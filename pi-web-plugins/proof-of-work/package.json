@@ -1,0 +1,15 @@
+{
+  "name": "@belayd/pi-web-proof-of-work",
+  "version": "0.0.1",
+  "private": true,
+  "description": "pi-web plugin for viewing proof-of-work artifacts",
+  "piWeb": {
+    "plugins": [
+      {
+        "id": "proof-of-work",
+        "browserRoot": ".",
+        "module": "pi-web-plugin.js"
+      }
+    ]
+  }
+}

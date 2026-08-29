@@ -1,0 +1,7 @@
+{
+  "extensions": [
+    "../extensions/index.ts",
+    "../extensions/stale-file-guard.ts",
+    "../extensions/worktree-guard.ts"
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "name": "belayd-agent-harness",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Belayd multi-agent harness — agent registry, spawn, process gate, quality gates, worktree utilities, and pi extension",
+  "keywords": [
+    "pi-package"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "extensions",
+    "pi-web-plugins"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts",
+      "./extensions/stale-file-guard.ts",
+      "./extensions/worktree-guard.ts"
+    ],
+    "skills": [
+      "./.agents/skills"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "dev:pi-web": "bash -c 'trap \"kill 0\" EXIT; pi-web-sessiond & pi-web-server & wait'",
+    "scotty": "scotty -p 7687"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.2.0",
+    "@jmfederico/pi-web": "1.202608.1",
+    "@types/node": "^26.1.2",
+    "typescript": "5.8.3",
+    "vitest": "3.2.4"
+  },
+  "dependencies": {
+    "@earendil-works/gondolin": "^0.12.0",
+    "lefthook": "^2.1.10"
+  },
+  "engines": {
+    "node": ">=23.6.0"
+  }
+}
