@@ -1,0 +1,9 @@
+allowBuilds:
+  '@biomejs/biome': true
+  '@google/genai': true
+  cpu-features: true
+  esbuild: true
+  lefthook: true
+  node-pty: true
+  protobufjs: true
+  ssh2: true

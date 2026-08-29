@@ -1,0 +1,27 @@
+node_modules
+dist
+*.tsbuildinfo
+coverage
+
+# Pi personal artifacts
+.pi/sessions/
+.pi/npm/
+
+# Nix / direnv
+.direnv
+result
+
+.belayd-task.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# Beads migration rollback + local backup config (machine-specific)
+.beads.bak/
+.beads/dolt-backup.json
+
+/proof-of-work
