@@ -1,0 +1,8 @@
+{
+  "provider": "openrouter",
+  "model": "qwen/qwen3-vl-32b-instruct",
+  "maxDimension": 1568,
+  "jpegQuality": 85,
+  "defaultReasoningEffort": "off",
+  "enabled": true
+}

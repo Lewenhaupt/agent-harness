@@ -371,7 +371,33 @@
         # The configured pi binary, exposed as `pi` so nix-tmp and the NixOS
         # config keep installing `belaydPkgs.pi` unchanged, and so
         # `nix run .#pi --` / `nix run <flake>#pi --` just works.
-        pi = belayd-pi.package;
+        #
+        # One extra layer on top of mkCodingAgent's wrapper: install the
+        # pi-exa and pi-vision-tool config files into the agentDir if absent
+        # (same install-if-absent pattern pi.nix uses for models.json). Both
+        # extensions read $PI_CODING_AGENT_DIR/<name>.json, so this keeps
+        # web_search_advanced_exa/deep_search_exa and describe_image configured
+        # without any hand-maintained global config. User edits made via the
+        # extensions' own /config commands persist (we only install when the
+        # file is missing).
+        pi = pkgs.writeShellScriptBin "pi" ''
+          set -euo pipefail
+          agent_dir="''${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+          install_if_absent() {
+            local name="$1" src="$2"
+            local dst="$agent_dir/$name"
+            if [ -L "$dst" ]; then
+              rm -f "$dst"
+            fi
+            if [ ! -f "$dst" ]; then
+              mkdir -p "$agent_dir"
+              install -m 0600 "$src" "$dst"
+            fi
+          }
+          install_if_absent "pi-exa.json" ${./pi-exa.json}
+          install_if_absent "vision-tool.json" ${./vision-tool.json}
+          exec ${belayd-pi.package}/bin/pi "$@"
+        '';
 
         # dockerTools.buildLayeredImage inherits `isExe = true` from its inner
         # streamLayeredImage even though its output is a plain tarball. Arion
