@@ -7,14 +7,13 @@
  * - runQualityGate multi-retry naming (via phase with quality gate)
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { listRuns, readRunManifest, writeRunManifest } from "../run-manifest.js";
+import { listRuns, RunStatus, readRunManifest, writeRunManifest } from "../run-manifest.js";
 import {
-  legacyTaskFilePath,
   readWorkflowState as readWorkflowStateFromDisk,
   type WorkflowState,
   workflowStateFilePath,
@@ -1248,7 +1247,7 @@ describe("session_start resume from disk (bd-40)", () => {
         taskId: "bd-42",
         phase: "plan",
         sessionName: "belayd-bd-42-sub-plan-plan-run",
-        status: "running",
+        status: RunStatus.Running,
         startedAt: 5_000,
       },
     });
@@ -1299,34 +1298,6 @@ describe("session_start resume from disk (bd-40)", () => {
     const message = await gateContextMessage(eventHandlers, ctx);
     expect(message).toBeUndefined();
     expect(existsSync(workflowStateFilePath(cwd))).toBe(false);
-    expect(existsSync(legacyTaskFilePath(cwd))).toBe(false);
-  });
-
-  it("migrates a legacy .belayd-task.json into workflow.json and resumes", async () => {
-    const cwd = freshWorktree();
-    // Pre-bd-40 shape: identity only, no completed phases.
-    writeFileSync(
-      legacyTaskFilePath(cwd),
-      JSON.stringify({
-        taskId: "bd-7",
-        branch: "feat/bd-7",
-        originalCwd: "/home/user/repo",
-        workflowType: "bugfix",
-      }),
-    );
-
-    const { eventHandlers } = await bootWithCwd(cwd);
-    const ctx = createResumeCtx({ cwd });
-
-    await fireSessionStart(eventHandlers, ctx);
-    const message = await gateContextMessage(eventHandlers, ctx);
-
-    // The legacy file migrated into workflow.json (deleted) and the gate
-    // resumed a bugfix workflow from its first phase.
-    expect(existsSync(legacyTaskFilePath(cwd))).toBe(false);
-    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
-    expect(message).toContain("bd-7");
-    expect(message).toContain("Next required step: call `belayd_scout`");
   });
 
   it("persists a completed phase to workflow.json only after its run succeeds (success path)", async () => {

@@ -45,6 +45,7 @@ import {
   isValidWorkflowType,
   isWorkflowComplete,
   markPhaseCompleted,
+  RunStatus,
   resolveQualityGate,
   resolveWorkflowType,
   setupWorktree,
@@ -913,7 +914,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         taskId: options.state.currentTaskId,
         phase: options.phaseName,
         sessionName: options.subagentSessionName,
-        status: "running",
+        status: RunStatus.Running,
         startedAt: Date.now(),
         model: options.model,
       },
@@ -998,7 +999,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state: SessionState;
     manifestCwd: string;
     runId: string;
-    status: "completed" | "failed";
+    status: RunStatus.Completed | RunStatus.Failed;
     exitCode: number;
   }): void {
     if (!options.state.gateActive || options.state.currentTaskId === "") return;
@@ -1011,7 +1012,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (!statusResult.ok) {
       console.warn(`[belayd-harness] failed to update run manifest: ${statusResult.error}`);
     }
-    if (options.status === "completed") {
+    if (options.status === RunStatus.Completed) {
       // The in-memory phase list is marked at tool_call time, but disk only
       // records a phase once its run actually completed — this is what makes
       // resume re-run an interrupted phase. Never persist on "failed".
@@ -1054,7 +1055,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           state,
           manifestCwd,
           runId,
-          status: outcome.ok && outcome.result.details.exitCode === 0 ? "completed" : "failed",
+          status:
+            outcome.ok && outcome.result.details.exitCode === 0
+              ? RunStatus.Completed
+              : RunStatus.Failed,
           exitCode: outcome.ok ? outcome.result.details.exitCode : 1,
         });
         return outcome.result;
@@ -1139,7 +1143,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           content: [
             {
               type: "text" as const,
-              text: `Invalid task id: ${params.taskId}. Expected bd-NN or bd-NN.N.`,
+              text: `Invalid task id: ${params.taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`,
             },
           ],
           details: { messages: [], usage: emptyUsage(), exitCode: 1 },
@@ -1380,7 +1384,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "commit",
           options.runId,
         ),
-        status: "running",
+        status: RunStatus.Running,
         startedAt: Date.now(),
       },
     });
@@ -1395,7 +1399,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state: SessionState;
     cwd: string;
     runId: string;
-    status: "completed" | "failed";
+    status: RunStatus.Completed | RunStatus.Failed;
     gateCommit: boolean;
   }): void {
     if (!options.gateCommit) return;
@@ -1404,7 +1408,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       runId: options.runId,
       status: options.status,
     });
-    if (options.status === "completed") {
+    if (options.status === RunStatus.Completed) {
       persistCompletedPhases({
         cwd: options.cwd,
         completedPhaseNames: options.state.completedPhaseNames,
@@ -1416,13 +1420,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   function markCommitRunStatus(options: {
     cwd: string;
     runId: string;
-    status: "completed" | "failed";
+    status: RunStatus.Completed | RunStatus.Failed;
   }): void {
     const statusResult = setRunStatus({
       cwd: options.cwd,
       runId: options.runId,
       status: options.status,
-      exitCode: options.status === "completed" ? 0 : 1,
+      exitCode: options.status === RunStatus.Completed ? 0 : 1,
     });
     if (!statusResult.ok) {
       console.warn(`[belayd-harness] failed to update commit run manifest: ${statusResult.error}`);
@@ -1473,7 +1477,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const stageError = await _stageChanges(execAsync, cwd, params.files);
       if (stageError) {
-        finalizeCommitRun({ state, cwd, runId, gateCommit, status: "failed" });
+        finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Failed });
         return commitFailure(stageError);
       }
 
@@ -1481,12 +1485,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const commitResult = await _runCommit(execAsync, fullMessage, cwd);
       if (typeof commitResult === "string") {
-        finalizeCommitRun({ state, cwd, runId, gateCommit, status: "failed" });
+        finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Failed });
         const feedback = await extractCommitFeedback(commitResult, ctx);
         return commitFailure(feedback, commitResult);
       }
 
-      finalizeCommitRun({ state, cwd, runId, gateCommit, status: "completed" });
+      finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Completed });
 
       return {
         content: [{ type: "text" as const, text: `Committed as ${commitResult.hash}` }],

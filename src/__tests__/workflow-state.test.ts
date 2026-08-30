@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   clearWorkflowState,
-  legacyTaskFilePath,
   parseWorkflowState,
   readWorkflowState,
   saveCompletedPhases,
@@ -104,70 +103,6 @@ describe("workflow state", () => {
     expect(readWorkflowState({ cwd, fs })).toBe(undefined);
   });
 
-  it("migrates the legacy task file into workflow.json and deletes it", () => {
-    const fs = createFakeFs({
-      [legacyTaskFilePath(cwd)]: JSON.stringify({
-        taskId: "bd-7",
-        branch: "feat/bd-7",
-        originalCwd: "/home/user/repo",
-        workflowType: "bugfix",
-      }),
-    });
-
-    const state = readWorkflowState({ cwd, fs, now: () => 42_000 });
-
-    expect(state).toHaveProperty("taskId", "bd-7");
-    expect(state).toHaveProperty("branch", "feat/bd-7");
-    expect(state).toHaveProperty("originalCwd", "/home/user/repo");
-    expect(state).toHaveProperty("workflowType", "bugfix");
-    expect(state).toHaveProperty("completedPhaseNames", []);
-    expect(state).toHaveProperty("startedAt", 42_000);
-    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(true);
-    expect(fs.files.has(legacyTaskFilePath(cwd))).toBe(false);
-  });
-
-  it("falls back to feature phases when the legacy workflow type is invalid", () => {
-    const fs = createFakeFs({
-      [legacyTaskFilePath(cwd)]: JSON.stringify({
-        taskId: "bd-8",
-        branch: "feat/bd-8",
-        originalCwd: "/home/user/repo",
-        workflowType: "nonsense",
-      }),
-    });
-
-    const state = readWorkflowState({ cwd, fs });
-
-    expect(state).toHaveProperty("workflowType", "feature");
-    expect(state?.phaseOrder).toEqual([
-      "scout",
-      "plan",
-      "implement",
-      "review",
-      "test",
-      "userguide",
-      "proof",
-      "commit",
-    ]);
-  });
-
-  it("migrates one-shot: a later read without the legacy file returns nothing", () => {
-    const fs = createFakeFs({
-      [legacyTaskFilePath(cwd)]: JSON.stringify({
-        taskId: "bd-9",
-        branch: "feat/bd-9",
-        originalCwd: "/home/user/repo",
-      }),
-    });
-
-    expect(readWorkflowState({ cwd, fs })).not.toBe(undefined);
-    expect(fs.files.has(legacyTaskFilePath(cwd))).toBe(false);
-
-    // Simulate the new file disappearing; migration must not run again.
-    fs.files.delete(workflowStateFilePath(cwd));
-    expect(readWorkflowState({ cwd, fs })).toBe(undefined);
-  });
-
   it("saveCompletedPhases preserves identity fields and updates the timestamp", () => {
     const fs = createFakeFs();
     const state = sampleState({
@@ -213,20 +148,16 @@ describe("workflow state", () => {
     expect([...fs.files.keys()].some((path) => path.endsWith(".tmp"))).toBe(false);
   });
 
-  it("returns undefined for a corrupt legacy task file without throwing", () => {
-    const fs = createFakeFs({ [legacyTaskFilePath(cwd)]: "not json" });
-    expect(readWorkflowState({ cwd, fs })).toBe(undefined);
-  });
-
-  it("clearWorkflowState removes both files and tolerates missing files", () => {
+  it("clearWorkflowState removes only workflow.json and tolerates missing files", () => {
     const fs = createFakeFs({
       [workflowStateFilePath(cwd)]: JSON.stringify(sampleState()),
-      [legacyTaskFilePath(cwd)]: JSON.stringify({ taskId: "bd-1" }),
+      [`${cwd}/.belayd-task.json`]: JSON.stringify({ taskId: "bd-1" }),
     });
 
     clearWorkflowState({ cwd, fs });
     expect(fs.files.has(workflowStateFilePath(cwd))).toBe(false);
-    expect(fs.files.has(legacyTaskFilePath(cwd))).toBe(false);
+    // The legacy file is no longer managed; only workflow.json is removed.
+    expect(fs.files.has(`${cwd}/.belayd-task.json`)).toBe(true);
 
     // No files present: must not throw.
     expect(() => clearWorkflowState({ cwd, fs })).not.toThrow();

@@ -72,9 +72,10 @@ export {
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   parseQuotaResetSeconds,
 } from "./quota-failure.js";
-export type { RunManifest, RunStatus } from "./run-manifest.js";
+export type { RunManifest } from "./run-manifest.js";
 export {
   listRuns,
+  RunStatus,
   readRunManifest,
   runManifestPath,
   runsDir,
@@ -115,7 +116,6 @@ export {
 export type { WorkflowFs, WorkflowState } from "./workflow-state.js";
 export {
   clearWorkflowState,
-  legacyTaskFilePath,
   readWorkflowState,
   saveCompletedPhases,
   workflowStateDir,

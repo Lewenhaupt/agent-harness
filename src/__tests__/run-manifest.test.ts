@@ -5,6 +5,7 @@ import {
   parseRunManifest,
   type RunManifest,
   type RunManifestFs,
+  RunStatus,
   readRunManifest,
   runManifestPath,
   scanForInterruptedRuns,
@@ -74,7 +75,7 @@ function sampleManifest(overrides: Partial<RunManifest> = {}): RunManifest {
     taskId: "bd-42",
     phase: "plan",
     sessionName: "belayd-bd-42-sub-plan-abc123",
-    status: "running",
+    status: RunStatus.Running,
     startedAt: 1_000,
     model: "opencode-go/deepseek-v4-flash",
     ...overrides,
@@ -98,7 +99,7 @@ describe("run manifest", () => {
     const result = setRunStatus({
       cwd,
       runId: manifest.runId,
-      status: "completed",
+      status: RunStatus.Completed,
       exitCode: 0,
       fs,
       now: () => 5_000,
@@ -115,7 +116,7 @@ describe("run manifest", () => {
     const fs = createFakeFs();
     writeRunManifest({ cwd, manifest: sampleManifest(), fs });
 
-    setRunStatus({ cwd, runId: "abc123", status: "running", fs, now: () => 5_000 });
+    setRunStatus({ cwd, runId: "abc123", status: RunStatus.Running, fs, now: () => 5_000 });
 
     const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
     expect(reloaded).toHaveProperty("status", "running");
@@ -137,7 +138,7 @@ describe("run manifest", () => {
     const result = setRunStatus({
       cwd,
       runId: manifest.runId,
-      status: "completed",
+      status: RunStatus.Completed,
       exitCode: 0,
       fs,
       now: () => 12_345,
@@ -157,14 +158,14 @@ describe("run manifest", () => {
     const fs = createFakeFs();
     writeRunManifest({
       cwd,
-      manifest: sampleManifest({ status: "completed", completedAt: 9_000 }),
+      manifest: sampleManifest({ status: RunStatus.Completed, completedAt: 9_000 }),
       fs,
     });
 
     const result = setRunStatus({
       cwd,
       runId: "abc123",
-      status: "running",
+      status: RunStatus.Running,
       fs,
       now: () => 10_000,
     });
@@ -177,7 +178,7 @@ describe("run manifest", () => {
 
   it("setRunStatus returns an error for an unknown run id", () => {
     const fs = createFakeFs();
-    const result = setRunStatus({ cwd, runId: "missing", status: "failed", fs });
+    const result = setRunStatus({ cwd, runId: "missing", status: RunStatus.Failed, fs });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("No run manifest");
   });
@@ -206,13 +207,13 @@ describe("run manifest", () => {
   it("scanForInterruptedRuns only flips running manifests", () => {
     const fs = createFakeFs({
       [runManifestPath(cwd, "running1")]: JSON.stringify(
-        sampleManifest({ runId: "running1", status: "running" }),
+        sampleManifest({ runId: "running1", status: RunStatus.Running }),
       ),
       [runManifestPath(cwd, "done")]: JSON.stringify(
-        sampleManifest({ runId: "done", status: "completed", completedAt: 2_000 }),
+        sampleManifest({ runId: "done", status: RunStatus.Completed, completedAt: 2_000 }),
       ),
       [runManifestPath(cwd, "running2")]: JSON.stringify(
-        sampleManifest({ runId: "running2", status: "running" }),
+        sampleManifest({ runId: "running2", status: RunStatus.Running }),
       ),
     });
 
