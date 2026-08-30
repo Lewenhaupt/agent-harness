@@ -54,6 +54,20 @@ pnpm typecheck        # TypeScript type checking
 pnpm lint             # Biome format + lint
 ```
 
+### Running pi in this repo
+
+The NixOS config installs these extensions globally (built from the pushed
+flake), so a plain `pi` here would load both the global copies and the local
+`.pi/settings.json` ones and fail with `Tool "belayd_*" conflicts with
+.../extensions/index.ts`. `bin/pi` (wired into PATH via `.envrc` / direnv)
+runs pi with `-ne` and re-adds the repo-local extensions explicitly, so edits
+to `extensions/` take effect on the next launch without pushing + rebuilding
+the OS. Manual use: `./bin/pi` (or `nix develop -c ./bin/pi`).
+
+Spawned belayd agents get the same isolation: `.envrc` and the devShell
+shellHook export `PI_BINARY_PATH` pointing at `bin/pi`, and `src/spawn.ts`
+resolves the agent's pi binary from that var first (`resolvePiBinary`).
+
 ## Local services
 
 The harness relies on a few long-running local services, split across two
