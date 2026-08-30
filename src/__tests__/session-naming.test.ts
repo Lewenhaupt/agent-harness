@@ -31,6 +31,11 @@ describe("computeSubagentSessionName", () => {
       "belayd-bd-9999-sub-scout-a",
     ]);
   });
+
+  it("works with subtask notation", () => {
+    const name = computeSubagentSessionName("bd-16.2", "scout", "abc");
+    expect(name).toBe("belayd-bd-16.2-sub-scout-abc");
+  });
 });
 
 describe("computeOrchestratorSessionName", () => {
@@ -45,13 +50,17 @@ describe("computeOrchestratorSessionName", () => {
     expect(computeOrchestratorSessionName("bd-9999")).toBe("belayd-bd-9999");
   });
 
+  it("works with subtask notation", () => {
+    expect(computeOrchestratorSessionName("bd-16.2")).toBe("belayd-bd-16.2");
+  });
+
   it("throws on empty taskId", () => {
     expect(() => computeOrchestratorSessionName("")).toThrow("taskId must be a non-empty string");
   });
 
   it("throws on taskId not matching bd-N pattern", () => {
     expect(() => computeOrchestratorSessionName("bad-id")).toThrow(
-      "taskId must follow the beads ID pattern (e.g. bd-42)",
+      "taskId must follow the beads ID pattern (e.g. bd-42, bd-42.1)",
     );
     expect(() => computeOrchestratorSessionName("my-task-123")).toThrow();
   });
@@ -84,7 +93,7 @@ describe("input validation", () => {
   });
   it("throws on taskId not matching bd-N pattern", () => {
     expect(() => computeSubagentSessionName("bad-id", "scout", "abc")).toThrow(
-      "taskId must follow the beads ID pattern (e.g. bd-42)",
+      "taskId must follow the beads ID pattern (e.g. bd-42, bd-42.1)",
     );
   });
 
