@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Refresh LLM Gateway models into pi's custom-provider config.
 #
-# Fetches https://api.llmgateway.io/v1/models and rewrites
-# ~/.pi/agent/models.json with an `llmgateway` custom provider, so pi can use
-# any of the gateway's models through /model without a per-provider extension
-# (see docs/llmgateway.md).
+# Fetches https://api.llmgateway.io/v1/models and rewrites the repo's
+# models.json (baked into the flake's pi binary) with an `llmgateway` custom
+# provider, so pi can use any of the gateway's models through /model without a
+# per-provider extension (see docs/llmgateway.md).
 #
 # Field mapping follows the pi-llmgateway extension's own logic
 # (src/extensions/provider/models/map.ts): per-million-token costs from
@@ -23,7 +23,7 @@
 #     --print         Write the JSON to stdout instead of the config file.
 #     --offline       Reuse cached _models.json; no network.
 #     --require-key   Fail instead of proceeding without an API key.
-#     --out FILE      Override the output path (default ~/.pi/agent/models.json).
+#     --out FILE      Override the output path (default <repo>/models.json).
 #     --min-models N  Fail if fewer than N models would be written (default 10).
 #
 # Requires: curl, python3 (both present in the flake devShell).
@@ -54,7 +54,7 @@ PRINT=0
 OFFLINE=0
 REQUIRE_KEY=0
 MIN_MODELS=10
-OUT="${LLMGW_MODELS_OUT:-$HOME/.pi/agent/models.json}"
+OUT="${LLMGW_MODELS_OUT:-$repo_root/models.json}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -215,3 +215,16 @@ print(f"wrote {len(models)} models to {out_path}")
 if changed:
     print(f"  ({len(api_models)} api models; {len(models)} chat models; diff applied)")
 PY
+
+# Normalize formatting with biome so the committed file passes `pnpm lint`.
+# Prefer the repo's local biome (matches the devDependency version) over any
+# system install. Skipped for --print and --dry-run, which write no file.
+if [[ $PRINT -eq 0 && $DRY_RUN -eq 0 ]]; then
+  if [[ -x "$repo_root/node_modules/.bin/biome" ]]; then
+    "$repo_root/node_modules/.bin/biome" format --write "$OUT" >/dev/null 2>&1 || \
+      echo "warning: biome format failed; run 'pnpm lint' to check formatting" >&2
+  elif command -v biome >/dev/null 2>&1; then
+    biome format --write "$OUT" >/dev/null 2>&1 || \
+      echo "warning: biome format failed; run 'pnpm lint' to check formatting" >&2
+  fi
+fi
