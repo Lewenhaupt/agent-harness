@@ -126,12 +126,13 @@ by falling back to the same model on llmgateway.
 
 - **Cooldown state is in-memory** — lost on orchestrator restart. Follow-up:
   persist to `~/.pi/agent/...` with atomic write + lockfile (harvest
-  pi-gateway `state.ts`).
+  pi-gateway `state.ts`). → **bd-16.1**
 - **`MODEL_TO_CLASS` is string-keyed** — an explicit `AgentDefinition.modelClass`
-  field would make the mapping self-documenting. Follow-up.
+  field would make the mapping self-documenting. Follow-up. → **bd-16.2**
 - **Mid-stream exhaustion** (quota after output began) is handled by re-spawning
   fresh from the task (classifier sees the final `stopReason:"error"`), but the
-  partial work is lost and the residual behavior is untested. Observation only.
+  partial work is lost and the residual behavior is untested. Observation only
+  (no follow-up bead).
 - `@pedro_klein/pi-gateway` was evaluated and **rejected as a dependency**
   (session-scoped, pre-output-only failover); its detect/state patterns were
   harvested instead. See bd-16 comments.
