@@ -23,7 +23,17 @@ bd where
 
 ## Preferred Route
 
-Use the `bd` CLI when shell access is available. It is the most compact and direct Beads interface.
+Use the `bd` tool if your harness provides one; otherwise use the `bd` CLI when shell access is available. Either is the most compact and direct Beads interface — and the only reliable way to read issue data.
+
+Some harnesses expose a `bd` tool restricted to safe subcommands (create, update, show, list, search, ...) that cannot `close`, `delete`, or `edit` issues. Run those mutating commands through the `bd` CLI instead.
+
+## Data lives in a shared Dolt server — do not read files
+
+Issues are stored in a Dolt database, commonly on a shared Dolt server (`dolt.shared-server: true`, `dolt_mode: server`), not in readable local files.
+
+- Never read `.beads/issues.jsonl`, `.beads/dolt/`, or any other `.beads/` file to discover or inspect work. `issues.jsonl` is a passive export that may be absent or stale; `.beads/dolt/` is server/runtime state.
+- Always go through `bd` (`bd list`, `bd show`, `bd search`, `bd ready`, ...) to see current, authoritative issue state.
+- Because it is shared, mutate carefully: claim with `bd update <id> --claim`, and use `--if-assignee`/`--if-status` guards for concurrent-safe updates.
 
 ## Core CLI Workflow
 
@@ -80,6 +90,7 @@ Use agent-local planning tools only for the current turn's execution checklist. 
 
 ## Rules
 
+- Do not read `.beads/` files (`.beads/issues.jsonl`, `.beads/dolt/`, etc.) to find or inspect work; always use `bd`. File contents are not the source of truth for a shared server.
 - Do not create markdown TODO files as the source of truth when Beads is available.
 - Do not use `bd edit`; it opens an interactive editor. Use `bd update` flags instead.
 - Prefer `--json` when parsing `bd` output programmatically.
