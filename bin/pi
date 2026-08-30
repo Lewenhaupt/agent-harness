@@ -27,8 +27,25 @@ if [[ -z "$real_pi" ]]; then
   exit 1
 fi
 
+# pi CLI subcommands. pi expects these as the FIRST argument; prepending the
+# -ne/-e flags below would push e.g. "pi install foo" into treating
+# "install foo" as an agent prompt. Pass subcommands through untouched so they
+# operate on the real user/global settings.
+case "${1:-}" in
+  install|remove|uninstall|update|list|config|auth)
+    exec "$real_pi" "$@"
+    ;;
+esac
+
+# Run mode: -ne disables all extension discovery (global dirs AND settings
+# packages), then the repo-local extensions are re-added explicitly with -e.
+# Third-party npm packages are re-added the same way; their extraction dir is
+# cached under the pi config dir, so reruns do not hit the network. Note the
+# run-mode flags are all placed BEFORE the user args on purpose: pi treats the
+# first positional as the prompt, so the user's prompt/args must stay last.
 exec "$real_pi" -ne \
   -e "$repo_dir/extensions/index.ts" \
   -e "$repo_dir/extensions/stale-file-guard.ts" \
   -e "$repo_dir/extensions/worktree-guard.ts" \
+  -e npm:@mcowger/pi-llmgateway \
   "$@"
