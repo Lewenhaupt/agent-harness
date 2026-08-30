@@ -68,7 +68,7 @@ Spawned belayd agents get the same isolation: `.envrc` and the devShell
 shellHook export `PI_BINARY_PATH` pointing at `bin/pi`, and `src/spawn.ts`
 resolves the agent's pi binary from that var first (`resolvePiBinary`).
 
-### Third-party npm extensions
+### Third-party npm extensions & custom providers
 
 pi auto-installs packages listed in settings at startup, so for the NixOS
 global install just run `pi install npm:<pkg>` (writes to
@@ -76,13 +76,17 @@ global install just run `pi install npm:<pkg>` (writes to
 change — the global pi reads the same `~/.pi/agent`. `bin/pi` passes pi's
 CLI subcommands (`install`, `remove`, `uninstall`, `update`, `list`,
 `config`, `auth`) straight through to the real pi, so those also operate on
-the global settings. Only *running* pi in this repo is isolated. The repo's
-`bin/pi` run mode uses `-ne`, which skips settings-declared packages, so npm
-extensions are loaded there with an explicit `-e npm:<pkg>` line in `bin/pi`
-(the extraction is cached under the pi config dir, so reruns are offline).
-Note: some packages error during `-e` startup (e.g. pi-llmgateway prints an
-`authStorage` error) but still register their provider, so the session
-continues.
+the global settings. Only *running* pi in this repo is isolated, and only
+there do you need to add an explicit `-e npm:<pkg>` line to `bin/pi` for a
+third-party extension.
+
+Custom providers without an extension — for example LLM Gateway, see the
+official [pi integration guide](https://docs.llmgateway.io/guides/pi) — are
+configured in `~/.pi/agent/models.json` (a `providers` map). These load
+regardless of `-ne`, so they also work in this repo's wrapper and spawned
+agents with zero repo changes. For DevPass plans, use canonical model ids
+without a provider prefix (`claude-sonnet-4-5`, not
+`anthropic/claude-sonnet-4-5`): provider-pinned ids are rejected (403).
 
 ## Local services
 
