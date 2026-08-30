@@ -12,6 +12,7 @@ coverage
 result
 
 .belayd-task.json
+.belayd/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

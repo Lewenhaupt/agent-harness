@@ -7,10 +7,30 @@
  * - runQualityGate multi-retry naming (via phase with quality gate)
  */
 
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { listRuns, readRunManifest, writeRunManifest } from "../run-manifest.js";
+import {
+  legacyTaskFilePath,
+  readWorkflowState as readWorkflowStateFromDisk,
+  type WorkflowState,
+  workflowStateFilePath,
+  writeWorkflowState,
+} from "../workflow-state.js";
+
+const FEATURE_PHASES = [
+  "scout",
+  "plan",
+  "implement",
+  "review",
+  "test",
+  "userguide",
+  "proof",
+  "commit",
+] as const;
 
 // Isolate the extension's persistent cooldown store from the real user file. A
 // live pi-web quota cooldown in ~/.pi/agent/model-cooldowns.json would leak
@@ -1055,5 +1075,338 @@ describe("extension load dedup", () => {
     const sessionTwo = createMockPi();
     factory(sessionTwo.api);
     expect(sessionTwo.tools.get("belayd_scout")).toBeDefined();
+  });
+});
+
+// ── Crash-resume semantics (bd-40) ─────────────────────────────────────
+//
+// The session_start handler restores a crashed orchestrator from .belayd/
+// workflow.json via resumeWorkflowFromDisk. A completed phase is only
+// persisted to workflow.json after its phase run actually succeeds
+// (persistRunStatus), so a mid-phase crash re-runs the interrupted phase.
+// Any manifest still marked "running" is flipped to "interrupted" on the
+// next session_start so the orchestrator can surface dead runs.
+
+describe("session_start resume from disk (bd-40)", () => {
+  const surface = new Set<string>();
+  let nextSessionId = 0;
+
+  afterEach(() => {
+    for (const dir of surface) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+    surface.clear();
+    mockSpawnAgentProcess.mockClear();
+    mockExec.mockClear();
+    // Restore the default success spawn result other describe blocks expect.
+    mockSpawnAgentProcess.mockResolvedValue({
+      content: [{ type: "text" as const, text: "done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked",
+    });
+  });
+
+  function freshWorktree(): string {
+    const dir = mkdtempSync(join(tmpdir(), "belayd-resume-"));
+    surface.add(dir);
+    return dir;
+  }
+
+  function featureState(overrides: Partial<WorkflowState> = {}): WorkflowState {
+    return {
+      schemaVersion: 1,
+      taskId: "bd-42",
+      workflowType: "feature",
+      branch: "feat/bd-42",
+      originalCwd: "/home/user/repo",
+      phaseOrder: [...FEATURE_PHASES],
+      completedPhaseNames: [],
+      startedAt: 1_000,
+      updatedAt: 1_000,
+      ...overrides,
+    };
+  }
+
+  /**
+   * Build an orchestrator-shaped ctx for session_start: a real session file
+   * (truthy) and a non-sub-agent session name so resumeWorkflowFromDisk runs.
+   * Each call uses a unique sessionId so the module-level sessionStates map
+   * never aliases state across tests.
+   */
+  function createResumeCtx(opts: { cwd: string; sessionName?: string; sessionFile?: string }): {
+    sessionManager: {
+      getSessionId: () => string;
+      getSessionName: () => string | undefined;
+      getSessionFile: () => string | undefined;
+    };
+    cwd: string;
+  } {
+    const sessionId = `resume-session-${nextSessionId++}`;
+    return {
+      sessionManager: {
+        getSessionId: () => sessionId,
+        getSessionName: () => opts.sessionName ?? "orchestrator-session",
+        getSessionFile: () => opts.sessionFile ?? `${opts.cwd}/session.jsonl`,
+      },
+      cwd: opts.cwd,
+    };
+  }
+
+  async function bootWithCwd(cwd: string) {
+    const { api, tools, eventHandlers } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+    return { cwd, api, tools, eventHandlers };
+  }
+
+  async function fireSessionStart(
+    eventHandlers: Map<string, (...args: unknown[]) => void>,
+    ctx: { sessionManager: unknown; cwd: string },
+  ): Promise<void> {
+    const handler = eventHandlers.get("session_start");
+    expect(handler).toBeDefined();
+    await handler?.({}, ctx);
+  }
+
+  async function gateContextMessage(
+    eventHandlers: Map<string, (...args: unknown[]) => void>,
+    ctx: { sessionManager: unknown; cwd: string },
+  ): Promise<string | undefined> {
+    const handler = eventHandlers.get("before_agent_start");
+    expect(handler).toBeDefined();
+    // before_agent_start is async and returns { message: { content } } when the
+    // gate is active, or undefined when it is not; the loose mock types it as
+    // void so cast through unknown to read the shape we care about.
+    const result = (await handler?.({}, ctx)) as unknown as
+      | { message?: { content?: string } }
+      | undefined;
+    return result?.message?.content;
+  }
+
+  it("restores completedPhaseNames from disk and resumes at the next unfinished phase", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout", "plan"] }),
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    // The gate is active again and the next required step jumps straight to
+    // the first unfinished phase — scout and plan must NOT be re-requested.
+    expect(message).toBeTruthy();
+    expect(message).toContain("BELAYD WORKFLOW ACTIVE");
+    expect(message).toContain("bd-42");
+    expect(message).toContain("Next required step: call `belayd_implement`");
+    expect(message).not.toContain("call `belayd_scout`");
+  });
+
+  it("clears a fully-complete workflow and leaves the gate inactive", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: [...FEATURE_PHASES] }),
+    });
+    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+
+    // A finished workflow must not resurrect the gate; the stale state file
+    // is removed so a later start_task writes fresh.
+    expect(existsSync(workflowStateFilePath(cwd))).toBe(false);
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toBeUndefined();
+  });
+
+  it("flips a still-running manifest to interrupted during resume", async () => {
+    const cwd = freshWorktree();
+    // scout already done, plan was running when the previous process died.
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout"] }),
+    });
+    writeRunManifest({
+      cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: "plan-run",
+        taskId: "bd-42",
+        phase: "plan",
+        sessionName: "belayd-bd-42-sub-plan-plan-run",
+        status: "running",
+        startedAt: 5_000,
+      },
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+
+    const reloaded = readRunManifest({ cwd, runId: "plan-run" });
+    expect(reloaded).toHaveProperty("status", "interrupted");
+    expect(reloaded).toHaveProperty("completedAt");
+    expect(typeof reloaded?.completedAt).toBe("number");
+
+    // And the gate still resumes at plan (the phase that died), not skipped.
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toContain("Next required step: call `belayd_plan`");
+  });
+
+  it("ignores sub-agent sessions and leaves disk state untouched", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout", "plan"] }),
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    // Session name contains "-sub-" so this is a spawned phase agent, not the
+    // orchestrator; resumeWorkflowFromDisk must be skipped entirely.
+    const ctx = createResumeCtx({ cwd, sessionName: "belayd-bd-42-sub-plan-abc123" });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    expect(message).toBeUndefined();
+    // State file is untouched (not migrated/cleared) because resume was skipped.
+    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
+    expect(readWorkflowStateFromDisk({ cwd })).toHaveProperty("taskId", "bd-42");
+  });
+
+  it("does nothing when no workflow or legacy state exists (fresh worktree)", async () => {
+    const cwd = freshWorktree();
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toBeUndefined();
+    expect(existsSync(workflowStateFilePath(cwd))).toBe(false);
+    expect(existsSync(legacyTaskFilePath(cwd))).toBe(false);
+  });
+
+  it("migrates a legacy .belayd-task.json into workflow.json and resumes", async () => {
+    const cwd = freshWorktree();
+    // Pre-bd-40 shape: identity only, no completed phases.
+    writeFileSync(
+      legacyTaskFilePath(cwd),
+      JSON.stringify({
+        taskId: "bd-7",
+        branch: "feat/bd-7",
+        originalCwd: "/home/user/repo",
+        workflowType: "bugfix",
+      }),
+    );
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    // The legacy file migrated into workflow.json (deleted) and the gate
+    // resumed a bugfix workflow from its first phase.
+    expect(existsSync(legacyTaskFilePath(cwd))).toBe(false);
+    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
+    expect(message).toContain("bd-7");
+    expect(message).toContain("Next required step: call `belayd_scout`");
+  });
+
+  it("persists a completed phase to workflow.json only after its run succeeds (success path)", async () => {
+    const cwd = freshWorktree();
+    const { tools, eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    // Fresh start_task writes an empty completed-phase state to disk.
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    // The real pi flow marks the phase in-memory at tool_call time, then runs
+    // the phase tool. Reproduce that ordering so persistRunStatus sees scout.
+    // Fire the tool_call event against the same ctx the tool executes under
+    // so the in-memory mark and the disk write share one SessionState.
+    await eventHandlers.get("tool_call")?.({ toolName: "belayd_scout", abort: vi.fn() }, ctx);
+
+    mockSpawnAgentProcess.mockResolvedValueOnce({
+      content: [{ type: "text" as const, text: "scout done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked-scout",
+    });
+
+    await tools
+      .get("belayd_scout")
+      ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+    // A successful run persists scout to workflow.json AND marks the run
+    // manifest completed.
+    const persisted = readWorkflowStateFromDisk({ cwd });
+    expect(persisted).toHaveProperty("completedPhaseNames", ["scout"]);
+
+    const runs = listRuns({ cwd });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toHaveProperty("phase", "scout");
+    expect(runs[0]).toHaveProperty("status", "completed");
+    expect(runs[0]).toHaveProperty("exitCode", 0);
+  });
+
+  it("does NOT persist a failed phase to workflow.json (failure path)", async () => {
+    const cwd = freshWorktree();
+    const { tools, eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    // tool_call marks scout in-memory; the marker must share the tool's
+    // ctx/state so the (skipped) disk write sees the same SessionState.
+    await eventHandlers.get("tool_call")?.({ toolName: "belayd_scout", abort: vi.fn() }, ctx);
+
+    mockSpawnAgentProcess.mockResolvedValueOnce({
+      content: [{ type: "text" as const, text: "scout crashed" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 1,
+      },
+      sessionName: "mocked-scout",
+    });
+
+    await tools
+      .get("belayd_scout")
+      ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+    // The in-memory list was marked at tool_call time, but disk must NOT record
+    // scout — a resume re-runs the failed phase instead of skipping it.
+    const persisted = readWorkflowStateFromDisk({ cwd });
+    expect(persisted).toHaveProperty("completedPhaseNames", []);
+
+    const runs = listRuns({ cwd });
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toHaveProperty("phase", "scout");
+    expect(runs[0]).toHaveProperty("status", "failed");
+    expect(runs[0]).toHaveProperty("exitCode", 1);
   });
 });
