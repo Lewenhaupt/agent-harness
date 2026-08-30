@@ -67,6 +67,7 @@ export {
   computeOrchestratorSessionName,
   computeSubagentSessionName,
   generateShortRunId,
+  isValidTaskId,
 } from "./session-naming.js";
 export { spawnAgentProcess } from "./spawn.js";
 export type {

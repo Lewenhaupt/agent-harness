@@ -41,6 +41,7 @@ import {
   getPhasesForType,
   getPhaseToolName,
   isInsideWorktreeForBranch,
+  isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
   markPhaseCompleted,
@@ -589,9 +590,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       const noWorktree = parts.includes("--no-worktree");
       const typeArg = parts.slice(1).find((p) => p !== "--no-worktree");
 
-      if (!taskId || !/^bd-[a-z0-9]+$/i.test(taskId)) {
+      if (!taskId || !isValidTaskId(taskId)) {
         ctx.ui.notify(
           "Usage: /belayd bd-42 [type] [--no-worktree]\n" +
+            "  taskId: beads issue or subtask ID (e.g. bd-42, bd-42.1)\n" +
             "  type: feature (default), bugfix, research, chore, documentation, refactor, hotfix\n" +
             "  --no-worktree: activate gate in the current directory, no worktree or daemon",
           "error",
