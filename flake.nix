@@ -374,6 +374,10 @@
 
           shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            # Local pi wrapper (bin/pi): spawned belayd agents resolve their pi
+            # binary via this var (src/spawn.ts) and would otherwise pick the
+            # global /run/current-system/sw/bin/pi and dual-load extensions.
+            export PI_BINARY_PATH="''${PWD}/bin/pi"
           '';
         };
       }
