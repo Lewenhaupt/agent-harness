@@ -13,7 +13,7 @@
  */
 
 import { exec } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +53,7 @@ import {
   WORKFLOW_REGISTRY,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
+import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
   computeOrchestratorSessionName,
@@ -60,6 +61,12 @@ import {
   generateShortRunId,
 } from "../src/session-naming.js";
 import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
+import {
+  clearWorkflowState,
+  readWorkflowState,
+  saveCompletedPhases,
+  writeWorkflowState,
+} from "../src/workflow-state.js";
 
 // ── Process gate state ─────────────────────────────────────────────────
 type SessionState = {
@@ -214,11 +221,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
-  function activateGate(
-    ctx: { sessionManager: { getSessionId: () => string } },
-    taskId: string,
-    workflowType?: WorkflowSubType,
-  ): SessionState {
+  function activateGate(options: {
+    ctx: { sessionManager: { getSessionId: () => string } };
+    taskId: string;
+    workflowType?: WorkflowSubType;
+    cwd: string;
+    branch?: string;
+    originalCwd?: string;
+  }): SessionState {
+    const { ctx, taskId, workflowType, cwd } = options;
     const state = getSessionState(ctx);
     state.gateActive = true;
     state.completedPhaseNames = [];
@@ -228,6 +239,40 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
     state.userGuideContent = undefined;
     enableGateTools(state);
+
+    // Reconcile with disk: resume a crashed workflow's completed phases, or
+    // write a fresh state file so a later crash can be resumed.
+    const persisted = readWorkflowState({ cwd });
+    if (persisted !== undefined && persisted.taskId === taskId) {
+      state.workflowType = isValidWorkflowType(persisted.workflowType)
+        ? persisted.workflowType
+        : "feature";
+      state.phaseOrder = [...persisted.phaseOrder];
+      state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+      state.completedPhaseNames = persisted.completedPhaseNames.filter((phase) =>
+        state.phaseOrder.includes(phase),
+      );
+    } else {
+      const now = Date.now();
+      const phaseOrder = getPhasesForType(state.workflowType);
+      const writeResult = writeWorkflowState({
+        cwd,
+        state: {
+          schemaVersion: 1,
+          taskId,
+          workflowType: state.workflowType,
+          branch: options.branch ?? "",
+          originalCwd: options.originalCwd ?? cwd,
+          phaseOrder: [...phaseOrder],
+          completedPhaseNames: [],
+          startedAt: now,
+          updatedAt: now,
+        },
+      });
+      if (!writeResult.ok) {
+        console.warn(`[belayd-harness] failed to persist workflow state: ${writeResult.error}`);
+      }
+    }
     return state;
   }
 
@@ -428,47 +473,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     return current;
   }
 
-  // ── Belayd task state file ─────────────────────────────────────────
-  // Written before spawning a new pi process in the worktree (TUI mode)
-  // or before activating the gate in-place (RPC mode).
-  // The session_start handler reads it to activate the gate.
-  // Persists for the workflow duration so belayd_stop_task can restore
-  // the original cwd.
-
-  type BelaydTaskFile = {
-    taskId: string;
-    branch: string;
-    originalCwd: string;
-    workflowType?: string;
-  };
-
-  function belaydTaskFilePath(cwd: string): string {
-    return join(cwd, ".belayd-task.json");
-  }
-
-  function writeBelaydTaskFile(cwd: string, data: BelaydTaskFile): void {
-    mkdirSync(cwd, { recursive: true });
-    writeFileSync(belaydTaskFilePath(cwd), JSON.stringify(data), "utf-8");
-  }
-
-  function readBelaydTaskFile(cwd: string): BelaydTaskFile | undefined {
-    const p = belaydTaskFilePath(cwd);
-    if (!existsSync(p)) return undefined;
-    try {
-      return JSON.parse(readFileSync(p, "utf-8")) as BelaydTaskFile;
-    } catch {
-      return undefined;
-    }
-  }
-
-  function deleteBelaydTaskFile(cwd: string): void {
-    try {
-      unlinkSync(belaydTaskFilePath(cwd));
-    } catch {
-      // Gone already
-    }
-  }
-
   // ── Worktree creation helper ────────────────────────────────────────
   function ensureWorktree(projectRoot: string, branch: string): string | undefined {
     try {
@@ -624,13 +628,27 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       `Begin by calling \`belayd_${phaseOrder[0] ?? "commit"}\` to start.`,
     ].join("\n");
 
-    // Write task file so the new session's session_start handler activates the gate.
-    writeBelaydTaskFile(worktreePath, {
-      taskId,
-      branch,
-      originalCwd,
-      workflowType,
+    // Persist workflow state so the new session's session_start handler can
+    // activate (and later resume) the gate.
+    const now = Date.now();
+    const writeResult = writeWorkflowState({
+      cwd: worktreePath,
+      state: {
+        schemaVersion: 1,
+        taskId,
+        workflowType,
+        branch,
+        originalCwd,
+        phaseOrder,
+        completedPhaseNames: [],
+        startedAt: now,
+        updatedAt: now,
+      },
     });
+    if (!writeResult.ok) {
+      ctx.ui.notify(`Failed to persist Belayd workflow state: ${writeResult.error}`, "error");
+      return;
+    }
 
     // Delegate to pi-web session daemon for persistent session management.
     const orchestrationName = computeOrchestratorSessionName(taskId);
@@ -700,7 +718,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       // --no-worktree mode: activate gate in-place, no isolation
       if (noWorktree) {
-        activateGate(ctx, taskId, workflowType);
+        activateGate({
+          ctx,
+          taskId,
+          workflowType,
+          cwd: ctx.cwd,
+          originalCwd: process.cwd(),
+        });
         ctx.ui.notify(
           `Belayd ${workflowType} workflow started for ${taskId} (no worktree).`,
           "info",
@@ -724,6 +748,40 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * Resume the gate from the persisted workflow state written by /belayd.
+   * A completed workflow is cleared instead of resurrected; a sub-agent never
+   * reaches this helper because its session has no workflow state file.
+   */
+  function resumeWorkflowFromDisk(state: SessionState, cwd: string): void {
+    const persisted = readWorkflowState({ cwd });
+    if (persisted === undefined) return;
+
+    // A stale workflow.json that already finished must not resurrect the gate.
+    if (isWorkflowComplete(persisted.completedPhaseNames, persisted.phaseOrder)) {
+      clearWorkflowState({ cwd });
+      return;
+    }
+
+    state.gateActive = true;
+    state.currentTaskId = persisted.taskId;
+    state.workflowType = isValidWorkflowType(persisted.workflowType)
+      ? persisted.workflowType
+      : "feature";
+    state.phaseOrder = [...persisted.phaseOrder];
+    state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+    state.completedPhaseNames = [...persisted.completedPhaseNames];
+    enableGateTools(state);
+
+    // Surface any phase runs that died with the previous orchestrator.
+    const interrupted = scanForInterruptedRuns({ cwd });
+    if (interrupted.length > 0) {
+      console.warn(
+        `[belayd-harness] ${interrupted.length} interrupted phase run(s) detected for ${persisted.taskId}`,
+      );
+    }
+  }
+
   pi.on("session_start", (_event, ctx) => {
     const state = getSessionState(ctx);
     state.gateActive = false;
@@ -736,21 +794,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // tool restrictions from their agent definition's tools allowlist, not the gate.
     const sessionName = ctx.sessionManager.getSessionName();
     const isSubAgent = sessionName?.includes("-sub-");
-
-    // Read the task file (written by /belayd). Only activate the gate for
-    // the orchestrator session — sub-agent sessions skip this.
-    const taskFile =
-      ctx.sessionManager.getSessionFile() && !isSubAgent ? readBelaydTaskFile(ctx.cwd) : undefined;
-    if (taskFile) {
-      state.gateActive = true;
-      state.currentTaskId = taskFile.taskId;
-      state.workflowType = taskFile.workflowType
-        ? (taskFile.workflowType as WorkflowSubType)
-        : "feature";
-      state.phaseOrder = getPhasesForType(state.workflowType);
-      state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
-      enableGateTools(state);
-    }
+    if (!ctx.sessionManager.getSessionFile() || isSubAgent) return;
+    resumeWorkflowFromDisk(state, ctx.cwd);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -838,6 +883,145 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd-committer": "commit",
   };
 
+  interface PhaseToolContext {
+    sessionManager: { getSessionId: () => string };
+    cwd?: string;
+  }
+
+  interface PhaseToolParams {
+    task: string;
+    cwd?: string;
+  }
+
+  type PhaseRunOutcome = { ok: true; result: SpawnResult } | { ok: false; result: SpawnResult };
+
+  /** Persist the "running" manifest so a mid-phase crash is resumable. */
+  function persistRunningManifest(options: {
+    state: SessionState;
+    manifestCwd: string;
+    runId: string;
+    phaseName: string;
+    subagentSessionName: string;
+    model: string;
+  }): void {
+    if (!options.state.gateActive || options.state.currentTaskId === "") return;
+    const writeResult = writeRunManifest({
+      cwd: options.manifestCwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: options.runId,
+        taskId: options.state.currentTaskId,
+        phase: options.phaseName,
+        sessionName: options.subagentSessionName,
+        status: "running",
+        startedAt: Date.now(),
+        model: options.model,
+      },
+    });
+    if (!writeResult.ok) {
+      console.warn(`[belayd-harness] failed to persist run manifest: ${writeResult.error}`);
+    }
+  }
+
+  /** Spawn the phase agent and run its quality gate. */
+  async function runPhaseAgent(
+    agent: AgentDefinition,
+    phaseName: string,
+    params: PhaseToolParams,
+    signal: AbortSignal | undefined,
+    state: SessionState,
+    effectiveCwd: string | undefined,
+    runId: string,
+  ): Promise<PhaseRunOutcome> {
+    const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
+    const effectiveModel = overrides?.model ?? agent.model;
+    const effectiveTools = overrides?.tools ?? agent.tools;
+    const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
+    const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
+
+    persistRunningManifest({
+      state,
+      manifestCwd: effectiveCwd ?? process.cwd(),
+      runId,
+      phaseName,
+      subagentSessionName,
+      model: effectiveModel,
+    });
+
+    try {
+      const { result, attempts } = await spawnAgentWithFallback({
+        model: effectiveModel,
+        tools: effectiveTools,
+        systemPrompt: effectiveSystemPrompt,
+        task: params.task,
+        sessionName: subagentSessionName,
+        cwd: effectiveCwd,
+        signal,
+        cooldownStore: modelCooldown,
+        enabled: modelFallbackEnabled,
+      });
+      const spawnedResult = withFallbackNote(result, attempts);
+
+      const gateResult = await runQualityGate(
+        agent,
+        spawnedResult,
+        { task: params.task, cwd: effectiveCwd },
+        state.workflowType,
+        phaseName,
+        signal,
+        effectiveModel,
+        effectiveTools,
+        subagentSessionName,
+      );
+      // Use the retried result if available, otherwise use the original result
+      const finalResult = gateResult ?? spawnedResult;
+      captureUserGuideContent(phaseName, finalResult, state);
+      return { ok: true, result: finalResult };
+    } catch (err) {
+      return { ok: false, result: agentFailureResult(err) };
+    }
+  }
+
+  /** Persist the completed phase list (best-effort, after a phase succeeds). */
+  function persistCompletedPhases(options: { cwd: string; completedPhaseNames: string[] }): void {
+    const saveResult = saveCompletedPhases({
+      cwd: options.cwd,
+      completedPhaseNames: options.completedPhaseNames,
+    });
+    if (!saveResult.ok) {
+      console.warn(`[belayd-harness] failed to persist completed phases: ${saveResult.error}`);
+    }
+  }
+
+  /** Mark a completed/failed phase run in its manifest. */
+  function persistRunStatus(options: {
+    state: SessionState;
+    manifestCwd: string;
+    runId: string;
+    status: "completed" | "failed";
+    exitCode: number;
+  }): void {
+    if (!options.state.gateActive || options.state.currentTaskId === "") return;
+    const statusResult = setRunStatus({
+      cwd: options.manifestCwd,
+      runId: options.runId,
+      status: options.status,
+      exitCode: options.exitCode,
+    });
+    if (!statusResult.ok) {
+      console.warn(`[belayd-harness] failed to update run manifest: ${statusResult.error}`);
+    }
+    if (options.status === "completed") {
+      // The in-memory phase list is marked at tool_call time, but disk only
+      // records a phase once its run actually completed — this is what makes
+      // resume re-run an interrupted phase. Never persist on "failed".
+      persistCompletedPhases({
+        cwd: options.manifestCwd,
+        completedPhaseNames: options.state.completedPhaseNames,
+      });
+    }
+  }
+
   // ── Register agent tools ────────────────────────────────────────────
   for (const agent of DEFAULT_AGENTS) {
     if (agent.name === "belayd-committer") continue;
@@ -852,51 +1036,28 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         cwd: Type.Optional(Type.String({ description: "Working directory" })),
       }),
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        try {
-          const state = getSessionState(ctx);
-          const effectiveCwd = params.cwd ?? (ctx as { cwd?: string })?.cwd;
-          const overrides =
-            WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
-          const effectiveModel = overrides?.model ?? agent.model;
-          const effectiveTools = overrides?.tools ?? agent.tools;
-          const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
-          const subagentSessionName = computeSubagentSessionName(
-            state.currentTaskId,
-            phaseName,
-            generateShortRunId(),
-          );
-          const { result, attempts } = await spawnAgentWithFallback({
-            model: effectiveModel,
-            tools: effectiveTools,
-            systemPrompt: effectiveSystemPrompt,
-            task: params.task,
-            sessionName: subagentSessionName,
-            cwd: effectiveCwd,
-            signal,
-            cooldownStore: modelCooldown,
-            enabled: modelFallbackEnabled,
-          });
-          const spawnedResult = withFallbackNote(result, attempts);
-
-          const gateResult = await runQualityGate(
-            agent,
-            spawnedResult,
-            { task: params.task, cwd: effectiveCwd },
-            state.workflowType,
-            phaseName,
-            signal,
-            effectiveModel,
-            effectiveTools,
-            subagentSessionName,
-          );
-          // Use the retried result if available, otherwise use the original result
-          const finalResult = gateResult ?? spawnedResult;
-          captureUserGuideContent(phaseName, finalResult, state);
-
-          return finalResult;
-        } catch (err) {
-          return agentFailureResult(err);
-        }
+        const state = getSessionState(ctx);
+        const ctxWithCwd = ctx as PhaseToolContext;
+        const effectiveCwd = params.cwd ?? ctxWithCwd.cwd;
+        const manifestCwd = effectiveCwd ?? ctxWithCwd.cwd ?? process.cwd();
+        const runId = generateShortRunId();
+        const outcome = await runPhaseAgent(
+          agent,
+          phaseName,
+          params,
+          signal,
+          state,
+          effectiveCwd,
+          runId,
+        );
+        persistRunStatus({
+          state,
+          manifestCwd,
+          runId,
+          status: outcome.ok && outcome.result.details.exitCode === 0 ? "completed" : "failed",
+          exitCode: outcome.ok ? outcome.result.details.exitCode : 1,
+        });
+        return outcome.result;
       },
     });
   }
@@ -973,13 +1134,30 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!isValidTaskId(params.taskId)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid task id: ${params.taskId}. Expected bd-NN or bd-NN.N.`,
+            },
+          ],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+
       const metadata = await readTaskMetadata(params.taskId);
       const workflowType = resolveWorkflowType(
         params.workflowType,
         metadata?.labels,
         metadata?.title,
       );
-      const state = activateGate(ctx, params.taskId, workflowType);
+      const state = activateGate({
+        ctx,
+        taskId: params.taskId,
+        workflowType,
+        cwd: ctx.cwd ?? process.cwd(),
+      });
       return {
         content: [
           {
@@ -1006,10 +1184,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       const state = getSessionState(ctx);
 
       // Restore original cwd if we're in a worktree
-      const taskFile = readBelaydTaskFile(ctx.cwd);
-      if (taskFile) {
-        process.chdir(taskFile.originalCwd);
-        deleteBelaydTaskFile(ctx.cwd);
+      const persisted = readWorkflowState({ cwd: ctx.cwd });
+      if (persisted) {
+        process.chdir(persisted.originalCwd);
+        clearWorkflowState({ cwd: ctx.cwd });
       }
 
       state.gateActive = false;
@@ -1183,6 +1361,74 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
+  /** Record the commit phase's "running" manifest, returning whether the gate owns the run. */
+  function startCommitRunManifest(options: {
+    state: SessionState;
+    cwd: string;
+    runId: string;
+  }): boolean {
+    if (!options.state.gateActive || options.state.currentTaskId === "") return false;
+    const writeResult = writeRunManifest({
+      cwd: options.cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: options.runId,
+        taskId: options.state.currentTaskId,
+        phase: "commit",
+        sessionName: computeSubagentSessionName(
+          options.state.currentTaskId,
+          "commit",
+          options.runId,
+        ),
+        status: "running",
+        startedAt: Date.now(),
+      },
+    });
+    if (!writeResult.ok) {
+      console.warn(`[belayd-harness] failed to persist commit run manifest: ${writeResult.error}`);
+    }
+    return true;
+  }
+
+  /** Mark the commit run finished and, on success, persist the completed phases. */
+  function finalizeCommitRun(options: {
+    state: SessionState;
+    cwd: string;
+    runId: string;
+    status: "completed" | "failed";
+    gateCommit: boolean;
+  }): void {
+    if (!options.gateCommit) return;
+    markCommitRunStatus({
+      cwd: options.cwd,
+      runId: options.runId,
+      status: options.status,
+    });
+    if (options.status === "completed") {
+      persistCompletedPhases({
+        cwd: options.cwd,
+        completedPhaseNames: options.state.completedPhaseNames,
+      });
+    }
+  }
+
+  /** Mark a commit phase run's manifest status (best-effort). */
+  function markCommitRunStatus(options: {
+    cwd: string;
+    runId: string;
+    status: "completed" | "failed";
+  }): void {
+    const statusResult = setRunStatus({
+      cwd: options.cwd,
+      runId: options.runId,
+      status: options.status,
+      exitCode: options.status === "completed" ? 0 : 1,
+    });
+    if (!statusResult.ok) {
+      console.warn(`[belayd-harness] failed to update commit run manifest: ${statusResult.error}`);
+    }
+  }
+
   // ── Register commit tool ────────────────────────────────────────────
   pi.registerTool({
     name: "belayd_commit",
@@ -1211,21 +1457,23 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const execAsync = promisify(exec);
       const cwd = ctx?.cwd ?? process.cwd();
+      const state = getSessionState(ctx);
+      const runId = generateShortRunId();
+      const gateCommit = startCommitRunManifest({ state, cwd, runId });
 
       // Flag the issue for human review (agents never close — human closes on wt merge).
       // Done before staging so the JSONL export (export.auto + git-add) is committed.
       if (params.taskId) {
         await flagForHumanReview(execAsync, params.taskId, cwd);
-      }
-
-      // Append user guide content to task notes if available
-      const state = getSessionState(ctx);
-      if (params.taskId && state.userGuideContent && state.phaseOrder.includes("userguide")) {
-        await appendUserGuideNote(execAsync, params.taskId, state.userGuideContent, cwd);
+        // Append user guide content to task notes if available
+        if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
+          await appendUserGuideNote(execAsync, params.taskId, state.userGuideContent, cwd);
+        }
       }
 
       const stageError = await _stageChanges(execAsync, cwd, params.files);
       if (stageError) {
+        finalizeCommitRun({ state, cwd, runId, gateCommit, status: "failed" });
         return commitFailure(stageError);
       }
 
@@ -1233,9 +1481,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const commitResult = await _runCommit(execAsync, fullMessage, cwd);
       if (typeof commitResult === "string") {
+        finalizeCommitRun({ state, cwd, runId, gateCommit, status: "failed" });
         const feedback = await extractCommitFeedback(commitResult, ctx);
         return commitFailure(feedback, commitResult);
       }
+
+      finalizeCommitRun({ state, cwd, runId, gateCommit, status: "completed" });
 
       return {
         content: [{ type: "text" as const, text: `Committed as ${commitResult.hash}` }],
@@ -1279,6 +1530,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         state.completedPhaseNames,
         state.phaseOrder,
       );
+      // Phases are persisted in persistRunStatus / the commit tool only AFTER
+      // the phase actually succeeds, so a mid-phase crash re-runs the phase
+      // instead of skipping lost work.
     }
 
     return {};
@@ -1303,6 +1557,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       // Compact completed phase sessions before resetting state
       await compactTaskSessions(currentTaskId, currentCompleted);
+
+      // Workflow complete: the persisted state file is no longer needed.
+      clearWorkflowState({ cwd: ctx.cwd });
 
       state.gateActive = false;
       state.completedPhaseNames = [];

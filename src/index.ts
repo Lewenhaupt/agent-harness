@@ -72,6 +72,16 @@ export {
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   parseQuotaResetSeconds,
 } from "./quota-failure.js";
+export type { RunManifest, RunStatus } from "./run-manifest.js";
+export {
+  listRuns,
+  readRunManifest,
+  runManifestPath,
+  runsDir,
+  scanForInterruptedRuns,
+  setRunStatus,
+  writeRunManifest,
+} from "./run-manifest.js";
 export {
   computeOrchestratorSessionName,
   computeSubagentSessionName,
@@ -102,5 +112,15 @@ export {
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";
+export type { WorkflowFs, WorkflowState } from "./workflow-state.js";
+export {
+  clearWorkflowState,
+  legacyTaskFilePath,
+  readWorkflowState,
+  saveCompletedPhases,
+  workflowStateDir,
+  workflowStateFilePath,
+  writeWorkflowState,
+} from "./workflow-state.js";
 export type { WorktreeOptions } from "./worktree.js";
 export { isInsideWorktreeForBranch, resolveWorktreePath, setupWorktree } from "./worktree.js";
