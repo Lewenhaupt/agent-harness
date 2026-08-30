@@ -1,0 +1,12 @@
+{
+  "name": "pi-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "@plannotator/pi-extension": "^0.26.8",
+    "@robhowley/pi-openrouter": "^0.13.0",
+    "pi-ast-grep": "^0.1.0",
+    "pi-exa": "^0.6.1",
+    "pi-vision-tool": "^1.3.7"
+  }
+}
