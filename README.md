@@ -80,13 +80,13 @@ the global settings. Only *running* pi in this repo is isolated, and only
 there do you need to add an explicit `-e npm:<pkg>` line to `bin/pi` for a
 third-party extension.
 
-Custom providers without an extension — for example LLM Gateway, see the
-official [pi integration guide](https://docs.llmgateway.io/guides/pi) — are
-configured in `~/.pi/agent/models.json` (a `providers` map). These load
-regardless of `-ne`, so they also work in this repo's wrapper and spawned
-agents with zero repo changes. For DevPass plans, use canonical model ids
-without a provider prefix (`claude-sonnet-4-5`, not
-`anthropic/claude-sonnet-4-5`): provider-pinned ids are rejected (403).
+Custom providers without an extension — for example LLM Gateway — are
+configured in `~/.pi/agent/models.json`. These load regardless of `-ne`, so
+they also work in this repo's wrapper and spawned agents with zero repo
+changes. For DevPass plans, use canonical model ids without a provider prefix
+(`claude-sonnet-4-5`, not `anthropic/claude-sonnet-4-5`): provider-pinned ids
+are rejected (403). LLM Gateway's model list is refreshed from the live API
+with `scripts/refresh-llmgateway-models.sh` — see `docs/llmgateway.md`.
 
 ## Local services
 
