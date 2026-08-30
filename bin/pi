@@ -39,13 +39,13 @@ esac
 
 # Run mode: -ne disables all extension discovery (global dirs AND settings
 # packages), then the repo-local extensions are re-added explicitly with -e.
-# Third-party npm packages are re-added the same way; their extraction dir is
-# cached under the pi config dir, so reruns do not hit the network. Note the
-# run-mode flags are all placed BEFORE the user args on purpose: pi treats the
-# first positional as the prompt, so the user's prompt/args must stay last.
+# Third-party npm extensions need a matching -e npm:<pkg> line here; note
+# that -ne does NOT affect models.json custom providers (e.g. LLM Gateway via
+# ~/.pi/agent/models.json) — those load regardless of extension discovery.
+# The run-mode flags are all placed BEFORE the user args on purpose: pi treats
+# the first positional as the prompt, so the user's prompt/args must stay last.
 exec "$real_pi" -ne \
   -e "$repo_dir/extensions/index.ts" \
   -e "$repo_dir/extensions/stale-file-guard.ts" \
   -e "$repo_dir/extensions/worktree-guard.ts" \
-  -e npm:@mcowger/pi-llmgateway \
   "$@"
