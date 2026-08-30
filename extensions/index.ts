@@ -48,6 +48,7 @@ import {
   resolveWorkflowType,
   setupWorktree,
   spawnAgentWithFallback,
+  validateBdCommand,
   WORKFLOW_REGISTRY,
 } from "../src/index.js";
 import { createModelCooldownStore } from "../src/model-cooldown.js";
@@ -104,6 +105,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     ...ALL_PHASE_TOOLS,
     "belayd_start_task",
     "belayd_stop_task",
+    "bd",
     "read",
     "grep",
     "find",
@@ -194,13 +196,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       lines.push(
         "",
         "**Before `belayd_commit`:**",
-        "- Create follow-up implementation tasks using `bd create` for any action items uncovered.",
+        '- Create follow-up implementation tasks with the `bd` tool (e.g. `bd create --title="..." --type=task`) for any action items uncovered.',
       );
     }
 
     lines.push("", "**After workflow completion:**");
     lines.push(
-      `- Flag this task for human review (NEVER close it yourself): \`bd label add ${taskId} human\``,
+      `- Flag this task for human review (NEVER close it yourself): pass \`taskId\` to \`belayd_commit\`, or run \`bd update ${taskId} --status in_progress --add-label human\` with the \`bd\` tool.`,
     );
 
     sender.sendMessage(
@@ -703,6 +705,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "Editing and writing tools are DISABLED. You MUST delegate ALL code changes to the phase tools:",
           ...phaseLines,
           "",
+          "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
+          "",
           `Next required step: call \`${getPhaseToolName(remaining)}\``,
         ].join("\n"),
         display: false,
@@ -802,6 +806,62 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       },
     });
   }
+
+  // ── Register bd (beads) tool ─────────────────────────────────────────
+  // The gate disables bash so editing tools can't be abused, but task
+  // tracking still needs the bd CLI. This tool proxies bd through a safe
+  // subcommand allowlist so the orchestrator can manage beads without raw
+  // shell access. It is included in GATED_TOOLS, so it stays available while
+  // the gate is active.
+  pi.registerTool({
+    name: "bd",
+    label: "Beads task tracker",
+    description:
+      "Run a beads (bd) CLI command for task tracking. Restricted to safe " +
+      "subcommands (create, update, label, note, show, search, list, ready, " +
+      "prime, remember, and similar). Cannot close, delete, or edit issues.",
+    parameters: Type.Object({
+      command: Type.String({
+        description:
+          'Full bd command including subcommand and flags, e.g. "create --title=\\"Fix login\\" --type=bug" or "list --status=open"',
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const validation = validateBdCommand(params.command);
+      if (!validation.ok) {
+        return {
+          content: [{ type: "text" as const, text: validation.error }],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+
+      const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
+      const execAsync = promisify(exec);
+      try {
+        const { stdout, stderr } = await execAsync(`bd ${params.command}`, {
+          cwd,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        });
+        const text = stdout.trim() || stderr.trim() || "(no output)";
+        return {
+          content: [{ type: "text" as const, text }],
+          details: {
+            messages: [],
+            usage: emptyUsage(),
+            exitCode: 0,
+            ...(stderr.trim() ? { stderr: stderr.trim() } : {}),
+          },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `bd command failed: ${message}` }],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+    },
+  });
 
   // ── Register start-task tool ────────────────────────────────────────
   pi.registerTool({

@@ -53,6 +53,13 @@ bd update <id> --claim
 bd create "Short title" --description="Why this exists and what needs to be done" --type=task --priority=2
 ```
 
+Create follow-up work as a separate top-level bead, never as a subtask. If the new work is related to the current bead, link it afterward instead:
+
+```bash
+bd link <current-id> <new-id>          # new-id blocks current-id
+bd link <current-id> <new-id> --type related
+```
+
 5. Close completed work:
 
 ```bash
@@ -78,3 +85,4 @@ Use agent-local planning tools only for the current turn's execution checklist. 
 - Prefer `--json` when parsing `bd` output programmatically.
 - If hooks are installed, `bd prime` may already be injected. Run it manually when context is missing.
 - Do not auto-close or mutate tasks unless the work is actually complete.
+- Do not create subtasks: no `bd create ... --parent <id>` and no `parent-child` links. Subtasks keep the parent open and block closing it, which breaks the merge = close workflow. Model hierarchy as separate top-level beads plus `bd dep` / `bd link` (blocks or related) dependencies instead.

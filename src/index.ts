@@ -20,6 +20,8 @@ export {
   getAgentByShortName,
   getPhaseToolName,
 } from "./agent-registry.js";
+export type { BdCommandValidation } from "./bd-command.js";
+export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
 export type { ModelClass } from "./model-classes.js";
 // Model classes & quota-fallback routing
 export {
