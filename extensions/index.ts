@@ -47,15 +47,17 @@ import {
   resolveQualityGate,
   resolveWorkflowType,
   setupWorktree,
-  spawnAgentProcess,
+  spawnAgentWithFallback,
   WORKFLOW_REGISTRY,
 } from "../src/index.js";
+import { createModelCooldownStore } from "../src/model-cooldown.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
   computeOrchestratorSessionName,
   computeSubagentSessionName,
   generateShortRunId,
 } from "../src/session-naming.js";
+import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
 
 // ── Process gate state ─────────────────────────────────────────────────
 type SessionState = {
@@ -70,6 +72,12 @@ type SessionState = {
 };
 
 const sessionStates = new Map<string, SessionState>();
+
+// Shared per-orchestrator model cooldown store: when a model hits a quota/rate
+// limit, subsequent spawns in this session skip it until the cooldown lapses.
+// Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
+const modelCooldown = createModelCooldownStore();
+const modelFallbackEnabled = process.env.BELAYD_MODEL_FALLBACK !== "0";
 
 function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }): SessionState {
   const id = ctx.sessionManager.getSessionId();
@@ -228,6 +236,21 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
+  /** Surface a model fallback (if any) as a trailing note on the agent result. */
+  function withFallbackNote(result: SpawnResult, attempts: SpawnAttempt[]): SpawnResult {
+    if (attempts.length <= 1) return result;
+    const trail = attempts
+      .map((a) => `${a.model} (${a.skippedCooldown ? "cooldown" : a.classification.kind})`)
+      .join(" → ");
+    const existingContent = result.content?.[0]?.text ?? "";
+    return {
+      ...result,
+      content: [
+        { type: "text" as const, text: `${existingContent}\n\n[belayd model fallback] ${trail}` },
+      ],
+    };
+  }
+
   /** Spawn a single fix-up attempt for a failed quality gate. */
   function spawnGateRetry(
     agent: AgentDefinition,
@@ -241,7 +264,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       attempt: number;
     },
   ): Promise<SpawnResult> {
-    return spawnAgentProcess({
+    return spawnAgentWithFallback({
       model: options.model ?? agent.model,
       tools: options.tools ?? agent.tools,
       systemPrompt: agent.systemPrompt,
@@ -251,7 +274,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       sessionName: options.sessionName
         ? `${options.sessionName}-retry-${options.attempt}`
         : undefined,
-    });
+      cooldownStore: modelCooldown,
+      enabled: modelFallbackEnabled,
+    }).then((r) => r.result);
   }
 
   /** Run a quality gate over a result, normalizing the feedback text. */
@@ -742,7 +767,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
             phaseName,
             generateShortRunId(),
           );
-          const result = await spawnAgentProcess({
+          const { result, attempts } = await spawnAgentWithFallback({
             model: effectiveModel,
             tools: effectiveTools,
             systemPrompt: agent.systemPrompt,
@@ -750,11 +775,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
             sessionName: subagentSessionName,
             cwd: effectiveCwd,
             signal,
+            cooldownStore: modelCooldown,
+            enabled: modelFallbackEnabled,
           });
+          const spawnedResult = withFallbackNote(result, attempts);
 
           const gateResult = await runQualityGate(
             agent,
-            result,
+            spawnedResult,
             params,
             state.workflowType,
             phaseName,
@@ -764,7 +792,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
             subagentSessionName,
           );
           // Use the retried result if available, otherwise use the original result
-          const finalResult = gateResult ?? result;
+          const finalResult = gateResult ?? spawnedResult;
           captureUserGuideContent(phaseName, finalResult, state);
 
           return finalResult;
