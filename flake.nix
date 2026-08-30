@@ -5,6 +5,7 @@
   inputs.backlog-md.url = "github:MrLesk/Backlog.md";
   inputs.beads.url = "github:gastownhall/beads";
   inputs.llm-agents.url = "github:numtide/llm-agents.nix";
+  inputs.pi-nix.url = "github:lukasl-dev/pi.nix";
 
   outputs =
     {
@@ -15,6 +16,7 @@
       backlog-md,
       beads,
       llm-agents,
+      pi-nix,
       ...
     }:
     {
@@ -292,10 +294,9 @@
           pathsToLink = [ "/bin" ];
         };
 
-        # pi — the pi coding agent CLI. Exposed so the NixOS config can install
-        # it system-wide: the harness's spawnAgentProcess resolves
-        # /run/current-system/sw/bin/pi first, and pi-web sessions expect `pi`.
-        pi = llm-agents.packages.${system}.pi;
+        # pi — the pi coding agent CLI, unconfigured (bare). Kept as the base
+        # binary for the configured wrapper below and as an escape hatch.
+        pi-bare = llm-agents.packages.${system}.pi;
 
         # The harness's agent skills (.agents/skills). Linked into
         # ~/.agents/skills/ by the NixOS config so pi discovers them globally.
@@ -312,6 +313,65 @@
           cp -r ${./extensions}/. "$out/extensions/"
           cp -r ${./src}/. "$out/src/"
         '';
+
+        # Third-party pi npm extensions (exa web search, ast-grep, vision,
+        # plannotator, OpenRouter provider). Packaged as a Nix node_modules tree
+        # so pi never needs a runtime `npm install` into ~/.pi/agent/npm. Each
+        # package's `pi.extensions` entry is passed via --extension below.
+        pi-extensions = pkgs.buildNpmPackage {
+          pname = "pi-extensions";
+          version = "0.1.0";
+          src = ./nix/pi-extensions;
+          npmDepsHash = "sha256-sicP/7UKlZqFj8VaNKaj/VsRJWHvcm/TpG/HQe9lfr8=";
+          npmDepsFetcherVersion = 2;
+          npmFlags = [ "--legacy-peer-deps" ];
+          dontNpmBuild = true;
+        };
+
+        # pi configured via pi.nix's mkCodingAgent: harness + npm extensions,
+        # skills, and the LLM Gateway models all baked into one binary. The only
+        # global pi state left is ~/.pi/agent/auth.json (credentials), plus
+        # sessions and the wrapper-managed models.json/settings.json.
+        belayd-pi = pi-nix.lib.mkCodingAgent {
+          inherit pkgs;
+          modules = [{
+            pi.coding-agent = {
+              # Keep the llm-agents pi build as the base binary; pi.nix only
+              # supplies the wrapper-generation logic here (no pi.cachix.org).
+              package = pi-bare;
+              extensions = [
+                "${belayd-harness}/extensions/index.ts"
+                "${belayd-harness}/extensions/stale-file-guard.ts"
+                "${belayd-harness}/extensions/worktree-guard.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-exa/src/index.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-ast-grep/src/index.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-vision-tool/extensions/vision-tool.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@plannotator/pi-extension/index.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@robhowley/pi-openrouter/extensions/openrouter/index.ts"
+              ];
+              skills = [ belayd-skills ];
+              models = ./models.json;
+              settings = {
+                defaultProvider = "llmgateway";
+                defaultModel = "deepseek-v4-pro";
+                defaultThinkingLevel = "high";
+                theme = "dark";
+              };
+              # -ne disables ALL extension auto-discovery (global dirs, the
+              # settings `extensions`/`packages` arrays, and project
+              # .pi/settings.json), so the only extensions that load are the
+              # explicit --extension flags above. This is the same trick as
+              # bin/pi: it makes the binary self-contained and immune to
+              # leftover global config double-loading the same tools.
+              extraArgs = [ "-ne" ];
+            };
+          }];
+        };
+
+        # The configured pi binary, exposed as `pi` so nix-tmp and the NixOS
+        # config keep installing `belaydPkgs.pi` unchanged, and so
+        # `nix run .#pi --` / `nix run <flake>#pi --` just works.
+        pi = belayd-pi.package;
 
         # dockerTools.buildLayeredImage inherits `isExe = true` from its inner
         # streamLayeredImage even though its output is a plain tarball. Arion
@@ -360,7 +420,15 @@
       in
       {
         packages = {
-          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi belayd-skills belayd-harness;
+          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions belayd-pi belayd-skills belayd-harness;
+        };
+
+        # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`
+        # fragment needed) launches the configured pi. This also makes the
+        # `npi` shell abbreviation trivial and avoids `#` quoting issues.
+        apps.default = {
+          type = "app";
+          program = "${pi}/bin/pi";
         };
 
         devShells.default = pkgs.mkShell {
