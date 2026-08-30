@@ -9,23 +9,33 @@
 
 import * as nodeFs from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
 
 import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
-export type RunStatus = "running" | "completed" | "failed" | "interrupted";
-
-export interface RunManifest {
-  schemaVersion: 1;
-  runId: string;
-  taskId: string;
-  phase: string;
-  sessionName: string;
-  status: RunStatus;
-  startedAt: number;
-  completedAt?: number;
-  exitCode?: number;
-  model?: string;
+export enum RunStatus {
+  Running = "running",
+  Completed = "completed",
+  Failed = "failed",
+  Interrupted = "interrupted",
 }
+
+const SCHEMA_VERSION = 1;
+
+const RunManifestSchema = z.object({
+  schemaVersion: z.literal(SCHEMA_VERSION),
+  runId: z.string(),
+  taskId: z.string(),
+  phase: z.string(),
+  sessionName: z.string(),
+  status: z.nativeEnum(RunStatus),
+  startedAt: z.number().finite(),
+  completedAt: z.number().finite().optional(),
+  exitCode: z.number().finite().optional(),
+  model: z.string().optional(),
+});
+
+export type RunManifest = z.infer<typeof RunManifestSchema>;
 
 /** Workflow fs seam plus the directory listing that run manifests need. */
 export interface RunManifestFs extends WorkflowFs {
@@ -64,9 +74,6 @@ export interface ScanForInterruptedRunsOptions {
   now?: () => number;
 }
 
-const SCHEMA_VERSION = 1;
-const RUN_STATUSES: readonly RunStatus[] = ["running", "completed", "failed", "interrupted"];
-
 const nodeFsSeam: RunManifestFs = {
   existsSync: (path) => nodeFs.existsSync(path),
   readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
@@ -77,14 +84,6 @@ const nodeFsSeam: RunManifestFs = {
   readdirSync: (path) => nodeFs.readdirSync(path),
 };
 
-function isRunStatus(value: unknown): value is RunStatus {
-  return typeof value === "string" && (RUN_STATUSES as readonly string[]).includes(value);
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
 export function runsDir(cwd: string): string {
   return join(cwd, ".belayd", "runs");
 }
@@ -93,61 +92,10 @@ export function runManifestPath(cwd: string, runId: string): string {
   return join(runsDir(cwd), `${runId}.json`);
 }
 
-interface RunManifestCore {
-  runId: string;
-  taskId: string;
-  phase: string;
-  sessionName: string;
-  status: RunStatus;
-  startedAt: number;
-}
-
-/** Narrow the fields every run manifest requires; wrong type → undefined. */
-function parseRunManifestCore(record: Record<string, unknown>): RunManifestCore | undefined {
-  if (typeof record.runId !== "string") return undefined;
-  if (typeof record.taskId !== "string") return undefined;
-  if (typeof record.phase !== "string") return undefined;
-  if (typeof record.sessionName !== "string") return undefined;
-  if (!isRunStatus(record.status)) return undefined;
-  if (!isFiniteNumber(record.startedAt)) return undefined;
-  return {
-    runId: record.runId,
-    taskId: record.taskId,
-    phase: record.phase,
-    sessionName: record.sessionName,
-    status: record.status,
-    startedAt: record.startedAt,
-  };
-}
-
-/** Narrow a run manifest's optional fields, returning undefined on wrong types. */
-function parseOptionalFields(record: Record<string, unknown>):
-  | {
-      completedAt?: number;
-      exitCode?: number;
-      model?: string;
-    }
-  | undefined {
-  if (record.completedAt !== undefined && !isFiniteNumber(record.completedAt)) return undefined;
-  if (record.exitCode !== undefined && !isFiniteNumber(record.exitCode)) return undefined;
-  if (record.model !== undefined && typeof record.model !== "string") return undefined;
-  return {
-    ...(record.completedAt !== undefined ? { completedAt: record.completedAt } : {}),
-    ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
-    ...(record.model !== undefined ? { model: record.model } : {}),
-  };
-}
-
 /** Parse and strictly narrow a run manifest; corrupt/wrong version → undefined. */
 export function parseRunManifest(raw: unknown): RunManifest | undefined {
-  if (typeof raw !== "object" || raw === null) return undefined;
-  const record = raw as Record<string, unknown>;
-  if (record.schemaVersion !== SCHEMA_VERSION) return undefined;
-  const core = parseRunManifestCore(record);
-  if (core === undefined) return undefined;
-  const optional = parseOptionalFields(record);
-  if (optional === undefined) return undefined;
-  return { schemaVersion: 1, ...core, ...optional };
+  const result = RunManifestSchema.safeParse(raw);
+  return result.success ? result.data : undefined;
 }
 
 export function writeRunManifest(
@@ -179,7 +127,11 @@ export function readRunManifest(options: ReadRunManifestOptions): RunManifest | 
 }
 
 function terminalStatus(status: RunStatus): boolean {
-  return status === "completed" || status === "failed" || status === "interrupted";
+  return (
+    status === RunStatus.Completed ||
+    status === RunStatus.Failed ||
+    status === RunStatus.Interrupted
+  );
 }
 
 /**
@@ -237,17 +189,17 @@ export function scanForInterruptedRuns(options: ScanForInterruptedRunsOptions): 
   const now = options.now ?? Date.now;
   const interrupted: RunManifest[] = [];
   for (const run of listRuns({ cwd: options.cwd, fs })) {
-    if (run.status !== "running") continue;
+    if (run.status !== RunStatus.Running) continue;
     const completedAt = now();
     const result = setRunStatus({
       cwd: options.cwd,
       runId: run.runId,
-      status: "interrupted",
+      status: RunStatus.Interrupted,
       fs,
       now,
     });
     if (result.ok) {
-      interrupted.push({ ...run, status: "interrupted", completedAt });
+      interrupted.push({ ...run, status: RunStatus.Interrupted, completedAt });
     }
   }
   return interrupted;
