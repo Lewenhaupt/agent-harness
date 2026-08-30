@@ -52,7 +52,7 @@ import {
   validateBdCommand,
   WORKFLOW_REGISTRY,
 } from "../src/index.js";
-import { createModelCooldownStore } from "../src/model-cooldown.js";
+import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
   computeOrchestratorSessionName,
@@ -77,8 +77,9 @@ const sessionStates = new Map<string, SessionState>();
 
 // Shared per-orchestrator model cooldown store: when a model hits a quota/rate
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
+// Persisted to disk so cooldowns survive orchestrator restarts.
 // Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
-const modelCooldown = createModelCooldownStore();
+const modelCooldown = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
 const modelFallbackEnabled = process.env.BELAYD_MODEL_FALLBACK !== "0";
 
 function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }): SessionState {

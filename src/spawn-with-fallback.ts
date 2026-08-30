@@ -124,27 +124,41 @@ interface LoopDeps {
 }
 
 /** A candidate to record in `attempts` without spawning, or undefined to spawn it. */
-function skipCandidate(
-  candidate: string,
-  store: ModelCooldownStore,
-  exhaustedProviders: ReadonlySet<string>,
-): SpawnAttempt | undefined {
-  if (store.isCoolingDown(candidate)) {
-    return {
-      model: candidate,
-      classification: skippedClassification(candidate),
-      skippedCooldown: true,
-    };
-  }
-  const provider = providerOf(candidate);
-  if (provider !== "" && exhaustedProviders.has(provider)) {
+function skipCandidate(candidate: string, store: ModelCooldownStore): SpawnAttempt | undefined {
+  const scope = store.cooldownScope(candidate);
+  if (scope === "provider") {
+    const provider = providerOf(candidate);
     return {
       model: candidate,
       classification: skippedProviderClassification(provider),
       skippedProvider: provider,
     };
   }
+  if (scope === "model") {
+    return {
+      model: candidate,
+      classification: skippedClassification(candidate),
+      skippedCooldown: true,
+    };
+  }
   return undefined;
+}
+
+/** Record a cooldown: provider-scoped for quota, endpoint-scoped otherwise. */
+function recordCooldown(
+  store: ModelCooldownStore,
+  candidate: string,
+  provider: string,
+  classification: FailureClassification,
+): void {
+  if (classification.cooldownSeconds === undefined) return;
+  const seconds = classification.cooldownSeconds;
+  const reason = classification.reason ?? classification.kind;
+  if (classification.kind === "quota" && provider !== "") {
+    store.markProviderCooldown(provider, seconds, reason);
+  } else {
+    store.markCooldown(candidate, seconds, reason);
+  }
 }
 
 /** Try candidates in order, cooling down quota/transient failures as it goes. */
@@ -152,16 +166,12 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
   const attempts: SpawnAttempt[] = [];
   let lastResult: SpawnResult | undefined;
   let totalUsage: SpawnUsage = zeroUsage();
-  // Quota failures are provider-scoped: once a provider returns 402/429, every
-  // remaining model on that provider is dead until reset, so skip them instead
-  // of burning a spawn on the same exhausted quota bucket.
-  const exhaustedProviders = new Set<string>();
 
   for (const [index, candidate] of deps.candidates.entries()) {
     if (deps.signal?.aborted) break;
 
     deps.store.prune();
-    const skip = skipCandidate(candidate, deps.store, exhaustedProviders);
+    const skip = skipCandidate(candidate, deps.store);
     if (skip) {
       attempts.push(skip);
       continue;
@@ -175,17 +185,7 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
 
     if (outcome.stop) return { result: withUsage(outcome.result, totalUsage), attempts };
 
-    if (outcome.classification.kind === "quota" && provider !== "") {
-      exhaustedProviders.add(provider);
-    }
-
-    if (outcome.classification.cooldownSeconds !== undefined) {
-      deps.store.markCooldown(
-        candidate,
-        outcome.classification.cooldownSeconds,
-        outcome.classification.reason ?? outcome.classification.kind,
-      );
-    }
+    recordCooldown(deps.store, candidate, provider, outcome.classification);
   }
 
   return {

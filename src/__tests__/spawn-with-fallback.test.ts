@@ -36,16 +36,14 @@ function seqClassifier(...kinds: FailureClassification["kind"][]): typeof classi
   const queue = [...kinds];
   return () => {
     const kind = queue.shift() ?? "success";
-    return kind === "success"
-      ? { kind }
-      : kind === "quota"
-        ? { kind, cooldownSeconds: 900 }
-        : { kind };
+    if (kind === "quota") return { kind, cooldownSeconds: 900 };
+    if (kind === "transient") return { kind, cooldownSeconds: 300 };
+    return { kind };
   };
 }
 
 describe("spawnAgentWithFallback", () => {
-  it("falls back to the next candidate on a quota failure and cools the failed model", async () => {
+  it("falls back to the next candidate on a quota failure and cools the failed provider", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"))
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
@@ -62,8 +60,30 @@ describe("spawnAgentWithFallback", () => {
 
     expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
     expect(attempts.map((a) => a.model)).toEqual(["opencode-go/mimo-v2.5", "llmgateway/mimo-v2.5"]);
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
+    // Quota is provider-scoped: the whole provider cools, not just the model.
+    expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("provider");
+    expect(store.isCoolingDown("opencode-go/deepseek-v4-pro")).toBe(true);
     expect(store.isCoolingDown("llmgateway/mimo-v2.5")).toBe(false);
+  });
+
+  it("cools only the endpoint on a transient failure, leaving the provider usable", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"))
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      classify: seqClassifier("transient", "success"),
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
+    expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("model");
+    expect(store.isCoolingDown("opencode-go/deepseek-v4-pro")).toBe(false);
   });
 
   it("stops immediately on an auth/other failure without trying more candidates", async () => {
