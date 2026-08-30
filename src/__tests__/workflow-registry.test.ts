@@ -75,6 +75,13 @@ describe("WORKFLOW_REGISTRY", () => {
   it("bugfix has optionalPhases including scout", () => {
     expect(WORKFLOW_REGISTRY.bugfix.optionalPhases).toContain("scout");
   });
+
+  it("research skips proof and overrides the plan agent to record a bead", () => {
+    expect(WORKFLOW_REGISTRY.research.phases).toEqual(["scout", "plan", "commit"]);
+    expect(WORKFLOW_REGISTRY.research.proofRequired).toBe(false);
+    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.systemPrompt).toBeDefined();
+    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bd");
+  });
 });
 
 describe("WORKFLOW_SUB_TYPES", () => {

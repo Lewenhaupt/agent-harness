@@ -62,6 +62,12 @@ export function bareModelId(model: string): string {
   return slash === -1 ? model : model.slice(slash + 1);
 }
 
+/** Provider prefix: "provider/model" → "provider", "model" → "". */
+export function providerOf(model: string): string {
+  const slash = model.indexOf("/");
+  return slash === -1 ? "" : model.slice(0, slash);
+}
+
 /** The class a model belongs to, or undefined if unknown. */
 export function modelClassOf(model: string): ModelClass | undefined {
   return MODEL_TO_CLASS[bareModelId(model)];
@@ -87,6 +93,22 @@ export function resolveModelCandidates(modelClass: ModelClass): string[] {
 export function candidatesForModel(model: string): string[] {
   const modelClass = modelClassOf(model);
   if (!modelClass) return [model];
+
+  const primaryBareId = bareModelId(model);
   const expanded = resolveModelCandidates(modelClass);
-  return [model, ...expanded.filter((candidate) => candidate !== model)];
+
+  // The class contract: the first failover hop is the SAME model id on the
+  // alternate provider (identical behavior, different quota bucket), not a
+  // different model on the same provider. `resolveModelCandidates` is
+  // model-major, so for a model that is not first in its class the same id can
+  // land after a same-provider model. Re-partition so same-id-alternate-provider
+  // candidates come first, then the remaining class candidates.
+  const sameModelAlternateProvider = expanded.filter(
+    (candidate) => candidate !== model && bareModelId(candidate) === primaryBareId,
+  );
+  const otherModels = expanded.filter(
+    (candidate) => candidate !== model && bareModelId(candidate) !== primaryBareId,
+  );
+
+  return [model, ...sameModelAlternateProvider, ...otherModels];
 }

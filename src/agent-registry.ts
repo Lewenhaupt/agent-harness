@@ -30,8 +30,20 @@ export interface GateResult {
   feedback?: string;
 }
 
+/** Options forwarded to quality gate functions. */
+export interface GateOptions {
+  /** Working directory for shell commands. */
+  cwd?: string;
+  /** Timeout in milliseconds for each check. */
+  timeoutInMs?: number;
+}
+
 /** Deterministic quality gate: takes the agent's output and returns pass/fail. */
-export type QualityGate = (output: string, details: SpawnDetails) => Promise<GateResult>;
+export type QualityGate = (
+  output: string,
+  details: SpawnDetails,
+  options?: GateOptions,
+) => Promise<GateResult>;
 
 /** Usage statistics from a spawned agent process. */
 export interface SpawnUsage {
@@ -126,6 +138,38 @@ Brief explanation of how the pieces connect.
 
 ## Start Here
 Which file to look at first and why.${SHARED_AGENT_GUIDANCE}`;
+
+export const RESEARCHER_SYSTEM_PROMPT = `You are a researcher. Investigate the research question thoroughly and produce an evidence-based answer grounded in the actual codebase, citing specific files and line ranges.
+
+Your deliverable is a bead, not a document:
+- Record your findings as a note on the task's bead using the \`bd\` tool, e.g. \`bd note <task-id> "..."\`.
+- Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
+- The task ID is provided in your instructions. If it is missing, discover the current task with \`bd ready\` or \`bd list --status=in_progress\`.
+
+Output format:
+
+## Findings
+The answer to the research question, with evidence (file paths + line ranges).
+
+## Recorded As
+The exact \`bd\` command(s) you ran to record the findings on the bead.${SHARED_AGENT_GUIDANCE}`;
+
+/**
+ * Tools for the research sub-agent: the planner's read/search tools plus
+ * \`bd\` so it can record findings directly as a bead note.
+ */
+export const RESEARCHER_TOOLS: string[] = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ast_grep",
+  "web_search_exa",
+  "web_fetch_exa",
+  "deep_search_exa",
+  "web_search_advanced_exa",
+  "bd",
+];
 
 const PLANNER_SYSTEM_PROMPT = `You are a senior software architect. Create a detailed implementation plan.
 
