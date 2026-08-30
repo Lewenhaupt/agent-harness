@@ -13,6 +13,9 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// Isolate the extension's persistent cooldown store from the real user file.
+process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
+
 // ── Mocks ──────────────────────────────────────────────────────────────
 
 // Shared with the hoisted mocks; the worktree path is created per-test.
@@ -125,6 +128,12 @@ function createMockPi(): {
     sendMessage: () => {},
     getActiveTools: () => [],
     setActiveTools: () => {},
+    // The harness factory probes `pi.events` to dedupe duplicate copies; a
+    // no-op bus makes the single mock the first (and only) registration.
+    events: {
+      emit: () => {},
+      on: () => () => {},
+    },
   } as unknown as ExtensionAPI;
 
   return { api, commands };

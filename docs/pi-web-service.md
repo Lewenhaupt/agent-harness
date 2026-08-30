@@ -56,6 +56,61 @@ Both units run as `user` with an explicit environment:
 `pi-web-sessiond.service`. The referenced `/nix/store` paths are part of the
 system closure, so they are GC-rooted automatically — no manual GC roots.
 
+## Extension loading: rebuild → restart
+
+pi-web sessions run **in-process** inside `pi-web-sessiond` — the daemon loads
+pi's extension modules once at startup and keeps that module graph for its
+whole lifetime. `nixos-rebuild switch` (or `home-manager switch`) only replaces
+files on disk; a running daemon keeps the old extensions until restarted. That
+includes the belayd harness (`~/.pi/agent/extensions/belayd-harness.ts` and its
+`src/` tree), so any change to `extensions/` or `src/` needs:
+
+```bash
+sudo systemctl restart pi-web pi-web-sessiond
+```
+
+before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
+wrapper is unaffected — it reloads extensions on every launch.)
+
+### How the belayd harness dedupes duplicate copies
+
+The harness ships in two places that can load together: globally
+(`~/.pi/agent/extensions/belayd-harness.ts`) and project-locally (a
+`.pi/settings.json` `packages` entry). Registering the same `belayd_*` tools
+twice is reported as `Tool "belayd_*" conflicts with ...`. Dedup must be scoped
+to a single load batch, not the whole process:
+
+- pi's extension factory cannot read registration state — `pi.getAllTools()`
+  and `pi.getCommands()` throw `"Extension runtime not initialized"` until
+  `Runner.bindCore()` runs *after* all extensions load.
+- The harness instead claims on the batch's shared event bus (`pi.events`):
+  the first copy leaves a probe listener and later copies in the same batch
+  detect it with a synchronous emit. Separate batches (the provider-bootstrap
+  pass and each session) get fresh buses, so each session registers again.
+
+A process-wide marker was tried and broke this: the daemon first runs a
+"provider bootstrap" pass (`global extension provider baseline bootstrapped and
+frozen` in the logs) with a scratch cwd, which set the marker once; every real
+session then saw the stale flag and registered nothing — `/belayd` and every
+`belayd_*` tool disappeared.
+
+### Detecting a stale build
+
+The harness logs its own path when it registers:
+
+```bash
+journalctl -u pi-web-sessiond | grep "belayd-harness.*registering"
+# [belayd-harness] registering tools/commands from file:///nix/store/<hash>-belayd-harness/extensions/index.ts
+```
+
+Compare the `<hash>` against the current symlink target:
+
+```bash
+readlink -f ~/.pi/agent/extensions/belayd-harness.ts
+```
+
+If they differ, the daemon is still running a pre-rebuild copy — restart it.
+
 ## Git commit signing
 
 The service has no SSH agent socket, so agents sign commits with the on-disk

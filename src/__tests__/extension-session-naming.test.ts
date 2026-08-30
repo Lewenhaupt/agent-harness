@@ -7,8 +7,15 @@
  * - runQualityGate multi-retry naming (via phase with quality gate)
  */
 
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Isolate the extension's persistent cooldown store from the real user file. A
+// live pi-web quota cooldown in ~/.pi/agent/model-cooldowns.json would leak
+// into these tests and reorder the fallback loop's candidates.
+process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
@@ -126,7 +133,28 @@ vi.mock("node:http", () => ({
 
 // ── Mock pi API ───────────────────────────────────────────────────────
 
-function createMockPi(): {
+/** Minimal synchronous event bus mirroring pi's per-load-batch EventEmitter bus. */
+function createMockEventBus(): {
+  emit(channel: string, data: unknown): void;
+  on(channel: string, handler: (data: unknown) => void): () => void;
+} {
+  const listeners = new Map<string, Set<(data: unknown) => void>>();
+  return {
+    emit(channel, data) {
+      for (const handler of [...(listeners.get(channel) ?? [])]) handler(data);
+    },
+    on(channel, handler) {
+      const set = listeners.get(channel) ?? new Set<(data: unknown) => void>();
+      set.add(handler);
+      listeners.set(channel, set);
+      return () => {
+        set.delete(handler);
+      };
+    },
+  };
+}
+
+function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   api: ExtensionAPI;
   tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>;
   commands: Map<string, unknown>;
@@ -142,6 +170,7 @@ function createMockPi(): {
   const eventHandlers = new Map<string, (...args: unknown[]) => void>();
   const messages: Array<{ customType: string; content: string; display: boolean }> = [];
   let activeTools: string[] = [];
+  const eventBus = sharedBus ?? createMockEventBus();
 
   const api: ExtensionAPI = {
     registerTool: (def: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) => {
@@ -166,6 +195,7 @@ function createMockPi(): {
     setActiveTools: (toolsList: string[]) => {
       activeTools = toolsList;
     },
+    events: eventBus,
   } as unknown as ExtensionAPI;
 
   return { api, tools, commands, eventHandlers, messages, activeTools };
@@ -203,13 +233,6 @@ async function loadExtension() {
   const mod = await import("../../extensions/index.js");
   return mod.default as (pi: ExtensionAPI) => void;
 }
-
-// The harness extension dedupes duplicate loads (global vs project copy) with
-// a process-wide globalThis marker. Reset it before each test so the factory
-// registers tools fresh instead of returning early.
-beforeEach(() => {
-  (globalThis as Record<string, unknown>).__belayd_harness_loaded__ = false;
-});
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
@@ -1004,16 +1027,33 @@ describe("belayd_commit file staging", () => {
 });
 
 describe("extension load dedup", () => {
-  it("skips registration when another copy already loaded in this process", async () => {
-    const first = createMockPi();
+  it("skips registration when another copy already loaded in the same batch", async () => {
     const factory = await loadExtension();
-    factory(first.api);
-    expect(first.tools.get("belayd_scout")).toBeDefined();
 
-    // A second copy (e.g. global vs project) must be a no-op: pi treats
-    // duplicate tool registrations as a fatal conflict.
-    const second = createMockPi();
-    factory(second.api);
-    expect(second.tools.size).toBe(0);
+    // Global and project copies in one session share the load batch's bus.
+    const sharedBus = createMockEventBus();
+    const globalCopy = createMockPi(sharedBus);
+    factory(globalCopy.api);
+    expect(globalCopy.tools.get("belayd_scout")).toBeDefined();
+
+    // The project copy must be a no-op: pi reports duplicate tool
+    // registrations as a fatal conflict.
+    const projectCopy = createMockPi(sharedBus);
+    factory(projectCopy.api);
+    expect(projectCopy.tools.size).toBe(0);
+  });
+
+  it("registers again in a fresh batch (a new pi-web session)", async () => {
+    const factory = await loadExtension();
+
+    const sessionOne = createMockPi();
+    factory(sessionOne.api);
+    expect(sessionOne.tools.get("belayd_scout")).toBeDefined();
+
+    // A separate session has its own batch bus, so it must register its tools
+    // rather than inheriting a stale process-wide flag.
+    const sessionTwo = createMockPi();
+    factory(sessionTwo.api);
+    expect(sessionTwo.tools.get("belayd_scout")).toBeDefined();
   });
 });

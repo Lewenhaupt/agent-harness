@@ -105,25 +105,63 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
 // This extension ships in two places that can load in the same process:
 // globally at ~/.pi/agent/extensions/belayd-harness.ts (Nix-installed) and
 // project-locally via .pi/settings.json → extensions/index.ts. When pi runs
-// inside this repo or one of its worktrees, both load and every belayd_*
-// tool registration fails with "Tool X conflicts with ...". A process-wide
-// marker dedupes the second instance: the first copy to load wins, the other
-// returns before registering tools or event handlers. `globalThis` (not a
-// module-level variable) is used because the two copies are separate jiti
-// module instances but share one JS process.
-const HARNESS_LOAD_MARKER = "__belayd_harness_loaded__";
+// inside this repo or one of its worktrees, both load, and pi's post-load
+// conflict detection reports every duplicate belayd_* tool as
+// "Tool X conflicts with ...".
+//
+// Dedup keys on the extension load batch's shared event bus (via `pi.events`).
+// Every extension in one `loadExtensions` call shares one bus; separate
+// batches — the pi-web provider-bootstrap pass and each session — get their
+// own. A claim on the bus therefore scopes to "this session":
+// - CLI: only one copy loads anyway (bin/pi and the Nix pi both use -ne).
+// - pi-web: the global and project copies in one session share a bus, so the
+//   first copy wins and the second is a no-op; a later session has a fresh bus
+//   and registers again.
+//
+// A process-wide boolean was tried and broke pi-web: the provider-bootstrap
+// pass set it once, then every real session saw the stale flag and registered
+// nothing. `pi.getAllTools()` / `pi.getCommands()` can't be used here either —
+// they are "action methods" that throw "Extension runtime not initialized"
+// until Runner.bindCore() runs after all extensions finish loading.
+const CLAIM_CHANNEL = "__belayd_harness_claim__";
 
-function harnessAlreadyLoaded(): boolean {
-  return (globalThis as Record<string, unknown>)[HARNESS_LOAD_MARKER] === true;
+/**
+ * True when another harness copy in this load batch already claimed
+ * registration. The probe listener is left in place for the first copy so
+ * later copies in the same batch count it and yield; the shared bus is
+ * discarded with its session, so nothing leaks across sessions.
+ */
+function harnessAlreadyLoaded(pi: ExtensionAPI): boolean {
+  // The counter travels through `emit` as the event payload, so every listener
+  // — our own plus any earlier copy's — mutates the *same* object. A per-call
+  // local would only see our own listener's increment and never detect a
+  // prior copy.
+  const counter = { responses: 0 };
+  const respond = (data: unknown): void => {
+    (data as { responses: number }).responses += 1;
+  };
+  // `emit` dispatches synchronously (the bus wraps handlers in async fns, but
+  // the handler body up to its first `await` runs before `emit` returns).
+  const unsubscribe = pi.events.on(CLAIM_CHANNEL, respond);
+  pi.events.emit(CLAIM_CHANNEL, counter);
+
+  const isFirstCopy = counter.responses <= 1;
+  if (!isFirstCopy) {
+    unsubscribe();
+  }
+  return !isFirstCopy;
 }
 
-function markHarnessLoaded(): void {
-  (globalThis as Record<string, unknown>)[HARNESS_LOAD_MARKER] = true;
-}
+// Build identity for the stale-build guard. In the Nix-installed copy this is
+// file:///nix/store/<hash>-belayd-harness/extensions/index.ts, so the load log
+// below reveals exactly which build registered the tools — the trap hit when
+// pi-web kept a pre-fallback extension in memory after a rebuild.
+const HARNESS_MODULE_PATH: string = import.meta.url;
 
 export default function belaydAgentHarness(pi: ExtensionAPI): void {
-  if (harnessAlreadyLoaded()) return;
-  markHarnessLoaded();
+  if (harnessAlreadyLoaded(pi)) return;
+
+  console.warn(`[belayd-harness] registering tools/commands from ${HARNESS_MODULE_PATH}`);
 
   const GATED_TOOLS = [
     ...ALL_PHASE_TOOLS,
