@@ -214,6 +214,10 @@ Strategy:
 2. Read the modified files
 3. Check for bugs, security issues, code smells
 
+Also check these codebase conventions:
+- Data validation: validate external/untrusted data at the boundary with a schema — zod for runtime data (file contents, env vars, JSON), TypeBox only for pi tool parameters (pi's \`registerTool\` requires it). No hand-rolled parsing or bare \`as\` casts.
+- String unions over raw literals: string literal values must have a single source of truth — a \`const\` array plus a derived union (\`type Phase = (typeof PHASE_ORDER)[number]\`), or an explicit union type — instead of repeating raw string literals across the code.
+
 DO NOT run unit tests, linting, typechecking. This is handled elsewhere and will already have passed.
 
 Output format:
