@@ -123,6 +123,30 @@ describe("spawnAgentWithFallback", () => {
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
   });
 
+  it("skips remaining candidates on a provider after a quota failure", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("opencode-go/a"))
+      .mockResolvedValueOnce(makeResult("llmgateway/c"));
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["opencode-go/a", "opencode-go/b", "llmgateway/c"],
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/c");
+    expect(attempts.map((a) => a.model)).toEqual([
+      "opencode-go/a",
+      "opencode-go/b",
+      "llmgateway/c",
+    ]);
+    expect(attempts[1]).toHaveProperty("skippedProvider", "opencode-go");
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+  });
+
   it("tries a single candidate for an unknown model", async () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("unknown/x"));
 

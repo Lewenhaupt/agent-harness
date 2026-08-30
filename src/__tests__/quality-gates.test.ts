@@ -3,8 +3,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { SpawnDetails } from "../agent-registry.js";
-import type { GateOptions } from "../quality-gates.js";
+import type { GateOptions, SpawnDetails } from "../agent-registry.js";
 import { gateProofContent, gateUserGuide, validateCastRecording } from "../quality-gates.js";
 
 const MOCK_DETAILS: SpawnDetails = {
@@ -97,6 +96,29 @@ describe("validateCastRecording", () => {
 
     expect(result).toHaveProperty("passed", true);
     expect(result.feedback).toContain("No .cast file found");
+  });
+
+  it("resolves a .cast path relative to the provided cwd", async () => {
+    const proofDir = join(tmpDir, "proof-of-work", "bd-99");
+    await mkdir(proofDir, { recursive: true });
+    const castPath = join(proofDir, "valid.cast");
+    await writeFile(
+      castPath,
+      [
+        JSON.stringify({ version: 3, command: "pnpm test" }),
+        JSON.stringify([0.0, "o", "Running tests...\n"]),
+        JSON.stringify([1.5, "o", "PASS\n"]),
+        JSON.stringify([2.0, "x", "0"]),
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const output = "Proof recording: proof-of-work/bd-99/valid.cast\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      cwd: tmpDir,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
   });
 
   it("fails for malformed JSON header", async () => {

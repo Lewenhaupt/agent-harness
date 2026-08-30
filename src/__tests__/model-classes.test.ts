@@ -7,6 +7,7 @@ import {
   MODEL_TO_CLASS,
   modelClassOf,
   PROVIDER_PREFERENCE,
+  providerOf,
   resolveModelCandidates,
 } from "../model-classes.js";
 import { WORKFLOW_REGISTRY } from "../workflow-registry.js";
@@ -19,6 +20,17 @@ describe("bareModelId", () => {
 
   it("leaves provider-less ids untouched", () => {
     expect(bareModelId("mimo-v2.5")).toBe("mimo-v2.5");
+  });
+});
+
+describe("providerOf", () => {
+  it("returns the provider prefix", () => {
+    expect(providerOf("opencode-go/mimo-v2.5")).toBe("opencode-go");
+    expect(providerOf("llmgateway/deepseek-v4-pro")).toBe("llmgateway");
+  });
+
+  it("returns an empty string for provider-less ids", () => {
+    expect(providerOf("mimo-v2.5")).toBe("");
   });
 });
 
@@ -63,6 +75,15 @@ describe("candidatesForModel", () => {
     const candidates = candidatesForModel("opencode-go/deepseek-v4-pro");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4-pro");
     expect(candidates[1]).toBe("llmgateway/deepseek-v4-pro");
+  });
+
+  it("tries the same model on an alternate provider before other models on the same provider", () => {
+    // glm-5.3 is the 2nd frontier model; without the re-partition its first
+    // fallback would be opencode-go/deepseek-v4-pro (same provider, wrong
+    // quota bucket).
+    const candidates = candidatesForModel("opencode-go/glm-5.3");
+    expect(candidates[0]).toBe("opencode-go/glm-5.3");
+    expect(candidates[1]).toBe("llmgateway/glm-5.3");
   });
 
   it("does not duplicate the requested model", () => {

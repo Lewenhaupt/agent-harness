@@ -8,9 +8,9 @@
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import type { GateResult, SpawnDetails } from "./agent-registry.js";
+import type { GateOptions, GateResult, SpawnDetails } from "./agent-registry.js";
 
 const execAsync = promisify(exec);
 
@@ -21,16 +21,6 @@ function truncateOutput(text: string, maxLines = 50): string {
   const lines = text.split("\n");
   if (lines.length <= maxLines) return text;
   return `${lines.slice(0, maxLines).join("\n")}\n... (${lines.length - maxLines} more lines truncated)`;
-}
-
-/**
- * Options for running quality gates.
- */
-export interface GateOptions {
-  /** Working directory for shell commands. */
-  cwd?: string;
-  /** Timeout in milliseconds for each check. */
-  timeoutInMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -204,7 +194,7 @@ function findCastFilePath(output: string): string | null {
   const lines = output.split("\n");
   for (const line of lines) {
     const match = line.match(/\bproof-of-work\/[\w/.-]+\.cast\b/);
-    if (match) return match[0];
+    if (match) return match[0].startsWith("/") ? match[0].slice(1) : match[0];
   }
   return null;
 }
@@ -387,10 +377,11 @@ function checkNonCastProofRefs(output: string, cwd: string): GateResult | null {
   const missingRefs: string[] = [];
   for (const ref of proofRefMatch) {
     if (ref.endsWith(".cast")) continue;
-    if (ref.includes("..")) continue;
-    const resolvedPath = resolve(cwd, ref);
+    const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
+    if (normalizedRef.includes("..")) continue;
+    const resolvedPath = resolve(cwd, normalizedRef);
     if (!existsSync(resolvedPath)) {
-      missingRefs.push(ref);
+      missingRefs.push(normalizedRef);
     }
   }
 
@@ -404,13 +395,55 @@ function checkNonCastProofRefs(output: string, cwd: string): GateResult | null {
 }
 
 /**
+ * Walk up from startDir looking for a directory containing a "proof-of-work" subdirectory.
+ * Returns the absolute path to that parent directory.
+ *
+ * Search order:
+ * 1. Walk up from startDir (handles worktrees linked to the main repo)
+ * 2. Fall back to process.cwd() and walk up from there
+ * 3. Return startDir if nothing found (degrades to old behavior)
+ */
+function findAncestorProofDir(startDir: string): string {
+  // Walk up from startDir
+  let dir = startDir;
+  while (true) {
+    if (existsSync(resolve(dir, "proof-of-work"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  // Fallback: walk up from process.cwd() (may differ from startDir in sandboxed environments)
+  const cwd = process.cwd();
+  if (cwd !== startDir) {
+    dir = cwd;
+    while (true) {
+      if (existsSync(resolve(dir, "proof-of-work"))) {
+        return dir;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+
+  return startDir;
+}
+
+/**
  * Validate that a cast file path does not escape the proof-of-work directory.
  * Returns a failed GateResult on path traversal, or null if safe.
  */
-function checkPathTraversal(castPath: string, cwd: string): GateResult | null {
-  const resolved = resolve(cwd, castPath);
-  const proofDir = resolve(cwd, "proof-of-work");
-  if (!resolved.startsWith(proofDir + sep)) {
+function checkPathTraversal(castPath: string, proofBase: string): GateResult | null {
+  // Strip "proof-of-work/" prefix if present, since we resolve against proofBase + "proof-of-work/"
+  const relativePath = castPath.startsWith("proof-of-work/")
+    ? castPath.slice("proof-of-work/".length)
+    : castPath;
+  const resolved = resolve(proofBase, "proof-of-work", relativePath);
+  const allowedDir = resolve(proofBase, "proof-of-work");
+  if (!resolved.startsWith(allowedDir + sep)) {
     return { passed: false, feedback: `Path traversal detected: ${castPath}` };
   }
   return null;
@@ -430,15 +463,18 @@ export async function gateProofContent(
   options?: GateOptions,
 ): Promise<GateResult> {
   const cwd = options?.cwd ?? process.cwd();
+  // Walk up from cwd to find the ancestor that contains proof-of-work/.
+  // This handles worktrees where the proof dir lives in the main repo root.
+  const proofBase = findAncestorProofDir(cwd);
   const castPath = findCastFilePath(output);
 
   if (castPath) {
-    const traversalCheck = checkPathTraversal(castPath, cwd);
+    const traversalCheck = checkPathTraversal(castPath, proofBase);
     if (traversalCheck) return traversalCheck;
-    return validateCastRecording(resolve(cwd, castPath));
+    return validateCastRecording(resolve(proofBase, castPath));
   }
 
-  const missingRefsCheck = checkNonCastProofRefs(output, cwd);
+  const missingRefsCheck = checkNonCastProofRefs(output, proofBase);
   if (missingRefsCheck) return missingRefsCheck;
 
   return {

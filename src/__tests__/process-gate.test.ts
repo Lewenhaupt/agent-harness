@@ -353,7 +353,7 @@ describe("formatProcessState with custom order", () => {
 });
 
 describe("checkToolAllowed with custom phaseOrder (research)", () => {
-  const researchOrder = ["scout", "plan", "proof", "commit"] as const;
+  const researchOrder = ["scout", "plan", "commit"] as const;
 
   it("allows scout as first step in research", () => {
     const result = checkToolAllowed("belayd_scout", [], true, researchOrder);
@@ -371,13 +371,19 @@ describe("checkToolAllowed with custom phaseOrder (research)", () => {
     expect(result.reason).toContain("not part of the");
   });
 
-  it("allows proof after scout+plan in research", () => {
-    const result = checkToolAllowed("belayd_proof", ["scout", "plan"], true, researchOrder);
+  it("blocks proof in research (not in phase order)", () => {
+    const result = checkToolAllowed("belayd_proof", [], true, researchOrder, "research");
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("not part of the");
+  });
+
+  it("allows commit after scout+plan in research", () => {
+    const result = checkToolAllowed("belayd_commit", ["scout", "plan"], true, researchOrder);
     expect(result.allowed).toBe(true);
   });
 
-  it("blocks proof before plan in research", () => {
-    const result = checkToolAllowed("belayd_proof", ["scout"], true, researchOrder);
+  it("blocks commit before plan in research", () => {
+    const result = checkToolAllowed("belayd_commit", ["scout"], true, researchOrder);
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("plan");
   });
@@ -562,7 +568,7 @@ describe("checkToolAllowed for belayd_userguide in all workflow types", () => {
   });
 
   it("blocks belayd_userguide in research workflow", () => {
-    const researchOrder = ["scout", "plan", "proof", "commit"] as const;
+    const researchOrder = ["scout", "plan", "commit"] as const;
     const result = checkToolAllowed("belayd_userguide", [], true, researchOrder, "research");
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("not part of the");
@@ -781,14 +787,14 @@ describe("markPhaseCompleted with custom phaseOrder", () => {
 });
 
 describe("isWorkflowComplete with custom phaseOrder", () => {
-  const researchOrder = ["scout", "plan", "proof", "commit"] as const;
+  const researchOrder = ["scout", "plan", "commit"] as const;
 
   it("returns false when not all research phases done", () => {
     expect(isWorkflowComplete(["scout", "plan"], researchOrder)).toBe(false);
   });
 
   it("returns true when all research phases done", () => {
-    expect(isWorkflowComplete(["scout", "plan", "proof", "commit"], researchOrder)).toBe(true);
+    expect(isWorkflowComplete(["scout", "plan", "commit"], researchOrder)).toBe(true);
   });
 
   it("returns true for standard 7 phases which contain all research phases", () => {

@@ -7,6 +7,7 @@
 
 export type {
   AgentDefinition,
+  GateOptions,
   GateResult,
   QualityGate,
   SpawnDetails,
@@ -19,6 +20,8 @@ export {
   getAgent,
   getAgentByShortName,
   getPhaseToolName,
+  RESEARCHER_SYSTEM_PROMPT,
+  RESEARCHER_TOOLS,
 } from "./agent-registry.js";
 export type { BdCommandValidation } from "./bd-command.js";
 export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
@@ -31,6 +34,7 @@ export {
   MODEL_TO_CLASS,
   modelClassOf,
   PROVIDER_PREFERENCE,
+  providerOf,
   resolveModelCandidates,
 } from "./model-classes.js";
 export type { CooldownEntry, ModelCooldownStore } from "./model-cooldown.js";
@@ -48,7 +52,6 @@ export {
   PHASE_ORDER,
   PHASE_TOOLS,
 } from "./process-gate.js";
-export type { GateOptions } from "./quality-gates.js";
 export {
   gateFullValidation,
   gateLint,

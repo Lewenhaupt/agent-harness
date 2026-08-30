@@ -7,6 +7,7 @@
  */
 
 import type { QualityGate } from "./agent-registry.js";
+import { RESEARCHER_SYSTEM_PROMPT, RESEARCHER_TOOLS } from "./agent-registry.js";
 import type { Phase } from "./process-gate.js";
 import { gateFullValidation } from "./quality-gates.js";
 
@@ -42,6 +43,7 @@ export interface WorkflowSubTypeConfig {
       {
         model?: string;
         tools?: string[];
+        systemPrompt?: string;
         qualityGate?: QualityGate;
       }
     >
@@ -82,11 +84,14 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
 
   research: {
     name: "research",
-    phases: ["scout", "plan", "proof", "commit"],
-    proofRequired: true,
+    // Research is investigation only — no implementation, no proof artifacts.
+    phases: ["scout", "plan", "commit"],
+    proofRequired: false,
     agentOverrides: {
       plan: {
         model: "opencode-go/glm-5.3",
+        tools: RESEARCHER_TOOLS,
+        systemPrompt: RESEARCHER_SYSTEM_PROMPT,
       },
     },
   },

@@ -213,12 +213,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     lines.push("", `Next required step: call \`belayd_${phases[0] ?? "commit"}\``);
 
-    // Research workflows: create follow-up tasks before committing so they're
-    // included in the final commit. Other types: mark complete after commit.
+    // Research workflows: the plan phase is the research agent — it records
+    // findings as a bead note (not a .md file). Create follow-up tasks before
+    // committing so they're included in the final commit.
     if (type === "research") {
       lines.push(
         "",
         "**Before `belayd_commit`:**",
+        "- `belayd_plan` is the research agent. Pass it the task ID and the research question; it records findings as a bead note (never a research .md file).",
         '- Create follow-up implementation tasks with the `bd` tool (e.g. `bd create --title="..." --type=task`) for any action items uncovered.',
       );
     }
@@ -265,7 +267,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   function withFallbackNote(result: SpawnResult, attempts: SpawnAttempt[]): SpawnResult {
     if (attempts.length <= 1) return result;
     const trail = attempts
-      .map((a) => `${a.model} (${a.skippedCooldown ? "cooldown" : a.classification.kind})`)
+      .map((a) => {
+        if (a.skippedCooldown) return `${a.model} (cooldown)`;
+        if (a.skippedProvider) return `${a.model} (provider ${a.skippedProvider} exhausted)`;
+        return `${a.model} (${a.classification.kind})`;
+      })
       .join(" → ");
     const existingContent = result.content?.[0]?.text ?? "";
     return {
@@ -308,9 +314,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   async function evaluateGate(
     gate: QualityGate,
     result: SpawnResult,
+    cwd?: string,
   ): Promise<{ passed: boolean; feedback: string }> {
     const text = result.content?.[0]?.text ?? "";
-    const outcome = await gate(text, result.details);
+    const outcome = await gate(text, result.details, cwd ? { cwd } : undefined);
     return {
       passed: outcome.passed,
       feedback: outcome.feedback ?? (outcome.passed ? "All quality gates passed." : "Failed"),
@@ -338,7 +345,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // total passes are exhausted. Each retry gets a unique session suffix so
     // sessions never collide.
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
-      const verdict = await evaluateGate(effectiveGate, current);
+      const verdict = await evaluateGate(effectiveGate, current, params.cwd);
 
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
@@ -790,6 +797,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
             WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
           const effectiveModel = overrides?.model ?? agent.model;
           const effectiveTools = overrides?.tools ?? agent.tools;
+          const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
           const subagentSessionName = computeSubagentSessionName(
             state.currentTaskId,
             phaseName,
@@ -798,7 +806,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           const { result, attempts } = await spawnAgentWithFallback({
             model: effectiveModel,
             tools: effectiveTools,
-            systemPrompt: agent.systemPrompt,
+            systemPrompt: effectiveSystemPrompt,
             task: params.task,
             sessionName: subagentSessionName,
             cwd: effectiveCwd,
@@ -811,7 +819,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           const gateResult = await runQualityGate(
             agent,
             spawnedResult,
-            params,
+            { task: params.task, cwd: effectiveCwd },
             state.workflowType,
             phaseName,
             signal,
