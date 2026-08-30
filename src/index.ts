@@ -37,8 +37,14 @@ export {
   providerOf,
   resolveModelCandidates,
 } from "./model-classes.js";
-export type { CooldownEntry, ModelCooldownStore } from "./model-cooldown.js";
-export { createModelCooldownStore } from "./model-cooldown.js";
+export type {
+  CooldownEntry,
+  CooldownFs,
+  CooldownScope,
+  ModelCooldownStore,
+  ModelCooldownStoreOptions,
+} from "./model-cooldown.js";
+export { createModelCooldownStore, defaultModelCooldownPath } from "./model-cooldown.js";
 export type { Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,
