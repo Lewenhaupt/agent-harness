@@ -58,11 +58,14 @@ pnpm lint             # Biome format + lint
 
 The NixOS config installs these extensions globally (built from the pushed
 flake), so a plain `pi` here would load both the global copies and the local
-`.pi/settings.json` ones and fail with `Tool "belayd_*" conflicts with
-.../extensions/index.ts`. `bin/pi` (wired into PATH via `.envrc` / direnv)
-runs pi with `-ne` and re-adds the repo-local extensions explicitly, so edits
-to `extensions/` take effect on the next launch without pushing + rebuilding
-the OS. Manual use: `./bin/pi` (or `nix develop -c ./bin/pi`).
+`.pi/settings.json` ones. The extension factories self-dedupe on a process-wide
+marker, so the double load no longer fails with `Tool "belayd_*" conflicts
+with ...` — but global extensions load before project-local ones, so the
+Nix-built copy would win and edits to `extensions/` would be ignored. `bin/pi`
+(wired into PATH via `.envrc` / direnv) runs pi with `-ne` and re-adds the
+repo-local extensions explicitly, so the local copy always wins and edits take
+effect on the next launch without pushing + rebuilding the OS. Manual use:
+`./bin/pi` (or `nix develop -c ./bin/pi`).
 
 Spawned belayd agents get the same isolation: `.envrc` and the devShell
 shellHook export `PI_BINARY_PATH` pointing at `bin/pi`, and `src/spawn.ts`

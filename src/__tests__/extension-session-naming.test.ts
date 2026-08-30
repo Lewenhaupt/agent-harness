@@ -8,7 +8,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
@@ -203,6 +203,13 @@ async function loadExtension() {
   const mod = await import("../../extensions/index.js");
   return mod.default as (pi: ExtensionAPI) => void;
 }
+
+// The harness extension dedupes duplicate loads (global vs project copy) with
+// a process-wide globalThis marker. Reset it before each test so the factory
+// registers tools fresh instead of returning early.
+beforeEach(() => {
+  (globalThis as Record<string, unknown>).__belayd_harness_loaded__ = false;
+});
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
@@ -993,5 +1000,20 @@ describe("belayd_commit file staging", () => {
     );
 
     expect(stagedGitAddCommands()).toEqual(["git add -A"]);
+  });
+});
+
+describe("extension load dedup", () => {
+  it("skips registration when another copy already loaded in this process", async () => {
+    const first = createMockPi();
+    const factory = await loadExtension();
+    factory(first.api);
+    expect(first.tools.get("belayd_scout")).toBeDefined();
+
+    // A second copy (e.g. global vs project) must be a no-op: pi treats
+    // duplicate tool registrations as a fatal conflict.
+    const second = createMockPi();
+    factory(second.api);
+    expect(second.tools.size).toBe(0);
   });
 });

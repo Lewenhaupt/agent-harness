@@ -22,7 +22,24 @@ import type {
 
 import { checkEdit, clearHashes, recordRead } from "../src/stale-file-guard.js";
 
+// The same guard ships globally (~/.pi/agent/extensions/belayd-stale-file-guard.ts)
+// and project-locally (.pi/settings.json). When both load in one process the
+// event handlers would be registered twice. The process-wide marker dedupes:
+// the first copy wins, the second returns before registering handlers.
+const STALE_GUARD_LOAD_MARKER = "__belayd_stale_file_guard_loaded__";
+
+function staleGuardAlreadyLoaded(): boolean {
+  return (globalThis as Record<string, unknown>)[STALE_GUARD_LOAD_MARKER] === true;
+}
+
+function markStaleGuardLoaded(): void {
+  (globalThis as Record<string, unknown>)[STALE_GUARD_LOAD_MARKER] = true;
+}
+
 export default function staleFileGuardExtension(pi: ExtensionAPI): void {
+  if (staleGuardAlreadyLoaded()) return;
+  markStaleGuardLoaded();
+
   // Intercept tool_result events to record reads
   pi.on("tool_result", (event: ToolResultEvent) => {
     if (event.toolName === "read" || event.toolName === "Read") {

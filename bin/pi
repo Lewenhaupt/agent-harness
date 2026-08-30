@@ -3,17 +3,17 @@
 #
 # The NixOS config (nix-tmp/modules/core/belayd-pi-web.nix) installs the same
 # harness extensions globally at ~/.pi/agent/extensions/belayd-*.ts, built from
-# the pushed flake. Running plain `pi` in this repo then loads those global
-# copies AND the ones declared in .pi/settings.json, and every belayd_* tool
-# registration fails with:
-#
-#   Error: Failed to load extension "~/.pi/agent/extensions/belayd-harness.ts":
-#          Tool "belayd_scout" conflicts with .../extensions/index.ts
+# the pushed flake. The extension factories self-dedupe on a process-wide
+# marker (extensions/index.ts, stale-file-guard.ts, worktree-guard.ts), so a
+# double load no longer fails — but whichever copy loads first wins, and global
+# extensions load before project-local ones, so plain `pi` here would run the
+# Nix-built copy and silently ignore edits to extensions/.
 #
 # `-ne` disables ALL extension discovery (global dirs AND the settings
 # `extensions`/`packages` arrays — verified by test), so the local extensions
-# are re-added explicitly with -e. This keeps the dev loop local: edits to
-# extensions/ take effect on the next pi start, with no push + OS rebuild.
+# are re-added explicitly with -e and always win. This keeps the dev loop
+# local: edits to extensions/ take effect on the next pi start, with no push
+# + OS rebuild.
 #
 # `.envrc` captures the real pi path in PI_WRAPPER_REAL_PI before prepending
 # bin/ to PATH, so this script never re-executes itself.
