@@ -100,6 +100,32 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
   return state;
 }
 
+/**
+ * Human-readable phase description, workflow-aware.
+ *
+ * In research workflows the "plan" phase is overridden to the research agent,
+ * which records findings as a bead note — it never writes an implementation
+ * plan file. Label it accordingly; otherwise the orchestrator reads "create
+ * implementation plan" and re-delegates `belayd_plan` to force a research .md
+ * file that the researcher contract explicitly forbids.
+ */
+function describePhase(phase: string, workflowType: WorkflowSubType): string {
+  if (workflowType === "research" && phase === "plan") {
+    return "Research the question and record findings as a bead note (never a .md file)";
+  }
+  const descriptions: Record<string, string> = {
+    scout: "Fast codebase recon — returns structured findings",
+    plan: "Create implementation plan",
+    implement: "Implements code (runs typecheck+lint+tests)",
+    review: "Adversarial code review",
+    test: "Run the test suite",
+    userguide: "Generate user-facing How to Verify and How to Use docs",
+    proof: "Capture verifiable proof",
+    commit: "Commit changes",
+  };
+  return descriptions[phase] ?? phase;
+}
+
 // ── Extension factory ──────────────────────────────────────────────────
 
 // This extension ships in two places that can load in the same process:
@@ -215,17 +241,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const type = workflowType ?? "feature";
     const phases = phaseOrder ?? getPhasesForType(type);
 
-    const phaseDescriptions: Record<string, string> = {
-      scout: "Fast codebase recon — returns structured findings",
-      plan: "Create implementation plan",
-      implement: "Implements code (runs typecheck+lint+tests)",
-      review: "Adversarial code review",
-      test: "Run the test suite",
-      userguide: "Generate user-facing How to Verify and How to Use docs",
-      proof: "Capture verifiable proof",
-      commit: "Commit changes",
-    };
-
     const typeDescriptions: Record<string, string> = {
       feature: "This is a FEATURE task — new functionality.",
       bugfix: "This is a BUGFIX task — fixing a bug.",
@@ -247,7 +262,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     ];
 
     phases.forEach((phase, i) => {
-      lines.push(`${i + 1}. \`belayd_${phase}\` — ${phaseDescriptions[phase] ?? phase}`);
+      lines.push(`${i + 1}. \`belayd_${phase}\` — ${describePhase(phase, type)}`);
     });
 
     lines.push("", `Next required step: call \`belayd_${phases[0] ?? "commit"}\``);
@@ -258,8 +273,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (type === "research") {
       lines.push(
         "",
-        "**Before `belayd_commit`:**",
+        "**Research deliverable:**",
         "- `belayd_plan` is the research agent. Pass it the task ID and the research question; it records findings as a bead note (never a research .md file).",
+        "- The deliverable is the bead note — NOT a committed file. Do not re-delegate `belayd_plan` to write a research .md file, and do not expect `belayd_commit` to commit one.",
+        "",
+        "**Before `belayd_commit`:**",
         '- Create follow-up implementation tasks with the `bd` tool (e.g. `bd create --title="..." --type=task`) for any action items uncovered.',
       );
     }
@@ -749,18 +767,22 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const phaseOrder = state.phaseOrder;
     const workflowType = state.workflowType;
 
-    const phaseDescriptions: Record<string, string> = {
-      scout: "investigate the codebase",
-      plan: "create implementation plan",
-      implement: "implement code (runs typecheck+lint+tests automatically)",
-      review: "adversarial code review",
-      test: "run the test suite",
-      userguide: "Generate user-facing How to Verify and How to Use docs",
-      proof: "capture verifiable proof",
-      commit: "commit changes",
-    };
+    const phaseLines = phaseOrder.map(
+      (p) => `- \`belayd_${p}\` — ${describePhase(p, workflowType)}`,
+    );
 
-    const phaseLines = phaseOrder.map((p) => `- \`belayd_${p}\` — ${phaseDescriptions[p] ?? p}`);
+    // Research workflows record findings as a bead note — there is no research
+    // .md file to write and no committed-file deliverable. State this every
+    // turn, not just at workflow start, because the orchestrator otherwise
+    // re-delegates `belayd_plan` to force a research .md file that the
+    // researcher contract explicitly forbids.
+    const researchGuidance =
+      workflowType === "research"
+        ? [
+            "",
+            "RESEARCH workflow: the `plan` phase is the research agent. Its deliverable is a bead note (via `bd note`) — NOT a committed file or research .md document. Do not re-delegate to write a research file.",
+          ]
+        : [];
 
     return {
       message: {
@@ -774,6 +796,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "",
           "Editing and writing tools are DISABLED. You MUST delegate ALL code changes to the phase tools:",
           ...phaseLines,
+          ...researchGuidance,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
           "",
