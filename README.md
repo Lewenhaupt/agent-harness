@@ -68,6 +68,22 @@ Spawned belayd agents get the same isolation: `.envrc` and the devShell
 shellHook export `PI_BINARY_PATH` pointing at `bin/pi`, and `src/spawn.ts`
 resolves the agent's pi binary from that var first (`resolvePiBinary`).
 
+### Third-party npm extensions
+
+pi auto-installs packages listed in settings at startup, so for the NixOS
+global install just run `pi install npm:<pkg>` (writes to
+`~/.pi/agent/settings.json`; installed to `~/.pi/agent/npm/`). No flake
+change — the global pi reads the same `~/.pi/agent`. `bin/pi` passes pi's
+CLI subcommands (`install`, `remove`, `uninstall`, `update`, `list`,
+`config`, `auth`) straight through to the real pi, so those also operate on
+the global settings. Only *running* pi in this repo is isolated. The repo's
+`bin/pi` run mode uses `-ne`, which skips settings-declared packages, so npm
+extensions are loaded there with an explicit `-e npm:<pkg>` line in `bin/pi`
+(the extraction is cached under the pi config dir, so reruns are offline).
+Note: some packages error during `-e` startup (e.g. pi-llmgateway prints an
+`authStorage` error) but still register their provider, so the session
+continues.
+
 ## Local services
 
 The harness relies on a few long-running local services, split across two
