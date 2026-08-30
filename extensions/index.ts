@@ -101,7 +101,29 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
 
 // ── Extension factory ──────────────────────────────────────────────────
 
+// This extension ships in two places that can load in the same process:
+// globally at ~/.pi/agent/extensions/belayd-harness.ts (Nix-installed) and
+// project-locally via .pi/settings.json → extensions/index.ts. When pi runs
+// inside this repo or one of its worktrees, both load and every belayd_*
+// tool registration fails with "Tool X conflicts with ...". A process-wide
+// marker dedupes the second instance: the first copy to load wins, the other
+// returns before registering tools or event handlers. `globalThis` (not a
+// module-level variable) is used because the two copies are separate jiti
+// module instances but share one JS process.
+const HARNESS_LOAD_MARKER = "__belayd_harness_loaded__";
+
+function harnessAlreadyLoaded(): boolean {
+  return (globalThis as Record<string, unknown>)[HARNESS_LOAD_MARKER] === true;
+}
+
+function markHarnessLoaded(): void {
+  (globalThis as Record<string, unknown>)[HARNESS_LOAD_MARKER] = true;
+}
+
 export default function belaydAgentHarness(pi: ExtensionAPI): void {
+  if (harnessAlreadyLoaded()) return;
+  markHarnessLoaded();
+
   const GATED_TOOLS = [
     ...ALL_PHASE_TOOLS,
     "belayd_start_task",

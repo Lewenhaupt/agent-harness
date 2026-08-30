@@ -53,8 +53,26 @@ function isWithinWorktree(filePath: string): boolean {
 
 // ── Extension factory ──────────────────────────────────────────────────
 
+// The same guard ships globally (~/.pi/agent/extensions/belayd-worktree-guard.ts)
+// and project-locally (.pi/settings.json). When both load in one process the
+// event handler would be registered twice. The process-wide marker dedupes:
+// the first copy wins, the second returns before registering handlers. It is
+// only set once the worktree check passes so a non-worktree load never marks
+// the guard as active.
+const WORKTREE_GUARD_LOAD_MARKER = "__belayd_worktree_guard_loaded__";
+
+function worktreeGuardAlreadyLoaded(): boolean {
+  return (globalThis as Record<string, unknown>)[WORKTREE_GUARD_LOAD_MARKER] === true;
+}
+
+function markWorktreeGuardLoaded(): void {
+  (globalThis as Record<string, unknown>)[WORKTREE_GUARD_LOAD_MARKER] = true;
+}
+
 export default function worktreeGuardExtension(pi: ExtensionAPI): void {
   if (!isLinkedWorktree) return;
+  if (worktreeGuardAlreadyLoaded()) return;
+  markWorktreeGuardLoaded();
 
   pi.on("tool_call", (event: ToolCallEvent): ToolCallEventResult => {
     const toolName = event.toolName;
