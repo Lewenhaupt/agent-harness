@@ -12,7 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { listRuns, RunStatus, readRunManifest, writeRunManifest } from "../run-manifest.js";
+import {
+  listRuns,
+  RunStatus,
+  readRunManifest,
+  scanForInterruptedRuns,
+  writeRunManifest,
+} from "../run-manifest.js";
 import {
   readWorkflowState as readWorkflowStateFromDisk,
   type WorkflowState,
@@ -178,7 +184,13 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>;
   commands: Map<string, unknown>;
   eventHandlers: Map<string, (...args: unknown[]) => void>;
-  messages: Array<{ customType: string; content: string; display: boolean }>;
+  messages: Array<{
+    customType: string;
+    content: string;
+    display: boolean;
+    details?: Record<string, unknown>;
+    options?: { triggerTurn?: boolean; deliverAs?: string };
+  }>;
   activeTools: string[];
 } {
   const tools = new Map<
@@ -187,7 +199,13 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   >();
   const commands = new Map<string, unknown>();
   const eventHandlers = new Map<string, (...args: unknown[]) => void>();
-  const messages: Array<{ customType: string; content: string; display: boolean }> = [];
+  const messages: Array<{
+    customType: string;
+    content: string;
+    display: boolean;
+    details?: Record<string, unknown>;
+    options?: { triggerTurn?: boolean; deliverAs?: string };
+  }> = [];
   let activeTools: string[] = [];
   const eventBus = sharedBus ?? createMockEventBus();
 
@@ -205,10 +223,15 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
       eventHandlers.set(event, handler);
     },
     sendMessage: (
-      msg: { customType: string; content: string; display: boolean },
-      _opts?: { triggerTurn?: boolean },
+      msg: {
+        customType: string;
+        content: string;
+        display: boolean;
+        details?: Record<string, unknown>;
+      },
+      opts?: { triggerTurn?: boolean; deliverAs?: string },
     ) => {
-      messages.push(msg);
+      messages.push({ ...msg, options: opts });
     },
     getActiveTools: () => activeTools,
     setActiveTools: (toolsList: string[]) => {
@@ -232,25 +255,76 @@ function createMockCtx(overrides?: Partial<{ sessionId: string; cwd: string }>):
   };
 }
 
-// Helper to simulate a tool_call event and mark a phase completed
-function simulatePhaseToolCall(
-  eventHandlers: Map<string, (...args: unknown[]) => void>,
-  toolName: string,
-): void {
-  const toolCallHandler = eventHandlers.get("tool_call");
-  if (!toolCallHandler) return;
-  toolCallHandler(
-    {
-      toolName,
-      abort: vi.fn(),
-    },
-    createMockCtx(),
-  );
-}
-
 async function loadExtension() {
   const mod = await import("../../extensions/index.js");
   return mod.default as (pi: ExtensionAPI) => void;
+}
+
+// ── Non-blocking run helpers (bd-41) ───────────────────────────────────
+
+/** Count delivered run-completion follow-ups in the mock pi message log. */
+function runCompletionCount(messages: Array<{ customType: string }>): number {
+  return messages.filter((m) => m.customType === "belayd-run-complete").length;
+}
+
+/** Run one phase tool and wait until its background run has delivered. */
+async function runPhaseToolAndWait(
+  tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>,
+  toolName: string,
+  messages: Array<{ customType: string }>,
+  ctx: { sessionManager: { getSessionId: () => string }; cwd: string },
+): Promise<void> {
+  const before = runCompletionCount(messages);
+  const tool = tools.get(toolName);
+  expect(tool).toBeDefined();
+  await tool?.execute(`call-${toolName}`, { task: `do ${toolName}` }, undefined, undefined, ctx);
+  await vi.waitFor(() => {
+    expect(runCompletionCount(messages)).toBe(before + 1);
+  });
+}
+
+/** Make node:child_process.exec succeed so the commit tool can finish. */
+function setExecToSucceed(): void {
+  mockExec.mockImplementation(
+    (
+      _cmd: string,
+      _opts: unknown,
+      cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
+    ) => {
+      cb(null, { stdout: "[abc1234] commit done", stderr: "" });
+    },
+  );
+}
+
+/** Restore the default failing exec used by most tests. */
+function setExecToFail(): void {
+  mockExec.mockImplementation(
+    (
+      _cmd: string,
+      _opts: unknown,
+      cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
+    ) => {
+      cb(new Error("pnpm not found in test environment"), {
+        stdout: "",
+        stderr: "Command failed",
+      });
+    },
+  );
+}
+
+/** Run the commit tool to completion with exec succeeding. */
+async function runCommitTool(
+  tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>,
+  ctx: { sessionManager: { getSessionId: () => string }; cwd: string },
+): Promise<void> {
+  const commit = tools.get("belayd_commit");
+  expect(commit).toBeDefined();
+  setExecToSucceed();
+  try {
+    await commit?.execute("call-commit", { message: "feat: done" }, undefined, undefined, ctx);
+  } finally {
+    setExecToFail();
+  }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -260,6 +334,7 @@ describe("extension session naming (bd-10)", () => {
     mockSpawnAgentProcess.mockClear();
     mockHttpRequest.mockClear();
     mockExec.mockClear();
+    setExecToFail();
     mockRequestResponses.clear();
     // Reset default sessions response to empty
     (
@@ -298,8 +373,10 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Verify spawnAgentProcess was called with a sessionName matching the pattern
-      expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      // The spawn now happens in the background (non-blocking run).
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      });
       const options = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(options.sessionName).toBeTruthy();
       expect(options.sessionName).toMatch(/^belayd-bd-42-sub-scout-/);
@@ -328,8 +405,10 @@ describe("extension session naming (bd-10)", () => {
       const plan = tools.get("belayd_plan");
       await plan?.execute("call-3", { task: "plan" }, undefined, undefined, createMockCtx());
 
-      // Should have two spawn calls
-      expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+      // Both spawns run in the background once their phase tools return.
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+      });
 
       const scoutOptions = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
       const planOptions = mockSpawnAgentProcess.mock.calls[1]?.[0] as Record<string, unknown>;
@@ -342,13 +421,12 @@ describe("extension session naming (bd-10)", () => {
 
   describe("compactTaskSessions", () => {
     it("compacts matching sessions on agent_end when workflow complete", async () => {
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, eventHandlers, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
       // Set up mock responses for the daemon:
       // GET /sessions → returns a list with matching and non-matching sessions
-      // (the mock reuses this for every phase's GET /sessions call)
       (
         mockHttpRequest as unknown as {
           _setDefaultSessions: (data: string) => void;
@@ -366,35 +444,26 @@ describe("extension session naming (bd-10)", () => {
         }),
       );
 
-      // Activate the gate with bd-42 (feature workflow: 8 phases)
+      // Activate a short research workflow (scout → plan → commit) so phases
+      // complete via real background runs instead of tool_call marks.
       const startTask = tools.get("belayd_start_task");
       await startTask?.execute(
         "call-1",
-        { taskId: "bd-42" },
+        { taskId: "bd-42", workflowType: "research" },
         undefined,
         undefined,
         createMockCtx(),
       );
 
-      // Mark ALL phases as completed via tool_call events
-      const phaseOrder = [
-        "scout",
-        "plan",
-        "implement",
-        "review",
-        "test",
-        "userguide",
-        "proof",
-        "commit",
-      ];
-      for (const phase of phaseOrder) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
+      const ctx = createMockCtx();
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+      await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
+      await runCommitTool(tools, ctx);
 
       // Trigger agent_end
       const agentEndHandler = eventHandlers.get("agent_end");
       expect(agentEndHandler).toBeDefined();
-      await agentEndHandler?.({}, createMockCtx());
+      await agentEndHandler?.({}, ctx);
 
       // Verify: GET /sessions was called
       const getCall = mockHttpRequest.mock.calls.find(
@@ -402,85 +471,69 @@ describe("extension session naming (bd-10)", () => {
       );
       expect(getCall).toBeDefined();
 
-      // Verify: POST /sessions/sess-1/compact and /sessions/sess-2/compact were called
-      // (sess-1 and sess-2 start with belayd-bd-42-scout, sess-3 starts with plan)
+      // Verify: POST /sessions/sess-1/compact and /sessions/sess-2/compact were called.
       const compactCalls = mockHttpRequest.mock.calls.filter(
         (call: unknown[]) =>
           (call[0] as Record<string, unknown>).method === "POST" &&
           (call[0] as Record<string, unknown>).path?.toString().includes("/compact"),
       );
-      // Only scout sessions (sess-1, sess-2) should be compacted, not plan (sess-3)
-      // because compactTaskSessions only compacts completed phases, and scout is
-      // the only phase that used the session daemon (the others didn't create sessions).
-      // Actually, compactTaskSessions iterates over completedPhases and compacts all
-      // sessions matching the prefix for each phase. Since all 8 phases are completed,
-      // it will try to compact scout sessions (sess-1, sess-2), plan sessions (sess-3),
-      // and the other 4 phases (no matching sessions).
-      // So we expect at least 3 compact calls (scout: 2, plan: 1).
+      // scout matches sess-1 + sess-2, plan matches sess-3, commit matches none.
       expect(compactCalls.length).toBeGreaterThanOrEqual(3);
     });
 
     it("handles empty sessions list gracefully", async () => {
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, eventHandlers, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
       // Mock response: empty sessions list
       mockRequestResponses.addResponse(200, JSON.stringify({ sessions: [] }));
 
-      // Activate gate and complete all phases
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute("call-1", { taskId: "bd-1" }, undefined, undefined, createMockCtx());
+      await startTask?.execute(
+        "call-1",
+        { taskId: "bd-1", workflowType: "research" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
 
-      const phaseOrder = [
-        "scout",
-        "plan",
-        "implement",
-        "review",
-        "test",
-        "proof",
-        "userguide",
-        "commit",
-      ];
-      for (const phase of phaseOrder) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
+      const ctx = createMockCtx();
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+      await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
+      await runCommitTool(tools, ctx);
 
       const agentEndHandler = eventHandlers.get("agent_end");
-      await agentEndHandler?.({}, createMockCtx());
+      await agentEndHandler?.({}, ctx);
 
       // Should not throw even with empty sessions
       expect(true).toBe(true);
     });
 
     it("handles missing sessions field gracefully", async () => {
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, eventHandlers, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
       // Mock response: no sessions field
       mockRequestResponses.addResponse(200, JSON.stringify({}));
 
-      // Activate gate and complete all phases
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute("call-1", { taskId: "bd-1" }, undefined, undefined, createMockCtx());
+      await startTask?.execute(
+        "call-1",
+        { taskId: "bd-1", workflowType: "research" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
 
-      const phaseOrder = [
-        "scout",
-        "plan",
-        "implement",
-        "review",
-        "test",
-        "userguide",
-        "proof",
-        "commit",
-      ];
-      for (const phase of phaseOrder) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
+      const ctx = createMockCtx();
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+      await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
+      await runCommitTool(tools, ctx);
 
       const agentEndHandler = eventHandlers.get("agent_end");
-      await agentEndHandler?.({}, createMockCtx());
+      await agentEndHandler?.({}, ctx);
 
       // Should not throw even without sessions field
       expect(true).toBe(true);
@@ -502,7 +555,7 @@ describe("extension session naming (bd-10)", () => {
 
   describe("runQualityGate retry naming", () => {
     it("retries multiple times with unique -retry-N suffixes when the gate keeps failing", async () => {
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -518,10 +571,7 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Mark plan as completed (required before implement)
-      simulatePhaseToolCall(eventHandlers, "belayd_plan");
-
-      // Execute implement tool
+      // Execute implement tool — its gate retries now run in the background.
       const implement = tools.get("belayd_implement");
       await implement?.execute(
         "call-2",
@@ -534,12 +584,18 @@ describe("extension session naming (bd-10)", () => {
       // The quality gate (gateFullValidation) shells out to pnpm via exec.
       // Since we mocked exec to fail, the gate keeps failing, so the harness
       // retries until MAX_GATE_ATTEMPTS (10) passes: 1 initial + 9 retries.
+      await vi.waitFor(() => {
+        const retryCalls = mockSpawnAgentProcess.mock.calls.filter((call: unknown[]) => {
+          const opts = call[0] as Record<string, unknown>;
+          return typeof opts.sessionName === "string" && opts.sessionName.includes("-retry-");
+        });
+        expect(retryCalls).toHaveLength(9);
+      });
+
       const retryCalls = mockSpawnAgentProcess.mock.calls.filter((call: unknown[]) => {
         const opts = call[0] as Record<string, unknown>;
         return typeof opts.sessionName === "string" && opts.sessionName.includes("-retry-");
       });
-      expect(retryCalls).toHaveLength(9);
-
       const names = retryCalls.map(
         (call: unknown[]) => (call[0] as Record<string, unknown>).sessionName as string,
       );
@@ -589,7 +645,7 @@ describe("extension session naming (bd-10)", () => {
         sessionName: "mocked-userguide",
       });
 
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -603,22 +659,8 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Complete prior phases via tool_call events
-      for (const phase of ["scout", "plan", "implement", "review", "test"]) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
-
-      // Execute the userguide tool
-      const userguide = tools.get("belayd_userguide");
-      expect(userguide).toBeDefined();
-
-      await userguide?.execute(
-        "call-userguide",
-        { task: "Write user guide" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      // Execute the userguide tool and wait for its background run to finish.
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Now call commit with the taskId — if userGuideContent is set,
       // commit will try to write a notes file and call bd note.
@@ -672,7 +714,7 @@ describe("extension session naming (bd-10)", () => {
         sessionName: "mocked-userguide",
       });
 
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -686,19 +728,8 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Complete prior phases and execute userguide
-      for (const phase of ["scout", "plan", "implement", "review", "test"]) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
-
-      const userguide = tools.get("belayd_userguide");
-      await userguide?.execute(
-        "call-ug",
-        { task: "Write guide" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      // Complete userguide in the background before starting the next task.
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Start a new task — this should clear userGuideContent
       mockExec.mockClear();
@@ -753,7 +784,7 @@ describe("extension session naming (bd-10)", () => {
         sessionName: "mocked-userguide",
       });
 
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -767,19 +798,8 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Complete prior phases and execute userguide
-      for (const phase of ["scout", "plan", "implement", "review", "test"]) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
-
-      const userguide = tools.get("belayd_userguide");
-      await userguide?.execute(
-        "call-ug",
-        { task: "Write guide" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      // Complete userguide in the background before stopping the task.
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Stop the task — this should clear userGuideContent
       const stopTask = tools.get("belayd_stop_task");
@@ -857,7 +877,7 @@ describe("extension session naming (bd-10)", () => {
           sessionName: "mocked-ug-2",
         });
 
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -871,31 +891,9 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Complete prior phases
-      for (const phase of ["scout", "plan", "implement", "review", "test"]) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
-
-      // Execute userguide first time
-      const userguide = tools.get("belayd_userguide");
-      await userguide?.execute(
-        "call-ug-1",
-        { task: "First guide" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
-
-      // Execute userguide second time — tool_call marks it, then runs again
-      // We need to re-simulate the tool_call after the first run completed it
-      // Actually, markPhaseCompleted skips duplicates, but the tool executes anyway
-      await userguide?.execute(
-        "call-ug-2",
-        { task: "Second guide (should overwrite)" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      // Execute userguide twice; the second background run overwrites the first.
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Now call commit with taskId — should use the second (overwritten) content
       const commit = tools.get("belayd_commit");
@@ -940,7 +938,7 @@ describe("extension session naming (bd-10)", () => {
         sessionName: "mocked-userguide",
       });
 
-      const { api, tools, eventHandlers } = createMockPi();
+      const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
       factory(api);
 
@@ -954,18 +952,7 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      for (const phase of ["scout", "plan", "implement", "review", "test"]) {
-        simulatePhaseToolCall(eventHandlers, `belayd_${phase}`);
-      }
-
-      const userguide = tools.get("belayd_userguide");
-      await userguide?.execute(
-        "call-ug",
-        { task: "Write guide" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Stop without committing
       const stopTask = tools.get("belayd_stop_task");
@@ -974,6 +961,549 @@ describe("extension session naming (bd-10)", () => {
       // No execute should fail, no crash should occur
       expect(true).toBe(true);
     });
+  });
+});
+
+describe("non-blocking phase runs (bd-41)", () => {
+  afterEach(() => {
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess.mockResolvedValue({
+      content: [{ type: "text" as const, text: "done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked",
+    });
+    setExecToFail();
+  });
+
+  it("phase tool returns immediately and delivers a follow-up with run details", async () => {
+    const { api, tools, messages } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute(
+        "start",
+        { taskId: "bd-42", workflowType: "research" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
+
+    const result = (await tools
+      .get("belayd_scout")
+      ?.execute("scout", { task: "investigate" }, undefined, undefined, createMockCtx())) as {
+      content: Array<{ type: string; text: string }>;
+      details: { exitCode: number };
+    };
+
+    // Non-blocking: the tool resolves with a "started" message, not the spawn result.
+    expect(result.details.exitCode).toBe(0);
+    expect(result.content[0]?.text).toContain("run started in the background");
+    expect(result.content[0]?.text).toContain("Run ID:");
+    expect(result.content[0]?.text).toContain("belayd_status");
+
+    await vi.waitFor(() => {
+      const completion = messages.find((m) => m.customType === "belayd-run-complete");
+      expect(completion).toBeDefined();
+    });
+
+    const completion = messages.find((m) => m.customType === "belayd-run-complete");
+    expect(completion).toHaveProperty("options.deliverAs", "followUp");
+    expect(completion).toHaveProperty("options.triggerTurn", true);
+    expect(completion).toHaveProperty("details.runId");
+    expect(completion).toHaveProperty("details.phaseName", "scout");
+    expect(completion).toHaveProperty("details.taskId", "bd-42");
+    expect(completion).toHaveProperty("details.exitCode", 0);
+  });
+
+  it("blocks a second phase tool while a run is in flight, then allows it after the run settles", async () => {
+    const { api, tools, eventHandlers } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute(
+        "start",
+        { taskId: "bd-42", workflowType: "research" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
+
+    // Hold the scout run open so it stays in state.activeRuns.
+    let resolveScout: (value: unknown) => void = () => {};
+    mockSpawnAgentProcess.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveScout = resolve;
+      }),
+    );
+
+    await tools
+      .get("belayd_scout")
+      ?.execute("scout", { task: "investigate" }, undefined, undefined, createMockCtx());
+
+    const handler = eventHandlers.get("tool_call");
+    expect(handler).toBeDefined();
+
+    const abortInFlight = vi.fn();
+    const block = handler?.(
+      { toolName: "belayd_plan", abort: abortInFlight },
+      createMockCtx(),
+    ) as unknown as {
+      block?: boolean;
+      reason?: string;
+    };
+
+    expect(block).toHaveProperty("block", true);
+    expect(block.reason).toContain("belayd_status");
+    expect(abortInFlight).toHaveBeenCalledWith(
+      "phase-run-in-flight",
+      expect.stringContaining("belayd_status"),
+    );
+
+    // Let the held run finish; its watcher releases activeRuns and marks scout
+    // completed, so the next phase tool must now be allowed.
+    resolveScout({
+      content: [{ type: "text" as const, text: "scout done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked-scout",
+    });
+    await vi.waitFor(() => {
+      const abortAfterSettle = vi.fn();
+      const next = handler?.(
+        { toolName: "belayd_plan", abort: abortAfterSettle },
+        createMockCtx(),
+      ) as unknown as { block?: boolean; reason?: string };
+      expect(next).not.toHaveProperty("block");
+      expect(abortAfterSettle).not.toHaveBeenCalled();
+    });
+  });
+
+  it("a failed phase run lets the next phase proceed", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-failrun-"));
+    try {
+      const { api, tools, eventHandlers } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `failrun-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      mockSpawnAgentProcess.mockResolvedValueOnce({
+        content: [{ type: "text" as const, text: "scout crashed" }],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 1,
+        },
+        sessionName: "mocked-scout",
+      });
+
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+      await vi.waitFor(() => {
+        const runs = listRuns({ cwd });
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toHaveProperty("status", "failed");
+      });
+
+      const abort = vi.fn();
+      const handler = eventHandlers.get("tool_call");
+      expect(handler).toBeDefined();
+      const result = handler?.({ toolName: "belayd_plan", abort }, ctx) as unknown as {
+        block?: boolean;
+        reason?: string;
+      };
+
+      // The deadlock is gone: even though scout failed, the in-flight gate must
+      // not block a later phase tool with phase-run-in-flight.
+      expect(abort).not.toHaveBeenCalledWith("phase-run-in-flight", expect.anything());
+      expect(result.reason ?? "").not.toContain("in progress");
+
+      // A failed run must not persist its phase as completed.
+      const persisted = readWorkflowStateFromDisk({ cwd });
+      expect(persisted?.completedPhaseNames ?? []).not.toContain("scout");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("starting a new task aborts an in-flight run", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-abort-"));
+    try {
+      const { api, tools } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `abort-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      let releaseRun: (value: unknown) => void = () => {};
+      mockSpawnAgentProcess.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseRun = resolve;
+        }),
+      );
+
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      });
+      const options = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+      const capturedSignal = options.signal as AbortSignal | undefined;
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-88", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      expect(capturedSignal?.aborted).toBe(true);
+
+      // Release the held run so no dangling promise leaks out of the test.
+      releaseRun({
+        content: [{ type: "text" as const, text: "scout done" }],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 0,
+        },
+        sessionName: "mocked-scout",
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("bd/read are allowed while a run is in flight", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-gated-"));
+    try {
+      const { api, tools, eventHandlers } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `gated-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      let releaseRun: (value: unknown) => void = () => {};
+      mockSpawnAgentProcess.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseRun = resolve;
+        }),
+      );
+
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+      const handler = eventHandlers.get("tool_call");
+      expect(handler).toBeDefined();
+
+      for (const toolName of ["bd", "read"]) {
+        const abort = vi.fn();
+        const result = handler?.({ toolName, abort }, ctx) as unknown as {
+          block?: boolean;
+          reason?: string;
+        };
+        expect(result).not.toHaveProperty("block");
+        expect(abort).not.toHaveBeenCalled();
+      }
+
+      releaseRun({
+        content: [{ type: "text" as const, text: "scout done" }],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 0,
+        },
+        sessionName: "mocked-scout",
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("belayd_status reports active runs and manifest history", async () => {
+    const { api, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute(
+        "start",
+        { taskId: "bd-42", workflowType: "research" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
+
+    // Hold scout open so it shows up in the active-runs section.
+    let resolveScout: (value: unknown) => void = () => {};
+    mockSpawnAgentProcess.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveScout = resolve;
+      }),
+    );
+    await tools
+      .get("belayd_scout")
+      ?.execute("scout", { task: "investigate" }, undefined, undefined, createMockCtx());
+
+    const status = (await tools
+      .get("belayd_status")
+      ?.execute("status", {}, undefined, undefined, createMockCtx())) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    const text = status.content[0]?.text ?? "";
+    expect(text).toContain("Active runs");
+    expect(text).toContain("scout");
+
+    resolveScout({
+      content: [{ type: "text" as const, text: "scout done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked-scout",
+    });
+    await vi.waitFor(() => {
+      expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("belayd_status reports persisted run history after a run settles", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-status-history-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `status-history-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+
+      const completion = messages.find((m) => m.customType === "belayd-run-complete");
+      expect(completion).toBeDefined();
+      const runId = (completion?.details as { runId?: string } | undefined)?.runId;
+      expect(runId).toBeTruthy();
+
+      const status = (await tools
+        .get("belayd_status")
+        ?.execute("status", {}, undefined, undefined, ctx)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const text = status.content[0]?.text ?? "";
+
+      // No run is in flight anymore: the active list must be empty.
+      expect(text).toContain("Active runs");
+      expect(text).toContain("(none)");
+
+      // The settled run is listed in the manifest-backed history table.
+      expect(text).toContain("Run history");
+      expect(text).toContain("scout");
+      expect(text).toContain("completed");
+      if (runId !== undefined) {
+        expect(text).toContain(runId);
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("a signal-killed run (exitCode 128) is failed, not phase-completed, and delivered exactly once", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-signalkill-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `signalkill-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      // collectSpawnResult maps a signal-killed child to exitCode 128; the
+      // mocked spawn replays that settled result.
+      mockSpawnAgentProcess.mockResolvedValueOnce({
+        content: [{ type: "text" as const, text: "killed by signal" }],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 128,
+        },
+        sessionName: "mocked-scout",
+      });
+
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+      await vi.waitFor(() => {
+        const runs = listRuns({ cwd });
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toHaveProperty("status", "failed");
+        expect(runs[0]).toHaveProperty("exitCode", 128);
+      });
+
+      // Exactly one failure follow-up is delivered for the runId, and no more
+      // arrive after the watcher has fully settled.
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(1);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(runCompletionCount(messages)).toBe(1);
+
+      const completion = messages.find((m) => m.customType === "belayd-run-complete");
+      expect(completion?.content).toContain("failed");
+      expect(completion?.content).toContain("❌");
+      expect(completion).toHaveProperty("details.exitCode", 128);
+
+      // A signal-killed run must never mark its phase completed.
+      const persisted = readWorkflowStateFromDisk({ cwd });
+      expect(persisted?.completedPhaseNames ?? []).not.toContain("scout");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("an aborted in-flight run (task switch) neither delivers nor marks its phase complete", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-abort-nodeliver-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `abort-nodeliver-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      let releaseScout: (value: unknown) => void = () => {};
+      mockSpawnAgentProcess.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseScout = resolve;
+        }),
+      );
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      });
+
+      // Starting a new task aborts and clears the in-flight run.
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start-2",
+          { taskId: "bd-88", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      // Release with a signal-killed shape: abort → SIGTERM → exitCode 128.
+      releaseScout({
+        content: [{ type: "text" as const, text: "aborted" }],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 128,
+        },
+        sessionName: "mocked-scout",
+      });
+
+      // The manifest stays "running": persistStatus was skipped because the
+      // task switched, so the abandoned run is never recorded as completed.
+      await vi.waitFor(() => {
+        const runs = listRuns({ cwd });
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toHaveProperty("status", "running");
+      });
+
+      // bd-40 semantics: the next session start flips the stale "running"
+      // manifest to "interrupted".
+      const interrupted = scanForInterruptedRuns({ cwd });
+      expect(interrupted).toHaveLength(1);
+      expect(interrupted[0]).toHaveProperty("status", "interrupted");
+
+      // Must NOT deliver a follow-up for the abandoned task.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(runCompletionCount(messages)).toBe(0);
+
+      // And scout must not leak into the new task's completed phase list.
+      const persisted = readWorkflowStateFromDisk({ cwd });
+      expect(persisted).toHaveProperty("taskId", "bd-88");
+      expect(persisted?.completedPhaseNames ?? []).not.toContain("scout");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1302,19 +1832,13 @@ describe("session_start resume from disk (bd-40)", () => {
 
   it("persists a completed phase to workflow.json only after its run succeeds (success path)", async () => {
     const cwd = freshWorktree();
-    const { tools, eventHandlers } = await bootWithCwd(cwd);
+    const { tools } = await bootWithCwd(cwd);
     const ctx = createResumeCtx({ cwd });
 
     // Fresh start_task writes an empty completed-phase state to disk.
     await tools
       .get("belayd_start_task")
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
-
-    // The real pi flow marks the phase in-memory at tool_call time, then runs
-    // the phase tool. Reproduce that ordering so persistRunStatus sees scout.
-    // Fire the tool_call event against the same ctx the tool executes under
-    // so the in-memory mark and the disk write share one SessionState.
-    await eventHandlers.get("tool_call")?.({ toolName: "belayd_scout", abort: vi.fn() }, ctx);
 
     mockSpawnAgentProcess.mockResolvedValueOnce({
       content: [{ type: "text" as const, text: "scout done" }],
@@ -1326,14 +1850,16 @@ describe("session_start resume from disk (bd-40)", () => {
       sessionName: "mocked-scout",
     });
 
+    // The phase tool now returns immediately; its completion watcher persists
+    // the completed phase in the background.
     await tools
       .get("belayd_scout")
       ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
 
-    // A successful run persists scout to workflow.json AND marks the run
-    // manifest completed.
-    const persisted = readWorkflowStateFromDisk({ cwd });
-    expect(persisted).toHaveProperty("completedPhaseNames", ["scout"]);
+    await vi.waitFor(() => {
+      const persisted = readWorkflowStateFromDisk({ cwd });
+      expect(persisted).toHaveProperty("completedPhaseNames", ["scout"]);
+    });
 
     const runs = listRuns({ cwd });
     expect(runs).toHaveLength(1);
@@ -1344,16 +1870,12 @@ describe("session_start resume from disk (bd-40)", () => {
 
   it("does NOT persist a failed phase to workflow.json (failure path)", async () => {
     const cwd = freshWorktree();
-    const { tools, eventHandlers } = await bootWithCwd(cwd);
+    const { tools } = await bootWithCwd(cwd);
     const ctx = createResumeCtx({ cwd });
 
     await tools
       .get("belayd_start_task")
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
-
-    // tool_call marks scout in-memory; the marker must share the tool's
-    // ctx/state so the (skipped) disk write sees the same SessionState.
-    await eventHandlers.get("tool_call")?.({ toolName: "belayd_scout", abort: vi.fn() }, ctx);
 
     mockSpawnAgentProcess.mockResolvedValueOnce({
       content: [{ type: "text" as const, text: "scout crashed" }],
@@ -1369,15 +1891,19 @@ describe("session_start resume from disk (bd-40)", () => {
       .get("belayd_scout")
       ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
 
-    // The in-memory list was marked at tool_call time, but disk must NOT record
-    // scout — a resume re-runs the failed phase instead of skipping it.
+    // The failed run's watcher must NOT persist scout to disk.
+    await vi.waitFor(() => {
+      const runs = listRuns({ cwd });
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toHaveProperty("status", "failed");
+    });
+
     const persisted = readWorkflowStateFromDisk({ cwd });
     expect(persisted).toHaveProperty("completedPhaseNames", []);
 
     const runs = listRuns({ cwd });
     expect(runs).toHaveLength(1);
     expect(runs[0]).toHaveProperty("phase", "scout");
-    expect(runs[0]).toHaveProperty("status", "failed");
     expect(runs[0]).toHaveProperty("exitCode", 1);
   });
 });

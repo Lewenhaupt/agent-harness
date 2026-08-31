@@ -28,6 +28,7 @@ import type {
   AgentDefinition,
   Phase,
   QualityGate,
+  RunHandle,
   SpawnResult,
   WorkflowSubType,
 } from "../src/index.js";
@@ -44,14 +45,17 @@ import {
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
+  listRuns,
   markPhaseCompleted,
   RunStatus,
   resolveQualityGate,
   resolveWorkflowType,
   setupWorktree,
   spawnAgentWithFallback,
+  spawnDetachedRun,
   validateBdCommand,
   WORKFLOW_REGISTRY,
+  watchRunCompletion,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
 import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
@@ -79,6 +83,8 @@ type SessionState = {
   phaseOrder: string[];
   optionalPhases: readonly string[];
   userGuideContent?: string;
+  deliveredRunIds: Set<string>;
+  activeRuns: Map<string, { handle: RunHandle; abortController: AbortController }>;
 };
 
 const sessionStates = new Map<string, SessionState>();
@@ -102,10 +108,86 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
       workflowType: "feature",
       phaseOrder: getPhasesForType("feature"),
       optionalPhases: WORKFLOW_REGISTRY.feature.optionalPhases ?? [],
+      deliveredRunIds: new Set(),
+      activeRuns: new Map(),
     };
     sessionStates.set(id, state);
   }
   return state;
+}
+
+interface ToolCallGateEvent {
+  toolName: string;
+}
+
+/** Abort a tool call when the event exposes pi's optional abort hook. */
+function abortToolCall(event: unknown, code: string, reason: string): void {
+  const abort = (event as { abort?: (code: string, reason: string) => void }).abort;
+  if (typeof abort === "function") {
+    abort(code, reason);
+  }
+}
+
+/**
+ * Evaluate the process gate for a tool call. Extracted from the `tool_call`
+ * hook so the two blocking branches (in-flight run and out-of-order phase)
+ * stay flat and the hook stays below the complexity limit.
+ */
+function evaluateToolCallGate(
+  event: ToolCallGateEvent,
+  state: SessionState,
+): { block?: boolean; reason?: string } {
+  const toolName = event.toolName;
+
+  // While a background phase run is active, block starting another phase
+  // (or the commit) — completion is delivered asynchronously, so the
+  // orchestrator must wait for that follow-up instead of racing ahead.
+  // Checked before phase-order so the reason names the in-flight run.
+  const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
+  const isPhaseRunTarget = state.phaseOrder.includes(toolBase) || toolBase === "commit";
+  if (state.activeRuns.size > 0 && isPhaseRunTarget) {
+    const activeRunIds = [...state.activeRuns.keys()].join(", ");
+    const reason =
+      `A phase run is already in progress (run ${activeRunIds}). ` +
+      `Wait for its follow-up result, or check progress with belayd_status.`;
+    abortToolCall(event, "phase-run-in-flight", reason);
+    return { block: true, reason };
+  }
+
+  const check = checkToolAllowed(
+    toolName,
+    state.completedPhaseNames,
+    state.gateActive,
+    state.phaseOrder,
+    state.workflowType,
+    state.optionalPhases,
+  );
+  if (!check.allowed) {
+    abortToolCall(event, "phase-order-blocked", check.reason ?? "Phase order violation");
+    return { block: true, reason: check.reason };
+  }
+
+  return {};
+}
+
+/** Abort every active background run, then drop their handles. */
+function abortActiveRuns(state: SessionState): void {
+  for (const { abortController } of state.activeRuns.values()) {
+    abortController.abort();
+  }
+  state.activeRuns.clear();
+}
+
+/** Forget delivered-run and active-run bookkeeping without aborting anything. */
+function resetRunTracking(state: SessionState): void {
+  state.deliveredRunIds.clear();
+  state.activeRuns.clear();
+}
+
+/** Abort every active background run, then forget run bookkeeping. */
+function abortAndResetRunTracking(state: SessionState): void {
+  abortActiveRuns(state);
+  state.deliveredRunIds.clear();
 }
 
 /**
@@ -201,6 +283,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     ...ALL_PHASE_TOOLS,
     "belayd_start_task",
     "belayd_stop_task",
+    "belayd_status",
     "bd",
     "read",
     "grep",
@@ -239,6 +322,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.phaseOrder = getPhasesForType(state.workflowType);
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
     state.userGuideContent = undefined;
+    abortAndResetRunTracking(state);
     enableGateTools(state);
 
     // Reconcile with disk: resume a crashed workflow's completed phases, or
@@ -405,6 +489,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       task: `Previous attempt failed quality gate:\n${feedback}\n\nFix the issues and retry.`,
       cwd: options.cwd,
       signal: options.signal,
+      detached: true,
       sessionName: options.sessionName
         ? `${options.sessionName}-retry-${options.attempt}`
         : undefined,
@@ -788,6 +873,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.gateActive = false;
     state.completedPhaseNames = [];
     state.currentTaskId = "";
+    resetRunTracking(state);
     restoreFullTools(state);
 
     // Sub-agents have "-sub-" in their session name (set by computeSubagentSessionName).
@@ -801,6 +887,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", (_event, ctx) => {
     const id = ctx.sessionManager.getSessionId();
+    const state = sessionStates.get(id);
+    if (state) {
+      // In-flight background runs must not outlive their session.
+      abortActiveRuns(state);
+    }
     sessionStates.delete(id);
   });
 
@@ -864,15 +955,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (content) state.userGuideContent = content;
   }
 
-  /** Build the failure result returned when a phase agent cannot be spawned. */
-  function agentFailureResult(err: unknown): SpawnResult {
-    const message = err instanceof Error ? err.message : "Agent process failed";
-    return {
-      content: [{ type: "text" as const, text: message }],
-      details: { messages: [], usage: emptyUsage(), exitCode: 1 },
-    };
-  }
-
   // ── Map agent tool names to phase names ────────────────────────────
   const AGENT_TO_PHASE: Record<string, string> = {
     "belayd-planner": "plan",
@@ -893,8 +975,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     task: string;
     cwd?: string;
   }
-
-  type PhaseRunOutcome = { ok: true; result: SpawnResult } | { ok: false; result: SpawnResult };
 
   /** Persist the "running" manifest so a mid-phase crash is resumable. */
   function persistRunningManifest(options: {
@@ -924,16 +1004,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
-  /** Spawn the phase agent and run its quality gate. */
-  async function runPhaseAgent(
+  /**
+   * Start a phase run in the background and return its handle immediately.
+   *
+   * The run owns its abort signal — the tool-call signal belongs to the
+   * (now non-blocking) tool response and must not cancel the background run.
+   */
+  function startPhaseRun(
     agent: AgentDefinition,
     phaseName: string,
     params: PhaseToolParams,
-    signal: AbortSignal | undefined,
     state: SessionState,
     effectiveCwd: string | undefined,
     runId: string,
-  ): Promise<PhaseRunOutcome> {
+  ): { handle: RunHandle; sessionName: string } {
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
     const effectiveModel = overrides?.model ?? agent.model;
     const effectiveTools = overrides?.tools ?? agent.tools;
@@ -949,38 +1033,115 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       model: effectiveModel,
     });
 
-    try {
-      const { result, attempts } = await spawnAgentWithFallback({
+    const abortController = new AbortController();
+
+    // Guard watcher callbacks against a task switch: once a new
+    // belayd_start_task (or stop) aborts and clears these runs, their
+    // still-pending promises must not mutate the new task's state or deliver
+    // the old task's follow-up.
+    const taskIdAtStart = state.currentTaskId;
+    const runStillRelevant = (): boolean =>
+      state.gateActive && state.currentTaskId === taskIdAtStart;
+
+    const spawnAgent = (): Promise<SpawnResult> =>
+      spawnAgentWithFallback({
         model: effectiveModel,
         tools: effectiveTools,
         systemPrompt: effectiveSystemPrompt,
         task: params.task,
         sessionName: subagentSessionName,
         cwd: effectiveCwd,
-        signal,
+        signal: abortController.signal,
+        // Background runs use detached:true so a terminal Ctrl-C in the
+        // orchestrator does not kill the sub-agent; explicit cancellation goes
+        // through this run's AbortController.
+        detached: true,
         cooldownStore: modelCooldown,
         enabled: modelFallbackEnabled,
-      });
-      const spawnedResult = withFallbackNote(result, attempts);
+      }).then((r) => withFallbackNote(r.result, r.attempts));
 
-      const gateResult = await runQualityGate(
+    const runGate = (result: SpawnResult): Promise<SpawnResult> =>
+      runQualityGate(
         agent,
-        spawnedResult,
+        result,
         { task: params.task, cwd: effectiveCwd },
         state.workflowType,
         phaseName,
-        signal,
+        abortController.signal,
         effectiveModel,
         effectiveTools,
         subagentSessionName,
-      );
-      // Use the retried result if available, otherwise use the original result
-      const finalResult = gateResult ?? spawnedResult;
-      captureUserGuideContent(phaseName, finalResult, state);
-      return { ok: true, result: finalResult };
-    } catch (err) {
-      return { ok: false, result: agentFailureResult(err) };
-    }
+      ).then((gateResult) => gateResult ?? result);
+
+    const handle = spawnDetachedRun({
+      runId,
+      phaseName,
+      startedAtInMs: Date.now(),
+      spawnAgent,
+      runGate,
+    });
+
+    state.activeRuns.set(runId, { handle, abortController });
+
+    watchRunCompletion(handle, {
+      onSettled: (info) => {
+        // A failed run must still release its activeRuns entry; skip only when
+        // the task has already switched (the new task cleared activeRuns).
+        if (runStillRelevant()) state.activeRuns.delete(info.runId);
+      },
+      persistStatus: (info) => {
+        // An aborted/abandoned run's manifest stays "running" and is flipped
+        // to "interrupted" by scanForInterruptedRuns on the next session start
+        // (bd-40 semantics) — never persist completion under the wrong task.
+        if (!runStillRelevant()) return;
+        persistRunStatus({
+          state,
+          manifestCwd: effectiveCwd ?? process.cwd(),
+          runId: info.runId,
+          status: info.success ? RunStatus.Completed : RunStatus.Failed,
+          exitCode: info.result.details.exitCode,
+        });
+      },
+      onPhaseComplete: (info) => {
+        if (!runStillRelevant()) return;
+        state.completedPhaseNames = markPhaseCompleted(
+          getPhaseToolName(info.phaseName),
+          state.completedPhaseNames,
+          state.phaseOrder,
+        );
+        captureUserGuideContent(info.phaseName, info.result, state);
+      },
+      deliver: (delivery) => {
+        if (!runStillRelevant()) return;
+        const text = delivery.result.content?.[0]?.text ?? "";
+        const header = delivery.success
+          ? `✅ **${delivery.phaseName} phase completed** (run \`${delivery.runId}\`)`
+          : `❌ **${delivery.phaseName} phase failed** (run \`${delivery.runId}\`)`;
+        const failureGuidance = delivery.success
+          ? ""
+          : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
+        pi.sendMessage(
+          {
+            customType: "belayd-run-complete",
+            content: `${header}\n\n${text}${failureGuidance}`,
+            display: true,
+            details: {
+              runId: delivery.runId,
+              phaseName: delivery.phaseName,
+              taskId: state.currentTaskId,
+              exitCode: delivery.result.details.exitCode,
+            },
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      },
+      isDelivered: (id) => state.deliveredRunIds.has(id),
+      markDelivered: (id) => {
+        state.deliveredRunIds.add(id);
+      },
+    });
+
+    return { handle, sessionName: subagentSessionName };
   }
 
   /** Persist the completed phase list (best-effort, after a phase succeeds). */
@@ -1013,9 +1174,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       console.warn(`[belayd-harness] failed to update run manifest: ${statusResult.error}`);
     }
     if (options.status === RunStatus.Completed) {
-      // The in-memory phase list is marked at tool_call time, but disk only
-      // records a phase once its run actually completed — this is what makes
-      // resume re-run an interrupted phase. Never persist on "failed".
+      // The in-memory phase list is marked in the run watcher's
+      // onPhaseComplete, and disk only records a phase once its run actually
+      // completed — this is what makes resume re-run an interrupted phase.
+      // Never persist on "failed".
       persistCompletedPhases({
         cwd: options.manifestCwd,
         completedPhaseNames: options.state.completedPhaseNames,
@@ -1036,35 +1198,75 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         task: Type.String({ description: "Task to delegate to this agent" }),
         cwd: Type.Optional(Type.String({ description: "Working directory" })),
       }),
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const state = getSessionState(ctx);
         const ctxWithCwd = ctx as PhaseToolContext;
         const effectiveCwd = params.cwd ?? ctxWithCwd.cwd;
-        const manifestCwd = effectiveCwd ?? ctxWithCwd.cwd ?? process.cwd();
         const runId = generateShortRunId();
-        const outcome = await runPhaseAgent(
-          agent,
-          phaseName,
-          params,
-          signal,
-          state,
-          effectiveCwd,
-          runId,
-        );
-        persistRunStatus({
-          state,
-          manifestCwd,
-          runId,
-          status:
-            outcome.ok && outcome.result.details.exitCode === 0
-              ? RunStatus.Completed
-              : RunStatus.Failed,
-          exitCode: outcome.ok ? outcome.result.details.exitCode : 1,
-        });
-        return outcome.result;
+        const { sessionName } = startPhaseRun(agent, phaseName, params, state, effectiveCwd, runId);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `belayd ${phaseName} run started in the background.\n\n` +
+                `Run ID: ${runId}\nSession: ${sessionName}\n` +
+                `The result will be delivered as a follow-up message when the run (and its quality gate) completes.\n` +
+                `Use belayd_status to check progress.`,
+            },
+          ],
+          details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+        };
       },
     });
   }
+
+  // ── Register status tool ─────────────────────────────────────────────
+  pi.registerTool({
+    name: "belayd_status",
+    label: "Belayd Status",
+    description: "Show Belayd process state, active background runs, and run history.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const state = getSessionState(ctx);
+      const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+      const sections: string[] = [];
+
+      sections.push(
+        state.gateActive
+          ? formatProcessState(state.completedPhaseNames, state.currentTaskId, state.phaseOrder)
+          : "Belayd process is inactive.",
+      );
+
+      const activeLines = ["**Active runs**"];
+      if (state.activeRuns.size > 0) {
+        for (const [runId, { handle }] of state.activeRuns) {
+          activeLines.push(`- \`${runId}\` — ${handle.phaseName} (${handle.status})`);
+        }
+      } else {
+        activeLines.push("(none)");
+      }
+      sections.push(activeLines.join("\n"));
+
+      const runs = listRuns({ cwd });
+      if (runs.length > 0) {
+        const lines = ["**Run history**", ""];
+        lines.push("| runId | phase | status | startedAt | exitCode | model |");
+        lines.push("| --- | --- | --- | --- | --- | --- |");
+        for (const run of runs) {
+          lines.push(
+            `| \`${run.runId}\` | ${run.phase} | ${run.status} | ${new Date(run.startedAt).toISOString()} | ${run.exitCode ?? ""} | ${run.model ?? ""} |`,
+          );
+        }
+        sections.push(lines.join("\n"));
+      }
+
+      return {
+        content: [{ type: "text" as const, text: sections.join("\n\n") }],
+        details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+      };
+    },
+  });
 
   // ── Register bd (beads) tool ─────────────────────────────────────────
   // The gate disables bash so editing tools can't be abused, but task
@@ -1186,6 +1388,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
+
+      // In-flight background runs must not survive task teardown.
+      abortAndResetRunTracking(state);
 
       // Restore original cwd if we're in a worktree
       const persisted = readWorkflowState({ cwd: ctx.cwd });
@@ -1409,6 +1614,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       status: options.status,
     });
     if (options.status === RunStatus.Completed) {
+      // Commit is no longer marked at tool_call time (phase runs are
+      // non-blocking), so record it here for the agent_end workflow-complete
+      // check to fire.
+      options.state.completedPhaseNames = markPhaseCompleted(
+        "belayd_commit",
+        options.state.completedPhaseNames,
+        options.state.phaseOrder,
+      );
       persistCompletedPhases({
         cwd: options.cwd,
         completedPhaseNames: options.state.completedPhaseNames,
@@ -1503,43 +1716,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     const state = getSessionState(ctx);
     if (!state.gateActive) return {};
-
-    const toolName = event.toolName;
-    const check = checkToolAllowed(
-      toolName,
-      state.completedPhaseNames,
-      state.gateActive,
-      state.phaseOrder,
-      state.workflowType,
-      state.optionalPhases,
-    );
-    if (!check.allowed) {
-      if (
-        typeof (event as unknown as { abort?: (code: string, reason: string) => void }).abort ===
-        "function"
-      ) {
-        (event as unknown as { abort: (code: string, reason: string) => void }).abort(
-          "phase-order-blocked",
-          check.reason ?? "Phase order violation",
-        );
-      }
-      return { block: true, reason: check.reason };
-    }
-
-    // Check if the tool is a phase tool in the current workflow's phase order
-    const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
-    if (state.phaseOrder.includes(toolBase)) {
-      state.completedPhaseNames = markPhaseCompleted(
-        toolName,
-        state.completedPhaseNames,
-        state.phaseOrder,
-      );
-      // Phases are persisted in persistRunStatus / the commit tool only AFTER
-      // the phase actually succeeds, so a mid-phase crash re-runs the phase
-      // instead of skipping lost work.
-    }
-
-    return {};
+    return evaluateToolCallGate(event, state);
   });
 
   // ── Uncommitted-files notification ────────────────────────────────

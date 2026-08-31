@@ -3,9 +3,16 @@
  *
  * Spawns a separate pi process with the agent's configuration, streams JSON
  * events back to the caller, and tracks usage statistics.
+ *
+ * The spawn path is split into three stages so callers can launch a child in
+ * the background and collect its result later:
+ *
+ * - `buildSpawnArgs` resolves everything needed before the process starts.
+ * - `launchAgentProcess` starts the child and returns a handle immediately.
+ * - `collectSpawnResult` resolves once the child exits (or fails to start).
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,14 +22,40 @@ import { setupWorktree } from "./worktree.js";
 /** Cached path to the pi binary, resolved once. */
 let cachedPiBinary: string | undefined;
 
+/** Everything needed to launch the child, resolved up front. */
+export interface BuiltSpawnArgs {
+  args: string[];
+  sessionId: string;
+  piBinary: string;
+  worktreePath?: string;
+  tempDir?: string;
+  tempFile?: string;
+}
+
+/** Mutable stream state filled in as the child emits JSONL on stdout/stderr. */
+export interface SpawnStream {
+  messages: unknown[];
+  usage: SpawnUsage;
+  stderr: string;
+}
+
+/** A running (or runnable) child process plus the state needed to collect it. */
+export interface AgentProcessHandle {
+  proc: ChildProcess;
+  stream: SpawnStream;
+  built: BuiltSpawnArgs;
+  cleanup: () => void;
+}
+
 /**
- * Spawn an isolated pi process for an agent and return structured results.
+ * Build the spawn arguments and temp artifacts for an agent run.
  *
- * @param options - Agent configuration and task
- * @returns Structured result with content and usage details
+ * Worktree setup, session-id fallback, argv construction, system-prompt temp
+ * file, and pi-binary resolution all happen here so `launchAgentProcess` can
+ * spawn synchronously.
  */
-export async function spawnAgentProcess(options: SpawnOptions): Promise<SpawnResult> {
-  const { model, tools, systemPrompt, task, sessionName, cwd, signal, worktree } = options;
+export function buildSpawnArgs(options: SpawnOptions): BuiltSpawnArgs {
+  const { model, tools, systemPrompt, task, sessionName, cwd, worktree } = options;
 
   // If worktree isolation is requested, set it up before spawning
   let worktreePath: string | undefined;
@@ -58,110 +91,178 @@ export async function spawnAgentProcess(options: SpawnOptions): Promise<SpawnRes
     // Add the task as the prompt argument
     args.push(task);
 
-    // Resolve pi binary
-    const piBinary = resolvePiBinary();
-
-    // Usage tracking
-    const usage: SpawnUsage = {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      cost: 0,
-      turns: 0,
+    return {
+      args,
+      sessionId: effectiveSessionId,
+      piBinary: resolvePiBinary(),
+      worktreePath,
+      tempDir: tmpDir,
+      tempFile: tmpFile,
     };
-    const messages: unknown[] = [];
-    let usedModel: string | undefined;
-
-    // Spawn the process
-    const result = await new Promise<SpawnResult>((resolve, reject) => {
-      const proc = spawn(piBinary, args, {
-        cwd: worktreePath ?? cwd ?? process.cwd(),
-        stdio: ["ignore", "pipe", "pipe"],
-        shell: false,
-      });
-
-      let buffer = "";
-      let stderr = "";
-      let exitCode = 0;
-      let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
-
-      proc.stdout.on("data", (data: Buffer) => {
-        buffer = processChunk(data, buffer, messages, usage);
-      });
-
-      // Drain stderr to prevent deadlock
-      proc.stderr.on("data", (data: Buffer) => {
-        stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        // Clear SIGKILL backup timer if process exited normally
-        if (sigkillTimer) clearTimeout(sigkillTimer);
-
-        // Process remaining buffer
-        flushBuffer(buffer, messages, usage);
-
-        exitCode = code ?? 0;
-        usedModel = extractFinalMessages(messages);
-
-        const finalContent = extractFinalContent(messages);
-
-        resolve({
-          content: [{ type: "text" as const, text: finalContent || "(no output)" }],
-          details: {
-            messages,
-            usage,
-            exitCode,
-            model: usedModel,
-            stderr: stderr || undefined,
-          },
-          worktreePath,
-          sessionName: effectiveSessionId,
-        });
-      });
-
-      proc.on("error", (err) => {
-        reject(new Error(`Failed to spawn pi: ${err.message}`));
-      });
-
-      // Handle abort signal
-      if (signal) {
-        if (signal.aborted) {
-          proc.kill("SIGTERM");
-        } else {
-          signal.addEventListener(
-            "abort",
-            () => {
-              proc.kill("SIGTERM");
-              sigkillTimer = setTimeout(() => {
-                if (!proc.killed) proc.kill("SIGKILL");
-              }, 5000);
-            },
-            { once: true },
-          );
-        }
-      }
-    });
-
-    return result;
-  } finally {
-    // Clean up temp files
-    if (tmpFile) {
+  } catch (error) {
+    // Don't leak a partially created temp dir when the prompt write fails.
+    if (tmpFile !== undefined) {
       try {
         unlinkSync(tmpFile);
       } catch {
         /* ignore */
       }
     }
-    if (tmpDir) {
+    if (tmpDir !== undefined) {
       try {
         rmdirSync(tmpDir);
       } catch {
         /* ignore */
       }
     }
+    throw error;
   }
+}
+
+/**
+ * Launch the child process and start streaming its output.
+ *
+ * Returns a handle synchronously; callers collect the final result with
+ * `collectSpawnResult`. The remaining partial stdout buffer is flushed on
+ * `close` here (before `collectSpawnResult` resolves) so the two stages share
+ * one source of truth in `handle.stream`.
+ */
+export function launchAgentProcess(
+  options: SpawnOptions,
+  built: BuiltSpawnArgs,
+): AgentProcessHandle {
+  const stream: SpawnStream = {
+    messages: [],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+    stderr: "",
+  };
+
+  // We intentionally do NOT call proc.unref(): a background phase run must keep
+  // the parent pi process alive until it completes, otherwise the run would be
+  // killed when the tool-call turn finishes.
+  const proc = spawn(built.piBinary, built.args, {
+    cwd: built.worktreePath ?? options.cwd ?? process.cwd(),
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+    detached: options.detached === true,
+  });
+
+  let buffer = "";
+  let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
+
+  proc.stdout.on("data", (data: Buffer) => {
+    buffer = processChunk(data, buffer, stream.messages, stream.usage);
+  });
+
+  // Drain stderr to prevent deadlock
+  proc.stderr.on("data", (data: Buffer) => {
+    stream.stderr += data.toString();
+  });
+
+  proc.on("close", () => {
+    // Clear SIGKILL backup timer if process exited normally
+    if (sigkillTimer) clearTimeout(sigkillTimer);
+
+    // Process remaining buffer before collectSpawnResult reads the stream
+    flushBuffer(buffer, stream.messages, stream.usage);
+  });
+
+  // Handle abort signal
+  if (options.signal) {
+    if (options.signal.aborted) {
+      proc.kill("SIGTERM");
+    } else {
+      options.signal.addEventListener(
+        "abort",
+        () => {
+          proc.kill("SIGTERM");
+          sigkillTimer = setTimeout(() => {
+            if (!proc.killed) proc.kill("SIGKILL");
+          }, 5000);
+        },
+        { once: true },
+      );
+    }
+  }
+
+  let cleaned = false;
+  const cleanup = (): void => {
+    if (cleaned) return;
+    cleaned = true;
+    if (built.tempFile !== undefined) {
+      try {
+        unlinkSync(built.tempFile);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (built.tempDir !== undefined) {
+      try {
+        rmdirSync(built.tempDir);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  return { proc, stream, built, cleanup };
+}
+
+/**
+ * Resolve once the launched process exits (or fails to start).
+ *
+ * The `close` listener registered by `launchAgentProcess` flushes any partial
+ * stdout line before this promise resolves, so the stream is already final
+ * here. Cleanup runs exactly once, on both success and failure.
+ */
+export function collectSpawnResult(handle: AgentProcessHandle): Promise<SpawnResult> {
+  return new Promise<SpawnResult>((resolve, reject) => {
+    let settled = false;
+
+    handle.proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Failed to spawn pi: ${err.message}`));
+    });
+
+    handle.proc.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+
+      const messages = handle.stream.messages;
+      const usedModel = extractFinalMessages(messages);
+      const finalContent = extractFinalContent(messages);
+
+      resolve({
+        content: [{ type: "text" as const, text: finalContent || "(no output)" }],
+        details: {
+          messages,
+          usage: handle.stream.usage,
+          // A signal-killed child (e.g. aborted run) must read as a failure,
+          // never as exitCode 0 success.
+          exitCode: code ?? (signal ? 128 : 0),
+          model: usedModel,
+          stderr: handle.stream.stderr || undefined,
+        },
+        worktreePath: handle.built.worktreePath,
+        sessionName: handle.built.sessionId,
+      });
+    });
+  }).finally(() => {
+    handle.cleanup();
+  });
+}
+
+/**
+ * Spawn an isolated pi process for an agent and return structured results.
+ *
+ * @param options - Agent configuration and task
+ * @returns Structured result with content and usage details
+ */
+export async function spawnAgentProcess(options: SpawnOptions): Promise<SpawnResult> {
+  const built = buildSpawnArgs(options);
+  const handle = launchAgentProcess(options, built);
+  return collectSpawnResult(handle);
 }
 
 /**
