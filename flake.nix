@@ -308,11 +308,92 @@
         # The harness's pi extensions plus the src/ tree they import from
         # (extensions/index.ts does `import "../src/index.js"`). Linked into
         # ~/.pi/agent/ by the NixOS config.
-        belayd-harness = pkgs.runCommand "belayd-harness" { } ''
-          mkdir -p "$out/extensions" "$out/src"
-          cp -r ${./extensions}/. "$out/extensions/"
-          cp -r ${./src}/. "$out/src/"
-        '';
+        #
+        # node_modules/ is built from this repo's own package.json + pnpm-lock.yaml,
+        # so every `dependencies` entry is bundled automatically — no separate
+        # npm manifest to keep in sync. peerDependencies are stripped before
+        # install (pi bundles those itself) and devDependencies are skipped with
+        # --prod. `hash` below is the only thing to refresh after changing
+        # dependencies (the failed build prints the new value).
+        belayd-harness = pkgs.stdenv.mkDerivation {
+          pname = "belayd-harness";
+          version = "0.0.1";
+          src = ./.;
+          nativeBuildInputs = [
+            pkgs.nodejs_24
+            pkgs.pnpm
+            pkgs.jq
+            pkgs.yq-go
+            pkgs.sqlite
+            pkgs.zstd
+          ];
+          # Fetch the pnpm content-addressable store for the full lockfile
+          # (fixed-output, so it's reproducible and network runs in the fetch
+          # phase only).
+          pnpmDeps = pkgs.fetchPnpmDeps {
+            pname = "belayd-harness";
+            version = "0.0.1";
+            src = ./.;
+            pnpm = pkgs.pnpm;
+            fetcherVersion = 4;
+            hash = "sha256-Kyy2fK4lKdxd6UT9M41uuMIz+Hz1Nww0iFxEy0dmmtA=";
+          };
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+
+            # stdenv sets HOME=/homeless-shelter (read-only); pnpm writes its
+            # config/cache there, so give it a writable home first.
+            export HOME="$(mktemp -d)"
+
+            # Reconstruct the pnpm store shipped by fetchPnpmDeps (fetcherVersion 4
+            # stores it as a zstd tarball plus a SQL dump of its index.db) so the
+            # install below can run offline.
+            store_path="$(mktemp -d)"
+            tar --zstd -xf "$pnpmDeps/pnpm-store.tar.zst" -C "$store_path"
+            chmod -R +w "$store_path"
+            if [ -f "$store_path/v11/index.db.sql" ]; then
+              sqlite3 "$store_path/v11/index.db" < "$store_path/v11/index.db.sql"
+              rm "$store_path/v11/index.db.sql"
+            fi
+            pnpm config set store-dir "$store_path"
+            pnpm config set package-import-method clone-or-copy
+            # Same flags pnpmConfigHook sets: don't block on pnpm's own version
+            # manager and skip the lockfile supply-chain-policy check, which would
+            # otherwise try to fetch npm attestations from the network at build
+            # time (the build phase is offline).
+            export pnpm_config_pm_on_fail=ignore
+            export pnpm_config_trust_lockfile=true
+
+            # Install only `dependencies`. peerDependencies are bundled by the pi
+            # runtime and devDependencies are never imported by the loaded
+            # extension, so strip both from package.json AND from the lockfile's
+            # importer (pnpm merges the root's peers into `dependencies` there),
+            # keeping the two in sync so --frozen-lockfile still passes. Frozen
+            # means no re-resolution, so the install works offline against the
+            # store. Hoisted node-linker keeps node_modules flat (no symlinks).
+            for p in $(jq -r '.peerDependencies // {} | keys[]' package.json); do
+              yq -i "del(.importers[\".\"].dependencies[\"$p\"])" pnpm-lock.yaml
+            done
+            yq -i 'del(.importers["."].devDependencies)' pnpm-lock.yaml
+            jq 'del(.peerDependencies, .devDependencies)' package.json > package.json.stripped
+            mv package.json.stripped package.json
+            pnpm install --offline --ignore-scripts --prod --frozen-lockfile --config.node-linker=hoisted
+
+            mkdir -p "$out/extensions" "$out/src" "$out/node_modules"
+            cp -r extensions/. "$out/extensions/"
+            cp -r src/. "$out/src/"
+            cp -r node_modules/. "$out/node_modules/"
+            # Drop pnpm's own metadata; pi only needs the flat package dirs
+            # for module resolution.
+            rm -rf "$out/node_modules/.pnpm" "$out/node_modules/.bin"
+            rm -f "$out/node_modules/.modules.yaml" \
+                  "$out/node_modules/.package-map.json" \
+                  "$out/node_modules/.pnpm-workspace-state-v1.json"
+
+            runHook postInstall
+          '';
+        };
 
         # Third-party pi npm extensions (exa web search, ast-grep, vision,
         # plannotator, OpenRouter provider). Packaged as a Nix node_modules tree

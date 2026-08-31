@@ -47,6 +47,20 @@ belayd-agent-harness/
 - Extensions in `extensions/` are loaded directly by pi via `pi install -l`. They import from `dist/` at runtime.
 - `@earendil-works/pi-coding-agent` and `typebox` are listed as `peerDependencies` (pi provides them at runtime).
 
+### Nix dependency bundling (`belayd-harness`)
+
+The flake's `belayd-harness` derivation bundles every `dependencies` entry from
+`package.json` into the extension's `node_modules/` (via `fetchPnpmDeps` plus an
+install of the lockfile stripped of `peerDependencies`/`devDependencies`).
+`peerDependencies` and `devDependencies` are **not** bundled.
+
+When adding, removing, or changing a `dependencies` entry:
+
+1. `pnpm install` — regenerate `pnpm-lock.yaml`.
+2. `nix build .#belayd-harness` — fails with `hash mismatch … got: sha256-…`.
+3. Copy the `got:` hash into `belayd-harness.pnpmDeps.hash` in `flake.nix`.
+4. Re-run `nix build .#belayd-harness`.
+
 ## Checking local services
 
 Two runtimes back the harness. Inspect them when diagnosing session,
