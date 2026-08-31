@@ -6,8 +6,9 @@
 [post-create]
 # Copy gitignored files (node_modules, .pnpm-store, etc.) from primary worktree
 copy = "wt step copy-ignored"
-# Allow direnv, install dependencies, and build local packages the extension needs
-install = "direnv allow && pnpm install && pnpm turbo run build --filter=@belayd/agent-harness --filter=@belayd/agent-shared"
+# Allow direnv and install dependencies (copy-ignored above already seeds
+# node_modules; this refreshes it against package.json + pnpm-lock.yaml).
+install = "direnv allow && pnpm install"
 build = "pnpm build"
 # Move the bead for this branch to in_progress when the worktree is created
 mark-in-progress = 'bd_id="$(printf "%s" "{{ branch }}" | sed "s#^[^/]*/##")"; case "$bd_id" in bd-*) bd update "$bd_id" --status in_progress ;; esac'
