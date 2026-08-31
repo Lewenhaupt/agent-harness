@@ -49,12 +49,12 @@
     "@biomejs/biome": "2.2.0",
     "@jmfederico/pi-web": "1.202608.1",
     "@types/node": "^26.1.2",
+    "lefthook": "^2.1.10",
     "typescript": "5.8.3",
     "vitest": "3.2.4"
   },
   "dependencies": {
     "@earendil-works/gondolin": "^0.12.0",
-    "lefthook": "^2.1.10",
     "zod": "^4.5.4"
   },
   "engines": {

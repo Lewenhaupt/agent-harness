@@ -14,9 +14,6 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: '*'
         version: 0.84.1(ws@8.21.3)(zod@4.5.4)
-      lefthook:
-        specifier: ^2.1.10
-        version: 2.1.10
       typebox:
         specifier: '*'
         version: 1.3.13
@@ -33,6 +30,9 @@ importers:
       '@types/node':
         specifier: ^26.1.2
         version: 26.2.0
+      lefthook:
+        specifier: ^2.1.10
+        version: 2.1.10
       typescript:
         specifier: 5.8.3
         version: 5.8.3
@@ -1773,9 +1773,6 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
-
   zod@4.5.4:
     resolution: {integrity: sha512-sC95tT5iHHH9gtpj6A81kh+NEaRAUFN+qlUPDUbRfOMvNf5QCBqsb3WgvnpVtK5Y+4UfA6KqufotuTvMGiTlsA==}
 
@@ -2553,8 +2550,8 @@ snapshots:
     dependencies:
       '@opentelemetry/semantic-conventions': 1.43.0
       ws: 8.21.3
-      zod: 4.4.3
-      zod-to-json-schema: 3.25.2(zod@4.4.3)
+      zod: 4.5.4
+      zod-to-json-schema: 3.25.2(zod@4.5.4)
     optionalDependencies:
       '@opentelemetry/api': 1.9.0
     transitivePeerDependencies:
@@ -3598,10 +3595,8 @@ snapshots:
 
   yaml@2.9.0: {}
 
-  zod-to-json-schema@3.25.2(zod@4.4.3):
+  zod-to-json-schema@3.25.2(zod@4.5.4):
     dependencies:
-      zod: 4.4.3
-
-  zod@4.4.3: {}
+      zod: 4.5.4
 
   zod@4.5.4: {}
