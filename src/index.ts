@@ -72,6 +72,13 @@ export {
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   parseQuotaResetSeconds,
 } from "./quota-failure.js";
+export type {
+  DetachedRunOptions,
+  RunDelivery,
+  RunHandle,
+  WatchRunDeps,
+} from "./run-detached.js";
+export { spawnDetachedRun, watchRunCompletion } from "./run-detached.js";
 export type { RunManifest } from "./run-manifest.js";
 export {
   listRuns,
@@ -89,7 +96,13 @@ export {
   generateShortRunId,
   isValidTaskId,
 } from "./session-naming.js";
-export { spawnAgentProcess } from "./spawn.js";
+export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
+export {
+  buildSpawnArgs,
+  collectSpawnResult,
+  launchAgentProcess,
+  spawnAgentProcess,
+} from "./spawn.js";
 export type {
   SpawnAttempt,
   SpawnWithFallbackOptions,

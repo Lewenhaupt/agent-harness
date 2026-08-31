@@ -86,6 +86,8 @@ export interface SpawnOptions {
   signal?: AbortSignal;
   /** If set, creates an isolated git worktree before spawning. */
   worktree?: WorktreeOptions;
+  /** Spawn the child detached (background runs). Default false. */
+  detached?: boolean;
   /** Called with partial agent session events as they arrive. */
   onUpdate?: (event: unknown) => void;
 }
