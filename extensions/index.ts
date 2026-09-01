@@ -750,15 +750,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       return;
     }
 
-    // Best-effort rename via PATCH (wrapped in try/catch)
-    try {
-      await daemonRequest("PATCH", `/sessions/${created.id}`, {
-        name: orchestrationName,
-      });
-    } catch {
-      // Graceful fallback
-    }
-
     // The session daemon's per-session routes scope every request by cwd, so
     // the prompt body must carry the worktree path alongside the prompt text.
     await daemonRequest("POST", `/sessions/${created.id}/prompt`, {
@@ -921,6 +912,30 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ]
         : [];
 
+    // When phase runs are active, tell the orchestrator to wait instead of
+    // repeating "call belayd_X" — the phase is already running, and the
+    // gate will block any re-call, creating a contradictory loop.
+    const activeRunLines: string[] = [];
+    if (state.activeRuns.size > 0) {
+      activeRunLines.push("", "⏳ **Phase runs in progress — WAIT, do not act:**");
+      for (const [runId, { handle }] of state.activeRuns) {
+        activeRunLines.push(`- \`${handle.phaseName}\` (run \`${runId}\`) — ${handle.status}`);
+      }
+      activeRunLines.push(
+        "",
+        "Do NOT call any phase tools. Do NOT call belayd_status on your own initiative.",
+        "The result will arrive as a follow-up message when each run completes.",
+        "If the user explicitly asks you to check progress, you may call belayd_status.",
+      );
+    }
+
+    // Build the next-step line: "wait" when runs are active, otherwise the
+    // normal directive to call the next phase tool.
+    const nextStepLine =
+      state.activeRuns.size > 0
+        ? "Waiting for active runs to complete — see above."
+        : `Next required step: call \`${getPhaseToolName(remaining)}\``;
+
     return {
       message: {
         customType: "belayd-gate-context",
@@ -934,10 +949,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "Editing and writing tools are DISABLED. You MUST delegate ALL code changes to the phase tools:",
           ...phaseLines,
           ...researchGuidance,
+          ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
           "",
-          `Next required step: call \`${getPhaseToolName(remaining)}\``,
+          nextStepLine,
         ].join("\n"),
         display: false,
       },
@@ -1212,7 +1228,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
                 `belayd ${phaseName} run started in the background.\n\n` +
                 `Run ID: ${runId}\nSession: ${sessionName}\n` +
                 `The result will be delivered as a follow-up message when the run (and its quality gate) completes.\n` +
-                `Use belayd_status to check progress.`,
+                `Wait for the follow-up — do NOT call belayd_status on your own initiative.` +
+                ` Only call belayd_status if the user explicitly asks you to.` +
+                `\nDo not re-call this phase tool — the run is already in progress.`,
             },
           ],
           details: { messages: [], usage: emptyUsage(), exitCode: 0 },
