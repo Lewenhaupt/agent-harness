@@ -137,4 +137,9 @@ export {
   writeWorkflowState,
 } from "./workflow-state.js";
 export type { WorktreeOptions } from "./worktree.js";
-export { isInsideWorktreeForBranch, resolveWorktreePath, setupWorktree } from "./worktree.js";
+export {
+  awaitWorktreeReady,
+  isInsideWorktreeForBranch,
+  resolveWorktreePath,
+  setupWorktree,
+} from "./worktree.js";

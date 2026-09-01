@@ -1,7 +1,13 @@
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isInsideWorktreeForBranch, resolveWorktreePath, setupWorktree } from "../worktree.js";
+import {
+  awaitWorktreeReady,
+  isInsideWorktreeForBranch,
+  resolveWorktreePath,
+  setupWorktree,
+} from "../worktree.js";
 
 vi.mock("node:child_process", () => ({
   execSync: vi.fn(),
@@ -10,6 +16,10 @@ vi.mock("node:child_process", () => ({
 
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(),
+}));
+
+vi.mock("node:timers/promises", () => ({
+  setTimeout: vi.fn(() => Promise.resolve()),
 }));
 
 const mockedExecSync = vi.mocked(execSync);
@@ -227,5 +237,45 @@ describe("setupWorktree", () => {
       ["switch", "--create", "feat/bd-42", "--base", "develop", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
+  });
+});
+
+describe("awaitWorktreeReady", () => {
+  it("resolves ok once .modules.yaml exists", async () => {
+    mockedExistsSync.mockReturnValue(true);
+
+    const result = await awaitWorktreeReady("/repo/feat", { timeoutInMs: 1000 });
+
+    expect(result).toEqual({ ok: true });
+    expect(mockedExistsSync).toHaveBeenCalledWith("/repo/feat/node_modules/.modules.yaml");
+  });
+
+  it("polls until .modules.yaml appears", async () => {
+    mockedExistsSync
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    const result = await awaitWorktreeReady("/repo/feat", {
+      timeoutInMs: 1000,
+      pollIntervalInMs: 10,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails after the timeout elapses", async () => {
+    mockedExistsSync.mockReturnValue(false);
+
+    const result = await awaitWorktreeReady("/repo/feat", {
+      timeoutInMs: 0,
+      pollIntervalInMs: 10,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: "Worktree dependencies not ready within 0ms: /repo/feat",
+    });
   });
 });
