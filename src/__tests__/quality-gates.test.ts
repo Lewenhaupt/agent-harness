@@ -1,10 +1,23 @@
-import { existsSync, mkdirSync, mkdtempSync, readlinkSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GateOptions, SpawnDetails } from "../agent-registry.js";
-import { ensureProofBridge, proofDirForTask, resolveProofBase } from "../proof-dir.js";
+import {
+  ensureProofBridge,
+  PROOF_DIR_MARKER_RELATIVE_PATH,
+  proofDirForTask,
+  resolveProofBase,
+} from "../proof-dir.js";
 import { gateProofContent, gateUserGuide, validateCastRecording } from "../quality-gates.js";
 
 const MOCK_DETAILS: SpawnDetails = {
@@ -267,6 +280,10 @@ describe("ensureProofBridge", () => {
     expect(result).toHaveProperty("ok", true);
     expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
     expect(existsSync(resolve(proofBase))).toBe(true);
+
+    const marker = readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8");
+    expect(marker.trim()).toBe(resolve(proofBase));
+    expect(marker.endsWith("\n")).toBe(true);
   });
 
   it("is idempotent when the symlink already points at the same target", () => {
@@ -278,6 +295,22 @@ describe("ensureProofBridge", () => {
     expect(first).toHaveProperty("ok", true);
     expect(second).toHaveProperty("ok", true);
     expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+    expect(readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8").trim()).toBe(
+      resolve(proofBase),
+    );
+  });
+
+  it("overwrites a stale proof-dir marker with the resolved base", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "/stale/path\n", "utf-8");
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    expect(readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8").trim()).toBe(
+      resolve(proofBase),
+    );
   });
 
   it("errors when proof-of-work already exists as a real directory", () => {
@@ -288,6 +321,7 @@ describe("ensureProofBridge", () => {
 
     expect(result).toHaveProperty("ok", false);
     if (!result.ok) expect(result.error).toContain("real directory");
+    expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
   });
 
   it("errors when proof-of-work points at a different target", () => {
@@ -300,6 +334,7 @@ describe("ensureProofBridge", () => {
 
     expect(result).toHaveProperty("ok", false);
     if (!result.ok) expect(result.error).toContain("already points");
+    expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
   });
 
   it("errors when no .git ancestor exists", () => {
@@ -310,6 +345,7 @@ describe("ensureProofBridge", () => {
 
     expect(result).toHaveProperty("ok", false);
     if (!result.ok) expect(result.error).toContain("No .git ancestor");
+    expect(existsSync(join(cwd, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
   });
 });
 
