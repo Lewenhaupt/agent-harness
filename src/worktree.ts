@@ -1,4 +1,5 @@
 import { execFileSync, execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 
 /** Options for creating an isolated git worktree for agent processes. */
 export interface WorktreeOptions {
@@ -44,12 +45,26 @@ export function resolveWorktreePath(projectRoot: string, branch: string): string
 }
 
 /**
+ * Resolve the default worktree directory path for a branch without consulting
+ * git. `wt` and `git worktree` use the convention `<repo-root>.<branch>` with
+ * "/" replaced by "-" in the branch name.
+ */
+function defaultWorktreeDir(projectRoot: string, branch: string): string {
+  const sanitized = branch.replace(/\//g, "-");
+  return `${projectRoot}.${sanitized}`;
+}
+
+/**
  * Set up the worktree for a workflow run.
  *
- * Uses `wt switch` which is idempotent: if the branch + worktree already exist,
- * it switches to the existing one.
- *
- * If the branch doesn't exist yet, uses `wt switch --create` to create it.
+ * Strategy (in order):
+ * 1. If the worktree is already registered in git, return its path immediately.
+ * 2. If the branch exists but no worktree is registered, use `wt switch`.
+ * 3. If the branch doesn't exist and the default directory is absent, use
+ *    `wt switch --create`.
+ * 4. If the branch doesn't exist but the default directory already exists
+ *    (orphaned from a prior failed attempt), use `wt switch --create --clobber`
+ *    to overwrite it with a backup.
  *
  * Returns the absolute path to the worktree.
  *
@@ -58,7 +73,13 @@ export function resolveWorktreePath(projectRoot: string, branch: string): string
 export function setupWorktree(projectRoot: string, options: WorktreeOptions): string {
   const base = options.base ?? "main";
 
-  // Step 1: Check if the branch already exists
+  // Step 1: Check if the worktree is already registered in git
+  const existingPath = resolveWorktreePath(projectRoot, options.branch);
+  if (existingPath !== undefined) {
+    return existingPath;
+  }
+
+  // Step 2: Check if the branch already exists
   let branchExists = false;
   try {
     const branches = execFileSync("git", ["branch", "--list", options.branch], {
@@ -71,11 +92,25 @@ export function setupWorktree(projectRoot: string, options: WorktreeOptions): st
     // If git fails, assume branch doesn't exist
   }
 
-  // Step 2: Create or switch to the worktree
-  const wtArgs = branchExists
-    ? ["switch", options.branch, "-y"]
-    : ["switch", "--create", options.branch, "--base", base, "-y"];
+  // Step 3: Determine the right wt arguments
+  let wtArgs: string[];
+  if (branchExists) {
+    // Branch exists but worktree not registered — just switch to it.
+    // wt will create the directory and register the worktree.
+    wtArgs = ["switch", options.branch, "-y"];
+  } else {
+    // Branch doesn't exist — need --create.
+    const dirPath = defaultWorktreeDir(projectRoot, options.branch);
+    const dirExists = existsSync(dirPath);
+    if (dirExists) {
+      // Orphaned directory from a prior failed attempt — clobber it.
+      wtArgs = ["switch", "--create", options.branch, "--base", base, "--clobber", "-y"];
+    } else {
+      wtArgs = ["switch", "--create", options.branch, "--base", base, "-y"];
+    }
+  }
 
+  // Step 4: Create or switch to the worktree
   try {
     execFileSync("wt", wtArgs, {
       cwd: projectRoot,
@@ -91,7 +126,7 @@ export function setupWorktree(projectRoot: string, options: WorktreeOptions): st
     );
   }
 
-  // Step 3: Resolve the worktree path
+  // Step 5: Resolve the worktree path
   const worktreePath = resolveWorktreePath(projectRoot, options.branch);
   if (!worktreePath) {
     throw new Error("Could not resolve worktree path after creation. Check `git worktree list`.");
