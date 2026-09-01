@@ -3,14 +3,26 @@
 # Project-specific hooks for the Belayd monorepo.
 # Ensures worktrees have dependencies available after creation.
 
-[post-create]
+# pre-start hooks BLOCK worktree creation until they complete (wt docs:
+# "Runs once when a new worktree is created, blocking post-start/--execute
+# until complete: dependency install, env file generation"). Dependency
+# setup must finish before any agent session boots in the worktree, otherwise
+# the harness extension fails to load ("Cannot find module 'zod'"). Each
+# [[pre-start]] block is one pipeline step; steps run in order.
+[[pre-start]]
 # Copy gitignored files (node_modules, .pnpm-store, etc.) from primary worktree
 copy = "wt step copy-ignored"
+
+[[pre-start]]
 # Allow direnv and install dependencies (copy-ignored above already seeds
 # node_modules; this refreshes it against package.json + pnpm-lock.yaml).
 install = "direnv allow && pnpm install"
+
+[[pre-start]]
 build = "pnpm build"
-# Move the bead for this branch to in_progress when the worktree is created
+
+[post-start]
+# Non-critical background work: move the bead for this branch to in_progress.
 mark-in-progress = 'bd_id="$(printf "%s" "{{ branch }}" | sed "s#^[^/]*/##")"; case "$bd_id" in bd-*) bd update "$bd_id" --status in_progress ;; esac'
 
 [post-merge]

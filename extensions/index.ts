@@ -35,6 +35,7 @@ import type {
 import {
   ALL_PHASE_NAMES,
   ALL_PHASE_TOOLS,
+  awaitWorktreeReady,
   checkToolAllowed,
   DEFAULT_AGENTS,
   formatProcessState,
@@ -824,6 +825,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "Worktree creation failed. Use --no-worktree to skip isolation, or check that wt is installed.",
           "error",
         );
+        return;
+      }
+
+      // Hardening: `wt switch` can return before background post-start hooks
+      // finish installing deps. Wait for them so the new session does not fail
+      // to load the harness extension (e.g. "Cannot find module 'zod'").
+      const ready = await awaitWorktreeReady(worktreePath);
+      if (!ready.ok) {
+        ctx.ui.notify(`Worktree not ready: ${ready.error}`, "error");
         return;
       }
 

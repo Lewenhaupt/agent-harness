@@ -7,7 +7,7 @@
  *   Extension "command:belayd" error: cwd field must be a string
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -152,6 +152,10 @@ describe("/belayd command daemon delegation", () => {
   beforeEach(() => {
     worktreeDir = mkdtempSync(join(tmpdir(), "belayd-cmd-test-"));
     state.worktreeDir = worktreeDir;
+    // Simulate a completed dependency install so awaitWorktreeReady resolves
+    // immediately instead of polling until the test times out.
+    mkdirSync(join(worktreeDir, "node_modules"));
+    writeFileSync(join(worktreeDir, "node_modules", ".modules.yaml"), "");
   });
 
   afterEach(() => {

@@ -1,5 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 /** Options for creating an isolated git worktree for agent processes. */
 export interface WorktreeOptions {
@@ -177,4 +179,45 @@ export function isInsideWorktreeForBranch(cwd: string, branch: string): boolean 
     // Fall through to false
   }
   return false;
+}
+
+/**
+ * pnpm writes `.modules.yaml` last when a worktree install completes, so it is
+ * a reliable completion marker for dependency setup.
+ */
+function dependenciesReady(worktreePath: string): boolean {
+  return existsSync(join(worktreePath, "node_modules", ".modules.yaml"));
+}
+
+/**
+ * Wait for a worktree's dependencies to be installed.
+ *
+ * `wt switch` returns once the worktree is registered, but until this was
+ * migrated to `pre-start` hooks its post-start hooks installed deps in the
+ * background. A session booting before that finishes hits e.g.
+ * "Cannot find module 'zod'" when loading the harness extension, so we poll
+ * for install completion before delegating the orchestrator session.
+ *
+ * @returns `{ ok: true }` once deps are ready, or `{ ok: false; error }` after
+ * `timeoutInMs` elapses.
+ */
+export async function awaitWorktreeReady(
+  worktreePath: string,
+  options: { timeoutInMs?: number; pollIntervalInMs?: number } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const timeoutInMs = options.timeoutInMs ?? 60_000;
+  const pollIntervalInMs = options.pollIntervalInMs ?? 200;
+  const deadline = Date.now() + timeoutInMs;
+
+  while (Date.now() < deadline) {
+    if (dependenciesReady(worktreePath)) {
+      return { ok: true };
+    }
+    await sleep(pollIntervalInMs);
+  }
+
+  return {
+    ok: false,
+    error: `Worktree dependencies not ready within ${timeoutInMs}ms: ${worktreePath}`,
+  };
 }
