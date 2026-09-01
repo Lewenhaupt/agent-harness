@@ -58,6 +58,7 @@ export {
   PHASE_ORDER,
   PHASE_TOOLS,
 } from "./process-gate.js";
+export * from "./proof-dir.js";
 export {
   gateFullValidation,
   gateLint,

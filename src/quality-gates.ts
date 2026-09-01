@@ -8,7 +8,7 @@
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GateOptions, GateResult, SpawnDetails } from "./agent-registry.js";
 
@@ -188,13 +188,24 @@ function stripControlChars(text: string): string {
 
 /**
  * Parse an asciicast v2 file path from the agent output.
- * Returns the first .cast file path mentioned, or null.
+ *
+ * Without `proofDir` the raw `proof-of-work/...` reference is returned so the
+ * caller can resolve it against the workspace root (which may expose a
+ * `proof-of-work` symlink). With `proofDir` the reference is mapped directly
+ * into the external per-task directory, dropping the task-id segment that is
+ * already encoded in `proofDir`.
  */
-function findCastFilePath(output: string): string | null {
+function findCastFilePath(output: string, proofDir?: string): string | null {
   const lines = output.split("\n");
   for (const line of lines) {
     const match = line.match(/\bproof-of-work\/[\w/.-]+\.cast\b/);
-    if (match) return match[0].startsWith("/") ? match[0].slice(1) : match[0];
+    if (!match) continue;
+    const matched = match[0];
+    if (proofDir === undefined) {
+      return matched;
+    }
+    const relative = matched.slice("proof-of-work/".length);
+    return resolve(proofDir, ...relative.split("/").slice(1));
   }
   return null;
 }
@@ -368,7 +379,11 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
  * Check that referenced non-.cast proof files exist on disk.
  * Returns a failed GateResult if any are missing, or null if all exist or none referenced.
  */
-function checkNonCastProofRefs(output: string, cwd: string): GateResult | null {
+function checkNonCastProofRefs(
+  output: string,
+  proofWorkRoot: string,
+  proofDir?: string,
+): GateResult | null {
   const proofRefMatch = output.match(/\bproof-of-work\/[\w/.-]+\b/g);
   if (!proofRefMatch || proofRefMatch.length === 0) {
     return null;
@@ -379,7 +394,10 @@ function checkNonCastProofRefs(output: string, cwd: string): GateResult | null {
     if (ref.endsWith(".cast")) continue;
     const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
     if (normalizedRef.includes("..")) continue;
-    const resolvedPath = resolve(cwd, normalizedRef);
+    const resolvedPath =
+      proofDir === undefined
+        ? resolve(proofWorkRoot, normalizedRef)
+        : resolveProofRefInDir(normalizedRef, proofDir);
     if (!existsSync(resolvedPath)) {
       missingRefs.push(normalizedRef);
     }
@@ -394,42 +412,28 @@ function checkNonCastProofRefs(output: string, cwd: string): GateResult | null {
   return null;
 }
 
+/** Map a `proof-of-work/<task-id>/...` reference into an external task dir. */
+function resolveProofRefInDir(ref: string, proofDir: string): string {
+  const relative = ref.startsWith("proof-of-work/") ? ref.slice("proof-of-work/".length) : ref;
+  return resolve(proofDir, ...relative.split("/").slice(1));
+}
+
 /**
- * Walk up from startDir looking for a directory containing a "proof-of-work" subdirectory.
- * Returns the absolute path to that parent directory.
- *
- * Search order:
- * 1. Walk up from startDir (handles worktrees linked to the main repo)
- * 2. Fall back to process.cwd() and walk up from there
- * 3. Return startDir if nothing found (degrades to old behavior)
+ * Walk up from startDir to the nearest ancestor containing a `.git` entry.
+ * Falls back to startDir when no git worktree root is found, preserving the
+ * legacy behavior for ad-hoc directories that contain proof-of-work directly.
  */
-function findAncestorProofDir(startDir: string): string {
-  // Walk up from startDir
-  let dir = startDir;
+function findWorkspaceRoot(startDir: string): string {
+  let dir = resolve(startDir);
   while (true) {
-    if (existsSync(resolve(dir, "proof-of-work"))) {
+    if (existsSync(join(dir, ".git"))) {
       return dir;
     }
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
-
-  // Fallback: walk up from process.cwd() (may differ from startDir in sandboxed environments)
-  const cwd = process.cwd();
-  if (cwd !== startDir) {
-    dir = cwd;
-    while (true) {
-      if (existsSync(resolve(dir, "proof-of-work"))) {
-        return dir;
-      }
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-  }
-
-  return startDir;
+  return resolve(startDir);
 }
 
 /**
@@ -450,6 +454,18 @@ function checkPathTraversal(castPath: string, proofBase: string): GateResult | n
 }
 
 /**
+ * Validate that an absolute cast path stays inside the external proof dir.
+ */
+function checkProofDirTraversal(castPath: string, proofDir: string): GateResult | null {
+  const resolved = resolve(castPath);
+  const allowedDir = resolve(proofDir);
+  if (resolved !== allowedDir && !resolved.startsWith(allowedDir + sep)) {
+    return { passed: false, feedback: `Path traversal detected: ${castPath}` };
+  }
+  return null;
+}
+
+/**
  * Quality gate for proof-of-work content.
  *
  * Scans the agent output for a .cast file path, then validates the recording
@@ -463,18 +479,26 @@ export async function gateProofContent(
   options?: GateOptions,
 ): Promise<GateResult> {
   const cwd = options?.cwd ?? process.cwd();
-  // Walk up from cwd to find the ancestor that contains proof-of-work/.
-  // This handles worktrees where the proof dir lives in the main repo root.
-  const proofBase = findAncestorProofDir(cwd);
-  const castPath = findCastFilePath(output);
+  const proofDir = options?.proofDir !== undefined ? resolve(options.proofDir) : undefined;
+  const castPath = findCastFilePath(output, proofDir);
 
   if (castPath) {
-    const traversalCheck = checkPathTraversal(castPath, proofBase);
+    if (proofDir !== undefined) {
+      const traversalCheck = checkProofDirTraversal(castPath, proofDir);
+      if (traversalCheck) return traversalCheck;
+      return validateCastRecording(castPath);
+    }
+
+    // No explicit proof dir: resolve through the workspace-root proof-of-work
+    // path (which may be a symlink to the external proof base).
+    const proofWorkRoot = findWorkspaceRoot(cwd);
+    const traversalCheck = checkPathTraversal(castPath, proofWorkRoot);
     if (traversalCheck) return traversalCheck;
-    return validateCastRecording(resolve(proofBase, castPath));
+    return validateCastRecording(resolve(proofWorkRoot, castPath));
   }
 
-  const missingRefsCheck = checkNonCastProofRefs(output, proofBase);
+  const proofWorkRoot = findWorkspaceRoot(cwd);
+  const missingRefsCheck = checkNonCastProofRefs(output, proofWorkRoot, proofDir);
   if (missingRefsCheck) return missingRefsCheck;
 
   return {

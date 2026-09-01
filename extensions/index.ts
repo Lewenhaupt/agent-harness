@@ -58,6 +58,7 @@ import {
   watchRunCompletion,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
+import { ensureProofBridge, proofDirForTask, resolveProofBase } from "../src/proof-dir.js";
 import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
@@ -480,6 +481,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       tools?: string[];
       sessionName?: string;
       attempt: number;
+      env?: Record<string, string>;
     },
   ): Promise<SpawnResult> {
     return spawnAgentWithFallback({
@@ -490,6 +492,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       cwd: options.cwd,
       signal: options.signal,
       detached: true,
+      env: options.env,
       sessionName: options.sessionName
         ? `${options.sessionName}-retry-${options.attempt}`
         : undefined,
@@ -503,9 +506,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     gate: QualityGate,
     result: SpawnResult,
     cwd?: string,
+    proofDir?: string,
   ): Promise<{ passed: boolean; feedback: string }> {
     const text = result.content?.[0]?.text ?? "";
-    const outcome = await gate(text, result.details, cwd ? { cwd } : undefined);
+    const options = cwd !== undefined || proofDir !== undefined ? { cwd, proofDir } : undefined;
+    const outcome = await gate(text, result.details, options);
     return {
       passed: outcome.passed,
       feedback: outcome.feedback ?? (outcome.passed ? "All quality gates passed." : "Failed"),
@@ -515,7 +520,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   async function runQualityGate(
     agent: AgentDefinition,
     result: SpawnResult,
-    params: { task: string; cwd?: string },
+    params: { task: string; cwd?: string; proofDir?: string; env?: Record<string, string> },
     workflowType: WorkflowSubType,
     phaseName: string,
     signal?: AbortSignal,
@@ -533,7 +538,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // total passes are exhausted. Each retry gets a unique session suffix so
     // sessions never collide.
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
-      const verdict = await evaluateGate(effectiveGate, current, params.cwd);
+      const verdict = await evaluateGate(effectiveGate, current, params.cwd, params.proofDir);
 
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
@@ -553,6 +558,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         tools: effectiveTools,
         sessionName,
         attempt,
+        env: params.env,
       });
     }
 
@@ -1040,6 +1046,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
     const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
 
+    // Proof artifacts live outside the worktree. The bridge symlink exposes
+    // them at proof-of-work/ while the agent writes through BELAYD_PROOF_TASK_DIR
+    // (the proof base; the agent creates the task-id subdirectory inside it).
+    const proofBase = resolveProofBase(process.env);
+    const hasTaskId = state.currentTaskId !== "";
+    const proofDir = hasTaskId ? proofDirForTask(state.currentTaskId, proofBase) : undefined;
+    const spawnEnv = hasTaskId ? { BELAYD_PROOF_TASK_DIR: proofBase } : undefined;
+    if (hasTaskId) {
+      const bridgeResult = ensureProofBridge(effectiveCwd ?? process.cwd(), proofBase);
+      if (!bridgeResult.ok) {
+        console.warn(`[belayd-harness] proof-of-work bridge unavailable: ${bridgeResult.error}`);
+      }
+    }
+
     persistRunningManifest({
       state,
       manifestCwd: effectiveCwd ?? process.cwd(),
@@ -1072,6 +1092,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         // orchestrator does not kill the sub-agent; explicit cancellation goes
         // through this run's AbortController.
         detached: true,
+        env: spawnEnv,
         cooldownStore: modelCooldown,
         enabled: modelFallbackEnabled,
       }).then((r) => withFallbackNote(r.result, r.attempts));
@@ -1080,7 +1101,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       runQualityGate(
         agent,
         result,
-        { task: params.task, cwd: effectiveCwd },
+        { task: params.task, cwd: effectiveCwd, proofDir, env: spawnEnv },
         state.workflowType,
         phaseName,
         abortController.signal,

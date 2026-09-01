@@ -1,9 +1,10 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readlinkSync, symlinkSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GateOptions, SpawnDetails } from "../agent-registry.js";
+import { ensureProofBridge, proofDirForTask, resolveProofBase } from "../proof-dir.js";
 import { gateProofContent, gateUserGuide, validateCastRecording } from "../quality-gates.js";
 
 const MOCK_DETAILS: SpawnDetails = {
@@ -98,8 +99,8 @@ describe("validateCastRecording", () => {
     expect(result.feedback).toContain("No .cast file found");
   });
 
-  it("resolves a .cast path relative to the provided cwd", async () => {
-    const proofDir = join(tmpDir, "proof-of-work", "bd-99");
+  it("resolves a .cast path from the provided proofDir", async () => {
+    const proofDir = join(tmpDir, "external-proof", "bd-99");
     await mkdir(proofDir, { recursive: true });
     const castPath = join(proofDir, "valid.cast");
     await writeFile(
@@ -115,7 +116,7 @@ describe("validateCastRecording", () => {
 
     const output = "Proof recording: proof-of-work/bd-99/valid.cast\n";
     const result = await gateProofContent(output, MOCK_DETAILS, {
-      cwd: tmpDir,
+      proofDir,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", true);
@@ -133,7 +134,9 @@ describe("validateCastRecording", () => {
   it("fails when the .cast file does not exist on disk", async () => {
     const output = "Here is the proof recording:\nproof-of-work/bd-99/nonexistent.cast\n";
 
-    const result = await gateProofContent(output, MOCK_DETAILS);
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir: join(tmpDir, "external-proof", "bd-99"),
+    } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
     expect(result.feedback).toContain("not found on disk");
@@ -166,7 +169,7 @@ describe("validateCastRecording", () => {
     const output = "proof-of-work/../../../etc/passwd.cast\n";
 
     const result = await gateProofContent(output, MOCK_DETAILS, {
-      cwd: tmpDir,
+      proofDir: join(tmpDir, "external-proof", "bd-99"),
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
@@ -185,7 +188,7 @@ describe("validateCastRecording", () => {
     const output = "Screenshot: proof-of-work/bd-99/screenshot.png\n";
 
     const result = await gateProofContent(output, MOCK_DETAILS, {
-      cwd: tmpDir,
+      proofDir: join(tmpDir, "external-proof", "bd-99"),
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
@@ -193,7 +196,7 @@ describe("validateCastRecording", () => {
   });
 
   it("passes when referenced non-.cast proof file exists on disk", async () => {
-    const proofDir = join(tmpDir, "proof-of-work", "bd-99");
+    const proofDir = join(tmpDir, "external-proof", "bd-99");
     const refPath = join(proofDir, "screenshot.png");
     const output = "Screenshot: proof-of-work/bd-99/screenshot.png\n";
 
@@ -202,8 +205,172 @@ describe("validateCastRecording", () => {
     await writeFile(refPath, "fake-png-content", "utf-8");
 
     const result = await gateProofContent(output, MOCK_DETAILS, {
-      cwd: tmpDir,
+      proofDir,
     } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+});
+
+describe("resolveProofBase", () => {
+  it("returns BELAYD_PROOF_DIR when set", () => {
+    expect(resolveProofBase({ BELAYD_PROOF_DIR: "/tmp/proofs" })).toBe("/tmp/proofs");
+  });
+
+  it("uses XDG_STATE_HOME when BELAYD_PROOF_DIR is absent", () => {
+    expect(resolveProofBase({ XDG_STATE_HOME: "/tmp/state" })).toBe(
+      join("/tmp/state", "belayd", "proof"),
+    );
+  });
+
+  it("falls back to ~/.local/state/belayd/proof", () => {
+    expect(resolveProofBase({})).toBe(join(homedir(), ".local", "state", "belayd", "proof"));
+  });
+
+  it("treats empty BELAYD_PROOF_DIR as unset", () => {
+    expect(resolveProofBase({ BELAYD_PROOF_DIR: "", XDG_STATE_HOME: "/tmp/state" })).toBe(
+      join("/tmp/state", "belayd", "proof"),
+    );
+  });
+});
+
+describe("proofDirForTask", () => {
+  it("joins the proof base and task id", () => {
+    expect(proofDirForTask("bd-42", "/base")).toBe(join("/base", "bd-42"));
+  });
+});
+
+describe("ensureProofBridge", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "proof-bridge-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Create a git worktree root plus an external proof base under tmpDir. */
+  function makeWorkspace(): { workspaceRoot: string; proofBase: string } {
+    const workspaceRoot = join(tmpDir, "repo");
+    mkdirSync(join(workspaceRoot, ".git"), { recursive: true });
+    const proofBase = join(tmpDir, "external", "proof");
+    return { workspaceRoot, proofBase };
+  }
+
+  it("creates the symlink and the proof base directory", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+    expect(existsSync(resolve(proofBase))).toBe(true);
+  });
+
+  it("is idempotent when the symlink already points at the same target", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+
+    const first = ensureProofBridge(workspaceRoot, proofBase);
+    const second = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(first).toHaveProperty("ok", true);
+    expect(second).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+  });
+
+  it("errors when proof-of-work already exists as a real directory", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    mkdirSync(join(workspaceRoot, "proof-of-work"), { recursive: true });
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("real directory");
+  });
+
+  it("errors when proof-of-work points at a different target", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const otherTarget = join(tmpDir, "external", "other");
+    mkdirSync(otherTarget, { recursive: true });
+    symlinkSync(otherTarget, join(workspaceRoot, "proof-of-work"));
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("already points");
+  });
+
+  it("errors when no .git ancestor exists", () => {
+    const cwd = join(tmpDir, "no-git");
+    mkdirSync(cwd, { recursive: true });
+
+    const result = ensureProofBridge(cwd, join(tmpDir, "external", "proof"));
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("No .git ancestor");
+  });
+});
+
+describe("gateProofContent fallback", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "proof-gate-fallback-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  const validCast = [
+    JSON.stringify({ version: 3, command: "pnpm test" }),
+    JSON.stringify([0.0, "o", "Running tests...\n"]),
+    JSON.stringify([1.5, "o", "PASS\n"]),
+    JSON.stringify([2.0, "x", "0"]),
+  ].join("\n");
+
+  async function writeFileEnsuringParent(path: string, content: string): Promise<void> {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, content, "utf-8");
+  }
+
+  it("resolves a .cast path through the workspace proof-of-work symlink", async () => {
+    const workspaceRoot = join(tmpDir, "repo");
+    mkdirSync(join(workspaceRoot, ".git"), { recursive: true });
+    const proofBase = join(tmpDir, "external", "proof");
+    const castPath = join(proofBase, "bd-99", "valid.cast");
+    await writeFileEnsuringParent(castPath, validCast);
+    symlinkSync(resolve(proofBase), join(workspaceRoot, "proof-of-work"));
+
+    const output = "Proof recording: proof-of-work/bd-99/valid.cast\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, { cwd: workspaceRoot });
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("still resolves a real proof-of-work directory when no proofDir is given", async () => {
+    const workspaceRoot = join(tmpDir, "repo");
+    mkdirSync(join(workspaceRoot, ".git"), { recursive: true });
+    const castPath = join(workspaceRoot, "proof-of-work", "bd-99", "valid.cast");
+    await writeFileEnsuringParent(castPath, validCast);
+
+    const output = "Proof recording: proof-of-work/bd-99/valid.cast\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, { cwd: workspaceRoot });
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("resolves non-.cast refs through the workspace proof-of-work symlink", async () => {
+    const workspaceRoot = join(tmpDir, "repo");
+    mkdirSync(join(workspaceRoot, ".git"), { recursive: true });
+    const proofBase = join(tmpDir, "external", "proof");
+    await writeFileEnsuringParent(join(proofBase, "bd-99", "screenshot.png"), "fake-png-content");
+    symlinkSync(resolve(proofBase), join(workspaceRoot, "proof-of-work"));
+
+    const output = "Screenshot: proof-of-work/bd-99/screenshot.png\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, { cwd: workspaceRoot });
 
     expect(result).toHaveProperty("passed", true);
   });
