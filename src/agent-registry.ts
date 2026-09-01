@@ -36,6 +36,8 @@ export interface GateOptions {
   cwd?: string;
   /** Timeout in milliseconds for each check. */
   timeoutInMs?: number;
+  /** External per-task proof directory (used by the proof gate). */
+  proofDir?: string;
 }
 
 /** Deterministic quality gate: takes the agent's output and returns pass/fail. */
@@ -88,6 +90,8 @@ export interface SpawnOptions {
   worktree?: WorktreeOptions;
   /** Spawn the child detached (background runs). Default false. */
   detached?: boolean;
+  /** Extra environment variables for the spawned agent process. */
+  env?: Record<string, string>;
   /** Called with partial agent session events as they arrive. */
   onUpdate?: (event: unknown) => void;
 }
@@ -271,7 +275,7 @@ For each task, produce the appropriate proof artifacts:
 - API changes: asciinema of curl commands
 - E2E tests: run with BELAYD_PROOF=1 to capture video
 
-Save artifacts to \`proof-of-work/<task-id>/\` with descriptive filenames.
+Save all artifacts to the directory specified by the BELAYD_PROOF_TASK_DIR environment variable. Create a subdirectory named after the task ID. The harness will create a symlink at proof-of-work/ pointing to the external directory.
 
 ## Quality Requirements
 

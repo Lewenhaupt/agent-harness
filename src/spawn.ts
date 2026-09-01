@@ -145,6 +145,7 @@ export function launchAgentProcess(
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
     detached: options.detached === true,
+    env: options.env === undefined ? process.env : { ...process.env, ...options.env },
   });
 
   let buffer = "";
