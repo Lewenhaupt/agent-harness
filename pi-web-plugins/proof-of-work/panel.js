@@ -1,4 +1,4 @@
-import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT } from "./discovery.js";
+import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot } from "./discovery.js";
 import { renderFileContent, renderTracePlaceholder, isTraceFile } from "./renderers.js";
 
 export const proofPanelTagName = "pi-web-proof-of-work-panel";
@@ -21,6 +21,7 @@ export function defineProofPanelElement() {
 class PiWebProofOfWorkPanel extends HTMLElement {
   contextValue;
   listing;
+  proofRoot;
   selectedTaskPath;
   taskFiles;
   selectedFilePath;
@@ -121,7 +122,16 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     this.renderAll();
     this.loadAsciinemaPlayerAssets();
 
-    const listing = await listTaskDirs(context.files);
+    const root = await resolveProofRoot(context.files);
+    if (!this.isCurrentScan(context, token)) return;
+    if (root.kind === "unavailable") {
+      this.listing = { kind: "unavailable", detail: root.detail };
+      this.renderAll();
+      return;
+    }
+    this.proofRoot = root;
+
+    const listing = await listTaskDirs(context.files, root.path);
     if (!this.isCurrentScan(context, token)) return;
     this.listing = listing;
 
@@ -276,6 +286,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   resetScanState() {
     this.destroyPlayers();
     this.listing = undefined;
+    this.proofRoot = undefined;
     this.selectedTaskPath = undefined;
     this.taskFiles = undefined;
     this.selectedFilePath = undefined;
@@ -320,13 +331,18 @@ class PiWebProofOfWorkPanel extends HTMLElement {
       return;
     }
 
+    if (listing.kind === "denied") {
+      this.taskListEl.innerHTML = this.renderDenied();
+      return;
+    }
+
     if (listing.kind === "unavailable") {
       this.taskListEl.innerHTML = `<div class="status error"><strong>${escapeHtml("Could not scan proof-of-work directory.")}</strong><pre>${escapeHtml(listing.detail)}</pre></div>`;
       return;
     }
 
     if (listing.kind === "missing" || listing.tasks.length === 0) {
-      this.taskListEl.innerHTML = `<div class="empty-state"><strong>No artifacts found.</strong><p>Proof-of-work artifacts live in <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
+      this.taskListEl.innerHTML = `<div class="empty-state"><strong>No artifacts found.</strong><p>Proof-of-work artifacts live outside the workspace in the external proof base, presented as <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
       return;
     }
 
@@ -350,6 +366,9 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   renderFileListItems(taskFiles) {
     if (taskFiles === undefined) {
       return `<p class="muted small">Loading files…</p>`;
+    }
+    if (taskFiles.kind === "denied") {
+      return `<p class="status error small">${escapeHtml("Could not access the proof-of-work directory.")}</p>`;
     }
     if (taskFiles.kind === "unavailable") {
       return `<p class="status error small">${escapeHtml(taskFiles.detail)}</p>`;
@@ -400,13 +419,19 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     if (listing.kind === "unavailable") {
       return renderErrorState("Could not scan proof-of-work directory.", listing.detail);
     }
+    if (listing.kind === "denied") {
+      return this.renderDenied();
+    }
     if (listing.kind === "missing" || listing.tasks.length === 0) {
-      return `<div class="empty-state"><strong>No proof-of-work artifacts in this workspace.</strong><p>Proof artifacts live in <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
+      return `<div class="empty-state"><strong>No proof-of-work artifacts in this workspace.</strong><p>Proof artifacts live outside the workspace in the external proof base, presented as <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
     }
 
     const taskFiles = this.taskFiles;
     if (taskFiles === undefined) {
       return `<p class="muted">Loading files…</p>`;
+    }
+    if (taskFiles.kind === "denied") {
+      return this.renderDenied();
     }
     if (taskFiles.kind === "unavailable") {
       return renderErrorState("Could not list task files.", taskFiles.detail);
@@ -432,11 +457,33 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     if (content.kind === "unavailable") {
       return renderErrorState("Could not read this file.", content.detail);
     }
+    if (content.kind === "denied") {
+      return this.renderDenied();
+    }
     if (content.kind === "missing") {
       return `<div class="empty-state"><strong>File no longer exists.</strong><p>Click Refresh to rescan.</p></div>`;
     }
 
     return renderFileContent(filePath, content.content, content.binary, content.truncated);
+  }
+
+  /**
+   * Render the guidance shown when pi-web blocks access to the proof base path.
+   *
+   * The proof base comes from a marker file and is attacker-controllable, so
+   * this message must never interpolate it. Guidance is keyed off the resolved
+   * root kind and uses only static, trusted HTML.
+   */
+  renderDenied() {
+    let guidance;
+    if (this.proofRoot?.kind === "workspace") {
+      guidance =
+        "The workspace <code>proof-of-work</code> link points outside the workspace. Re-run a Belayd phase tool so the harness writes the <code>.belayd/proof-dir</code> marker, then refresh.";
+    } else {
+      guidance =
+        "Add the proof base directory to pi-web's <strong>External filesystem roots</strong> (<code>pathAccess.allowedPaths</code> in the global pi-web config or <code>&lt;workspace&gt;/.pi-web/config.json</code>), then refresh.";
+    }
+    return `<div class="status error"><strong>Could not access the proof-of-work directory.</strong><p>${guidance}</p></div>`;
   }
 
   /**

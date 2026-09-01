@@ -21,14 +21,58 @@ readlink -f ~/.pi-web/plugins/proof-of-work
 # Expected: <path-to-repo>/pi-web-plugins/proof-of-work
 ```
 
-### 2. Create test proof-of-work artifacts
+### 2. Run a phase tool and verify the proof bridge
 
-Create a full set of demo artifacts under a workspace that pi-web has open:
+In the workspace selected by pi-web, start or resume a task and run a phase
+tool (for example, `belayd_plan`) so the harness calls `ensureProofBridge()`.
+Use a phase tool with a current task ID; merely opening the panel does not create
+the bridge. After the tool has run, inspect both bridge artifacts from a
+terminal:
 
 ```bash
-WORKSPACE_DIR="/path/to/a-workspace-connected-to-pi-web"
-mkdir -p "$WORKSPACE_DIR/proof-of-work/TASK-1"
-cd "$WORKSPACE_DIR/proof-of-work/TASK-1"
+WORKSPACE_DIR="/path/to/the-workspace"
+PROOF_BASE="${BELAYD_PROOF_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/belayd/proof}"
+EXPECTED_BASE="$(realpath "$PROOF_BASE")"
+
+# The marker is one absolute path followed by a newline.
+test -f "$WORKSPACE_DIR/.belayd/proof-dir"
+test "$(wc -l < "$WORKSPACE_DIR/.belayd/proof-dir")" -eq 1
+grep -Fx "$EXPECTED_BASE" "$WORKSPACE_DIR/.belayd/proof-dir"
+test "$(tail -c 1 "$WORKSPACE_DIR/.belayd/proof-dir" | od -An -t x1 | tr -d '[:space:]')" = "0a"
+
+# The symlink remains available to terminal and agent commands.
+test -L "$WORKSPACE_DIR/proof-of-work"
+test "$(readlink -f "$WORKSPACE_DIR/proof-of-work")" = "$EXPECTED_BASE"
+```
+
+The marker path is `<workspace>/.belayd/proof-dir`; its content must be the
+expanded absolute base, such as `/home/alice/.local/state/belayd/proof`, not a
+workspace-relative path. The `proof-of-work` symlink and marker are gitignored.
+
+### 3. Allow pi-web to read the external proof base
+
+The panel reads artifacts from the external proof base by absolute path, so that
+path must be listed in pi-web's allowed filesystem roots. Add it to the global
+pi-web config (or the project `<workspace>/.pi-web/config.json`):
+
+```json
+{ "pathAccess": { "allowedPaths": ["~/.local/state/belayd/proof"] } }
+```
+
+If you set `BELAYD_PROOF_DIR`, list that path instead. Without this entry the
+panel shows: *"Could not access the proof-of-work directory."*
+
+### 4. Create test proof-of-work artifacts
+
+Create a full set of demo artifacts in the external proof base. This step
+must write under `$PROOF_BASE/<task-id>/...`, not under
+`$WORKSPACE_DIR/proof-of-work/TASK-1/...`; the latter is only the
+terminal/agent symlink view of the external directory.
+
+```bash
+PROOF_BASE="${BELAYD_PROOF_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/belayd/proof}"
+mkdir -p "$PROOF_BASE/TASK-1"
+cd "$PROOF_BASE/TASK-1"
 
 # --- Terminal recording (.cast) — minimal valid asciinema file ---
 cat > demo.cast << 'EOF'
@@ -82,18 +126,23 @@ printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\
 # show the "Binary file" fallback state, which is expected for this test.
 touch demo.webm
 
-echo "Test artifacts created in $WORKSPACE_DIR/proof-of-work/TASK-1/"
+echo "Test artifacts created in $PROOF_BASE/TASK-1/"
 ```
 
-### 3. Open the panel and verify each file type
+### 5. Open the panel and verify each file type
 
 1. Open pi-web in a browser (default: `http://127.0.0.1:8504`).
-2. Select the workspace that contains the `proof-of-work/` directory from step 2.
+2. Select the workspace whose proof base was configured in step 3.
 3. In the workspace panel area (the left-hand column with Files, Git, Terminal tabs), look for the **Proof of Work** tab (shield badge icon). Click it.
    - If the tab is not visible, press `Ctrl+K` / `Cmd+K` to open the action palette and type **"Open Proof of Work"**, then press Enter.
 4. The panel shows a two-pane layout:
-   - **Left sidebar:** lists task directories under `proof-of-work/`.
+   - **Left sidebar:** lists task directories under the logical `proof-of-work/` root.
    - **Right viewer:** renders the selected file.
+
+Confirm that `TASK-1` and its files appear. The files must have been created at
+`$PROOF_BASE/TASK-1/...` in step 4, not at
+`$WORKSPACE_DIR/proof-of-work/TASK-1/...`; the panel reports the external files
+through the logical `proof-of-work/<task-id>/...` layout.
 
 **Expected behavior for each file:**
 
@@ -107,32 +156,67 @@ echo "Test artifacts created in $WORKSPACE_DIR/proof-of-work/TASK-1/"
 | `screenshot.png` | Inline image scaled to fit panel width |
 | `demo.webm` | HTML5 `<video>` element with native controls (play, pause, volume, fullscreen); or a "Binary file: demo.webm — This file has no text preview." message if the file is empty/corrupt |
 
-### 4. Verify empty state
+### 6. Verify denied external access
+
+Temporarily remove the proof base from every `pathAccess.allowedPaths` list that
+could apply (global and project config), or point the marker at a base that is
+not listed. Save the config and click ↻ **Refresh**; `pathAccess` is applied on
+the next file request, and a browser refresh can be used if the existing view
+is stale.
+
+Expected result: the panel shows the exact error title **"Could not access the
+proof-of-work directory."** and this exact guidance:
+> Add the proof base directory to pi-web's **External filesystem roots**
+> (`pathAccess.allowedPaths` in the global pi-web config or
+> `<workspace>/.pi-web/config.json`), then refresh.
+
+It must not silently show an empty artifact list. Restore the allowed path before continuing.
+
+### 7. Verify legacy workspace-relative fallback
+
+Use a separate workspace that has no `.belayd/proof-dir` marker and has a real
+(non-symlink) `proof-of-work/` directory. Do not run a phase tool in this
+workspace while testing the fallback.
+
+```bash
+LEGACY_WORKSPACE="/path/to/legacy-workspace"
+rm -f "$LEGACY_WORKSPACE/.belayd/proof-dir"
+mkdir -p "$LEGACY_WORKSPACE/proof-of-work/LEGACY-1"
+printf 'legacy artifact\n' > "$LEGACY_WORKSPACE/proof-of-work/LEGACY-1/artifact.txt"
+test -d "$LEGACY_WORKSPACE/proof-of-work"
+test ! -L "$LEGACY_WORKSPACE/proof-of-work"
+```
+
+Select that workspace in pi-web and open the Proof of Work panel. It must list
+`LEGACY-1/artifact.txt` from the workspace-relative `proof-of-work/` directory,
+without a marker or an external `allowedPaths` entry.
+
+### 8. Verify empty state
 
 | Scenario | Expected message |
 |---|---|
-| No `proof-of-work/` directory exists in the workspace | *"No proof-of-work artifacts in this workspace. Proof artifacts live in `proof-of-work/<task-id>/`."* |
-| `proof-of-work/` exists but is empty | *"No artifacts found."* (sidebar) / *"No proof-of-work artifacts in this workspace."* (viewer) |
-| `proof-of-work/TASK-1/` exists but has no files | Expand TASK-1 → *"No files."* (sidebar); viewer shows *"This task has no files."* |
+| No proof artifacts exist for the workspace | *"No proof-of-work artifacts in this workspace. Proof artifacts live outside the workspace in the external proof base, presented as `proof-of-work/<task-id>/`."* |
+| The proof base exists but is empty | *"No artifacts found."* (sidebar) / *"No proof-of-work artifacts in this workspace."* (viewer) |
+| `TASK-1/` exists but has no files | Expand TASK-1 → *"No files."* (sidebar); viewer shows *"This task has no files."* |
 | No workspace is selected | *"Select a workspace to view proof artifacts."* |
 
 To test the empty-task scenario:
 
 ```bash
-mkdir -p "$WORKSPACE_DIR/proof-of-work/EMPTY-TASK"
+mkdir -p "$PROOF_BASE/EMPTY-TASK"
 # Then click the Refresh button (↻) in the panel toolbar
 ```
 
-### 5. Verify the Refresh button
+### 9. Verify the Refresh button
 
 1. With the panel open and TASK-1 visible, add a new file:
    ```bash
-   echo "new artifact" > "$WORKSPACE_DIR/proof-of-work/TASK-1/new-file.txt"
+   echo "new artifact" > "$PROOF_BASE/TASK-1/new-file.txt"
    ```
 2. Click the ↻ **Refresh** button in the panel toolbar.
 3. `new-file.txt` appears in the file list under TASK-1.
 
-### 6. Verify asciinema-player asset loading
+### 10. Verify asciinema-player asset loading
 
 1. Open browser Developer Tools (F12) → Network tab.
 2. Filter for `asciinema-player`.
@@ -144,7 +228,7 @@ mkdir -p "$WORKSPACE_DIR/proof-of-work/EMPTY-TASK"
 
 If the script fails to load, the viewer shows: *"Asciinema player failed to load. Cast recordings cannot be played."*
 
-### 7. Verify workspace-switch cleanup
+### 11. Verify workspace-switch cleanup
 
 1. Open a workspace that has artifacts and play a `.cast` recording.
 2. Switch to a different workspace (without artifacts).
@@ -210,6 +294,33 @@ The panel can be opened in two ways:
 
 The action is only available when a workspace is selected.
 
+### Proof location and access
+
+The harness resolves the external proof base in this order:
+
+1. A non-empty `BELAYD_PROOF_DIR` value.
+2. `${XDG_STATE_HOME}/belayd/proof` when `XDG_STATE_HOME` is set.
+3. `~/.local/state/belayd/proof` otherwise.
+
+After a phase tool runs, `ensureProofBridge()` writes the resolved absolute base
+(one line plus a trailing newline) to `<workspace>/.belayd/proof-dir`. It also
+keeps `<workspace>/proof-of-work` as a symlink to that base for terminal and
+agent use. The plugin reads the marker because browser code cannot read the
+harness process environment.
+
+For the external viewer to work, both conditions are required:
+
+- the workspace must have the marker written by the harness; and
+- the resolved external base must be listed in pi-web's
+  `pathAccess.allowedPaths` under **External filesystem roots** (in the global
+  config or `<workspace>/.pi-web/config.json`).
+
+An allowed path change applies on the next file request; click ↻ **Refresh** or
+reload the browser tab. If the marker is absent, the plugin instead uses the
+legacy workspace-relative `proof-of-work/` directory. Artifacts are therefore
+reported logically as `proof-of-work/<task-id>/...`, while external-mode files
+are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
+
 ### Supported formats
 
 | Extension | Renderer | Notes |
@@ -235,28 +346,57 @@ Proof artifacts are generated by agents using the **verifiable-proof** skill:
 
 Full details: `.agents/skills/verifiable-proof/SKILL.md`
 
+The `proof-of-work/...` command is intentionally a terminal/agent example: the
+symlink resolves it to the external base. When creating manual viewer fixtures,
+write to the external `$PROOF_BASE/<task-id>/...` path as shown in How to Verify.
+
 ### Directory structure
 
-Proof artifacts live under the workspace root in this layout:
+Proof artifacts live outside the workspace under the external proof base
+(`${BELAYD_PROOF_DIR:-${XDG_STATE_HOME:-~/.local/state}/belayd/proof}`):
+
+```
+<external-proof-base>/
+├── TASK-42/
+│   ├── e2e-video.webm
+│   ├── cli-demo.cast
+│   └── dashboard-state.png
+├── TASK-43/
+│   ├── test-run.cast
+│   └── notes.md
+└── TASK-1/
+    └── ...
+```
+
+The workspace only holds two bridge artifacts:
 
 ```
 <workspace-root>/
-├── proof-of-work/
-│   ├── TASK-42/
-│   │   ├── e2e-video.webm
-│   │   ├── cli-demo.cast
-│   │   └── dashboard-state.png
-│   ├── TASK-43/
-│   │   ├── test-run.cast
-│   │   └── notes.md
-│   └── TASK-1/
-│       └── ...
-└── ...
+├── proof-of-work -> <external-proof-base>   # symlink — terminal/agent use ONLY (NOT readable by the panel)
+└── .belayd/
+    └── proof-dir                            # marker file carrying the absolute proof base
 ```
 
 - Each subdirectory is named after a task ID.
 - Files inside are arbitrary — the plugin detects them by extension.
-- The `proof-of-work/` directory is gitignored; artifacts are ephemeral.
+- The `proof-of-work/` symlink is for terminals and agents. pi-web's browser
+  file API rejects it (realpath + workspace-boundary checks), so the panel never
+  reads through it — it reads the external base by absolute path instead.
+- The `.belayd/proof-dir` marker is written by the harness and carries the
+  absolute proof base. The browser plugin reads it because it cannot read
+  server-side environment variables.
+- The `proof-of-work/` symlink and `.belayd/` are gitignored; artifacts are ephemeral.
+
+#### Resolution order
+
+1. The harness chooses the base using `BELAYD_PROOF_DIR`, then
+   `XDG_STATE_HOME`, then `~/.local/state/belayd/proof`.
+2. It writes that resolved absolute path as one line plus a trailing newline in
+   `.belayd/proof-dir`.
+3. The plugin reads the marker and lists the external path directly. That path
+   must be in `pathAccess.allowedPaths`.
+4. If the marker is missing, the plugin falls back to the legacy
+   workspace-relative `proof-of-work` location.
 
 ### Troubleshooting
 
@@ -275,10 +415,28 @@ The viewer shows *"Asciinema player failed to load"* or *"Asciinema player not l
 
 The viewer shows the empty-state message.
 
-- Ensure a `proof-of-work/` directory exists at the **workspace root** (not inside a subdirectory).
-- Ensure at least one task subdirectory exists: `proof-of-work/<task-id>/`.
+- In external mode, ensure the proof base contains at least one task
+  subdirectory: `<proof-base>/<task-id>/`.
+- In external mode, confirm `.belayd/proof-dir` exists in the workspace and
+  contains the absolute proof base. If testing legacy fallback, confirm the
+  marker is absent and a real workspace-relative `proof-of-work/` directory
+  contains the task subdirectory.
 - Click the ↻ Refresh button to re-scan.
-- Verify the workspace has a `proof-of-work/` directory you can see in the Files tab.
+
+#### "Could not access the proof-of-work directory"
+
+pi-web rejected the absolute proof-base path because it is not in the allowed
+filesystem roots. The panel deliberately does not echo the marker's absolute
+path.
+
+- Add the proof base directory to pi-web's **External filesystem roots**
+  (`pathAccess.allowedPaths` in the global pi-web config or
+  `<workspace>/.pi-web/config.json`), then refresh.
+- Use this config shape (or merge the entry into an existing config):
+  `{ "pathAccess": { "allowedPaths": ["~/.local/state/belayd/proof"] } }`
+  (`BELAYD_PROOF_DIR` users list that path instead).
+- The setting applies on the next file request; click ↻ **Refresh** or reload
+  the browser tab if the existing view is stale.
 
 #### "Binary file — no preview"
 
@@ -324,10 +482,12 @@ The plugin is a plain JavaScript ES module with no build step. It consists of fo
 | File | Responsibility |
 |---|---|
 | `pi-web-plugin.js` | Plugin metadata and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
-| `discovery.js` | File I/O helpers — `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()` |
+| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()` |
 | `panel.js` | Custom element `<pi-web-proof-work-panel>` — all UI, state management, player lifecycle |
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
+
+Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step).
 
 Async operations are guarded by a monotonic `scanToken` counter that prevents stale responses from overwriting newer state. Binary media content is passed through blob URLs that are tracked and revoked on cleanup.
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readlinkSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -77,6 +77,9 @@ describe("proof-of-work relocation (integration)", () => {
 
     const bridge = ensureProofBridge(workspaceRoot, proofBase);
     expect(bridge).toHaveProperty("ok", true);
+    expect(readFileSync(join(workspaceRoot, ".belayd/proof-dir"), "utf-8").trim()).toBe(
+      resolve(proofBase),
+    );
 
     await mkdir(proofDir, { recursive: true });
     await writeFile(join(proofDir, "valid.cast"), validCast, "utf-8");
@@ -114,6 +117,7 @@ describe("proof-of-work relocation (integration)", () => {
     const result = ensureProofBridge(workspaceRoot, join(tmpDir, "external", "proof"));
 
     expect(result).toHaveProperty("ok", false);
+    expect(existsSync(join(workspaceRoot, ".belayd/proof-dir"))).toBe(false);
   });
 
   it("keeps proof artifacts outside the workspace tree", async () => {

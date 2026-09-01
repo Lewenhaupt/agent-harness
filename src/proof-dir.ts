@@ -8,7 +8,15 @@
  * commit payloads.
  */
 
-import { existsSync, lstatSync, mkdirSync, readlinkSync, type Stats, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  type Stats,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -40,6 +48,22 @@ export function proofDirForTask(taskId: string, proofBase: string): string {
 }
 
 /**
+ * Workspace-relative path of the file that records the absolute proof base.
+ *
+ * pi-web's browser file API cannot read server-side environment variables, so
+ * this marker is the only channel through which the browser plugin learns
+ * where proof artifacts actually live. It lives under `.belayd/`, which is
+ * gitignored alongside the `proof-of-work` symlink.
+ */
+// SYNC WARNING: The marker path and file format below are a cross-component
+// contract duplicated in `pi-web-plugins/proof-of-work/discovery.js`
+// (`PROOF_DIR_MARKER_PATH`). The marker lives at ".belayd/proof-dir" and
+// contains a single-line absolute proof base path followed by a trailing
+// newline. Any change here must be mirrored in
+// `pi-web-plugins/proof-of-work/discovery.js`, and vice versa.
+export const PROOF_DIR_MARKER_RELATIVE_PATH = ".belayd/proof-dir";
+
+/**
  * Walk up from `cwd` to the nearest ancestor containing a `.git` entry.
  * Returns undefined when no git worktree root is found.
  */
@@ -63,12 +87,44 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * Create (or verify) the `proof-of-work` symlink at the workspace root.
+ * Write the absolute proof base into the workspace marker file.
  *
- * Side effect: creates the proof base directory and the symlink when missing.
+ * The browser plugin reads this file through its absolute-path file API to
+ * discover where proof artifacts live; it cannot read server environment
+ * variables, so the marker is the only channel for that information.
+ */
+function writeProofDirMarker(
+  workspaceRoot: string,
+  absoluteProofBase: string,
+): { ok: true } | { ok: false; error: string } {
+  try {
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH),
+      `${absoluteProofBase}\n`,
+      "utf-8",
+    );
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: `Failed to write proof dir marker: ${errorMessage(error)}` };
+  }
+}
+
+/**
+ * Create (or verify) the `proof-of-work` symlink at the workspace root and
+ * write the proof-base marker that the browser plugin reads.
+ *
+ * The bridge contract has two parts:
+ * - the `proof-of-work` symlink (terminal/agent use; resolves the external base)
+ * - the `.belayd/proof-dir` marker (browser plugin use; carries the absolute base)
+ *
+ * A successful return guarantees both are in place; every error path leaves
+ * the marker untouched.
+ *
+ * Side effect: creates the proof base directory, the symlink, and the marker.
  * Idempotent when the symlink already points at the expected proof base.
  *
- * - Symlink to the same target → no-op success.
+ * - Symlink to the same target → rewrite marker, success.
  * - Existing real directory → error (do not clobber real artifacts).
  * - Symlink to a different target → error (do not silently redirect).
  */
@@ -104,7 +160,7 @@ export function ensureProofBridge(
     if (isFsError(error, "ENOENT")) {
       try {
         symlinkSync(absoluteProofBase, linkPath);
-        return { ok: true };
+        return writeProofDirMarker(workspaceRoot, absoluteProofBase);
       } catch (symlinkError) {
         return {
           ok: false,
@@ -130,7 +186,7 @@ export function ensureProofBridge(
     }
     const resolvedTarget = resolve(workspaceRoot, target);
     if (resolvedTarget === absoluteProofBase) {
-      return { ok: true };
+      return writeProofDirMarker(workspaceRoot, absoluteProofBase);
     }
     return {
       ok: false,

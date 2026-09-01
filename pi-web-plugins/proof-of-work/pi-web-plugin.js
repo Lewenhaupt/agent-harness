@@ -1,4 +1,3 @@
-import { PROOF_OF_WORK_ROOT } from "./discovery.js";
 import { defineProofPanelElement } from "./panel.js";
 
 const plugin = {
@@ -12,7 +11,7 @@ const plugin = {
           {
             id: "workspace.open-proof-of-work",
             title: "Open Proof of Work",
-            description: `View proof-of-work artifacts (${PROOF_OF_WORK_ROOT}/).`,
+            description: `View proof-of-work artifacts (per-task directories, external proof base).`,
             group: "Workspace",
             enabled: (context) => context.state.selectedWorkspace !== undefined,
             run: (context) => {
