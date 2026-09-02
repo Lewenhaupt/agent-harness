@@ -26,6 +26,7 @@ import type {
 import { Type } from "typebox";
 import type {
   AgentDefinition,
+  ModelClass,
   Phase,
   QualityGate,
   RunHandle,
@@ -492,6 +493,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       cwd?: string;
       signal?: AbortSignal;
       model?: string;
+      modelClass?: ModelClass;
       tools?: string[];
       sessionName?: string;
       attempt: number;
@@ -500,6 +502,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   ): Promise<SpawnResult> {
     return spawnAgentWithFallback({
       model: options.model ?? agent.model,
+      modelClass: options.modelClass,
       tools: options.tools ?? agent.tools,
       systemPrompt: agent.systemPrompt,
       task: `Previous attempt failed quality gate:\n${feedback}\n\nFix the issues and retry.`,
@@ -539,6 +542,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     phaseName: string,
     signal?: AbortSignal,
     effectiveModel?: string,
+    effectiveModelClass?: ModelClass,
     effectiveTools?: string[],
     sessionName?: string,
   ): Promise<SpawnResult | null> {
@@ -569,6 +573,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         cwd: params.cwd,
         signal,
         model: effectiveModel,
+        modelClass: effectiveModelClass,
         tools: effectiveTools,
         sessionName,
         attempt,
@@ -1064,6 +1069,17 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /** Resolve a phase's effective capability tier from agent + workflow overrides. */
+  function resolveEffectiveModelClass(
+    agent: AgentDefinition,
+    overrides: { model?: string; modelClass?: ModelClass } | undefined,
+  ): ModelClass | undefined {
+    // Edge-case matrix: an override model derives its class from MODEL_TO_CLASS
+    // (undefined here); an explicit override modelClass wins over both the
+    // override model and the agent's default class.
+    return overrides?.modelClass ?? (overrides?.model ? undefined : agent.modelClass);
+  }
+
   /**
    * Start a phase run in the background and return its handle immediately.
    *
@@ -1080,6 +1096,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   ): { handle: RunHandle; sessionName: string } {
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
     const effectiveModel = overrides?.model ?? agent.model;
+    const effectiveModelClass = resolveEffectiveModelClass(agent, overrides);
     const effectiveTools = overrides?.tools ?? agent.tools;
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
     const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
@@ -1120,6 +1137,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const spawnAgent = (): Promise<SpawnResult> =>
       spawnAgentWithFallback({
         model: effectiveModel,
+        modelClass: effectiveModelClass,
         tools: effectiveTools,
         systemPrompt: effectiveSystemPrompt,
         task: params.task,
@@ -1144,6 +1162,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         phaseName,
         abortController.signal,
         effectiveModel,
+        effectiveModelClass,
         effectiveTools,
         subagentSessionName,
       ).then((gateResult) => gateResult ?? result);

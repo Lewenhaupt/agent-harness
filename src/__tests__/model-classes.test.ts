@@ -94,12 +94,73 @@ describe("candidatesForModel", () => {
   it("yields a single candidate for unknown models", () => {
     expect(candidatesForModel("unknown/x")).toEqual(["unknown/x"]);
   });
+
+  it("uses an explicit class to expand candidates even when the model is known", () => {
+    const candidates = candidatesForModel("opencode-go/deepseek-v4-pro", "fast");
+    expect(candidates[0]).toBe("opencode-go/deepseek-v4-pro");
+    expect(candidates[1]).toBe("opencode-go/mimo-v2.5");
+    expect(candidates).toHaveLength(1 + resolveModelCandidates("fast").length);
+  });
+
+  it("expands an unknown model when an explicit class is provided", () => {
+    const candidates = candidatesForModel("unknown/x", "fast");
+    expect(candidates[0]).toBe("unknown/x");
+    expect(candidates[1]).toBe("opencode-go/mimo-v2.5");
+  });
+
+  it("treats an omitted class identically to an explicit undefined", () => {
+    expect(candidatesForModel("opencode-go/glm-5.3")).toEqual(
+      candidatesForModel("opencode-go/glm-5.3", undefined),
+    );
+  });
+
+  it("does not duplicate the requested model when it belongs to the explicit class", () => {
+    const candidates = candidatesForModel("opencode-go/mimo-v2.5", "fast");
+    expect(candidates.filter((c) => c === "opencode-go/mimo-v2.5")).toHaveLength(1);
+  });
+
+  it("resolves a bare known id through its class (class-of-one entry first)", () => {
+    // The empty sameModelAlternateProvider partition for bare ids: the bare
+    // id leads, then every provider-qualified same-id candidate, then the rest.
+    expect(candidatesForModel("glm-5.3")).toEqual([
+      "glm-5.3",
+      "opencode-go/glm-5.3",
+      "llmgateway/glm-5.3",
+      "opencode-go/deepseek-v4-pro",
+      "llmgateway/deepseek-v4-pro",
+      "opencode-go/gpt-5.6-luna",
+      "llmgateway/gpt-5.6-luna",
+    ]);
+  });
+
+  it("returns a bare unknown id as a single candidate", () => {
+    expect(candidatesForModel("mystery-model")).toEqual(["mystery-model"]);
+  });
+
+  it("expands a bare id when an explicit class is provided", () => {
+    expect(candidatesForModel("glm-5.2", "fast")).toEqual([
+      "glm-5.2",
+      "opencode-go/glm-5.2",
+      "llmgateway/glm-5.2",
+      "opencode-go/mimo-v2.5",
+      "llmgateway/mimo-v2.5",
+      "opencode-go/deepseek-v4-flash",
+      "llmgateway/deepseek-v4-flash",
+    ]);
+  });
 });
 
 describe("model class coverage", () => {
   it("every DEFAULT_AGENTS model maps to a known class", () => {
     for (const agent of DEFAULT_AGENTS) {
       expect(modelClassOf(agent.model), agent.model).toBeDefined();
+    }
+  });
+
+  it("every DEFAULT_AGENTS entry defines modelClass matching its model", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      expect(agent.modelClass, agent.model).toBeDefined();
+      expect(agent.modelClass, agent.model).toBe(modelClassOf(agent.model));
     }
   });
 

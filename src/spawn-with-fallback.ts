@@ -16,6 +16,7 @@
  */
 
 import type { SpawnDetails, SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js";
+import type { ModelClass } from "./model-classes.js";
 import { candidatesForModel, providerOf } from "./model-classes.js";
 import { createModelCooldownStore, type ModelCooldownStore } from "./model-cooldown.js";
 import type { FailureClassification } from "./quota-failure.js";
@@ -39,6 +40,8 @@ export interface SpawnWithFallbackResult {
 export interface SpawnWithFallbackOptions extends SpawnOptions {
   /** Ordered candidates to try. Defaults to the class of `model`. */
   candidates?: string[];
+  /** Explicit capability tier for fallback expansion; defaults to the class of `model`. */
+  modelClass?: ModelClass;
   /** Shared cooldown store; create one per orchestrator and pass it across spawns. */
   cooldownStore?: ModelCooldownStore;
   /** Classifier override (test seam). */
@@ -197,10 +200,11 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
 export async function spawnAgentWithFallback(
   options: SpawnWithFallbackOptions,
 ): Promise<SpawnWithFallbackResult> {
-  const { candidates, cooldownStore, classify, enabled, maxAttempts, ...spawnOptions } = options;
+  const { candidates, modelClass, cooldownStore, classify, enabled, maxAttempts, ...spawnOptions } =
+    options;
   const classifyFn = classify ?? classifySpawnFailure;
   const store = cooldownStore ?? createModelCooldownStore();
-  const resolved = candidates ?? candidatesForModel(options.model);
+  const resolved = candidates ?? candidatesForModel(options.model, modelClass);
   const modelCandidates = resolved.slice(0, maxAttempts);
 
   const firstModel = modelCandidates[0];

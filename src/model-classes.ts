@@ -90,12 +90,12 @@ export function resolveModelCandidates(modelClass: ModelClass): string[] {
  * remaining candidates. Unknown models yield a single-candidate list so an
  * unknown model is attempted as-is rather than silently swapped.
  */
-export function candidatesForModel(model: string): string[] {
-  const modelClass = modelClassOf(model);
-  if (!modelClass) return [model];
+export function candidatesForModel(model: string, modelClass?: ModelClass): string[] {
+  const resolvedClass = modelClass ?? modelClassOf(model);
+  if (!resolvedClass) return [model];
 
   const primaryBareId = bareModelId(model);
-  const expanded = resolveModelCandidates(modelClass);
+  const expanded = resolveModelCandidates(resolvedClass);
 
   // The class contract: the first failover hop is the SAME model id on the
   // alternate provider (identical behavior, different quota bucket), not a
