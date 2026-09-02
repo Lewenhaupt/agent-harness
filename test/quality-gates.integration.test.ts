@@ -109,14 +109,29 @@ describe("proof-of-work relocation (integration)", () => {
     expect(result).toHaveProperty("passed", true);
   });
 
-  it("errors when the bridge target is already a real directory", async () => {
+  it("replaces an empty proof-of-work directory with the bridge symlink", async () => {
     const workspaceRoot = join(tmpDir, "repo");
     await mkdir(join(workspaceRoot, ".git"), { recursive: true });
     await mkdir(join(workspaceRoot, "proof-of-work"), { recursive: true });
 
+    const proofBase = join(tmpDir, "external", "proof");
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+    expect(existsSync(join(workspaceRoot, ".belayd/proof-dir"))).toBe(true);
+  });
+
+  it("errors when the bridge target is a non-empty real directory", async () => {
+    const workspaceRoot = join(tmpDir, "repo");
+    await mkdir(join(workspaceRoot, ".git"), { recursive: true });
+    await mkdir(join(workspaceRoot, "proof-of-work"), { recursive: true });
+    await writeFile(join(workspaceRoot, "proof-of-work", "keep.cast"), "{}", "utf-8");
+
     const result = ensureProofBridge(workspaceRoot, join(tmpDir, "external", "proof"));
 
     expect(result).toHaveProperty("ok", false);
+    expect(existsSync(join(workspaceRoot, "proof-of-work", "keep.cast"))).toBe(true);
     expect(existsSync(join(workspaceRoot, ".belayd/proof-dir"))).toBe(false);
   });
 
