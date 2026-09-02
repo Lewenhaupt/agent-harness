@@ -414,6 +414,19 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       );
     }
 
+    // Only workflows that include a review phase need this rule; the reviewer
+    // output otherwise never exists.
+    if (phases.includes("review")) {
+      lines.push(
+        "",
+        "**Review findings** (after `belayd_review`):",
+        "- Consider EVERY finding: Critical (must fix), Warnings (should fix), and Suggestions (consider).",
+        "- Address all Critical and Warnings findings — never dismiss them.",
+        "- You may decline only Suggestions, and only with a reason.",
+        "- In the task's Final Summary, list every finding you chose not to address, with a one-line reason each.",
+      );
+    }
+
     lines.push("", "**After workflow completion:**");
     lines.push(
       `- Flag this task for human review (NEVER close it yourself): pass \`taskId\` to \`belayd_commit\`, or run \`bd update ${taskId} --status in_progress --add-label human\` with the \`bd\` tool.`,
@@ -928,6 +941,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ]
         : [];
 
+    // The reviewer's output has three severity sections. The orchestrator must
+    // treat all of them as input — not just "Critical" — and disclose anything
+    // it declines so the human reviewer sees what was consciously skipped.
+    const reviewFindingsGuidance = phaseOrder.includes("review")
+      ? [
+          "",
+          "**Review findings** (after `belayd_review`):",
+          "- Consider EVERY finding: Critical (must fix), Warnings (should fix), and Suggestions (consider).",
+          "- Address all Critical and Warnings findings — you may NOT dismiss them.",
+          "- You may decline only Suggestions, and only with a reason.",
+          "- In the task's Final Summary, list every finding you chose not to address, each with a one-line reason.",
+        ]
+      : [];
+
     // When phase runs are active, tell the orchestrator to wait instead of
     // repeating "call belayd_X" — the phase is already running, and the
     // gate will block any re-call, creating a contradictory loop.
@@ -965,6 +992,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           "Editing and writing tools are DISABLED. You MUST delegate ALL code changes to the phase tools:",
           ...phaseLines,
           ...researchGuidance,
+          ...reviewFindingsGuidance,
           ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
