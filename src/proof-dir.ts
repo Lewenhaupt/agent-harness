@@ -12,7 +12,9 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readlinkSync,
+  rmdirSync,
   type Stats,
   symlinkSync,
   writeFileSync,
@@ -110,6 +112,66 @@ function writeProofDirMarker(
   }
 }
 
+function createSymlinkAndMarker(
+  workspaceRoot: string,
+  absoluteProofBase: string,
+  linkPath: string,
+): { ok: true } | { ok: false; error: string } {
+  try {
+    symlinkSync(absoluteProofBase, linkPath);
+    return writeProofDirMarker(workspaceRoot, absoluteProofBase);
+  } catch (symlinkError) {
+    return {
+      ok: false,
+      error: `Failed to create proof-of-work symlink: ${errorMessage(symlinkError)}`,
+    };
+  }
+}
+
+/** True when the directory exists and contains no entries. */
+function isEmptyDirectory(
+  path: string,
+): { ok: true; empty: boolean } | { ok: false; error: string } {
+  try {
+    return { ok: true, empty: readdirSync(path).length === 0 };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) };
+  }
+}
+
+/**
+ * Replace an empty real directory with the bridge symlink. Non-empty
+ * directories are left untouched so real artifacts are never clobbered.
+ */
+function replaceEmptyDirectoryWithSymlink(
+  workspaceRoot: string,
+  absoluteProofBase: string,
+  linkPath: string,
+): { ok: true } | { ok: false; error: string } {
+  const isEmpty = isEmptyDirectory(linkPath);
+  if (!isEmpty.ok) {
+    return {
+      ok: false,
+      error: `proof-of-work already exists as a real directory at ${linkPath} and could not be inspected: ${isEmpty.error}`,
+    };
+  }
+  if (!isEmpty.empty) {
+    return {
+      ok: false,
+      error: `proof-of-work already exists as a real directory with content at ${linkPath}`,
+    };
+  }
+  try {
+    rmdirSync(linkPath);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to remove empty proof-of-work directory: ${errorMessage(error)}`,
+    };
+  }
+  return createSymlinkAndMarker(workspaceRoot, absoluteProofBase, linkPath);
+}
+
 /**
  * Create (or verify) the `proof-of-work` symlink at the workspace root and
  * write the proof-base marker that the browser plugin reads.
@@ -125,7 +187,9 @@ function writeProofDirMarker(
  * Idempotent when the symlink already points at the expected proof base.
  *
  * - Symlink to the same target → rewrite marker, success.
- * - Existing real directory → error (do not clobber real artifacts).
+ * - Existing empty real directory → removed and replaced with the symlink
+ *   (a stray empty directory is a setup artifact, not real proof content).
+ * - Existing non-empty real directory → error (do not clobber real artifacts).
  * - Symlink to a different target → error (do not silently redirect).
  */
 export function ensureProofBridge(
@@ -158,15 +222,7 @@ export function ensureProofBridge(
     linkStat = lstatSync(linkPath);
   } catch (error) {
     if (isFsError(error, "ENOENT")) {
-      try {
-        symlinkSync(absoluteProofBase, linkPath);
-        return writeProofDirMarker(workspaceRoot, absoluteProofBase);
-      } catch (symlinkError) {
-        return {
-          ok: false,
-          error: `Failed to create proof-of-work symlink: ${errorMessage(symlinkError)}`,
-        };
-      }
+      return createSymlinkAndMarker(workspaceRoot, absoluteProofBase, linkPath);
     }
     return {
       ok: false,
@@ -195,10 +251,7 @@ export function ensureProofBridge(
   }
 
   if (linkStat.isDirectory()) {
-    return {
-      ok: false,
-      error: `proof-of-work already exists as a real directory at ${linkPath}`,
-    };
+    return replaceEmptyDirectoryWithSymlink(workspaceRoot, absoluteProofBase, linkPath);
   }
 
   return {

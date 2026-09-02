@@ -313,14 +313,27 @@ describe("ensureProofBridge", () => {
     );
   });
 
-  it("errors when proof-of-work already exists as a real directory", () => {
+  it("replaces an empty proof-of-work directory with the symlink", () => {
     const { workspaceRoot, proofBase } = makeWorkspace();
     mkdirSync(join(workspaceRoot, "proof-of-work"), { recursive: true });
 
     const result = ensureProofBridge(workspaceRoot, proofBase);
 
+    expect(result).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+    expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(true);
+  });
+
+  it("errors when proof-of-work is a non-empty real directory", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    mkdirSync(join(workspaceRoot, "proof-of-work"), { recursive: true });
+    writeFileSync(join(workspaceRoot, "proof-of-work", "keep.cast"), "{}", "utf-8");
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
     expect(result).toHaveProperty("ok", false);
     if (!result.ok) expect(result.error).toContain("real directory");
+    expect(existsSync(join(workspaceRoot, "proof-of-work", "keep.cast"))).toBe(true);
     expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
   });
 
