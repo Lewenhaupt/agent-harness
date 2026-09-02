@@ -5,6 +5,7 @@ import {
   getAgentByShortName,
   getPhaseToolName,
 } from "../agent-registry.js";
+import { MODEL_CLASS_SPECS } from "../model-classes.js";
 
 describe("DEFAULT_AGENTS", () => {
   it("defines all 9 agents", () => {
@@ -110,6 +111,22 @@ describe("DEFAULT_AGENTS", () => {
 
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
     expect(proofGen?.qualityGate).toBeDefined();
+  });
+
+  it("all agents declare a valid modelClass", () => {
+    // Derived from MODEL_CLASS_SPECS so a new class cannot silently make this
+    // list stale; the union-vs-spec drift check lives in model-classes.test.ts.
+    const validClasses = Object.keys(MODEL_CLASS_SPECS);
+    for (const agent of DEFAULT_AGENTS) {
+      expect(agent.modelClass, agent.name).toBeDefined();
+      expect(validClasses, agent.name).toContain(agent.modelClass);
+    }
+  });
+
+  it("spot checks modelClass assignments", () => {
+    expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-scout")?.modelClass).toBe("fast");
+    expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-planner")?.modelClass).toBe("frontier");
+    expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer")?.modelClass).toBe("standard");
   });
 });
 

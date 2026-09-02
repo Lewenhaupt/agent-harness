@@ -229,6 +229,97 @@ describe("spawnAgentWithFallback", () => {
     expect(attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
   });
 
+  it("uses modelClass to drive fallback for a known model", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("opencode-go/glm-5.3"))
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3"));
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/glm-5.3",
+      modelClass: "frontier",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3");
+    expect(attempts).toHaveLength(2);
+    expect(attempts.map((a) => a.model)).toEqual(["opencode-go/glm-5.3", "llmgateway/glm-5.3"]);
+  });
+
+  it("expands an unknown model using the explicit class", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("unknown/x"))
+      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      modelClass: "fast",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.5");
+    expect(attempts.map((a) => a.model)).toEqual(["unknown/x", "opencode-go/mimo-v2.5"]);
+    expect(attempts.map((a) => a.model)).not.toContain("llmgateway/unknown");
+  });
+
+  it("does not forward modelClass to spawnAgentProcess", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+
+    await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.5",
+      modelClass: "fast",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      classify: seqClassifier("success"),
+    });
+
+    // Exact-shape assertion: enumerate every key the spawner receives so a
+    // stray modelClass key (even modelClass: undefined) fails the test.
+    // toEqual alone cannot catch this — it treats undefined keys as absent.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    const call = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(call).toBeDefined();
+    expect(Object.keys(call ?? {}).sort()).toEqual([
+      "model",
+      "sessionName",
+      "systemPrompt",
+      "task",
+      "tools",
+    ]);
+    expect(call).toEqual({
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      sessionName: undefined,
+    });
+  });
+
+  it("prefers explicit candidates over modelClass", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("custom/candidate"));
+
+    const { attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/glm-5.3",
+      modelClass: "fast",
+      candidates: ["custom/candidate"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "custom/candidate" }),
+    );
+    expect(attempts.map((a) => a.model)).toEqual(["custom/candidate"]);
+  });
+
   it("uses a fresh session id per attempt", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("a"))

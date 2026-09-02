@@ -8,6 +8,7 @@
 
 import type { QualityGate } from "./agent-registry.js";
 import { RESEARCHER_SYSTEM_PROMPT, RESEARCHER_TOOLS } from "./agent-registry.js";
+import type { ModelClass } from "./model-classes.js";
 import type { Phase } from "./process-gate.js";
 import { gateFullValidation } from "./quality-gates.js";
 
@@ -42,6 +43,7 @@ export interface WorkflowSubTypeConfig {
       Phase,
       {
         model?: string;
+        modelClass?: ModelClass;
         tools?: string[];
         systemPrompt?: string;
         qualityGate?: QualityGate;
