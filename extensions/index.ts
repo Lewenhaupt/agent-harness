@@ -50,6 +50,7 @@ import {
   listRuns,
   markPhaseCompleted,
   RunStatus,
+  resolveModelSpec,
   resolveQualityGate,
   resolveWorkflowType,
   setupWorktree,
@@ -501,7 +502,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   ): Promise<SpawnResult> {
     return spawnAgentWithFallback({
-      model: options.model ?? agent.model,
+      model: options.model ?? resolveModelSpec(agent).model,
       modelClass: options.modelClass,
       tools: options.tools ?? agent.tools,
       systemPrompt: agent.systemPrompt,
@@ -1071,13 +1072,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   /** Resolve a phase's effective capability tier from agent + workflow overrides. */
   function resolveEffectiveModelClass(
-    agent: AgentDefinition,
+    agentClass: ModelClass | undefined,
     overrides: { model?: string; modelClass?: ModelClass } | undefined,
   ): ModelClass | undefined {
-    // Edge-case matrix: an override model derives its class from MODEL_TO_CLASS
-    // (undefined here); an explicit override modelClass wins over both the
-    // override model and the agent's default class.
-    return overrides?.modelClass ?? (overrides?.model ? undefined : agent.modelClass);
+    // Edge-case matrix: an override model has no class here (undefined) so
+    // the derivation happens inside candidatesForModel via modelClassOf, not
+    // via MODEL_TO_CLASS directly; an explicit override modelClass wins over
+    // both the override model and the agent's default class.
+    return overrides?.modelClass ?? (overrides?.model ? undefined : agentClass);
   }
 
   /**
@@ -1095,8 +1097,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     runId: string,
   ): { handle: RunHandle; sessionName: string } {
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
-    const effectiveModel = overrides?.model ?? agent.model;
-    const effectiveModelClass = resolveEffectiveModelClass(agent, overrides);
+    const resolvedModel = resolveModelSpec(agent);
+    const effectiveModel = overrides?.model ?? resolvedModel.model;
+    const effectiveModelClass = resolveEffectiveModelClass(resolvedModel.modelClass, overrides);
     const effectiveTools = overrides?.tools ?? agent.tools;
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
     const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);

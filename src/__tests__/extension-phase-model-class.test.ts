@@ -10,13 +10,16 @@
  * - workflow model override without a class → modelClass undefined (the class
  *   is derived from the override model inside candidatesForModel)
  * - gate-retry (spawnGateRetry) pass-through of the same effective model/modelClass
+ *   (the documentation workflow used for this gate-retry test is a real
+ *   workflow-registry entry; only the `feature` entry is patched via
+ *   registryState, not synthesized)
  * - explicit override modelClass winning over both the agent default and the
  *   override model's own class
  *
  * Note on spawnGateRetry's model/modelClass asymmetry
- * (extensions/index.ts): `model` falls back to `agent.model` while
- * `modelClass` does not fall back to `agent.modelClass`. That is correct as
- * long as runQualityGate always passes the resolved effective pair: when a
+ * (extensions/index.ts): `model` falls back to `resolveModelSpec(agent).model`
+ * while `modelClass` does not fall back to `agent.modelClass`. That is correct
+ * as long as runQualityGate always passes the resolved effective pair: when a
  * workflow overrides the model without a class, a blanket
  * `?? agent.modelClass` fallback would misclassify the override model with the
  * agent's default tier. The documentation-workflow test below pins this
@@ -303,5 +306,26 @@ describe("extension modelClass threading", () => {
       | undefined;
     expect(options?.model).toBe("opencode-go/glm-5.2");
     expect(options?.modelClass).toBe("fast");
+  });
+
+  it("resolves the planner's class-only declaration to the frontier primary (no per-role model pick)", async () => {
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("mc-plan", workDir);
+    await commands.get("belayd")?.handler("bd-92 feature --no-worktree", ctx);
+
+    const plan = tools.get("belayd_plan");
+    expect(plan).toBeDefined();
+    await plan?.execute("call-4", { task: "plan it" }, undefined, undefined, ctx);
+
+    await vi.waitFor(() => expect(mockSpawnAgentWithFallback).toHaveBeenCalledTimes(1));
+
+    const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
+      | { model: string; modelClass?: string }
+      | undefined;
+    expect(options?.model).toBe("opencode-go/deepseek-v4-pro");
+    expect(options?.modelClass).toBe("frontier");
   });
 });

@@ -1,9 +1,20 @@
 # Explicit agent model classes
 
-`AgentDefinition.modelClass` gives an agent an explicit capability tier for
-quota fallback routing. The valid tiers are `frontier`, `standard`, and `fast`.
-The requested model is still tried first; the class controls the candidates
-used after a quota or transient failure.
+`AgentDefinition` includes the `AgentModelSpec` mutually exclusive union:
+
+```typescript
+type AgentModelSpec =
+  | { model: string; modelClass?: never }
+  | { model?: never; modelClass: ModelClass };
+```
+
+An agent declares EITHER an explicit `model` OR a `modelClass` capability tier;
+TypeScript rejects both fields together. A `modelClass` resolves to its class
+primary model (the first model entry on the first-preference provider). An
+explicit `model` is used as requested and derives a class through
+`MODEL_TO_CLASS` when it is known, so quota-fallback routing remains available.
+Unknown explicit models have no class-derived fallback. The valid tiers are
+`frontier`, `standard`, and `fast`.
 
 ## How to Verify
 
@@ -12,13 +23,14 @@ Run these commands from the repository root. Run each command to completion:
 1. ```bash
    pnpm test
    ```
-   Expected: Vitest exits with status 0. This includes the model-class,
-   agent-registry, spawn-fallback, and extension phase-threading tests.
+   Expected: 465 unit tests pass; Vitest exits with status 0. This includes
+   the model-class, agent-registry, spawn-fallback, and extension
+   phase-threading tests.
 
 2. ```bash
    pnpm test:integration
    ```
-   Expected: all integration tests pass and Vitest exits with status 0.
+   Expected: 18 integration tests pass and Vitest exits with status 0.
 
 3. ```bash
    pnpm typecheck
@@ -56,20 +68,28 @@ Expected behavior:
 - Pi reports that the Belayd feature workflow started, then the orchestrator
   invokes the phase tools in order (`belayd_scout`, `belayd_plan`,
   `belayd_implement`, and so on).
-- The nine default agents retain their configured first-choice models and use
-  these classes for fallback routing:
+- The nine default agents resolve to their class primary as first-choice
+  models and use these classes for fallback routing:
 
-  | Agent | First-choice model class |
+  | Agent | Class primary (first-choice model) |
   | --- | --- |
-  | `belayd-scout` | `fast` |
-  | `belayd-planner` | `frontier` |
-  | `belayd-implementer` | `frontier` |
-  | `belayd-reviewer` | `standard` |
-  | `belayd-tester` | `standard` |
-  | `belayd-userguide` | `frontier` |
-  | `belayd-proof-generator` | `fast` |
-  | `belayd-documenter` | `frontier` |
-  | `belayd-committer` | `fast` |
+  | `belayd-scout` | `fast` → `opencode-go/mimo-v2.5` |
+  | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-reviewer` | `standard` → `opencode-go/glm-5.2` |
+  | `belayd-tester` | `standard` → `opencode-go/glm-5.2` |
+  | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-proof-generator` | `fast` → `opencode-go/mimo-v2.5` |
+  | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-committer` | `fast` → `opencode-go/mimo-v2.5` |
+
+The tier-to-primary mapping used by `primaryModelOf` is:
+
+| `modelClass` | Primary model |
+| --- | --- |
+| `frontier` | `opencode-go/deepseek-v4-pro` |
+| `standard` | `opencode-go/glm-5.2` |
+| `fast` | `opencode-go/mimo-v2.5` |
 
 - On a quota or transient failure, the next attempt stays within that class:
   the alternate provider for the same model is preferred before another model
@@ -109,21 +129,50 @@ import type { AgentDefinition } from "belayd-agent-harness";
 const customAgent: AgentDefinition = {
   name: "belayd-custom-scout",
   description: "Fast repository investigation",
-  model: "vendor/my-recon-model",
   modelClass: "fast",
   tools: ["read", "grep", "find", "ls", "bash", "ast_grep"],
   systemPrompt: "Investigate the repository and return concise, cited findings.",
 };
 ```
 
-`modelClass` is optional for compatibility. If it is omitted, a known model is
-classified through `MODEL_TO_CLASS`; an unknown model remains a single
-candidate unless a class is supplied explicitly.
+Alternatively, pin an explicit model instead of a class (never both):
+
+```typescript
+const customAgent: AgentDefinition = {
+  name: "belayd-custom-reviewer",
+  description: "Review repository changes",
+  model: "opencode-go/glm-5.2",
+  tools: ["read", "grep", "find", "ls", "ast_grep"],
+  systemPrompt: "Review the changes and report actionable findings.",
+};
+```
+
+The model arm still receives class-derived fallback for known models:
+`resolveModelSpec({ model: "opencode-go/glm-5.2" })` returns
+`{ model: "opencode-go/glm-5.2", modelClass: "standard" }`. An unknown
+explicit model has `modelClass: undefined` and is attempted as-is without
+class expansion. To use a fallback class for an otherwise unknown model,
+declare the `modelClass` arm instead.
 
 ### Resolve fallback candidates explicitly
 
 Use `candidatesForModel(model, modelClass?)` when constructing or inspecting a
-fallback list:
+fallback list. To resolve an `AgentDefinition`'s declaration into its concrete
+spawn pair, use `resolveModelSpec` (and `primaryModelOf` for the class
+primary directly):
+
+```typescript
+import { candidatesForModel, primaryModelOf, resolveModelSpec } from "belayd-agent-harness";
+
+primaryModelOf("fast");
+// "opencode-go/mimo-v2.5"
+
+resolveModelSpec({ modelClass: "standard" });
+// { model: "opencode-go/glm-5.2", modelClass: "standard" }
+
+resolveModelSpec({ model: "vendor/x" });
+// { model: "vendor/x", modelClass: undefined }
+```
 
 ```typescript
 import { candidatesForModel } from "belayd-agent-harness";
@@ -175,7 +224,9 @@ An explicit `candidates` array still takes precedence over `modelClass`.
 
 ### Configure a workflow override
 
-Workflow overrides can set either field independently or both:
+Workflow overrides are modifiers on the selected agent, not `AgentModelSpec`.
+Their `model` and `modelClass` fields are independent and may be set either
+individually or together:
 
 ```typescript
 import type { WorkflowSubTypeConfig } from "belayd-agent-harness";

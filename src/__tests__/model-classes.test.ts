@@ -7,8 +7,10 @@ import {
   MODEL_TO_CLASS,
   modelClassOf,
   PROVIDER_PREFERENCE,
+  primaryModelOf,
   providerOf,
   resolveModelCandidates,
+  resolveModelSpec,
 } from "../model-classes.js";
 import { WORKFLOW_REGISTRY } from "../workflow-registry.js";
 
@@ -151,16 +153,12 @@ describe("candidatesForModel", () => {
 });
 
 describe("model class coverage", () => {
-  it("every DEFAULT_AGENTS model maps to a known class", () => {
+  it("every DEFAULT_AGENTS entry is modelClass-only and resolves to its class primary", () => {
     for (const agent of DEFAULT_AGENTS) {
-      expect(modelClassOf(agent.model), agent.model).toBeDefined();
-    }
-  });
-
-  it("every DEFAULT_AGENTS entry defines modelClass matching its model", () => {
-    for (const agent of DEFAULT_AGENTS) {
-      expect(agent.modelClass, agent.model).toBeDefined();
-      expect(agent.modelClass, agent.model).toBe(modelClassOf(agent.model));
+      expect("model" in agent, agent.name).toBe(false);
+      const modelClass = agent.modelClass;
+      if (modelClass === undefined) continue;
+      expect(resolveModelSpec(agent)).toEqual({ model: primaryModelOf(modelClass), modelClass });
     }
   });
 
@@ -182,5 +180,36 @@ describe("model class coverage", () => {
     }
     expect(PROVIDER_PREFERENCE).toContain("opencode-go");
     expect(PROVIDER_PREFERENCE).toContain("llmgateway");
+  });
+});
+
+describe("primaryModelOf", () => {
+  it("resolves each class to its first-preference-provider primary", () => {
+    expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4-pro");
+    expect(primaryModelOf("standard")).toBe("opencode-go/glm-5.2");
+    expect(primaryModelOf("fast")).toBe("opencode-go/mimo-v2.5");
+  });
+});
+
+describe("resolveModelSpec", () => {
+  it("resolves a modelClass-only spec to the class primary", () => {
+    expect(resolveModelSpec({ modelClass: "standard" })).toEqual({
+      model: "opencode-go/glm-5.2",
+      modelClass: "standard",
+    });
+  });
+
+  it("derives the class for a known explicit model", () => {
+    expect(resolveModelSpec({ model: "opencode-go/mimo-v2.5" })).toEqual({
+      model: "opencode-go/mimo-v2.5",
+      modelClass: "fast",
+    });
+  });
+
+  it("yields no class for an unknown explicit model", () => {
+    expect(resolveModelSpec({ model: "vendor/x" })).toEqual({
+      model: "vendor/x",
+      modelClass: undefined,
+    });
   });
 });

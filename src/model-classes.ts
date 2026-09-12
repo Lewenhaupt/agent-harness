@@ -14,6 +14,15 @@
 
 export type ModelClass = "frontier" | "standard" | "fast";
 
+/**
+ * An agent's model declaration: EITHER an explicit model OR a capability
+ * class — never both. The model arm still derives a class via MODEL_TO_CLASS
+ * so quota fallback works for explicitly-pinned models.
+ */
+export type AgentModelSpec =
+  | { model: string; modelClass?: never }
+  | { model?: never; modelClass: ModelClass };
+
 /** Providers tried for each model id, in preference order. */
 export const PROVIDER_PREFERENCE: readonly string[] = ["opencode-go", "llmgateway"];
 
@@ -29,19 +38,19 @@ export const MODEL_CLASS_SPECS: Record<ModelClass, ModelClassSpec> = {
   frontier: {
     name: "frontier",
     rationale:
-      "Highest-reasoning roles (planner, implementer, doc authoring). Ordered by capability then cost: deepseek-v4-pro (implementer), glm-5.3 (planner), gpt-5.6-luna (doc quality).",
+      "Ordered by capability then cost: deepseek-v4-pro, glm-5.3, gpt-5.6-luna. The first entry is the class primary (frontier's default first choice).",
     models: ["deepseek-v4-pro", "glm-5.3", "gpt-5.6-luna"],
   },
   standard: {
     name: "standard",
     rationale:
-      "Mid-tier detail work (review, test). glm-5.2 primary; gpt-5.6-luna for doc-quality output; deepseek-v4-pro as the capability ceiling.",
+      "glm-5.2 is the class primary; gpt-5.6-luna for doc-quality output; deepseek-v4-pro as the capability ceiling.",
     models: ["glm-5.2", "gpt-5.6-luna", "deepseek-v4-pro"],
   },
   fast: {
     name: "fast",
     rationale:
-      "Low-latency/cost recon and proof capture. mimo-v2.5 primary; deepseek-v4-flash; glm-5.2 as the capability ceiling.",
+      "mimo-v2.5 is the class primary; deepseek-v4-flash; glm-5.2 as the capability ceiling.",
     models: ["mimo-v2.5", "deepseek-v4-flash", "glm-5.2"],
   },
 };
@@ -111,4 +120,28 @@ export function candidatesForModel(model: string, modelClass?: ModelClass): stri
   );
 
   return [model, ...sameModelAlternateProvider, ...otherModels];
+}
+
+/** The class primary: first models entry on the first-preference provider. */
+export function primaryModelOf(modelClass: ModelClass): string {
+  const provider = PROVIDER_PREFERENCE[0];
+  const primaryId = MODEL_CLASS_SPECS[modelClass].models[0];
+  if (provider === undefined || primaryId === undefined) {
+    throw new Error(`model class ${modelClass} has no primary model`);
+  }
+  return `${provider}/${primaryId}`;
+}
+
+/** Resolve a spec into the concrete spawn pair (model + optional class). */
+export function resolveModelSpec(spec: AgentModelSpec): {
+  model: string;
+  modelClass: ModelClass | undefined;
+} {
+  // The discriminated union's `never` arm guarantees that when this branch
+  // runs, `spec` carries no `model` at runtime, so the typeof check falls
+  // through to the modelClass arm below.
+  if (typeof spec.model === "string") {
+    return { model: spec.model, modelClass: modelClassOf(spec.model) };
+  }
+  return { model: primaryModelOf(spec.modelClass), modelClass: spec.modelClass };
 }
