@@ -5,27 +5,23 @@
  * tools and spawned as isolated pi processes.
  */
 
-import type { ModelClass } from "./model-classes.js";
+import type { AgentModelSpec } from "./model-classes.js";
 import { gateFullValidation, gateProofContent, gateTests, gateUserGuide } from "./quality-gates.js";
 import type { WorktreeOptions } from "./worktree.js";
 
 /** A single agent's configuration. */
-export interface AgentDefinition {
+export type AgentDefinition = AgentModelSpec & {
   /** Unique name, e.g. "belayd-scout". The pi tool name is `belayd_<name>`. */
   name: string;
   /** Human-readable description shown to the LLM. */
   description: string;
-  /** Model identifier, e.g. "opencode-go/deepseek-v4-flash". */
-  model: string;
-  /** Explicit capability tier; when omitted the class is derived from model via MODEL_TO_CLASS. */
-  modelClass?: ModelClass;
   /** Tool allowlist for this agent's session. */
   tools: string[];
   /** System prompt that defines the agent's role and behavior. */
   systemPrompt: string;
   /** Optional quality gate: runs deterministically after the agent finishes. */
   qualityGate?: QualityGate;
-}
+};
 
 /** Result from a quality gate check. */
 export interface GateResult {
@@ -364,7 +360,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-scout",
     description:
       "Fast codebase recon — returns structured findings (files, key code, architecture)",
-    model: "opencode-go/mimo-v2.5",
     modelClass: "fast",
     tools: ["read", "grep", "find", "ls", "bash", "ast_grep", "web_search_exa", "web_fetch_exa"],
     systemPrompt: SCOUT_SYSTEM_PROMPT,
@@ -373,7 +368,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-planner",
     description:
       "Creates detailed implementation plans from task requirements and codebase context",
-    model: "opencode-go/glm-5.3",
     modelClass: "frontier",
     tools: [
       "read",
@@ -391,7 +385,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-implementer",
     description: "Implements code changes following a plan — writes code and tests",
-    model: "opencode-go/deepseek-v4-pro",
     modelClass: "frontier",
     tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep"],
     systemPrompt: IMPLEMENTER_SYSTEM_PROMPT,
@@ -400,7 +393,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-reviewer",
     description: "Adversarial code review — checks for bugs, security issues, design problems",
-    model: "opencode-go/glm-5.2",
     modelClass: "standard",
     tools: [
       "read",
@@ -419,7 +411,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-tester",
     description: "Writes thorough tests — covers happy path, edge cases, error conditions",
-    model: "opencode-go/glm-5.2",
     modelClass: "standard",
     tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep"],
     systemPrompt: TESTER_SYSTEM_PROMPT,
@@ -428,7 +419,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-userguide",
     description: "Generates user-facing How to Verify and How to Use documentation",
-    model: "opencode-go/gpt-5.6-luna",
     modelClass: "frontier",
     tools: ["read", "grep", "find", "ls", "bash", "ast_grep", "web_search_exa", "web_fetch_exa"],
     systemPrompt: USER_GUIDE_SYSTEM_PROMPT,
@@ -437,7 +427,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-proof-generator",
     description: "Captures proof artifacts — video recordings, screenshots, terminal recordings",
-    model: "opencode-go/deepseek-v4-flash",
     modelClass: "fast",
     tools: ["read", "bash", "ls", "find", "ast_grep"],
     systemPrompt: PROOF_GENERATOR_SYSTEM_PROMPT,
@@ -446,7 +435,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-documenter",
     description: "Updates project documentation to reflect changes",
-    model: "opencode-go/gpt-5.6-luna",
     modelClass: "frontier",
     tools: [
       "read",
@@ -464,7 +452,6 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-committer",
     description: "Commits changes with conventional commit messages and updates task status",
-    model: "opencode-go/mimo-v2.5",
     modelClass: "fast",
     tools: ["bash", "ls", "find", "ast_grep"],
     systemPrompt: COMMITTER_SYSTEM_PROMPT,

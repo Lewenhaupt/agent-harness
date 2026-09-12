@@ -27,15 +27,15 @@ describe("DEFAULT_AGENTS", () => {
     for (const agent of DEFAULT_AGENTS) {
       expect(agent).toHaveProperty("name");
       expect(agent).toHaveProperty("description");
-      expect(agent).toHaveProperty("model");
+      expect(agent).toHaveProperty("modelClass");
       expect(agent).toHaveProperty("tools");
       expect(agent).toHaveProperty("systemPrompt");
 
       // Name should start with belayd-
       expect(agent.name).toMatch(/^belayd-/);
 
-      // Model should be set
-      expect(agent.model).toBeTruthy();
+      // Model class should be set
+      expect(agent.modelClass).toBeTruthy();
 
       // Tools should be a non-empty array
       expect(agent.tools.length).toBeGreaterThan(0);
@@ -55,23 +55,23 @@ describe("DEFAULT_AGENTS", () => {
     expect(scout?.tools).not.toContain("write");
   });
 
-  it("planner uses a top-tier model", () => {
+  it("planner declares the frontier class", () => {
     const planner = DEFAULT_AGENTS.find((a) => a.name === "belayd-planner");
     expect(planner).toBeDefined();
-    expect(planner?.model).toBe("opencode-go/glm-5.3");
+    expect(planner?.modelClass).toBe("frontier");
   });
 
-  it("reviewer uses glm-5.2", () => {
+  it("reviewer declares the standard class", () => {
     const reviewer = DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer");
     expect(reviewer).toBeDefined();
-    expect(reviewer?.model).toBe("opencode-go/glm-5.2");
+    expect(reviewer?.modelClass).toBe("standard");
   });
 
-  it("scout and committer use the cheapest model", () => {
+  it("scout and committer declare the fast class", () => {
     const scout = DEFAULT_AGENTS.find((a) => a.name === "belayd-scout");
     const committer = DEFAULT_AGENTS.find((a) => a.name === "belayd-committer");
-    expect(scout?.model).toBe("opencode-go/mimo-v2.5");
-    expect(committer?.model).toBe("opencode-go/mimo-v2.5");
+    expect(scout?.modelClass).toBe("fast");
+    expect(committer?.modelClass).toBe("fast");
   });
 
   it("implementer has write tools", () => {
@@ -127,6 +127,12 @@ describe("DEFAULT_AGENTS", () => {
     expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-scout")?.modelClass).toBe("fast");
     expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-planner")?.modelClass).toBe("frontier");
     expect(DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer")?.modelClass).toBe("standard");
+  });
+
+  it("every agent is modelClass-only (no explicit model)", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      expect("model" in agent, agent.name).toBe(false);
+    }
   });
 });
 

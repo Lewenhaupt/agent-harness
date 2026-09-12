@@ -25,7 +25,7 @@ export {
 } from "./agent-registry.js";
 export type { BdCommandValidation } from "./bd-command.js";
 export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
-export type { ModelClass } from "./model-classes.js";
+export type { AgentModelSpec, ModelClass } from "./model-classes.js";
 // Model classes & quota-fallback routing
 export {
   bareModelId,
@@ -34,8 +34,10 @@ export {
   MODEL_TO_CLASS,
   modelClassOf,
   PROVIDER_PREFERENCE,
+  primaryModelOf,
   providerOf,
   resolveModelCandidates,
+  resolveModelSpec,
 } from "./model-classes.js";
 export type {
   CooldownEntry,
