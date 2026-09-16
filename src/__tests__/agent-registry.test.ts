@@ -134,6 +134,42 @@ describe("DEFAULT_AGENTS", () => {
       expect("model" in agent, agent.name).toBe(false);
     }
   });
+
+  it("proof-generator has the functional-proof tool allowlist", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    expect(proofGen?.tools).toEqual(["read", "bash", "ls", "find", "ast_grep"]);
+  });
+
+  it("proof-generator prompt presents proof tools as bash commands, not standalone tools", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(prompt).toContain("asciinema");
+    expect(prompt).toContain("playwright-cli");
+    expect(prompt).toContain("SHELL COMMANDS");
+    expect(prompt).not.toMatch(/^\s*-\s*`(asciinema|playwright-cli|playwright|screenshot)`\s*—/m);
+  });
+
+  it("proof-generator prompt documents skip marker and trace.zip guidance", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(prompt).toContain("Proof skipped");
+    expect(prompt).toContain("trace.zip");
+    expect(prompt).toContain("BELAYD_PROOF=1");
+  });
+
+  it("proof-generator description and prompt name the rejected test runners", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const description = proofGen?.description ?? "";
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(description).not.toContain("video recordings");
+    expect(description).toContain("browser traces");
+    expect(prompt).toContain("vitest");
+    expect(prompt).toContain("jest");
+  });
 });
 
 describe("getAgent", () => {

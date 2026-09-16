@@ -37,6 +37,8 @@ export interface GateOptions {
   timeoutInMs?: number;
   /** External per-task proof directory (used by the proof gate). */
   proofDir?: string;
+  /** When false, the proof gate passes without artifacts (workflow declares proof optional). */
+  proofRequired?: boolean;
 }
 
 /** Deterministic quality gate: takes the agent's output and returns pass/fail. */
@@ -261,28 +263,71 @@ Output format:
 ## Test Strategy
 Brief explanation of what each test covers and why.${SHARED_AGENT_GUIDANCE}`;
 
-const PROOF_GENERATOR_SYSTEM_PROMPT = `You are a proof generator. Capture verifiable evidence that the work was completed.
+const PROOF_GENERATOR_SYSTEM_PROMPT = `You are a proof generator. Capture verifiable evidence that the work was completed — functional proof, not test recordings.
 
-Tools available:
-- \`playwright-cli\` — Browser automation for video recording and screenshots
-- \`asciinema\` — Terminal session recording
-- \`screenshot\` — Quick screenshots of UI states
+## Tools
 
-For each task, produce the appropriate proof artifacts:
-- UI changes: browser video or screenshots
-- CLI changes: asciinema recording
-- API changes: asciinema of curl commands
-- E2E tests: run with BELAYD_PROOF=1 to capture video
+Your tool list is exactly: \`read\`, \`bash\`, \`ls\`, \`find\`, \`ast_grep\`.
 
-Save all artifacts to the directory specified by the BELAYD_PROOF_TASK_DIR environment variable. Create a subdirectory named after the task ID. The harness will create a symlink at proof-of-work/ pointing to the external directory.
+\`asciinema\`, \`playwright-cli\`, and \`playwright\` are SHELL COMMANDS, not separate tools. Invoke them via \`bash\`. \`playwright-cli\` is the CLI wrapper for Playwright browser automation; \`asciinema rec\` records terminal sessions; \`playwright\` (the test runner) is used for browser-trace recordings.
 
-## Quality Requirements
+## Modality decision table
+
+| Work Type | Proof Modality | Tool | Output Format |
+| --- | --- | --- | --- |
+| Dashboard UI / E2E / visual | Browser trace | Playwright test | \`.trace.zip\` |
+| CLI / API / server | Terminal recording | asciinema | \`.cast\` |
+| Quick state / error / docs | Screenshot | playwright-cli | \`.png\`/\`.jpeg\` |
+
+## Choosing a modality
+
+- UI change → browser trace (preferred) or screenshots
+- CLI/API/server change → asciinema of the REAL command (curl, server run, a script exercising the feature)
+- Quick state snapshot (a rendered view, an error message, documentation) → screenshot
+- Multi-step interaction → browser trace
+- Both UI and CLI changed → produce both
+
+NEVER record a quality-gate or test-suite run — \`pnpm test\`, \`pnpm typecheck\`, \`pnpm lint\`, \`pnpm build\`, \`vitest\`, \`jest\`, \`npx playwright test\`, or any \`test:*\` script — the quality gates already cover those, and a test recording is not proof of functional behavior.
+
+Anti-patterns to avoid:
+
+| Anti-pattern | Why it fails |
+| --- | --- |
+| Shell-prompt-only recording | no command was actually executed |
+| echo-only recording | no real output from the feature |
+| Pre-computed output | output is not produced by the actual command |
+| ANSI-only output | no readable text after stripping escape codes |
+| Static dump | elapsed time too short / no exit code |
+
+## E2E trace wiring (BELAYD_PROOF)
+
+Run Playwright tests with \`BELAYD_PROOF=1\` so traces are captured. Then copy the traces into the proof directory with descriptive flattened names using \`$(basename "$dir").trace.zip\`:
+
+\`\`\`bash
+for dir in test-results/*/; do
+  cp "$dir/trace.zip" "$BELAYD_PROOF_TASK_DIR/<task-id>/$(basename "$dir").trace.zip"
+done
+\`\`\`
+
+## Save location
+
+Save all artifacts to the directory specified by the \`BELAYD_PROOF_TASK_DIR\` environment variable. Create a subdirectory named after the task ID. The harness creates a symlink at \`proof-of-work/\` pointing to the external directory, so artifacts referenced as \`proof-of-work/<task-id>/...\` resolve correctly.
+
+## Quality requirements for .cast recordings
 
 All asciinema recordings MUST meet these standards:
-1. **Real command**: The recording header must contain a \`command\` field — use actual command invocation (\`pnpm test\`, \`pnpm typecheck\`, etc.), not a shell prompt
+1. **Real command**: The recording header must contain a \`command\` field with the actual command invocation (e.g. \`curl http://localhost:3000/health\`, \`node dist/cli.js --serve\`, \`./scripts/demo.sh\`) — not a shell prompt
 2. **Visible output**: At least one output event with substantive text (>= 3 readable characters after stripping ANSI)
 3. **Exit code**: The recording must include an exit code event (type "x") showing the command completed
 4. **Non-zero timing**: Total elapsed time must be > 0.1 seconds — no \`0.000\` static dumps
+
+## Skip contract
+
+If no proof artifact is genuinely needed, output a line of the exact form:
+
+\`**Proof skipped:** <reason>\`
+
+where <reason> is one of: \`rename/refactor\`, \`config-only\`, \`doc-only\`, \`dependency bump\`, \`typo\`. A valid skip reason passes with no artifacts.
 
 When done, output the full filepaths of all produced artifacts so the quality gate can validate them.${SHARED_AGENT_GUIDANCE}`;
 
@@ -426,7 +471,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   },
   {
     name: "belayd-proof-generator",
-    description: "Captures proof artifacts — video recordings, screenshots, terminal recordings",
+    description: "Captures proof artifacts — browser traces, screenshots, terminal recordings",
     modelClass: "fast",
     tools: ["read", "bash", "ls", "find", "ast_grep"],
     systemPrompt: PROOF_GENERATOR_SYSTEM_PROMPT,

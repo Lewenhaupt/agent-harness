@@ -49,7 +49,7 @@ describe("validateCastRecording", () => {
   }
 
   it("passes for a valid recording with command, output, exit code, and non-zero timing", async () => {
-    const path = await writeCast({ version: 3, command: "pnpm test" }, [
+    const path = await writeCast({ version: 3, command: "node dist/cli.js --serve" }, [
       [0.0, "o", "Running tests...\n"],
       [1.5, "o", "PASS  src/index.test.ts\n"],
       [2.0, "x", "0"],
@@ -82,7 +82,7 @@ describe("validateCastRecording", () => {
   });
 
   it("fails when no exit code event is present", async () => {
-    const path = await writeCast({ version: 3, command: "pnpm test" }, [
+    const path = await writeCast({ version: 3, command: "node dist/cli.js --serve" }, [
       [0.0, "o", "Running...\n"],
       [5.0, "o", "All tests pass\n"],
     ]);
@@ -103,13 +103,13 @@ describe("validateCastRecording", () => {
     expect(result.feedback).toContain("too short");
   });
 
-  it("passes when no .cast file is found (other modalities OK)", async () => {
+  it("fails when no artifacts and no skip reason", async () => {
     const output = "Proof artifacts generated:\n- screenshot.png\n- recording.webm\n";
 
     const result = await gateProofContent(output, MOCK_DETAILS);
 
-    expect(result).toHaveProperty("passed", true);
-    expect(result.feedback).toContain("No .cast file found");
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
   });
 
   it("resolves a .cast path from the provided proofDir", async () => {
@@ -119,7 +119,7 @@ describe("validateCastRecording", () => {
     await writeFile(
       castPath,
       [
-        JSON.stringify({ version: 3, command: "pnpm test" }),
+        JSON.stringify({ version: 3, command: "node dist/cli.js --serve" }),
         JSON.stringify([0.0, "o", "Running tests...\n"]),
         JSON.stringify([1.5, "o", "PASS\n"]),
         JSON.stringify([2.0, "x", "0"]),
@@ -189,6 +189,17 @@ describe("validateCastRecording", () => {
     expect(result.feedback).toContain("Path traversal detected");
   });
 
+  it("fails for path traversal in a non-.cast artifact ref", async () => {
+    const output = "proof-of-work/../../../etc/passwd.png\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir: join(tmpDir, "external-proof", "bd-99"),
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Path traversal detected");
+  });
+
   it("fails for empty events array", async () => {
     const path = await writeCast({ version: 3, command: "echo test" }, []);
 
@@ -222,6 +233,176 @@ describe("validateCastRecording", () => {
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", true);
+  });
+});
+
+describe("gateProofContent proof-optional and skip-reason flow", () => {
+  it("passes with proofRequired false and no artifacts", async () => {
+    const result = await gateProofContent("no artifacts here", MOCK_DETAILS, {
+      proofRequired: false,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain("Proof not required");
+  });
+
+  it.each([
+    ["rename/refactor", "rename/refactor"],
+    ["config-only", "config-only"],
+    ["doc-only", "doc-only"],
+    ["dependency bump", "dependency bump"],
+    ["typo", "typo"],
+  ])("passes with documented skip reason %s", async (_reason, label) => {
+    const output = `**Proof skipped:** ${label}\n`;
+    const result = await gateProofContent(output, MOCK_DETAILS);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain(`Proof skipped: ${label}`);
+  });
+
+  it("fails for an unknown skip reason", async () => {
+    const output = "**Proof skipped:** because I felt like it\n";
+    const result = await gateProofContent(output, MOCK_DETAILS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+
+  it("fails for a skip reason that only substring-matches a canonical label", async () => {
+    const output = "**Proof skipped:** updating the readme\n";
+    const result = await gateProofContent(output, MOCK_DETAILS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+
+  it("passes with a prefix-with-explanation skip reason", async () => {
+    const output = "**Proof skipped:** config-only change — correctness validated by gates\n";
+    const result = await gateProofContent(output, MOCK_DETAILS);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain("Proof skipped: config-only");
+  });
+
+  it("fails with no artifacts when proofRequired is undefined", async () => {
+    const result = await gateProofContent("nothing to see\n", MOCK_DETAILS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+});
+
+describe("validateCastRecording quality-gate command rejection", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "quality-gates-command-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  async function writeCast(header: Record<string, unknown>): Promise<string> {
+    const path = join(tmpDir, "test.cast");
+    const events: Array<[number, string, string]> = [
+      [0.0, "o", "Running...\n"],
+      [1.5, "o", "PASS\n"],
+      [2.0, "x", "0"],
+    ];
+    const lines = [JSON.stringify(header), ...events.map((e) => JSON.stringify(e))];
+    await writeFile(path, lines.join("\n"), "utf-8");
+    return path;
+  }
+
+  it.each([
+    "pnpm test",
+    "pnpm run typecheck",
+    "npm run lint",
+    "yarn build",
+    "pnpm vitest run",
+    "npx playwright test",
+    "pnpm run test:unit",
+  ])("rejects a .cast with header command %s", async (command) => {
+    const path = await writeCast({ version: 3, command });
+    const result = await validateCastRecording(path);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("replicates a quality gate");
+  });
+
+  it("rejects a bash -c command wrapping a test-runner invocation", async () => {
+    const path = await writeCast({
+      version: 3,
+      command: "bash -c 'cd /repo && pnpm vitest run src/foo.test.ts'",
+    });
+    const result = await validateCastRecording(path);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("replicates a quality gate");
+  });
+
+  it("accepts a bash -c command wrapping a functional run", async () => {
+    const path = await writeCast({
+      version: 3,
+      command: "bash -c 'curl http://localhost:3000/health'",
+    });
+    const result = await validateCastRecording(path);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+});
+
+describe("gateProofContent accepted artifact existence", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "proof-artifact-existence-"));
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  async function makeArtifact(filename: string): Promise<void> {
+    const proofDir = join(tmpDir, "external-proof", "bd-99");
+    await mkdir(proofDir, { recursive: true });
+    await writeFile(join(proofDir, filename), "fake-content", "utf-8");
+  }
+
+  const proofDir = () => join(tmpDir, "external-proof", "bd-99");
+
+  it.each(["x.trace.zip", "x.png", "x.jpg"])(
+    "accepts existing proof-of-work/bd-99/%s via proofDir",
+    async (filename) => {
+      await makeArtifact(filename);
+      const output = `Artifact: proof-of-work/bd-99/${filename}\n`;
+      const result = await gateProofContent(output, MOCK_DETAILS, {
+        proofDir: proofDir(),
+      } satisfies GateOptions);
+
+      expect(result).toHaveProperty("passed", true);
+    },
+  );
+
+  it("rejects a missing referenced artifact", async () => {
+    const output = "Artifact: proof-of-work/bd-99/missing.png\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir: proofDir(),
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("not found on disk");
+  });
+
+  it("rejects a .webm reference as no artifacts", async () => {
+    const output = "Recording: proof-of-work/bd-99/recording.webm\n";
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir: proofDir(),
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
   });
 });
 
@@ -374,7 +555,7 @@ describe("gateProofContent fallback", () => {
   });
 
   const validCast = [
-    JSON.stringify({ version: 3, command: "pnpm test" }),
+    JSON.stringify({ version: 3, command: "curl http://localhost:3000/health" }),
     JSON.stringify([0.0, "o", "Running tests...\n"]),
     JSON.stringify([1.5, "o", "PASS\n"]),
     JSON.stringify([2.0, "x", "0"]),
