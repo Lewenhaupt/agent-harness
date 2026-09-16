@@ -187,30 +187,6 @@ function stripControlChars(text: string): string {
 }
 
 /**
- * Parse an asciicast v2 file path from the agent output.
- *
- * Without `proofDir` the raw `proof-of-work/...` reference is returned so the
- * caller can resolve it against the workspace root (which may expose a
- * `proof-of-work` symlink). With `proofDir` the reference is mapped directly
- * into the external per-task directory, dropping the task-id segment that is
- * already encoded in `proofDir`.
- */
-function findCastFilePath(output: string, proofDir?: string): string | null {
-  const lines = output.split("\n");
-  for (const line of lines) {
-    const match = line.match(/\bproof-of-work\/[\w/.-]+\.cast\b/);
-    if (!match) continue;
-    const matched = match[0];
-    if (proofDir === undefined) {
-      return matched;
-    }
-    const relative = matched.slice("proof-of-work/".length);
-    return resolve(proofDir, ...relative.split("/").slice(1));
-  }
-  return null;
-}
-
-/**
  * Parse the header line of an asciicast file and check for a command field.
  */
 function parseCastHeader(
@@ -284,6 +260,138 @@ function parseCastEvents(
   return { passed: true, events };
 }
 
+const PACKAGE_MANAGER_PATTERN = /^(pnpm|npm|yarn|npx|bun)$/i;
+const GATE_RUNNER_PATTERN = /^(typecheck|lint|build|vitest|jest|mocha|cypress)$/i;
+const TEST_SCRIPT_PATTERN = /^(?:test(?:[:._-]|$)|.+[:._-]test$)/i;
+// Bare tokens exclude the plain `test` builtin; it is only a gate when a
+// package manager invokes it (pnpm test / npm test) or a separator follows.
+const TEST_SCRIPT_TOKEN_PATTERN = /^(?:test[:._-].+|.+[:._-]test)$/i;
+
+/** True when a token names a gate runner. */
+function isGateRunner(token: string): boolean {
+  return GATE_RUNNER_PATTERN.test(token);
+}
+
+/** True when a package-manager sub-command names a test script (includes plain `test`). */
+function isTestScript(token: string): boolean {
+  return TEST_SCRIPT_PATTERN.test(token);
+}
+
+/** True when a bare token names a test script (excludes plain `test`). */
+function isTestScriptToken(token: string): boolean {
+  return TEST_SCRIPT_TOKEN_PATTERN.test(token);
+}
+
+/** True when the token after `playwright` is `test` (the test runner, not the trace viewer). */
+function isPlaywrightTestInvocation(current: string, next: string): boolean {
+  return current.toLowerCase() === "playwright" && next.toLowerCase() === "test";
+}
+
+/** The subcommand a package-manager token targets, skipping an optional `run`. */
+function packageManagerTarget(tokens: string[], index: number): string {
+  const after = (tokens[index + 1] ?? "").toLowerCase();
+  if (after === "run") {
+    return (tokens[index + 2] ?? "").toLowerCase();
+  }
+  return after;
+}
+
+/** Unwrap a single `bash -c '...'`-style shell wrapper, recursing once for double wrapping. */
+function unwrapShellWrapper(command: string): string {
+  const trimmed = command.trim();
+  const match = trimmed.match(/^(?:bash|sh|zsh)(?:\s+-[a-z]*c[a-z]*)?\s+(['"])([\s\S]*)\1\s*$/i);
+  if (match && match[2] !== undefined && match[2] !== "") {
+    const inner = unwrapShellWrapper(match[2]);
+    return inner === "" ? match[2] : inner;
+  }
+  return trimmed;
+}
+
+/** True when a single token at `index` flags the command as a quality gate or test runner. */
+function tokenFlagsQualityGate(tokens: string[], index: number): boolean {
+  const token = tokens[index];
+  if (token === undefined) return false;
+  if (isPlaywrightTestInvocation(token, tokens[index + 1] ?? "")) return true;
+  if (PACKAGE_MANAGER_PATTERN.test(token)) {
+    const sub = packageManagerTarget(tokens, index);
+    return sub !== "" && (isGateRunner(sub) || isTestScript(sub));
+  }
+  return isGateRunner(token) || isTestScriptToken(token);
+}
+
+/** True when a command re-runs a quality gate or test runner rather than exercising functional behavior. */
+function isQualityGateCommand(command: string): boolean {
+  const inner = unwrapShellWrapper(command).trim();
+  if (inner === "") return false;
+  const tokens = inner.split(/\s+/).filter((t) => t !== "");
+  for (let i = 0; i < tokens.length; i += 1) {
+    if (tokenFlagsQualityGate(tokens, i)) return true;
+  }
+  return false;
+}
+
+/** Accepted proof artifact file extensions. */
+const PROOF_ARTIFACT_EXTENSIONS: readonly string[] = [
+  ".trace.zip",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".cast",
+];
+
+/** True when a path ends with one of the accepted proof artifact extensions. */
+function isProofArtifactPath(path: string): boolean {
+  return PROOF_ARTIFACT_EXTENSIONS.some((ext) => path.endsWith(ext));
+}
+
+/** All proof-of-work/... references in the output that point at accepted artifact types. */
+function findProofArtifactRefs(output: string): string[] {
+  const matches = output.match(/\bproof-of-work\/[\w/.-]+\b/g);
+  if (!matches) return [];
+  return matches.filter(isProofArtifactPath);
+}
+
+/** Canonical skip-reason labels matched against the proof prompt's skip contract. */
+const SKIPPABLE_REASONS: readonly string[] = [
+  "rename/refactor",
+  "config-only",
+  "doc-only",
+  "dependency bump",
+  "typo",
+] as const;
+
+/** True when a documented skip reason equals a canonical label or begins with it followed by a boundary. */
+function reasonMatchesLabel(reason: string, label: string): boolean {
+  if (reason === label) return true;
+  if (reason.startsWith(`${label} `)) return true;
+  if (reason.startsWith(`${label}:`)) return true;
+  if (reason.startsWith(`${label}-`)) return true;
+  return false;
+}
+
+/**
+ * Detect a documented proof-skip reason in the output.
+ * Returns the canonical label when the skip marker is present and its reason
+ * matches a known skip reason; otherwise null.
+ */
+function findDocumentedSkipReason(output: string): string | null {
+  for (const line of output.split("\n")) {
+    if (!/proof\s+skipped/i.test(line)) continue;
+    const match = line.match(/proof\s+skipped[:\- ]\s*(.+)$/i);
+    if (!match || !match[1]) continue;
+    const reasonLower = match[1]
+      .trim()
+      .replace(/^\*+|\*+$/g, "")
+      .trim()
+      .toLowerCase();
+    for (const label of SKIPPABLE_REASONS) {
+      if (reasonMatchesLabel(reasonLower, label)) return label;
+    }
+    return null;
+  }
+  return null;
+}
+
 /**
  * Check that at least one event has substantive output text.
  */
@@ -340,6 +448,16 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
     return headerResult;
   }
 
+  if (
+    headerResult.header !== undefined &&
+    isQualityGateCommand(String(headerResult.header.command))
+  ) {
+    return {
+      passed: false,
+      feedback: `Proof recording replicates a quality gate (${headerResult.header.command}); record functional behavior instead (${castPath})`,
+    };
+  }
+
   const eventResult = parseCastEvents(lines, castPath);
   if (!eventResult.passed || !eventResult.events) {
     return eventResult;
@@ -376,24 +494,29 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
 }
 
 /**
- * Check that referenced non-.cast proof files exist on disk.
- * Returns a failed GateResult if any are missing, or null if all exist or none referenced.
+ * Check that referenced proof artifacts exist on disk.
+ * Resolves accepted artifact refs (including .cast) against either the
+ * workspace proof-of-work root or the external proof dir. Returns a failed
+ * GateResult listing missing refs, or null when every referenced artifact exists.
  */
-function checkNonCastProofRefs(
+function checkProofArtifactsExist(
   output: string,
   proofWorkRoot: string,
   proofDir?: string,
 ): GateResult | null {
-  const proofRefMatch = output.match(/\bproof-of-work\/[\w/.-]+\b/g);
-  if (!proofRefMatch || proofRefMatch.length === 0) {
+  const refs = findProofArtifactRefs(output);
+  if (refs.length === 0) {
     return null;
   }
 
   const missingRefs: string[] = [];
-  for (const ref of proofRefMatch) {
-    if (ref.endsWith(".cast")) continue;
+  for (const ref of refs) {
     const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
-    if (normalizedRef.includes("..")) continue;
+    if (normalizedRef.includes("..")) {
+      return { passed: false, feedback: `Path traversal detected: ${normalizedRef}` };
+    }
+    // Workspace refs resolve proof-of-work/<task>/... directly under proofWorkRoot
+    // (via the proof-of-work symlink); the proofDir branch strips the prefix above.
     const resolvedPath =
       proofDir === undefined
         ? resolve(proofWorkRoot, normalizedRef)
@@ -466,45 +589,70 @@ function checkProofDirTraversal(castPath: string, proofDir: string): GateResult 
 }
 
 /**
+ * Validate a single .cast artifact reference against its resolved path.
+ * Applies the path-traversal guard for the active resolution mode, then
+ * content-validates the recording.
+ */
+async function validateCastArtifact(
+  artifact: string,
+  cwd: string,
+  proofDir: string | undefined,
+): Promise<GateResult> {
+  if (proofDir !== undefined) {
+    const castPath = resolveProofRefInDir(artifact, proofDir);
+    const traversalCheck = checkProofDirTraversal(castPath, proofDir);
+    if (traversalCheck) return traversalCheck;
+    return validateCastRecording(castPath);
+  }
+
+  const proofWorkRoot = findWorkspaceRoot(cwd);
+  const traversalCheck = checkPathTraversal(artifact, proofWorkRoot);
+  if (traversalCheck) return traversalCheck;
+  return validateCastRecording(resolve(proofWorkRoot, artifact));
+}
+
+/**
  * Quality gate for proof-of-work content.
  *
- * Scans the agent output for a .cast file path, then validates the recording
- * against proof quality standards. If no .cast file is found (e.g. video or
- * screenshot modality), the gate passes with a warning, but also checks that
- * any referenced proof files exist on disk.
+ * Resolution order: optional proofRequired, documented skip reason, then
+ * artifact validation. Artifacts must be referenced in the output; .cast
+ * recordings are content-validated and every other accepted artifact type
+ * must exist on disk. Never judges whether a proof is relevant.
  */
 export async function gateProofContent(
   output: string,
   _details: SpawnDetails,
   options?: GateOptions,
 ): Promise<GateResult> {
+  if (options?.proofRequired === false) {
+    return { passed: true, feedback: "Proof not required for this workflow type" };
+  }
+
+  const skipReason = findDocumentedSkipReason(output);
+  if (skipReason !== null) {
+    return { passed: true, feedback: `Proof skipped: ${skipReason}` };
+  }
+
+  const artifacts = findProofArtifactRefs(output);
+  if (artifacts.length === 0) {
+    return { passed: false, feedback: "No proof artifacts produced or referenced" };
+  }
+
   const cwd = options?.cwd ?? process.cwd();
   const proofDir = options?.proofDir !== undefined ? resolve(options.proofDir) : undefined;
-  const castPath = findCastFilePath(output, proofDir);
 
-  if (castPath) {
-    if (proofDir !== undefined) {
-      const traversalCheck = checkProofDirTraversal(castPath, proofDir);
-      if (traversalCheck) return traversalCheck;
-      return validateCastRecording(castPath);
+  for (const artifact of artifacts) {
+    if (artifact.endsWith(".cast")) {
+      const castResult = await validateCastArtifact(artifact, cwd, proofDir);
+      if (!castResult.passed) return castResult;
     }
-
-    // No explicit proof dir: resolve through the workspace-root proof-of-work
-    // path (which may be a symlink to the external proof base).
-    const proofWorkRoot = findWorkspaceRoot(cwd);
-    const traversalCheck = checkPathTraversal(castPath, proofWorkRoot);
-    if (traversalCheck) return traversalCheck;
-    return validateCastRecording(resolve(proofWorkRoot, castPath));
   }
 
   const proofWorkRoot = findWorkspaceRoot(cwd);
-  const missingRefsCheck = checkNonCastProofRefs(output, proofWorkRoot, proofDir);
+  const missingRefsCheck = checkProofArtifactsExist(output, proofWorkRoot, proofDir);
   if (missingRefsCheck) return missingRefsCheck;
 
-  return {
-    passed: true,
-    feedback: "No .cast file found in output (other proof modalities OK)",
-  };
+  return { passed: true, feedback: `${artifacts.length} proof artifact(s) validated` };
 }
 
 /**

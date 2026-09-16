@@ -93,6 +93,8 @@ type SessionState = {
 
 const sessionStates = new Map<string, SessionState>();
 
+const execAsync = promisify(exec);
+
 // Shared per-orchestrator model cooldown store: when a model hits a quota/rate
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
 // Persisted to disk so cooldowns survive orchestrator restarts.
@@ -525,9 +527,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     result: SpawnResult,
     cwd?: string,
     proofDir?: string,
+    proofRequired?: boolean,
   ): Promise<{ passed: boolean; feedback: string }> {
     const text = result.content?.[0]?.text ?? "";
-    const options = cwd !== undefined || proofDir !== undefined ? { cwd, proofDir } : undefined;
+    const options =
+      cwd !== undefined || proofDir !== undefined || proofRequired !== undefined
+        ? { cwd, proofDir, proofRequired }
+        : undefined;
     const outcome = await gate(text, result.details, options);
     return {
       passed: outcome.passed,
@@ -557,7 +563,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // total passes are exhausted. Each retry gets a unique session suffix so
     // sessions never collide.
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
-      const verdict = await evaluateGate(effectiveGate, current, params.cwd, params.proofDir);
+      const verdict = await evaluateGate(
+        effectiveGate,
+        current,
+        params.cwd,
+        params.proofDir,
+        WORKFLOW_REGISTRY[workflowType].proofRequired,
+      );
 
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
@@ -639,6 +651,64 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     } catch {
       return undefined;
     }
+  }
+
+  /** Extract the "## How to Verify" section up to the next "## " heading. */
+  function extractHowToVerify(userGuideContent: string | undefined): string {
+    if (!userGuideContent) return "";
+    const lines = userGuideContent.split("\n");
+    let inSection = false;
+    const collected: string[] = [];
+    for (const line of lines) {
+      if (!inSection && /^##\s+How\s+to\s+Verify/i.test(line)) {
+        inSection = true;
+        continue;
+      }
+      if (inSection && /^##\s+/.test(line)) {
+        break;
+      }
+      if (inSection) {
+        collected.push(line);
+      }
+    }
+    return collected.join("\n").trim();
+  }
+
+  /**
+   * Gather functional context for the proof agent from the git working tree
+   * and the userguide's How to Verify section.
+   */
+  async function gatherProofContext(
+    cwd: string,
+    userGuideContent: string | undefined,
+  ): Promise<string> {
+    const sections: string[] = [];
+
+    const statResult = await execAsync("git diff --stat HEAD", { cwd }).catch((err: unknown) => ({
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    if ("error" in statResult) {
+      sections.push(`git diff --stat HEAD: (unavailable: ${statResult.error})`);
+    } else if (statResult.stdout.trim() !== "") {
+      sections.push(`git diff --stat HEAD:\n${statResult.stdout.trim()}`);
+    }
+
+    const namesResult = await execAsync("git status --short", { cwd }).catch((err: unknown) => ({
+      error: err instanceof Error ? err.message : String(err),
+    }));
+    if ("error" in namesResult) {
+      sections.push(`Changed files: (unavailable: ${namesResult.error})`);
+    } else if (namesResult.stdout.trim() !== "") {
+      sections.push(`Changed files:\n${namesResult.stdout.trim()}`);
+    }
+
+    const howToVerify = extractHowToVerify(userGuideContent);
+    if (howToVerify !== "") {
+      sections.push(`## How to Verify\n${howToVerify}`);
+    }
+
+    if (sections.length === 0) return "";
+    return `\n\n## Functional Context\n${sections.join("\n\n")}`;
   }
 
   // ── Session daemon helpers ────────────────────────────────────────────
@@ -1137,24 +1207,35 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const runStillRelevant = (): boolean =>
       state.gateActive && state.currentTaskId === taskIdAtStart;
 
-    const spawnAgent = (): Promise<SpawnResult> =>
-      spawnAgentWithFallback({
-        model: effectiveModel,
-        modelClass: effectiveModelClass,
-        tools: effectiveTools,
-        systemPrompt: effectiveSystemPrompt,
-        task: params.task,
-        sessionName: subagentSessionName,
-        cwd: effectiveCwd,
-        signal: abortController.signal,
-        // Background runs use detached:true so a terminal Ctrl-C in the
-        // orchestrator does not kill the sub-agent; explicit cancellation goes
-        // through this run's AbortController.
-        detached: true,
-        env: spawnEnv,
-        cooldownStore: modelCooldown,
-        enabled: modelFallbackEnabled,
-      }).then((r) => withFallbackNote(r.result, r.attempts));
+    const spawnAgent = (): Promise<SpawnResult> => {
+      const buildTask = async (): Promise<string> => {
+        if (phaseName !== "proof") return params.task;
+        const proofContext = await gatherProofContext(
+          effectiveCwd ?? process.cwd(),
+          state.userGuideContent,
+        );
+        return `${params.task}${proofContext}`;
+      };
+      return buildTask().then((task) =>
+        spawnAgentWithFallback({
+          model: effectiveModel,
+          modelClass: effectiveModelClass,
+          tools: effectiveTools,
+          systemPrompt: effectiveSystemPrompt,
+          task,
+          sessionName: subagentSessionName,
+          cwd: effectiveCwd,
+          signal: abortController.signal,
+          // Background runs use detached:true so a terminal Ctrl-C in the
+          // orchestrator does not kill the sub-agent; explicit cancellation goes
+          // through this run's AbortController.
+          detached: true,
+          env: spawnEnv,
+          cooldownStore: modelCooldown,
+          enabled: modelFallbackEnabled,
+        }).then((r) => withFallbackNote(r.result, r.attempts)),
+      );
+    };
 
     const runGate = (result: SpawnResult): Promise<SpawnResult> =>
       runQualityGate(
@@ -1396,7 +1477,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       }
 
       const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
-      const execAsync = promisify(exec);
       try {
         const { stdout, stderr } = await execAsync(`bd ${params.command}`, {
           cwd,
@@ -1771,7 +1851,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const execAsync = promisify(exec);
       const cwd = ctx?.cwd ?? process.cwd();
       const state = getSessionState(ctx);
       const runId = generateShortRunId();

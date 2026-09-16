@@ -50,6 +50,8 @@
             "LD_LIBRARY_PATH=${gccLib}/lib"
             "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
             "NIX_SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
+            "PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}"
+            "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1"
           ];
         in
         {
@@ -260,6 +262,40 @@
         # `bash` is explicit because the pi `bash` tool resolves `/bin/bash`
         # (falling back to `which bash` → `sh`), and a system service does not
         # get the user's login-shell PATH.
+        playwright-cli = pkgs.stdenv.mkDerivation rec {
+          pname = "playwright-cli";
+          version = "0.1.14";
+
+          src = pkgs.fetchurl {
+            url = "https://registry.npmjs.org/@playwright/cli/-/cli-${version}.tgz";
+            sha256 = "12iy66wbq19n99qpkkkqfgvs2dcikyg5iiyywh86d9hhys8ynlrv";
+          };
+
+          # playwright-core alpha pin matches @playwright/cli@0.1.14's pinned dependency (ported verbatim from package-proxy-v2); bump both together when upgrading @playwright/cli.
+          playwrightCoreSrc = pkgs.fetchurl {
+            url = "https://registry.npmjs.org/playwright-core/-/playwright-core-1.61.0-alpha-1781023400000.tgz";
+            sha256 = "0y2m575swmkpwa6ryxxa8a5gjwm5nb7v62wf97g7hrqbc55hsii8";
+          };
+
+          phases = [ "installPhase" ];
+
+          installPhase = ''
+            mkdir -p $out/lib/node_modules/@playwright/cli
+            tar -xzf $src -C $out/lib/node_modules/@playwright/cli --strip-components=1
+
+            mkdir -p $out/lib/node_modules/playwright-core
+            tar -xzf $playwrightCoreSrc -C $out/lib/node_modules/playwright-core --strip-components=1
+
+            mkdir -p $out/bin
+            cat > $out/bin/playwright-cli <<WRAPPER
+            #!${pkgs.bash}/bin/bash
+            export NODE_PATH="$out/lib/node_modules"
+            exec "${pkgs.nodejs_24}/bin/node" "$out/lib/node_modules/@playwright/cli/playwright-cli.js" "\$@"
+            WRAPPER
+            chmod +x $out/bin/playwright-cli
+          '';
+        };
+
         devShellTools = [
           pkgs.bash
           pkgs.nodejs_24
@@ -275,6 +311,9 @@
           llm-agents.packages.${system}.pi
           pkgs.stdenv.cc.cc.lib # runtime lib for native node modules (shellHook)
           pkgs.procps # bd's dolt-server liveness check runs `ps -axo`
+          pkgs.asciinema
+          playwright-cli
+          pkgs.playwright-driver.browsers
         ];
 
         # Native runtime environment for the pi-web system service: a buildEnv
@@ -549,6 +588,8 @@
 
           shellHook = ''
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
+            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS="1"
             # Local pi wrapper (bin/pi): spawned belayd agents resolve their pi
             # binary via this var (src/spawn.ts) and would otherwise pick the
             # global /run/current-system/sw/bin/pi and dual-load extensions.

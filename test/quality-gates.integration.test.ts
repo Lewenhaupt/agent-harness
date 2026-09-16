@@ -55,7 +55,7 @@ describe("proof-of-work relocation (integration)", () => {
   });
 
   const validCast = [
-    JSON.stringify({ version: 3, command: "pnpm test" }),
+    JSON.stringify({ version: 3, command: "node dist/cli.js --serve" }),
     JSON.stringify([0.0, "o", "Running tests...\n"]),
     JSON.stringify([1.5, "o", "PASS\n"]),
     JSON.stringify([2.0, "x", "0"]),
