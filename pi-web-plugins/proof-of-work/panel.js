@@ -1,5 +1,5 @@
-import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot } from "./discovery.js";
-import { renderFileContent, renderTracePlaceholder, isTraceFile } from "./renderers.js";
+import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot, mediaPreviewUrl } from "./discovery.js";
+import { renderFileContent, renderTracePlaceholder, isTraceFile, renderMediaLoadError } from "./renderers.js";
 
 export const proofPanelTagName = "pi-web-proof-of-work-panel";
 
@@ -27,7 +27,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   selectedFilePath;
   fileContent;
   scanToken = 0;
-  /** Blob URLs created for media/cast playback; revoked on disconnect. */
+  /** Blob URLs created for cast playback; revoked on disconnect. */
   blobUrls = new Set();
   /** Asciinema player instances { element, instance } for cleanup. */
   playerInstances = [];
@@ -521,28 +521,39 @@ class PiWebProofOfWorkPanel extends HTMLElement {
       }
     }
 
-    // Initialize image/video media
+    // Initialize image/video media. Media bytes are served only by pi-web's
+    // streaming preview endpoint (readFile returns content:"" for these),
+    // mirroring pi-web's own file viewer, so we build a preview URL instead of
+    // decoding base64 content into a blob URL.
+    const context = this.contextValue;
+    if (context === undefined) return;
     for (const mediaEl of this.viewer.querySelectorAll(".proof-media[data-media-path]")) {
       const mediaPath = mediaEl.getAttribute("data-media-path");
       const mimeType = mediaEl.getAttribute("data-mime-type") || "application/octet-stream";
       if (mediaPath === null) continue;
 
       const content = this.fileContent;
-      if (content?.kind !== "loaded" || !content.binary) continue;
+      const modifiedAt = content?.kind === "loaded" ? content.modifiedAt : undefined;
 
-      try {
-        const bytes = base64ToBytes(content.content);
-        const blob = new Blob([bytes], { type: mimeType });
-        const blobUrl = URL.createObjectURL(blob);
-        this.blobUrls.add(blobUrl);
+      const url = mediaPreviewUrl({
+        machineId: context.machine.id,
+        machineKind: context.machine.kind,
+        projectId: context.workspace.projectId,
+        workspaceId: context.workspace.id,
+        filePath: mediaPath,
+        modifiedAt,
+      });
 
-        if (mediaEl instanceof HTMLVideoElement) {
-          mediaEl.src = blobUrl;
-        } else if (mediaEl instanceof HTMLImageElement) {
-          mediaEl.src = blobUrl;
+      mediaEl.addEventListener("error", () => {
+        if (mediaEl.isConnected) {
+          mediaEl.outerHTML = renderMediaLoadError(mediaPath, mimeType);
         }
-      } catch (error) {
-        mediaEl.outerHTML = `<div class="status error"><strong>Failed to load media.</strong><pre>${escapeHtml(String(error))}</pre></div>`;
+      }, { once: true });
+
+      if (mediaEl instanceof HTMLVideoElement || mediaEl instanceof HTMLImageElement) {
+        mediaEl.src = url;
+      } else {
+        mediaEl.outerHTML = renderMediaLoadError(mediaPath, mimeType);
       }
     }
   }
@@ -663,16 +674,6 @@ function showTraceCommand({ port, tracePath }) {
     `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found in this workspace (is @belayd/dashboard-spa installed?)"; exit 1; fi`,
     `"$PW" show-trace --port "$PORT" "$TRACE"`,
   ].join("\n");
-}
-
-/** Decode a base64 string into a Uint8Array. */
-function base64ToBytes(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
 }
 
 function fileIcon(ext) {

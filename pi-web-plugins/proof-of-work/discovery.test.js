@@ -5,6 +5,7 @@ import {
   getFileExtension,
   listTaskDirs,
   listTaskFiles,
+  mediaPreviewUrl,
   readProofFile,
   resolveProofRoot,
 } from "./discovery.js";
@@ -182,12 +183,23 @@ describe("listTaskFiles", () => {
 describe("readProofFile", () => {
   it("passes content, binary, and truncated through", async () => {
     const files = fakeFiles({
-      readFile: async () => ({ content: "hello", binary: true, truncated: true }),
+      readFile: async () => ({
+        content: "hello",
+        binary: true,
+        truncated: true,
+        modifiedAt: "2026-01-01T00:00:00.000Z",
+      }),
     });
 
     const result = await readProofFile(files, "/abs/base/bd-1/notes.md");
 
-    expect(result).toEqual({ kind: "loaded", content: "hello", binary: true, truncated: true });
+    expect(result).toEqual({
+      kind: "loaded",
+      content: "hello",
+      binary: true,
+      truncated: true,
+      modifiedAt: "2026-01-01T00:00:00.000Z",
+    });
   });
 
   it("maps denied errors to { kind: 'denied' }", async () => {
@@ -214,5 +226,68 @@ describe("getFileExtension", () => {
 
   it("returns an empty string when there is no extension", () => {
     expect(getFileExtension("/a/b/Makefile")).toBe("");
+  });
+});
+
+describe("mediaPreviewUrl", () => {
+  it("builds the local preview URL shape", () => {
+    expect(mediaPreviewUrl({
+      machineId: "local-machine",
+      machineKind: "local",
+      projectId: "proj-1",
+      workspaceId: "ws-1",
+      filePath: "proof-of-work/TASK-1/screenshot.png",
+    })).toBe("/api/projects/proj-1/workspaces/ws-1/file/preview?path=proof-of-work%2FTASK-1%2Fscreenshot.png");
+  });
+
+  it("builds the remote preview URL shape through the machines proxy", () => {
+    expect(mediaPreviewUrl({
+      machineId: "m-42",
+      machineKind: "remote",
+      projectId: "proj-1",
+      workspaceId: "ws-1",
+      filePath: "proof-of-work/TASK-1/demo.webm",
+    })).toBe("/api/machines/m-42/projects/proj-1/workspaces/ws-1/file/preview?path=proof-of-work%2FTASK-1%2Fdemo.webm");
+  });
+
+  it("encodes the path query parameter", () => {
+    expect(mediaPreviewUrl({
+      machineId: "m",
+      machineKind: "local",
+      projectId: "p",
+      workspaceId: "w",
+      filePath: "a b&c=d?e#f.png",
+    })).toBe("/api/projects/p/workspaces/w/file/preview?path=a%20b%26c%3Dd%3Fe%23f.png");
+  });
+
+  it("encodes projectId and workspaceId in the path", () => {
+    expect(mediaPreviewUrl({
+      machineId: "m",
+      machineKind: "local",
+      projectId: "proj/id",
+      workspaceId: "ws one",
+      filePath: "file.png",
+    })).toBe("/api/projects/proj%2Fid/workspaces/ws%20one/file/preview?path=file.png");
+  });
+
+  it("omits the cache-busting param when modifiedAt is not provided", () => {
+    expect(mediaPreviewUrl({
+      machineId: "m",
+      machineKind: "local",
+      projectId: "p",
+      workspaceId: "w",
+      filePath: "file.png",
+    })).toBe("/api/projects/p/workspaces/w/file/preview?path=file.png");
+  });
+
+  it("appends a cache-busting param when modifiedAt is provided", () => {
+    expect(mediaPreviewUrl({
+      machineId: "m",
+      machineKind: "local",
+      projectId: "p",
+      workspaceId: "w",
+      filePath: "file.png",
+      modifiedAt: "2026-01-01T00:00:00.000Z",
+    })).toBe("/api/projects/p/workspaces/w/file/preview?path=file.png&v=2026-01-01T00%3A00%3A00.000Z");
   });
 });

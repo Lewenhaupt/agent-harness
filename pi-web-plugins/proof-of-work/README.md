@@ -1,6 +1,6 @@
 # Proof of Work Viewer — pi-web Plugin
 
-A workspace panel for pi-web that renders verifiable-proof artifacts from `proof-of-work/<task-id>/` directories. Supports Playwright traces (`.trace.zip`), terminal recordings (`.cast`), screenshots (`.png`/`.jpg`/`.gif`), rendered markdown (`.md`), plain text (`.patch`, `.txt`, `.log`), and legacy browser videos (`.webm`).
+A workspace panel for pi-web that renders verifiable-proof artifacts from `proof-of-work/<task-id>/` directories. Supports Playwright traces (`.trace.zip`), terminal recordings (`.cast`), screenshots (`.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`/`.bmp`/`.ico`/`.avif`), rendered markdown (`.md`), plain text (`.patch`, `.txt`, `.log`), and legacy browser videos (`.webm`).
 
 ---
 
@@ -122,8 +122,9 @@ echo "Build complete — 0 errors, 0 warnings." > build-summary.txt
 printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82' > screenshot.png
 
 # --- Browser video (.webm) — leave empty for now (see note below) ---
-# Real .webm files come from Playwright E2E runs. A zero-byte file will
-# show the "Binary file" fallback state, which is expected for this test.
+# Real .webm files come from Playwright E2E runs. A zero-byte file
+# routes to the video preview path and shows an explicit
+# 'Could not load media preview' error (pi-web does not serve webm preview bytes).
 touch demo.webm
 
 echo "Test artifacts created in $PROOF_BASE/TASK-1/"
@@ -153,8 +154,14 @@ through the logical `proof-of-work/<task-id>/...` layout.
 | `output.log` | Preformatted text in a monospace `<pre>` block with word-wrap |
 | `changes.patch` | Same as above — preformatted monospace text with word-wrap |
 | `build-summary.txt` | Same — plain text in a `<pre>` block |
-| `screenshot.png` | Inline image scaled to fit panel width |
-| `demo.webm` | HTML5 `<video>` element with native controls (play, pause, volume, fullscreen); or a "Binary file: demo.webm — This file has no text preview." message if the file is empty/corrupt |
+| `screenshot.png` | Inline image rendered via pi-web's streaming preview endpoint and scaled to panel width (no perpetual "Loading image/png…") |
+| `demo.webm` | Explicit "Could not load media preview." error state (pi-web does not serve webm preview bytes), not a perpetual loading spinner |
+
+> **Note:** On remote machines the media preview URL routes through
+> `/api/machines/:machineId/...`; on the local machine it is served directly from
+> `/api/...`. A failed media preview is reported by a one-time `error` handler that
+> replaces the placeholder with the explicit "Could not load media preview." error
+> state — there is no perpetual spinner.
 
 ### 6. Verify denied external access
 
@@ -327,9 +334,8 @@ are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 |---|---|---|
 | `.cast` | [asciinema-player](https://github.com/asciinema/asciinema-player) — terminal playback with play/pause, speed control, resize | Loaded from `vendor/asciinema-player.min.js`. Configured with `fit: "width"`, `terminalFontSize: "small"` |
 | `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace` in a workspace terminal and opens the local Trace Viewer (DOM snapshots, scrubbable screencast, network, console) |
-| `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen. Codec support depends on browser (VP8/VP9) |
-| `.png`, `.jpg`, `.jpeg` | Inline `<img>` | Scaled to panel width; respects aspect ratio |
-| `.gif` | Inline `<img>` | Animated GIFs play in-browser |
+| `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen; or an explicit "Could not load media preview" error if preview bytes are unavailable |
+| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; scaled to panel width |
 | `.md` | [marked](https://marked.js.org/) → sanitized HTML | GFM tables, autolinks, task lists. Script tags and `on*` attributes are stripped |
 | `.txt`, `.log`, `.patch` | `<pre class="document">` — monospace, word-wrap | Lines wrap with `overflow-wrap: anywhere` |
 | Any other binary | "Binary file: \<name\> — This file has no text preview." | Fallback for unsupported extensions |
@@ -438,9 +444,22 @@ path.
 - The setting applies on the next file request; click ↻ **Refresh** or reload
   the browser tab if the existing view is stale.
 
+#### "Could not load media preview"
+
+The viewer shows *"Could not load media preview"* instead of the image or video.
+
+- The file is too large for pi-web's streaming preview (over ~10 MB) or is not
+  in a allowlisted filesystem path; add the proof base to `pathAccess.allowedPaths`
+  and confirm the file size.
+- `.webm` is not a pi-web-previewable file type (only raster images and PDF
+  have preview MIME types in pi-web's allowlist), so the preview endpoint
+  returns an error and the viewer falls back to this message.
+- On remote machines, the preview routes through `/api/machines/:id`; ensure the
+  remote machine is reachable and exposes the preview route.
+
 #### "Binary file — no preview"
 
-The selected file has an extension that is not in the supported list (`.cast`, `.webm`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.md`, `.txt`, `.log`, `.patch`), OR it is a binary file with a supported extension that could not be loaded as text.
+The selected file has an extension that is not in the supported list (`.cast`, `.webm`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif`, `.md`, `.txt`, `.log`, `.patch`), OR it is a binary file with a supported extension that could not be loaded as text.
 
 - For unsupported binary files: rename to a supported extension or add a companion markdown note.
 - For text files with binary content: check that the file is not corrupt.
@@ -482,14 +501,14 @@ The plugin is a plain JavaScript ES module with no build step. It consists of fo
 | File | Responsibility |
 |---|---|
 | `pi-web-plugin.js` | Plugin metadata and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
-| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()` |
+| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
 | `panel.js` | Custom element `<pi-web-proof-work-panel>` — all UI, state management, player lifecycle |
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
 
 Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step).
 
-Async operations are guarded by a monotonic `scanToken` counter that prevents stale responses from overwriting newer state. Binary media content is passed through blob URLs that are tracked and revoked on cleanup.
+Async operations are guarded by a monotonic `scanToken` counter that prevents stale responses from overwriting newer state. Cast recordings play via blob URLs; raster images and video set `src` to the streaming preview endpoint URL via `mediaPreviewUrl()`, with explicit error fallback.
 
 ### Related documentation
 
