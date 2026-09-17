@@ -98,6 +98,7 @@ export async function readProofFile(files, filePath) {
       content: file.content,
       binary: file.binary,
       truncated: file.truncated,
+      modifiedAt: file.modifiedAt,
     };
   } catch (error) {
     return fileAccessFailure(error);
@@ -108,6 +109,19 @@ export async function readProofFile(files, filePath) {
 export function getFileExtension(path) {
   const dot = path.lastIndexOf(".");
   return dot === -1 ? "" : path.slice(dot).toLowerCase();
+}
+
+/** Build the pi-web preview URL for a binary media file (image or video).
+ *  readFile() returns content:"" for these files; their bytes are served only
+ *  by the streaming preview route, which local machines expose directly and
+ *  remote machines expose through the /api/machines/:id proxy. An optional
+ *  modifiedAt appends a cache-busting `v` param so a refreshed artifact is not
+ *  served stale by the route's `max-age=3600` caching. */
+export function mediaPreviewUrl({ machineId, machineKind, projectId, workspaceId, filePath, modifiedAt }) {
+  const resource = `/projects/${encodeURIComponent(projectId)}/workspaces/${encodeURIComponent(workspaceId)}/file/preview`;
+  const prefix = machineKind === "remote" ? `/api/machines/${encodeURIComponent(machineId)}` : "/api";
+  const cacheBust = modifiedAt === undefined || modifiedAt === "" ? "" : `&v=${encodeURIComponent(modifiedAt)}`;
+  return `${prefix}${resource}?path=${encodeURIComponent(filePath)}${cacheBust}`;
 }
 
 function fileAccessFailure(error) {

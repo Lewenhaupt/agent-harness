@@ -33,12 +33,17 @@ export function renderCastPlaceholder(filePath) {
 
 /** Render a placeholder for an image or video file. */
 export function renderMediaPlaceholder(filePath, mimeType) {
-  const type = mimeType.startsWith("video/") ? "video" : "img";
+  const kind = mimeType.startsWith("video/") ? "video" : "img";
   const attrs = `class="proof-media" data-media-path="${escapeAttr(filePath)}" data-mime-type="${escapeAttr(mimeType)}"`;
-  if (type === "video") {
-    return `<video ${attrs} controls><p class="muted">Loading ${escapeHtml(mimeType)}…</p></video>`;
+  if (kind === "video") {
+    return `<video ${attrs} controls></video>`;
   }
-  return `<${type} ${attrs}><p class="muted">Loading ${escapeHtml(mimeType)}…</p></${type}>`;
+  return `<img ${attrs} alt="${escapeAttr(fileName(filePath))}">`;
+}
+
+/** Render an explicit failure state for a media file whose preview failed to load. */
+export function renderMediaLoadError(filePath, mimeType) {
+  return `<div class="status error"><strong>Could not load media preview.</strong><pre>${escapeHtml(fileName(filePath))} (${escapeHtml(mimeType)})</pre></div>`;
 }
 
 /** Render a Playwright trace (.trace.zip) as an "open in viewer" action. */
@@ -111,7 +116,7 @@ export function isTraceFile(ext) {
 
 /** Check if the extension indicates an image file. */
 export function isImageFile(ext) {
-  return ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".gif";
+  return ext === ".png" || ext === ".jpg" || ext === ".jpeg" || ext === ".gif" || ext === ".webp" || ext === ".bmp" || ext === ".ico" || ext === ".avif";
 }
 
 /** Return the MIME type for a known media extension. */
@@ -122,6 +127,10 @@ export function mediaMimeType(ext) {
     case ".jpg":
     case ".jpeg": return "image/jpeg";
     case ".gif": return "image/gif";
+    case ".webp": return "image/webp";
+    case ".bmp": return "image/bmp";
+    case ".ico": return "image/x-icon";
+    case ".avif": return "image/avif";
     default: return "application/octet-stream";
   }
 }
