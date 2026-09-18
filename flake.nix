@@ -461,6 +461,7 @@
               package = pi-bare;
               extensions = [
                 "${belayd-harness}/extensions/index.ts"
+                "${belayd-harness}/extensions/llmgateway-refresh.ts"
                 "${belayd-harness}/extensions/stale-file-guard.ts"
                 "${belayd-harness}/extensions/worktree-guard.ts"
                 "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-exa/src/index.ts"

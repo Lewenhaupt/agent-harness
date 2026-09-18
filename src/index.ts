@@ -25,6 +25,24 @@ export {
 } from "./agent-registry.js";
 export type { BdCommandValidation } from "./bd-command.js";
 export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
+export type {
+  GatewayModelEntry,
+  LlmGatewayApiResponse,
+  LlmGatewayModel,
+  LlmGatewayPricing,
+  ModelCompat,
+  ModelCost,
+  ModelsJsonDoc,
+  ThinkingLevelMap,
+} from "./llmgateway-models.js";
+export {
+  buildLlmGatewayModelsDoc,
+  diffModelsDoc,
+  isLlmGatewayApiResponse,
+  mapLlmGatewayModels,
+  parseLlmGatewayApiKeyFromAuthJson,
+  serializeModelsJsonDoc,
+} from "./llmgateway-models.js";
 export type { AgentModelSpec, ModelClass } from "./model-classes.js";
 // Model classes & quota-fallback routing
 export {

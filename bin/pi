@@ -46,6 +46,7 @@ esac
 # the first positional as the prompt, so the user's prompt/args must stay last.
 exec "$real_pi" -ne \
   -e "$repo_dir/extensions/index.ts" \
+  -e "$repo_dir/extensions/llmgateway-refresh.ts" \
   -e "$repo_dir/extensions/stale-file-guard.ts" \
   -e "$repo_dir/extensions/worktree-guard.ts" \
   "$@"
