@@ -61,6 +61,8 @@ describe("renderMediaPlaceholder", () => {
     expect(html).toContain('alt="screenshot.png"');
     expect(html).toContain('data-media-path="proof-of-work/TASK-1/screenshot.png"');
     expect(html).toContain('data-mime-type="image/png"');
+    expect(html).toContain('referrerpolicy="no-referrer"');
+    expect(html).toContain('decoding="async"');
   });
 
   it("renders a bare video element with controls and no stray child", () => {
@@ -69,6 +71,8 @@ describe("renderMediaPlaceholder", () => {
     expect(html).toContain("<video");
     expect(html).toContain("controls");
     expect(html).toContain("></video>");
+    expect(html).toContain('referrerpolicy="no-referrer"');
+    expect(html).not.toContain('decoding="async"');
     expect(html).not.toContain("<p");
     expect(html).not.toContain("Loading");
   });

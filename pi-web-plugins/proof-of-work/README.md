@@ -154,14 +154,19 @@ through the logical `proof-of-work/<task-id>/...` layout.
 | `output.log` | Preformatted text in a monospace `<pre>` block with word-wrap |
 | `changes.patch` | Same as above — preformatted monospace text with word-wrap |
 | `build-summary.txt` | Same — plain text in a `<pre>` block |
-| `screenshot.png` | Inline image rendered via pi-web's streaming preview endpoint and scaled to panel width (no perpetual "Loading image/png…") |
+| `screenshot.png` | Inline image rendered via pi-web's streaming preview endpoint, fitted with `max-width`/`max-height` + `object-fit: contain` (no perpetual "Loading image/png…") |
 | `demo.webm` | Explicit "Could not load media preview." error state (pi-web does not serve webm preview bytes), not a perpetual loading spinner |
 
 > **Note:** On remote machines the media preview URL routes through
 > `/api/machines/:machineId/...`; on the local machine it is served directly from
-> `/api/...`. A failed media preview is reported by a one-time `error` handler that
-> replaces the placeholder with the explicit "Could not load media preview." error
-> state — there is no perpetual spinner.
+> `/api/...`. Media placeholders are served with `referrerpolicy="no-referrer"`
+> (and `decoding="async"` for images), so the preview endpoint does not receive a
+> Referer header and images decode off the main thread. A failed media preview is
+> reported by a one-time `error` handler that replaces the placeholder with the
+> explicit "Could not load media preview." error state; empty previews (an image
+> or video that loads with zero natural dimensions) are detected via `load` /
+> `loadeddata` and replaced with the same error state — there is no perpetual
+> spinner.
 
 ### 6. Verify denied external access
 
@@ -335,7 +340,7 @@ are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 | `.cast` | [asciinema-player](https://github.com/asciinema/asciinema-player) — terminal playback with play/pause, speed control, resize | Loaded from `vendor/asciinema-player.min.js`. Configured with `fit: "width"`, `terminalFontSize: "small"` |
 | `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace` in a workspace terminal and opens the local Trace Viewer (DOM snapshots, scrubbable screencast, network, console) |
 | `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen; or an explicit "Could not load media preview" error if preview bytes are unavailable |
-| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; scaled to panel width |
+| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; fitted with `max-width`/`max-height` + `object-fit: contain`, `referrerpolicy="no-referrer"`, `decoding="async"` |
 | `.md` | [marked](https://marked.js.org/) → sanitized HTML | GFM tables, autolinks, task lists. Script tags and `on*` attributes are stripped |
 | `.txt`, `.log`, `.patch` | `<pre class="document">` — monospace, word-wrap | Lines wrap with `overflow-wrap: anywhere` |
 | Any other binary | "Binary file: \<name\> — This file has no text preview." | Fallback for unsupported extensions |
