@@ -148,10 +148,9 @@ Which file to look at first and why.${SHARED_AGENT_GUIDANCE}`;
 
 export const RESEARCHER_SYSTEM_PROMPT = `You are a researcher. Investigate the research question thoroughly and produce an evidence-based answer grounded in the actual codebase, citing specific files and line ranges.
 
-Your deliverable is a bead, not a document:
-- Record your findings as a note on the task's bead using the \`bd\` tool, e.g. \`bd note <task-id> "..."\`.
-- Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
-- The task ID is provided in your instructions. If it is missing, discover the current task with \`bd ready\` or \`bd list --status=in_progress\`.
+Your deliverable depends on whether a task ID is provided:
+- When a task ID IS provided in your instructions: record your findings as a note on the task's bead using the \`bd\` tool, e.g. \`bd note <task-id> "..."\`. Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
+- When NO task ID is provided (planning mode): do NOT create beads and do NOT write files — return your findings in your output for the planning orchestrator to synthesize.
 
 Output format:
 
@@ -159,7 +158,7 @@ Output format:
 The answer to the research question, with evidence (file paths + line ranges).
 
 ## Recorded As
-The exact \`bd\` command(s) you ran to record the findings on the bead.${SHARED_AGENT_GUIDANCE}`;
+The exact \`bd\` command(s) you ran to record the findings on the bead (empty when no task ID was provided).${SHARED_AGENT_GUIDANCE}`;
 
 /**
  * Tools for the research sub-agent: the planner's read/search tools plus
@@ -204,6 +203,53 @@ What to test and at what level (unit, integration, e2e).
 
 ## Risks
 Potential pitfalls or dependencies on other work.${SHARED_AGENT_GUIDANCE}`;
+
+/**
+ * System prompt for the planning-mode orchestrator (the /plan command).
+ *
+ * The planning orchestrator investigates via sub-agents and writes the
+ * finalized plan directly into beads — it never edits files or creates a
+ * worktree. This is the planning-only counterpart to the implementation
+ * workflows started by /belayd.
+ */
+export const PLANNING_MODE_SYSTEM_PROMPT = `You are a planning orchestrator. Investigate the work and produce a finalized, implementation-ready plan — recorded as one or more beads, not as a document.
+
+Investigation:
+- Use \`belayd_plan_scout\` for codebase recon (files, key code, architecture).
+- Use \`belayd_plan_research\` for deeper questions that need more than a quick recon.
+- Wait for each sub-agent's follow-up result before synthesizing — do not race ahead.
+
+Deliverable: one or more beads.
+- Choose a normal bead type (task/feature/bugfix/spike/etc — NOT a special "plan" type).
+- Mode A (new work): create the bead with \`bd create "title" --description="..." --design="..." --notes="..." --type=<type> --priority=2\`.
+- Mode B (refine an existing bead, /plan bd-x): run \`bd show <id>\` first, then \`bd update <id> --description="..." --design="..." --notes="..."\` to write the refined plan back.
+- Use the \`## Overview / ## Steps / ## Test Strategy / ## Risks\` shape for the plan content.
+- When the work is large, decompose it into multiple top-level step beads and link them with the unambiguous \`bd dep <blocker-id> --blocks <blocked-id>\` form (or \`bd dep relate\` for a bidirectional relation). Avoid \`bd dep add\`'s positional form — it is easy to reverse.
+- NEVER use \`--parent\` or parent-child links.
+- Leave every created bead open/backlog — never pass \`--status\`, \`--claim\`, or set in_progress.
+
+Rules:
+- No edit/write/bash tools and no worktree. Your deliverable is the bead(s).
+- Write no plan documents into the repository.${SHARED_AGENT_GUIDANCE}`;
+
+/**
+ * Tools available to the planning-mode orchestrator: read-only code exploration
+ * plus the \`bd\` CLI for writing plans into beads. No edit/write/bash so the
+ * planning phase can never modify the repository.
+ */
+export const PLANNING_MODE_TOOLS: string[] = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ast_grep",
+  "bd",
+  "web_search_exa",
+  "web_fetch_exa",
+  "deep_search_exa",
+  "web_search_advanced_exa",
+  "describe_image",
+];
 
 const IMPLEMENTER_SYSTEM_PROMPT = `You are an implementer. Your job is to execute the plan, not describe it — the planner already did that. You must use the edit and write tools to actually modify/create files.
 

@@ -6,10 +6,10 @@ Multi-agent harness for [Belayd](https://github.com/belayd/package-proxy-v2) —
 
 Provides the machinery for Belayd's multi-agent workflow system:
 
-- **Agent registry** — 8 specialized agents (scout, planner, implementer, reviewer, tester, proof generator, documenter, committer), each with model config, tool allowlists, and system prompts.
+- **Agent registry** — 9 specialized agents (scout, planner, implementer, reviewer, tester, userguide, proof generator, documenter, committer), each with model config, tool allowlists, and system prompts. Also exports `PLANNING_MODE_SYSTEM_PROMPT` and `PLANNING_MODE_TOOLS` for planning-mode orchestrators.
 - **Process spawner** — Spawns isolated `pi --mode json` processes for each agent, streams results back, and tracks usage.
-- **Process gate** — Enforces phase order (scout → plan → implement → review → test → proof → plannotator → commit), blocks out-of-sequence tool calls.
-- **Workflow registry** — 7 workflow sub-types (feature, bugfix, research, chore, documentation, refactor, hotfix) with configurable phase sequences.
+- **Process gate** — Enforces an implement-first phase order for each workflow (e.g. feature: implement → review → test → userguide → proof → commit), blocks out-of-sequence tool calls, and keeps `belayd_scout`/`belayd_plan` callable as non-gating consultation phases when a workflow declares them.
+- **Workflow registry** — 7 workflow sub-types (feature, bugfix, research, chore, documentation, refactor, hotfix) with configurable phase sequences; feature/bugfix/refactor/documentation declare `consultPhases: ["scout", "plan"]` so planning runs as a separate, optional consultation step rather than a required phase.
 - **Quality gates** — Deterministic post-agent checks: typecheck, lint, tests, proof content validation.
 - **Worktree utilities** — Git worktree setup/resolution for agent process isolation.
 - **Stale-file guard** — Tracks file content hashes and blocks edits when files change between read and write.
@@ -42,6 +42,30 @@ pnpm add belayd-agent-harness
 ```typescript
 import { DEFAULT_AGENTS, spawnAgentProcess, setupWorktree } from "belayd-agent-harness";
 ```
+
+## Planning mode (`/plan`)
+
+Split from the implementation workflows: `/plan` enters a planning-only mode
+that investigates and writes implementation-ready beads, without touching files
+or creating a worktree.
+
+Full verification steps and end-user usage:
+[docs/planning-implement-workflows.md](docs/planning-implement-workflows.md).
+
+```
+/plan "description of the work"   # mode A: investigate then bd create
+/plan bd-x [focus]                # mode B: bd show, then bd update
+```
+
+- No worktree, no edit/write/bash — the planning orchestrator uses
+  `belayd_plan_scout` (codebase recon) and `belayd_plan_research` (deeper
+  questions), then records the plan into beads.
+- Beads are created open/backlog (never `--status`/`--claim`), using
+  `bd create "title" --description="..." --design="..." --notes="..." --type=<type> --priority=2`.
+  Large work is decomposed into top-level step beads linked with `bd dep` /
+  `bd dep add` / `bd dep relate` — never `--parent` or parent-child links.
+- Exit planning with `belayd_stop_planning`, or start implementation with
+  `/belayd` (or `belayd_start_task`), which resets planning state.
 
 ## Development
 

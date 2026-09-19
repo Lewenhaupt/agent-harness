@@ -26,16 +26,7 @@ import {
   writeWorkflowState,
 } from "../workflow-state.js";
 
-const FEATURE_PHASES = [
-  "scout",
-  "plan",
-  "implement",
-  "review",
-  "test",
-  "userguide",
-  "proof",
-  "commit",
-] as const;
+const FEATURE_PHASES = ["implement", "review", "test", "userguide", "proof", "commit"] as const;
 
 // Isolate the extension's persistent cooldown store from the real user file. A
 // live pi-web quota cooldown in ~/.pi/agent/model-cooldowns.json would leak
@@ -1764,19 +1755,19 @@ describe("session_start resume from disk (bd-40)", () => {
 
   it("flips a still-running manifest to interrupted during resume", async () => {
     const cwd = freshWorktree();
-    // scout already done, plan was running when the previous process died.
+    // implement was running when the previous process died; nothing completed.
     writeWorkflowState({
       cwd,
-      state: featureState({ completedPhaseNames: ["scout"] }),
+      state: featureState({ completedPhaseNames: [] }),
     });
     writeRunManifest({
       cwd,
       manifest: {
         schemaVersion: 1,
-        runId: "plan-run",
+        runId: "implement-run",
         taskId: "bd-42",
-        phase: "plan",
-        sessionName: "belayd-bd-42-sub-plan-plan-run",
+        phase: "implement",
+        sessionName: "belayd-bd-42-sub-implement-implement-run",
         status: RunStatus.Running,
         startedAt: 5_000,
       },
@@ -1787,14 +1778,14 @@ describe("session_start resume from disk (bd-40)", () => {
 
     await fireSessionStart(eventHandlers, ctx);
 
-    const reloaded = readRunManifest({ cwd, runId: "plan-run" });
+    const reloaded = readRunManifest({ cwd, runId: "implement-run" });
     expect(reloaded).toHaveProperty("status", "interrupted");
     expect(reloaded).toHaveProperty("completedAt");
     expect(typeof reloaded?.completedAt).toBe("number");
 
-    // And the gate still resumes at plan (the phase that died), not skipped.
+    // And the gate still resumes at implement (the phase that died), not skipped.
     const message = await gateContextMessage(eventHandlers, ctx);
-    expect(message).toContain("Next required step: call `belayd_plan`");
+    expect(message).toContain("Next required step: call `belayd_implement`");
   });
 
   it("ignores sub-agent sessions and leaves disk state untouched", async () => {
@@ -1841,29 +1832,29 @@ describe("session_start resume from disk (bd-40)", () => {
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
 
     mockSpawnAgentProcess.mockResolvedValueOnce({
-      content: [{ type: "text" as const, text: "scout done" }],
+      content: [{ type: "text" as const, text: "implement done" }],
       details: {
         messages: [],
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
         exitCode: 0,
       },
-      sessionName: "mocked-scout",
+      sessionName: "mocked-implement",
     });
 
     // The phase tool now returns immediately; its completion watcher persists
     // the completed phase in the background.
     await tools
-      .get("belayd_scout")
-      ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+      .get("belayd_implement")
+      ?.execute("implement", { task: "implement" }, undefined, undefined, ctx);
 
     await vi.waitFor(() => {
       const persisted = readWorkflowStateFromDisk({ cwd });
-      expect(persisted).toHaveProperty("completedPhaseNames", ["scout"]);
+      expect(persisted).toHaveProperty("completedPhaseNames", ["implement"]);
     });
 
     const runs = listRuns({ cwd });
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toHaveProperty("phase", "scout");
+    expect(runs[0]).toHaveProperty("phase", "implement");
     expect(runs[0]).toHaveProperty("status", "completed");
     expect(runs[0]).toHaveProperty("exitCode", 0);
   });
@@ -1877,21 +1868,23 @@ describe("session_start resume from disk (bd-40)", () => {
       .get("belayd_start_task")
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
 
-    mockSpawnAgentProcess.mockResolvedValueOnce({
-      content: [{ type: "text" as const, text: "scout crashed" }],
+    // Always fail so both the initial implement run AND its quality-gate
+    // retries settle with exitCode 1; the gate then records a failed run.
+    mockSpawnAgentProcess.mockResolvedValue({
+      content: [{ type: "text" as const, text: "implement crashed" }],
       details: {
         messages: [],
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
         exitCode: 1,
       },
-      sessionName: "mocked-scout",
+      sessionName: "mocked-implement",
     });
 
     await tools
-      .get("belayd_scout")
-      ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+      .get("belayd_implement")
+      ?.execute("implement", { task: "implement" }, undefined, undefined, ctx);
 
-    // The failed run's watcher must NOT persist scout to disk.
+    // The failed run's watcher must NOT persist implement to disk.
     await vi.waitFor(() => {
       const runs = listRuns({ cwd });
       expect(runs).toHaveLength(1);
@@ -1903,7 +1896,7 @@ describe("session_start resume from disk (bd-40)", () => {
 
     const runs = listRuns({ cwd });
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toHaveProperty("phase", "scout");
+    expect(runs[0]).toHaveProperty("phase", "implement");
     expect(runs[0]).toHaveProperty("exitCode", 1);
   });
 });

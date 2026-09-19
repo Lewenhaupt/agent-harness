@@ -40,6 +40,7 @@ import {
   checkToolAllowed,
   DEFAULT_AGENTS,
   formatProcessState,
+  getAgentByShortName,
   getNextPhase,
   getPhasesForType,
   getPhaseToolName,
@@ -49,6 +50,10 @@ import {
   isWorkflowComplete,
   listRuns,
   markPhaseCompleted,
+  PLANNING_MODE_SYSTEM_PROMPT,
+  PLANNING_MODE_TOOLS,
+  RESEARCHER_SYSTEM_PROMPT,
+  RESEARCHER_TOOLS,
   RunStatus,
   resolveModelSpec,
   resolveQualityGate,
@@ -66,6 +71,7 @@ import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/r
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
   computeOrchestratorSessionName,
+  computePlanningSubagentSessionName,
   computeSubagentSessionName,
   generateShortRunId,
 } from "../src/session-naming.js";
@@ -78,8 +84,16 @@ import {
 } from "../src/workflow-state.js";
 
 // ── Process gate state ─────────────────────────────────────────────────
+/** Planning mode target: either a new bead or an existing bead to refine. */
+type PlanningTarget =
+  | { kind: "new"; description: string }
+  | { kind: "existing"; taskId: string; focus?: string };
+
 type SessionState = {
   gateActive: boolean;
+  planningActive: boolean;
+  planningTarget: PlanningTarget | undefined;
+  consultPhases: readonly string[];
   completedPhaseNames: string[];
   currentTaskId: string;
   fullTools: string[] | undefined;
@@ -108,6 +122,9 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
   if (!state) {
     state = {
       gateActive: false,
+      planningActive: false,
+      planningTarget: undefined,
+      consultPhases: [],
       completedPhaseNames: [],
       currentTaskId: "",
       fullTools: undefined,
@@ -150,7 +167,12 @@ function evaluateToolCallGate(
   // orchestrator must wait for that follow-up instead of racing ahead.
   // Checked before phase-order so the reason names the in-flight run.
   const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
-  const isPhaseRunTarget = state.phaseOrder.includes(toolBase) || toolBase === "commit";
+  // `commit` is a safety net: it already appears in every phaseOrder, so this
+  // clause catches a commit racing ahead during a phase run.
+  const isPhaseRunTarget =
+    state.phaseOrder.includes(toolBase) ||
+    state.consultPhases.includes(toolBase) ||
+    toolBase === "commit";
   if (state.activeRuns.size > 0 && isPhaseRunTarget) {
     const activeRunIds = [...state.activeRuns.keys()].join(", ");
     const reason =
@@ -167,6 +189,7 @@ function evaluateToolCallGate(
     state.phaseOrder,
     state.workflowType,
     state.optionalPhases,
+    state.consultPhases,
   );
   if (!check.allowed) {
     abortToolCall(event, "phase-order-blocked", check.reason ?? "Phase order violation");
@@ -297,14 +320,32 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "ls",
   ];
 
-  function enableGateTools(state: SessionState): void {
-    if (state.fullTools === undefined) {
-      state.fullTools = pi.getActiveTools();
-    }
-    pi.setActiveTools(GATED_TOOLS);
-  }
+  const PLANNING_GATED_TOOLS = [
+    ...PLANNING_MODE_TOOLS,
+    "belayd_plan_scout",
+    "belayd_plan_research",
+    "belayd_status",
+    "belayd_stop_planning",
+  ];
 
-  function restoreFullTools(state: SessionState): void {
+  /**
+   * Derive the active tool set from session state instead of stashing
+   * incrementally. A single `fullTools` stash, guarded by the current mode
+   * flags, makes interleaved gate↔planning transitions always converge on the
+   * correct set — the full original tools are only restored once both modes
+   * are off, so edit/write/bash can never leak back into an active mode.
+   */
+  function applyToolGate(state: SessionState): void {
+    if (state.planningActive) {
+      if (state.fullTools === undefined) state.fullTools = pi.getActiveTools();
+      pi.setActiveTools(PLANNING_GATED_TOOLS);
+      return;
+    }
+    if (state.gateActive) {
+      if (state.fullTools === undefined) state.fullTools = pi.getActiveTools();
+      pi.setActiveTools(GATED_TOOLS);
+      return;
+    }
     if (state.fullTools !== undefined) {
       pi.setActiveTools(state.fullTools);
       state.fullTools = undefined;
@@ -322,39 +363,47 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const { ctx, taskId, workflowType, cwd } = options;
     const state = getSessionState(ctx);
     state.gateActive = true;
+    state.planningActive = false;
+    state.planningTarget = undefined;
     state.completedPhaseNames = [];
     state.currentTaskId = taskId;
     state.workflowType = workflowType ?? "feature";
-    state.phaseOrder = getPhasesForType(state.workflowType);
-    state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+    applyWorkflowConfig(state);
     state.userGuideContent = undefined;
     abortAndResetRunTracking(state);
-    enableGateTools(state);
+    applyToolGate(state);
+    reconcileWorkflowState(state, { taskId, cwd, options });
+    return state;
+  }
 
-    // Reconcile with disk: resume a crashed workflow's completed phases, or
-    // write a fresh state file so a later crash can be resumed.
-    const persisted = readWorkflowState({ cwd });
-    if (persisted !== undefined && persisted.taskId === taskId) {
-      state.workflowType = isValidWorkflowType(persisted.workflowType)
-        ? persisted.workflowType
-        : "feature";
-      state.phaseOrder = [...persisted.phaseOrder];
-      state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
-      state.completedPhaseNames = persisted.completedPhaseNames.filter((phase) =>
-        state.phaseOrder.includes(phase),
-      );
-    } else {
+  /** Point the session state at a workflow's ordered phases and consult set. */
+  function applyWorkflowConfig(state: SessionState): void {
+    state.phaseOrder = getPhasesForType(state.workflowType);
+    state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+    state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
+  }
+
+  /** Reconcile a newly-activated gate with persisted workflow state. */
+  function reconcileWorkflowState(
+    state: SessionState,
+    input: {
+      taskId: string;
+      cwd: string;
+      options: { branch?: string; originalCwd?: string };
+    },
+  ): void {
+    const persisted = readWorkflowState({ cwd: input.cwd });
+    if (persisted === undefined || persisted.taskId !== input.taskId) {
       const now = Date.now();
-      const phaseOrder = getPhasesForType(state.workflowType);
       const writeResult = writeWorkflowState({
-        cwd,
+        cwd: input.cwd,
         state: {
           schemaVersion: 1,
-          taskId,
+          taskId: input.taskId,
           workflowType: state.workflowType,
-          branch: options.branch ?? "",
-          originalCwd: options.originalCwd ?? cwd,
-          phaseOrder: [...phaseOrder],
+          branch: input.options.branch ?? "",
+          originalCwd: input.options.originalCwd ?? input.cwd,
+          phaseOrder: [...state.phaseOrder],
           completedPhaseNames: [],
           startedAt: now,
           updatedAt: now,
@@ -363,8 +412,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       if (!writeResult.ok) {
         console.warn(`[belayd-harness] failed to persist workflow state: ${writeResult.error}`);
       }
+      return;
     }
-    return state;
+
+    state.workflowType = isValidWorkflowType(persisted.workflowType)
+      ? persisted.workflowType
+      : "feature";
+    state.phaseOrder = [...persisted.phaseOrder];
+    state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+    state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
+    state.completedPhaseNames = persisted.completedPhaseNames.filter((phase) =>
+      state.phaseOrder.includes(phase),
+    );
   }
 
   function sendWorkflowMessage(
@@ -376,6 +435,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   ): void {
     const type = workflowType ?? "feature";
     const phases = phaseOrder ?? getPhasesForType(type);
+    const consultPhases = WORKFLOW_REGISTRY[type].consultPhases ?? [];
 
     const typeDescriptions: Record<string, string> = {
       feature: "This is a FEATURE task — new functionality.",
@@ -402,6 +462,19 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     });
 
     lines.push("", `Next required step: call \`belayd_${phases[0] ?? "commit"}\``);
+
+    // When the workflow declares consult phases, the bead's description/design/
+    // notes are the plan — /plan already wrote it. The scout/plan tools remain
+    // available only as consultation when that plan is unclear, and are NOT
+    // required steps in the phase order.
+    if (consultPhases.length > 0) {
+      const consultTools = consultPhases.map((p) => `\`belayd_${p}\``).join(" and ");
+      lines.push(
+        "",
+        "**Plan source** — this bead's description/design/notes are the implementation plan. Read them first (via `bd show`) and implement from them.",
+        `${consultTools} are available as consultation (NOT required steps) — use them if the plan is sparse or unclear before implementing. They do not gate progress.`,
+      );
+    }
 
     // Research workflows: the plan phase is the research agent — it records
     // findings as a bead note (not a .md file). Create follow-up tasks before
@@ -653,6 +726,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Read a bead's full plain-text content via `bd show <taskId>`.
+   * Returns undefined on error so callers can proceed without the plan.
+   */
+  function readTaskPlan(taskId: string): Promise<string | undefined> {
+    return new Promise((resolve) => {
+      exec(`bd show ${taskId}`, { timeout: 15_000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+        resolve(err ? undefined : stdout.trim() || undefined);
+      });
+    });
+  }
+
   /** Extract the "## How to Verify" section up to the next "## " heading. */
   function extractHowToVerify(userGuideContent: string | undefined): string {
     if (!userGuideContent) return "";
@@ -856,6 +941,74 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     ctx.ui.notify(`Belayd ${workflowType} workflow started for ${taskId} (${branch}).`, "info");
   }
 
+  // ── Slash command: /plan <description> | /plan bd-x ───────────────
+  pi.registerCommand("plan", {
+    description:
+      "Enter planning mode: investigate and write an implementation-ready plan into beads. " +
+      'Usage: /plan "description" or /plan bd-x [focus]',
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+      if (trimmed === "") {
+        ctx.ui.notify(
+          'Usage: /plan "description of the work to plan" or /plan bd-x [focus]',
+          "error",
+        );
+        return;
+      }
+
+      const state = getSessionState(ctx);
+      if (state.gateActive) {
+        ctx.ui.notify(
+          "A /belayd workflow is active for " +
+            state.currentTaskId +
+            ". Stop it first (belayd_stop_task) before entering planning mode.",
+          "error",
+        );
+        return;
+      }
+
+      const parts = trimmed.split(/\s+/);
+      const first = parts[0] ?? "";
+      let planningTarget: PlanningTarget;
+      if (isValidTaskId(first)) {
+        const focus = parts.slice(1).join(" ");
+        planningTarget =
+          focus !== ""
+            ? { kind: "existing", taskId: first, focus }
+            : { kind: "existing", taskId: first };
+      } else {
+        planningTarget = { kind: "new", description: trimmed };
+      }
+
+      // Reset any prior implementation gate before entering planning mode.
+      abortAndResetRunTracking(state);
+      state.gateActive = false;
+      clearWorkflowState({ cwd: ctx.cwd });
+
+      state.planningActive = true;
+      state.planningTarget = planningTarget;
+      applyToolGate(state);
+
+      const targetLabel =
+        planningTarget.kind === "new"
+          ? `New plan: ${planningTarget.description}`
+          : `Existing bead ${planningTarget.taskId}`;
+      const kickoff =
+        planningTarget.kind === "existing"
+          ? `Planning for bead \`${planningTarget.taskId}\`. Start by running \`bd show ${planningTarget.taskId}\` to read the current content.`
+          : `Planning a new bead: ${planningTarget.description}. Investigate the codebase with \`belayd_plan_scout\`/\`belayd_plan_research\`, then write the finalized plan into a new bead with \`bd create ...\`.`;
+      ctx.ui.notify(targetLabel, "info");
+      pi.sendMessage(
+        {
+          customType: "belayd-plan",
+          content: kickoff,
+          display: true,
+        },
+        { triggerTurn: true },
+      );
+    },
+  });
+
   // ── Slash command: /belayd bd-42 [type] ────────────────────────────
   pi.registerCommand("belayd", {
     description: "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree]",
@@ -939,6 +1092,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const persisted = readWorkflowState({ cwd });
     if (persisted === undefined) return;
 
+    if (!isValidTaskId(persisted.taskId)) {
+      // A crafted/corrupt workflow.json must not reach the `bd show ${taskId}` shell sink.
+      clearWorkflowState({ cwd });
+      return;
+    }
+
     // A stale workflow.json that already finished must not resurrect the gate.
     if (isWorkflowComplete(persisted.completedPhaseNames, persisted.phaseOrder)) {
       clearWorkflowState({ cwd });
@@ -952,8 +1111,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       : "feature";
     state.phaseOrder = [...persisted.phaseOrder];
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
+    state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
     state.completedPhaseNames = [...persisted.completedPhaseNames];
-    enableGateTools(state);
+    applyToolGate(state);
 
     // Surface any phase runs that died with the previous orchestrator.
     const interrupted = scanForInterruptedRuns({ cwd });
@@ -967,10 +1127,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     const state = getSessionState(ctx);
     state.gateActive = false;
+    state.planningActive = false;
+    state.planningTarget = undefined;
+    state.consultPhases = [];
     state.completedPhaseNames = [];
     state.currentTaskId = "";
     resetRunTracking(state);
-    restoreFullTools(state);
+    applyToolGate(state);
 
     // Sub-agents have "-sub-" in their session name (set by computeSubagentSessionName).
     // Only the orchestrator session should activate the gate; sub-agents get their
@@ -992,9 +1155,52 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   });
 
   // ── Inject workflow context when gate is active ────────────────────
-  pi.on("before_agent_start", async (_event, ctx) => {
-    const state = getSessionState(ctx);
-    if (!state.gateActive) return;
+
+  /** Build the planning-mode context message, or undefined when inactive. */
+  function planningContextMessage(
+    state: SessionState,
+  ): { message: { customType: string; content: string; display: boolean } } | undefined {
+    if (!state.planningActive) return undefined;
+    const target = state.planningTarget;
+    const targetLine =
+      target?.kind === "existing"
+        ? `Refine existing bead \`${target.taskId}\`. Start with \`bd show ${target.taskId}\` to read its current plan.`
+        : target?.kind === "new"
+          ? `Plan new work: ${target.description}`
+          : "Plan new work.";
+
+    const activeRunLines: string[] = [];
+    if (state.activeRuns.size > 0) {
+      activeRunLines.push("", "⏳ **Planning runs in progress — WAIT, do not act:**");
+      for (const [runId, { handle }] of state.activeRuns) {
+        activeRunLines.push(`- \`${handle.phaseName}\` (run \`${runId}\`) — ${handle.status}`);
+      }
+      activeRunLines.push(
+        "",
+        "Do NOT launch another planning sub-agent. The result will arrive as a follow-up message.",
+      );
+    }
+
+    return {
+      message: {
+        customType: "belayd-planning-context",
+        content: [
+          "[BELAYD PLANNING MODE ACTIVE]",
+          PLANNING_MODE_SYSTEM_PROMPT,
+          "",
+          `Target: ${targetLine}`,
+          ...activeRunLines,
+        ].join("\n"),
+        display: false,
+      },
+    };
+  }
+
+  /** Build the implementation-gate context message, or undefined when inactive. */
+  function gateContextMessage(
+    state: SessionState,
+  ): { message: { customType: string; content: string; display: boolean } } | undefined {
+    if (!state.gateActive) return undefined;
 
     const remaining = getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? "commit";
     const phaseOrder = state.phaseOrder;
@@ -1078,6 +1284,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         display: false,
       },
     };
+  }
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    const state = getSessionState(ctx);
+    return planningContextMessage(state) ?? gateContextMessage(state);
   });
 
   /** Capture the userguide output so the commit tool can append it to notes. */
@@ -1209,6 +1420,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     const spawnAgent = (): Promise<SpawnResult> => {
       const buildTask = async (): Promise<string> => {
+        if (phaseName === "implement" && state.currentTaskId !== "") {
+          const plan = await readTaskPlan(state.currentTaskId);
+          if (plan) {
+            return `## Bead plan (${state.currentTaskId})\n${plan}\n\n${params.task}`;
+          }
+        }
         if (phaseName !== "proof") return params.task;
         const proofContext = await gatherProofContext(
           effectiveCwd ?? process.cwd(),
@@ -1322,6 +1539,86 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     return { handle, sessionName: subagentSessionName };
   }
 
+  /**
+   * Start a planning sub-agent run (scout or research) in the background.
+   *
+   * Planning runs are not task-gated: no quality gate, no run manifest, no
+   * proof bridge. Completion is delivered as a planning-specific follow-up so
+   * the planning orchestrator can synthesize the results.
+   */
+  function startPlanningRun(
+    spec: { name: string; modelClass: ModelClass; tools: string[]; systemPrompt: string },
+    phaseName: "scout" | "research",
+    params: { task: string },
+    state: SessionState,
+    effectiveCwd: string | undefined,
+    runId: string,
+  ): { handle: RunHandle; sessionName: string } {
+    const sessionName = computePlanningSubagentSessionName(phaseName, runId);
+    const abortController = new AbortController();
+
+    // Guard watcher callbacks against planning-mode exit or a new /plan target:
+    // once stop_planning (or a new /plan) aborts and clears these runs, their
+    // still-pending promises must not deliver the old target's follow-up.
+    const targetAtStart = state.planningTarget;
+    const runStillRelevant = (): boolean =>
+      state.planningActive && state.planningTarget === targetAtStart;
+
+    const spawnAgent = (): Promise<SpawnResult> =>
+      spawnAgentWithFallback({
+        model: resolveModelSpec(spec).model,
+        modelClass: spec.modelClass,
+        tools: spec.tools,
+        systemPrompt: spec.systemPrompt,
+        task: params.task,
+        sessionName,
+        cwd: effectiveCwd,
+        signal: abortController.signal,
+        detached: true,
+        cooldownStore: modelCooldown,
+        enabled: modelFallbackEnabled,
+      }).then((r) => r.result);
+
+    const handle = spawnDetachedRun({
+      runId,
+      phaseName,
+      startedAtInMs: Date.now(),
+      spawnAgent,
+      runGate: (result) => Promise.resolve(result),
+    });
+
+    state.activeRuns.set(runId, { handle, abortController });
+
+    watchRunCompletion(handle, {
+      onSettled: (info) => {
+        if (runStillRelevant()) state.activeRuns.delete(info.runId);
+      },
+      persistStatus: () => {},
+      onPhaseComplete: () => {},
+      deliver: (delivery) => {
+        if (!runStillRelevant()) return;
+        const text = delivery.result.content?.[0]?.text ?? "";
+        const header = delivery.success
+          ? `✅ **planning ${delivery.phaseName} complete** (run \`${delivery.runId}\`)`
+          : `❌ **planning ${delivery.phaseName} failed** (run \`${delivery.runId}\`)`;
+        pi.sendMessage(
+          {
+            customType: "belayd-planning-run-complete",
+            content: `${header}\n\n${text}`,
+            display: true,
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      },
+      isDelivered: (id) => state.deliveredRunIds.has(id),
+      markDelivered: (id) => {
+        state.deliveredRunIds.add(id);
+      },
+    });
+
+    return { handle, sessionName };
+  }
+
   /** Persist the completed phase list (best-effort, after a phase succeeds). */
   function persistCompletedPhases(options: { cwd: string; completedPhaseNames: string[] }): void {
     const saveResult = saveCompletedPhases({
@@ -1400,6 +1697,90 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       },
     });
   }
+
+  // ── Planning sub-agent tools ─────────────────────────────────────────
+  pi.registerTool({
+    name: "belayd_plan_scout",
+    label: "Planning scout",
+    description: "Fast codebase recon for planning mode. Returns structured findings.",
+    parameters: Type.Object({
+      task: Type.String({ description: "What to investigate" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getSessionState(ctx);
+      const scout = getAgentByShortName("scout");
+      if (!scout) {
+        return {
+          content: [{ type: "text" as const, text: "Scout agent not found." }],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+      const runId = generateShortRunId();
+      const { sessionName } = startPlanningRun(
+        {
+          name: scout.name,
+          modelClass: scout.modelClass ?? "fast",
+          tools: scout.tools.filter((t) => t !== "bash"),
+          systemPrompt: scout.systemPrompt,
+        },
+        "scout",
+        params,
+        state,
+        (ctx as { cwd?: string }).cwd,
+        runId,
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `belayd_plan_scout run started in the background.\n\n` +
+              `Run ID: ${runId}\nSession: ${sessionName}\n` +
+              `Wait for the follow-up message before synthesizing.`,
+          },
+        ],
+        details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "belayd_plan_research",
+    label: "Planning research",
+    description: "Deeper investigation for planning mode. Returns evidence-based findings.",
+    parameters: Type.Object({
+      task: Type.String({ description: "The research question" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getSessionState(ctx);
+      const runId = generateShortRunId();
+      const { sessionName } = startPlanningRun(
+        {
+          name: "belayd-plan-research",
+          modelClass: "frontier",
+          tools: RESEARCHER_TOOLS.filter((t) => t !== "bd"),
+          systemPrompt: RESEARCHER_SYSTEM_PROMPT,
+        },
+        "research",
+        params,
+        state,
+        (ctx as { cwd?: string }).cwd,
+        runId,
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `belayd_plan_research run started in the background.\n\n` +
+              `Run ID: ${runId}\nSession: ${sessionName}\n` +
+              `Wait for the follow-up message before synthesizing.`,
+          },
+        ],
+        details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+      };
+    },
+  });
 
   // ── Register status tool ─────────────────────────────────────────────
   pi.registerTool({
@@ -1583,13 +1964,42 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.workflowType = "feature";
       state.phaseOrder = getPhasesForType("feature");
       state.optionalPhases = WORKFLOW_REGISTRY.feature.optionalPhases ?? [];
+      state.consultPhases = WORKFLOW_REGISTRY.feature.consultPhases ?? [];
       state.userGuideContent = undefined;
-      restoreFullTools(state);
+      applyToolGate(state);
       return {
         content: [
           {
             type: "text" as const,
             text: "Belayd process deactivated.",
+          },
+        ],
+        details: {
+          messages: [],
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          exitCode: 0,
+        },
+      };
+    },
+  });
+
+  // ── Register stop-planning tool ──────────────────────────────────────
+  pi.registerTool({
+    name: "belayd_stop_planning",
+    label: "Stop planning mode",
+    description: "Exit planning mode, abort any planning sub-agent runs, and restore full tools.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const state = getSessionState(ctx);
+      abortAndResetRunTracking(state);
+      state.planningActive = false;
+      state.planningTarget = undefined;
+      applyToolGate(state);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Planning mode deactivated.",
           },
         ],
         details: {
@@ -1893,6 +2303,22 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   // ── Process gate: block out-of-sequence tool calls ──────────────────
   pi.on("tool_call", (event, ctx) => {
     const state = getSessionState(ctx);
+    if (state.planningActive) {
+      const toolName = event.toolName;
+      const isPlanningSubagent =
+        toolName === "belayd_plan_scout" || toolName === "belayd_plan_research";
+      const isBlockedDuringRun =
+        (isPlanningSubagent || toolName === "bd") && state.activeRuns.size > 0;
+      if (isBlockedDuringRun) {
+        const activeRunIds = [...state.activeRuns.keys()].join(", ");
+        const reason =
+          `A planning run is already in progress (run ${activeRunIds}). ` +
+          `Wait for its follow-up result before launching another sub-agent or writing beads.`;
+        abortToolCall(event, "planning-run-in-flight", reason);
+        return { block: true, reason };
+      }
+      return {};
+    }
     if (!state.gateActive) return {};
     return evaluateToolCallGate(event, state);
   });
@@ -1925,8 +2351,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.workflowType = "feature";
       state.phaseOrder = getPhasesForType("feature");
       state.optionalPhases = WORKFLOW_REGISTRY.feature.optionalPhases ?? [];
+      state.consultPhases = WORKFLOW_REGISTRY.feature.consultPhases ?? [];
       state.userGuideContent = undefined;
-      restoreFullTools(state);
+      applyToolGate(state);
       pi.sendMessage(
         {
           customType: "process-complete",

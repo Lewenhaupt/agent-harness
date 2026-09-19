@@ -91,5 +91,38 @@ export function validateBdCommand(command: string): BdCommandValidation {
     };
   }
 
+  const tokens = trimmed.split(/\s+/);
+
+  // Beads hierarchy mutations must not be reachable through the bd tool:
+  // parent-child links need `bd dep`/`bd link` instead, and task lifecycle
+  // (status/claim) stays with the human via `wt merge`.
+  if (tokens.some((t) => t === "--parent" || t.startsWith("--parent="))) {
+    return {
+      ok: false,
+      error:
+        "Creating child beads (--parent) is not allowed. Use top-level beads + bd dep instead.",
+    };
+  }
+  if (tokens.some((t) => t === "parent-child" || t === "--type=parent-child")) {
+    return {
+      ok: false,
+      error: "parent-child links are not allowed. Use bd dep / bd link (blocks|related) instead.",
+    };
+  }
+  if (subcommand === "create" || subcommand === "update") {
+    if (tokens.some((t) => t === "--status" || t.startsWith("--status="))) {
+      return {
+        ok: false,
+        error: "bd <sub> --status is not allowed through the bd tool. Leave beads open/backlog.",
+      };
+    }
+    if (tokens.some((t) => t === "--claim")) {
+      return {
+        ok: false,
+        error: "bd <sub> --claim is not allowed through the bd tool.",
+      };
+    }
+  }
+
   return { ok: true, subcommand };
 }
