@@ -28,6 +28,24 @@ describe("WORKFLOW_REGISTRY", () => {
     }
   });
 
+  it("consult phases are not in phases", () => {
+    for (const config of Object.values(WORKFLOW_REGISTRY)) {
+      for (const consult of config.consultPhases ?? []) {
+        expect(config.phases).not.toContain(consult);
+      }
+    }
+  });
+
+  it("no duplicate phase names per type (including consult phases)", () => {
+    for (const config of Object.values(WORKFLOW_REGISTRY)) {
+      const seen = new Set<string>();
+      for (const phase of [...config.phases, ...(config.consultPhases ?? [])]) {
+        expect(seen.has(phase)).toBe(false);
+        seen.add(phase);
+      }
+    }
+  });
+
   it.each(Object.keys(WORKFLOW_REGISTRY))("type '%s' has non-empty phases", (type) => {
     const config = WORKFLOW_REGISTRY[type as keyof typeof WORKFLOW_REGISTRY];
     expect(config.phases.length).toBeGreaterThan(0);
@@ -43,10 +61,8 @@ describe("WORKFLOW_REGISTRY", () => {
     }
   });
 
-  it("feature has all 8 phases", () => {
+  it("feature has 6 phases", () => {
     expect(WORKFLOW_REGISTRY.feature.phases).toEqual([
-      "scout",
-      "plan",
       "implement",
       "review",
       "test",
@@ -54,6 +70,7 @@ describe("WORKFLOW_REGISTRY", () => {
       "proof",
       "commit",
     ]);
+    expect(WORKFLOW_REGISTRY.feature.consultPhases).toEqual(["scout", "plan"]);
   });
 
   it("chore has 4 phases with no proof", () => {
@@ -72,8 +89,16 @@ describe("WORKFLOW_REGISTRY", () => {
     expect(WORKFLOW_REGISTRY.hotfix.proofRequired).toBe(true);
   });
 
-  it("bugfix has optionalPhases including scout", () => {
-    expect(WORKFLOW_REGISTRY.bugfix.optionalPhases).toContain("scout");
+  it("bugfix phases omit scout/plan and consult them instead", () => {
+    expect(WORKFLOW_REGISTRY.bugfix.phases).toEqual([
+      "implement",
+      "review",
+      "test",
+      "proof",
+      "commit",
+    ]);
+    expect(WORKFLOW_REGISTRY.bugfix.optionalPhases).toBeUndefined();
+    expect(WORKFLOW_REGISTRY.bugfix.consultPhases).toEqual(["scout", "plan"]);
   });
 
   it("research skips proof and overrides the plan agent to record a bead", () => {
@@ -203,8 +228,6 @@ describe("getPhasesForType", () => {
 
   it("returns correct phases for feature", () => {
     expect(getPhasesForType("feature")).toEqual([
-      "scout",
-      "plan",
       "implement",
       "review",
       "test",
@@ -223,10 +246,18 @@ describe("getPhasesForType", () => {
   });
 
   it("returns correct phases for documentation", () => {
-    expect(getPhasesForType("documentation")).toEqual([
-      "scout",
-      "plan",
+    expect(getPhasesForType("documentation")).toEqual(["implement", "proof", "commit"]);
+  });
+
+  it("returns correct phases for bugfix", () => {
+    expect(getPhasesForType("bugfix")).toEqual(["implement", "review", "test", "proof", "commit"]);
+  });
+
+  it("returns correct phases for refactor", () => {
+    expect(getPhasesForType("refactor")).toEqual([
       "implement",
+      "review",
+      "test",
       "proof",
       "commit",
     ]);

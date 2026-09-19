@@ -57,6 +57,8 @@ PHASE_ORDER.forEach((phase, index) => {
  * @param phaseOrder - Optional phase order (defaults to PHASE_ORDER)
  * @param workflowType - Optional workflow type name for error messages
  * @param optionalPhases - Optional list of phases that can be skipped
+ * @param allowedExtraPhases - Phases whose tools stay callable but are not
+ *   required steps (defaults to none)
  * @returns `{ allowed: true, reason: undefined }` if allowed,
  *          `{ allowed: false, reason: string }` if blocked
  */
@@ -67,25 +69,20 @@ export function checkToolAllowed(
   phaseOrder?: readonly string[],
   workflowType?: string,
   optionalPhases?: readonly string[],
+  allowedExtraPhases?: readonly string[],
 ): { allowed: boolean; reason?: string } {
   if (!active) return { allowed: true };
 
   const order = phaseOrder ?? PHASE_ORDER;
   const optional = optionalPhases ?? [];
+  const extras = allowedExtraPhases ?? [];
 
   // Extract phase name from tool name (e.g., "belayd_scout" → "scout")
   const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
   const idx = order.indexOf(toolBase);
 
   if (idx === -1) {
-    // If it's a known phase tool excluded from this workflow, block it explicitly
-    if (ALL_PHASE_NAMES.includes(toolBase)) {
-      return {
-        allowed: false,
-        reason: `${toolName} is not part of the ${workflowType ?? "current"} workflow.`,
-      };
-    }
-    return { allowed: true }; // genuinely not a phase tool (e.g., read, grep)
+    return checkToolOutsideOrder(toolName, toolBase, workflowType, extras);
   }
 
   const previousPhases = order.slice(0, idx);
@@ -101,6 +98,30 @@ export function checkToolAllowed(
   }
 
   return { allowed: true };
+}
+
+/**
+ * Decide whether a phase tool that is NOT in this workflow's order may run.
+ * Consult phases stay callable; any other known phase tool is blocked; anything
+ * else (read, grep, etc.) is allowed.
+ */
+function checkToolOutsideOrder(
+  toolName: string,
+  toolBase: string,
+  workflowType: string | undefined,
+  extras: readonly string[],
+): { allowed: boolean; reason?: string } {
+  const isKnownPhase = ALL_PHASE_NAMES.includes(toolBase);
+  if (isKnownPhase && extras.includes(toolBase)) {
+    return { allowed: true };
+  }
+  if (isKnownPhase) {
+    return {
+      allowed: false,
+      reason: `${toolName} is not part of the ${workflowType ?? "current"} workflow.`,
+    };
+  }
+  return { allowed: true }; // genuinely not a phase tool (e.g., read, grep)
 }
 
 /**

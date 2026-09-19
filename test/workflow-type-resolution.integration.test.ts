@@ -27,21 +27,12 @@ describe("workflow type resolution (integration)", () => {
       expect(type).toBe("bugfix");
     });
 
-    it("no labels or arg resolves to feature with all 8 phases", () => {
+    it("no labels or arg resolves to feature with implement-first phases", () => {
       const type = resolveWorkflowType();
       expect(type).toBe("feature");
       const phases = getPhasesForType(type);
-      expect(phases).toHaveLength(8);
-      expect(phases).toEqual([
-        "scout",
-        "plan",
-        "implement",
-        "review",
-        "test",
-        "userguide",
-        "proof",
-        "commit",
-      ]);
+      expect(phases).toHaveLength(6);
+      expect(phases).toEqual(["implement", "review", "test", "userguide", "proof", "commit"]);
     });
 
     it("unknown type falls back to feature", () => {

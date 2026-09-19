@@ -20,6 +20,8 @@ export {
   getAgent,
   getAgentByShortName,
   getPhaseToolName,
+  PLANNING_MODE_SYSTEM_PROMPT,
+  PLANNING_MODE_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
 } from "./agent-registry.js";
@@ -113,6 +115,7 @@ export {
 } from "./run-manifest.js";
 export {
   computeOrchestratorSessionName,
+  computePlanningSubagentSessionName,
   computeSubagentSessionName,
   generateShortRunId,
   isValidTaskId,

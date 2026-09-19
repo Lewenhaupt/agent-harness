@@ -56,3 +56,21 @@ export function computeOrchestratorSessionName(taskId: string): string {
   }
   return `belayd-${taskId}`;
 }
+
+/**
+ * Compute a planning sub-agent session name:
+ * belayd-planning-sub-{phaseName}-{shortRunId}.
+ *
+ * Planning runs are not tied to a task ID (planning happens before a bead
+ * exists), so unlike computeSubagentSessionName there is no taskId segment
+ * or task-id validation.
+ */
+export function computePlanningSubagentSessionName(phaseName: string, shortRunId: string): string {
+  if (!phaseName || typeof phaseName !== "string") {
+    throw new Error("phaseName must be a non-empty string");
+  }
+  if (!shortRunId || typeof shortRunId !== "string") {
+    throw new Error("shortRunId must be a non-empty string");
+  }
+  return `belayd-planning-sub-${phaseName}-${shortRunId}`;
+}

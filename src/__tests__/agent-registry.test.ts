@@ -4,6 +4,9 @@ import {
   getAgent,
   getAgentByShortName,
   getPhaseToolName,
+  PLANNING_MODE_SYSTEM_PROMPT,
+  PLANNING_MODE_TOOLS,
+  RESEARCHER_SYSTEM_PROMPT,
 } from "../agent-registry.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
 
@@ -200,5 +203,48 @@ describe("getPhaseToolName", () => {
   it("returns the tool name for a phase", () => {
     expect(getPhaseToolName("scout")).toBe("belayd_scout");
     expect(getPhaseToolName("commit")).toBe("belayd_commit");
+  });
+});
+
+describe("PLANNING_MODE_SYSTEM_PROMPT", () => {
+  it("contains the plan section shape and bd linking guidance", () => {
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("## Overview");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("## Steps");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("## Test Strategy");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("## Risks");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("bd dep");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("parent");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("open");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("backlog");
+  });
+
+  it("forbids edit/write/bash", () => {
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("edit");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("write");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("bash");
+  });
+});
+
+describe("PLANNING_MODE_TOOLS", () => {
+  it("contains bd, describe_image, and web tools", () => {
+    expect(PLANNING_MODE_TOOLS).toContain("bd");
+    expect(PLANNING_MODE_TOOLS).toContain("describe_image");
+    expect(PLANNING_MODE_TOOLS).toContain("web_search_exa");
+    expect(PLANNING_MODE_TOOLS).toContain("web_fetch_exa");
+    expect(PLANNING_MODE_TOOLS).toContain("deep_search_exa");
+    expect(PLANNING_MODE_TOOLS).toContain("web_search_advanced_exa");
+  });
+
+  it("contains no edit/write/bash", () => {
+    expect(PLANNING_MODE_TOOLS).not.toContain("edit");
+    expect(PLANNING_MODE_TOOLS).not.toContain("write");
+    expect(PLANNING_MODE_TOOLS).not.toContain("bash");
+  });
+});
+
+describe("RESEARCHER_SYSTEM_PROMPT", () => {
+  it("contains the no-task-bead branch", () => {
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("return your findings");
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("planning mode");
   });
 });

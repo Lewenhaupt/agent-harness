@@ -93,4 +93,29 @@ describe("validateBdCommand", () => {
     expect(BD_ALLOWED_SUBCOMMANDS).toContain("create");
     expect(BD_ALLOWED_SUBCOMMANDS).toContain("show");
   });
+
+  it("rejects --parent on any subcommand", () => {
+    expect(validateBdCommand("create --parent bd-42 --title=x")).toHaveProperty("ok", false);
+    expect(validateBdCommand("create --parent=bd-42 --title=x")).toHaveProperty("ok", false);
+  });
+
+  it("rejects parent-child link tokens on any subcommand", () => {
+    expect(validateBdCommand("link bd-1 bd-2 --type parent-child")).toHaveProperty("ok", false);
+    expect(validateBdCommand("link bd-1 bd-2 --type=parent-child")).toHaveProperty("ok", false);
+  });
+
+  it("rejects --status and --claim on create/update", () => {
+    expect(validateBdCommand("update bd-42 --status in_progress")).toHaveProperty("ok", false);
+    expect(validateBdCommand("update bd-42 --status=in_progress")).toHaveProperty("ok", false);
+    expect(validateBdCommand("update bd-42 --claim")).toHaveProperty("ok", false);
+    expect(validateBdCommand("create --title=x --status open")).toHaveProperty("ok", false);
+  });
+
+  it("keeps --status allowed on read subcommands", () => {
+    expect(validateBdCommand("list --status=open")).toEqual({ ok: true, subcommand: "list" });
+  });
+
+  it("keeps notes/description/design flags allowed on update", () => {
+    expect(validateBdCommand("update bd-42 --append-notes x")).toHaveProperty("ok", true);
+  });
 });

@@ -65,6 +65,13 @@ export interface WorkflowSubTypeConfig {
    * without blocking subsequent phases.
    */
   optionalPhases?: Phase[];
+
+  /**
+   * Phases whose tools stay callable during the workflow but are not required
+   * steps. They are not part of `phases`, so they do not gate progress or
+   * advance completion — they are consultation-only.
+   */
+  consultPhases?: Phase[];
 }
 
 /**
@@ -73,15 +80,16 @@ export interface WorkflowSubTypeConfig {
 export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> = {
   feature: {
     name: "feature",
-    phases: ["scout", "plan", "implement", "review", "test", "userguide", "proof", "commit"],
+    phases: ["implement", "review", "test", "userguide", "proof", "commit"],
+    consultPhases: ["scout", "plan"],
     proofRequired: true,
   },
 
   bugfix: {
     name: "bugfix",
-    phases: ["scout", "plan", "implement", "review", "test", "proof", "commit"],
+    phases: ["implement", "review", "test", "proof", "commit"],
+    consultPhases: ["scout", "plan"],
     proofRequired: true,
-    optionalPhases: ["scout"],
   },
 
   research: {
@@ -111,7 +119,8 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
 
   documentation: {
     name: "documentation",
-    phases: ["scout", "plan", "implement", "proof", "commit"],
+    phases: ["implement", "proof", "commit"],
+    consultPhases: ["scout", "plan"],
     proofRequired: true,
     agentOverrides: {
       implement: {
@@ -122,7 +131,8 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
 
   refactor: {
     name: "refactor",
-    phases: ["scout", "plan", "implement", "review", "test", "proof", "commit"],
+    phases: ["implement", "review", "test", "proof", "commit"],
+    consultPhases: ["scout", "plan"],
     proofRequired: true,
   },
 

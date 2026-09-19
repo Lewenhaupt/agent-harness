@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   computeOrchestratorSessionName,
+  computePlanningSubagentSessionName,
   computeSubagentSessionName,
   generateShortRunId,
 } from "../session-naming.js";
@@ -35,6 +36,32 @@ describe("computeSubagentSessionName", () => {
   it("works with subtask notation", () => {
     const name = computeSubagentSessionName("bd-16.2", "scout", "abc");
     expect(name).toBe("belayd-bd-16.2-sub-scout-abc");
+  });
+});
+
+describe("computePlanningSubagentSessionName", () => {
+  it("returns belayd-planning-sub-scout-abc", () => {
+    expect(computePlanningSubagentSessionName("scout", "abc")).toBe(
+      "belayd-planning-sub-scout-abc",
+    );
+  });
+
+  it("works with the research phase", () => {
+    expect(computePlanningSubagentSessionName("research", "r1")).toBe(
+      "belayd-planning-sub-research-r1",
+    );
+  });
+
+  it("throws on empty phaseName", () => {
+    expect(() => computePlanningSubagentSessionName("", "abc")).toThrow(
+      "phaseName must be a non-empty string",
+    );
+  });
+
+  it("throws on empty runId", () => {
+    expect(() => computePlanningSubagentSessionName("scout", "")).toThrow(
+      "shortRunId must be a non-empty string",
+    );
   });
 });
 

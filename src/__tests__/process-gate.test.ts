@@ -160,6 +160,63 @@ describe("checkToolAllowed with custom 4-phase order", () => {
   });
 });
 
+describe("checkToolAllowed with allowedExtraPhases", () => {
+  const customOrder = ["implement", "review", "test", "commit"] as const;
+  const extras = ["scout", "plan"];
+
+  it("allows belayd_plan when absent from order but in allowedExtraPhases", () => {
+    const result = checkToolAllowed(
+      "belayd_plan",
+      [],
+      true,
+      customOrder,
+      "feature",
+      undefined,
+      extras,
+    );
+    expect(result.allowed).toBe(true);
+  });
+
+  it("still blocks belayd_userguide when absent from order and not in extras", () => {
+    const result = checkToolAllowed(
+      "belayd_userguide",
+      [],
+      true,
+      customOrder,
+      "feature",
+      undefined,
+      extras,
+    );
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("not part of the");
+  });
+
+  it("a consult phase does not satisfy a required phase", () => {
+    const result = checkToolAllowed(
+      "belayd_implement",
+      [],
+      true,
+      customOrder,
+      "feature",
+      undefined,
+      extras,
+    );
+    expect(result.allowed).toBe(true); // implement is first in this order
+
+    const result2 = checkToolAllowed(
+      "belayd_review",
+      [],
+      true,
+      customOrder,
+      "feature",
+      undefined,
+      extras,
+    );
+    expect(result2.allowed).toBe(false);
+    expect(result2.reason).toContain("implement");
+  });
+});
+
 describe("checkToolAllowed with optionalPhases", () => {
   const customOrder = ["scout", "plan", "implement", "commit"] as const;
   const optional = ["scout"];
