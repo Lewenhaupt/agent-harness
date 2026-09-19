@@ -11,6 +11,7 @@ Provides the machinery for Belayd's multi-agent workflow system:
 - **Process gate** — Enforces an implement-first phase order for each workflow (e.g. feature: implement → review → test → userguide → proof → commit), blocks out-of-sequence tool calls, and keeps `belayd_scout`/`belayd_plan` callable as non-gating consultation phases when a workflow declares them.
 - **Workflow registry** — 7 workflow sub-types (feature, bugfix, research, chore, documentation, refactor, hotfix) with configurable phase sequences; feature/bugfix/refactor/documentation declare `consultPhases: ["scout", "plan"]` so planning runs as a separate, optional consultation step rather than a required phase.
 - **Quality gates** — Deterministic post-agent checks: typecheck, lint, tests, proof content validation.
+- **Proof verifier** — Optional, advisory, non-blocking `belayd_proof_verifier` tool that LLM-judges proof relevance/plausibility after the proof phase. See [docs/proof-verifier.md](docs/proof-verifier.md).
 - **Worktree utilities** — Git worktree setup/resolution for agent process isolation.
 - **Stale-file guard** — Tracks file content hashes and blocks edits when files change between read and write.
 - **Plannotator protocol** — Signal file contract for human-in-the-loop code review.

@@ -812,6 +812,11 @@ describe("checkToolAllowed with non-phase tools and excluded workflows", () => {
     const result = checkToolAllowed("belayd_plannotator", [], true, hotfixOrder, "hotfix");
     expect(result.allowed).toBe(true);
   });
+
+  it("allows belayd_proof_verifier (advisory, not a phase tool)", () => {
+    const result = checkToolAllowed("belayd_proof_verifier", [], true);
+    expect(result.allowed).toBe(true);
+  });
 });
 
 describe("markPhaseCompleted with custom phaseOrder", () => {

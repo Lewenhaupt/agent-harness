@@ -6,11 +6,19 @@
  */
 
 import { exec } from "node:child_process";
-import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GateOptions, GateResult, SpawnDetails } from "./agent-registry.js";
+import { cleanTerminalOutput, parseCast } from "./cast-utils.js";
+import {
+  checkPathTraversal,
+  checkProofArtifactsExist,
+  checkProofDirTraversal,
+  findProofArtifactRefs,
+  findWorkspaceRoot,
+  resolveProofRefInDir,
+} from "./proof-verification.js";
 
 const execAsync = promisify(exec);
 
@@ -85,52 +93,6 @@ export async function gateTests(
   }
 }
 
-/** Regex for ANSI escape sequences - built via RegExp to avoid lint warnings on control chars. */
-const ansiPattern = "[\\u001b\\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]";
-const ansiRegex = new RegExp(ansiPattern, "g");
-
-/** Regex for OSC sequences - built via RegExp to avoid lint warnings on control chars. */
-const oscPattern = "\\u001b\\].*?(?:\\u0007|\\u001b\\\\)";
-const oscRegex = new RegExp(oscPattern, "g");
-
-/**
- * Strip ANSI escape sequences from a string.
- */
-function stripAnsi(text: string): string {
-  return text.replace(ansiRegex, "");
-}
-
-/**
- * Strip OSC (Operating System Command) sequences.
- * These are ESC ] ... BEL or ESC ] ... ESC \ patterns used for
- * window titles, kitty cwd markers, shell integration, etc.
- */
-function stripOscSequences(text: string): string {
-  return text.replace(oscRegex, "");
-}
-
-/**
- * Strip OSC residues that survive after control char removal.
- * When ESC and BEL bytes are removed by stripControlChars, sequences
- * like ]2;shell or ]7;kitty-shell-cwd://path remain. This removes them.
- */
-function stripOscResidues(text: string): string {
-  return text.replace(/\]\d+;[^\n]*/g, "");
-}
-
-/**
- * Clean terminal output by stripping all escape sequences and
- * control characters in the correct order.
- */
-function cleanTerminalOutput(text: string): string {
-  let result = text;
-  result = stripOscSequences(result);
-  result = stripAnsi(result);
-  result = stripControlChars(result);
-  result = stripOscResidues(result);
-  return result;
-}
-
 /** Minimum content length for a user guide to be considered valid. */
 const MIN_USER_GUIDE_LENGTH = 200;
 
@@ -168,96 +130,6 @@ export async function gateUserGuide(
   }
 
   return { passed: true };
-}
-
-/**
- * Strip low control characters (non-printable) from text.
- * Uses charCode comparison to avoid control characters in regex literals.
- */
-function stripControlChars(text: string): string {
-  let result = "";
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    // Keep printable chars and common whitespace (tab 0x09, newline 0x0a, carriage return 0x0d)
-    if (code >= 0x20 || code === 0x09 || code === 0x0a || code === 0x0d) {
-      result += text[i];
-    }
-  }
-  return result;
-}
-
-/**
- * Parse the header line of an asciicast file and check for a command field.
- */
-function parseCastHeader(
-  headerJson: string,
-  castPath: string,
-): GateResult & { header?: Record<string, unknown> } {
-  let header: Record<string, unknown>;
-  try {
-    header = JSON.parse(headerJson);
-  } catch {
-    return { passed: false, feedback: `Malformed .cast file: invalid header JSON (${castPath})` };
-  }
-
-  if (typeof header !== "object" || header === null) {
-    return {
-      passed: false,
-      feedback: `Malformed .cast file: header is not an object (${castPath})`,
-    };
-  }
-
-  if (!("command" in header) || typeof header.command !== "string" || header.command === "") {
-    return {
-      passed: false,
-      feedback: `Proof recording has no command in header: no command executed (${castPath})`,
-    };
-  }
-
-  return { passed: true, header };
-}
-
-/**
- * Parse asciicast events from lines (index 1+), returning events or a failure.
- */
-function parseCastEvents(
-  lines: string[],
-  castPath: string,
-): GateResult & { events?: Array<[number, string, string]> } {
-  const events: Array<[number, string, string]> = [];
-  for (let i = 1; i < lines.length; i++) {
-    const eventLine = lines[i];
-    if (eventLine === undefined) {
-      return {
-        passed: false,
-        feedback: `Malformed .cast file: missing event line ${i + 1} (${castPath})`,
-      };
-    }
-    let event: unknown;
-    try {
-      event = JSON.parse(eventLine);
-    } catch {
-      return {
-        passed: false,
-        feedback: `Malformed .cast file: invalid JSON at event line ${i + 1} (${castPath})`,
-      };
-    }
-
-    if (
-      !Array.isArray(event) ||
-      event.length < 3 ||
-      typeof event[0] !== "number" ||
-      typeof event[1] !== "string" ||
-      typeof event[2] !== "string"
-    ) {
-      return {
-        passed: false,
-        feedback: `Malformed .cast file: invalid event format at line ${i + 1} (${castPath})`,
-      };
-    }
-    events.push(event as [number, string, string]);
-  }
-  return { passed: true, events };
 }
 
 const PACKAGE_MANAGER_PATTERN = /^(pnpm|npm|yarn|npx|bun)$/i;
@@ -328,27 +200,6 @@ function isQualityGateCommand(command: string): boolean {
     if (tokenFlagsQualityGate(tokens, i)) return true;
   }
   return false;
-}
-
-/** Accepted proof artifact file extensions. */
-const PROOF_ARTIFACT_EXTENSIONS: readonly string[] = [
-  ".trace.zip",
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".cast",
-];
-
-/** True when a path ends with one of the accepted proof artifact extensions. */
-function isProofArtifactPath(path: string): boolean {
-  return PROOF_ARTIFACT_EXTENSIONS.some((ext) => path.endsWith(ext));
-}
-
-/** All proof-of-work/... references in the output that point at accepted artifact types. */
-function findProofArtifactRefs(output: string): string[] {
-  const matches = output.match(/\bproof-of-work\/[\w/.-]+\b/g);
-  if (!matches) return [];
-  return matches.filter(isProofArtifactPath);
 }
 
 /** Canonical skip-reason labels matched against the proof prompt's skip contract. */
@@ -433,36 +284,27 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
     return { passed: false, feedback: `Proof file not found on disk: ${castPath}` };
   }
 
-  const lines = content.trim().split("\n");
-  if (lines.length < 1) {
+  const parsed = parseCast(content, castPath);
+  if (!parsed.passed) {
+    return parsed;
+  }
+
+  const header = parsed.header;
+  if (header === undefined) {
     return { passed: false, feedback: `Malformed .cast file: empty (${castPath})` };
   }
 
-  const firstLine = lines[0];
-  if (firstLine === undefined) {
-    return { passed: false, feedback: `Malformed .cast file: empty (${castPath})` };
-  }
-
-  const headerResult = parseCastHeader(firstLine, castPath);
-  if (!headerResult.passed) {
-    return headerResult;
-  }
-
-  if (
-    headerResult.header !== undefined &&
-    isQualityGateCommand(String(headerResult.header.command))
-  ) {
+  if (isQualityGateCommand(String(header.command))) {
     return {
       passed: false,
-      feedback: `Proof recording replicates a quality gate (${headerResult.header.command}); record functional behavior instead (${castPath})`,
+      feedback: `Proof recording replicates a quality gate (${header.command}); record functional behavior instead (${castPath})`,
     };
   }
 
-  const eventResult = parseCastEvents(lines, castPath);
-  if (!eventResult.passed || !eventResult.events) {
-    return eventResult;
+  const events = parsed.events;
+  if (events === undefined) {
+    return { passed: false, feedback: `Malformed .cast file: empty (${castPath})` };
   }
-  const { events } = eventResult;
 
   const outputCheck = checkSubstantiveOutput(events);
   if (outputCheck) {
@@ -491,101 +333,6 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
   }
 
   return { passed: true };
-}
-
-/**
- * Check that referenced proof artifacts exist on disk.
- * Resolves accepted artifact refs (including .cast) against either the
- * workspace proof-of-work root or the external proof dir. Returns a failed
- * GateResult listing missing refs, or null when every referenced artifact exists.
- */
-function checkProofArtifactsExist(
-  output: string,
-  proofWorkRoot: string,
-  proofDir?: string,
-): GateResult | null {
-  const refs = findProofArtifactRefs(output);
-  if (refs.length === 0) {
-    return null;
-  }
-
-  const missingRefs: string[] = [];
-  for (const ref of refs) {
-    const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
-    if (normalizedRef.includes("..")) {
-      return { passed: false, feedback: `Path traversal detected: ${normalizedRef}` };
-    }
-    // Workspace refs resolve proof-of-work/<task>/... directly under proofWorkRoot
-    // (via the proof-of-work symlink); the proofDir branch strips the prefix above.
-    const resolvedPath =
-      proofDir === undefined
-        ? resolve(proofWorkRoot, normalizedRef)
-        : resolveProofRefInDir(normalizedRef, proofDir);
-    if (!existsSync(resolvedPath)) {
-      missingRefs.push(normalizedRef);
-    }
-  }
-
-  if (missingRefs.length > 0) {
-    return {
-      passed: false,
-      feedback: `Referenced proof files not found on disk: ${missingRefs.join(", ")}`,
-    };
-  }
-  return null;
-}
-
-/** Map a `proof-of-work/<task-id>/...` reference into an external task dir. */
-function resolveProofRefInDir(ref: string, proofDir: string): string {
-  const relative = ref.startsWith("proof-of-work/") ? ref.slice("proof-of-work/".length) : ref;
-  return resolve(proofDir, ...relative.split("/").slice(1));
-}
-
-/**
- * Walk up from startDir to the nearest ancestor containing a `.git` entry.
- * Falls back to startDir when no git worktree root is found, preserving the
- * legacy behavior for ad-hoc directories that contain proof-of-work directly.
- */
-function findWorkspaceRoot(startDir: string): string {
-  let dir = resolve(startDir);
-  while (true) {
-    if (existsSync(join(dir, ".git"))) {
-      return dir;
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return resolve(startDir);
-}
-
-/**
- * Validate that a cast file path does not escape the proof-of-work directory.
- * Returns a failed GateResult on path traversal, or null if safe.
- */
-function checkPathTraversal(castPath: string, proofBase: string): GateResult | null {
-  // Strip "proof-of-work/" prefix if present, since we resolve against proofBase + "proof-of-work/"
-  const relativePath = castPath.startsWith("proof-of-work/")
-    ? castPath.slice("proof-of-work/".length)
-    : castPath;
-  const resolved = resolve(proofBase, "proof-of-work", relativePath);
-  const allowedDir = resolve(proofBase, "proof-of-work");
-  if (!resolved.startsWith(allowedDir + sep)) {
-    return { passed: false, feedback: `Path traversal detected: ${castPath}` };
-  }
-  return null;
-}
-
-/**
- * Validate that an absolute cast path stays inside the external proof dir.
- */
-function checkProofDirTraversal(castPath: string, proofDir: string): GateResult | null {
-  const resolved = resolve(castPath);
-  const allowedDir = resolve(proofDir);
-  if (resolved !== allowedDir && !resolved.startsWith(allowedDir + sep)) {
-    return { passed: false, feedback: `Path traversal detected: ${castPath}` };
-  }
-  return null;
 }
 
 /**
