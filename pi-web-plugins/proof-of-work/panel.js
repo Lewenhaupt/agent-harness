@@ -524,7 +524,10 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     // Initialize image/video media. Media bytes are served only by pi-web's
     // streaming preview endpoint (readFile returns content:"" for these),
     // mirroring pi-web's own file viewer, so we build a preview URL instead of
-    // decoding base64 content into a blob URL.
+    // decoding base64 content into a blob URL. The load/loadeddata
+    // dimension-guard listeners cannot capture scanToken, so staleness is
+    // handled by the mediaEl.isConnected check (a re-render detaches the old
+    // node, making isConnected false) rather than by token comparison.
     const context = this.contextValue;
     if (context === undefined) return;
     for (const mediaEl of this.viewer.querySelectorAll(".proof-media[data-media-path]")) {
@@ -551,6 +554,21 @@ class PiWebProofOfWorkPanel extends HTMLElement {
       }, { once: true });
 
       if (mediaEl instanceof HTMLVideoElement || mediaEl instanceof HTMLImageElement) {
+        if (mediaEl instanceof HTMLImageElement) {
+          mediaEl.addEventListener("load", () => {
+            if (!mediaEl.isConnected) return;
+            if (mediaEl.naturalWidth === 0 || mediaEl.naturalHeight === 0) {
+              mediaEl.outerHTML = renderMediaLoadError(mediaPath, mimeType);
+            }
+          }, { once: true });
+        } else {
+          mediaEl.addEventListener("loadeddata", () => {
+            if (!mediaEl.isConnected) return;
+            if (mediaEl.videoWidth === 0 || mediaEl.videoHeight === 0) {
+              mediaEl.outerHTML = renderMediaLoadError(mediaPath, mimeType);
+            }
+          }, { once: true });
+        }
         mediaEl.src = url;
       } else {
         mediaEl.outerHTML = renderMediaLoadError(mediaPath, mimeType);
@@ -756,8 +774,7 @@ function proofStyles() {
       .empty { padding: 16px; color: var(--pi-muted); }
       .cast-player { min-height: 200px; border: 1px solid var(--pi-border-muted); border-radius: 8px; background: var(--pi-bg); }
       .cast-player .status { margin: 8px; }
-      .proof-media { max-width: 100%; border-radius: 8px; }
-      video.proof-media { max-height: 80vh; }
+      .proof-media { display: block; max-width: 100%; max-height: 80vh; object-fit: contain; border-radius: 8px; border: 1px solid var(--pi-border-muted); background: var(--pi-bg); min-height: 120px; }
       .trace-artifact { display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--pi-border-muted); border-radius: 8px; padding: 12px; }
       .trace-artifact-copy strong { display: block; margin-bottom: 4px; }
       .trace-artifact-copy .muted { margin: 0; }

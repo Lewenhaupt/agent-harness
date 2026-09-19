@@ -34,11 +34,11 @@ export function renderCastPlaceholder(filePath) {
 /** Render a placeholder for an image or video file. */
 export function renderMediaPlaceholder(filePath, mimeType) {
   const kind = mimeType.startsWith("video/") ? "video" : "img";
-  const attrs = `class="proof-media" data-media-path="${escapeAttr(filePath)}" data-mime-type="${escapeAttr(mimeType)}"`;
+  const attrs = `class="proof-media" data-media-path="${escapeAttr(filePath)}" data-mime-type="${escapeAttr(mimeType)}" referrerpolicy="no-referrer"`;
   if (kind === "video") {
     return `<video ${attrs} controls></video>`;
   }
-  return `<img ${attrs} alt="${escapeAttr(fileName(filePath))}">`;
+  return `<img ${attrs} decoding="async" alt="${escapeAttr(fileName(filePath))}">`;
 }
 
 /** Render an explicit failure state for a media file whose preview failed to load. */
