@@ -37,8 +37,13 @@ import {
   ALL_PHASE_NAMES,
   ALL_PHASE_TOOLS,
   awaitWorktreeReady,
+  buildVerifierPrompt,
   checkToolAllowed,
+  collectChangeContext,
   DEFAULT_AGENTS,
+  extractProofArtifacts,
+  findProofArtifactRefs,
+  findWorkspaceRoot,
   formatProcessState,
   getAgentByShortName,
   getNextPhase,
@@ -52,6 +57,8 @@ import {
   markPhaseCompleted,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_MODE_TOOLS,
+  PROOF_VERIFIER_AGENT,
+  PROOF_VERIFIER_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
@@ -101,6 +108,8 @@ type SessionState = {
   phaseOrder: string[];
   optionalPhases: readonly string[];
   userGuideContent?: string;
+  proofOutput?: string;
+  proofVerifierVerdict?: string;
   deliveredRunIds: Set<string>;
   activeRuns: Map<string, { handle: RunHandle; abortController: AbortController }>;
 };
@@ -313,6 +322,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd_start_task",
     "belayd_stop_task",
     "belayd_status",
+    "belayd_proof_verifier",
     "bd",
     "read",
     "grep",
@@ -370,6 +380,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.workflowType = workflowType ?? "feature";
     applyWorkflowConfig(state);
     state.userGuideContent = undefined;
+    state.proofOutput = undefined;
+    state.proofVerifierVerdict = undefined;
     abortAndResetRunTracking(state);
     applyToolGate(state);
     reconcileWorkflowState(state, { taskId, cwd, options });
@@ -501,6 +513,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         "- Address all Critical and Warnings findings — never dismiss them.",
         "- You may decline only Suggestions, and only with a reason.",
         "- In the task's Final Summary, list every finding you chose not to address, with a one-line reason each.",
+      );
+    }
+
+    if (phases.includes("proof")) {
+      lines.push(
+        "",
+        "A `belayd_proof_verifier` tool is available after the proof phase — it is an advisory, non-blocking review of proof relevance and plausibility.",
       );
     }
 
@@ -736,64 +755,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         resolve(err ? undefined : stdout.trim() || undefined);
       });
     });
-  }
-
-  /** Extract the "## How to Verify" section up to the next "## " heading. */
-  function extractHowToVerify(userGuideContent: string | undefined): string {
-    if (!userGuideContent) return "";
-    const lines = userGuideContent.split("\n");
-    let inSection = false;
-    const collected: string[] = [];
-    for (const line of lines) {
-      if (!inSection && /^##\s+How\s+to\s+Verify/i.test(line)) {
-        inSection = true;
-        continue;
-      }
-      if (inSection && /^##\s+/.test(line)) {
-        break;
-      }
-      if (inSection) {
-        collected.push(line);
-      }
-    }
-    return collected.join("\n").trim();
-  }
-
-  /**
-   * Gather functional context for the proof agent from the git working tree
-   * and the userguide's How to Verify section.
-   */
-  async function gatherProofContext(
-    cwd: string,
-    userGuideContent: string | undefined,
-  ): Promise<string> {
-    const sections: string[] = [];
-
-    const statResult = await execAsync("git diff --stat HEAD", { cwd }).catch((err: unknown) => ({
-      error: err instanceof Error ? err.message : String(err),
-    }));
-    if ("error" in statResult) {
-      sections.push(`git diff --stat HEAD: (unavailable: ${statResult.error})`);
-    } else if (statResult.stdout.trim() !== "") {
-      sections.push(`git diff --stat HEAD:\n${statResult.stdout.trim()}`);
-    }
-
-    const namesResult = await execAsync("git status --short", { cwd }).catch((err: unknown) => ({
-      error: err instanceof Error ? err.message : String(err),
-    }));
-    if ("error" in namesResult) {
-      sections.push(`Changed files: (unavailable: ${namesResult.error})`);
-    } else if (namesResult.stdout.trim() !== "") {
-      sections.push(`Changed files:\n${namesResult.stdout.trim()}`);
-    }
-
-    const howToVerify = extractHowToVerify(userGuideContent);
-    if (howToVerify !== "") {
-      sections.push(`## How to Verify\n${howToVerify}`);
-    }
-
-    if (sections.length === 0) return "";
-    return `\n\n## Functional Context\n${sections.join("\n\n")}`;
   }
 
   // ── Session daemon helpers ────────────────────────────────────────────
@@ -1132,6 +1093,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.consultPhases = [];
     state.completedPhaseNames = [];
     state.currentTaskId = "";
+    state.userGuideContent = undefined;
+    state.proofOutput = undefined;
+    state.proofVerifierVerdict = undefined;
     resetRunTracking(state);
     applyToolGate(state);
 
@@ -1194,6 +1158,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         display: false,
       },
     };
+  }
+
+  /** Proof-verifier guidance lines, returned only for proof workflows. */
+  function proofVerifierGuidanceLines(phaseOrder: readonly string[]): string[] {
+    if (!phaseOrder.includes("proof")) return [];
+    return [
+      "",
+      "**Proof verifier** (after `belayd_proof`):",
+      "- Call `belayd_proof_verifier` when proof relevance or quality is uncertain.",
+      "- It is ADVISORY and non-blocking: a `reasonable: false` verdict is worth investigating, but never blocks the commit phase.",
+      "- Record the verdict in the task's Final Summary and bead notes.",
+    ];
   }
 
   /** Build the implementation-gate context message, or undefined when inactive. */
@@ -1275,6 +1251,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ...phaseLines,
           ...researchGuidance,
           ...reviewFindingsGuidance,
+          ...proofVerifierGuidanceLines(phaseOrder),
           ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
@@ -1427,7 +1404,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           }
         }
         if (phaseName !== "proof") return params.task;
-        const proofContext = await gatherProofContext(
+        const proofContext = await collectChangeContext(
           effectiveCwd ?? process.cwd(),
           state.userGuideContent,
         );
@@ -1505,6 +1482,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           state.phaseOrder,
         );
         captureUserGuideContent(info.phaseName, info.result, state);
+        if (info.phaseName === "proof") {
+          state.proofOutput = info.result.content?.[0]?.text ?? "";
+        }
       },
       deliver: (delivery) => {
         if (!runStillRelevant()) return;
@@ -1782,6 +1762,123 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  /** Per-task proof dir, or undefined when no task is active. */
+  function proofDirForActiveTask(state: SessionState): string | undefined {
+    const proofBase = resolveProofBase(process.env);
+    if (state.currentTaskId === "") return undefined;
+    return proofDirForTask(state.currentTaskId, proofBase);
+  }
+
+  /** Assemble the verifier prompt from proof output and change context. */
+  async function buildProofVerifierPrompt(
+    params: {
+      task?: string;
+      proof?: string;
+      cwd?: string;
+    },
+    state: SessionState,
+    ctx: unknown,
+  ): Promise<{ prompt: string; cwd: string; skipped: boolean }> {
+    const cwd = params.cwd ?? (ctx as { cwd?: string }).cwd ?? process.cwd();
+    const taskText = params.task ?? state.currentTaskId;
+    const proofOutput = params.proof ?? state.proofOutput ?? "";
+    const changeContext = await collectChangeContext(cwd, state.userGuideContent);
+    const refs = proofOutput === "" ? [] : findProofArtifactRefs(proofOutput);
+
+    if (refs.length === 0 && changeContext === "") {
+      return { prompt: "", cwd, skipped: true };
+    }
+
+    const proofDir = proofDirForActiveTask(state);
+    const proofWorkRoot = findWorkspaceRoot(cwd);
+    const extraction = await extractProofArtifacts(refs, proofWorkRoot, proofDir);
+    const artifacts = extraction.ok ? extraction.artifacts : [];
+    const prompt = buildVerifierPrompt({
+      taskText,
+      changeContext,
+      proofOutput: extraction.ok
+        ? proofOutput
+        : `${proofOutput}\n\n(artifact extraction skipped: ${extraction.error})`,
+      artifacts,
+    });
+    return { prompt, cwd, skipped: false };
+  }
+
+  /** Run the verifier judge; every path returns a non-blocking verdict. */
+  async function runProofVerifier(
+    prompt: string,
+    cwd: string,
+    state: SessionState,
+    signal?: AbortSignal,
+  ): Promise<{ text: string }> {
+    const runId = generateShortRunId();
+    const sessionName = `belayd-proof-verifier-${runId}`;
+    try {
+      const result = await spawnAgentWithFallback({
+        model: resolveModelSpec(PROOF_VERIFIER_AGENT).model,
+        modelClass: PROOF_VERIFIER_AGENT.modelClass,
+        tools: PROOF_VERIFIER_TOOLS,
+        systemPrompt: PROOF_VERIFIER_AGENT.systemPrompt,
+        task: prompt,
+        sessionName,
+        cwd,
+        signal,
+        // detached: false blocks the orchestrator turn on purpose: the verdict
+        // must be synchronously available for the response that returns it.
+        detached: false,
+        cooldownStore: modelCooldown,
+        enabled: modelFallbackEnabled,
+      });
+      const text = result.result.content?.[0]?.text ?? "Proof verifier produced no output.";
+      state.proofVerifierVerdict = text;
+      return { text };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const advisory = [
+        "## Verdict",
+        "reasonable: false",
+        `reason: proof verifier could not run (${message})`,
+        "evidence: none",
+      ].join("\n");
+      state.proofVerifierVerdict = advisory;
+      return { text: advisory };
+    }
+  }
+
+  // ── Register proof verifier tool ────────────────────────────────────
+  pi.registerTool({
+    name: "belayd_proof_verifier",
+    label: "Proof verifier",
+    description:
+      "Advisory, non-blocking review of proof relevance and plausibility. " +
+      "Runs a read-only judge over the proof phase output and records a verdict.",
+    parameters: Type.Object({
+      task: Type.Optional(Type.String({ description: "The task the proof should demonstrate" })),
+      proof: Type.Optional(Type.String({ description: "Optional proof output override" })),
+      cwd: Type.Optional(Type.String({ description: "Working directory" })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const state = getSessionState(ctx);
+      const built = await buildProofVerifierPrompt(params, state, ctx);
+      if (built.skipped) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Proof verifier skipped: no proof artifacts referenced and no change context available.",
+            },
+          ],
+          details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+        };
+      }
+      const verdict = await runProofVerifier(built.prompt, built.cwd, state, signal);
+      return {
+        content: [{ type: "text" as const, text: verdict.text }],
+        details: { messages: [], usage: emptyUsage(), exitCode: 0 },
+      };
+    },
+  });
+
   // ── Register status tool ─────────────────────────────────────────────
   pi.registerTool({
     name: "belayd_status",
@@ -1966,6 +2063,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.optionalPhases = WORKFLOW_REGISTRY.feature.optionalPhases ?? [];
       state.consultPhases = WORKFLOW_REGISTRY.feature.consultPhases ?? [];
       state.userGuideContent = undefined;
+      state.proofOutput = undefined;
+      state.proofVerifierVerdict = undefined;
       applyToolGate(state);
       return {
         content: [
@@ -2235,6 +2334,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /** Append userguide + proof-verifier verdict notes (best-effort). */
+  async function appendTaskNotes(taskId: string, state: SessionState, cwd: string): Promise<void> {
+    if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
+      await appendUserGuideNote(execAsync, taskId, state.userGuideContent, cwd);
+    }
+    if (state.proofVerifierVerdict) {
+      await appendUserGuideNote(execAsync, taskId, state.proofVerifierVerdict, cwd);
+    }
+  }
+
   // ── Register commit tool ────────────────────────────────────────────
   pi.registerTool({
     name: "belayd_commit",
@@ -2270,10 +2379,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       // Done before staging so the JSONL export (export.auto + git-add) is committed.
       if (params.taskId) {
         await flagForHumanReview(execAsync, params.taskId, cwd);
-        // Append user guide content to task notes if available
-        if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
-          await appendUserGuideNote(execAsync, params.taskId, state.userGuideContent, cwd);
-        }
+        await appendTaskNotes(params.taskId, state, cwd);
       }
 
       const stageError = await _stageChanges(execAsync, cwd, params.files);
@@ -2353,6 +2459,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.optionalPhases = WORKFLOW_REGISTRY.feature.optionalPhases ?? [];
       state.consultPhases = WORKFLOW_REGISTRY.feature.consultPhases ?? [];
       state.userGuideContent = undefined;
+      state.proofOutput = undefined;
+      state.proofVerifierVerdict = undefined;
       applyToolGate(state);
       pi.sendMessage(
         {

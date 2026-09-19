@@ -6,6 +6,9 @@ import {
   getPhaseToolName,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_MODE_TOOLS,
+  PROOF_VERIFIER_AGENT,
+  PROOF_VERIFIER_SYSTEM_PROMPT,
+  PROOF_VERIFIER_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
 } from "../agent-registry.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
@@ -172,6 +175,31 @@ describe("DEFAULT_AGENTS", () => {
     expect(description).toContain("browser traces");
     expect(prompt).toContain("vitest");
     expect(prompt).toContain("jest");
+  });
+});
+
+describe("PROOF_VERIFIER_AGENT", () => {
+  it("is not registered in DEFAULT_AGENTS (no auto phase tool)", () => {
+    expect(DEFAULT_AGENTS.some((a) => a.name === "belayd-proof-verifier")).toBe(false);
+  });
+
+  it("declares the standard class and read-only tools", () => {
+    expect(PROOF_VERIFIER_AGENT.modelClass).toBe("standard");
+    expect(PROOF_VERIFIER_AGENT.tools).toContain("read");
+    expect(PROOF_VERIFIER_AGENT.tools).toContain("describe_image");
+    expect(PROOF_VERIFIER_AGENT.tools).not.toContain("edit");
+    expect(PROOF_VERIFIER_AGENT.tools).not.toContain("write");
+    expect(PROOF_VERIFIER_AGENT.tools).not.toContain("bash");
+  });
+
+  it("has an advisory, non-blocking prompt with the verdict shape", () => {
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("reasonable");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("non-blocking");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("## Verdict");
+  });
+
+  it("lists the expected tool names", () => {
+    expect(PROOF_VERIFIER_TOOLS).toEqual(["read", "describe_image"]);
   });
 });
 

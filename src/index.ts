@@ -22,11 +22,16 @@ export {
   getPhaseToolName,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_MODE_TOOLS,
+  PROOF_VERIFIER_AGENT,
+  PROOF_VERIFIER_SYSTEM_PROMPT,
+  PROOF_VERIFIER_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
 } from "./agent-registry.js";
 export type { BdCommandValidation } from "./bd-command.js";
 export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
+export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
+export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export type {
   GatewayModelEntry,
   LlmGatewayApiResponse,
@@ -81,6 +86,26 @@ export {
   PHASE_TOOLS,
 } from "./process-gate.js";
 export * from "./proof-dir.js";
+export type {
+  ExtractedProofArtifact,
+  ResolvedProofRef,
+  VerifierInputs,
+} from "./proof-verification.js";
+export {
+  buildVerifierPrompt,
+  checkPathTraversal,
+  checkProofArtifactsExist,
+  checkProofDirTraversal,
+  collectChangeContext,
+  extractHowToVerify,
+  extractProofArtifacts,
+  findProofArtifactRefs,
+  findWorkspaceRoot,
+  isProofArtifactPath,
+  PROOF_ARTIFACT_EXTENSIONS,
+  resolveProofArtifactPath,
+  resolveProofRefInDir,
+} from "./proof-verification.js";
 export {
   gateFullValidation,
   gateLint,
