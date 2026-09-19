@@ -32,6 +32,7 @@ export type { BdCommandValidation } from "./bd-command.js";
 export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
 export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
+export * from "./honcho-memory/index.js";
 export type {
   GatewayModelEntry,
   LlmGatewayApiResponse,
