@@ -105,8 +105,8 @@ where possible:
 
 | Class | Bare ids (ordered) | Rationale |
 |---|---|---|
-| `frontier` | deepseek-v4-pro, glm-5.3, gpt-5.6-luna | Planner/implementer/doc-authoring — capability then cost |
-| `standard` | glm-5.2, gpt-5.6-luna, deepseek-v4-pro | Review/test detail work |
+| `frontier` | deepseek-v4.1-flash, glm-5.3, gpt-5.6-luna | Planner/implementer/doc-authoring — capability then cost |
+| `standard` | glm-5.2, gpt-5.6-luna, deepseek-v4.1-flash | Review/test detail work |
 | `fast` | mimo-v2.5, deepseek-v4-flash, glm-5.2 | Recon/proof — low latency + cost |
 
 Expansion: each bare id × `[opencode-go, llmgateway]` → 6 candidates per class.

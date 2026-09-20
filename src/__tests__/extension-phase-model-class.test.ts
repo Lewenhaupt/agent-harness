@@ -325,7 +325,7 @@ describe("extension modelClass threading", () => {
     const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
       | { model: string; modelClass?: string }
       | undefined;
-    expect(options?.model).toBe("opencode-go/deepseek-v4-pro");
+    expect(options?.model).toBe("opencode-go/deepseek-v4.1-flash");
     expect(options?.modelClass).toBe("frontier");
   });
 });

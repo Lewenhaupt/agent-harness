@@ -17,7 +17,7 @@ import { WORKFLOW_REGISTRY } from "../workflow-registry.js";
 describe("bareModelId", () => {
   it("strips the provider prefix", () => {
     expect(bareModelId("opencode-go/mimo-v2.5")).toBe("mimo-v2.5");
-    expect(bareModelId("llmgateway/deepseek-v4-pro")).toBe("deepseek-v4-pro");
+    expect(bareModelId("llmgateway/deepseek-v4.1-flash")).toBe("deepseek-v4.1-flash");
   });
 
   it("leaves provider-less ids untouched", () => {
@@ -28,7 +28,7 @@ describe("bareModelId", () => {
 describe("providerOf", () => {
   it("returns the provider prefix", () => {
     expect(providerOf("opencode-go/mimo-v2.5")).toBe("opencode-go");
-    expect(providerOf("llmgateway/deepseek-v4-pro")).toBe("llmgateway");
+    expect(providerOf("llmgateway/deepseek-v4.1-flash")).toBe("llmgateway");
   });
 
   it("returns an empty string for provider-less ids", () => {
@@ -39,7 +39,7 @@ describe("providerOf", () => {
 describe("modelClassOf", () => {
   it("resolves a class from a provider-qualified model", () => {
     expect(modelClassOf("opencode-go/mimo-v2.5")).toBe("fast");
-    expect(modelClassOf("llmgateway/deepseek-v4-pro")).toBe("frontier");
+    expect(modelClassOf("llmgateway/deepseek-v4.1-flash")).toBe("frontier");
     expect(modelClassOf("opencode-go/glm-5.2")).toBe("standard");
   });
 
@@ -67,21 +67,21 @@ describe("resolveModelCandidates", () => {
 
   it("keeps the same model id adjacent across providers", () => {
     const candidates = resolveModelCandidates("frontier");
-    expect(candidates[0]).toBe("opencode-go/deepseek-v4-pro");
-    expect(candidates[1]).toBe("llmgateway/deepseek-v4-pro");
+    expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
+    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
   });
 });
 
 describe("candidatesForModel", () => {
   it("puts the requested model first, then class alternates", () => {
-    const candidates = candidatesForModel("opencode-go/deepseek-v4-pro");
-    expect(candidates[0]).toBe("opencode-go/deepseek-v4-pro");
-    expect(candidates[1]).toBe("llmgateway/deepseek-v4-pro");
+    const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash");
+    expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
+    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
   });
 
   it("tries the same model on an alternate provider before other models on the same provider", () => {
     // glm-5.3 is the 2nd frontier model; without the re-partition its first
-    // fallback would be opencode-go/deepseek-v4-pro (same provider, wrong
+    // fallback would be opencode-go/deepseek-v4.1-flash (same provider, wrong
     // quota bucket).
     const candidates = candidatesForModel("opencode-go/glm-5.3");
     expect(candidates[0]).toBe("opencode-go/glm-5.3");
@@ -98,8 +98,8 @@ describe("candidatesForModel", () => {
   });
 
   it("uses an explicit class to expand candidates even when the model is known", () => {
-    const candidates = candidatesForModel("opencode-go/deepseek-v4-pro", "fast");
-    expect(candidates[0]).toBe("opencode-go/deepseek-v4-pro");
+    const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash", "fast");
+    expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
     expect(candidates[1]).toBe("opencode-go/mimo-v2.5");
     expect(candidates).toHaveLength(1 + resolveModelCandidates("fast").length);
   });
@@ -128,8 +128,8 @@ describe("candidatesForModel", () => {
       "glm-5.3",
       "opencode-go/glm-5.3",
       "llmgateway/glm-5.3",
-      "opencode-go/deepseek-v4-pro",
-      "llmgateway/deepseek-v4-pro",
+      "opencode-go/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash",
       "opencode-go/gpt-5.6-luna",
       "llmgateway/gpt-5.6-luna",
     ]);
@@ -185,7 +185,7 @@ describe("model class coverage", () => {
 
 describe("primaryModelOf", () => {
   it("resolves each class to its first-preference-provider primary", () => {
-    expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4-pro");
+    expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4.1-flash");
     expect(primaryModelOf("standard")).toBe("opencode-go/glm-5.2");
     expect(primaryModelOf("fast")).toBe("opencode-go/mimo-v2.5");
   });

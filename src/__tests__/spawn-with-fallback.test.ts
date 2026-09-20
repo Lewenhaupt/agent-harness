@@ -62,7 +62,7 @@ describe("spawnAgentWithFallback", () => {
     expect(attempts.map((a) => a.model)).toEqual(["opencode-go/mimo-v2.5", "llmgateway/mimo-v2.5"]);
     // Quota is provider-scoped: the whole provider cools, not just the model.
     expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("provider");
-    expect(store.isCoolingDown("opencode-go/deepseek-v4-pro")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(true);
     expect(store.isCoolingDown("llmgateway/mimo-v2.5")).toBe(false);
   });
 
@@ -83,7 +83,7 @@ describe("spawnAgentWithFallback", () => {
 
     expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
     expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("model");
-    expect(store.isCoolingDown("opencode-go/deepseek-v4-pro")).toBe(false);
+    expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(false);
   });
 
   it("stops immediately on an auth/other failure without trying more candidates", async () => {

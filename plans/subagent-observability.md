@@ -210,7 +210,7 @@ Sessions are stored as **append-only JSONL files** in `~/.pi/agent/sessions/<enc
     ],
     "api": "openai-completions",
     "provider": "openrouter",
-    "model": "deepseek/deepseek-v4-pro",
+    "model": "deepseek/deepseek-v4.1-flash",
     "usage": { "input": 1688, "output": 182, "totalTokens": 22350, "cost": { "total": 0.00285 } },
     "stopReason": "toolUse"
   }
