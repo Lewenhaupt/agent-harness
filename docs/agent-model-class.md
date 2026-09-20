@@ -74,20 +74,20 @@ Expected behavior:
   | Agent | Class primary (first-choice model) |
   | --- | --- |
   | `belayd-scout` | `fast` → `opencode-go/mimo-v2.5` |
-  | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4-pro` |
-  | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
+  | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-reviewer` | `standard` → `opencode-go/glm-5.2` |
   | `belayd-tester` | `standard` → `opencode-go/glm-5.2` |
-  | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `fast` → `opencode-go/mimo-v2.5` |
-  | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4-pro` |
+  | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-committer` | `fast` → `opencode-go/mimo-v2.5` |
 
 The tier-to-primary mapping used by `primaryModelOf` is:
 
 | `modelClass` | Primary model |
 | --- | --- |
-| `frontier` | `opencode-go/deepseek-v4-pro` |
+| `frontier` | `opencode-go/deepseek-v4.1-flash` |
 | `standard` | `opencode-go/glm-5.2` |
 | `fast` | `opencode-go/mimo-v2.5` |
 
@@ -246,7 +246,7 @@ quality-gate failure, it passes the same effective model/class pair to
 ### Four-branch override matrix
 
 Assume the agent defaults to model
-`opencode-go/deepseek-v4-pro` with class `frontier`:
+`opencode-go/deepseek-v4.1-flash` with class `frontier`:
 
 | Override `model` | Override `modelClass` | Effective class | Result |
 | --- | --- | --- | --- |

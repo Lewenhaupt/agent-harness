@@ -20,7 +20,7 @@ describe("model cooldown store", () => {
   it("does not affect other models", () => {
     const store = createModelCooldownStore(() => 1_000_000);
     store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
-    expect(store.isCoolingDown("deepseek-v4-pro")).toBe(false);
+    expect(store.isCoolingDown("deepseek-v4.1-flash")).toBe(false);
   });
 
   it("cools every model on a provider but not the same model on another provider", () => {
@@ -28,7 +28,7 @@ describe("model cooldown store", () => {
     store.markProviderCooldown("opencode-go", 300, "quota");
 
     expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
-    expect(store.isCoolingDown("opencode-go/deepseek-v4-pro")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(true);
     // The same bare model id on another provider has its own quota bucket.
     expect(store.isCoolingDown("llmgateway/mimo-v2.5")).toBe(false);
   });

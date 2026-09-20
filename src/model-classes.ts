@@ -38,14 +38,14 @@ export const MODEL_CLASS_SPECS: Record<ModelClass, ModelClassSpec> = {
   frontier: {
     name: "frontier",
     rationale:
-      "Ordered by capability then cost: deepseek-v4-pro, glm-5.3, gpt-5.6-luna. The first entry is the class primary (frontier's default first choice).",
-    models: ["deepseek-v4-pro", "glm-5.3", "gpt-5.6-luna"],
+      "Ordered by capability then cost: deepseek-v4.1-flash, glm-5.3, gpt-5.6-luna. The first entry is the class primary (frontier's default first choice).",
+    models: ["deepseek-v4.1-flash", "glm-5.3", "gpt-5.6-luna"],
   },
   standard: {
     name: "standard",
     rationale:
-      "glm-5.2 is the class primary; gpt-5.6-luna for doc-quality output; deepseek-v4-pro as the capability ceiling.",
-    models: ["glm-5.2", "gpt-5.6-luna", "deepseek-v4-pro"],
+      "glm-5.2 is the class primary; gpt-5.6-luna for doc-quality output; deepseek-v4.1-flash as the capability ceiling.",
+    models: ["glm-5.2", "gpt-5.6-luna", "deepseek-v4.1-flash"],
   },
   fast: {
     name: "fast",
@@ -61,7 +61,7 @@ export const MODEL_TO_CLASS: Record<string, ModelClass> = {
   "deepseek-v4-flash": "fast",
   "glm-5.2": "standard",
   "glm-5.3": "frontier",
-  "deepseek-v4-pro": "frontier",
+  "deepseek-v4.1-flash": "frontier",
   "gpt-5.6-luna": "frontier",
 };
 

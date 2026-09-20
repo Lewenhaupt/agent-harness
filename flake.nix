@@ -475,7 +475,7 @@
               models = ./models.json;
               settings = {
                 defaultProvider = "llmgateway";
-                defaultModel = "deepseek-v4-pro";
+                defaultModel = "deepseek-v4.1-flash";
                 defaultThinkingLevel = "high";
                 theme = "dark";
               };
