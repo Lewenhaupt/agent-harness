@@ -20,7 +20,7 @@ import {
   resolveProofBase,
 } from "../src/proof-dir.js";
 import { gateProofContent, validateCastRecording } from "../src/quality-gates.js";
-import { projectKeyFromRepoRoot, resolveRepoKey } from "../src/worktree.js";
+import { gitContextFreeEnv, projectKeyFromRepoRoot, resolveRepoKey } from "../src/worktree.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..");
 
@@ -311,6 +311,7 @@ describe("proof-of-work relocation (integration)", () => {
       "git",
       ["-C", repoRoot, "worktree", "add", "-q", "-b", "feat/bd-99", worktreePath],
       {
+        env: gitContextFreeEnv(),
         timeout: 30_000,
         stdio: "pipe",
       },
@@ -337,7 +338,11 @@ describe("proof-of-work relocation (integration)", () => {
 function initGitRepo(dir: string): void {
   mkdirSync(dir, { recursive: true });
   const run = (args: string[]): void => {
-    execFileSync("git", ["-C", dir, ...args], { timeout: 30_000, stdio: "pipe" });
+    execFileSync("git", ["-C", dir, ...args], {
+      env: gitContextFreeEnv(),
+      timeout: 30_000,
+      stdio: "pipe",
+    });
   };
   run(["init", "-q"]);
   run(["config", "user.email", "test@example.com"]);

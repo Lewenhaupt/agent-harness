@@ -284,8 +284,17 @@ export function resolveRepoKey(cwd: string, exec: RepoKeyExec = execGitCommonDir
  * context of the caller (e.g. a git hook) rather than `cwd`, which would
  * resolve another repository's project key and break the per-project
  * namespace guarantee.
+ *
+ * Exported so test helpers that create temporary repositories strip the same
+ * variables: an inherited `GIT_DIR` makes `git init` ignore its target and
+ * reinitialize the caller's repository, rewriting `core.bare` to true (bd-58).
  */
-const GIT_CONTEXT_ENV_KEYS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"];
+export const GIT_CONTEXT_ENV_KEYS = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+];
 
 /**
  * Copy `process.env` with inherited git-context variables removed. Fortifying
@@ -295,7 +304,7 @@ const GIT_CONTEXT_ENV_KEYS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT
  * because Node's child_process skips `undefined` env values inconsistently
  * across versions. `process.env` itself is never mutated.
  */
-function gitContextFreeEnv(): NodeJS.ProcessEnv {
+export function gitContextFreeEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of GIT_CONTEXT_ENV_KEYS) {
     delete env[key];
