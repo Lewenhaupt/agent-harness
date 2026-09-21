@@ -13,29 +13,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveProjectProofBase } from "../proof-dir.js";
-import { projectKeyFromRepoRoot, resolveRepoKey } from "../worktree.js";
-
-/**
- * Git-context variables that override the process cwd. Test helpers strip
- * them so temp repos and git queries are pinned to their arguments even when
- * the ambient environment (e.g. a git hook) has exported them.
- */
-const GIT_CONTEXT_ENV_KEYS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"];
-
-/** Copy `process.env` without the git-context variables, leaving it unmutated. */
-function withoutGitContextEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of GIT_CONTEXT_ENV_KEYS) {
-    delete env[key];
-  }
-  return env;
-}
+import {
+  GIT_CONTEXT_ENV_KEYS,
+  gitContextFreeEnv,
+  projectKeyFromRepoRoot,
+  resolveRepoKey,
+} from "../worktree.js";
 
 /** Initialize a throwaway git repo so real `git rev-parse` succeeds. */
 function initRepo(dir: string): void {
   mkdirSync(dir, { recursive: true });
   execFileSync("git", ["init", "-q", dir], {
-    env: withoutGitContextEnv(),
+    env: gitContextFreeEnv(),
     timeout: 10_000,
     stdio: "pipe",
   });
@@ -48,7 +37,7 @@ function initRepo(dir: string): void {
 function gitDirOfCurrentCheckout(): string {
   return execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
     cwd: process.cwd(),
-    env: withoutGitContextEnv(),
+    env: gitContextFreeEnv(),
     timeout: 10_000,
     encoding: "utf8",
     stdio: "pipe",
