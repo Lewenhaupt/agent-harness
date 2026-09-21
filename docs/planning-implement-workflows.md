@@ -151,6 +151,14 @@ bd dep <blocker-id> --blocks <blocked-id>   # unambiguous direction
 Never `--parent` / `parent-child`, never `--status` / `--claim` — beads stay
 open/backlog for a human to pick up.
 
+If the request is ambiguous (scope, acceptance criteria, approach, key design
+decisions), the orchestrator asks focused clarifying questions **before**
+writing the plan — as one structured `ask_user` form when that tool is
+available, otherwise in a single message — and waits for the answers. Planning
+is only complete once the new bead has been created; the orchestrator never
+ends with a menu offering to \"settle decisions\", \"write the plan\", or
+\"start implementation\".
+
 ### Refine an existing bead's plan (mode B)
 
 ```
@@ -160,7 +168,9 @@ open/backlog for a human to pick up.
 
 The orchestrator runs `bd show bd-42` first, then writes the refined plan back
 via `bd update bd-42 --description="..." --design="..." --notes="..."`. The
-bead is not claimed or moved out of open/backlog.
+bead is not claimed or moved out of open/backlog. As in mode A, ambiguity is
+resolved with clarifying questions up front and the run is not complete until
+the same bead has been updated.
 
 ### Exit planning
 

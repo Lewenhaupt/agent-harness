@@ -61,6 +61,11 @@ Full verification steps and end-user usage:
 - No worktree, no edit/write/bash — the planning orchestrator uses
   `belayd_plan_scout` (codebase recon) and `belayd_plan_research` (deeper
   questions), then records the plan into beads.
+- Ambiguity is resolved first: the orchestrator asks focused clarifying
+  questions (one structured `ask_user` form, or a single message) and waits
+  before writing. Planning is complete only once the target bead exists
+  (mode A) or has been updated (mode B) — it never ends by offering to write a
+  plan file or start implementation.
 - Beads are created open/backlog (never `--status`/`--claim`), using
   `bd create "title" --description="..." --design="..." --notes="..." --type=<type> --priority=2`.
   Large work is decomposed into top-level step beads linked with `bd dep` /

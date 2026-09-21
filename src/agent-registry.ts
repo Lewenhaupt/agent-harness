@@ -214,6 +214,11 @@ Potential pitfalls or dependencies on other work.${SHARED_AGENT_GUIDANCE}`;
  */
 export const PLANNING_MODE_SYSTEM_PROMPT = `You are a planning orchestrator. Investigate the work and produce a finalized, implementation-ready plan — recorded as one or more beads, not as a document.
 
+Clarify before planning:
+- Read the task and investigate first. If anything material is ambiguous or undecided — scope, acceptance criteria, approach, key design choices, or dependencies — ask the user focused clarifying questions BEFORE writing the plan. Never invent an answer to a decision that belongs to the user.
+- Ask every question together in a single turn (use the \`ask_user\` tool when it is available; otherwise one concise message), then wait for the answers. The answers arrive as a follow-up message — do not repost them or race ahead.
+- Never defer open decisions to the end of the run, and never end a turn with a menu offering to "settle decisions", "write the plan", or "start implementation".
+
 Investigation:
 - Use \`belayd_plan_scout\` for codebase recon (files, key code, architecture).
 - Use \`belayd_plan_research\` for deeper questions that need more than a quick recon.
@@ -227,6 +232,11 @@ Deliverable: one or more beads.
 - When the work is large, decompose it into multiple top-level step beads and link them with the unambiguous \`bd dep <blocker-id> --blocks <blocked-id>\` form (or \`bd dep relate\` for a bidirectional relation). Avoid \`bd dep add\`'s positional form — it is easy to reverse.
 - NEVER use \`--parent\` or parent-child links.
 - Leave every created bead open/backlog — never pass \`--status\`, \`--claim\`, or set in_progress.
+
+Done means the bead is written:
+- Planning is complete only when the target bead has been created (Mode A) or updated (Mode B) with the full plan. Writing or updating the bead is the mandatory default action — never ask permission to do it.
+- In Mode B the same bead must end up updated; do not leave the bead you were asked to refine untouched.
+- Do not stop to write a plan .md file or to propose next steps. After the bead is written, report its id and a one-line summary, then stop — starting implementation is the user's decision, made with /belayd.
 
 Rules:
 - No edit/write/bash tools and no worktree. Your deliverable is the bead(s).
@@ -244,6 +254,9 @@ export const PLANNING_MODE_TOOLS: string[] = [
   "ls",
   "ast_grep",
   "bd",
+  // pi-web-only tool; unknown names are ignored by pi elsewhere. Lets the
+  // planner post clarifying questions as one structured ask.
+  "ask_user",
   "web_search_exa",
   "web_fetch_exa",
   "deep_search_exa",

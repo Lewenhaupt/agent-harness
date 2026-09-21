@@ -251,6 +251,17 @@ describe("PLANNING_MODE_SYSTEM_PROMPT", () => {
     expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("write");
     expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("bash");
   });
+
+  it("requires clarifying questions before planning and forbids a trailing menu", () => {
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("clarifying questions");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("ambigu");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("settle decisions");
+  });
+
+  it("requires the target bead to be written before planning ends", () => {
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("complete only when the target bead");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("bd update");
+  });
 });
 
 describe("PLANNING_MODE_TOOLS", () => {
@@ -267,6 +278,10 @@ describe("PLANNING_MODE_TOOLS", () => {
     expect(PLANNING_MODE_TOOLS).not.toContain("edit");
     expect(PLANNING_MODE_TOOLS).not.toContain("write");
     expect(PLANNING_MODE_TOOLS).not.toContain("bash");
+  });
+
+  it("allows ask_user for structured clarifying questions", () => {
+    expect(PLANNING_MODE_TOOLS).toContain("ask_user");
   });
 });
 

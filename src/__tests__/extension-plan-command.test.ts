@@ -236,6 +236,21 @@ describe("/plan command (bd-51)", () => {
     expect(kickoff).toBeDefined();
     expect(kickoff?.content).toContain("bd-42");
     expect(kickoff?.content).toContain("bd show");
+    // Mode B must write the refined plan back into the same bead.
+    expect(kickoff?.content).toContain("bd update");
+    expect(kickoff?.content).toContain("Clarify");
+  });
+
+  it('/plan bd-42 "focus" carries the focus into the kickoff', async () => {
+    const { api, commands, messages } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx(cwd);
+    await commands.get("plan")?.handler('bd-42 "focus on caching"', ctx);
+
+    const kickoff = messages.find((m) => m.customType === "belayd-plan");
+    expect(kickoff?.content).toContain("focus on caching");
   });
 
   it("belayd_plan_research spawns with RESEARCHER_SYSTEM_PROMPT and RESEARCHER_TOOLS", async () => {
