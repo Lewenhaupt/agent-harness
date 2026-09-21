@@ -262,6 +262,11 @@ describe("PLANNING_MODE_SYSTEM_PROMPT", () => {
     expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("complete only when the target bead");
     expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("bd update");
   });
+
+  it("routes long/multiline plan content through the stdin parameter", () => {
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("--stdin");
+    expect(PLANNING_MODE_SYSTEM_PROMPT).toContain("stdin");
+  });
 });
 
 describe("PLANNING_MODE_TOOLS", () => {
@@ -289,5 +294,10 @@ describe("RESEARCHER_SYSTEM_PROMPT", () => {
   it("contains the no-task-bead branch", () => {
     expect(RESEARCHER_SYSTEM_PROMPT).toContain("return your findings");
     expect(RESEARCHER_SYSTEM_PROMPT).toContain("planning mode");
+  });
+
+  it("tells the researcher to record notes via the stdin parameter", () => {
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("--stdin");
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("stdin");
   });
 });

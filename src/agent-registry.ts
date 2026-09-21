@@ -149,7 +149,7 @@ Which file to look at first and why.${SHARED_AGENT_GUIDANCE}`;
 export const RESEARCHER_SYSTEM_PROMPT = `You are a researcher. Investigate the research question thoroughly and produce an evidence-based answer grounded in the actual codebase, citing specific files and line ranges.
 
 Your deliverable depends on whether a task ID is provided:
-- When a task ID IS provided in your instructions: record your findings as a note on the task's bead using the \`bd\` tool, e.g. \`bd note <task-id> "..."\`. Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
+- When a task ID IS provided in your instructions: record your findings as a note on the task's bead using the \`bd\` tool with \`command: "note <task-id> --stdin"\` and the note body in the \`stdin\` parameter (keeps multiline markdown intact). Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
 - When NO task ID is provided (planning mode): do NOT create beads and do NOT write files — return your findings in your output for the planning orchestrator to synthesize.
 
 Output format:
@@ -226,8 +226,9 @@ Investigation:
 
 Deliverable: one or more beads.
 - Choose a normal bead type (task/feature/bugfix/spike/etc — NOT a special "plan" type).
-- Mode A (new work): create the bead with \`bd create "title" --description="..." --design="..." --notes="..." --type=<type> --priority=2\`.
-- Mode B (refine an existing bead, /plan bd-x): run \`bd show <id>\` first, then \`bd update <id> --description="..." --design="..." --notes="..."\` to write the refined plan back.
+- Mode A (new work): create the bead with a short \`bd create "title" --type=<type> --priority=2\` call, then write the long sections with \`bd update <id> --stdin\` (or \`--body-file -\`), passing the markdown body in the tool's \`stdin\` parameter.
+- Mode B (refine an existing bead, /plan bd-x): run \`bd show <id>\` first, then \`bd update <id> --stdin\` with the refined plan in the \`stdin\` parameter.
+- Long or multiline content must go through the \`stdin\` parameter, not inline in \`command\`: it avoids shell quoting entirely and keeps markdown newlines, tables, and code fences intact.
 - Use the \`## Overview / ## Steps / ## Test Strategy / ## Risks\` shape for the plan content.
 - When the work is large, decompose it into multiple top-level step beads and link them with the unambiguous \`bd dep <blocker-id> --blocks <blocked-id>\` form (or \`bd dep relate\` for a bidirectional relation). Avoid \`bd dep add\`'s positional form — it is easy to reverse.
 - NEVER use \`--parent\` or parent-child links.

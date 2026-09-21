@@ -12,7 +12,7 @@
  * unaffected. Only activates when `belayd_start_task` is called.
  */
 
-import { exec } from "node:child_process";
+import { exec, execFile } from "node:child_process";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
@@ -37,6 +37,7 @@ import {
   ALL_PHASE_NAMES,
   ALL_PHASE_TOOLS,
   awaitWorktreeReady,
+  bdCommandReadsStdin,
   buildVerifierPrompt,
   checkToolAllowed,
   collectChangeContext,
@@ -117,6 +118,53 @@ type SessionState = {
 const sessionStates = new Map<string, SessionState>();
 
 const execAsync = promisify(exec);
+
+/**
+ * Run `bd` with an explicit argv array and no shell.
+ *
+ * A shell is what previously forced command strings through quoting rules and
+ * made real newlines impossible (and escaped `\n` survive literally). With
+ * argv the arguments are passed verbatim, so multiline markdown reaches `bd`
+ * intact. `stdin` lets large note/description bodies bypass argv length
+ * limits (see bd-22 for the same class of failure on git commits).
+ */
+function runBdCommand(
+  argv: readonly string[],
+  options: {
+    cwd: string;
+    stdin: string | undefined;
+    timeoutInMs: number;
+    maxBufferInBytes: number;
+  },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      "bd",
+      [...argv],
+      {
+        cwd: options.cwd,
+        timeout: options.timeoutInMs,
+        maxBuffer: options.maxBufferInBytes,
+        encoding: "utf-8",
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(Object.assign(error, { stdout, stderr }));
+          return;
+        }
+        resolve({ stdout, stderr });
+      },
+    );
+
+    if (child.stdin) {
+      // bd may exit before consuming stdin (e.g. on a validation error),
+      // which turns the pending write into EPIPE; without a listener that
+      // would surface as an unhandled stream error.
+      child.stdin.on("error", () => {});
+      child.stdin.end(options.stdin ?? "");
+    }
+  });
+}
 
 // Shared per-orchestrator model cooldown store: when a model hits a quota/rate
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
@@ -1942,12 +1990,21 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     description:
       "Run a beads (bd) CLI command for task tracking. Restricted to safe " +
       "subcommands (create, update, label, note, show, search, list, ready, " +
-      "prime, remember, and similar). Cannot close, delete, or edit issues.",
+      "prime, remember, and similar). Cannot close, delete, or edit issues. " +
+      "Multiline content is supported: quote arguments containing spaces or " +
+      "newlines, or pass content via the `stdin` parameter together with " +
+      "`--stdin` (recommended for long notes/descriptions).",
     parameters: Type.Object({
       command: Type.String({
         description:
           'Full bd command including subcommand and flags, e.g. "create --title=\\"Fix login\\" --type=bug" or "list --status=open"',
       }),
+      stdin: Type.Optional(
+        Type.String({
+          description:
+            "Content piped to bd's stdin. Pair with `--stdin` (or `--file -` / `--body-file -`) to write multiline notes, descriptions, or comments without shell quoting or argv length limits.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const validation = validateBdCommand(params.command);
@@ -1958,12 +2015,28 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         };
       }
 
+      const stdin = params.stdin;
+      if (stdin !== undefined && stdin !== "" && !bdCommandReadsStdin(validation.argv)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "bd command received a `stdin` payload but has no flag that reads stdin. " +
+                "Append `--stdin` (or `--file -` / `--body-file -`) so bd consumes it.",
+            },
+          ],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+
       const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
       try {
-        const { stdout, stderr } = await execAsync(`bd ${params.command}`, {
+        const { stdout, stderr } = await runBdCommand(validation.argv, {
           cwd,
-          timeout: 30_000,
-          maxBuffer: 1024 * 1024,
+          stdin,
+          timeoutInMs: 30_000,
+          maxBufferInBytes: 1024 * 1024,
         });
         const text = stdout.trim() || stderr.trim() || "(no output)";
         return {
