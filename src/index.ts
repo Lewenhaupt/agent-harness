@@ -91,7 +91,13 @@ export {
   PHASE_ORDER,
   PHASE_TOOLS,
 } from "./process-gate.js";
-export * from "./proof-dir.js";
+export {
+  ensureProofBridge,
+  PROOF_DIR_MARKER_RELATIVE_PATH,
+  proofDirForTask,
+  resolveProjectProofBase,
+  resolveProofBase,
+} from "./proof-dir.js";
 export type {
   ExtractedProofArtifact,
   ResolvedProofRef,
@@ -190,10 +196,12 @@ export {
   workflowStateFilePath,
   writeWorkflowState,
 } from "./workflow-state.js";
-export type { WorktreeOptions } from "./worktree.js";
+export type { RepoKeyExec, RepoKeyResult, WorktreeOptions } from "./worktree.js";
 export {
   awaitWorktreeReady,
   isInsideWorktreeForBranch,
+  projectKeyFromRepoRoot,
+  resolveRepoKey,
   resolveWorktreePath,
   setupWorktree,
 } from "./worktree.js";

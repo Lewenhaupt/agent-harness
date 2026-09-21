@@ -74,7 +74,12 @@ import {
   watchRunCompletion,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
-import { ensureProofBridge, proofDirForTask, resolveProofBase } from "../src/proof-dir.js";
+import {
+  ensureProofBridge,
+  proofDirForTask,
+  resolveProjectProofBase,
+  resolveProofBase,
+} from "../src/proof-dir.js";
 import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import {
@@ -104,6 +109,8 @@ type SessionState = {
   consultPhases: readonly string[];
   completedPhaseNames: string[];
   currentTaskId: string;
+  /** Proof base resolved for the current task, cached so the spawn and verifier paths agree. */
+  proofBase?: string;
   fullTools: string[] | undefined;
   workflowType: WorkflowSubType;
   phaseOrder: string[];
@@ -425,6 +432,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.planningTarget = undefined;
     state.completedPhaseNames = [];
     state.currentTaskId = taskId;
+    state.proofBase = undefined;
     state.workflowType = workflowType ?? "feature";
     applyWorkflowConfig(state);
     state.userGuideContent = undefined;
@@ -1145,6 +1153,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.consultPhases = [];
     state.completedPhaseNames = [];
     state.currentTaskId = "";
+    state.proofBase = undefined;
     state.userGuideContent = undefined;
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
@@ -1414,19 +1423,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
     const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
 
-    // Proof artifacts live outside the worktree. The bridge symlink exposes
-    // them at proof-of-work/ while the agent writes through BELAYD_PROOF_TASK_DIR
-    // (the proof base; the agent creates the task-id subdirectory inside it).
-    const proofBase = resolveProofBase(process.env);
-    const hasTaskId = state.currentTaskId !== "";
-    const proofDir = hasTaskId ? proofDirForTask(state.currentTaskId, proofBase) : undefined;
-    const spawnEnv = hasTaskId ? { BELAYD_PROOF_TASK_DIR: proofBase } : undefined;
-    if (hasTaskId) {
-      const bridgeResult = ensureProofBridge(effectiveCwd ?? process.cwd(), proofBase);
-      if (!bridgeResult.ok) {
-        console.warn(`[belayd-harness] proof-of-work bridge unavailable: ${bridgeResult.error}`);
-      }
-    }
+    const cwd = effectiveCwd ?? process.cwd();
+    const { proofDir, spawnEnv } = preparePhaseProof(state, cwd);
 
     persistRunningManifest({
       state,
@@ -1814,10 +1812,64 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * Project-scoped proof base, falling back to the global base when the git
+   * project key cannot be derived so proof handling never blocks a phase.
+   */
+  function resolveProjectProofBaseOrGlobal(env: NodeJS.ProcessEnv, cwd: string): string {
+    const projectBase = resolveProjectProofBase(env, cwd);
+    if (projectBase.ok) return projectBase.base;
+    console.warn(
+      `[belayd-harness] proof base project namespacing failed, using global base: ${projectBase.error}`,
+    );
+    return resolveProofBase(env);
+  }
+
+  /**
+   * Prepare the phase proof env and per-task dir and ensure the bridge symlink.
+   *
+   * Proof artifacts live outside the worktree. The bridge symlink exposes them
+   * at proof-of-work/ while the agent writes through BELAYD_PROOF_TASK_DIR
+   * (the proof base; the agent creates the task-id subdirectory inside it).
+   * The base is namespaced per project so identical task IDs in different
+   * repos never collide; a key-derivation failure falls back to the global base
+   * so it never blocks a phase.
+   */
+  function preparePhaseProof(
+    state: SessionState,
+    cwd: string,
+  ): {
+    proofDir: string | undefined;
+    spawnEnv: { BELAYD_PROOF_TASK_DIR: string } | undefined;
+  } {
+    if (state.currentTaskId === "") {
+      return { proofDir: undefined, spawnEnv: undefined };
+    }
+    const proofBase = resolveProjectProofBaseOrGlobal(process.env, cwd);
+    // Cache unconditionally (namespaced result or global fallback) so the
+    // verifier path reuses the exact base the spawn path selected; a later git
+    // failure must not silently shift the verifier to a different base.
+    state.proofBase = proofBase;
+    const bridgeResult = ensureProofBridge(cwd, proofBase);
+    if (!bridgeResult.ok) {
+      console.warn(`[belayd-harness] proof-of-work bridge unavailable: ${bridgeResult.error}`);
+    }
+    return {
+      proofDir: proofDirForTask(state.currentTaskId, proofBase),
+      spawnEnv: { BELAYD_PROOF_TASK_DIR: proofBase },
+    };
+  }
+
   /** Per-task proof dir, or undefined when no task is active. */
-  function proofDirForActiveTask(state: SessionState): string | undefined {
-    const proofBase = resolveProofBase(process.env);
+  function proofDirForActiveTask(state: SessionState, cwd: string): string | undefined {
     if (state.currentTaskId === "") return undefined;
+    // Reuse the base the spawn path already resolved. Only a state restored
+    // from a persisted manifest (no cached base) derives and caches it here.
+    let proofBase = state.proofBase;
+    if (proofBase === undefined) {
+      proofBase = resolveProjectProofBaseOrGlobal(process.env, cwd);
+      state.proofBase = proofBase;
+    }
     return proofDirForTask(state.currentTaskId, proofBase);
   }
 
@@ -1841,7 +1893,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       return { prompt: "", cwd, skipped: true };
     }
 
-    const proofDir = proofDirForActiveTask(state);
+    const proofDir = proofDirForActiveTask(state, cwd);
     const proofWorkRoot = findWorkspaceRoot(cwd);
     const extraction = await extractProofArtifacts(refs, proofWorkRoot, proofDir);
     const artifacts = extraction.ok ? extraction.artifacts : [];

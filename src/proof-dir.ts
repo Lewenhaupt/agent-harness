@@ -6,6 +6,10 @@
  * exposed in the worktree through a `proof-of-work` symlink. Keeping artifacts
  * out of the worktree means they never show up in git status, diffs, or
  * commit payloads.
+ *
+ * Namespacing: {@link resolveProofBase} returns the global proof root and
+ * {@link resolveProjectProofBase} returns `root/<projectKey>`, so identical
+ * task IDs in different git repositories never share a proof directory.
  */
 
 import {
@@ -13,21 +17,26 @@ import {
   lstatSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   readlinkSync,
   rmdirSync,
   type Stats,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { resolveRepoKey } from "./worktree.js";
 
 /**
- * Resolve the proof base directory.
+ * Resolve the global proof root.
  *
- * `BELAYD_PROOF_DIR` wins when set. Otherwise the base is
+ * `BELAYD_PROOF_DIR` wins when set. Otherwise the root is
  * `${XDG_STATE_HOME:-~/.local/state}/belayd/proof`, matching the XDG Base
- * Directory specification for state data.
+ * Directory specification for state data. The per-project base is
+ * `root/<projectKey>` (see {@link resolveProjectProofBase}); this function
+ * intentionally stays project-agnostic so legacy callers keep the old path.
  */
 export function resolveProofBase(env: Record<string, string | undefined>): string {
   const belaydProofDir = env.BELAYD_PROOF_DIR;
@@ -42,6 +51,26 @@ export function resolveProofBase(env: Record<string, string | undefined>): strin
       : join(homedir(), ".local", "state");
 
   return join(stateHome, "belayd", "proof");
+}
+
+/**
+ * Resolve the project-scoped proof base: `resolveProofBase(env)/<projectKey>`.
+ *
+ * The key is derived from the git common dir of `cwd`, so every linked
+ * worktree of one repository maps to the same base. A custom
+ * `BELAYD_PROOF_DIR` is namespaced the same way.
+ *
+ * Side effect: derives the key via git (see `resolveRepoKey`).
+ */
+export function resolveProjectProofBase(
+  env: Record<string, string | undefined>,
+  cwd: string,
+): { ok: true; base: string } | { ok: false; error: string } {
+  const repoKey = resolveRepoKey(cwd);
+  if (!repoKey.ok) {
+    return { ok: false, error: repoKey.error };
+  }
+  return { ok: true, base: join(resolveProofBase(env), repoKey.key) };
 }
 
 /** Compute the per-task proof directory under a proof base. */
@@ -61,9 +90,29 @@ export function proofDirForTask(taskId: string, proofBase: string): string {
 // contract duplicated in `pi-web-plugins/proof-of-work/discovery.js`
 // (`PROOF_DIR_MARKER_PATH`). The marker lives at ".belayd/proof-dir" and
 // contains a single-line absolute proof base path followed by a trailing
-// newline. Any change here must be mirrored in
+// newline. bd-58 namespaces the proof base by project key but leaves this
+// marker format unchanged (still one absolute path line), so discovery.js
+// needs no edit. Any change here must be mirrored in
 // `pi-web-plugins/proof-of-work/discovery.js`, and vice versa.
 export const PROOF_DIR_MARKER_RELATIVE_PATH = ".belayd/proof-dir";
+
+/**
+ * Read the proof-base marker, returning undefined when it is missing or empty.
+ * The marker is the harness-owned signal that a bridge symlink is safe to
+ * repoint (production of the marker proves the harness created the bridge).
+ */
+function readProofDirMarker(workspaceRoot: string): string | undefined {
+  try {
+    const content = readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8");
+    const trimmed = content.trim();
+    return trimmed === "" ? undefined : trimmed;
+  } catch {
+    // Any read failure means there is no usable marker, and a missing marker
+    // means the bridge is not harness-owned, so failing closed is the safe
+    // direction (never repoint a link we cannot prove we created).
+    return undefined;
+  }
+}
 
 /**
  * Walk up from `cwd` to the nearest ancestor containing a `.git` entry.
@@ -173,6 +222,99 @@ function replaceEmptyDirectoryWithSymlink(
 }
 
 /**
+ * Repoint a harness-owned bridge symlink at the expected proof base.
+ *
+ * Only called after the marker has been verified to match the current symlink
+ * target, so the stale link is known to be harness-owned and safe to replace.
+ */
+function repointSymlink(
+  workspaceRoot: string,
+  absoluteProofBase: string,
+  linkPath: string,
+): { ok: true } | { ok: false; error: string } {
+  // The unlink→symlink window is subject to a race; a lost race surfaces as a
+  // caught symlinkSync error returned as { ok: false } (non-fatal, and never a
+  // silent mis-point).
+  try {
+    unlinkSync(linkPath);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to remove stale proof-of-work symlink: ${errorMessage(error)}`,
+    };
+  }
+  try {
+    symlinkSync(absoluteProofBase, linkPath);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to repoint proof-of-work symlink: ${errorMessage(error)}`,
+    };
+  }
+  return writeProofDirMarker(workspaceRoot, absoluteProofBase);
+}
+
+/**
+ * Inspect the existing `proof-of-work` entry and create, verify, repoint, or
+ * reject it. Split from {@link ensureProofBridge} to keep both functions'
+ * branching readable.
+ */
+function ensureSymlinkBridge(
+  workspaceRoot: string,
+  absoluteProofBase: string,
+  linkPath: string,
+): { ok: true } | { ok: false; error: string } {
+  let linkStat: Stats;
+  try {
+    linkStat = lstatSync(linkPath);
+  } catch (error) {
+    if (isFsError(error, "ENOENT")) {
+      return createSymlinkAndMarker(workspaceRoot, absoluteProofBase, linkPath);
+    }
+    return {
+      ok: false,
+      error: `Failed to inspect proof-of-work: ${errorMessage(error)}`,
+    };
+  }
+
+  if (linkStat.isSymbolicLink()) {
+    let target: string;
+    try {
+      target = readlinkSync(linkPath);
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Failed to read proof-of-work symlink: ${errorMessage(error)}`,
+      };
+    }
+    // The bridge target and the marker both store absolute paths, so a
+    // relative symlink target can never match the marker and is therefore
+    // never repointed (fails closed).
+    const resolvedTarget = resolve(workspaceRoot, target);
+    if (resolvedTarget === absoluteProofBase) {
+      return writeProofDirMarker(workspaceRoot, absoluteProofBase);
+    }
+    const marker = readProofDirMarker(workspaceRoot);
+    if (marker !== undefined && resolve(workspaceRoot, marker) === resolvedTarget) {
+      return repointSymlink(workspaceRoot, absoluteProofBase, linkPath);
+    }
+    return {
+      ok: false,
+      error: `proof-of-work already points to ${target}, expected ${absoluteProofBase}`,
+    };
+  }
+
+  if (linkStat.isDirectory()) {
+    return replaceEmptyDirectoryWithSymlink(workspaceRoot, absoluteProofBase, linkPath);
+  }
+
+  return {
+    ok: false,
+    error: `proof-of-work already exists and is not a symlink at ${linkPath}`,
+  };
+}
+
+/**
  * Create (or verify) the `proof-of-work` symlink at the workspace root and
  * write the proof-base marker that the browser plugin reads.
  *
@@ -187,10 +329,13 @@ function replaceEmptyDirectoryWithSymlink(
  * Idempotent when the symlink already points at the expected proof base.
  *
  * - Symlink to the same target → rewrite marker, success.
+ * - Symlink to a different target whose marker matches that target → repoint
+ *   (harness-owned bridge being migrated to a new namespaced base).
+ * - Symlink to a different target with no/mismatched marker → error (do not
+ *   silently redirect a link we did not create).
  * - Existing empty real directory → removed and replaced with the symlink
  *   (a stray empty directory is a setup artifact, not real proof content).
  * - Existing non-empty real directory → error (do not clobber real artifacts).
- * - Symlink to a different target → error (do not silently redirect).
  */
 export function ensureProofBridge(
   cwd: string,
@@ -217,45 +362,5 @@ export function ensureProofBridge(
     };
   }
 
-  let linkStat: Stats;
-  try {
-    linkStat = lstatSync(linkPath);
-  } catch (error) {
-    if (isFsError(error, "ENOENT")) {
-      return createSymlinkAndMarker(workspaceRoot, absoluteProofBase, linkPath);
-    }
-    return {
-      ok: false,
-      error: `Failed to inspect proof-of-work: ${errorMessage(error)}`,
-    };
-  }
-
-  if (linkStat.isSymbolicLink()) {
-    let target: string;
-    try {
-      target = readlinkSync(linkPath);
-    } catch (error) {
-      return {
-        ok: false,
-        error: `Failed to read proof-of-work symlink: ${errorMessage(error)}`,
-      };
-    }
-    const resolvedTarget = resolve(workspaceRoot, target);
-    if (resolvedTarget === absoluteProofBase) {
-      return writeProofDirMarker(workspaceRoot, absoluteProofBase);
-    }
-    return {
-      ok: false,
-      error: `proof-of-work already points to ${target}, expected ${absoluteProofBase}`,
-    };
-  }
-
-  if (linkStat.isDirectory()) {
-    return replaceEmptyDirectoryWithSymlink(workspaceRoot, absoluteProofBase, linkPath);
-  }
-
-  return {
-    ok: false,
-    error: `proof-of-work already exists and is not a symlink at ${linkPath}`,
-  };
+  return ensureSymlinkBridge(workspaceRoot, absoluteProofBase, linkPath);
 }

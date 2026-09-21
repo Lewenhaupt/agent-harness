@@ -1,6 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 /** Options for creating an isolated git worktree for agent processes. */
@@ -220,4 +221,118 @@ export async function awaitWorktreeReady(
     ok: false,
     error: `Worktree dependencies not ready within ${timeoutInMs}ms: ${worktreePath}`,
   };
+}
+
+/** Discriminated result of resolving a project namespace key. */
+export type RepoKeyResult = { ok: true; key: string } | { ok: false; error: string };
+
+/**
+ * Exec seam for {@link resolveRepoKey}. Production runs `git rev-parse`;
+ * tests inject a function returning a fixed common-dir or throwing.
+ */
+export type RepoKeyExec = (cwd: string) => string;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Resolve the shared git common dir for `cwd` and derive a stable project key.
+ *
+ * Uses `--path-format=absolute` so linked worktrees all report the main
+ * repository's git dir and therefore map to the same project key.
+ *
+ * Known limitation: bare repositories are out of scope. For a bare repo,
+ * `git rev-parse --git-common-dir` returns the bare repo directory itself,
+ * so `dirname` yields its parent and two bare repos under the same parent
+ * would resolve to the same key. This harness operates on normal worktrees.
+ *
+ * Side effect: shells out to git with a 10s timeout.
+ */
+export function resolveRepoKey(cwd: string, exec: RepoKeyExec = execGitCommonDir): RepoKeyResult {
+  let commonDirRaw: string;
+  try {
+    commonDirRaw = exec(cwd).trim();
+  } catch (error) {
+    return {
+      ok: false,
+      error: `git rev-parse --git-common-dir failed in ${cwd}: ${errorMessage(error)}`,
+    };
+  }
+
+  if (commonDirRaw === "") {
+    return { ok: false, error: `git rev-parse returned an empty common dir for ${cwd}` };
+  }
+
+  // For non-bare repos, git-common-dir is the `.git` directory itself and its
+  // parent is the repo root (bare repos resolve to their parent; see above).
+  const commonDir = resolve(cwd, commonDirRaw);
+  const repoRoot = dirname(commonDir);
+  try {
+    return { ok: true, key: projectKeyFromRepoRoot(repoRoot) };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Failed to derive project key from ${repoRoot}: ${errorMessage(error)}`,
+    };
+  }
+}
+
+/**
+ * Git variables that let an inherited environment override the process `cwd`.
+ * `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` make `rev-parse` report the git
+ * context of the caller (e.g. a git hook) rather than `cwd`, which would
+ * resolve another repository's project key and break the per-project
+ * namespace guarantee.
+ */
+const GIT_CONTEXT_ENV_KEYS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"];
+
+/**
+ * Copy `process.env` with inherited git-context variables removed. Fortifying
+ * against them keeps {@link execGitCommonDir} pinned to the passed `cwd`.
+ *
+ * The keys are deleted from the copy instead of being set to `undefined`
+ * because Node's child_process skips `undefined` env values inconsistently
+ * across versions. `process.env` itself is never mutated.
+ */
+function gitContextFreeEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of GIT_CONTEXT_ENV_KEYS) {
+    delete env[key];
+  }
+  return env;
+}
+
+function execGitCommonDir(cwd: string): string {
+  return execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    cwd,
+    env: gitContextFreeEnv(),
+    timeout: 10_000,
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+}
+
+/**
+ * Derive a filesystem-safe project key from a repository root path.
+ *
+ * Format: `<sanitized-basename>-<first 8 hex chars of sha256(realpath)>`.
+ * The hash keeps same-named repositories in different locations distinct,
+ * while the readable basename keeps directories recognizable.
+ *
+ * The 32-bit suffix makes collisions unlikely: two roots collide only when
+ * their basenames match AND their 32-bit hashes match. A collision merely
+ * merges two ephemeral proof directories — it is not data corruption.
+ *
+ * Deterministic for a given root; side effect: realpathSync reads the fs.
+ * Throws when `repoRoot` does not exist; {@link resolveRepoKey} catches this
+ * and returns an error result.
+ */
+export function projectKeyFromRepoRoot(repoRoot: string): string {
+  const sanitized = basename(repoRoot).replace(/[^A-Za-z0-9._-]/g, "-");
+  // `.` and `..` survive sanitization and would create hidden/traversal-like
+  // key names, so they fall back to the literal "repo" like an empty basename.
+  const name = sanitized === "" || sanitized === "." || sanitized === ".." ? "repo" : sanitized;
+  const digest = createHash("sha256").update(realpathSync(repoRoot)).digest("hex");
+  return `${name}-${digest.slice(0, 8)}`;
 }

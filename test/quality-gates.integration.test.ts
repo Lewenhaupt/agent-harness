@@ -1,11 +1,26 @@
-import { existsSync, mkdtempSync, readFileSync, readlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { SpawnDetails } from "../src/agent-registry.js";
-import { ensureProofBridge, proofDirForTask, resolveProofBase } from "../src/proof-dir.js";
+import {
+  ensureProofBridge,
+  proofDirForTask,
+  resolveProjectProofBase,
+  resolveProofBase,
+} from "../src/proof-dir.js";
 import { gateProofContent, validateCastRecording } from "../src/quality-gates.js";
+import { projectKeyFromRepoRoot, resolveRepoKey } from "../src/worktree.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..");
 
@@ -163,4 +178,171 @@ describe("proof-of-work relocation (integration)", () => {
     // The first-created symlink is left intact (target is unchanged).
     expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
   });
+
+  it("namespaces the proof base per project and validates through bridge and explicit proofDir", async () => {
+    const repoRoot = join(tmpDir, "repo-a");
+    initGitRepo(repoRoot);
+    const globalRoot = join(tmpDir, "global", "proof");
+
+    const projectBase = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoRoot);
+    expect(projectBase).toHaveProperty("ok", true);
+    if (!projectBase.ok) throw new Error(projectBase.error);
+    expect(projectBase.base).toBe(join(globalRoot, projectKeyFromRepoRoot(repoRoot)));
+
+    const bridge = ensureProofBridge(repoRoot, projectBase.base);
+    expect(bridge).toHaveProperty("ok", true);
+    expect(readFileSync(join(repoRoot, ".belayd/proof-dir"), "utf-8").trim()).toBe(
+      resolve(projectBase.base),
+    );
+
+    const proofDir = proofDirForTask("bd-99", projectBase.base);
+    await mkdir(proofDir, { recursive: true });
+    await writeFile(join(proofDir, "valid.cast"), validCast, "utf-8");
+
+    const viaBridge = await gateProofContent(
+      "Proof recording: proof-of-work/bd-99/valid.cast\n",
+      MOCK_DETAILS,
+      { cwd: repoRoot },
+    );
+    expect(viaBridge).toHaveProperty("passed", true);
+
+    const viaProofDir = await gateProofContent(
+      "Proof recording: proof-of-work/bd-99/valid.cast\n",
+      MOCK_DETAILS,
+      { proofDir },
+    );
+    expect(viaProofDir).toHaveProperty("passed", true);
+  });
+
+  it("gives sibling repos with the same task ID distinct bases and no shared directory", async () => {
+    const repoA = join(tmpDir, "repo-a");
+    const repoB = join(tmpDir, "repo-b");
+    initGitRepo(repoA);
+    initGitRepo(repoB);
+    const globalRoot = join(tmpDir, "global", "proof");
+
+    const baseA = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoA);
+    const baseB = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoB);
+    expect(baseA).toHaveProperty("ok", true);
+    expect(baseB).toHaveProperty("ok", true);
+    if (!baseA.ok || !baseB.ok) throw new Error("expected project bases");
+    expect(baseA.base).not.toBe(baseB.base);
+
+    const dirA = proofDirForTask("bd-99", baseA.base);
+    const dirB = proofDirForTask("bd-99", baseB.base);
+    await mkdir(dirA, { recursive: true });
+    await mkdir(dirB, { recursive: true });
+    await writeFile(join(dirA, "only-a.txt"), "a", "utf-8");
+
+    // bd-99 in repo B must not see repo A's artifact.
+    expect(existsSync(join(dirA, "only-a.txt"))).toBe(true);
+    expect(existsSync(join(dirB, "only-a.txt"))).toBe(false);
+  });
+
+  it("negative control: the legacy non-namespaced path DOES collide for the same task ID", async () => {
+    // This is the core bug bd-58 fixes. Without project namespacing
+    // (`resolveProjectProofBase`), two sibling repos with the same task ID
+    // resolve to one shared directory via `resolveProofBase` + `proofDirForTask`.
+    // Asserting the collision here proves the namespaced tests above are doing
+    // real work rather than being tautological.
+    const repoA = join(tmpDir, "legacy-repo-a");
+    const repoB = join(tmpDir, "legacy-repo-b");
+    initGitRepo(repoA);
+    initGitRepo(repoB);
+    const globalRoot = join(tmpDir, "legacy-global", "proof");
+
+    const legacyDirA = proofDirForTask("bd-99", resolveProofBase({ BELAYD_PROOF_DIR: globalRoot }));
+    const legacyDirB = proofDirForTask("bd-99", resolveProofBase({ BELAYD_PROOF_DIR: globalRoot }));
+
+    // The legacy path keys only on task ID, so both repos map to the same dir.
+    expect(legacyDirA).toBe(legacyDirB);
+    expect(legacyDirA).toBe(join(globalRoot, "bd-99"));
+
+    // And the namespaced path demonstrably diverges from this legacy collision.
+    const namespacedA = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoA);
+    const namespacedB = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoB);
+    expect(namespacedA).toHaveProperty("ok", true);
+    expect(namespacedB).toHaveProperty("ok", true);
+    if (!namespacedA.ok || !namespacedB.ok) throw new Error("expected namespaced bases");
+    expect(namespacedA.base).not.toBe(legacyDirA);
+    expect(namespacedB.base).not.toBe(legacyDirA);
+  });
+
+  it("migrates a pre-existing global-base bridge to the namespaced base on a real repo", async () => {
+    const repoRoot = join(tmpDir, "repo-migrate");
+    initGitRepo(repoRoot);
+    const legacyGlobalBase = join(tmpDir, "legacy", "proof");
+
+    // Old behavior: bridge to the global base with the harness marker in place.
+    const legacyBridge = ensureProofBridge(repoRoot, legacyGlobalBase);
+    expect(legacyBridge).toHaveProperty("ok", true);
+    expect(readlinkSync(join(repoRoot, "proof-of-work"))).toBe(resolve(legacyGlobalBase));
+
+    const namespacedBase = join(legacyGlobalBase, projectKeyFromRepoRoot(repoRoot));
+    const migrated = ensureProofBridge(repoRoot, namespacedBase);
+
+    expect(migrated).toHaveProperty("ok", true);
+    expect(readlinkSync(join(repoRoot, "proof-of-work"))).toBe(resolve(namespacedBase));
+    expect(readFileSync(join(repoRoot, ".belayd/proof-dir"), "utf-8").trim()).toBe(
+      resolve(namespacedBase),
+    );
+  });
+
+  it("refuses to repoint a foreign symlink that has no harness marker", async () => {
+    const repoRoot = join(tmpDir, "repo-foreign");
+    initGitRepo(repoRoot);
+    const foreignTarget = join(tmpDir, "foreign-target");
+    mkdirSync(foreignTarget, { recursive: true });
+    symlinkSync(foreignTarget, join(repoRoot, "proof-of-work"));
+
+    const result = ensureProofBridge(repoRoot, join(tmpDir, "desired", "proof"));
+
+    expect(result).toHaveProperty("ok", false);
+    // Over-eager repointing would silently redirect a link the harness did not create.
+    expect(readlinkSync(join(repoRoot, "proof-of-work"))).toBe(foreignTarget);
+    expect(existsSync(join(repoRoot, ".belayd/proof-dir"))).toBe(false);
+  });
+
+  it("resolves one project key for the main repo and its linked worktree", async () => {
+    const repoRoot = join(tmpDir, "repo-main");
+    initGitRepo(repoRoot);
+    const worktreePath = join(tmpDir, "repo-linked");
+    execFileSync(
+      "git",
+      ["-C", repoRoot, "worktree", "add", "-q", "-b", "feat/bd-99", worktreePath],
+      {
+        timeout: 30_000,
+        stdio: "pipe",
+      },
+    );
+
+    const mainKey = resolveRepoKey(repoRoot);
+    const linkedKey = resolveRepoKey(worktreePath);
+    expect(mainKey).toHaveProperty("ok", true);
+    expect(linkedKey).toHaveProperty("ok", true);
+    if (!mainKey.ok || !linkedKey.ok) throw new Error("expected repo keys");
+    expect(linkedKey.key).toBe(mainKey.key);
+
+    const globalRoot = join(tmpDir, "global", "proof");
+    const mainBase = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, repoRoot);
+    const linkedBase = resolveProjectProofBase({ BELAYD_PROOF_DIR: globalRoot }, worktreePath);
+    expect(mainBase).toHaveProperty("ok", true);
+    expect(linkedBase).toHaveProperty("ok", true);
+    if (!mainBase.ok || !linkedBase.ok) throw new Error("expected project bases");
+    expect(linkedBase.base).toBe(mainBase.base);
+  });
 });
+
+/** Initialize a git repo with one commit so `git worktree add` works. */
+function initGitRepo(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  const run = (args: string[]): void => {
+    execFileSync("git", ["-C", dir, ...args], { timeout: 30_000, stdio: "pipe" });
+  };
+  run(["init", "-q"]);
+  run(["config", "user.email", "test@example.com"]);
+  run(["config", "user.name", "Belayd Test"]);
+  writeFileSync(join(dir, "README.md"), "init\n", "utf-8");
+  run(["add", "README.md"]);
+  run(["commit", "-q", "-m", "init"]);
+}

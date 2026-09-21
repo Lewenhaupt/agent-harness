@@ -531,6 +531,48 @@ describe("ensureProofBridge", () => {
     expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
   });
 
+  it("repoints a harness-owned symlink when the marker matches the stale target", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const oldBase = join(tmpDir, "external", "old-proof");
+    mkdirSync(oldBase, { recursive: true });
+    symlinkSync(oldBase, join(workspaceRoot, "proof-of-work"));
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH),
+      `${resolve(oldBase)}\n`,
+      "utf-8",
+    );
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+    expect(readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8").trim()).toBe(
+      resolve(proofBase),
+    );
+  });
+
+  it("errors when the marker and the symlink target disagree", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const oldBase = join(tmpDir, "external", "old-proof");
+    const otherBase = join(tmpDir, "external", "other-proof");
+    mkdirSync(oldBase, { recursive: true });
+    mkdirSync(otherBase, { recursive: true });
+    symlinkSync(oldBase, join(workspaceRoot, "proof-of-work"));
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH),
+      `${resolve(otherBase)}\n`,
+      "utf-8",
+    );
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("already points");
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(oldBase));
+  });
+
   it("errors when no .git ancestor exists", () => {
     const cwd = join(tmpDir, "no-git");
     mkdirSync(cwd, { recursive: true });
@@ -540,6 +582,94 @@ describe("ensureProofBridge", () => {
     expect(result).toHaveProperty("ok", false);
     if (!result.ok) expect(result.error).toContain("No .git ancestor");
     expect(existsSync(join(cwd, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
+  });
+
+  it("errors when proof-of-work is a regular file, never silently replacing it", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    writeFileSync(join(workspaceRoot, "proof-of-work"), "not a symlink", "utf-8");
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("not a symlink");
+    // The stray file is left in place; the harness never clobbers a non-symlink entry.
+    expect(existsSync(join(workspaceRoot, "proof-of-work"))).toBe(true);
+    expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
+  });
+
+  it("errors on a dangling symlink without repointing it", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    symlinkSync("/does/not/exist", join(workspaceRoot, "proof-of-work"));
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("already points");
+    // The dangling link is left in place; the harness refuses to repoint a link it did not own.
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe("/does/not/exist");
+    expect(existsSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH))).toBe(false);
+  });
+
+  it("repairs a CRLF-line-ending marker that matches the stale symlink target", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const oldBase = join(tmpDir, "external", "old-proof");
+    mkdirSync(oldBase, { recursive: true });
+    symlinkSync(oldBase, join(workspaceRoot, "proof-of-work"));
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH),
+      `${resolve(oldBase)}\r\n`,
+      "utf-8",
+    );
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(proofBase));
+  });
+
+  it("errors when an empty marker sits beside a foreign symlink", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const foreign = join(tmpDir, "external", "foreign");
+    mkdirSync(foreign, { recursive: true });
+    symlinkSync(foreign, join(workspaceRoot, "proof-of-work"));
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "\n", "utf-8");
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("already points");
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(foreign));
+  });
+
+  it("errors when the marker is a relative path that cannot match the absolute symlink target", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+    const foreign = join(tmpDir, "external", "foreign");
+    mkdirSync(foreign, { recursive: true });
+    symlinkSync(foreign, join(workspaceRoot, "proof-of-work"));
+    mkdirSync(join(workspaceRoot, ".belayd"), { recursive: true });
+    writeFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "foreign\n", "utf-8");
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", false);
+    if (!result.ok) expect(result.error).toContain("already points");
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(resolve(foreign));
+  });
+
+  it("writes the exact marker byte contract: a single absolute path line plus trailing newline", () => {
+    const { workspaceRoot, proofBase } = makeWorkspace();
+
+    const result = ensureProofBridge(workspaceRoot, proofBase);
+
+    expect(result).toHaveProperty("ok", true);
+    const absoluteBase = resolve(proofBase);
+    const marker = readFileSync(join(workspaceRoot, PROOF_DIR_MARKER_RELATIVE_PATH), "utf-8");
+    // pi-web-plugins/proof-of-work/discovery.js reads exactly `${absoluteBase}\n`.
+    expect(marker).toBe(`${absoluteBase}\n`);
+    // And the symlink target matches the marker's absolute path.
+    expect(readlinkSync(join(workspaceRoot, "proof-of-work"))).toBe(absoluteBase);
   });
 });
 
