@@ -28,8 +28,13 @@ export {
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
 } from "./agent-registry.js";
-export type { BdCommandValidation } from "./bd-command.js";
-export { BD_ALLOWED_SUBCOMMANDS, validateBdCommand } from "./bd-command.js";
+export type { BdCommandParse, BdCommandValidation } from "./bd-command.js";
+export {
+  BD_ALLOWED_SUBCOMMANDS,
+  bdCommandReadsStdin,
+  parseBdCommand,
+  validateBdCommand,
+} from "./bd-command.js";
 export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export * from "./honcho-memory/index.js";
