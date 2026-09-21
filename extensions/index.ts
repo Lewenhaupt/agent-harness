@@ -954,10 +954,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         planningTarget.kind === "new"
           ? `New plan: ${planningTarget.description}`
           : `Existing bead ${planningTarget.taskId}`;
+      const focusSuffix =
+        planningTarget.kind === "existing" && planningTarget.focus !== undefined
+          ? ` Focus: ${planningTarget.focus}.`
+          : "";
       const kickoff =
         planningTarget.kind === "existing"
-          ? `Planning for bead \`${planningTarget.taskId}\`. Start by running \`bd show ${planningTarget.taskId}\` to read the current content.`
-          : `Planning a new bead: ${planningTarget.description}. Investigate the codebase with \`belayd_plan_scout\`/\`belayd_plan_research\`, then write the finalized plan into a new bead with \`bd create ...\`.`;
+          ? `Planning for bead \`${planningTarget.taskId}\`. Start by running \`bd show ${planningTarget.taskId}\` to read the current content.${focusSuffix} Clarify any ambiguity with the user first, then write the refined plan back with \`bd update ${planningTarget.taskId} --description=... --design=... --notes=...\`.`
+          : `Planning a new bead: ${planningTarget.description}. Investigate the codebase with \`belayd_plan_scout\`/\`belayd_plan_research\`, clarify any ambiguity with the user first, then write the finalized plan into a new bead with \`bd create ...\`.`;
       ctx.ui.notify(targetLabel, "info");
       pi.sendMessage(
         {
@@ -1128,7 +1132,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const target = state.planningTarget;
     const targetLine =
       target?.kind === "existing"
-        ? `Refine existing bead \`${target.taskId}\`. Start with \`bd show ${target.taskId}\` to read its current plan.`
+        ? `Refine existing bead \`${target.taskId}\`${target.focus !== undefined ? ` (focus: ${target.focus})` : ""}. Start with \`bd show ${target.taskId}\`, then write the refined plan back with \`bd update\`.`
         : target?.kind === "new"
           ? `Plan new work: ${target.description}`
           : "Plan new work.";
