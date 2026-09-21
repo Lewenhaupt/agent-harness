@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { SpawnDetails, SpawnUsage } from "../agent-registry.js";
 import {
   classifySpawnFailure,
+  DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS,
   DEFAULT_QUOTA_COOLDOWN_SECONDS,
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   parseQuotaResetSeconds,
@@ -67,6 +68,37 @@ describe("classifySpawnFailure", () => {
       "kind",
       "auth",
     );
+  });
+
+  it("classifies a 403 provider-entitlement error as provider-scoped quota", () => {
+    const result = classifySpawnFailure(
+      details([
+        assistantError(
+          '403: {"type":"server_error","message":"Upstream request failed: An active OpenCode Go subscription is required to use Go models."}',
+        ),
+      ]),
+    );
+    expect(result).toHaveProperty("kind", "quota");
+    expect(result).toHaveProperty("cooldownSeconds", DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS);
+  });
+
+  it("keeps a 403 without entitlement wording classified as auth", () => {
+    expect(
+      classifySpawnFailure(details([assistantError('403: {"message":"invalid api key"}')])),
+    ).toHaveProperty("kind", "auth");
+    expect(
+      classifySpawnFailure(
+        details([
+          assistantError('403: {"type":"server_error","message":"upstream gateway error"}'),
+        ]),
+      ),
+    ).toHaveProperty("kind", "auth");
+  });
+
+  it("does not read entitlement wording on a non-403 status", () => {
+    expect(
+      classifySpawnFailure(details([assistantError("401: subscription required")])),
+    ).toHaveProperty("kind", "auth");
   });
 
   it("classifies 5xx/408 as transient with the transient cooldown", () => {

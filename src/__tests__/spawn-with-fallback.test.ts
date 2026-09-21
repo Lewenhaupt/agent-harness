@@ -229,6 +229,47 @@ describe("spawnAgentWithFallback", () => {
     expect(attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
   });
 
+  it("end-to-end: a real 403 entitlement error falls back to the next provider", async () => {
+    const entitlementDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "opencode-go/deepseek-v4.1-flash",
+          stopReason: "error",
+          errorMessage:
+            '403: {"type":"server_error","message":"Upstream request failed: An active OpenCode Go subscription is required to use Go models."}',
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("opencode-go/deepseek-v4.1-flash"),
+        details: entitlementDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/deepseek-v4.1-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/deepseek-v4.1-flash",
+      modelClass: "frontier",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/deepseek-v4.1-flash");
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
+    // Entitlement failures are provider-scoped: the whole provider cools, not
+    // just the failing model, so no other opencode-go candidate is attempted.
+    expect(store.cooldownScope("opencode-go/deepseek-v4.1-flash")).toBe("provider");
+    expect(store.isCoolingDown("opencode-go/glm-5.3")).toBe(true);
+    expect(store.isCoolingDown("llmgateway/deepseek-v4.1-flash")).toBe(false);
+  });
+
   it("uses modelClass to drive fallback for a known model", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("opencode-go/glm-5.3"))
