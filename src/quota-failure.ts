@@ -30,17 +30,37 @@ export interface FailureClassification {
 export const DEFAULT_QUOTA_COOLDOWN_SECONDS = 15 * 60;
 /** Cooldown for transient network/service failures. */
 export const DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 5 * 60;
+/**
+ * Cooldown for a provider entitlement failure (a 403 carrying subscription
+ * wording). Shorter than the quota default so a newly purchased subscription
+ * is picked up quickly, while still long enough to stop re-hitting a provider
+ * that cannot serve the caller at all.
+ */
+export const DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS = 10 * 60;
 
 /** Status codes indicating a capacity/quota/credit/rate limit. */
 const QUOTA_STATUS_CODES = new Set([402, 429]);
 /** Status codes indicating a transient service failure. */
 const TRANSIENT_STATUS_CODES = new Set([408, 425, 500, 502, 503, 504]);
-/** Status codes indicating an auth problem — not solved by switching models. */
+/**
+ * Status codes indicating an auth problem — not solved by switching models.
+ * A 403 whose body carries provider-entitlement wording is handled as a
+ * provider-scoped quota failure before this branch runs.
+ */
 const AUTH_STATUS_CODES = new Set([401, 403]);
 
 /** Statusless network-error signatures (matches pi-gateway detect.ts). */
 const NETWORK_ERROR_PATTERN =
   /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|connection reset|service unavailable/i;
+
+/**
+ * Provider-entitlement wording carried in 403 bodies, e.g. "An active OpenCode
+ * Go subscription is required to use Go models." Such a 403 is scoped to one
+ * provider rather than to the caller's credentials, so the fallback loop must
+ * cool that provider down and continue instead of stopping.
+ */
+const PROVIDER_ENTITLEMENT_PATTERN =
+  /subscription|not subscribed|entitlement|required to use|upgrade/i;
 
 /**
  * Classify a spawn result into one of the failure kinds.
@@ -83,6 +103,18 @@ function classifyAssistantError(
       model,
       reason: `Quota/credit/rate limit (HTTP ${status}).`,
       cooldownSeconds: parseQuotaResetSeconds(errorMessage) ?? DEFAULT_QUOTA_COOLDOWN_SECONDS,
+    };
+  }
+  if (
+    status === 403 &&
+    errorMessage !== undefined &&
+    PROVIDER_ENTITLEMENT_PATTERN.test(errorMessage)
+  ) {
+    return {
+      kind: "quota",
+      model,
+      reason: `Provider entitlement failure (HTTP ${status}).`,
+      cooldownSeconds: DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS,
     };
   }
   if (status !== undefined && AUTH_STATUS_CODES.has(status)) {

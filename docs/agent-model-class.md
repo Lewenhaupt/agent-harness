@@ -96,6 +96,12 @@ The tier-to-primary mapping used by `primaryModelOf` is:
   in the class. A successful result may include a trailing
   `[belayd model fallback] ...` note showing the attempted models. With no
   failure, no fallback note is added.
+- A provider-entitlement 403 — a 403 whose body carries subscription wording
+  such as "An active OpenCode Go subscription is required to use Go models" —
+  is treated as a provider-scoped quota failure: that provider is cooled down
+  and the fallback continues to the alternate provider for the same model. A
+  bare 401/403 (a credentials problem) still stops the fallback rather than
+  switching models.
 - Inspect persistent sub-agent sessions, if needed, with:
 
   ```bash
