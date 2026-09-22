@@ -114,6 +114,25 @@ describe("classifySpawnFailure", () => {
     expect(result).toHaveProperty("kind", "transient");
   });
 
+  it("classifies a 400 gateway model-routing rejection as transient", () => {
+    const result = classifySpawnFailure(
+      details([
+        assistantError(
+          '400: {"error":{"message":"The request was rejected","type":"invalid_request_error","param":null,"code":"invalid_value"}}',
+        ),
+      ]),
+    );
+    expect(result).toHaveProperty("kind", "transient");
+    expect(result).toHaveProperty("cooldownSeconds", DEFAULT_TRANSIENT_COOLDOWN_SECONDS);
+  });
+
+  it("classifies a generic 400 without rejection wording as other", () => {
+    expect(classifySpawnFailure(details([assistantError("400: bad request")]))).toHaveProperty(
+      "kind",
+      "other",
+    );
+  });
+
   it("classifies an unrecognized error as other", () => {
     const result = classifySpawnFailure(details([assistantError("something went sideways")]));
     expect(result).toHaveProperty("kind", "other");

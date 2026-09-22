@@ -54,6 +54,15 @@ const NETWORK_ERROR_PATTERN =
   /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|connection reset|service unavailable/i;
 
 /**
+ * Gateway-side rejection wording in 400 bodies that is scoped to one model's
+ * routing/availability rather than to the caller's request shape. A generic 400
+ * is treated as a config error (unfixable by switching models), but these
+ * signatures mean "this model is not servable right now" — the next candidate
+ * on another provider/model can succeed, so the fallback loop should retry.
+ */
+const GATEWAY_REJECTION_PATTERN = /invalid_value|invalid_request_error|request was rejected/i;
+
+/**
  * Provider-entitlement wording carried in 403 bodies, e.g. "An active OpenCode
  * Go subscription is required to use Go models." Such a 403 is scoped to one
  * provider rather than to the caller's credentials, so the fallback loop must
@@ -141,6 +150,18 @@ function classifyAssistantError(
       kind: "transient",
       model,
       reason: "Network error.",
+      cooldownSeconds: DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    };
+  }
+  if (
+    status === 400 &&
+    errorMessage !== undefined &&
+    GATEWAY_REJECTION_PATTERN.test(errorMessage)
+  ) {
+    return {
+      kind: "transient",
+      model,
+      reason: "Gateway model-routing rejection (HTTP 400).",
       cooldownSeconds: DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
     };
   }
