@@ -229,6 +229,41 @@ describe("spawnAgentWithFallback", () => {
     expect(attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
   });
 
+  it("end-to-end: a real 400 invalid_value details object triggers a fallback", async () => {
+    const rejectionDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "llmgateway/deepseek-v4.1-flash",
+          stopReason: "error",
+          errorMessage:
+            '400: {"error":{"message":"The request was rejected","type":"invalid_request_error","param":null,"code":"invalid_value"}}',
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("llmgateway/deepseek-v4.1-flash"),
+        details: rejectionDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3"));
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "llmgateway/deepseek-v4.1-flash",
+      modelClass: "frontier",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["llmgateway/deepseek-v4.1-flash", "llmgateway/glm-5.3"],
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3");
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["transient", "success"]);
+  });
+
   it("end-to-end: a real 403 entitlement error falls back to the next provider", async () => {
     const entitlementDetails = {
       messages: [
