@@ -166,6 +166,29 @@ describe("DEFAULT_AGENTS", () => {
     expect(prompt).toContain("BELAYD_PROOF=1");
   });
 
+  it("proof-generator prompt requires BOTH a trace and playwright-cli screenshots for UI work", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(prompt).toContain("Browser trace AND screenshots");
+    expect(prompt).toContain("Exploring the UI with playwright-cli");
+    expect(prompt).toContain("playwright-cli open");
+    expect(prompt).toMatch(/EXPECTED to explore the UI/);
+    expect(prompt).toMatch(/NEVER excuses omitting visual proof/);
+    expect(prompt).toMatch(/Browser-proof trouble is NOT a skippable reason/);
+  });
+
+  it("proof-generator prompt forbids playwright install and points at the Nix/devShell browser source", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(prompt).toMatch(/NEVER run `playwright install`/);
+    expect(prompt).toContain("libglib-2.0.so.0");
+    expect(prompt).toContain("direnv exec");
+    expect(prompt).toMatch(/Never symlink a mismatched revision/);
+    expect(prompt).not.toMatch(/writable directory and install/);
+  });
+
   it("proof-generator description and prompt name the rejected test runners", () => {
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
     expect(proofGen).toBeDefined();

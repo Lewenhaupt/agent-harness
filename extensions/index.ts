@@ -303,7 +303,8 @@ function describePhase(phase: string, workflowType: WorkflowSubType): string {
     review: "Adversarial code review",
     test: "Run the test suite",
     userguide: "Generate user-facing How to Verify and How to Use docs",
-    proof: "Capture verifiable proof",
+    proof:
+      "Capture verifiable proof — UI changes need both a Playwright trace and playwright-cli screenshots",
     commit: "Commit changes",
   };
   return descriptions[phase] ?? phase;
@@ -576,6 +577,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       lines.push(
         "",
         "A `belayd_proof_verifier` tool is available after the proof phase — it is an advisory, non-blocking review of proof relevance and plausibility.",
+        "For UI changes, the `belayd_proof` task MUST require both a Playwright trace and playwright-cli screenshots of the changed pages; a missing test-runner browser is not a skip reason.",
       );
     }
 
@@ -1221,6 +1223,26 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
+  /**
+   * Proof modality requirements, returned only for proof workflows.
+   *
+   * The orchestrator writes the `belayd_proof` task prompt, so the requirement
+   * must be restated every turn: UI changes need BOTH a Playwright trace and
+   * playwright-cli screenshots, and a missing test-runner browser is a
+   * workaround problem, never a reason to skip visual proof.
+   */
+  function proofModalityGuidanceLines(phaseOrder: readonly string[]): string[] {
+    if (!phaseOrder.includes("proof")) return [];
+    return [
+      "",
+      "**Proof modality** (before calling `belayd_proof`):",
+      "- UI change → the `belayd_proof` task MUST require BOTH a Playwright trace (E2E spec) and playwright-cli screenshots of the changed pages.",
+      "- Tell the proof agent to explore the built UI in a browser (playwright-cli open → click through → screenshot), not just run the E2E spec.",
+      "- A missing/incompatible Playwright browser is NOT a skip reason, and `playwright install` is forbidden on this host (CDN binaries need FHS libs that NixOS lacks): require the project devShell env (`direnv exec <repo> <cmd>` / `nix develop -c <cmd>`) or a Nix browser tree whose revision matches, then produce the artifact.",
+      "- Browser-proof trouble is absent from the proof agent's `**Proof skipped:**` reason list — reject a UI proof that skips visuals for that reason.",
+    ];
+  }
+
   /** Proof-verifier guidance lines, returned only for proof workflows. */
   function proofVerifierGuidanceLines(phaseOrder: readonly string[]): string[] {
     if (!phaseOrder.includes("proof")) return [];
@@ -1313,6 +1335,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ...researchGuidance,
           ...reviewFindingsGuidance,
           ...proofVerifierGuidanceLines(phaseOrder),
+          ...proofModalityGuidanceLines(phaseOrder),
           ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
