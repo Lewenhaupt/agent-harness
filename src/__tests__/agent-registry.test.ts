@@ -189,6 +189,21 @@ describe("DEFAULT_AGENTS", () => {
     expect(prompt).not.toMatch(/writable directory and install/);
   });
 
+  it("proof-generator prompt uses the accurate playwright-cli browser-channel wording (bd-64)", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    // Accurate description: the CLI probes a system channel, and --browser=chromium skips it.
+    expect(prompt).toContain("probes for a system Chrome/Edge channel");
+    expect(prompt).toContain("--browser=chromium");
+    // The old wording claimed the CLI defaults to the (absent) system Chrome channel, which is misleading.
+    expect(prompt).not.toContain("defaults to the system Chrome channel, which is absent on NixOS");
+    // Both runners still come from the Nix runtime env.
+    expect(prompt).toMatch(/provided by the Nix runtime env/);
+    expect(prompt).toContain("playwright");
+    expect(prompt).toContain("playwright-cli");
+  });
+
   it("proof-generator description and prompt name the rejected test runners", () => {
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
     expect(proofGen).toBeDefined();

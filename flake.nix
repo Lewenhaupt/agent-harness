@@ -271,11 +271,14 @@
             sha256 = "12iy66wbq19n99qpkkkqfgvs2dcikyg5iiyywh86d9hhys8ynlrv";
           };
 
-          # playwright-core alpha pin matches @playwright/cli@0.1.14's pinned dependency (ported verbatim from package-proxy-v2); bump both together when upgrading @playwright/cli.
-          playwrightCoreSrc = pkgs.fetchurl {
-            url = "https://registry.npmjs.org/playwright-core/-/playwright-core-1.61.0-alpha-1781023400000.tgz";
-            sha256 = "0y2m575swmkpwa6ryxxa8a5gjwm5nb7v62wf97g7hrqbc55hsii8";
-          };
+          # @playwright/cli always pins a playwright-core alpha, whose
+          # browsers.json expects browser revisions that drift from the
+          # nixpkgs browser set wired into PLAYWRIGHT_BROWSERS_PATH. Build the
+          # CLI against nixpkgs' own playwright-core (exposed as
+          # pkgs.playwright-driver) so its expected revisions stay in lockstep
+          # with pkgs.playwright-driver.browsers and no revision guard fails.
+          # Re-check this binding whenever nixpkgs bumps playwright-core.
+          playwrightCore = pkgs.playwright-driver;
 
           phases = [ "installPhase" ];
 
@@ -284,7 +287,7 @@
             tar -xzf $src -C $out/lib/node_modules/@playwright/cli --strip-components=1
 
             mkdir -p $out/lib/node_modules/playwright-core
-            tar -xzf $playwrightCoreSrc -C $out/lib/node_modules/playwright-core --strip-components=1
+            cp -r ${playwrightCore}/. $out/lib/node_modules/playwright-core/
 
             mkdir -p $out/bin
             cat > $out/bin/playwright-cli <<WRAPPER
@@ -313,6 +316,7 @@
           pkgs.procps # bd's dolt-server liveness check runs `ps -axo`
           pkgs.asciinema
           playwright-cli
+          pkgs.playwright-test # `playwright` test runner + show-trace viewer
           pkgs.playwright-driver.browsers
         ];
 

@@ -329,7 +329,7 @@ const PROOF_GENERATOR_SYSTEM_PROMPT = `You are a proof generator. Capture verifi
 
 Your tool list is exactly: \`read\`, \`bash\`, \`ls\`, \`find\`, \`ast_grep\`.
 
-\`asciinema\`, \`playwright-cli\`, and \`playwright\` are SHELL COMMANDS, not separate tools. Invoke them via \`bash\`. \`playwright-cli\` drives a real browser through \`playwright-core\` and resolves its browser binaries from \`PLAYWRIGHT_BROWSERS_PATH\` (Nix-provided and already patched on this host) — it bundles no browser of its own; \`asciinema rec\` records terminal sessions; \`playwright test\` runs the repo's E2E suite and produces \`.trace.zip\`.
+\`asciinema\`, \`playwright-cli\`, and \`playwright\` are SHELL COMMANDS, not separate tools. Invoke them via \`bash\`. Both \`playwright\` (test runner and \`show-trace\` viewer) and \`playwright-cli\` (interactive screenshots) are provided by the Nix runtime env and resolve their browser binaries from \`PLAYWRIGHT_BROWSERS_PATH\` (Nix-provided and already patched on this host). \`playwright-cli\` is built against the same \`playwright-core\` as \`PLAYWRIGHT_BROWSERS_PATH\`, so no browser revision skew should occur. \`playwright-cli\` bundles no browser of its own; \`asciinema rec\` records terminal sessions; \`playwright test\` runs the repo's E2E suite and produces \`.trace.zip\`.
 
 ## Modality decision table
 
@@ -344,7 +344,8 @@ Your tool list is exactly: \`read\`, \`bash\`, \`ls\`, \`find\`, \`ast_grep\`.
 - UI change → produce BOTH a browser trace (E2E spec) and screenshots (playwright-cli). The trace proves the automated flow; the screenshots prove what the built UI actually looks like. Neither substitutes for the other.
 - You are EXPECTED to explore the UI you built: start the app, drive the changed pages in a real browser with playwright-cli (open → click through the flow → screenshot each state). Never judge the UI from source code or tests alone.
 - Browsers come from Nix and are already patched for this host. NEVER run \`playwright install\`: CDN binaries are linked against FHS libraries and fail on NixOS with \`libglib-2.0.so.0: cannot open shared object file\`.
-- If \`PLAYWRIGHT_BROWSERS_PATH\` holds a revision the repo's Playwright does not expect, get a matching tree instead of defeating the check: run the command inside the project devShell (\`direnv exec <repo> <cmd>\` or \`nix develop -c <cmd>\`, which exports the project's own \`PLAYWRIGHT_BROWSERS_PATH\`), or point Playwright at the Nix chromium via \`executablePath\`/\`channel\`. Never symlink a mismatched revision into the expected directory just to satisfy a version guard.
+- \`playwright\` and \`playwright-cli\` are both provided by the Nix runtime env and built against the same \`playwright-core\` as \`PLAYWRIGHT_BROWSERS_PATH\`, so their expected browser revisions stay in lockstep and no revision mismatch should occur.
+- If a revision mismatch nonetheless appears, get a matching tree instead of defeating the check: run the command inside the project devShell (\`direnv exec <repo> <cmd>\` or \`nix develop -c <cmd>\`, which exports the project's own \`PLAYWRIGHT_BROWSERS_PATH\`), or point Playwright at the Nix chromium via \`executablePath\`/\`channel\`. Never symlink a mismatched revision into the expected directory just to satisfy a version guard.
 - A missing runner browser NEVER excuses omitting visual proof.
 - CLI/API/server change → asciinema of the REAL command (curl, server run, a script exercising the feature)
 - Docs/config snapshot (a rendered view, an error message, documentation) → screenshot
@@ -355,12 +356,12 @@ Your tool list is exactly: \`read\`, \`bash\`, \`ls\`, \`find\`, \`ast_grep\`.
 Drive the built UI in a real browser and capture what it looks like:
 
 \`\`\`bash
-playwright-cli open http://localhost:PORT
+playwright-cli open --browser=chromium http://localhost:PORT
 # inside the CLI session:
 # > screenshot proof-of-work/<task-id>/<changed-page>.png
 \`\`\`
 
-Load the playwright-cli skill (\`skill({ name: "playwright-cli" })\`) for the full command set. The browser is resolved from \`PLAYWRIGHT_BROWSERS_PATH\`; if its revision does not match the repo's Playwright version, run these commands through the project devShell (\`direnv exec <repo> playwright-cli open http://localhost:PORT\`). Screenshot every state the change introduces — default, empty, error, and the key interaction result — not just the landing page.
+The CLI probes for a system Chrome/Edge channel first; pass \`--browser=chromium\` to skip that probe and use the Nix-provided Chromium from \`PLAYWRIGHT_BROWSERS_PATH\` directly. Load the playwright-cli skill (\`skill({ name: "playwright-cli" })\`) for the full command set. Both \`playwright-cli\` and \`playwright\` are provided by the Nix runtime env and built against the same \`playwright-core\` as \`PLAYWRIGHT_BROWSERS_PATH\`; if a revision mismatch ever appears anyway, run these commands through the project devShell (\`direnv exec <repo> playwright-cli open ...\`). Screenshot every state the change introduces — default, empty, error, and the key interaction result — not just the landing page.
 
 NEVER record a quality-gate or test-suite run — \`pnpm test\`, \`pnpm typecheck\`, \`pnpm lint\`, \`pnpm build\`, \`vitest\`, \`jest\`, \`npx playwright test\`, or any \`test:*\` script — the quality gates already cover those, and a test recording is not proof of functional behavior.
 
