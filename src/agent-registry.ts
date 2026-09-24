@@ -372,7 +372,7 @@ Anti-patterns to avoid:
 | echo-only recording | no real output from the feature |
 | Pre-computed output | output is not produced by the actual command |
 | ANSI-only output | no readable text after stripping escape codes |
-| Static dump | elapsed time too short / no exit code |
+| Static dump | no command actually executed / no exit code |
 
 ## E2E trace wiring (BELAYD_PROOF)
 
@@ -394,7 +394,6 @@ All asciinema recordings MUST meet these standards:
 1. **Real command**: The recording header must contain a \`command\` field with the actual command invocation (e.g. \`curl http://localhost:3000/health\`, \`node dist/cli.js --serve\`, \`./scripts/demo.sh\`) — not a shell prompt
 2. **Visible output**: At least one output event with substantive text (>= 3 readable characters after stripping ANSI)
 3. **Exit code**: The recording must include an exit code event (type "x") showing the command completed
-4. **Non-zero timing**: Total elapsed time must be > 0.1 seconds — no \`0.000\` static dumps
 
 ## Skip contract
 

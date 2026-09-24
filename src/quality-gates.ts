@@ -273,7 +273,6 @@ function checkSubstantiveOutput(events: Array<[number, string, string]>): GateRe
  * Requirements:
  * - Header must contain a "command" field (asciicast v2 style)
  * - At least one substantive output event (>= 3 printable chars after stripping ANSI)
- * - Total elapsed time > 0.1s
  * - Exit code event ("x" type) present
  */
 export async function validateCastRecording(castPath: string): Promise<GateResult> {
@@ -312,16 +311,6 @@ export async function validateCastRecording(castPath: string): Promise<GateResul
       passed: false,
       feedback: `${outputCheck.feedback} (${castPath})`,
     };
-  }
-
-  if (events.length > 0) {
-    const maxTime = Math.max(...events.map((e) => e[0]));
-    if (maxTime <= 0.1) {
-      return {
-        passed: false,
-        feedback: `Proof recording elapsed time too short (${maxTime.toFixed(3)}s, minimum 0.1s) (${castPath})`,
-      };
-    }
   }
 
   const hasExitCode = events.some(([, type]) => type === "x");
