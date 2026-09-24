@@ -680,14 +680,14 @@ function shellQuote(value) {
  * first, then a pruned workspace search) and serves the viewer plus trace over
  * HTTP on the given port.
  */
-function showTraceCommand({ port, tracePath }) {
+export function showTraceCommand({ port, tracePath }) {
   return [
     `PORT=${port}`,
     `TRACE=${shellQuote(tracePath)}`,
     "if command -v playwright >/dev/null 2>&1; then",
     `  PW="playwright"`,
     "else",
-    `  PW="$(find . \( -name .pnpm -o -name .git -o -name proof-of-work \) -prune -o \( -type f -o -type l \) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
+    `  PW="$(find . \\( -name .pnpm -o -name .git -o -name proof-of-work \\) -prune -o \\( -type f -o -type l \\) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
     "fi",
     `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; printf 'Or run it via the project devShell: direnv exec <repo> playwright show-trace --port %s "%s", or nix develop -c playwright show-trace --port %s "%s"\n' "$PORT" "$TRACE" "$PORT" "$TRACE"; exit 1; fi`,
     `"$PW" show-trace --port "$PORT" "$TRACE"`,

@@ -26,3 +26,5 @@ result
 .beads/dolt-backup.json
 
 /proof-of-work
+
+.playwright-cli
