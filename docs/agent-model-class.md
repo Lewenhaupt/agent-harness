@@ -79,7 +79,7 @@ Expected behavior:
   | `belayd-reviewer` | `standard` → `opencode-go/glm-5.2` |
   | `belayd-tester` | `standard` → `opencode-go/glm-5.2` |
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-proof-generator` | `fast` → `opencode-go/mimo-v2.5` |
+  | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-committer` | `fast` → `opencode-go/mimo-v2.5` |
 

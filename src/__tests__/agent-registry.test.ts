@@ -80,6 +80,12 @@ describe("DEFAULT_AGENTS", () => {
     expect(committer?.modelClass).toBe("fast");
   });
 
+  it("proof-generator declares the frontier class", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    expect(proofGen?.modelClass).toBe("frontier");
+  });
+
   it("implementer has write tools", () => {
     const impl = DEFAULT_AGENTS.find((a) => a.name === "belayd-implementer");
     expect(impl).toBeDefined();

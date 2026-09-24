@@ -549,7 +549,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-proof-generator",
     description: "Captures proof artifacts — browser traces, screenshots, terminal recordings",
-    modelClass: "fast",
+    modelClass: "frontier",
     tools: ["read", "bash", "ls", "find", "ast_grep"],
     systemPrompt: PROOF_GENERATOR_SYSTEM_PROMPT,
     qualityGate: gateProofContent,
