@@ -689,7 +689,7 @@ function showTraceCommand({ port, tracePath }) {
     "else",
     `  PW="$(find . \( -name .pnpm -o -name .git -o -name proof-of-work \) -prune -o \( -type f -o -type l \) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
     "fi",
-    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found in this workspace (is @belayd/dashboard-spa installed?)"; exit 1; fi`,
+    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; exit 1; fi`,
     `"$PW" show-trace --port "$PORT" "$TRACE"`,
   ].join("\n");
 }
