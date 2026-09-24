@@ -13,11 +13,11 @@
  */
 
 import { exec, execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -124,18 +124,18 @@ type SessionState = {
 
 const sessionStates = new Map<string, SessionState>();
 
-const execAsync = promisify(exec);
-
 /**
- * Run `bd` with an explicit argv array and no shell.
+ * Run a child process with an explicit argv array and no shell.
  *
  * A shell is what previously forced command strings through quoting rules and
- * made real newlines impossible (and escaped `\n` survive literally). With
- * argv the arguments are passed verbatim, so multiline markdown reaches `bd`
- * intact. `stdin` lets large note/description bodies bypass argv length
- * limits (see bd-22 for the same class of failure on git commits).
+ * made real newlines impossible (and escaped `\n` survive literally), while
+ * interpolated content containing backticks or `$()` was executed outright.
+ * With argv the arguments are passed verbatim, so multiline markdown reaches
+ * the child intact. `stdin` lets large note/description bodies bypass argv
+ * length limits (see bd-22 for the same class of failure on git commits).
  */
-function runBdCommand(
+function runFileCommand(
+  file: string,
   argv: readonly string[],
   options: {
     cwd: string;
@@ -146,7 +146,7 @@ function runBdCommand(
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = execFile(
-      "bd",
+      file,
       [...argv],
       {
         cwd: options.cwd,
@@ -164,13 +164,34 @@ function runBdCommand(
     );
 
     if (child.stdin) {
-      // bd may exit before consuming stdin (e.g. on a validation error),
-      // which turns the pending write into EPIPE; without a listener that
-      // would surface as an unhandled stream error.
+      // The child may exit before consuming stdin (e.g. on a validation
+      // error), which turns the pending write into EPIPE; without a listener
+      // that would surface as an unhandled stream error.
       child.stdin.on("error", () => {});
       child.stdin.end(options.stdin ?? "");
     }
   });
+}
+
+/** Run `bd` with an explicit argv array and no shell. */
+function runBdCommand(
+  argv: readonly string[],
+  options: {
+    cwd: string;
+    stdin: string | undefined;
+    timeoutInMs: number;
+    maxBufferInBytes: number;
+  },
+): Promise<{ stdout: string; stderr: string }> {
+  return runFileCommand("bd", argv, options);
+}
+
+/** Run `git` with an explicit argv array and no shell. */
+function runGitCommand(
+  argv: readonly string[],
+  options: { cwd: string; timeoutInMs: number; maxBufferInBytes: number },
+): Promise<{ stdout: string; stderr: string }> {
+  return runFileCommand("git", argv, { ...options, stdin: undefined });
 }
 
 // Shared per-orchestrator model cooldown store: when a model hits a quota/rate
@@ -2263,58 +2284,92 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   });
 
   // ── Helpers for commit tool ─────────────────────────────────────────
-  async function _stageChanges(
-    execAsync: (cmd: string, opts: object) => Promise<{ stdout: string; stderr: string }>,
-    cwd: string,
-    files?: string[],
-  ): Promise<string | null> {
+  //
+  // Residual risk: argv removes shell injection, but argument confusion is
+  // only partly fixed. `--` shields `git add` paths and the `bd update`/`bd
+  // note` taskId positionals; taskId safety additionally rests on the
+  // `isValidTaskId` guard at the `belayd_commit` entry point.
+  async function _stageChanges(cwd: string, files?: string[]): Promise<string | null> {
     try {
       const paths = (files ?? []).filter((file) => file.length > 0);
-      if (paths.length === 0) {
-        await execAsync("git add -A", { cwd, timeout: 30_000 });
-      } else {
-        // `--` keeps leading-dash paths literal; quote each path for spaces.
-        const quoted = paths.map((file) => `"${file.replace(/"/g, '\\"')}"`).join(" ");
-        await execAsync(`git add -- ${quoted}`, { cwd, timeout: 30_000 });
-      }
+      // `--` keeps leading-dash paths literal.
+      const argv = paths.length > 0 ? ["add", "--", ...paths] : ["add", "-A"];
+      await runGitCommand(argv, { cwd, timeoutInMs: 30_000, maxBufferInBytes: 1024 * 1024 });
       return null;
     } catch (err) {
       return `Failed to stage changes: ${err instanceof Error ? err.message : err}`;
     }
   }
 
+  /**
+   * Read the new commit's short hash.
+   *
+   * `rev-parse` is authoritative; the regex fallback covers a git too old (or
+   * a hook that swallows stdout) to be trusted. Never throws — an unknown hash
+   * is cosmetic and must not fail an otherwise successful commit.
+   */
+  async function resolveCommitHash(cwd: string, output: string): Promise<string> {
+    try {
+      const { stdout } = await runGitCommand(["rev-parse", "--short", "HEAD"], {
+        cwd,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      const hash = stdout.trim();
+      if (hash.length > 0) return hash;
+    } catch {
+      // fall through to parsing the commit output
+    }
+    // Covers git's `[<branch> <hash>]` summary line; the branch may contain
+    // spaces in git's abbreviated form, so anchor on the last token.
+    const match = output.match(/\[[^\]]*?\s([0-9a-f]{7,})\]/);
+    return match?.[1] ?? "unknown";
+  }
+
   async function _runCommit(
-    execAsync: (cmd: string, opts: object) => Promise<{ stdout: string; stderr: string }>,
     message: string,
     cwd: string,
   ): Promise<{ hash: string; output: string } | string> {
+    // `randomUUID` (not a timestamp) keeps two commits in the same process and
+    // millisecond from sharing a file and clobbering each other's message.
+    const messageFile = join(tmpdir(), `belayd-commit-msg-${process.pid}-${randomUUID()}.txt`);
     try {
-      const escaped = message.replace(/"/g, '\\"');
-      const { stdout, stderr } = await execAsync(`git commit -m "${escaped}"`, {
+      // `-F` avoids both shell interpolation and argv length limits. Unlike an
+      // editor-driven message, git defaults `-F` to cleanup=whitespace, so a
+      // leading `#` line survives instead of being stripped as a comment — but
+      // only when the message is non-empty after cleanup; an all-`#`/whitespace
+      // message strips to empty and git aborts (exit 1), surfacing as a raw git
+      // error through the catch below. That failure path is acceptable.
+      writeFileSync(messageFile, message, "utf-8");
+      const { stdout, stderr } = await runGitCommand(["commit", "-F", messageFile], {
         cwd,
-        timeout: 300_000,
-        maxBuffer: 10 * 1024 * 1024,
+        timeoutInMs: 300_000,
+        maxBufferInBytes: 10 * 1024 * 1024,
       });
       const output = stdout || stderr;
-      const hashMatch = output.match(/\[([a-f0-9]+)\]/);
-      return { hash: hashMatch?.[1] ?? "unknown", output };
+      return { hash: await resolveCommitHash(cwd, output), output };
     } catch (err) {
       return err instanceof Error ? err.message : "Commit failed";
+    } finally {
+      removeFileQuietly(messageFile);
     }
   }
 
-  async function _flagForHumanReview(
-    execAsync: (cmd: string, opts: object) => Promise<{ stdout: string; stderr: string }>,
-    taskId: string,
-    cwd: string,
-  ): Promise<string | null> {
+  async function _flagForHumanReview(taskId: string, cwd: string): Promise<string | null> {
     try {
       // The `human` label surfaces the bead in Bead Me Up, Scotty's "Needs You"
       // inbox; `in_progress` keeps it out of `bd ready` until the human merges.
-      await execAsync(`bd update ${taskId} --status in_progress --add-label human`, {
-        cwd,
-        timeout: 15_000,
-      });
+      // Flags precede `--` so the taskId is parsed as a positional even if it
+      // starts with `-`; pflag stops flag parsing at the separator.
+      await runBdCommand(
+        ["update", "--status", "in_progress", "--add-label", "human", "--", taskId],
+        {
+          cwd,
+          stdin: undefined,
+          timeoutInMs: 15_000,
+          maxBufferInBytes: 1024 * 1024,
+        },
+      );
       return null;
     } catch (err) {
       return `Failed to flag beads issue for human review: ${err instanceof Error ? err.message : err}`;
@@ -2353,12 +2408,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Flag a beads issue for human review, surfacing any failure as a warning. */
-  async function flagForHumanReview(
-    execAsync: (cmd: string, opts: object) => Promise<{ stdout: string; stderr: string }>,
-    taskId: string,
-    cwd: string,
-  ): Promise<void> {
-    const updateError = await _flagForHumanReview(execAsync, taskId, cwd);
+  async function flagForHumanReview(taskId: string, cwd: string): Promise<void> {
+    const updateError = await _flagForHumanReview(taskId, cwd);
     if (updateError) {
       pi.sendMessage(
         { customType: "belayd-warning", content: updateError, display: true },
@@ -2368,27 +2419,22 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Append user-guide content to a task's notes; best-effort and non-blocking. */
-  async function appendUserGuideNote(
-    execAsync: (cmd: string, opts: object) => Promise<{ stdout: string; stderr: string }>,
-    taskId: string,
-    content: string,
-    cwd: string,
-  ): Promise<void> {
-    const notesFile = join(tmpdir(), `belayd-userguide-${taskId}.md`);
-    writeFileSync(notesFile, content, "utf-8");
+  async function appendUserGuideNote(taskId: string, content: string, cwd: string): Promise<void> {
     try {
-      await execAsync(`bd note ${taskId} --file "${notesFile}"`, {
+      // Piping via `--stdin` keeps the body out of argv and avoids a temp file
+      // that could leak if the process dies mid-append.
+      await runBdCommand(["note", "--stdin", "--", taskId], {
         cwd,
-        timeout: 15_000,
+        stdin: content,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
       });
     } catch {
       // Best-effort: don't block commit on note append failure
-    } finally {
-      removeFileQuietly(notesFile);
     }
   }
 
-  /** Unlink a file, ignoring any failure (used for temp-note cleanup). */
+  /** Unlink a file, ignoring any failure (used for temp-message cleanup). */
   function removeFileQuietly(path: string): void {
     try {
       unlinkSync(path);
@@ -2489,10 +2535,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   /** Append userguide + proof-verifier verdict notes (best-effort). */
   async function appendTaskNotes(taskId: string, state: SessionState, cwd: string): Promise<void> {
     if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
-      await appendUserGuideNote(execAsync, taskId, state.userGuideContent, cwd);
+      await appendUserGuideNote(taskId, state.userGuideContent, cwd);
     }
     if (state.proofVerifierVerdict) {
-      await appendUserGuideNote(execAsync, taskId, state.proofVerifierVerdict, cwd);
+      await appendUserGuideNote(taskId, state.proofVerifierVerdict, cwd);
     }
   }
 
@@ -2522,6 +2568,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (params.taskId !== undefined && !isValidTaskId(params.taskId)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Invalid task id: ${params.taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`,
+            },
+          ],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+
       const cwd = ctx?.cwd ?? process.cwd();
       const state = getSessionState(ctx);
       const runId = generateShortRunId();
@@ -2530,11 +2588,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       // Flag the issue for human review (agents never close — human closes on wt merge).
       // Done before staging so the JSONL export (export.auto + git-add) is committed.
       if (params.taskId) {
-        await flagForHumanReview(execAsync, params.taskId, cwd);
+        await flagForHumanReview(params.taskId, cwd);
         await appendTaskNotes(params.taskId, state, cwd);
       }
 
-      const stageError = await _stageChanges(execAsync, cwd, params.files);
+      const stageError = await _stageChanges(cwd, params.files);
       if (stageError) {
         finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Failed });
         return commitFailure(stageError);
@@ -2542,7 +2600,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const fullMessage = params.body ? `${params.message}\n\n${params.body}` : params.message;
 
-      const commitResult = await _runCommit(execAsync, fullMessage, cwd);
+      const commitResult = await _runCommit(fullMessage, cwd);
       if (typeof commitResult === "string") {
         finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Failed });
         const feedback = await extractCommitFeedback(commitResult, ctx);
