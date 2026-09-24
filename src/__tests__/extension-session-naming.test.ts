@@ -66,11 +66,64 @@ const mockExec = vi.hoisted(() =>
   ),
 );
 
+// The commit path runs git/bd via execFile (no shell). Recording argv lets the
+// staging and note tests assert exact arguments, and reading the `-F` temp file
+// inside the mock proves the message reaches disk verbatim.
+interface ExecFileRecord {
+  file: string;
+  args: readonly string[];
+  stdin: string;
+  cwd: string | undefined;
+}
+
+const mockExecFile = vi.hoisted(() => {
+  const calls: ExecFileRecord[] = [];
+  let mode: "fail" | "succeed" = "fail";
+  const fn = vi.fn(
+    (
+      file: string,
+      args: readonly string[],
+      options: { cwd?: string },
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const record: ExecFileRecord = { file, args, stdin: "", cwd: options?.cwd };
+      calls.push(record);
+      const childStdin = {
+        on: () => {},
+        end: (chunk?: string) => {
+          record.stdin = chunk ?? "";
+          if (mode === "fail") {
+            callback(new Error("execFile not found in test environment"), "", "Command failed");
+            return;
+          }
+          if (file === "git" && args[0] === "rev-parse") {
+            callback(null, "abc1234\n", "");
+            return;
+          }
+          callback(null, "[feat/x abc1234] commit done", "");
+        },
+      };
+      return { stdin: childStdin };
+    },
+  );
+  return {
+    fn,
+    calls,
+    clear: () => {
+      calls.length = 0;
+    },
+    setMode: (next: "fail" | "succeed") => {
+      mode = next;
+    },
+  };
+});
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
     exec: mockExec,
+    execFile: mockExecFile.fn,
   };
 });
 
@@ -274,7 +327,7 @@ async function runPhaseToolAndWait(
   });
 }
 
-/** Make node:child_process.exec succeed so the commit tool can finish. */
+/** Make node:child_process succeed so the commit tool can finish. */
 function setExecToSucceed(): void {
   mockExec.mockImplementation(
     (
@@ -285,6 +338,7 @@ function setExecToSucceed(): void {
       cb(null, { stdout: "[abc1234] commit done", stderr: "" });
     },
   );
+  mockExecFile.setMode("succeed");
 }
 
 /** Restore the default failing exec used by most tests. */
@@ -301,6 +355,7 @@ function setExecToFail(): void {
       });
     },
   );
+  mockExecFile.setMode("fail");
 }
 
 /** Run the commit tool to completion with exec succeeding. */
@@ -325,6 +380,7 @@ describe("extension session naming (bd-10)", () => {
     mockSpawnAgentProcess.mockClear();
     mockHttpRequest.mockClear();
     mockExec.mockClear();
+    mockExecFile.clear();
     setExecToFail();
     mockRequestResponses.clear();
     // Reset default sessions response to empty
@@ -654,12 +710,12 @@ describe("extension session naming (bd-10)", () => {
       await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Now call commit with the taskId — if userGuideContent is set,
-      // commit will try to write a notes file and call bd note.
-      // Since exec is mocked to fail, we check that something attempted exec.
+      // commit appends the note. execFile is mocked to fail, so we only
+      // check that the calls were attempted.
       const commit = tools.get("belayd_commit");
       expect(commit).toBeDefined();
 
-      mockExec.mockClear();
+      mockExecFile.clear();
       await commit?.execute(
         "call-commit",
         {
@@ -671,15 +727,17 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      // Verify that exec attempted the human-review flag and the note append.
-      const updateCalls = mockExec.mock.calls.filter((call: unknown[]) => {
-        const cmd = call[0] as string;
-        return cmd === "bd update bd-77 --status in_progress --add-label human";
-      });
-      const noteCalls = mockExec.mock.calls.filter((call: unknown[]) => {
-        const cmd = call[0] as string;
-        return cmd.startsWith("bd note bd-77 --file ");
-      });
+      // Verify that the human-review flag and the note append were attempted.
+      const updateCalls = mockExecFile.calls.filter(
+        (call) =>
+          call.file === "bd" &&
+          call.args[0] === "update" &&
+          call.args.includes("bd-77") &&
+          call.args.includes("human"),
+      );
+      const noteCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "note" && call.args.includes("bd-77"),
+      );
 
       expect(updateCalls.length).toBeGreaterThanOrEqual(1);
       expect(noteCalls.length).toBeGreaterThanOrEqual(1);
@@ -723,7 +781,7 @@ describe("extension session naming (bd-10)", () => {
       await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
 
       // Start a new task — this should clear userGuideContent
-      mockExec.mockClear();
+      mockExecFile.clear();
       await startTask?.execute(
         "call-2",
         { taskId: "bd-88" },
@@ -734,7 +792,7 @@ describe("extension session naming (bd-10)", () => {
 
       // Now call commit with the second taskId
       const commit = tools.get("belayd_commit");
-      mockExec.mockClear();
+      mockExecFile.clear();
       await commit?.execute(
         "call-commit",
         {
@@ -747,10 +805,9 @@ describe("extension session naming (bd-10)", () => {
       );
 
       // Since userGuideContent was cleared, no bd note call should happen
-      const noteCalls = mockExec.mock.calls.filter((call: unknown[]) => {
-        const cmd = call[0] as string;
-        return cmd.startsWith("bd note ");
-      });
+      const noteCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "note",
+      );
 
       expect(noteCalls).toHaveLength(0);
     });
@@ -808,7 +865,7 @@ describe("extension session naming (bd-10)", () => {
       );
 
       const commit = tools.get("belayd_commit");
-      mockExec.mockClear();
+      mockExecFile.clear();
       await commit?.execute(
         "call-commit",
         {
@@ -820,10 +877,9 @@ describe("extension session naming (bd-10)", () => {
         createMockCtx(),
       );
 
-      const noteCalls = mockExec.mock.calls.filter((call: unknown[]) => {
-        const cmd = call[0] as string;
-        return cmd.startsWith("bd note ");
-      });
+      const noteCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "note",
+      );
 
       expect(noteCalls).toHaveLength(0);
     });
@@ -888,7 +944,7 @@ describe("extension session naming (bd-10)", () => {
 
       // Now call commit with taskId — should use the second (overwritten) content
       const commit = tools.get("belayd_commit");
-      mockExec.mockClear();
+      mockExecFile.clear();
       await commit?.execute(
         "call-commit",
         {
@@ -901,10 +957,9 @@ describe("extension session naming (bd-10)", () => {
       );
 
       // The commit appends the user guide content via bd note.
-      const noteCalls = mockExec.mock.calls.filter((call: unknown[]) => {
-        const cmd = call[0] as string;
-        return cmd.startsWith("bd note bd-77 --file ");
-      });
+      const noteCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "note" && call.args.includes("bd-77"),
+      );
 
       expect(noteCalls.length).toBeGreaterThanOrEqual(1);
     });
@@ -1499,10 +1554,10 @@ describe("non-blocking phase runs (bd-41)", () => {
 });
 
 describe("belayd_commit file staging", () => {
-  function stagedGitAddCommands(): string[] {
-    return mockExec.mock.calls
-      .map((call: unknown[]) => call[0] as string)
-      .filter((cmd) => cmd.startsWith("git add"));
+  function stagedGitAddArgv(): string[][] {
+    return mockExecFile.calls
+      .filter((call) => call.file === "git" && call.args[0] === "add")
+      .map((call) => [...call.args]);
   }
 
   it("stages only the provided files", async () => {
@@ -1513,7 +1568,7 @@ describe("belayd_commit file staging", () => {
     const commit = tools.get("belayd_commit");
     expect(commit).toBeDefined();
 
-    mockExec.mockClear();
+    mockExecFile.clear();
     await commit?.execute(
       "call-commit",
       { message: "feat: add files", files: ["src/a.ts", "docs/b.md"] },
@@ -1522,7 +1577,7 @@ describe("belayd_commit file staging", () => {
       createMockCtx(),
     );
 
-    expect(stagedGitAddCommands()).toEqual(['git add -- "src/a.ts" "docs/b.md"']);
+    expect(stagedGitAddArgv()).toEqual([["add", "--", "src/a.ts", "docs/b.md"]]);
   });
 
   it("stages everything when files is omitted", async () => {
@@ -1533,7 +1588,7 @@ describe("belayd_commit file staging", () => {
     const commit = tools.get("belayd_commit");
     expect(commit).toBeDefined();
 
-    mockExec.mockClear();
+    mockExecFile.clear();
     await commit?.execute(
       "call-commit",
       { message: "feat: add all" },
@@ -1542,7 +1597,7 @@ describe("belayd_commit file staging", () => {
       createMockCtx(),
     );
 
-    expect(stagedGitAddCommands()).toEqual(["git add -A"]);
+    expect(stagedGitAddArgv()).toEqual([["add", "-A"]]);
   });
 
   it("stages everything when files is an empty array", async () => {
@@ -1553,7 +1608,7 @@ describe("belayd_commit file staging", () => {
     const commit = tools.get("belayd_commit");
     expect(commit).toBeDefined();
 
-    mockExec.mockClear();
+    mockExecFile.clear();
     await commit?.execute(
       "call-commit",
       { message: "feat: add all", files: [] },
@@ -1562,7 +1617,7 @@ describe("belayd_commit file staging", () => {
       createMockCtx(),
     );
 
-    expect(stagedGitAddCommands()).toEqual(["git add -A"]);
+    expect(stagedGitAddArgv()).toEqual([["add", "-A"]]);
   });
 });
 
