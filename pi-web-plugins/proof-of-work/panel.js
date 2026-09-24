@@ -229,7 +229,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     if (typeof context.terminal?.runCommand !== "function") {
       this.viewer.innerHTML = renderErrorState(
         "Could not start the Trace Viewer.",
-        "This pi-web build does not expose the terminal helper needed to launch it. Run `npx playwright show-trace <file>` in a terminal instead.",
+        "This pi-web build does not expose the terminal helper needed to launch it. Run `playwright show-trace <file>` in a terminal instead (the project devShell provides it); if it is not on PATH use `direnv exec <repo> playwright show-trace <file>` or `nix develop -c playwright show-trace <file>`.",
       );
       return;
     }
@@ -689,7 +689,7 @@ function showTraceCommand({ port, tracePath }) {
     "else",
     `  PW="$(find . \( -name .pnpm -o -name .git -o -name proof-of-work \) -prune -o \( -type f -o -type l \) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
     "fi",
-    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; exit 1; fi`,
+    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; printf 'Or run it via the project devShell: direnv exec <repo> playwright show-trace --port %s "%s", or nix develop -c playwright show-trace --port %s "%s"\n' "$PORT" "$TRACE" "$PORT" "$TRACE"; exit 1; fi`,
     `"$PW" show-trace --port "$PORT" "$TRACE"`,
   ].join("\n");
 }

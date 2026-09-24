@@ -247,6 +247,46 @@ If the script fails to load, the viewer shows: *"Asciinema player failed to load
 3. Switch back to the first workspace.
 4. The panel re-scans and restores its state. Old player instances and blob URLs are disposed (check via DevTools → Performance → Memory for no leaks).
 
+### 12. Verify the Trace Viewer hints (bd-69)
+
+The panel opens Playwright traces with the host `playwright` binary provided by
+the Nix runtime env. On a pi-web build that does **not** expose
+`context.terminal.runCommand`, the panel instead shows a hint telling the user to
+run `playwright show-trace` manually; that hint must never say `npx playwright`.
+
+1. **Run the regression guard.** It asserts `panel.js` contains no
+   `npx playwright`, that both trace hints name `playwright show-trace` plus a
+   devShell escape hatch (`direnv exec` / `nix develop -c`), and that the
+   not-found message quotes the trace argument. Its last test extracts the real
+   not-found branch from `panel.js` and executes it in `bash` with a trace path
+   containing a space, proving the argument survives as one word:
+
+   ```bash
+   pnpm vitest run src/__tests__/panel-trace-hint.test.ts
+   # Observed: Test Files  1 passed (1); Tests  8 passed (8)
+   ```
+
+2. **Open the primary path.** Open the Proof of Work panel, select a
+   `.trace.zip` file, and click **Open in Trace Viewer**. A workspace terminal
+   starts `playwright show-trace --port 9323 <trace.zip>` and a new tab opens the
+   local viewer at `http://localhost:9323` (`TRACE_VIEWER_PORT` is `9323`).
+
+   > The `openTrace()` fallback message (the `npx` → `playwright` change) is only
+   > rendered when the pi-web build does not expose
+   > `context.terminal.runCommand`. On builds that expose the helper, clicking
+   > the button never shows that message.
+
+3. **Check the not-found message.** If `playwright` is not on `PATH` and no
+   `node_modules/.bin/playwright` is found, the terminal shows these two lines:
+
+   ```text
+   ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set.
+   Or run it via the project devShell: direnv exec <repo> playwright show-trace --port 9323 "/tmp/my proof dir/trace.zip", or nix develop -c playwright show-trace --port 9323 "/tmp/my proof dir/trace.zip"
+   ```
+
+   The trace argument is emitted quoted, so the command is copy-pasteable even
+   when the path contains spaces.
+
 ---
 
 ## How to Use
@@ -338,7 +378,7 @@ are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 | Extension | Renderer | Notes |
 |---|---|---|
 | `.cast` | [asciinema-player](https://github.com/asciinema/asciinema-player) — terminal playback with play/pause, speed control, resize | Loaded from `vendor/asciinema-player.min.js`. Configured with `fit: "width"`, `terminalFontSize: "small"` |
-| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the local Trace Viewer (DOM snapshots, scrubbable screencast, network, console) |
+| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the local Trace Viewer (DOM snapshots, scrubbable screencast, network, console). If `playwright` is not on `PATH`, run it from the devShell: `direnv exec . playwright show-trace --port 9323 <trace.zip>` (or `nix develop -c playwright show-trace --port 9323 <trace.zip>`) |
 | `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen; or an explicit "Could not load media preview" error if preview bytes are unavailable |
 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; fitted with `max-width`/`max-height` + `object-fit: contain`, `referrerpolicy="no-referrer"`, `decoding="async"` |
 | `.md` | [marked](https://marked.js.org/) → sanitized HTML | GFM tables, autolinks, task lists. Script tags and `on*` attributes are stripped |
@@ -454,6 +494,36 @@ path.
   (`BELAYD_PROOF_DIR` users list that path instead).
 - The setting applies on the next file request; click ↻ **Refresh** or reload
   the browser tab if the existing view is stale.
+
+#### "Could not start the Trace Viewer."
+
+Clicking **Open in Trace Viewer** shows *"Could not start the Trace Viewer."*
+
+- Cause: the pi-web build does not expose `context.terminal.runCommand`, or the
+  viewer launch failed. Run `playwright show-trace <file>` in a terminal; the
+  project devShell provides it. If it is not on `PATH`, use
+  `direnv exec <repo> playwright show-trace <file>` or
+  `nix develop -c playwright show-trace <file>`.
+- See [docs/playwright-proof-env.md](../../docs/playwright-proof-env.md) for how
+  the devShell/pi-web toolchain provides `playwright`.
+- Do not run `npx playwright` or `playwright install`; see the same doc for why
+  `playwright install` is forbidden on this host.
+
+#### "ERROR: playwright CLI not found on PATH."
+
+The trace-viewer terminal prints:
+
+```text
+ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set.
+```
+
+- The session `PATH` does not include the runtime env's `playwright`, and no
+  `node_modules/.bin/playwright` was found. Use the `direnv exec …` /
+  `nix develop -c …` command quoted in the message to run the viewer from the
+  project devShell instead.
+- Do not run `npx playwright` or `playwright install`; see
+  [docs/playwright-proof-env.md](../../docs/playwright-proof-env.md) for why
+  `playwright install` is forbidden on this host.
 
 #### "Could not load media preview"
 
