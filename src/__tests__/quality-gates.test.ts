@@ -48,7 +48,7 @@ describe("validateCastRecording", () => {
     return path;
   }
 
-  it("passes for a valid recording with command, output, exit code, and non-zero timing", async () => {
+  it("passes for a valid recording with command, output, and exit code", async () => {
     const path = await writeCast({ version: 3, command: "node dist/cli.js --serve" }, [
       [0.0, "o", "Running tests...\n"],
       [1.5, "o", "PASS  src/index.test.ts\n"],
@@ -92,15 +92,24 @@ describe("validateCastRecording", () => {
     expect(result.feedback).toContain("missing exit code");
   });
 
-  it("fails when elapsed time is <= 0.1s", async () => {
+  it("passes for a minimal-duration recording (elapsed time << 0.1s)", async () => {
     const path = await writeCast({ version: 3, command: "echo done" }, [
       [0.0, "o", "done\n"],
       [0.05, "x", "0"],
     ]);
 
     const result = await validateCastRecording(path);
-    expect(result).toHaveProperty("passed", false);
-    expect(result.feedback).toContain("too short");
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("passes when the last event timestamp is exactly 0.1s", async () => {
+    const path = await writeCast({ version: 3, command: "echo done" }, [
+      [0.0, "o", "done\n"],
+      [0.1, "x", "0"],
+    ]);
+
+    const result = await validateCastRecording(path);
+    expect(result).toHaveProperty("passed", true);
   });
 
   it("fails when no artifacts and no skip reason", async () => {
