@@ -79,9 +79,28 @@ const mockExec = vi.hoisted(() =>
   ),
 );
 
+// `bd show` now runs through execFile (no shell); fail it because there is no
+// bd CLI in tests so workflow resolution falls back to the CLI type argument.
+const mockExecFile = vi.hoisted(() =>
+  vi.fn(
+    (
+      _file: string,
+      _args: readonly string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const stdin = {
+        on: () => {},
+        end: () => cb(new Error("bd not available"), "", ""),
+      };
+      return { stdin };
+    },
+  ),
+);
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, exec: mockExec };
+  return { ...actual, exec: mockExec, execFile: mockExecFile };
 });
 
 // Capture every spawnAgentWithFallback call the extension makes; everything
@@ -212,6 +231,7 @@ describe("extension modelClass threading", () => {
   afterEach(() => {
     rmSync(workDir, { recursive: true, force: true });
     mockExec.mockClear();
+    mockExecFile.mockClear();
   });
 
   it("threads the agent's declared modelClass to spawnAgentWithFallback", async () => {

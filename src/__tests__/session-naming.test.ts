@@ -4,6 +4,7 @@ import {
   computePlanningSubagentSessionName,
   computeSubagentSessionName,
   generateShortRunId,
+  isValidTaskId,
 } from "../session-naming.js";
 
 describe("computeSubagentSessionName", () => {
@@ -149,6 +150,67 @@ describe("input validation", () => {
     expect(() =>
       computeSubagentSessionName("bd-42", "scout", undefined as unknown as string),
     ).toThrow("shortRunId must be a non-empty string");
+  });
+});
+
+describe("isValidTaskId (shell-injection gate, bd-71)", () => {
+  // readTaskMetadata/readTaskPlan route the taskId through execFile argv
+  // (no shell), but the disk-resume and start-task paths rely on this gate
+  // to keep a crafted id out of argv at all. A weakened regex that accepted
+  // a metacharacter would let attacker-controlled bytes reach a positional
+  // argv element — and any future regression back to the `bd show ${taskId}`
+  // shell-string form would be exploitable. These cases pin the contract.
+  it("accepts beads ids and subtask notation", () => {
+    expect(isValidTaskId("bd-42")).toBe(true);
+    expect(isValidTaskId("bd-1")).toBe(true);
+    expect(isValidTaskId("bd-9999")).toBe(true);
+    expect(isValidTaskId("bd-42.1")).toBe(true);
+    expect(isValidTaskId("bd-42.1.7")).toBe(true);
+  });
+
+  it("rejects empty and non-string inputs", () => {
+    expect(isValidTaskId("")).toBe(false);
+    expect(isValidTaskId("  ")).toBe(false);
+    expect(isValidTaskId(null as unknown as string)).toBe(false);
+    expect(isValidTaskId(undefined as unknown as string)).toBe(false);
+    expect(isValidTaskId(42 as unknown as string)).toBe(false);
+  });
+
+  it("rejects shell command chaining", () => {
+    expect(isValidTaskId("bd-42;rm -rf /")).toBe(false);
+    expect(isValidTaskId("bd-42; rm -rf /")).toBe(false);
+    expect(isValidTaskId("bd-42 && echo pwned")).toBe(false);
+    expect(isValidTaskId("bd-42 | cat")).toBe(false);
+    expect(isValidTaskId("bd-42||echo pwned")).toBe(false);
+  });
+
+  it("rejects command substitution", () => {
+    expect(isValidTaskId("bd-42$(whoami)")).toBe(false);
+    expect(isValidTaskId("bd-42`whoami`")).toBe(false);
+    expect(isValidTaskId("$(id)bd-42")).toBe(false);
+  });
+
+  it("rejects quotes that could break out of surrounding strings", () => {
+    expect(isValidTaskId('bd-42"')).toBe(false);
+    expect(isValidTaskId("bd-42'")).toBe(false);
+    expect(isValidTaskId('bd-42";rm -rf /;"')).toBe(false);
+  });
+
+  it("rejects whitespace and shell-special bytes", () => {
+    expect(isValidTaskId("bd-42 ")).toBe(false);
+    expect(isValidTaskId(" bd-42")).toBe(false);
+    expect(isValidTaskId("bd-42\t")).toBe(false);
+    expect(isValidTaskId("bd-42\n")).toBe(false);
+    expect(isValidTaskId("bd-4>2")).toBe(false);
+    expect(isValidTaskId("bd-4<2")).toBe(false);
+    expect(isValidTaskId("bd-4&2")).toBe(false);
+  });
+
+  it("rejects ids that do not start with the bd- prefix", () => {
+    expect(isValidTaskId("bad-id")).toBe(false);
+    expect(isValidTaskId("my-task-123")).toBe(false);
+    expect(isValidTaskId("42")).toBe(false);
+    expect(isValidTaskId("bd-")).toBe(false);
   });
 });
 

@@ -19,23 +19,57 @@ process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-coold
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
-const mockExec = vi.hoisted(() => {
-  let showOutput = "";
-  const fn = vi.fn(
+// Quality gates shell out via `exec` (shell); fail them so gate-retry paths
+// settle deterministically instead of running real pnpm.
+const mockExec = vi.hoisted(() =>
+  vi.fn(
     (
-      cmd: string,
+      _cmd: string,
       _opts: unknown,
       cb: (err: Error | null, stdout: string, stderr: string) => void,
     ) => {
-      if (cmd === "bd show bd-42") {
-        cb(null, showOutput, "");
-        return;
-      }
-      cb(new Error("bd not available"), "", "");
+      cb(new Error("pnpm not available in test environment"), "", "");
+    },
+  ),
+);
+
+interface ExecFileRecord {
+  file: string;
+  args: readonly string[];
+}
+
+// `bd show bd-42` resolves the bead plan; every other bd lookup fails so
+// workflow resolution falls back to the CLI type argument.
+const mockExecFile = vi.hoisted(() => {
+  const calls: ExecFileRecord[] = [];
+  let showOutput = "";
+  const fn = vi.fn(
+    (
+      file: string,
+      args: readonly string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      calls.push({ file, args });
+      const stdin = {
+        on: () => {},
+        end: () => {
+          if (file === "bd" && args.length === 2 && args[0] === "show" && args[1] === "bd-42") {
+            cb(null, showOutput, "");
+            return;
+          }
+          cb(new Error("bd not available"), "", "");
+        },
+      };
+      return { stdin };
     },
   );
   return {
     fn,
+    calls,
+    clear: () => {
+      calls.length = 0;
+    },
     setShowOutput: (out: string) => {
       showOutput = out;
     },
@@ -46,13 +80,18 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
-    exec: mockExec.fn,
+    exec: mockExec,
+    execFile: mockExecFile.fn,
     execSync: () => {
       throw new Error("no execSync in test");
     },
     execFileSync: () => "",
   };
 });
+
+// readTaskMetadata/readTaskPlan sit behind isValidTaskId, so crafted ids never
+// reach them in normal operation. The argv-routing regression test drives a
+// valid id and asserts the shell path is never used.
 
 const httpCalls = vi.hoisted(() => {
   const calls: Array<{ method: string; path: string }> = [];
@@ -195,8 +234,9 @@ describe("/plan command (bd-51)", () => {
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
-    mockExec.fn.mockClear();
-    mockExec.setShowOutput("");
+    mockExecFile.fn.mockClear();
+    mockExecFile.clear();
+    mockExecFile.setShowOutput("");
     mockHttpRequest.mockClear();
     httpCalls.clear();
     spawnCalls.clear();
@@ -343,8 +383,9 @@ describe("/belayd implement-first workflow (bd-51)", () => {
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
-    mockExec.fn.mockClear();
-    mockExec.setShowOutput("");
+    mockExecFile.fn.mockClear();
+    mockExecFile.clear();
+    mockExecFile.setShowOutput("");
     mockHttpRequest.mockClear();
     spawnCalls.clear();
   });
@@ -369,7 +410,7 @@ describe("/belayd implement-first workflow (bd-51)", () => {
   });
 
   it("prepends the bead plan when bd show bd-42 returns output", async () => {
-    mockExec.setShowOutput("## Overview\nPlan text here");
+    mockExecFile.setShowOutput("## Overview\nPlan text here");
     const { api, tools } = createMockPi();
     const factory = await loadExtension();
     factory(api);
@@ -394,5 +435,72 @@ describe("/belayd implement-first workflow (bd-51)", () => {
     const first = spawnCalls.calls[0] as { task?: string };
     expect(first.task).toContain("Bead plan (bd-42)");
     expect(first.task).toContain("Plan text here");
+  });
+
+  it("routes bd show through execFile argv and never the shell", async () => {
+    // isValidTaskId rejects shell metacharacters, so the security property is
+    // that the shell (exec) path is never used for bd at all.
+    const { api, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx(cwd);
+
+    const start = tools.get("belayd_start_task");
+    expect(start).toBeDefined();
+    await start?.execute("call-start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    // The implement phase reads the bead plan for the active task.
+    const impl = tools.get("belayd_implement");
+    expect(impl).toBeDefined();
+    await impl?.execute("call-inject", { task: "implement plan" }, undefined, undefined, ctx);
+
+    const showArgv = mockExecFile.calls
+      .filter((call) => call.file === "bd" && call.args[0] === "show")
+      .map((call) => call.args);
+
+    // The id arrives as its own argv element; no shell string is ever built.
+    expect(showArgv).toContainEqual(["show", "bd-42", "--json"]);
+    expect(showArgv).toContainEqual(["show", "bd-42"]);
+    const shellCommands = mockExec.mock.calls.map(([cmd]) => cmd);
+    expect(shellCommands.every((cmd) => !cmd.includes("bd show"))).toBe(true);
+  });
+
+  it("rejects a malicious taskId at the gate so no bd argv is ever built (bd-71)", async () => {
+    // The security fix routes readTaskMetadata/readTaskPlan through execFile
+    // argv. Defense-in-depth still requires that a crafted taskId never
+    // reaches argv at all: isValidTaskId must reject metacharacters before
+    // the gate activates, so currentTaskId stays empty and the implement
+    // phase never calls `bd show` with attacker bytes.
+    const maliciousIds = [
+      "bd-42;rm -rf /",
+      "bd-42$(whoami)",
+      "bd-42`whoami`",
+      'bd-42";rm -rf /;"',
+      "bd-42'",
+      "bd-42 && echo pwned",
+    ];
+
+    for (const taskId of maliciousIds) {
+      mockExecFile.clear();
+      const { api, tools } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+
+      const ctx = makeCtx(cwd);
+
+      const start = tools.get("belayd_start_task");
+      expect(start).toBeDefined();
+      const result = await start?.execute("call-start", { taskId }, undefined, undefined, ctx);
+
+      // The gate rejects the id and returns an error without activating.
+      const text =
+        (result as { content: Array<{ type: string; text: string }> }).content[0]?.text ?? "";
+      expect(text).toContain("Invalid task id");
+
+      // No bd command of any kind is spawned for a malicious id.
+      const bdCalls = mockExecFile.calls.filter((call) => call.file === "bd");
+      expect(bdCalls).toHaveLength(0);
+    }
   });
 });

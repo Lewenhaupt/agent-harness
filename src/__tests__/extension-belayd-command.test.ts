@@ -22,14 +22,19 @@ process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-coold
 const state = vi.hoisted(() => ({ worktreeDir: "" }));
 
 // `bd show` lookups fail (no bd CLI in tests) → workflow falls back to "feature".
-const mockExec = vi.hoisted(() =>
+const mockExecFile = vi.hoisted(() =>
   vi.fn(
     (
-      _cmd: string,
+      _file: string,
+      _args: readonly string[],
       _opts: unknown,
-      cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
     ) => {
-      cb(new Error("bd not available"), { stdout: "", stderr: "" });
+      const stdin = {
+        on: () => {},
+        end: () => cb(new Error("bd not available"), "", ""),
+      };
+      return { stdin };
     },
   ),
 );
@@ -56,7 +61,8 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
-    exec: mockExec,
+    exec: vi.fn(),
+    execFile: mockExecFile,
     execSync: mockExecSync,
     execFileSync: mockExecFileSync,
   };
@@ -160,7 +166,7 @@ describe("/belayd command daemon delegation", () => {
 
   afterEach(() => {
     rmSync(worktreeDir, { recursive: true, force: true });
-    mockExec.mockClear();
+    mockExecFile.mockClear();
     mockExecSync.mockClear();
     mockExecFileSync.mockClear();
     mockHttpRequest.mockClear();
