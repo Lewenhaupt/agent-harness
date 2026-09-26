@@ -159,7 +159,10 @@ async function loadExtension() {
 }
 
 /** A successful spawn result shaped like the real SpawnWithFallbackResult. */
-function fallbackResult(model: string): {
+function fallbackResult(
+  model: string,
+  text: string = `agent output for ${model}`,
+): {
   result: {
     content: Array<{ type: "text"; text: string }>;
     details: { messages: unknown[]; usage: unknown; exitCode: number; model: string };
@@ -168,7 +171,7 @@ function fallbackResult(model: string): {
 } {
   return {
     result: {
-      content: [{ type: "text", text: `agent output for ${model}` }],
+      content: [{ type: "text", text }],
       details: {
         messages: [],
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
@@ -319,6 +322,36 @@ describe("extension modelClass threading", () => {
     const plan = tools.get("belayd_plan");
     expect(plan).toBeDefined();
     await plan?.execute("call-4", { task: "plan it" }, undefined, undefined, ctx);
+
+    await vi.waitFor(() => expect(mockSpawnAgentWithFallback).toHaveBeenCalledTimes(1));
+
+    const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
+      | { model: string; modelClass?: string }
+      | undefined;
+    expect(options?.model).toBe("opencode-go/deepseek-v4.1-flash");
+    expect(options?.modelClass).toBe("frontier");
+  });
+
+  it("threads the proof generator's frontier class to spawnAgentWithFallback", async () => {
+    // The proof agent declares modelClass "frontier" with no per-role model,
+    // so resolveModelSpec resolves to the frontier primary. Its quality gate
+    // (gateProofContent) inspects the run output; returning a documented skip
+    // reason lets the gate pass on the first attempt so exactly one spawn
+    // happens — mirroring the planner's single-spawn assertion shape.
+    mockSpawnAgentWithFallback.mockImplementation((options: { model: string }) =>
+      Promise.resolve(fallbackResult(options.model, "**Proof skipped:** doc-only")),
+    );
+
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("mc-proof", workDir);
+    await commands.get("belayd")?.handler("bd-93 feature --no-worktree", ctx);
+
+    const proof = tools.get("belayd_proof");
+    expect(proof).toBeDefined();
+    await proof?.execute("call-5", { task: "capture proof" }, undefined, undefined, ctx);
 
     await vi.waitFor(() => expect(mockSpawnAgentWithFallback).toHaveBeenCalledTimes(1));
 
