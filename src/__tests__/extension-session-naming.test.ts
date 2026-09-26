@@ -601,7 +601,7 @@ describe("extension session naming (bd-10)", () => {
   });
 
   describe("runQualityGate retry naming", () => {
-    it("retries multiple times with unique -retry-N suffixes when the gate keeps failing", async () => {
+    it("resumes the original session then alternates fresh/resumed epochs", async () => {
       const { api, tools } = createMockPi();
       const factory = await loadExtension();
       factory(api);
@@ -632,23 +632,79 @@ describe("extension session naming (bd-10)", () => {
       // Since we mocked exec to fail, the gate keeps failing, so the harness
       // retries until MAX_GATE_ATTEMPTS (10) passes: 1 initial + 9 retries.
       await vi.waitFor(() => {
-        const retryCalls = mockSpawnAgentProcess.mock.calls.filter((call: unknown[]) => {
-          const opts = call[0] as Record<string, unknown>;
-          return typeof opts.sessionName === "string" && opts.sessionName.includes("-retry-");
-        });
-        expect(retryCalls).toHaveLength(9);
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(10);
       });
 
-      const retryCalls = mockSpawnAgentProcess.mock.calls.filter((call: unknown[]) => {
-        const opts = call[0] as Record<string, unknown>;
-        return typeof opts.sessionName === "string" && opts.sessionName.includes("-retry-");
+      const optionsFor = (index: number): Record<string, unknown> =>
+        mockSpawnAgentProcess.mock.calls[index]?.[0] as Record<string, unknown>;
+      const baseName = optionsFor(0).sessionName as string;
+      expect(baseName).toMatch(/^belayd-bd-50-sub-implement-/);
+
+      const expected = [
+        { sessionName: baseName, resumeSession: true },
+        { sessionName: baseName, resumeSession: true },
+        { sessionName: `${baseName}-retry-3`, resumeSession: false },
+        { sessionName: `${baseName}-retry-3`, resumeSession: true },
+        { sessionName: `${baseName}-retry-5`, resumeSession: false },
+        { sessionName: `${baseName}-retry-5`, resumeSession: true },
+        { sessionName: `${baseName}-retry-7`, resumeSession: false },
+        { sessionName: `${baseName}-retry-7`, resumeSession: true },
+        { sessionName: `${baseName}-retry-9`, resumeSession: false },
+      ];
+      expected.forEach((want, offset) => {
+        const opts = optionsFor(offset + 1);
+        expect(opts.sessionName).toBe(want.sessionName);
+        expect(opts.resumeSession).toBe(want.resumeSession);
       });
-      const names = retryCalls.map(
-        (call: unknown[]) => (call[0] as Record<string, unknown>).sessionName as string,
+
+      // Resumed retries still deliver the gate feedback as the task text.
+      expect(optionsFor(1).task).toContain("Previous attempt failed quality gate");
+      expect(optionsFor(2).task).toContain("Previous attempt failed quality gate");
+      // A fresh epoch starts without the transcript, so it also gets the
+      // original task plus every accumulated gate verdict.
+      expect(optionsFor(3).task).toContain("## Original task");
+      expect(optionsFor(3).task).toContain("## Previous quality-gate failures");
+      expect(optionsFor(3).task).toContain("implement");
+      expect(optionsFor(2).task).not.toContain("## Original task");
+    });
+
+    it("passes the built (bead plan) task to a fresh-epoch retry", async () => {
+      // Succeeding `bd show` makes buildTask prepend the bead plan, so a
+      // fresh-epoch retry must carry it rather than the raw params.task.
+      mockExecFile.setMode("succeed");
+      const { api, tools } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+
+      const startTask = tools.get("belayd_start_task");
+      await startTask?.execute(
+        "call-1",
+        { taskId: "bd-50", workflowType: "chore" },
+        undefined,
+        undefined,
+        createMockCtx(),
       );
-      expect(new Set(names).size).toBe(9);
-      expect(names[0]).toMatch(/^belayd-bd-50-sub-implement-.+-retry-1$/);
-      expect(names[8]).toMatch(/^belayd-bd-50-sub-implement-.+-retry-9$/);
+
+      const implement = tools.get("belayd_implement");
+      await implement?.execute(
+        "call-2",
+        { task: "implement" },
+        undefined,
+        undefined,
+        createMockCtx(),
+      );
+
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(10);
+      });
+
+      const freshEpoch = mockSpawnAgentProcess.mock.calls[3]?.[0] as Record<string, unknown>;
+      expect(freshEpoch.task).toContain("## Bead plan (bd-50)");
+      expect(freshEpoch.task).toContain("## Original task");
+      // The resumed opening retries must not see the built task (transcript
+      // already has it); they get only the retry note.
+      const resumed = mockSpawnAgentProcess.mock.calls[1]?.[0] as Record<string, unknown>;
+      expect(resumed.task).not.toContain("## Bead plan");
     });
   });
 

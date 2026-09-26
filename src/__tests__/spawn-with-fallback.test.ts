@@ -364,6 +364,7 @@ describe("spawnAgentWithFallback", () => {
     expect(Object.keys(call ?? {}).sort()).toEqual([
       "model",
       "sessionName",
+      "suppressResumeWarning",
       "systemPrompt",
       "task",
       "tools",
@@ -374,6 +375,7 @@ describe("spawnAgentWithFallback", () => {
       systemPrompt: "t",
       task: "t",
       sessionName: undefined,
+      suppressResumeWarning: false,
     });
   });
 
@@ -418,6 +420,42 @@ describe("spawnAgentWithFallback", () => {
     expect(mockSpawnAgentProcess).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ model: "b", sessionName: "belayd-x-fallback-1" }),
+    );
+  });
+
+  it("shares the base session id across candidates in resume mode", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("a"))
+      .mockResolvedValueOnce(makeResult("b"));
+
+    await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["a", "b"],
+      sessionName: "belayd-x-retry-3",
+      resumeSession: true,
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ model: "a", sessionName: "belayd-x-retry-3", resumeSession: true }),
+    );
+    expect(mockSpawnAgentProcess).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ model: "b", sessionName: "belayd-x-retry-3", resumeSession: true }),
+    );
+    // The resume-unavailable warning is a per-spawn concern: only the first
+    // candidate may warn, so later candidates suppress it.
+    expect(mockSpawnAgentProcess).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ suppressResumeWarning: false }),
+    );
+    expect(mockSpawnAgentProcess).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ suppressResumeWarning: true }),
     );
   });
 

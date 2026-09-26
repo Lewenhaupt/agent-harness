@@ -17,6 +17,7 @@ import { existsSync, mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js";
+import { resolveProjectSessionExists } from "./session-naming.js";
 import { setupWorktree } from "./worktree.js";
 
 /** Cached path to the pi binary, resolved once. */
@@ -79,7 +80,65 @@ export function buildSpawnArgs(options: SpawnOptions): BuiltSpawnArgs {
   args.push("--model", model);
   args.push("--tools", tools.join(","));
 
-  // Write system prompt to a temp file so we don't hit shell arg limits
+  const runCwd = worktreePath ?? cwd ?? process.cwd();
+  if (shouldResumeSession(options, effectiveSessionId, runCwd)) {
+    args.push(task);
+    return {
+      args,
+      sessionId: effectiveSessionId,
+      piBinary: resolvePiBinary(),
+      worktreePath,
+      tempDir: undefined,
+      tempFile: undefined,
+    };
+  }
+
+  const { tempDir, tempFile } = appendSystemPromptArgs(args, systemPrompt, task);
+  return {
+    args,
+    sessionId: effectiveSessionId,
+    piBinary: resolvePiBinary(),
+    worktreePath,
+    tempDir,
+    tempFile,
+  };
+}
+
+/**
+ * Decide whether the run can resume an existing session.
+ *
+ * Resume reuses pi's create-or-resume `--session-id` behaviour: the transcript
+ * already carries the system prompt, so it must not be re-appended (and no temp
+ * file is needed). pi silently creates a NEW session when the id is unknown, so
+ * an existence pre-check decides the path deterministically and we warn rather
+ * than trusting pi's warning.
+ */
+function shouldResumeSession(options: SpawnOptions, sessionId: string, runCwd: string): boolean {
+  if (options.resumeSession !== true) return false;
+
+  const resumeEnv = options.env === undefined ? process.env : { ...process.env, ...options.env };
+  if (resolveProjectSessionExists(sessionId, { cwd: runCwd, env: resumeEnv })) {
+    return true;
+  }
+
+  if (options.suppressResumeWarning !== true) {
+    console.warn(
+      `[belayd-harness] resume requested for session ${sessionId} but it does not exist; starting a fresh session`,
+    );
+  }
+  return false;
+}
+
+/**
+ * Write the system prompt to a temp file so we don't hit shell arg limits, then
+ * append it and the task to argv. A partial temp file/dir is cleaned up if the
+ * write fails so the caller never leaks one.
+ */
+function appendSystemPromptArgs(
+  args: string[],
+  systemPrompt: string,
+  task: string,
+): { tempDir: string; tempFile: string } {
   let tmpDir: string | undefined;
   let tmpFile: string | undefined;
   try {
@@ -87,20 +146,9 @@ export function buildSpawnArgs(options: SpawnOptions): BuiltSpawnArgs {
     tmpFile = join(tmpDir, "system-prompt.md");
     writeFileSync(tmpFile, systemPrompt, "utf-8");
     args.push("--append-system-prompt", tmpFile);
-
-    // Add the task as the prompt argument
     args.push(task);
-
-    return {
-      args,
-      sessionId: effectiveSessionId,
-      piBinary: resolvePiBinary(),
-      worktreePath,
-      tempDir: tmpDir,
-      tempFile: tmpFile,
-    };
+    return { tempDir: tmpDir, tempFile: tmpFile };
   } catch (error) {
-    // Don't leak a partially created temp dir when the prompt write fails.
     if (tmpFile !== undefined) {
       try {
         unlinkSync(tmpFile);

@@ -1,4 +1,6 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Create the mock spawn function before the vi.mock hoisting.
@@ -650,5 +652,96 @@ describe("spawn abort handling (bd-41)", () => {
     expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
 
     handle.cleanup();
+  });
+});
+
+describe("buildSpawnArgs resumeSession (bd-74)", () => {
+  let sessionDir = "";
+  const originalEnv = { ...process.env };
+
+  afterEach(() => {
+    if (sessionDir !== "") rmSync(sessionDir, { recursive: true, force: true });
+    const prior = originalEnv.PI_CODING_AGENT_SESSION_DIR;
+    if (prior === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    else process.env.PI_CODING_AGENT_SESSION_DIR = prior;
+  });
+
+  it("omits --append-system-prompt but keeps --session-id and the task when resuming", async () => {
+    sessionDir = mkdtempSync(join(tmpdir(), "belayd-spawn-resume-"));
+    process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+    writeFileSync(
+      join(sessionDir, "2024-01-15T10-00-00-000Z_belayd-resume-me.jsonl"),
+      `${JSON.stringify({ type: "session", version: 3, id: "belayd-resume-me" })}\n`,
+    );
+
+    const mod = await import("../spawn.js");
+    const built = mod.buildSpawnArgs({
+      model: "test-model",
+      tools: ["read"],
+      systemPrompt: "system prompt",
+      task: "retry task text",
+      sessionName: "belayd-resume-me",
+      resumeSession: true,
+    });
+
+    const sessionIdIdx = built.args.indexOf("--session-id");
+    expect(sessionIdIdx).toBeGreaterThan(-1);
+    expect(built.args[sessionIdIdx + 1]).toBe("belayd-resume-me");
+    expect(built.args).not.toContain("--append-system-prompt");
+    expect(built.args.at(-1)).toBe("retry task text");
+    expect(built.tempDir).toBeUndefined();
+    expect(built.tempFile).toBeUndefined();
+  });
+
+  it("falls back to fresh with the system prompt when the session is missing", async () => {
+    sessionDir = mkdtempSync(join(tmpdir(), "belayd-spawn-resume-missing-"));
+    process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mod = await import("../spawn.js");
+      const built = mod.buildSpawnArgs({
+        model: "test-model",
+        tools: ["read"],
+        systemPrompt: "system prompt",
+        task: "retry task text",
+        sessionName: "belayd-not-there",
+        resumeSession: true,
+      });
+      try {
+        expect(built.args).toContain("--append-system-prompt");
+        expect(built.args.at(-1)).toBe("retry task text");
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("resume requested"));
+      } finally {
+        if (built.tempDir !== undefined) rmSync(built.tempDir, { recursive: true, force: true });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("suppresses the resume-unavailable warning when spawn-loop-only flag is set", async () => {
+    sessionDir = mkdtempSync(join(tmpdir(), "belayd-spawn-resume-quiet-"));
+    process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mod = await import("../spawn.js");
+      const built = mod.buildSpawnArgs({
+        model: "test-model",
+        tools: ["read"],
+        systemPrompt: "system prompt",
+        task: "retry task text",
+        sessionName: "belayd-not-there",
+        resumeSession: true,
+        suppressResumeWarning: true,
+      });
+      try {
+        expect(built.args).toContain("--append-system-prompt");
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        if (built.tempDir !== undefined) rmSync(built.tempDir, { recursive: true, force: true });
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
