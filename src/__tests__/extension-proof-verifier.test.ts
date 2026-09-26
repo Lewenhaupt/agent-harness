@@ -19,6 +19,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-pv-cooldowns.json");
 process.env.BELAYD_PROOF_DIR = join(tmpdir(), "belayd-test-pv-proof");
 
+// Reached via `collectChangeContext` (proof-verification.ts), which shells out
+// to git through `promisify(exec)`. The stdout callback arg carries the
+// exec-style `{ stdout, stderr }` object because `promisify` over a plain
+// `vi.fn` lacks exec's custom-args symbol, so the first success value becomes
+// the resolved value and callers read `.stdout` off it. bd lookups use the
+// execFile stub below.
 const mockExec = vi.hoisted(() =>
   vi.fn(
     (
@@ -32,9 +38,25 @@ const mockExec = vi.hoisted(() =>
   ),
 );
 
+// `bd show` now runs through execFile (no shell); fail it so workflow
+// resolution does not depend on a real bd CLI being installed.
+const mockExecFile = vi.hoisted(() =>
+  vi.fn(
+    (
+      _file: string,
+      _args: readonly string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const stdin = { on: () => {}, end: () => cb(new Error("bd not available"), "", "") };
+      return { stdin };
+    },
+  ),
+);
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, exec: mockExec };
+  return { ...actual, exec: mockExec, execFile: mockExecFile };
 });
 
 const mockSpawnAgentWithFallback = vi.hoisted(() => vi.fn());
@@ -90,7 +112,7 @@ describe("belayd_proof_verifier (bd-48)", () => {
   beforeEach(() => {
     workDir = mkdtempSync(join(tmpdir(), "belayd-pv-test-"));
     mockExec.mockReset();
-    // Empty git context by default.
+    // Empty git change context by default (collectChangeContext -> promisify(exec)).
     mockExec.mockImplementation(
       (
         _cmd: string,

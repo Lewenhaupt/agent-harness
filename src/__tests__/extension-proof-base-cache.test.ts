@@ -21,11 +21,33 @@ process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-pbc-cooldow
 process.env.BELAYD_PROOF_DIR = join(tmpdir(), "belayd-test-pbc-global-proof");
 
 const mockResolveProjectProofBase = vi.hoisted(() => vi.fn());
+
+// Reached via `collectChangeContext` (proof-verification.ts), which shells out
+// to git through `promisify(exec)`. The stdout callback arg must carry the
+// exec-style `{ stdout, stderr }` object: `promisify` over a plain `vi.fn` has
+// no exec custom-args symbol, so the first success value becomes the resolved
+// value and callers read `.stdout` off it. bd lookups use the execFile stub.
 const mockExec = vi.hoisted(() => vi.fn());
+
+// `bd show` now runs through execFile (no shell); fail it so workflow
+// resolution does not depend on a real bd CLI being installed.
+const mockExecFile = vi.hoisted(() =>
+  vi.fn(
+    (
+      _file: string,
+      _args: readonly string[],
+      _opts: unknown,
+      cb: (err: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      const stdin = { on: () => {}, end: () => cb(new Error("bd not available"), "", "") };
+      return { stdin };
+    },
+  ),
+);
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, exec: mockExec };
+  return { ...actual, exec: mockExec, execFile: mockExecFile };
 });
 
 // Replace only the git-backed base resolution; bridge and path helpers stay real.
@@ -128,7 +150,9 @@ describe("proof base cache (bd-58)", () => {
     workDir = mkdtempSync(join(tmpdir(), "belayd-pbc-test-"));
     mockResolveProjectProofBase.mockReset();
     mockExec.mockReset();
-    // git and bd are unavailable in tests; both degrade gracefully.
+    // Git change-context commands are unavailable; bd lookups go through the
+    // execFile stub and degrade to "bd not available". Both paths degrade
+    // gracefully so the tests stay hermetic (no real git/bd on PATH).
     mockExec.mockImplementation(
       (
         _cmd: string,

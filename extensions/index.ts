@@ -12,7 +12,7 @@
  * unaffected. Only activates when `belayd_start_task` is called.
  */
 
-import { exec, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
@@ -794,16 +794,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Read title and labels from a beads issue via `bd show --json`. */
-  function readTaskMetadata(taskId: string): Promise<TaskMetadata | undefined> {
-    return new Promise((resolve) => {
-      exec(
-        `bd show ${taskId} --json`,
-        { timeout: 15_000, maxBuffer: 1024 * 1024 },
-        (err, stdout) => {
-          resolve(err ? undefined : parseTaskMetadata(stdout));
-        },
-      );
-    });
+  async function readTaskMetadata(taskId: string, cwd: string): Promise<TaskMetadata | undefined> {
+    try {
+      const { stdout } = await runBdCommand(["show", taskId, "--json"], {
+        cwd,
+        stdin: undefined,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      return parseTaskMetadata(stdout);
+    } catch {
+      return undefined;
+    }
   }
 
   /** Parse the output of `bd show --json` into task metadata. */
@@ -828,12 +830,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
    * Read a bead's full plain-text content via `bd show <taskId>`.
    * Returns undefined on error so callers can proceed without the plan.
    */
-  function readTaskPlan(taskId: string): Promise<string | undefined> {
-    return new Promise((resolve) => {
-      exec(`bd show ${taskId}`, { timeout: 15_000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
-        resolve(err ? undefined : stdout.trim() || undefined);
+  async function readTaskPlan(taskId: string, cwd: string): Promise<string | undefined> {
+    try {
+      const { stdout } = await runBdCommand(["show", taskId], {
+        cwd,
+        stdin: undefined,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
       });
-    });
+      return stdout.trim() || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   // ── Session daemon helpers ────────────────────────────────────────────
@@ -1076,7 +1084,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       }
 
       // Resolve workflow type from CLI argument, task labels, and title
-      const metadata = await readTaskMetadata(taskId);
+      const metadata = await readTaskMetadata(taskId, ctx.cwd);
       const workflowType = resolveWorkflowType(typeArg, metadata?.labels, metadata?.title);
 
       if (typeArg && !isValidWorkflowType(typeArg)) {
@@ -1511,16 +1519,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const spawnAgent = (): Promise<SpawnResult> => {
       const buildTask = async (): Promise<string> => {
         if (phaseName === "implement" && state.currentTaskId !== "") {
-          const plan = await readTaskPlan(state.currentTaskId);
+          const plan = await readTaskPlan(state.currentTaskId, cwd);
           if (plan) {
             return `## Bead plan (${state.currentTaskId})\n${plan}\n\n${params.task}`;
           }
         }
         if (phaseName !== "proof") return params.task;
-        const proofContext = await collectChangeContext(
-          effectiveCwd ?? process.cwd(),
-          state.userGuideContent,
-        );
+        const proofContext = await collectChangeContext(cwd, state.userGuideContent);
         return `${params.task}${proofContext}`;
       };
       return buildTask().then((task) =>
@@ -2201,7 +2206,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         };
       }
 
-      const metadata = await readTaskMetadata(params.taskId);
+      const metadata = await readTaskMetadata(params.taskId, ctx.cwd ?? process.cwd());
       const workflowType = resolveWorkflowType(
         params.workflowType,
         metadata?.labels,
