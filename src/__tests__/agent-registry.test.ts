@@ -51,6 +51,20 @@ describe("DEFAULT_AGENTS", () => {
     }
   });
 
+  it("every agent prompt carries the stale-worktree rebase guidance", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      const prompt = agent.systemPrompt;
+      // Criterion 1: rebase onto the base branch rather than re-implementing.
+      expect(prompt, agent.name).toContain("git rebase main");
+      // Criterion 2: a closed/finished bead may just be absent; check the base.
+      expect(prompt, agent.name).toContain("not be present in this branch yet");
+      expect(prompt, agent.name).toContain("check `main` before duplicating work");
+      // Criterion 3: resolve mid-rebase conflicts toward the landed base work.
+      expect(prompt, agent.name).toContain("Mid-rebase conflicts are expected");
+      expect(prompt, agent.name).toContain("already-landed `main` implementation");
+    }
+  });
+
   it("scout has read-only tools (no edit/write)", () => {
     const scout = DEFAULT_AGENTS.find((a) => a.name === "belayd-scout");
     expect(scout).toBeDefined();
@@ -240,6 +254,16 @@ describe("PROOF_VERIFIER_AGENT", () => {
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("reasonable");
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("non-blocking");
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("## Verdict");
+  });
+
+  it("carries the shared stale-worktree rebase guidance", () => {
+    // Regression guard: PROOF_VERIFIER_AGENT is excluded from DEFAULT_AGENTS, so
+    // the loop over DEFAULT_AGENTS never asserts this prompt inherits the block.
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("git rebase main");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("not be present in this branch yet");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("check `main` before duplicating work");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("Mid-rebase conflicts are expected");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("already-landed `main` implementation");
   });
 
   it("lists the expected tool names", () => {

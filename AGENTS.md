@@ -241,6 +241,16 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
    ```
 5. **Hand off** - Summarize changes, validation, issue status, and any blocked sync/commit/push step
 
+**Stale worktree branches:** A worktree branch may be behind the base branch
+(`main`). A bead marked finished/closed elsewhere may simply not be present in
+the current branch yet, so check `main` before duplicating work. If the work
+already landed there, rebase with `git rebase main` instead of re-implementing
+apparently-missing work. Mid-rebase conflicts are expected: when the branch is
+re-implementing merged work, prefer the already-landed `main` implementation
+over the duplicate. This permission covers rebasing the *local* worktree branch
+onto the base branch only; force-pushing and rewriting shared history are NOT
+implied and still require explicit approval under the active profile.
+
 **Critical rules:**
 - Explicit user or orchestrator instructions override this Beads block.
 - Do not commit or push without clear authority from the active profile or the current user request.

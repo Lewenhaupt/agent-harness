@@ -1276,6 +1276,24 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     ];
   }
 
+  /**
+   * Stale-worktree guidance, restated every turn for every workflow type.
+   *
+   * The orchestrator farms work out to sub-agents whose branches may sit behind
+   * the base branch; without a per-turn reminder an already-merged task looks
+   * "missing" and gets re-implemented, so this is unconditional rather than
+   * tied to a phase.
+   */
+  function worktreeSyncGuidanceLines(): string[] {
+    return [
+      "",
+      "**Stale worktree?**",
+      "- The worktree branch may be behind the base branch (`main`); a task closed elsewhere may simply not be in this branch yet — check `main` before duplicating work.",
+      "- If the work already landed on `main`, rebase with `git rebase main` instead of re-implementing apparently-missing work.",
+      "- Mid-rebase conflicts are expected: when the branch re-implements merged work, prefer the already-landed `main` implementation over the duplicate.",
+    ];
+  }
+
   /** Build the implementation-gate context message, or undefined when inactive. */
   function gateContextMessage(
     state: SessionState,
@@ -1357,6 +1375,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ...reviewFindingsGuidance,
           ...proofVerifierGuidanceLines(phaseOrder),
           ...proofModalityGuidanceLines(phaseOrder),
+          ...worktreeSyncGuidanceLines(),
           ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
