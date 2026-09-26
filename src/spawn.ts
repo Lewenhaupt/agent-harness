@@ -137,6 +137,15 @@ export function launchAgentProcess(
     stderr: "",
   };
 
+  // Build the child environment explicitly and strip BELAYD_SHELL_ACTIVE.
+  // The wrapper's guard exists only to prevent re-entry inside a single shell
+  // process tree; leaking it to a sub-agent makes a sub-agent working in a
+  // DIFFERENT repo's worktree pass through instead of resolving that
+  // worktree's devShell (undercuts bd-47). The agent bash tool sets it around
+  // each command, so re-entry is still guarded where it matters.
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
+  delete childEnv.BELAYD_SHELL_ACTIVE;
+
   // We intentionally do NOT call proc.unref(): a background phase run must keep
   // the parent pi process alive until it completes, otherwise the run would be
   // killed when the tool-call turn finishes.
@@ -145,7 +154,7 @@ export function launchAgentProcess(
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
     detached: options.detached === true,
-    env: options.env === undefined ? process.env : { ...process.env, ...options.env },
+    env: childEnv,
   });
 
   let buffer = "";

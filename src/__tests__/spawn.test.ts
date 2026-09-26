@@ -498,6 +498,57 @@ describe("launchAgentProcess (bd-41)", () => {
   });
 });
 
+describe("launchAgentProcess env (W5)", () => {
+  afterEach(() => {
+    mockSpawn.mockClear();
+  });
+
+  it("strips BELAYD_SHELL_ACTIVE but preserves HOME and PATH", async () => {
+    const original = process.env.BELAYD_SHELL_ACTIVE;
+    process.env.BELAYD_SHELL_ACTIVE = "1";
+    try {
+      const mod = await import("../spawn.js");
+      const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      expect(spawnOptions.env).not.toHaveProperty("BELAYD_SHELL_ACTIVE");
+      expect(spawnOptions.env.HOME).toBe(process.env.HOME);
+      expect(spawnOptions.env.PATH).toBe(process.env.PATH);
+
+      handle.cleanup();
+    } finally {
+      if (original === undefined) {
+        delete process.env.BELAYD_SHELL_ACTIVE;
+      } else {
+        process.env.BELAYD_SHELL_ACTIVE = original;
+      }
+    }
+  });
+
+  it("does not leak the marker from options.env either", async () => {
+    const mod = await import("../spawn.js");
+    const options = {
+      model: "m",
+      tools: ["read"],
+      systemPrompt: "s",
+      task: "t",
+      env: { BELAYD_SHELL_ACTIVE: "1", BELAYD_EXTRA: "x" },
+    };
+    const built = mod.buildSpawnArgs(options);
+    const handle = mod.launchAgentProcess(options, built);
+
+    const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+    const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+    expect(spawnOptions.env).not.toHaveProperty("BELAYD_SHELL_ACTIVE");
+    expect(spawnOptions.env.BELAYD_EXTRA).toBe("x");
+
+    handle.cleanup();
+  });
+});
+
 describe("collectSpawnResult (bd-41)", () => {
   it("flushes a trailing partial stdout line on close", async () => {
     const mod = await import("../spawn.js");

@@ -30,6 +30,7 @@
           belaydPkgs = self.inputs.nixpkgs.legacyPackages.${system};
           pi-web = self.packages.${system}.pi-web;
           pi-web-runtime-env = self.packages.${system}.pi-web-runtime-env;
+          belayd-shell = self.packages.${system}.belayd-shell;
           gccLib = belaydPkgs.stdenv.cc.cc.lib;
           cacert = belaydPkgs.cacert.out;
 
@@ -38,7 +39,9 @@
 
           environment = [
             "HOME=${userHome}"
-            "SHELL=${pi-web-runtime-env}/bin/bash"
+            # Route terminals, plugin runCommand, and workspace removal through
+            # the cwd-aware devShell wrapper instead of a bare bash.
+            "SHELL=${belayd-shell}/bin/belayd-shell"
             "XDG_CONFIG_HOME=${userHome}/.config"
             "XDG_CACHE_HOME=${userHome}/.cache"
             "PI_WEB_HOST=${cfg.host}"
@@ -53,6 +56,18 @@
             "PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}"
             "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1"
           ];
+
+          # Runs before the session daemon: provision the direnv whitelist and
+          # merge the global settings.json shellPath. Both helpers are
+          # non-strict by default, so a corrupt direnv.toml/settings.json warns
+          # and exits 0 — a broken user config must not block the unit.
+          piWebSessiondSetup = pkgs.writeShellScriptBin "pi-web-sessiond-setup" ''
+            set -euo pipefail
+            ${belayd-shell}/bin/belayd-direnv-setup \
+              --toml ${lib.escapeShellArg "${userHome}/.config/direnv/direnv.toml"} \
+              ${lib.concatMapStringsSep " " (p: "--prefix ${lib.escapeShellArg p}") cfg.devShellWhitelistPrefixes}
+            ${belayd-shell}/bin/belayd-shell-path-setup
+          '';
         in
         {
           options.services.belayd-pi-web = {
@@ -76,6 +91,18 @@
               default = null;
               description = "PI_WEB_DATA_DIR; defaults to <home>/.pi-web.";
             };
+            devShellWhitelistPrefixes = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [ "${userHome}/git" ];
+              description = ''
+                Prefixes ensured in ~/.config/direnv/direnv.toml [whitelist]
+                prefix. A whitelisted prefix makes direnv trust every .envrc
+                beneath it *content-independently* — i.e. an arbitrary-code-
+                execution grant for anything a collaborator with VCS write
+                access can commit. Keep the list as narrow as possible; direnv
+                `deny` entries still override it.
+              '';
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -88,6 +115,7 @@
                 Type = "simple";
                 User = cfg.user;
                 Environment = environment;
+                ExecStartPre = "${piWebSessiondSetup}/bin/pi-web-sessiond-setup";
                 ExecStart = "${pi-web}/bin/pi-web-sessiond";
                 Restart = "on-failure";
                 RestartSec = 2;
@@ -331,11 +359,41 @@
           paths = devShellTools ++ [
             pkgs.nix
             pkgs.direnv
+            pkgs.jq
+            belayd-shell
             pkgs.gitMinimal
             pkgs.openssh # ssh-keygen for git SSH signing
           ];
           pathsToLink = [ "/bin" ];
         };
+
+        # belayd-shell — one cwd-aware shell wrapper that resolves the project
+        # devShell from $PWD. Both pi-web units set SHELL to this, and the
+        # global settings.json shellPath points at it, so terminals, plugin
+        # runCommand, workspace removal, the agent bash tool, and spawned
+        # sub-agents all route through the same wrapper.
+        #
+        # The scripts are checked in under scripts/ and substituted here rather
+        # than templated inline, so the in-repo unit tests can render them with
+        # the exact same @placeholder@ substitution (keep flake.nix and the
+        # test helper in sync). @realShell@ is ${pkgs.bash}/bin/bash — the same
+        # bash derivation and version that pi-web-runtime-env links as
+        # /bin/bash (and that the units previously used as SHELL), so it is
+        # behaviorally identical. The indirect path through the env cannot be
+        # referenced here: pi-web-runtime-env's paths include this derivation,
+        # so depending on it would be recursive. The build writes its own store
+        # shebang; the repo scripts keep a portable `#!/usr/bin/env bash`.
+        belayd-shell = pkgs.runCommand "belayd-shell" { } ''
+          mkdir -p "$out/bin"
+          for script in belayd-shell belayd-shell-path-setup belayd-direnv-setup; do
+            sed \
+              -e 's|^#!/usr/bin/env bash$|#!${pkgs.bash}/bin/bash|' \
+              -e 's|@realShell@|${pkgs.bash}/bin/bash|g' \
+              -e 's|@jq@|${pkgs.jq}/bin/jq|g' \
+              "${./scripts}/$script.sh" > "$out/bin/$script"
+            chmod +x "$out/bin/$script"
+          done
+        '';
 
         # pi — the pi coding agent CLI, unconfigured (bare). Kept as the base
         # binary for the configured wrapper below and as an escape hatch.
@@ -522,6 +580,12 @@
           }
           install_if_absent "pi-exa.json" ${./pi-exa.json}
           install_if_absent "vision-tool.json" ${./vision-tool.json}
+          # Fold bd-47: point the agent bash tool (and every spawned sub-agent
+          # that reads global settings) at the devShell wrapper. Idempotent and
+          # non-clobbering; a corrupt settings.json must not block interactive
+          # pi, so ignore the helper's exit status here.
+          ${belayd-shell}/bin/belayd-shell-path-setup \
+            --shell ${belayd-shell}/bin/belayd-shell || true
           exec ${belayd-pi.package}/bin/pi "$@"
         '';
 
@@ -572,7 +636,7 @@
       in
       {
         packages = {
-          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions belayd-pi belayd-skills belayd-harness;
+          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions belayd-pi belayd-skills belayd-harness belayd-shell;
         };
 
         # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`

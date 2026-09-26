@@ -104,6 +104,21 @@ Spawned belayd agents get the same isolation: `.envrc` and the devShell
 shellHook export `PI_BINARY_PATH` pointing at `bin/pi`, and `src/spawn.ts`
 resolves the agent's pi binary from that var first (`resolvePiBinary`).
 
+### devShell routing
+
+Every command pi-web and the harness execute is routed through the project's
+own devShell by one cwd-aware wrapper, `belayd-shell`, wired into two channels:
+`SHELL=<belayd-shell>` on both `pi-web` systemd units (terminals, plugin
+`runCommand`, workspace removal) and `shellPath=<belayd-shell>` in
+`~/.pi/agent/settings.json` (agent `bash` tool and spawned sub-agents, bd-47).
+
+The wrapper resolves the devShell from `$PWD` — one global config, per-repo
+devShells; repos without one pass through, and a `.pi/no-devshell` marker
+forces a pass-through. See
+[docs/pi-web-service.md](docs/pi-web-service.md#how-to-use-devshell-routing)
+for the direnv whitelist caveat, opt-out, nested-shell limitation, and
+verification steps.
+
 ### Third-party npm extensions & custom providers
 
 pi auto-installs packages listed in settings at startup, so for the NixOS
