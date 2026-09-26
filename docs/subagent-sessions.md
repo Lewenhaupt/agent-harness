@@ -13,7 +13,7 @@ convention:
 |-------|---------|---------|
 | **Orchestrator** | `belayd-{taskId}` | `belayd-bd-42` |
 | **Subagent** | `belayd-{taskId}-{phase}-{shortRunId}` | `belayd-bd-42-scout-a1b2c3` |
-| **Quality gate retry** | `belayd-{taskId}-{phase}-{shortRunId}-retry` | `belayd-bd-42-implement-x9y8z7-retry` |
+| **Quality gate retry (fresh epoch)** | `belayd-{taskId}-{phase}-{shortRunId}-retry-{N}` | `belayd-bd-42-implement-x9y8z7-retry-3` |
 
 The `{shortRunId}` is a base-36 timestamp derived from `Date.now()`, providing
 uniqueness across runs without requiring a central counter.
@@ -93,12 +93,49 @@ even if creation-time naming is not supported.
 
 ## Quality Gate Retry Sessions
 
-When a quality gate fails, the retry subagent spawns with the same phase name
-appended with `-retry`. This allows you to distinguish between original attempts
-and retries when inspecting sessions:
+When a quality gate fails, the harness retries the phase agent. Since bd-74 the
+first two retries **resume the original session** rather than starting fresh, so
+the agent can see what it already tried.
 
-- `belayd-bd-42-implement-a1b2c3` — First attempt
-- `belayd-bd-42-implement-a1b2c3-retry` — Quality gate retry
+- **Attempts 1-2** reuse the initial session id (no new session file is
+  created; pi appends to the existing transcript).
+- **Attempt 3** starts a fresh `-retry-3` session; **attempt 4** resumes it.
+- **Attempts 5/6, 7/8, 9/10** repeat that two-attempt epoch pattern
+  (`-retry-5`, `-retry-7`, `-retry-9`).
+
+Sessions for one phase therefore look like:
+
+```
+belayd-bd-42-sub-implement-a1b2c3            # initial spawn
+                                             # attempts 1-2 append here
+belayd-bd-42-sub-implement-a1b2c3-retry-3    # fresh epoch + its resume
+belayd-bd-42-sub-implement-a1b2c3-retry-5    # fresh epoch + its resume
+```
+
+Retries stop after `MAX_GATE_ATTEMPTS = 10` total passes (1 initial + 9
+retries); the final `-retry-9` session is created but never resumed. The
+`IN_SESSION_RETRY_LIMIT = 2` and `MAX_GATE_ATTEMPTS = 10` constants bound
+context growth.
+
+A fresh epoch never sees the prior transcript, so it is re-supplied with the
+original task (the bead plan for implement, the change context for proof) plus
+every gate verdict so far. Resumed retries only carry the latest verdict.
+
+Resume relies on pi's create-or-resume `--session-id`. If the target session
+cannot be found on disk, spawn falls back to a fresh session (re-appending the
+system prompt) and logs `[belayd-harness] resume requested for session ... but
+it does not exist; starting a fresh session` once per spawn loop.
+
+### Inspecting retry sessions
+
+Sessions live under `~/.pi/agent/sessions/<project-slug>/` where the slug is
+`--<abs-cwd-with-slashes-as-dashes>--`:
+
+```bash
+ls -lt ~/.pi/agent/sessions/--home-alice-code-myproject--/ | head
+```
+
+You can also use `pi --resume | grep belayd-bd-42`.
 
 ## Implementation Details
 

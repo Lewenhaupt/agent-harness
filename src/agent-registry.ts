@@ -95,6 +95,21 @@ export interface SpawnOptions {
   env?: Record<string, string>;
   /** Called with partial agent session events as they arrive. */
   onUpdate?: (event: unknown) => void;
+  /**
+   * Resume an existing session with `sessionName` instead of creating a new
+   * one. When true and the session exists on disk, `--append-system-prompt` is
+   * omitted (the transcript already carries it). When the session is missing,
+   * the spawn falls back to a fresh session. Defaults to false.
+   */
+  resumeSession?: boolean;
+  /**
+   * Internal/spawn-loop-only. When true, `buildSpawnArgs` skips the
+   * resume-unavailable `console.warn`. The fallback loop sets this after the
+   * first candidate has spawned so a missing base session warns only once
+   * instead of once per candidate. Direct `spawnAgentProcess` callers leave it
+   * unset and keep the warning.
+   */
+  suppressResumeWarning?: boolean;
 }
 
 // Shared guidance appended to every sub-agent system prompt. Sub-agents are

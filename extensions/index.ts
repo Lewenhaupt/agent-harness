@@ -86,6 +86,7 @@ import {
   computeOrchestratorSessionName,
   computePlanningSubagentSessionName,
   computeSubagentSessionName,
+  gateRetrySession,
   generateShortRunId,
 } from "../src/session-naming.js";
 import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
@@ -95,6 +96,25 @@ import {
   saveCompletedPhases,
   writeWorkflowState,
 } from "../src/workflow-state.js";
+
+// ── Quality-gate run options ──────────────────────────────────────────
+
+/** Inputs for one quality-gate evaluation + retry run. */
+export interface RunQualityGateOptions {
+  agent: AgentDefinition;
+  result: SpawnResult;
+  task: string;
+  workflowType: WorkflowSubType;
+  phaseName: string;
+  cwd?: string;
+  proofDir?: string;
+  env?: Record<string, string>;
+  signal?: AbortSignal;
+  model?: string;
+  modelClass?: ModelClass;
+  tools?: string[];
+  sessionName?: string;
+}
 
 // ── Process gate state ─────────────────────────────────────────────────
 /** Planning mode target: either a new bead or an existing bead to refine. */
@@ -659,34 +679,60 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
-  /** Spawn a single fix-up attempt for a failed quality gate. */
-  function spawnGateRetry(
-    agent: AgentDefinition,
-    feedback: string,
-    options: {
-      cwd?: string;
-      signal?: AbortSignal;
-      model?: string;
-      modelClass?: ModelClass;
-      tools?: string[];
-      sessionName?: string;
-      attempt: number;
-      env?: Record<string, string>;
-    },
-  ): Promise<SpawnResult> {
+  /** Options for one quality-gate fix-up attempt. */
+  interface GateRetryOptions {
+    cwd?: string;
+    signal?: AbortSignal;
+    model?: string;
+    modelClass?: ModelClass;
+    tools?: string[];
+    sessionName?: string;
+    attempt: number;
+    env?: Record<string, string>;
+    /** The phase's original task prompt, prepended on a fresh epoch. */
+    originalTask: string;
+    /** Every gate verdict so far, oldest first. */
+    feedbackHistory: readonly string[];
+  }
+
+  /**
+   * Spawn a single fix-up attempt for a failed quality gate.
+   *
+   * The session/epoch decision comes from `gateRetrySession`: the first two
+   * retries resume the initial session, later two-attempt epochs resume a
+   * freshly-minted `-retry-<n>` session. A fresh epoch never sees the prior
+   * transcript, so it also gets the original task plus every gate verdict.
+   */
+  function spawnGateRetry(agent: AgentDefinition, options: GateRetryOptions): Promise<SpawnResult> {
+    const retry =
+      options.sessionName !== undefined
+        ? gateRetrySession(options.sessionName, options.attempt)
+        : undefined;
+    const resumeSession = retry?.resumeSession ?? false;
+    const latestFeedback = options.feedbackHistory.at(-1) ?? "";
+    const retryNote = `Previous attempt failed quality gate:\n${latestFeedback}\n\nFix the issues and retry.`;
+    // A resumed session already carries the system prompt in its transcript, so
+    // re-appending it would duplicate it. A fresh epoch needs it as usual.
+    const systemPrompt = resumeSession ? "" : agent.systemPrompt;
+    let task = retryNote;
+    if (!resumeSession) {
+      // A fresh epoch has no transcript, so it needs the original task plus
+      // every gate verdict seen so far (resumed retries only need the latest).
+      const previousFailures = options.feedbackHistory.join("\n---\n");
+      task = `## Original task\n${options.originalTask}\n\n## Previous quality-gate failures\n${previousFailures}\n\nFix the issues and retry.`;
+    }
     return spawnAgentWithFallback({
       model: options.model ?? resolveModelSpec(agent).model,
       modelClass: options.modelClass,
       tools: options.tools ?? agent.tools,
-      systemPrompt: agent.systemPrompt,
-      task: `Previous attempt failed quality gate:\n${feedback}\n\nFix the issues and retry.`,
+      systemPrompt,
+      task,
       cwd: options.cwd,
       signal: options.signal,
       detached: true,
       env: options.env,
-      sessionName: options.sessionName
-        ? `${options.sessionName}-retry-${options.attempt}`
-        : undefined,
+      sessionName: retry?.sessionName,
+      resumeSession,
       cooldownStore: modelCooldown,
       enabled: modelFallbackEnabled,
     }).then((r) => r.result);
@@ -712,40 +758,34 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
-  async function runQualityGate(
-    agent: AgentDefinition,
-    result: SpawnResult,
-    params: { task: string; cwd?: string; proofDir?: string; env?: Record<string, string> },
-    workflowType: WorkflowSubType,
-    phaseName: string,
-    signal?: AbortSignal,
-    effectiveModel?: string,
-    effectiveModelClass?: ModelClass,
-    effectiveTools?: string[],
-    sessionName?: string,
-  ): Promise<SpawnResult | null> {
+  async function runQualityGate(options: RunQualityGateOptions): Promise<SpawnResult | null> {
+    const { agent, result, task, workflowType, phaseName } = options;
     if (!ALL_PHASE_NAMES.includes(phaseName)) return null;
     const effectiveGate = resolveQualityGate(phaseName as Phase, workflowType, agent.qualityGate);
     if (!effectiveGate) return null;
 
     let current = result;
+    const feedbackHistory: string[] = [];
 
     // Re-check the gate after every pass, retrying until MAX_GATE_ATTEMPTS
-    // total passes are exhausted. Each retry gets a unique session suffix so
-    // sessions never collide.
+    // total passes are exhausted. Retries resume the prior session for the
+    // first IN_SESSION_RETRY_LIMIT attempts, then alternate fresh epochs and
+    // resumes so context growth stays bounded.
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
       const verdict = await evaluateGate(
         effectiveGate,
         current,
-        params.cwd,
-        params.proofDir,
+        options.cwd,
+        options.proofDir,
         WORKFLOW_REGISTRY[workflowType].proofRequired,
       );
 
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
       }
-      if (attempt === MAX_GATE_ATTEMPTS || (signal?.aborted ?? false)) {
+      // attempt === MAX_GATE_ATTEMPTS short-circuits before spawnGateRetry, so
+      // the final `-retry-9` epoch is created but never resumed.
+      if (attempt === MAX_GATE_ATTEMPTS || (options.signal?.aborted ?? false)) {
         return withGateResult(
           current,
           `❌ **Quality Gates still failing after ${attempt - 1} retries**`,
@@ -753,15 +793,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         );
       }
 
-      current = await spawnGateRetry(agent, verdict.feedback, {
-        cwd: params.cwd,
-        signal,
-        model: effectiveModel,
-        modelClass: effectiveModelClass,
-        tools: effectiveTools,
-        sessionName,
+      feedbackHistory.push(verdict.feedback);
+      current = await spawnGateRetry(agent, {
+        cwd: options.cwd,
+        signal: options.signal,
+        model: options.model,
+        modelClass: options.modelClass,
+        tools: options.tools,
+        sessionName: options.sessionName,
         attempt,
-        env: params.env,
+        env: options.env,
+        originalTask: task,
+        feedbackHistory,
       });
     }
 
@@ -1516,17 +1559,27 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const runStillRelevant = (): boolean =>
       state.gateActive && state.currentTaskId === taskIdAtStart;
 
+    // Captures the task actually sent to the agent (bead plan / change context
+    // included) so a fresh-epoch gate retry can re-supply it. spawnAgent runs
+    // before runGate (see spawnDetachedRun), so it is populated in time.
+    let initialTask: string = params.task;
+
     const spawnAgent = (): Promise<SpawnResult> => {
       const buildTask = async (): Promise<string> => {
         if (phaseName === "implement" && state.currentTaskId !== "") {
           const plan = await readTaskPlan(state.currentTaskId, cwd);
           if (plan) {
-            return `## Bead plan (${state.currentTaskId})\n${plan}\n\n${params.task}`;
+            initialTask = `## Bead plan (${state.currentTaskId})\n${plan}\n\n${params.task}`;
+            return initialTask;
           }
         }
-        if (phaseName !== "proof") return params.task;
+        if (phaseName !== "proof") {
+          initialTask = params.task;
+          return initialTask;
+        }
         const proofContext = await collectChangeContext(cwd, state.userGuideContent);
-        return `${params.task}${proofContext}`;
+        initialTask = `${params.task}${proofContext}`;
+        return initialTask;
       };
       return buildTask().then((task) =>
         spawnAgentWithFallback({
@@ -1550,18 +1603,21 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
 
     const runGate = (result: SpawnResult): Promise<SpawnResult> =>
-      runQualityGate(
+      runQualityGate({
         agent,
         result,
-        { task: params.task, cwd: effectiveCwd, proofDir, env: spawnEnv },
-        state.workflowType,
+        task: initialTask,
+        cwd: effectiveCwd,
+        proofDir,
+        env: spawnEnv,
+        workflowType: state.workflowType,
         phaseName,
-        abortController.signal,
-        effectiveModel,
-        effectiveModelClass,
-        effectiveTools,
-        subagentSessionName,
-      ).then((gateResult) => gateResult ?? result);
+        signal: abortController.signal,
+        model: effectiveModel,
+        modelClass: effectiveModelClass,
+        tools: effectiveTools,
+        sessionName: subagentSessionName,
+      }).then((gateResult) => gateResult ?? result);
 
     const handle = spawnDetachedRun({
       runId,

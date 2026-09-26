@@ -7,8 +7,11 @@
  * immediately — switching models won't fix those and would hide a real
  * misconfiguration.
  *
- * Each attempt gets a fresh session id (a "-fallback-N" suffix) so pi never
- * resumes a half-failed session, and usage/cost is aggregated across attempts.
+ * Each attempt normally gets a fresh session id (a "-fallback-N" suffix) so
+ * pi never resumes a half-failed session. In resume mode (`resumeSession`)
+ * every candidate instead shares the base session name and the spawn layer's
+ * create-or-resume `--session-id` reuses the existing transcript, with usage/
+ * cost still aggregated across attempts.
  *
  * The "retry ONLY on quota" rule keeps deterministic quality-gate failures
  * untouched: those are evaluated by the caller against the returned result,
@@ -94,8 +97,13 @@ function skippedProviderClassification(provider: string): FailureClassification 
   };
 }
 
-/** A fresh session id per attempt so pi never resumes a half-failed session. */
-function sessionNameFor(base: string | undefined, index: number): string | undefined {
+/** A fresh session id per attempt, unless resume mode shares the base session. */
+function sessionNameFor(
+  base: string | undefined,
+  index: number,
+  resumeSession: boolean,
+): string | undefined {
+  if (resumeSession) return base;
   if (index === 0 || base === undefined) return base;
   return `${base}-fallback-${index}`;
 }
@@ -110,9 +118,19 @@ async function runCandidate(
   index: number,
   spawnOptions: SpawnOptions,
   classifyFn: (details: SpawnDetails) => FailureClassification,
+  suppressResumeWarning: boolean,
 ): Promise<CandidateOutcome> {
-  const sessionName = sessionNameFor(spawnOptions.sessionName, index);
-  const result = await spawnAgentProcess({ ...spawnOptions, model: candidate, sessionName });
+  const sessionName = sessionNameFor(
+    spawnOptions.sessionName,
+    index,
+    spawnOptions.resumeSession === true,
+  );
+  const result = await spawnAgentProcess({
+    ...spawnOptions,
+    model: candidate,
+    sessionName,
+    suppressResumeWarning,
+  });
   const classification = classifyFn(result.details);
   const stop = classification.kind !== "quota" && classification.kind !== "transient";
   return { stop, result, classification };
@@ -169,6 +187,10 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
   const attempts: SpawnAttempt[] = [];
   let lastResult: SpawnResult | undefined;
   let totalUsage: SpawnUsage = zeroUsage();
+  // The resume-unavailable warning is per-spawn, not per-candidate: a missing
+  // base session would otherwise warn once for every fallback candidate. Only
+  // the first candidate that actually spawns emits it.
+  let hasSpawned = false;
 
   for (const [index, candidate] of deps.candidates.entries()) {
     if (deps.signal?.aborted) break;
@@ -181,7 +203,14 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
     }
 
     const provider = providerOf(candidate);
-    const outcome = await runCandidate(candidate, index, deps.spawnOptions, deps.classifyFn);
+    const outcome = await runCandidate(
+      candidate,
+      index,
+      deps.spawnOptions,
+      deps.classifyFn,
+      hasSpawned,
+    );
+    hasSpawned = true;
     attempts.push({ model: candidate, classification: outcome.classification });
     lastResult = outcome.result;
     totalUsage = sumUsage(totalUsage, outcome.result.details.usage);

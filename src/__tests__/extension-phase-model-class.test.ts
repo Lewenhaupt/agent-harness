@@ -285,7 +285,7 @@ describe("extension modelClass threading", () => {
     await vi.waitFor(() => expect(mockSpawnAgentWithFallback).toHaveBeenCalledTimes(2));
 
     const first = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
-      | { model: string; modelClass?: string }
+      | { model: string; modelClass?: string; sessionName?: string }
       | undefined;
     // Documentation workflow overrides the implement model without a class:
     // the effective class is undefined so candidatesForModel derives it from
@@ -294,13 +294,22 @@ describe("extension modelClass threading", () => {
     expect(first?.modelClass).toBeUndefined();
 
     const retry = mockSpawnAgentWithFallback.mock.calls[1]?.[0] as
-      | { model: string; modelClass?: string; sessionName?: string; task?: string }
+      | {
+          model: string;
+          modelClass?: string;
+          sessionName?: string;
+          task?: string;
+          resumeSession?: boolean;
+        }
       | undefined;
     expect(retry?.model).toBe("opencode-go/deepseek-v4-flash");
     // spawnGateRetry intentionally has no `?? agent.modelClass` fallback: with
     // an override model in play that fallback would misclassify the tier.
     expect(retry?.modelClass).toBeUndefined();
-    expect(retry?.sessionName).toContain("-retry-1");
+    // The first retry resumes the original session rather than minting a new
+    // -retry-N id (bd-74).
+    expect(retry?.resumeSession).toBe(true);
+    expect(retry?.sessionName).toBe(first?.sessionName);
     expect(retry?.task).toContain("Previous attempt failed quality gate");
   });
 

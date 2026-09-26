@@ -154,8 +154,11 @@ export {
   computeOrchestratorSessionName,
   computePlanningSubagentSessionName,
   computeSubagentSessionName,
+  gateRetrySession,
   generateShortRunId,
+  IN_SESSION_RETRY_LIMIT,
   isValidTaskId,
+  resolveProjectSessionExists,
 } from "./session-naming.js";
 export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
 export {
