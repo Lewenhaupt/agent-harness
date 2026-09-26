@@ -1785,7 +1785,44 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(message).toContain("BELAYD WORKFLOW ACTIVE");
     expect(message).toContain("bd-42");
     expect(message).toContain("Next required step: call `belayd_implement`");
+    // Stale-worktree guidance is unconditional: every gate turn must warn that
+    // an apparently-missing task may simply be unrebased.
+    expect(message).toContain("**Stale worktree?**");
+    expect(message).toContain("git rebase main");
     expect(message).not.toContain("call `belayd_scout`");
+  });
+
+  it("emits the stale-worktree guidance for a non-feature workflow type (bugfix)", async () => {
+    // The guidance helper is unconditional; a non-feature workflow type must
+    // not silently drop it. Bugfix shares the gate path but has a different
+    // phase order, so this also guards that the phase-order switch does not
+    // bypass worktreeSyncGuidanceLines().
+    const cwd = freshWorktree();
+    const bugfixPhases = ["implement", "review", "test", "proof", "commit"] as const;
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        workflowType: "bugfix",
+        phaseOrder: [...bugfixPhases],
+        completedPhaseNames: ["implement"],
+      }),
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    expect(message).toBeTruthy();
+    expect(message).toContain("bugfix");
+    // Next unfinished phase after implement is review.
+    expect(message).toContain("Next required step: call `belayd_review`");
+    // Guidance is present regardless of workflow type.
+    expect(message).toContain("**Stale worktree?**");
+    expect(message).toContain("git rebase main");
+    expect(message).toContain("not be in this branch yet");
+    expect(message).toContain("Mid-rebase conflicts are expected");
   });
 
   it("clears a fully-complete workflow and leaves the gate inactive", async () => {

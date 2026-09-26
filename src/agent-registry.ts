@@ -113,7 +113,17 @@ const COMMUNICATION_GUIDANCE = `
 ## Communication
 - Be extremely concise. When reporting information to me, sacrifice grammar for the sake of concision. Keep responses short but never drop the actual facts — omit filler words, pleasantries, and narrative padding.`;
 
-const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${COMMUNICATION_GUIDANCE}`;
+// Worktree branches are cut from an older base and are not auto-rebased. Without
+// this note agents read already-merged work as "missing", re-implement it, and
+// duplicate commits — so state the recovery path explicitly.
+const WORKTREE_SYNC_GUIDANCE = `
+
+## Stale worktree branch
+- Your worktree branch may be behind the base branch (\`main\`). A task marked finished/closed elsewhere may simply not be present in this branch yet — check \`main\` before duplicating work.
+- If the work already landed on \`main\`, rebase the branch onto the base branch with \`git rebase main\` instead of re-implementing apparently-missing work.
+- Mid-rebase conflicts are expected: when this branch re-implements work already merged to \`main\`, resolve conflicts by preferring the already-landed \`main\` implementation over the duplicate.`;
+
+const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}`;
 
 // ── Default Belayd agents ──────────────────────────────────────────────
 
@@ -451,7 +461,7 @@ Code examples or CLI commands showing how to use the new/changed functionality:
 // Example usage
 \`\`\`
 
-Be specific — use real file paths, function names, and CLI commands from the codebase. The reader has NOT seen the implementation.`;
+Be specific — use real file paths, function names, and CLI commands from the codebase. The reader has NOT seen the implementation.${SHARED_AGENT_GUIDANCE}`;
 
 const COMMITTER_SYSTEM_PROMPT = `You are a committer. Commit the completed work with a conventional commit message.
 
@@ -608,7 +618,7 @@ Emit your verdict AFTER your analysis, in exactly this shape:
 ## Verdict
 reasonable: true|false
 reason: ...
-evidence: ...`;
+evidence: ...${SHARED_AGENT_GUIDANCE}`;
 
 /**
  * The proof verifier agent. Deliberately NOT in DEFAULT_AGENTS — the extension

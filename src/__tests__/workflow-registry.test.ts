@@ -107,6 +107,36 @@ describe("WORKFLOW_REGISTRY", () => {
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.systemPrompt).toBeDefined();
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bd");
   });
+
+  it("every agentOverride systemPrompt still carries the stale-worktree rebase guidance", () => {
+    // Regression guard: an override swaps the whole prompt, so a future
+    // override that forgets SHARED_AGENT_GUIDANCE would silently drop the
+    // rebase instructions. Assert the three acceptance-criteria substrings
+    // on every override that sets a systemPrompt.
+    for (const config of Object.values(WORKFLOW_REGISTRY)) {
+      const overrides = config.agentOverrides;
+      if (!overrides) continue;
+      for (const [phase, override] of Object.entries(overrides)) {
+        if (!override.systemPrompt) continue;
+        // Criterion 1: rebase onto the base branch rather than re-implementing.
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain("git rebase main");
+        // Criterion 2: a closed/finished bead may just be absent; check the base.
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
+          "not be present in this branch yet",
+        );
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
+          "check `main` before duplicating work",
+        );
+        // Criterion 3: resolve mid-rebase conflicts toward the landed base work.
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
+          "Mid-rebase conflicts are expected",
+        );
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
+          "already-landed `main` implementation",
+        );
+      }
+    }
+  });
 });
 
 describe("WORKFLOW_SUB_TYPES", () => {
