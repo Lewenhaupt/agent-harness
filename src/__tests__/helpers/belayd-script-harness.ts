@@ -57,6 +57,7 @@ const REAL_SHELL_STUB = `#!/bin/sh
 printf 'argc=%s\\n' "$#" > "$BELAYD_TEST_ARGV_LOG"
 printf '%s\\n' "$@" >> "$BELAYD_TEST_ARGV_LOG"
 if [ -n "\${BELAYD_TEST_PWD_LOG:-}" ]; then pwd >> "$BELAYD_TEST_PWD_LOG"; fi
+if [ -n "\${BELAYD_TEST_PROFILE_LOG:-}" ]; then printf '%s\\n' "\${__ETC_PROFILE_DONE:-<unset>}" >> "$BELAYD_TEST_PROFILE_LOG"; fi
 printf '%s' "\${BELAYD_TEST_SHELL_STDOUT:-}"
 printf '%s' "\${BELAYD_TEST_SHELL_STDERR:-}" >&2
 exit "\${BELAYD_TEST_SHELL_EXIT:-0}"
@@ -94,6 +95,7 @@ exit "\${BELAYD_TEST_DIRENV_EXIT:-0}"
 const NIX_STUB = `#!/bin/sh
 printf 'argc=%s\\n' "$#" > "$BELAYD_TEST_ARGV_LOG"
 printf '%s\\n' "$@" >> "$BELAYD_TEST_ARGV_LOG"
+if [ -n "\${BELAYD_TEST_PROFILE_LOG:-}" ]; then printf '%s\\n' "\${__ETC_PROFILE_DONE:-<unset>}" >> "$BELAYD_TEST_PROFILE_LOG"; fi
 exit "\${BELAYD_TEST_NIX_EXIT:-0}"
 `;
 
@@ -106,6 +108,7 @@ export interface ShellHarness {
   argvLog: string;
   pwdLog: string;
   direnvLog: string;
+  profileLog: string;
   /** Base env with the stubs first on PATH. */
   env: NodeJS.ProcessEnv;
   cleanup: () => void;
@@ -144,6 +147,7 @@ export function createShellHarness(): ShellHarness {
   const argvLog = join(root, "argv.log");
   const pwdLog = join(root, "pwd.log");
   const direnvLog = join(root, "direnv.log");
+  const profileLog = join(root, "profile.log");
   const jqPath = findJq();
   if (jqPath === null) {
     throw new Error("belayd-script-harness: no jq found (set BELAYD_TEST_JQ)");
@@ -160,6 +164,7 @@ export function createShellHarness(): ShellHarness {
     BELAYD_TEST_ARGV_LOG: argvLog,
     BELAYD_TEST_PWD_LOG: pwdLog,
     BELAYD_TEST_DIRENV_LOG: direnvLog,
+    BELAYD_TEST_PROFILE_LOG: profileLog,
     BELAYD_TEST_DIRENV_STATUS: '{"state":{"foundRC":{"allowed":0}}}',
   };
   delete baseEnv.BELAYD_SHELL_ACTIVE;
@@ -173,6 +178,7 @@ export function createShellHarness(): ShellHarness {
     argvLog,
     pwdLog,
     direnvLog,
+    profileLog,
     env: baseEnv,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };

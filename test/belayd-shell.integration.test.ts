@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -117,6 +117,38 @@ describe("belayd-shell (integration, real binaries)", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("belayd-devshell-only-tool");
     expect(result.stdout).toContain(join(dir, "sub"));
+  });
+
+  it("keeps .envrc PATH additions through an interactive startup", () => {
+    if (DIRENV_PATH === null) {
+      console.warn("Skipping integration test: direnv not available");
+      return;
+    }
+    const dir = join(tmpRoot, "interactive-repo");
+    const bin = join(dir, "mybin");
+    mkdirSync(bin, { recursive: true });
+    const tool = join(bin, "belayd-interactive-tool");
+    writeFileSync(tool, "#!/bin/sh\necho tool-ran\n");
+    chmodSync(tool, 0o755);
+    writeFileSync(join(dir, ".envrc"), "PATH_add mybin\n");
+
+    const env = integrationEnv({
+      XDG_DATA_HOME: join(tmpRoot, "interactive-data"),
+      XDG_CONFIG_HOME: join(tmpRoot, "interactive-config"),
+    });
+    execFileSync("direnv", ["allow", dir], { cwd: dir, env, stdio: "pipe" });
+
+    // `-i` makes bash read /etc/bashrc, which on NixOS re-sources /etc/profile
+    // (and /etc/set-environment) unless __ETC_PROFILE_DONE is set; that
+    // unconditionally rewrites PATH and would drop the devShell entries,
+    // which is exactly what a pi-web pty terminal hits.
+    const result = runScript(renderWrapper(), ["-i", "-c", "command -v belayd-interactive-tool"], {
+      cwd: dir,
+      env,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("belayd-interactive-tool");
   });
 
   it("is a transparent pass-through in a plain directory", () => {
