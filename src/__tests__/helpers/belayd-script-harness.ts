@@ -149,6 +149,21 @@ export function createShellHarness(): ShellHarness {
     throw new Error("belayd-script-harness: no jq found (set BELAYD_TEST_JQ)");
   }
 
+  // The wrapper's re-entry guard is process-tree scoped, but the harness spawns
+  // it in several fixture repos. The agent's own shell runs through
+  // belayd-shell, so an ambient BELAYD_SHELL_ACTIVE=1 would make every fixture
+  // pass through instead of resolving its devShell. Strip it so fixtures are
+  // hermetic (mirrors src/spawn.ts and the integration helper).
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${stubDir}:${bashDir}:${process.env.PATH ?? ""}`,
+    BELAYD_TEST_ARGV_LOG: argvLog,
+    BELAYD_TEST_PWD_LOG: pwdLog,
+    BELAYD_TEST_DIRENV_LOG: direnvLog,
+    BELAYD_TEST_DIRENV_STATUS: '{"state":{"foundRC":{"allowed":0}}}',
+  };
+  delete baseEnv.BELAYD_SHELL_ACTIVE;
+
   return {
     root,
     stubDir,
@@ -158,14 +173,7 @@ export function createShellHarness(): ShellHarness {
     argvLog,
     pwdLog,
     direnvLog,
-    env: {
-      ...process.env,
-      PATH: `${stubDir}:${bashDir}:${process.env.PATH ?? ""}`,
-      BELAYD_TEST_ARGV_LOG: argvLog,
-      BELAYD_TEST_PWD_LOG: pwdLog,
-      BELAYD_TEST_DIRENV_LOG: direnvLog,
-      BELAYD_TEST_DIRENV_STATUS: '{"state":{"foundRC":{"allowed":0}}}',
-    },
+    env: baseEnv,
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
