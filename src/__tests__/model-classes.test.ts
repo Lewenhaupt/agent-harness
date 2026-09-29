@@ -3,6 +3,7 @@ import { DEFAULT_AGENTS } from "../agent-registry.js";
 import {
   bareModelId,
   candidatesForModel,
+  canonicalModelId,
   MODEL_CLASS_SPECS,
   MODEL_TO_CLASS,
   modelClassOf,
@@ -31,8 +32,32 @@ describe("providerOf", () => {
     expect(providerOf("llmgateway/deepseek-v4.1-flash")).toBe("llmgateway");
   });
 
+  it("splits only on the first slash", () => {
+    expect(providerOf("openrouter/z-ai/glm-5.2")).toBe("openrouter");
+    expect(bareModelId("openrouter/z-ai/glm-5.2")).toBe("z-ai/glm-5.2");
+  });
+
   it("returns an empty string for provider-less ids", () => {
     expect(providerOf("mimo-v2.5")).toBe("");
+  });
+});
+
+describe("canonicalModelId", () => {
+  it("maps OpenRouter's vendor-qualified ids back to their canonical id", () => {
+    expect(canonicalModelId("openrouter/z-ai/glm-5.2")).toBe("glm-5.2");
+    expect(canonicalModelId("openrouter/xiaomi/mimo-v2.5")).toBe("mimo-v2.5");
+    expect(canonicalModelId("openrouter/openai/gpt-5.6-luna")).toBe("gpt-5.6-luna");
+    expect(canonicalModelId("openrouter/deepseek/deepseek-v4.1-flash")).toBe("deepseek-v4.1-flash");
+  });
+
+  it("behaves like bareModelId for providers without aliases", () => {
+    expect(canonicalModelId("opencode-go/mimo-v2.5")).toBe("mimo-v2.5");
+    expect(canonicalModelId("llmgateway/glm-5.2")).toBe("glm-5.2");
+    expect(canonicalModelId("mimo-v2.5")).toBe("mimo-v2.5");
+  });
+
+  it("leaves unmatched OpenRouter ids untouched", () => {
+    expect(canonicalModelId("openrouter/z-ai/glm-9.9")).toBe("z-ai/glm-9.9");
   });
 });
 
@@ -41,6 +66,12 @@ describe("modelClassOf", () => {
     expect(modelClassOf("opencode-go/mimo-v2.5")).toBe("fast");
     expect(modelClassOf("llmgateway/deepseek-v4.1-flash")).toBe("frontier");
     expect(modelClassOf("opencode-go/glm-5.2")).toBe("standard");
+  });
+
+  it("resolves a class from an OpenRouter vendor-qualified id", () => {
+    expect(modelClassOf("openrouter/z-ai/glm-5.2")).toBe("standard");
+    expect(modelClassOf("openrouter/deepseek/deepseek-v4.1-flash")).toBe("frontier");
+    expect(modelClassOf("openrouter/xiaomi/mimo-v2.5")).toBe("fast");
   });
 
   it("resolves a class from a bare id", () => {
@@ -58,10 +89,13 @@ describe("resolveModelCandidates", () => {
     expect(resolveModelCandidates("fast")).toEqual([
       "opencode-go/mimo-v2.5",
       "llmgateway/mimo-v2.5",
+      "openrouter/xiaomi/mimo-v2.5",
       "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
+      "openrouter/deepseek/deepseek-v4-flash",
       "opencode-go/glm-5.2",
       "llmgateway/glm-5.2",
+      "openrouter/z-ai/glm-5.2",
     ]);
   });
 
@@ -69,6 +103,7 @@ describe("resolveModelCandidates", () => {
     const candidates = resolveModelCandidates("frontier");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
     expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
+    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash");
   });
 });
 
@@ -77,15 +112,17 @@ describe("candidatesForModel", () => {
     const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
     expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
+    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash");
   });
 
-  it("tries the same model on an alternate provider before other models on the same provider", () => {
+  it("groups OpenRouter's vendor-qualified id with the same model", () => {
     // glm-5.3 is the 2nd frontier model; without the re-partition its first
     // fallback would be opencode-go/deepseek-v4.1-flash (same provider, wrong
     // quota bucket).
     const candidates = candidatesForModel("opencode-go/glm-5.3");
     expect(candidates[0]).toBe("opencode-go/glm-5.3");
     expect(candidates[1]).toBe("llmgateway/glm-5.3");
+    expect(candidates[2]).toBe("openrouter/z-ai/glm-5.3");
   });
 
   it("does not duplicate the requested model", () => {
@@ -128,10 +165,13 @@ describe("candidatesForModel", () => {
       "glm-5.3",
       "opencode-go/glm-5.3",
       "llmgateway/glm-5.3",
+      "openrouter/z-ai/glm-5.3",
       "opencode-go/deepseek-v4.1-flash",
       "llmgateway/deepseek-v4.1-flash",
+      "openrouter/deepseek/deepseek-v4.1-flash",
       "opencode-go/gpt-5.6-luna",
       "llmgateway/gpt-5.6-luna",
+      "openrouter/openai/gpt-5.6-luna",
     ]);
   });
 
@@ -144,10 +184,13 @@ describe("candidatesForModel", () => {
       "glm-5.2",
       "opencode-go/glm-5.2",
       "llmgateway/glm-5.2",
+      "openrouter/z-ai/glm-5.2",
       "opencode-go/mimo-v2.5",
       "llmgateway/mimo-v2.5",
+      "openrouter/xiaomi/mimo-v2.5",
       "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
+      "openrouter/deepseek/deepseek-v4-flash",
     ]);
   });
 });
@@ -180,6 +223,18 @@ describe("model class coverage", () => {
     }
     expect(PROVIDER_PREFERENCE).toContain("opencode-go");
     expect(PROVIDER_PREFERENCE).toContain("llmgateway");
+    expect(PROVIDER_PREFERENCE).toContain("openrouter");
+  });
+
+  it("maps every class model to an OpenRouter vendor-qualified id", () => {
+    const openrouterModels = new Set(
+      resolveModelCandidates("frontier")
+        .filter((candidate) => candidate.startsWith("openrouter/"))
+        .map(canonicalModelId),
+    );
+    for (const id of MODEL_CLASS_SPECS.frontier.models) {
+      expect(openrouterModels.has(id), id).toBe(true);
+    }
   });
 });
 

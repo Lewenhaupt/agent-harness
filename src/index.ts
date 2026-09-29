@@ -61,6 +61,7 @@ export type { AgentModelSpec, ModelClass } from "./model-classes.js";
 export {
   bareModelId,
   candidatesForModel,
+  canonicalModelId,
   MODEL_CLASS_SPECS,
   MODEL_TO_CLASS,
   modelClassOf,

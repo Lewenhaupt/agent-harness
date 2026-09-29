@@ -92,8 +92,13 @@ The tier-to-primary mapping used by `primaryModelOf` is:
 | `fast` | `opencode-go/mimo-v2.5` |
 
 - On a quota or transient failure, the next attempt stays within that class:
-  the alternate provider for the same model is preferred before another model
-  in the class. A successful result may include a trailing
+  the same model on each alternate provider (in `PROVIDER_PREFERENCE` order —
+  `opencode-go`, then `llmgateway`, then `openrouter`) is preferred before
+  another model in the class. OpenRouter serves the same models under
+  vendor-qualified ids (`glm-5.2` → `z-ai/glm-5.2`, `mimo-v2.5` →
+  `xiaomi/mimo-v2.5`, `gpt-5.6-luna` → `openai/gpt-5.6-luna`,
+  `deepseek-*` → `deepseek/deepseek-*`), so a candidate looks like
+  `openrouter/z-ai/glm-5.2`. A successful result may include a trailing
   `[belayd model fallback] ...` note showing the attempted models. With no
   failure, no fallback note is added.
 - A provider-entitlement 403 — a 403 whose body carries subscription wording
@@ -188,10 +193,13 @@ const candidates = candidatesForModel("opencode-go/glm-5.3", "fast");
 //   "opencode-go/glm-5.3",        // requested model always comes first
 //   "opencode-go/mimo-v2.5",
 //   "llmgateway/mimo-v2.5",
+//   "openrouter/xiaomi/mimo-v2.5",
 //   "opencode-go/deepseek-v4-flash",
 //   "llmgateway/deepseek-v4-flash",
+//   "openrouter/deepseek/deepseek-v4-flash",
 //   "opencode-go/glm-5.2",
 //   "llmgateway/glm-5.2",
+//   "openrouter/z-ai/glm-5.2",
 // ]
 ```
 
