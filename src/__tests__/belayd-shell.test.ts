@@ -272,6 +272,53 @@ describe("belayd-shell wrapper (unit)", () => {
     });
   });
 
+  describe("profile guard (NixOS PATH clobber)", () => {
+    // Without __ETC_PROFILE_DONE exported, an interactive shell's /etc/bashrc
+    // re-sources /etc/profile and /etc/set-environment rewrites PATH, wiping the
+    // devShell env. The wrapper must mark the profile as applied on every handoff
+    // path, including the ones that do not resolve a devShell.
+    const profileGuards = () => readArgvLog(harness.profileLog);
+
+    it("sets the guard on the direnv handoff", () => {
+      run(fixtures.direnvRepo, ["-c", "echo hi"]);
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+
+    it("sets the guard on the flake handoff", () => {
+      run(fixtures.flakeRepo, ["-l"]);
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+
+    it("sets the guard on the shell.nix handoff", () => {
+      run(fixtures.shellNixRepo, ["-c", "echo hi"]);
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+
+    it("sets the guard on transparent pass-through", () => {
+      run(fixtures.passRepo, ["-c", "echo hi"]);
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+
+    it("sets the guard when .pi/no-devshell forces pass-through", () => {
+      run(fixtures.noDevShellRepo, ["-c", "echo hi"]);
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+
+    it("sets the guard on the no-recursion branch", () => {
+      run(fixtures.direnvRepo, ["-c", "echo hi"], {
+        ...harness.env,
+        BELAYD_SHELL_ACTIVE: "1",
+      });
+
+      expect(profileGuards()).toEqual(["1"]);
+    });
+  });
+
   describe("fail-loud branches", () => {
     it("fails when .envrc exists but direnv is not on PATH", () => {
       const env = { ...harness.env, PATH: harness.bashDir };

@@ -16,6 +16,16 @@ JQ="${BELAYD_JQ:-@jq@}"
 belayd_warn() { printf 'belayd-shell: %s\n' "$1" >&2; }
 belayd_fail() { printf 'belayd-shell: %s\n' "$1" >&2; exit 1; }
 
+# On NixOS, an interactive non-login bash sources /etc/bashrc, which sources
+# /etc/profile (and thus /etc/set-environment) unless __ETC_PROFILE_DONE is set;
+# /etc/set-environment then unconditionally rewrites PATH to the plain system
+# profile. That clobbers the devShell env resolved below — and the ambient pi-web
+# runtime PATH when no devShell applies — as soon as a pi-web terminal starts,
+# dropping tools like bd/dolt/pnpm. Mark the profile as already applied so the
+# exported env survives. An explicit login shell (`exec bash -l`) still re-reads
+# /etc/profile, which remains the escape hatch; the variable is inert elsewhere.
+export __ETC_PROFILE_DONE=1
+
 # Filter direnv's own status noise from the failure and success paths below.
 # This runs synchronously against a temp file (never as a process substitution),
 # so no stderr data is lost and `exec` is not entangled with a background
@@ -89,7 +99,9 @@ while [ -n "$dir" ]; do
 done
 
 # No devShell anywhere up the tree: strict transparent pass-through with no
-# output and no env mutation.
+# output. (The profile guard exported above is the only env change, and it
+# exists precisely to keep this branch's inherited PATH from being clobbered by
+# an interactive shell's startup files.)
 if [ -z "$mode" ]; then
   exec "$REAL_SHELL" "$@"
 fi
