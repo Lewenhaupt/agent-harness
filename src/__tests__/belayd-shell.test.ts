@@ -250,6 +250,26 @@ describe("belayd-shell wrapper (unit)", () => {
 
       expect(argv()).toEqual(["argc=2", "-c", "echo hi"]);
     });
+
+    it("does not leak an ambient BELAYD_SHELL_ACTIVE into fixtures", () => {
+      // The agent's own shell runs through belayd-shell, so the variable is
+      // present when `pnpm test` runs. A leaked value would make every fixture
+      // pass through (breaking devShell resolution) instead of only the
+      // explicit guard case above.
+      const previous = process.env.BELAYD_SHELL_ACTIVE;
+      process.env.BELAYD_SHELL_ACTIVE = "1";
+      try {
+        const isolated = createShellHarness();
+        expect(isolated.env).not.toHaveProperty("BELAYD_SHELL_ACTIVE");
+        isolated.cleanup();
+      } finally {
+        if (previous === undefined) {
+          delete process.env.BELAYD_SHELL_ACTIVE;
+        } else {
+          process.env.BELAYD_SHELL_ACTIVE = previous;
+        }
+      }
+    });
   });
 
   describe("fail-loud branches", () => {
