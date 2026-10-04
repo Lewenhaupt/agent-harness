@@ -23,6 +23,23 @@ import { setupWorktree } from "./worktree.js";
 /** Cached path to the pi binary, resolved once. */
 let cachedPiBinary: string | undefined;
 
+/**
+ * direnv per-directory STATE variables, stripped from every child so a
+ * sub-agent resolves its own worktree's devShell instead of inheriting the
+ * parent repo's. This is an explicit list, not a `DIRENV_` prefix sweep, so
+ * direnv USER-CONFIG vars (DIRENV_CONFIG, DIRENV_WARN_TIMEOUT,
+ * DIRENV_LOG_FORMAT, DIRENV_MAX_DEPTH) keep flowing to sub-agents.
+ * DIRENV_LAYOUT_DIR is a newer-version state key; 2.37.1 does not emit it but
+ * stripping it is harmless.
+ */
+const DIRENV_STATE_ENV_KEYS = [
+  "DIRENV_DIR",
+  "DIRENV_FILE",
+  "DIRENV_DIFF",
+  "DIRENV_WATCHES",
+  "DIRENV_LAYOUT_DIR",
+] as const;
+
 /** Everything needed to launch the child, resolved up front. */
 export interface BuiltSpawnArgs {
   args: string[];
@@ -174,6 +191,10 @@ function appendSystemPromptArgs(
  * `collectSpawnResult`. The remaining partial stdout buffer is flushed on
  * `close` here (before `collectSpawnResult` resolves) so the two stages share
  * one source of truth in `handle.stream`.
+ *
+ * The child inherits the worktree cwd when the task has one
+ * (`built.worktreePath`), falling back to `options.cwd`/`process.cwd()` for
+ * non-worktree spawns (bd-47's folded path).
  */
 export function launchAgentProcess(
   options: SpawnOptions,
@@ -185,14 +206,22 @@ export function launchAgentProcess(
     stderr: "",
   };
 
-  // Build the child environment explicitly and strip BELAYD_SHELL_ACTIVE.
-  // The wrapper's guard exists only to prevent re-entry inside a single shell
-  // process tree; leaking it to a sub-agent makes a sub-agent working in a
-  // DIFFERENT repo's worktree pass through instead of resolving that
-  // worktree's devShell (undercuts bd-47). The agent bash tool sets it around
-  // each command, so re-entry is still guarded where it matters.
+  // Build the child environment explicitly, dropping BELAYD_SHELL_ACTIVE and
+  // the inherited direnv per-directory state. The wrapper's guard exists only
+  // to prevent re-entry inside a single shell process tree; leaking it to a
+  // sub-agent makes a sub-agent working in a DIFFERENT repo's worktree pass
+  // through instead of resolving that worktree's devShell (undercuts bd-47).
+  // The belayd-shell wrapper (scripts/belayd-shell.sh) sets BELAYD_SHELL_ACTIVE
+  // and the bash tool merely invokes it via shellPath, so the guard still
+  // holds. Stale DIRENV_DIFF is also what makes `direnv export bash` hard-fail
+  // (exit 1, "Revert() failed: unmarshal()") when the inherited state is
+  // corrupt or version-mismatched, which belayd-shell treats as fatal and kills
+  // the sub-agent's shell; stripping it additionally stops a sub-agent from
+  // inheriting the parent repo's devShell. HOME/PATH stay intact so harness
+  // tools (bd/dolt/wt/pnpm/node) remain available at lower priority.
   const childEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
   delete childEnv.BELAYD_SHELL_ACTIVE;
+  for (const key of DIRENV_STATE_ENV_KEYS) delete childEnv[key];
 
   // We intentionally do NOT call proc.unref(): a background phase run must keep
   // the parent pi process alive until it completes, otherwise the run would be
