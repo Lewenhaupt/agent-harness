@@ -12,8 +12,9 @@ convention:
 | Scope | Pattern | Example |
 |-------|---------|---------|
 | **Orchestrator** | `belayd-{taskId}` | `belayd-bd-42` |
-| **Subagent** | `belayd-{taskId}-{phase}-{shortRunId}` | `belayd-bd-42-scout-a1b2c3` |
-| **Quality gate retry (fresh epoch)** | `belayd-{taskId}-{phase}-{shortRunId}-retry-{N}` | `belayd-bd-42-implement-x9y8z7-retry-3` |
+| **Subagent** | `belayd-{taskId}-sub-{phase}-{shortRunId}` | `belayd-bd-42-sub-scout-a1b2c3` |
+| **Quality gate retry (fresh epoch)** | `belayd-{taskId}-sub-{phase}-{shortRunId}-retry-{N}` | `belayd-bd-42-sub-implement-x9y8z7-retry-3` |
+| **Cross-run resume (fresh epoch)** | `belayd-{taskId}-sub-{phase}-{shortRunId}-run-{N}` | `belayd-bd-42-sub-implement-x9y8z7-run-3` |
 
 The `{shortRunId}` is a base-36 timestamp derived from `Date.now()`, providing
 uniqueness across runs without requiring a central counter.
@@ -120,6 +121,66 @@ context growth.
 A fresh epoch never sees the prior transcript, so it is re-supplied with the
 original task (the bead plan for implement, the change context for proof) plus
 every gate verdict so far. Resumed retries only carry the latest verdict.
+
+## Review ↔ implement resume
+
+Quality-gate retries resume within one phase run. The orchestrator-driven
+review↔fix loop extends the same idea **across** phase runs: when
+`belayd_review` reports findings, the orchestrator re-calls `belayd_implement`
+and then `belayd_review`, and both phases resume the session they used
+earlier instead of starting fresh. Only the `implement` and `review` phases
+participate; every other phase keeps a fresh session per run.
+
+Each phase's handle is recorded per `(taskId, phase)` in
+`.belayd/workflow.json` under `phaseSessions`, so it survives turn boundaries
+and orchestrator restarts (`resumeWorkflowFromDisk`). The ledger uses the same
+bounded two-attempt epoch shape as intra-run gate retries, but under its own
+`-run-<n>` namespace so a cross-run epoch can never collide with a gate retry's
+`-retry-<n>` name. The invocation count is the attempt number:
+
+| Invocation | Session | Mode |
+|------------|---------|------|
+| 1st | `belayd-{taskId}-sub-{phase}-{runId}` | fresh |
+| 2nd | same base | resume |
+| 3rd | same base | resume |
+| 4th | `...-run-3` | fresh |
+| 5th | `...-run-3` | resume |
+| 6th | `...-run-5` | fresh |
+
+So `IN_SESSION_RETRY_LIMIT = 2` means the base session is seen by at most
+three passes before a fresh `-run-N` epoch bounds transcript growth.
+
+On a cross-run resume the bead plan is **not** re-prepended to the implement
+task — the transcript already has it — so the orchestrator supplies the review
+findings to fix in the task text. A fresh epoch within a resumed run falls back
+to the full built task (bead plan included). The harness runs the same on-disk
+existence pre-check as the spawn layer, so a ledger entry whose session file
+was deleted behaves as a fresh invocation (plan re-prepended) instead of
+silently spawning a transcript-less session.
+
+If a fresh `-run-<n>` epoch already exists on disk — e.g. a previous invocation
+created it but failed to persist the ledger advance — the harness skips to the
+next non-colliding odd epoch instead of spawning the stale name. Skipping
+(rather than resuming the collision) keeps transcript growth bounded even while
+the ledger write keeps failing.
+
+### Orchestrator-driven loop
+
+After `belayd_review` completes, the injected gate context no longer says
+"Next required step: call `belayd_test`". While review findings are
+outstanding it says:
+
+> If any Critical/Warnings remain, call `belayd_implement` with those findings
+> (it resumes the implementation session, so it sees its earlier work), then
+> call `belayd_review` again (it resumes the review session) to verify. Only
+> once no Critical/Warnings remain, call `belayd_test`.
+
+The run-completion follow-up for a successful review carries the same loop
+hint. The directive clears once a phase after review (`test`, `userguide`,
+`proof`, `commit`) completes, and re-arms when review runs again later or
+implement re-runs after review (a late fix loop). The flag is persisted in
+`workflow.json` alongside the phase list, so it survives an orchestrator
+restart.
 
 Resume relies on pi's create-or-resume `--session-id`. If the target session
 cannot be found on disk, spawn falls back to a fresh session (re-appending the

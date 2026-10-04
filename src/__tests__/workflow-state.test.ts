@@ -5,6 +5,7 @@ import {
   parseWorkflowState,
   readWorkflowState,
   saveCompletedPhases,
+  savePhaseSession,
   type WorkflowFs,
   type WorkflowState,
   workflowStateFilePath,
@@ -134,6 +135,167 @@ describe("workflow state", () => {
     if (!result.ok) expect(result.error).toContain("No Belayd workflow state");
   });
 
+  it("saveCompletedPhases persists the awaiting-review flag", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState(), fs });
+
+    saveCompletedPhases({
+      cwd,
+      fs,
+      completedPhaseNames: ["implement", "review"],
+      awaitingReviewResponse: true,
+    });
+    expect(readWorkflowState({ cwd, fs })?.awaitingReviewResponse).toBe(true);
+
+    saveCompletedPhases({
+      cwd,
+      fs,
+      completedPhaseNames: ["implement", "review", "test"],
+      awaitingReviewResponse: false,
+    });
+    expect(readWorkflowState({ cwd, fs })?.awaitingReviewResponse).toBe(false);
+  });
+
+  it("parses state with and without the awaiting-review flag", () => {
+    expect(parseWorkflowState(sampleState())?.awaitingReviewResponse).toBe(undefined);
+    expect(
+      parseWorkflowState({ ...sampleState(), awaitingReviewResponse: true })
+        ?.awaitingReviewResponse,
+    ).toBe(true);
+    expect(parseWorkflowState({ ...sampleState(), awaitingReviewResponse: "yes" })).toBe(undefined);
+  });
+
+  it("savePhaseSession upserts one entry and preserves identity fields", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({ startedAt: 5_000, updatedAt: 5_000 }),
+      fs,
+    });
+
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      now: () => 9_000,
+      phaseName: "implement",
+      record: { base: "belayd-bd-42-sub-implement-a", invocations: 1 },
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readWorkflowState({ cwd, fs });
+    expect(reloaded).toHaveProperty("taskId", "bd-42");
+    expect(reloaded).toHaveProperty("startedAt", 5_000);
+    expect(reloaded).toHaveProperty("updatedAt", 9_000);
+    expect(reloaded?.phaseSessions).toEqual({
+      implement: { base: "belayd-bd-42-sub-implement-a", invocations: 1 },
+    });
+  });
+
+  it("savePhaseSession keeps other phases' entries independent", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState(), fs });
+
+    savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "implement",
+      record: { base: "impl", invocations: 1 },
+    });
+    savePhaseSession({ cwd, fs, phaseName: "review", record: { base: "rev", invocations: 2 } });
+    savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "implement",
+      record: { base: "impl", invocations: 2 },
+    });
+
+    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toEqual({
+      implement: { base: "impl", invocations: 2 },
+      review: { base: "rev", invocations: 2 },
+    });
+  });
+
+  it("treats a pre-bd-81 workflow.json (no phaseSessions) as an empty ledger", () => {
+    const fs = createFakeFs();
+    // writeWorkflowState omits phaseSessions because sampleState never sets it.
+    writeWorkflowState({ cwd, state: sampleState(), fs });
+    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toBe(undefined);
+
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "review",
+      record: { base: "rev", invocations: 1 },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toEqual({
+      review: { base: "rev", invocations: 1 },
+    });
+  });
+
+  it("savePhaseSession returns an error when no state exists", () => {
+    const fs = createFakeFs();
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "review",
+      record: { base: "rev", invocations: 1 },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No Belayd workflow state");
+  });
+
+  it("savePhaseSession accepts a pre-read state without touching disk again", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState(), fs });
+    const existing = readWorkflowState({ cwd, fs });
+    expect(existing).toBeDefined();
+    if (existing === undefined) return;
+
+    // A failing read would prove the existingState was ignored; replacing the
+    // reader is not possible through the seam, so assert the write landed.
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      existingState: existing,
+      phaseName: "implement",
+      record: { base: "impl", invocations: 2 },
+    });
+    expect(result).toEqual({ ok: true });
+    expect(readWorkflowState({ cwd, fs })?.phaseSessions?.implement).toEqual({
+      base: "impl",
+      invocations: 2,
+    });
+  });
+
+  it("savePhaseSession returns an error for a corrupt state file", () => {
+    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: "not json" });
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "review",
+      record: { base: "rev", invocations: 1 },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it("savePhaseSession returns an error value (no throw) when the write fails", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState(), fs });
+    fs.renameSync = () => {
+      throw new Error("disk full");
+    };
+
+    const result = savePhaseSession({
+      cwd,
+      fs,
+      phaseName: "review",
+      record: { base: "rev", invocations: 1 },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe("disk full");
+  });
+
   it("returns an error value (no throw) when the write fails", () => {
     const fs = createFakeFs();
     const state = sampleState();
@@ -168,5 +330,11 @@ describe("workflow state", () => {
     expect(parseWorkflowState({ ...sampleState(), taskId: 42 })).toBe(undefined);
     expect(parseWorkflowState({ ...sampleState(), phaseOrder: ["scout", 1] })).toBe(undefined);
     expect(parseWorkflowState({ ...sampleState(), startedAt: "yesterday" })).toBe(undefined);
+    expect(
+      parseWorkflowState({
+        ...sampleState(),
+        phaseSessions: { implement: { base: "impl", invocations: 0 } },
+      }),
+    ).toBe(undefined);
   });
 });

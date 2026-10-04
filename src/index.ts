@@ -151,6 +151,7 @@ export {
   setRunStatus,
   writeRunManifest,
 } from "./run-manifest.js";
+export type { PhaseSessionRecord } from "./session-naming.js";
 export {
   computeOrchestratorSessionName,
   computePlanningSubagentSessionName,
@@ -159,6 +160,7 @@ export {
   generateShortRunId,
   IN_SESSION_RETRY_LIMIT,
   isValidTaskId,
+  resolvePhaseInvocation,
   resolveProjectSessionExists,
 } from "./session-naming.js";
 export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
@@ -191,11 +193,12 @@ export {
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";
-export type { WorkflowFs, WorkflowState } from "./workflow-state.js";
+export type { SavePhaseSessionOptions, WorkflowFs, WorkflowState } from "./workflow-state.js";
 export {
   clearWorkflowState,
   readWorkflowState,
   saveCompletedPhases,
+  savePhaseSession,
   workflowStateDir,
   workflowStateFilePath,
   writeWorkflowState,

@@ -9,6 +9,8 @@ import {
   gateRetrySession,
   generateShortRunId,
   isValidTaskId,
+  type PhaseSessionRecord,
+  resolvePhaseInvocation,
   resolveProjectSessionExists,
 } from "../session-naming.js";
 
@@ -311,6 +313,149 @@ describe("gateRetrySession", () => {
     );
     expect(() => gateRetrySession(base, 0)).toThrow("attempt must be a positive integer");
     expect(() => gateRetrySession(base, 1.5)).toThrow("attempt must be a positive integer");
+  });
+});
+
+describe("resolvePhaseInvocation", () => {
+  const fresh = "belayd-bd-42-sub-implement-run1";
+
+  it("starts fresh and seeds the ledger on the first invocation", () => {
+    expect(resolvePhaseInvocation(undefined, fresh)).toEqual({
+      sessionName: fresh,
+      resumeSession: false,
+      next: { base: fresh, invocations: 1 },
+    });
+  });
+
+  it("resumes the base for the next two invocations", () => {
+    expect(resolvePhaseInvocation({ base: fresh, invocations: 1 }, "ignored")).toEqual({
+      sessionName: fresh,
+      resumeSession: true,
+      next: { base: fresh, invocations: 2 },
+    });
+    expect(resolvePhaseInvocation({ base: fresh, invocations: 2 }, "ignored")).toEqual({
+      sessionName: fresh,
+      resumeSession: true,
+      next: { base: fresh, invocations: 3 },
+    });
+  });
+
+  it("mints a fresh -run-3 epoch on the fourth invocation and resumes it next", () => {
+    expect(resolvePhaseInvocation({ base: fresh, invocations: 3 }, "ignored")).toEqual({
+      sessionName: `${fresh}-run-3`,
+      resumeSession: false,
+      next: { base: fresh, invocations: 4 },
+    });
+    expect(resolvePhaseInvocation({ base: fresh, invocations: 4 }, "ignored")).toEqual({
+      sessionName: `${fresh}-run-3`,
+      resumeSession: true,
+      next: { base: fresh, invocations: 5 },
+    });
+  });
+
+  it("pins the full call-to-epoch mapping through the third cross-run epoch", () => {
+    const fresh = "belayd-bd-42-sub-implement-run1";
+    // Thread each result back in as the prior record, mirroring how the
+    // extension walks the persisted ledger. Call N is the N-th run of the
+    // phase for this task.
+    const observed: Array<{ sessionName: string; resumeSession: boolean }> = [];
+    let prior: PhaseSessionRecord | undefined;
+    for (let call = 1; call <= 9; call += 1) {
+      const resolved = resolvePhaseInvocation(prior, fresh);
+      observed.push({ sessionName: resolved.sessionName, resumeSession: resolved.resumeSession });
+      prior = resolved.next;
+    }
+
+    // Explicit names, not regex: each cross-run epoch is fresh on its first
+    // call and resumed on its second, under the `-run-<odd>` namespace.
+    expect(observed).toEqual([
+      { sessionName: fresh, resumeSession: false },
+      { sessionName: fresh, resumeSession: true },
+      { sessionName: fresh, resumeSession: true },
+      { sessionName: `${fresh}-run-3`, resumeSession: false },
+      { sessionName: `${fresh}-run-3`, resumeSession: true },
+      { sessionName: `${fresh}-run-5`, resumeSession: false },
+      { sessionName: `${fresh}-run-5`, resumeSession: true },
+      { sessionName: `${fresh}-run-7`, resumeSession: false },
+      { sessionName: `${fresh}-run-7`, resumeSession: true },
+    ]);
+
+    // Call 10 opens the fourth epoch and carries the advanced count forward.
+    expect(resolvePhaseInvocation(prior, fresh)).toEqual({
+      sessionName: `${fresh}-run-9`,
+      resumeSession: false,
+      next: { base: fresh, invocations: 10 },
+    });
+  });
+
+  it("pins prior.invocations 5-9 to their exact epochs and advanced counts", () => {
+    const fresh = "belayd-bd-42-sub-implement-run1";
+    const cases: Array<{
+      invocations: number;
+      sessionName: string;
+      resumeSession: boolean;
+      nextInvocations: number;
+    }> = [
+      { invocations: 5, sessionName: `${fresh}-run-5`, resumeSession: false, nextInvocations: 6 },
+      { invocations: 6, sessionName: `${fresh}-run-5`, resumeSession: true, nextInvocations: 7 },
+      { invocations: 7, sessionName: `${fresh}-run-7`, resumeSession: false, nextInvocations: 8 },
+      { invocations: 8, sessionName: `${fresh}-run-7`, resumeSession: true, nextInvocations: 9 },
+      { invocations: 9, sessionName: `${fresh}-run-9`, resumeSession: false, nextInvocations: 10 },
+    ];
+
+    for (const expected of cases) {
+      expect(
+        resolvePhaseInvocation({ base: fresh, invocations: expected.invocations }, "ignored"),
+      ).toEqual({
+        sessionName: expected.sessionName,
+        resumeSession: expected.resumeSession,
+        next: { base: fresh, invocations: expected.nextInvocations },
+      });
+    }
+  });
+
+  it("throws on a non-positive or non-integer invocations count", () => {
+    // A corrupt ledger must not silently resolve to attempt 0.
+    expect(() => resolvePhaseInvocation({ base: fresh, invocations: 0 }, "ignored")).toThrow(
+      "invocations must be a positive integer",
+    );
+    expect(() => resolvePhaseInvocation({ base: fresh, invocations: -1 }, "ignored")).toThrow(
+      "invocations must be a positive integer",
+    );
+    expect(() => resolvePhaseInvocation({ base: fresh, invocations: 1.5 }, "ignored")).toThrow(
+      "invocations must be a positive integer",
+    );
+  });
+
+  it("never reuses the gate-retry -retry-<n> namespace", () => {
+    // A first implement run that exhausts its gate mints base-retry-3 on disk.
+    // A later cross-run epoch must not resolve to that name or pi would
+    // silently resume the stale gate-retry transcript.
+    const gateNames = new Set<string>();
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      gateNames.add(gateRetrySession(fresh, attempt).sessionName);
+    }
+    for (let invocations = 3; invocations <= 10; invocations += 1) {
+      const resolved = resolvePhaseInvocation({ base: fresh, invocations }, "ignored");
+      expect(gateNames.has(resolved.sessionName)).toBe(false);
+      expect(resolved.sessionName).toMatch(/-run-\d+$/);
+    }
+  });
+
+  it("ignores the fresh name argument once a prior record exists", () => {
+    const resolved = resolvePhaseInvocation({ base: fresh, invocations: 1 }, "different-run");
+    expect(resolved.sessionName).toBe(fresh);
+    expect(resolved.next.base).toBe(fresh);
+  });
+
+  it("keeps independent ledgers per phase and per task", () => {
+    const implement = resolvePhaseInvocation(undefined, "belayd-bd-42-sub-implement-a");
+    const review = resolvePhaseInvocation(undefined, "belayd-bd-42-sub-review-b");
+    const otherTask = resolvePhaseInvocation(undefined, "belayd-bd-43-sub-implement-c");
+
+    expect(implement.next.base).toBe("belayd-bd-42-sub-implement-a");
+    expect(review.next.base).toBe("belayd-bd-42-sub-review-b");
+    expect(otherTask.next.base).toBe("belayd-bd-43-sub-implement-c");
   });
 });
 
