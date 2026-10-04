@@ -1,0 +1,32 @@
+# Lefthook — git hooks for __PROJECT_NAME__
+# https://lefthook.dev/configuration/
+pre-commit:
+  jobs:
+    - name: biome format + lint (staged)
+      glob: "*.{ts,tsx,js,jsx,json}"
+      run: pnpm biome check --fix --no-errors-on-unmatched {staged_files} && git add {staged_files}
+    # `--filter=...[HEAD]` limits the run to packages changed since HEAD. Turbo
+    # resolves HEAD through git, but the very first commit on a fresh scaffold
+    # can fire this hook before HEAD exists (bd init creates the first commit
+    # later), where turbo's SCM query fails with "ambiguous argument 'HEAD'" and
+    # the hook exits 1. Fall back to all packages in that unborn-HEAD window.
+    # Verified with turbo 2.5.5.
+    - name: typecheck (changed packages)
+      run: |
+        filter="--filter=...[HEAD]"
+        if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+          echo "No commits yet — typechecking all packages"
+          filter=""
+        fi
+        pnpm turbo run typecheck $filter
+    - name: lint (full)
+      run: pnpm biome check .
+    # Same unborn-HEAD guard as typecheck above.
+    - name: tests (changed packages)
+      run: |
+        filter="--filter=...[HEAD]"
+        if ! git rev-parse --verify --quiet HEAD >/dev/null; then
+          echo "No commits yet — running all tests"
+          filter=""
+        fi
+        pnpm turbo run test $filter

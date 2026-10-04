@@ -1,0 +1,28 @@
+# Build output
+node_modules
+dist
+*.tsbuildinfo
+coverage
+.turbo
+
+# Environment (keep .envrc, which is checked in)
+.env
+.env.local
+.env.prod
+
+# Nix / direnv
+.direnv
+result
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+.beads.bak/
+.beads/dolt-backup.json
+
+# Pi personal artifacts (sessions and package cache are user-specific)
+.pi/sessions/
+.pi/npm/

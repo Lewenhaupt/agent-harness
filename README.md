@@ -75,6 +75,24 @@ Full verification steps and end-user usage:
 - Exit planning with `belayd_stop_planning`, or start implementation with
   `/belayd` (or `belayd_start_task`), which resets planning state.
 
+## Bootstrap (`/bootstrap`)
+
+Scaffold a brand-new pnpm + turbo monorepo in the current (empty, or
+resumable) directory: flake devShell, biome/turbo/lefthook/vitest, harness
+wiring, and beads wiring. It writes the files, runs `git init` / `git add -A`
+/ `nix flake lock` / `direnv allow` / `pnpm install` / `lefthook install` /
+`bd init`, and
+hands the prose work (README/AGENTS placeholders, package layout, initial
+commit) to the agent. A re-run after a failure resumes from the failed step.
+
+```bash
+mkdir ~/git/my-new-project && cd ~/git/my-new-project
+> /bootstrap
+```
+
+See [docs/bootstrap.md](docs/bootstrap.md) for what is scripted vs. agent-owned,
+the `-ne` caveat, and the manual verification steps.
+
 ## Development
 
 ```bash

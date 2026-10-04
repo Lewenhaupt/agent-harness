@@ -1,6 +1,7 @@
 {
   "extensions": [
     "../extensions/index.ts",
+    "../extensions/bootstrap.ts",
     "../extensions/honcho-memory.ts",
     "../extensions/llmgateway-refresh.ts",
     "../extensions/stale-file-guard.ts",

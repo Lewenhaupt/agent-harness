@@ -495,9 +495,12 @@
             mv package.json.stripped package.json
             pnpm install --offline --ignore-scripts --prod --frozen-lockfile --config.node-linker=hoisted
 
-            mkdir -p "$out/extensions" "$out/src" "$out/node_modules"
+            mkdir -p "$out/extensions" "$out/src" "$out/templates" "$out/node_modules"
             cp -r extensions/. "$out/extensions/"
             cp -r src/. "$out/src/"
+            # templates/ must stay a sibling of extensions/ so the bootstrap
+            # extension resolves ../templates/bootstrap from the Nix store.
+            cp -r templates/. "$out/templates/"
             cp -r node_modules/. "$out/node_modules/"
             # Drop pnpm's own metadata; pi only needs the flat package dirs
             # for module resolution.
@@ -563,6 +566,7 @@
               package = pi-bare;
               extensions = [
                 "${belayd-harness}/extensions/index.ts"
+                "${belayd-harness}/extensions/bootstrap.ts"
                 "${belayd-harness}/extensions/honcho-memory.ts"
                 "${belayd-harness}/extensions/llmgateway-refresh.ts"
                 "${belayd-harness}/extensions/stale-file-guard.ts"

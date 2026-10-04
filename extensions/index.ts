@@ -24,6 +24,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
   AgentDefinition,
   ModelClass,
@@ -556,24 +557,7 @@ const CLAIM_CHANNEL = "__belayd_harness_claim__";
  * discarded with its session, so nothing leaks across sessions.
  */
 function harnessAlreadyLoaded(pi: ExtensionAPI): boolean {
-  // The counter travels through `emit` as the event payload, so every listener
-  // — our own plus any earlier copy's — mutates the *same* object. A per-call
-  // local would only see our own listener's increment and never detect a
-  // prior copy.
-  const counter = { responses: 0 };
-  const respond = (data: unknown): void => {
-    (data as { responses: number }).responses += 1;
-  };
-  // `emit` dispatches synchronously (the bus wraps handlers in async fns, but
-  // the handler body up to its first `await` runs before `emit` returns).
-  const unsubscribe = pi.events.on(CLAIM_CHANNEL, respond);
-  pi.events.emit(CLAIM_CHANNEL, counter);
-
-  const isFirstCopy = counter.responses <= 1;
-  if (!isFirstCopy) {
-    unsubscribe();
-  }
-  return !isFirstCopy;
+  return !claimRegistrationOnce(pi, CLAIM_CHANNEL);
 }
 
 // Build identity for the stale-build guard. In the Nix-installed copy this is
