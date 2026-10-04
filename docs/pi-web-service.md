@@ -42,7 +42,7 @@ Both units run as `user` with an explicit environment:
 
 - `PATH` = `pi-web-runtime-env` (a `buildEnv` of `nix`, `direnv`, `git`,
   `openssh`, and the flake's `devShellTools`: pnpm, node, `bd`, `dolt`, `wt`,
-  `pi`, …) plus `/run/current-system/sw/bin` and `~/.nix-profile/bin`. This is
+  `pi`, `agent-browser`, …) plus `/run/current-system/sw/bin` and `~/.nix-profile/bin`. This is
   the fix: spawned pi processes can run `nix develop`/direnv.
 - `HOME`/`XDG_*` point at the user's home, so agents see the same git config,
   SSH keys, `~/.pi`, and `~/.direnv` as interactive use.
@@ -446,6 +446,21 @@ sudo systemctl restart pi-web pi-web-sessiond
 
 before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
 wrapper is unaffected — it reloads extensions on every launch.)
+
+### agent-browser extension (not wired yet)
+
+The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
+The `agent_browser` extension is **not** symlinked there yet: pi-web embeds
+`@earendil-works/pi-coding-agent` 0.84.1, which is below the extension's
+declared Pi `>= 1.0.0` floor, so registering it would be ignored or fail. The
+flake exports the packaged artifact as
+`packages.${system}.pi-agent-browser-extension`; wiring the symlink and bumping
+pi-web's embedded SDK is tracked in bd-83. When that lands, the NixOS side needs
+just:
+
+```nix
+home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
+```
 
 ### How the belayd harness dedupes duplicate copies
 

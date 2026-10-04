@@ -108,6 +108,17 @@ describe("DEFAULT_AGENTS", () => {
     expect(impl?.tools).toContain("bash");
   });
 
+  it("implementer and tester expose the agent_browser tool (bd-68)", () => {
+    // bd-68 wired the native browser driver into the harness; the two agents
+    // that interact with web UIs must be able to call it. Focused containment
+    // checks only — exact allowlists for other agents are asserted above.
+    const impl = DEFAULT_AGENTS.find((a) => a.name === "belayd-implementer");
+    expect(impl?.tools).toContain("agent_browser");
+
+    const tester = DEFAULT_AGENTS.find((a) => a.name === "belayd-tester");
+    expect(tester?.tools).toContain("agent_browser");
+  });
+
   it("committer has bash, ls, find, and ast_grep", () => {
     const committer = DEFAULT_AGENTS.find((a) => a.name === "belayd-committer");
     expect(committer).toBeDefined();
@@ -164,7 +175,7 @@ describe("DEFAULT_AGENTS", () => {
   it("proof-generator has the functional-proof tool allowlist", () => {
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
     expect(proofGen).toBeDefined();
-    expect(proofGen?.tools).toEqual(["read", "bash", "ls", "find", "ast_grep"]);
+    expect(proofGen?.tools).toEqual(["read", "bash", "ls", "find", "ast_grep", "agent_browser"]);
   });
 
   it("proof-generator prompt presents proof tools as bash commands, not standalone tools", () => {

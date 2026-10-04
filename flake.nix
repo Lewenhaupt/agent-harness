@@ -329,6 +329,9 @@
 
         devShellTools = [
           pkgs.bash
+          # nodejs_24 here is 24.18.0; pi-agent-browser-native declares
+          # engines.node >= 24.21.0. It still loads/registers fine — the
+          # divergence is tracked in bd-82.
           pkgs.nodejs_24
           pkgs.pnpm
           pkgs.typescript
@@ -340,6 +343,10 @@
           pkgs.worktrunk # `wt` — worktree manager the harness shells out to
           bead-me-up-scotty
           llm-agents.packages.${system}.pi
+          # Native browser driver for the agent_browser tool
+          # (pi-agent-browser-native). The llm-agents wrapper points
+          # AGENT_BROWSER_EXECUTABLE_PATH at its bundled chromium.
+          llm-agents.packages.${system}.agent-browser
           pkgs.stdenv.cc.cc.lib # runtime lib for native node modules (shellHook)
           pkgs.procps # bd's dolt-server liveness check runs `ps -axo`
           pkgs.asciinema
@@ -397,6 +404,13 @@
 
         # pi — the pi coding agent CLI, unconfigured (bare). Kept as the base
         # binary for the configured wrapper below and as an escape hatch.
+        #
+        # llm-agents was bumped e222bd1e -> 372f0337 (flake.lock) because
+        # pi-agent-browser-native needs agent-browser >= 0.35 and Pi 1.0.0:
+        # the old rev shipped agent-browser 0.33.1 + pi 0.83.0, the new one
+        # ships agent-browser 0.38.2 + pi 1.0.2. This moved the pi base
+        # 0.83.0 -> 1.0.2 and refreshed llm-agents' transitive pins
+        # (nixpkgs, bun2nix, flake-parts).
         pi-bare = llm-agents.packages.${system}.pi;
 
         # The harness's agent skills (.agents/skills). Linked into
@@ -497,18 +511,44 @@
         };
 
         # Third-party pi npm extensions (exa web search, ast-grep, vision,
-        # plannotator, OpenRouter provider). Packaged as a Nix node_modules tree
-        # so pi never needs a runtime `npm install` into ~/.pi/agent/npm. Each
-        # package's `pi.extensions` entry is passed via --extension below.
+        # plannotator, OpenRouter provider, agent-browser). Packaged as a Nix
+        # node_modules tree so pi never needs a runtime `npm install` into
+        # ~/.pi/agent/npm. Each package's `pi.extensions` entry is passed via
+        # --extension below.
         pi-extensions = pkgs.buildNpmPackage {
           pname = "pi-extensions";
           version = "0.1.0";
           src = ./nix/pi-extensions;
-          npmDepsHash = "sha256-sicP/7UKlZqFj8VaNKaj/VsRJWHvcm/TpG/HQe9lfr8=";
+          npmDepsHash = "sha256-BKydHW7WAmVfDt7sqX7NkUCN1jh2OJW7GgNBEM5iehU=";
           npmDepsFetcherVersion = 2;
           npmFlags = [ "--legacy-peer-deps" ];
           dontNpmBuild = true;
         };
+
+        # Directory artifact for the pi-web orchestrator, which discovers
+        # extensions from ~/.pi/agent/extensions/ instead of taking explicit
+        # --extension flags. pi's discovery reads package.json `pi.extensions`
+        # at the directory root, so this exposes the whole
+        # pi-agent-browser-native package: the entry
+        # (dist/extensions/agent-browser/index.js) has relative imports into
+        # dist/scripts and its own lib/, and resolves its runtime deps
+        # (cross-spawn, which, …) from the sibling node_modules tree. NixOS
+        # symlinks ~/.pi/agent/extensions/pi-agent-browser at this store path.
+        pi-agent-browser-extension = pkgs.runCommand "pi-agent-browser-extension" { } ''
+          pkg="${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native"
+          mkdir -p "$out"
+          # Fail loudly if a future version drops an expected path, instead of
+          # leaving a dangling symlink in the store.
+          test -f "$pkg/package.json" || { echo "pi-agent-browser-extension: missing file $pkg/package.json" >&2; exit 1; }
+          test -d "$pkg/dist" || { echo "pi-agent-browser-extension: missing dir $pkg/dist" >&2; exit 1; }
+          test -d "$pkg/scripts" || { echo "pi-agent-browser-extension: missing dir $pkg/scripts" >&2; exit 1; }
+          ln -s "$pkg/package.json" "$out/package.json"
+          ln -s "$pkg/dist" "$out/dist"
+          ln -s "$pkg/scripts" "$out/scripts"
+          # Preserve dependency resolution if a loader follows the symlink
+          # (preserveSymlinks) rather than the realpath into pi-extensions.
+          ln -s "${pi-extensions}/lib/node_modules/pi-extensions/node_modules" "$out/node_modules"
+        '';
 
         # pi configured via pi.nix's mkCodingAgent: harness + npm extensions,
         # skills, and the LLM Gateway models all baked into one binary. The only
@@ -532,6 +572,7 @@
                 "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-vision-tool/extensions/vision-tool.ts"
                 "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@plannotator/pi-extension/index.ts"
                 "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@robhowley/pi-openrouter/extensions/openrouter/index.ts"
+                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native/dist/extensions/agent-browser/index.js"
               ];
               skills = [ belayd-skills ];
               models = ./models.json;
@@ -541,9 +582,10 @@
                 defaultThinkingLevel = "high";
                 theme = "dark";
               };
-              # -ne disables ALL extension auto-discovery (global dirs, the
+              # -ne disables extension auto-discovery (global dirs, the
               # settings `extensions`/`packages` arrays, and project
-              # .pi/settings.json), so the only extensions that load are the
+              # .pi/settings.json) and pi's built-in extensions (explicit -e
+              # paths still work), so the only extensions that load are the
               # explicit --extension flags above. This is the same trick as
               # bin/pi: it makes the binary self-contained and immune to
               # leftover global config double-loading the same tools.
@@ -636,7 +678,7 @@
       in
       {
         packages = {
-          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions belayd-pi belayd-skills belayd-harness belayd-shell;
+          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions pi-agent-browser-extension belayd-pi belayd-skills belayd-harness belayd-shell;
         };
 
         # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`

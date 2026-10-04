@@ -9,9 +9,9 @@
 # extensions load before project-local ones, so plain `pi` here would run the
 # Nix-built copy and silently ignore edits to extensions/.
 #
-# `-ne` disables ALL extension discovery (global dirs AND the settings
-# `extensions`/`packages` arrays — verified by test), so the local extensions
-# are re-added explicitly with -e and always win. This keeps the dev loop
+# `-ne` disables extension discovery and pi's built-in extensions (explicit -e
+# paths still work), so the local extensions are re-added explicitly with -e
+# and always win. This keeps the dev loop
 # local: edits to extensions/ take effect on the next pi start, with no push
 # + OS rebuild.
 #
@@ -37,11 +37,18 @@ case "${1:-}" in
     ;;
 esac
 
-# Run mode: -ne disables all extension discovery (global dirs AND settings
-# packages), then the repo-local extensions are re-added explicitly with -e.
+# Run mode: -ne disables extension discovery and built-in extensions, then the
+# repo-local extensions are re-added explicitly with -e.
 # Third-party npm extensions need a matching -e npm:<pkg> line here; note
 # that -ne does NOT affect models.json custom providers (e.g. LLM Gateway via
 # ~/.pi/agent/models.json) — those load regardless of extension discovery.
+#
+# The npm: source resolves at runtime: pi fetches the package once from the
+# registry into ~/.pi/agent/npm and caches it afterwards. It is pinned to the
+# same 0.9.2 the Nix pi-extensions tree ships. With PI_OFFLINE=1 (or no
+# registry access) the fetch cannot happen and the extension is silently
+# absent — accepted for this dev wrapper, because the configured belayd-pi
+# binary and pi-web runtime get the extension from the Nix store instead.
 # The run-mode flags are all placed BEFORE the user args on purpose: pi treats
 # the first positional as the prompt, so the user's prompt/args must stay last.
 exec "$real_pi" -ne \
@@ -50,4 +57,5 @@ exec "$real_pi" -ne \
   -e "$repo_dir/extensions/llmgateway-refresh.ts" \
   -e "$repo_dir/extensions/stale-file-guard.ts" \
   -e "$repo_dir/extensions/worktree-guard.ts" \
+  -e npm:pi-agent-browser-native@0.9.2 \
   "$@"
