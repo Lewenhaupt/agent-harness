@@ -281,10 +281,14 @@ propagation.
 
 ### 8. Sub-agent inheritance
 
-The harness spawns each sub-agent with `cwd` = its worktree and strips
-`BELAYD_SHELL_ACTIVE` (`src/spawn.ts`), so a sub-agent in another repo resolves
-*that* worktree's devShell. From pi-web, start a workflow/sub-agent whose
-worktree includes the probe devShell and ask it to run
+The harness spawns each sub-agent with `cwd` = its worktree when the task has
+one, falling back to `options.cwd`/`process.cwd()` otherwise, and strips
+`BELAYD_SHELL_ACTIVE` plus the inherited direnv per-directory state keys
+(`DIRENV_DIR`, `DIRENV_FILE`, `DIRENV_DIFF`, `DIRENV_WATCHES`,
+`DIRENV_LAYOUT_DIR`; direnv user-config vars are preserved) (`src/spawn.ts`). A
+sub-agent in another repo therefore resolves *that* worktree's devShell instead
+of inheriting the parent's stale direnv state. From pi-web, start a
+workflow/sub-agent whose worktree includes the probe devShell and ask it to run
 `command -v belayd-devshell-only-tool`; expect the devShell path and no hang.
 The env-stripping is unit-tested in `src/__tests__/spawn.test.ts`.
 
@@ -401,6 +405,15 @@ nesting.
   `1` blocked, `2` denied). `direnv allow <root>` re-allows.
 - `no readable state (foundRC is null)` — the `.envrc` is not readable by the
   service user.
+- `failed to load <root>/.envrc (direnv export bash exited 1)` whose stderr
+  contains `Revert() failed: unmarshal()` — the shell inherited a stale or
+  version-mismatched `DIRENV_DIFF` from a parent process that was already inside
+  a devShell (observed on direnv 2.37.1). Spawned sub-agents are immune: the
+  harness deletes the direnv per-directory state keys from the child env before
+  spawning (`src/spawn.ts`), so a sub-agent resolves its own worktree's devShell
+  instead of replaying the parent's state. In an interactive or terminal shell,
+  re-enter from a fresh shell (`unset DIRENV_DIR DIRENV_FILE DIRENV_DIFF
+  DIRENV_WATCHES`) and retry.
 - Other fail-loud messages: `direnv is not on PATH`, `nix is not on PATH`,
   `nix-shell is not on PATH`, and `failed to load <root>/.envrc (direnv export
   bash exited N)` for a broken `.envrc`.

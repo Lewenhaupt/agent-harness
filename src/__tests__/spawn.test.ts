@@ -95,6 +95,24 @@ function simulateSpawnError(message: string): void {
   fireEvent("error", new Error(message));
 }
 
+/**
+ * Apply env overrides on `process.env` and return a restore callback so tests
+ * can guarantee cleanup in a `finally` block.
+ */
+function applyProcessEnv(entries: Record<string, string>): () => void {
+  const saved = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(entries)) {
+    saved.set(key, process.env[key]);
+    process.env[key] = value;
+  }
+  return () => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
+
 /** Drop all registered handlers between tests. */
 function clearHandlers(): void {
   getHandlers().clear();
@@ -527,6 +545,66 @@ describe("launchAgentProcess env (W5)", () => {
       } else {
         process.env.BELAYD_SHELL_ACTIVE = original;
       }
+    }
+  });
+
+  it("strips direnv per-directory state from process.env and options.env, preserving user config and unrelated vars", async () => {
+    // Only the per-directory STATE keys are stripped. USER-CONFIG keys and
+    // unknown DIRENV_* vars must survive, proving this is an explicit list and
+    // not a prefix sweep.
+    const stateKeys = [
+      "DIRENV_DIR",
+      "DIRENV_FILE",
+      "DIRENV_DIFF",
+      "DIRENV_WATCHES",
+      "DIRENV_LAYOUT_DIR",
+    ] as const;
+    const userConfigKeys = [
+      "DIRENV_CONFIG",
+      "DIRENV_WARN_TIMEOUT",
+      "DIRENV_LOG_FORMAT",
+      "DIRENV_MAX_DEPTH",
+    ] as const;
+    const restoreEnv = applyProcessEnv({
+      ...Object.fromEntries(stateKeys.map((key) => [key, `/stale/parent/${key}`])),
+      ...Object.fromEntries(userConfigKeys.map((key) => [key, `parent-${key}`])),
+    });
+    try {
+      // Non-vacuous guard: every state key must actually be present in the
+      // input, otherwise the strip assertions below would be hollow. options.env
+      // overrides these values, so a surviving options.env key would still show.
+      for (const key of stateKeys) expect(process.env[key]).toBeDefined();
+
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        env: {
+          DIRENV_DIFF: "corrupt",
+          DIRENV_WATCHES: "stale",
+          DIRENV_UNKNOWN_KEY: "kept",
+          BELAYD_EXTRA: "x",
+        },
+      };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      expect(mockSpawn).toHaveBeenCalled();
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+
+      for (const key of stateKeys) expect(spawnOptions.env).not.toHaveProperty(key);
+      expect(spawnOptions.env.HOME).toBe(process.env.HOME);
+      expect(spawnOptions.env.PATH).toBe(process.env.PATH);
+      for (const key of userConfigKeys) expect(spawnOptions.env[key]).toBe(process.env[key]);
+      expect(spawnOptions.env.DIRENV_UNKNOWN_KEY).toBe("kept");
+      expect(spawnOptions.env.BELAYD_EXTRA).toBe("x");
+
+      handle.cleanup();
+    } finally {
+      restoreEnv();
     }
   });
 
