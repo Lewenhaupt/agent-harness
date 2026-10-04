@@ -11,7 +11,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   listRuns,
   RunStatus,
@@ -51,6 +51,21 @@ const mockSpawnAgentProcess = vi.hoisted(() =>
 vi.mock("../spawn.js", () => ({
   spawnAgentProcess: mockSpawnAgentProcess,
 }));
+
+// The spawn layer is mocked above, so the real on-disk session existence check
+// never runs. Control it directly: resume tests opt in with mockReturnValue(true),
+// while the resume-fallback test leaves it false to exercise W3.
+const mockResolveProjectSessionExists = vi.hoisted(() =>
+  vi.fn((_sessionId: string): boolean => false),
+);
+
+vi.mock("../session-naming.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../session-naming.js")>();
+  return {
+    ...actual,
+    resolveProjectSessionExists: mockResolveProjectSessionExists,
+  };
+});
 
 // Mock node:child_process exec so quality gates fail deterministically
 // (gateFullValidation shells out to pnpm typecheck/lint/test)
@@ -287,7 +302,16 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   return { api, tools, commands, eventHandlers, messages, activeTools };
 }
 
-function createMockCtx(overrides?: Partial<{ sessionId: string; cwd: string }>): {
+/**
+ * Per-test cwd for describes that do not need their own isolation. A fresh
+ * temp dir per test keeps a workflow.json (and its bd-81 phase-session ledger)
+ * written by one test from leaking into a later same-taskId test.
+ */
+let defaultMockCwd = "";
+
+/** Build a mock ctx. bd-10 binds a per-test temp dir through its own local
+ * wrapper instead of a mutable global. */
+function createMockCtxWithCwd(overrides?: Partial<{ sessionId: string; cwd: string }>): {
   sessionManager: { getSessionId: () => string };
   cwd: string;
 } {
@@ -295,8 +319,15 @@ function createMockCtx(overrides?: Partial<{ sessionId: string; cwd: string }>):
     sessionManager: {
       getSessionId: () => overrides?.sessionId ?? "test-session-id",
     },
-    cwd: overrides?.cwd ?? "/tmp/test",
+    cwd: overrides?.cwd ?? defaultMockCwd,
   };
+}
+
+/** Default ctx for describes that need no special setup; cwd is isolated per test. */
+function createMockCtx(
+  overrides?: Partial<{ sessionId: string; cwd: string }>,
+): ReturnType<typeof createMockCtxWithCwd> {
+  return createMockCtxWithCwd(overrides);
 }
 
 async function loadExtension() {
@@ -375,7 +406,37 @@ async function runCommitTool(
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+beforeEach(() => {
+  defaultMockCwd = mkdtempSync(join(tmpdir(), "belayd-extension-default-"));
+});
+
+// Default every test to "no session on disk" so resume-fallback (W3) stays
+// exercised unless a test explicitly opts into resume.
+afterEach(() => {
+  mockResolveProjectSessionExists.mockReset();
+  mockResolveProjectSessionExists.mockReturnValue(false);
+  if (defaultMockCwd !== "") {
+    rmSync(defaultMockCwd, { recursive: true, force: true });
+    defaultMockCwd = "";
+  }
+});
+
 describe("extension session naming (bd-10)", () => {
+  // Each test gets its own workflow-state directory so the bd-81 phase-session
+  // ledger (and completed phases) cannot leak between tests that reuse the
+  // same default task ID. A local wrapper binds the ctx to it, so no
+  // module-level mutable default is needed.
+  let mockCwd = "";
+
+  const bd10Ctx = (
+    overrides?: Partial<{ sessionId: string; cwd: string }>,
+  ): ReturnType<typeof createMockCtxWithCwd> =>
+    createMockCtxWithCwd({ ...overrides, cwd: overrides?.cwd ?? mockCwd });
+
+  beforeEach(() => {
+    mockCwd = mkdtempSync(join(tmpdir(), "belayd-mock-cwd-"));
+  });
+
   afterEach(() => {
     mockSpawnAgentProcess.mockClear();
     mockHttpRequest.mockClear();
@@ -389,6 +450,10 @@ describe("extension session naming (bd-10)", () => {
         _setDefaultSessions: (data: string) => void;
       }
     )._setDefaultSessions(JSON.stringify({ sessions: [] }));
+    if (mockCwd !== "") {
+      rmSync(mockCwd, { recursive: true, force: true });
+      mockCwd = "";
+    }
   });
 
   describe("phase tool session naming", () => {
@@ -401,24 +466,12 @@ describe("extension session naming (bd-10)", () => {
       const startTask = tools.get("belayd_start_task");
       expect(startTask).toBeDefined();
 
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-42" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-42" }, undefined, undefined, bd10Ctx());
 
       // Execute the scout tool
       const scout = tools.get("belayd_scout");
       expect(scout).toBeDefined();
-      await scout?.execute(
-        "call-2",
-        { task: "investigate" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await scout?.execute("call-2", { task: "investigate" }, undefined, undefined, bd10Ctx());
 
       // The spawn now happens in the background (non-blocking run).
       await vi.waitFor(() => {
@@ -441,16 +494,16 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-99", workflowType: "research" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       // Execute scout
       const scout = tools.get("belayd_scout");
-      await scout?.execute("call-2", { task: "scout" }, undefined, undefined, createMockCtx());
+      await scout?.execute("call-2", { task: "scout" }, undefined, undefined, bd10Ctx());
 
       // Execute plan
       const plan = tools.get("belayd_plan");
-      await plan?.execute("call-3", { task: "plan" }, undefined, undefined, createMockCtx());
+      await plan?.execute("call-3", { task: "plan" }, undefined, undefined, bd10Ctx());
 
       // Both spawns run in the background once their phase tools return.
       await vi.waitFor(() => {
@@ -499,10 +552,10 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-42", workflowType: "research" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
-      const ctx = createMockCtx();
+      const ctx = bd10Ctx();
       await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
       await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
       await runCommitTool(tools, ctx);
@@ -542,10 +595,10 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-1", workflowType: "research" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
-      const ctx = createMockCtx();
+      const ctx = bd10Ctx();
       await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
       await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
       await runCommitTool(tools, ctx);
@@ -571,10 +624,10 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-1", workflowType: "research" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
-      const ctx = createMockCtx();
+      const ctx = bd10Ctx();
       await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
       await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
       await runCommitTool(tools, ctx);
@@ -593,7 +646,7 @@ describe("extension session naming (bd-10)", () => {
 
       // Trigger agent_end without activating the gate
       const agentEndHandler = eventHandlers.get("agent_end");
-      await agentEndHandler?.({}, createMockCtx());
+      await agentEndHandler?.({}, bd10Ctx());
 
       // No HTTP requests to daemon should have been made
       expect(mockHttpRequest).not.toHaveBeenCalled();
@@ -615,18 +668,12 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-50", workflowType: "chore" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       // Execute implement tool — its gate retries now run in the background.
       const implement = tools.get("belayd_implement");
-      await implement?.execute(
-        "call-2",
-        { task: "implement" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await implement?.execute("call-2", { task: "implement" }, undefined, undefined, bd10Ctx());
 
       // The quality gate (gateFullValidation) shells out to pnpm via exec.
       // Since we mocked exec to fail, the gate keeps failing, so the harness
@@ -682,17 +729,11 @@ describe("extension session naming (bd-10)", () => {
         { taskId: "bd-50", workflowType: "chore" },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       const implement = tools.get("belayd_implement");
-      await implement?.execute(
-        "call-2",
-        { task: "implement" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await implement?.execute("call-2", { task: "implement" }, undefined, undefined, bd10Ctx());
 
       await vi.waitFor(() => {
         expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(10);
@@ -754,16 +795,10 @@ describe("extension session naming (bd-10)", () => {
 
       // Activate gate with feature workflow
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-77" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-77" }, undefined, undefined, bd10Ctx());
 
       // Execute the userguide tool and wait for its background run to finish.
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Now call commit with the taskId — if userGuideContent is set,
       // commit appends the note. execFile is mocked to fail, so we only
@@ -780,7 +815,7 @@ describe("extension session naming (bd-10)", () => {
         },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       // Verify that the human-review flag and the note append were attempted.
@@ -825,26 +860,14 @@ describe("extension session naming (bd-10)", () => {
 
       // Start first task
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-77" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-77" }, undefined, undefined, bd10Ctx());
 
       // Complete userguide in the background before starting the next task.
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Start a new task — this should clear userGuideContent
       mockExecFile.clear();
-      await startTask?.execute(
-        "call-2",
-        { taskId: "bd-88" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-2", { taskId: "bd-88" }, undefined, undefined, bd10Ctx());
 
       // Now call commit with the second taskId
       const commit = tools.get("belayd_commit");
@@ -857,7 +880,7 @@ describe("extension session naming (bd-10)", () => {
         },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       // Since userGuideContent was cleared, no bd note call should happen
@@ -894,31 +917,19 @@ describe("extension session naming (bd-10)", () => {
 
       // Start task
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-77" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-77" }, undefined, undefined, bd10Ctx());
 
       // Complete userguide in the background before stopping the task.
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Stop the task — this should clear userGuideContent
       const stopTask = tools.get("belayd_stop_task");
       expect(stopTask).toBeDefined();
 
-      await stopTask?.execute("call-stop", {}, undefined, undefined, createMockCtx());
+      await stopTask?.execute("call-stop", {}, undefined, undefined, bd10Ctx());
 
       // Start a new task and commit — no append-notes should happen
-      await startTask?.execute(
-        "call-2",
-        { taskId: "bd-88" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-2", { taskId: "bd-88" }, undefined, undefined, bd10Ctx());
 
       const commit = tools.get("belayd_commit");
       mockExecFile.clear();
@@ -930,7 +941,7 @@ describe("extension session naming (bd-10)", () => {
         },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       const noteCalls = mockExecFile.calls.filter(
@@ -986,17 +997,11 @@ describe("extension session naming (bd-10)", () => {
 
       // Start task
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-77" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-77" }, undefined, undefined, bd10Ctx());
 
       // Execute userguide twice; the second background run overwrites the first.
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Now call commit with taskId — should use the second (overwritten) content
       const commit = tools.get("belayd_commit");
@@ -1009,7 +1014,7 @@ describe("extension session naming (bd-10)", () => {
         },
         undefined,
         undefined,
-        createMockCtx(),
+        bd10Ctx(),
       );
 
       // The commit appends the user guide content via bd note.
@@ -1046,19 +1051,13 @@ describe("extension session naming (bd-10)", () => {
 
       // Start task and complete up to userguide, then stop (no commit)
       const startTask = tools.get("belayd_start_task");
-      await startTask?.execute(
-        "call-1",
-        { taskId: "bd-99" },
-        undefined,
-        undefined,
-        createMockCtx(),
-      );
+      await startTask?.execute("call-1", { taskId: "bd-99" }, undefined, undefined, bd10Ctx());
 
-      await runPhaseToolAndWait(tools, "belayd_userguide", messages, createMockCtx());
+      await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Stop without committing
       const stopTask = tools.get("belayd_stop_task");
-      await stopTask?.execute("call-stop", {}, undefined, undefined, createMockCtx());
+      await stopTask?.execute("call-stop", {}, undefined, undefined, bd10Ctx());
 
       // No execute should fail, no crash should occur
       expect(true).toBe(true);
@@ -1792,10 +1791,10 @@ describe("session_start resume from disk (bd-40)", () => {
   }
 
   async function bootWithCwd(cwd: string) {
-    const { api, tools, eventHandlers } = createMockPi();
+    const { api, tools, eventHandlers, messages } = createMockPi();
     const factory = await loadExtension();
     factory(api);
-    return { cwd, api, tools, eventHandlers };
+    return { cwd, api, tools, eventHandlers, messages };
   }
 
   async function fireSessionStart(
@@ -2046,5 +2045,645 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0]).toHaveProperty("phase", "implement");
     expect(runs[0]).toHaveProperty("exitCode", 1);
+  });
+
+  // ── Review↔fix resume (bd-81) ──────────────────────────────────────
+
+  it("resumes the implement session on later invocations and bounds epochs", async () => {
+    setExecToSucceed();
+    // The spawn layer is mocked, so track which sessions the mock has "created"
+    // on disk. A would-be fresh `-run-N` epoch must read as absent until it is
+    // spawned, which also lets the W6 collision-advance loop terminate.
+    const existingSessions = new Set<string>();
+    mockResolveProjectSessionExists.mockImplementation((sessionId: string) =>
+      existingSessions.has(sessionId),
+    );
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+      // Model the spawned session now existing on disk: the W6 pre-check must
+      // see a fresh epoch as absent before its spawn but present on the next
+      // (resume) invocation.
+      const spawned = mockSpawnAgentProcess.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+      if (typeof spawned.sessionName === "string") existingSessions.add(spawned.sessionName);
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    await runPhase("implement", "first pass");
+    const first = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(first.resumeSession).toBe(false);
+    const base = first.sessionName as string;
+
+    await runPhase("implement", "fix the findings");
+    const second = mockSpawnAgentProcess.mock.calls[1]?.[0] as Record<string, unknown>;
+    expect(second.sessionName).toBe(base);
+    expect(second.resumeSession).toBe(true);
+    // A cross-run resume must not re-prepend the bead plan; the orchestrator
+    // supplies the review findings in the task instead.
+    expect(second.task).toBe("fix the findings");
+
+    await runPhase("implement", "third pass");
+    const third = mockSpawnAgentProcess.mock.calls[2]?.[0] as Record<string, unknown>;
+    expect(third.sessionName).toBe(base);
+    expect(third.resumeSession).toBe(true);
+
+    await runPhase("implement", "fourth pass");
+    const fourth = mockSpawnAgentProcess.mock.calls[3]?.[0] as Record<string, unknown>;
+    expect(fourth.sessionName).toBe(`${base}-run-3`);
+    expect(fourth.resumeSession).toBe(false);
+
+    await runPhase("implement", "fifth pass");
+    const fifth = mockSpawnAgentProcess.mock.calls[4]?.[0] as Record<string, unknown>;
+    expect(fifth.sessionName).toBe(`${base}-run-3`);
+    expect(fifth.resumeSession).toBe(true);
+
+    // The ledger is per-(task, phase) and persisted for the next orchestrator.
+    expect(readWorkflowStateFromDisk({ cwd })?.phaseSessions?.implement).toEqual({
+      base,
+      invocations: 5,
+    });
+  });
+
+  it("mints a distinct -run-3 cross-run epoch despite a gate-retry -retry-3", async () => {
+    setExecToSucceed();
+    // The would-be fresh epoch is absent on disk; only a stale gate-retry
+    // `-retry-3` exists, which the `-run-3` namespace must not reuse.
+    mockResolveProjectSessionExists.mockReturnValue(false);
+    const cwd = freshWorktree();
+    const base = "belayd-bd-42-sub-implement-collision";
+    // The ledger is already at attempt 3, so the next invocation is the first
+    // fresh cross-run epoch. An earlier implement run's gate retries would have
+    // left `base-retry-3` on disk; the cross-run epoch must not reuse that name.
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        completedPhaseNames: ["implement", "review"],
+        phaseSessions: { implement: { base, invocations: 3 } },
+      }),
+    });
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "fix" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(opts.sessionName).toBe(`${base}-run-3`);
+    expect(opts.sessionName).not.toBe(`${base}-retry-3`);
+    expect(opts.resumeSession).toBe(false);
+  });
+
+  it("advances past a stale fresh-epoch name left by a failed ledger write (W6)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const base = "belayd-bd-42-sub-implement-stale";
+    // The ledger says attempt 3, but an earlier invocation already created
+    // `base-run-3` on disk and then failed to persist the advance. The next
+    // invocation resolves the same fresh epoch; spawning it as fresh would let
+    // pi's create-or-resume silently replay the stale transcript.
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        completedPhaseNames: ["implement", "review"],
+        phaseSessions: { implement: { base, invocations: 3 } },
+      }),
+    });
+    mockResolveProjectSessionExists.mockImplementation(
+      (sessionId: string) => sessionId === `${base}-run-3`,
+    );
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "fix" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    // Advanced to the next odd epoch instead of clobbering/resuming `-run-3`.
+    expect(opts.sessionName).toBe(`${base}-run-5`);
+    expect(opts.resumeSession).toBe(false);
+    // The ledger advanced past the skipped epoch, so the next invocation
+    // resumes the epoch actually spawned.
+    expect(readWorkflowStateFromDisk({ cwd })?.phaseSessions?.implement).toEqual({
+      base,
+      invocations: 6,
+    });
+  });
+
+  it("bounds the collision-advance loop when the exists probe never clears (W6)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const base = "belayd-bd-42-sub-implement-stuck";
+    // The ledger is at attempt 3 and every probe reports the name as present,
+    // so the W6 advance loop would never find an absent epoch. The defensive
+    // cap must terminate with a fresh name outside the `-run-<n>` namespace.
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        completedPhaseNames: ["implement", "review"],
+        phaseSessions: { implement: { base, invocations: 3 } },
+      }),
+    });
+    mockResolveProjectSessionExists.mockReturnValue(true);
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "fix" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(typeof opts.sessionName).toBe("string");
+    expect(opts.sessionName as string).toMatch(new RegExp(`^${base}-run-x-`));
+    expect(opts.resumeSession).toBe(false);
+    // The ledger advanced past the exhausted namespace rather than stalling.
+    const persisted = readWorkflowStateFromDisk({ cwd })?.phaseSessions?.implement;
+    expect(persisted?.base).toBe(base);
+    expect(persisted?.invocations).toBeGreaterThan(3);
+  });
+
+  it("ignores a foreign workflow.json (taskId mismatch) and writes no ledger entry (W1)", async () => {
+    setExecToSucceed();
+    mockResolveProjectSessionExists.mockReturnValue(true);
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    // Start bd-42 so the gate is active and currentTaskId is set, then swap the
+    // workflow.json for another task's state. A phase tool must treat the
+    // foreign ledger as absent: fresh session, and no write into it.
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        taskId: "bd-99",
+        completedPhaseNames: [],
+        phaseSessions: {
+          implement: { base: "belayd-bd-99-sub-implement-foreign", invocations: 2 },
+        },
+      }),
+    });
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "implement" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(opts.sessionName).toMatch(/^belayd-bd-42-sub-implement-/);
+    expect(opts.resumeSession).toBe(false);
+
+    // The foreign task's ledger entry is untouched and no bd-42 entry was added.
+    const persisted = readWorkflowStateFromDisk({ cwd });
+    expect(persisted).toHaveProperty("taskId", "bd-99");
+    expect(persisted?.phaseSessions).toEqual({
+      implement: { base: "belayd-bd-99-sub-implement-foreign", invocations: 2 },
+    });
+  });
+
+  it("resumes the review session across re-reviews", async () => {
+    setExecToSucceed();
+    mockResolveProjectSessionExists.mockReturnValue(true);
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    await runPhase("review", "first review");
+    const firstReview = mockSpawnAgentProcess.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find(
+        (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-review-"),
+      );
+    expect(firstReview).toBeDefined();
+    const base = firstReview?.sessionName as string;
+    expect(firstReview?.resumeSession).toBe(false);
+
+    await runPhase("review", "re-review after fixes");
+    const secondReview = mockSpawnAgentProcess.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .filter(
+        (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-review-"),
+      )
+      .at(-1);
+    expect(secondReview?.sessionName).toBe(base);
+    expect(secondReview?.resumeSession).toBe(true);
+  });
+
+  it("points the gate context at the resumable fix loop after review", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "review");
+
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toContain("If any Critical/Warnings remain, call `belayd_implement`");
+    expect(message).toContain("resumes the review session");
+    expect(message).not.toContain("Next required step: call `belayd_test`");
+
+    // The loop directive is also attached to the review completion follow-up.
+    const reviewDelivery = messages.find(
+      (m) =>
+        m.customType === "belayd-run-complete" && m.content.includes("call `belayd_review` again"),
+    );
+    expect(reviewDelivery?.content).toContain("call `belayd_review` again");
+  });
+
+  it("keeps the plain next-step directive when review never ran", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "implement" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toContain("Next required step: call `belayd_review`");
+    expect(message).not.toContain("Review findings need addressing");
+  });
+
+  it("prepends the bead plan when a resume target is missing on disk", async () => {
+    setExecToSucceed();
+    // Existence check defaults to false: the ledger says resume, but the session
+    // file is gone, so the invocation must behave as fresh and carry the plan.
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    await runPhase("implement", "first pass");
+    const first = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    const base = first.sessionName as string;
+
+    await runPhase("implement", "second pass");
+    const second = mockSpawnAgentProcess.mock.calls[1]?.[0] as Record<string, unknown>;
+    expect(second.sessionName).toBe(base);
+    expect(second.resumeSession).toBe(false);
+    // A missing resume target means a fresh session, so the plan is needed.
+    expect(second.task).toContain("## Bead plan (bd-42)");
+  });
+
+  it("re-arms the resumable-fix directive after a later review (W4)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "review");
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+
+    // A phase after review clears the flag and restores the plain directive.
+    await runPhase("test", "test");
+    const afterTest = await gateContextMessage(eventHandlers, ctx);
+    expect(afterTest).toContain("Next required step: call `belayd_userguide`");
+    expect(afterTest).not.toContain("Review findings need addressing");
+
+    // A late implement re-run is the fix half of the loop, so it re-arms the
+    // directive and points back at review instead of userguide.
+    await runPhase("implement", "late fix");
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+
+    // A late re-review after test keeps it armed.
+    await runPhase("review", "late re-review");
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+  });
+
+  it("resumes the persisted ledger and awaiting flag in a new session", async () => {
+    setExecToSucceed();
+    mockResolveProjectSessionExists.mockReturnValue(true);
+    const cwd = freshWorktree();
+    const base = "belayd-bd-42-sub-implement-persisted";
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        completedPhaseNames: ["implement", "review"],
+        phaseSessions: { implement: { base, invocations: 1 } },
+        awaitingReviewResponse: true,
+      }),
+    });
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    // The persisted flag survives the restart and drives the loop directive.
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_implement")
+      ?.execute("call-implement", { task: "fix findings" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(opts.sessionName).toBe(base);
+    expect(opts.resumeSession).toBe(true);
+    // Resumed runs must not re-prepend the plan (it is already in the transcript).
+    expect(opts.task).toBe("fix findings");
+  });
+
+  it("derives the armed loop from disk when the persisted flag is absent (pre-bd-81 state)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    // A pre-bd-81 workflow.json records review as completed but predates the
+    // awaitingReviewResponse field, so resume must derive the flag from the
+    // completed phase list instead of reading it.
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["implement", "review"] }),
+    });
+    expect(readWorkflowStateFromDisk({ cwd })?.awaitingReviewResponse).toBe(undefined);
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    const message = await gateContextMessage(eventHandlers, ctx);
+    expect(message).toContain("Review findings need addressing");
+    expect(message).toContain("If any Critical/Warnings remain, call `belayd_implement`");
+    expect(message).not.toContain("Next required step: call `belayd_test`");
+  });
+
+  it("keeps a fresh session and writes no ledger entry for a non-resumable phase", async () => {
+    setExecToSucceed();
+    mockResolveProjectSessionExists.mockReturnValue(true);
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "review");
+    await runPhase("test", "test");
+    await runPhase("test", "test again");
+
+    const testSpawns = mockSpawnAgentProcess.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .filter(
+        (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-test-"),
+      );
+    expect(testSpawns).toHaveLength(2);
+    for (const spawn of testSpawns) {
+      expect(spawn.resumeSession).toBe(false);
+      expect(spawn.sessionName).toMatch(/^belayd-bd-42-sub-test-/);
+      expect(spawn.sessionName).not.toMatch(/-run-\d+$/);
+    }
+
+    // Only implement/review participate, so `test` must not appear in the ledger.
+    const persisted = readWorkflowStateFromDisk({ cwd });
+    expect(persisted?.phaseSessions?.test).toBeUndefined();
+    expect(persisted?.phaseSessions?.implement).toBeDefined();
+    expect(persisted?.phaseSessions?.review).toBeDefined();
+  });
+
+  it("keeps the plain next-step directive for a workflow with no review phase", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    // research has no review phase, so the resumable-fix loop must never arm.
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        workflowType: "research",
+        phaseOrder: ["scout", "plan", "commit"],
+        completedPhaseNames: ["scout"],
+      }),
+    });
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+
+    const resumed = await gateContextMessage(eventHandlers, ctx);
+    expect(resumed).toContain("Next required step: call `belayd_plan`");
+    expect(resumed).not.toContain("Review findings need addressing");
+
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_plan")
+      ?.execute("call-plan", { task: "plan" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    // Completing a phase in a review-less order leaves the flag false on disk.
+    expect(readWorkflowStateFromDisk({ cwd })?.awaitingReviewResponse).toBe(false);
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Next required step: call `belayd_commit`",
+    );
+  });
+
+  it("prioritises the wait directive over the armed fix loop while a run is active", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "review");
+    // The directive is armed after review.
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+
+    // Hold the next run open so activeRuns stays non-empty while armed: the
+    // wait branch must win over the resumable-fix directive.
+    let releaseTest: (value: unknown) => void = () => {};
+    mockSpawnAgentProcess.mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseTest = resolve;
+      }),
+    );
+    await tools
+      .get("belayd_test")
+      ?.execute("call-test", { task: "test" }, undefined, undefined, ctx);
+
+    const armedWithActiveRun = await gateContextMessage(eventHandlers, ctx);
+    expect(armedWithActiveRun).toContain("Waiting for active runs to complete");
+    expect(armedWithActiveRun).not.toContain("Review findings need addressing");
+
+    const before = runCompletionCount(messages);
+    releaseTest({
+      content: [{ type: "text" as const, text: "test done" }],
+      details: {
+        messages: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        exitCode: 0,
+      },
+      sessionName: "mocked-test",
+    });
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+  });
+
+  it("leaves the armed fix loop unchanged across a pre-review phase re-run", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        completedPhaseNames: ["implement", "review"],
+        awaitingReviewResponse: true,
+      }),
+    });
+
+    const { tools, eventHandlers, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    await fireSessionStart(eventHandlers, ctx);
+    expect(await gateContextMessage(eventHandlers, ctx)).toContain(
+      "Review findings need addressing",
+    );
+
+    // scout precedes review in the order, so its completion must not disarm
+    // the directive (it is a consult phase, not part of the fix loop).
+    const before = runCompletionCount(messages);
+    await tools
+      .get("belayd_scout")
+      ?.execute("call-scout", { task: "scout" }, undefined, undefined, ctx);
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(before + 1);
+    });
+
+    const afterScout = await gateContextMessage(eventHandlers, ctx);
+    expect(afterScout).toContain("Review findings need addressing");
+    expect(afterScout).not.toContain("Next required step: call `belayd_test`");
   });
 });

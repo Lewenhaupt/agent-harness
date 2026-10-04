@@ -122,6 +122,86 @@ export function gateRetrySession(
   return { sessionName: `${base}-retry-${attempt - 1}`, resumeSession: true };
 }
 
+/**
+ * Per-(task, phase) ledger entry recording the phase's base session name and
+ * how many times the phase has been invoked for the task. Persisted in the
+ * workflow state so the handle survives orchestrator restarts.
+ */
+export interface PhaseSessionRecord {
+  base: string;
+  invocations: number;
+}
+
+/**
+ * Session name and resume flag for a cross-run phase re-invocation.
+ *
+ * Deliberately NOT gateRetrySession: intra-run gate retries mint
+ * `base-retry-<n>` names on the same base, and a first implement run that
+ * exhausts its gate already creates `base-retry-3` on disk. Reusing that
+ * namespace here would let pi's create-or-resume `--session-id` silently
+ * resume a stale gate-retry transcript where a fresh cross-run epoch was
+ * intended (duplicating the system prompt and carrying the wrong history).
+ * The `-run-<n>` namespace keeps the two bounded independently.
+ *
+ * Attempts 1..IN_SESSION_RETRY_LIMIT resume `base`; attempt 3 starts
+ * `base-run-3`, attempt 4 resumes it, and so on with two-attempt epochs.
+ */
+function crossRunPhaseSession(
+  base: string,
+  attempt: number,
+): { sessionName: string; resumeSession: boolean } {
+  if (!base || typeof base !== "string") {
+    throw new Error("base must be a non-empty string");
+  }
+  if (!Number.isInteger(attempt) || attempt < 1) {
+    throw new Error("attempt must be a positive integer");
+  }
+  if (attempt <= IN_SESSION_RETRY_LIMIT) {
+    return { sessionName: base, resumeSession: true };
+  }
+  // Epoch length is 2: the first attempt mints a fresh session, the second
+  // resumes it. Both share the first attempt's `-run-<odd>` name.
+  if (attempt % 2 === 1) {
+    return { sessionName: `${base}-run-${attempt}`, resumeSession: false };
+  }
+  return { sessionName: `${base}-run-${attempt - 1}`, resumeSession: true };
+}
+
+/**
+ * Resolve the session name and resume flag for a phase invocation.
+ *
+ * The first invocation of a phase starts a fresh session. Later invocations
+ * resume the recorded base for IN_SESSION_RETRY_LIMIT attempts, then alternate
+ * two-attempt fresh epochs on that base — the same bounded-growth shape as
+ * intra-run gate retries, but under its own `-run-<n>` namespace so a
+ * cross-run epoch can never collide with a gate retry's `-retry-<n>` name.
+ * `next` carries the incremented invocation count for the caller to persist.
+ */
+export function resolvePhaseInvocation(
+  prior: PhaseSessionRecord | undefined,
+  freshSessionName: string,
+): { sessionName: string; resumeSession: boolean; next: PhaseSessionRecord } {
+  if (prior === undefined) {
+    return {
+      sessionName: freshSessionName,
+      resumeSession: false,
+      next: { base: freshSessionName, invocations: 1 },
+    };
+  }
+  // A corrupt ledger can carry a zero/negative/NaN count; reject it here so
+  // the contract is explicit rather than relying on the nested epoch helper.
+  if (!Number.isInteger(prior.invocations) || prior.invocations < 1) {
+    throw new Error("invocations must be a positive integer");
+  }
+  const attempt = prior.invocations;
+  const { sessionName, resumeSession } = crossRunPhaseSession(prior.base, attempt);
+  return {
+    sessionName,
+    resumeSession,
+    next: { base: prior.base, invocations: prior.invocations + 1 },
+  };
+}
+
 /** Expand a leading `~` to the user's home directory. */
 function expandHome(dir: string): string {
   if (dir === "~") return homedir();

@@ -10,8 +10,14 @@ import { randomBytes } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import type { PhaseSessionRecord } from "./session-naming.js";
 
 const SCHEMA_VERSION = 1;
+
+const PhaseSessionRecordSchema = z.object({
+  base: z.string(),
+  invocations: z.number().int().positive(),
+});
 
 const WorkflowStateSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
@@ -21,6 +27,13 @@ const WorkflowStateSchema = z.object({
   originalCwd: z.string(),
   phaseOrder: z.array(z.string()),
   completedPhaseNames: z.array(z.string()),
+  // Optional so a workflow.json written before bd-81 still parses (undefined
+  // ledger means every phase starts fresh on first invocation).
+  phaseSessions: z.record(z.string(), PhaseSessionRecordSchema).optional(),
+  // Optional so pre-bd-81 state parses; absent means the flag is derived from
+  // the completed phase list on resume. Persisted so a late re-review after a
+  // later phase completed still re-arms the resumable-fix directive.
+  awaitingReviewResponse: z.boolean().optional(),
   startedAt: z.number().finite(),
   updatedAt: z.number().finite(),
 });
@@ -56,8 +69,28 @@ export interface WriteWorkflowStateOptions {
 export interface SaveCompletedPhasesOptions {
   cwd: string;
   completedPhaseNames: string[];
+  /**
+   * When provided, persisted alongside the phase list. When omitted, the value
+   * already on disk is preserved (see the `?? existing.awaitingReviewResponse`
+   * fallback in saveCompletedPhases), so a caller that only updates the phase
+   * list never clears the flag.
+   */
+  awaitingReviewResponse?: boolean;
   fs?: WorkflowFs;
   now?: () => number;
+}
+
+export interface SavePhaseSessionOptions {
+  cwd: string;
+  phaseName: string;
+  record: PhaseSessionRecord;
+  fs?: WorkflowFs;
+  now?: () => number;
+  /**
+   * Pre-read workflow state. The caller already read it to validate the task
+   * id, so passing it here avoids a second synchronous disk read.
+   */
+  existingState?: WorkflowState;
 }
 
 export interface ClearWorkflowStateOptions {
@@ -163,8 +196,9 @@ export function writeWorkflowState(
 }
 
 /**
- * Read-modify-write: replace only the completed phase list and `updatedAt`,
- * preserving identity fields (task, type, branch, cwd, startedAt).
+ * Read-modify-write: replace only the completed phase list, the optional
+ * awaiting-review flag, and `updatedAt`, preserving identity fields (task,
+ * type, branch, cwd, startedAt) and the phase-session ledger.
  */
 export function saveCompletedPhases(
   options: SaveCompletedPhasesOptions,
@@ -177,6 +211,35 @@ export function saveCompletedPhases(
   const updated: WorkflowState = {
     ...existing,
     completedPhaseNames: [...options.completedPhaseNames],
+    awaitingReviewResponse: options.awaitingReviewResponse ?? existing.awaitingReviewResponse,
+    updatedAt: nowMs(options.now),
+  };
+  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+}
+
+/**
+ * Read-modify-write: upsert one phase's session ledger entry and `updatedAt`,
+ * preserving every identity field and the other phases' entries. Mirrors
+ * saveCompletedPhases so the persisted handle survives orchestrator restarts.
+ */
+export function savePhaseSession(
+  options: SavePhaseSessionOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing =
+    options.existingState ?? readWorkflowState({ cwd: options.cwd, fs, now: options.now });
+  if (existing === undefined) {
+    return { ok: false, error: `No Belayd workflow state found in ${options.cwd}` };
+  }
+  const updated: WorkflowState = {
+    ...existing,
+    phaseSessions: {
+      ...(existing.phaseSessions ?? {}),
+      [options.phaseName]: {
+        base: options.record.base,
+        invocations: options.record.invocations,
+      },
+    },
     updatedAt: nowMs(options.now),
   };
   return writeWorkflowState({ cwd: options.cwd, state: updated, fs });

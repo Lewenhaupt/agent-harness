@@ -82,18 +82,22 @@ import {
 } from "../src/proof-dir.js";
 import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
+import type { PhaseSessionRecord } from "../src/session-naming.js";
 import {
   computeOrchestratorSessionName,
   computePlanningSubagentSessionName,
   computeSubagentSessionName,
   gateRetrySession,
   generateShortRunId,
+  resolvePhaseInvocation,
+  resolveProjectSessionExists,
 } from "../src/session-naming.js";
 import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
 import {
   clearWorkflowState,
   readWorkflowState,
   saveCompletedPhases,
+  savePhaseSession,
   writeWorkflowState,
 } from "../src/workflow-state.js";
 
@@ -138,6 +142,8 @@ type SessionState = {
   userGuideContent?: string;
   proofOutput?: string;
   proofVerifierVerdict?: string;
+  /** True after a review run completes and before a later phase runs again. */
+  awaitingReviewResponse: boolean;
   deliveredRunIds: Set<string>;
   activeRuns: Map<string, { handle: RunHandle; abortController: AbortController }>;
 };
@@ -238,6 +244,7 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
       optionalPhases: WORKFLOW_REGISTRY.feature.optionalPhases ?? [],
       deliveredRunIds: new Set(),
       activeRuns: new Map(),
+      awaitingReviewResponse: false,
     };
     sessionStates.set(id, state);
   }
@@ -349,6 +356,172 @@ function describePhase(phase: string, workflowType: WorkflowSubType): string {
     commit: "Commit changes",
   };
   return descriptions[phase] ?? phase;
+}
+
+/**
+ * Shared fix-loop wording. The gate context, the workflow-start message, and
+ * the run-completion follow-up all instruct the orchestrator the same way; one
+ * helper keeps them from drifting.
+ */
+const REVIEW_LOOP_FIX_STEP =
+  "call `belayd_implement` with those findings (it resumes the implementation session, so it sees its earlier work), then call `belayd_review` again (it resumes the review session) to verify";
+
+// Phase-name constants for the review↔fix loop helpers (bd-81). Hoisted so the
+// loop checks and the guidance strings cannot drift from the workflow phase
+// names.
+const IMPLEMENT_PHASE = "implement" as const;
+const REVIEW_PHASE = "review" as const;
+const COMMIT_PHASE = "commit" as const;
+const RESUMABLE_PHASES = [IMPLEMENT_PHASE, REVIEW_PHASE] as const;
+
+/** True for phases that participate in the cross-run session-resume ledger. */
+function isResumablePhase(phaseName: string): phaseName is (typeof RESUMABLE_PHASES)[number] {
+  return RESUMABLE_PHASES.some((phase) => phase === phaseName);
+}
+
+/**
+ * Upper bound on the W6 collision-advance loop. A correctly-behaving `exists`
+ * probe reaches the first absent epoch in a step or two; this cap only fires
+ * when the injected probe never reports an absent epoch, guaranteeing the loop
+ * terminates instead of spinning forever.
+ */
+const MAX_EPOCH_ADVANCES = 1000;
+
+/**
+ * Resolve a re-invocation's session, skipping past fresh cross-run epochs whose
+ * name already exists on disk.
+ *
+ * A re-invocation that resolves to a FRESH epoch whose name already exists
+ * means an earlier invocation minted that epoch but failed to persist the
+ * ledger advance (W6). Spawning it as "fresh" would let pi's create-or-resume
+ * `--session-id` silently replay the stale transcript with the system prompt
+ * re-appended. Advance to the next non-colliding odd `-run-N` epoch instead of
+ * resuming the collision: skipping preserves the transcript-bounding guarantee
+ * even while the ledger write keeps failing (resuming would let one epoch grow
+ * unbounded). `exists` is injected so the caller controls the on-disk probe.
+ */
+function advancePastExistingEpoch(options: {
+  prior: PhaseSessionRecord | undefined;
+  freshSessionName: string;
+  exists: (sessionName: string) => boolean;
+}): { sessionName: string; resumeSession: boolean; next: PhaseSessionRecord } {
+  let resolved = resolvePhaseInvocation(options.prior, options.freshSessionName);
+  if (options.prior === undefined) return resolved;
+  let advances = 0;
+  while (!resolved.resumeSession && options.exists(resolved.sessionName)) {
+    if (advances >= MAX_EPOCH_ADVANCES) {
+      // The `exists` probe never reported an absent epoch (e.g. a buggy or
+      // mocked implementation). Stop probing and hand back a name outside the
+      // `-run-<n>` namespace so termination never depends on the probe.
+      const uniqueName = `${resolved.next.base}-run-x-${randomUUID()}`;
+      return {
+        sessionName: uniqueName,
+        resumeSession: false,
+        next: { base: resolved.next.base, invocations: resolved.next.invocations + 1 },
+      };
+    }
+    advances += 1;
+    resolved = resolvePhaseInvocation(
+      { base: resolved.next.base, invocations: resolved.next.invocations + 1 },
+      options.freshSessionName,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * The resumable-fix directive: address findings before advancing. `nextPhaseTool`
+ * is the tool that follows review in this workflow's phase order, so the
+ * "advance only when clean" clause stays correct for any phaseOrder.
+ */
+function reviewLoopDirective(nextPhaseTool: string): string {
+  return `If any Critical/Warnings remain, ${REVIEW_LOOP_FIX_STEP}. Only once no Critical/Warnings remain, call \`${nextPhaseTool}\`.`;
+}
+
+/**
+ * Review-findings guidance shared by the workflow-start and gate-context
+ * messages. The reviewer emits Critical/Warnings/Suggestions; the orchestrator
+ * must treat all three as input and disclose anything it declines.
+ */
+function reviewFindingsGuidanceLines(nextPhaseTool: string): string[] {
+  return [
+    "",
+    "**Review findings** (after `belayd_review`):",
+    "- Consider EVERY finding: Critical (must fix), Warnings (should fix), and Suggestions (consider).",
+    "- Address all Critical and Warnings findings — you may NOT dismiss them.",
+    `- Re-run the fix loop yourself: ${REVIEW_LOOP_FIX_STEP}.`,
+    `- Repeat until no Critical/Warnings remain, then call \`${nextPhaseTool}\`. You may decline only Suggestions, and only with a reason.`,
+    "- In the task's Final Summary, list every finding you chose not to address, each with a one-line reason.",
+  ];
+}
+
+/**
+ * Derive the tool for the phase that follows `phaseName` (defaulting to commit
+ * at the end of the order), so loop messages never hard-code a phase name.
+ */
+function nextPhaseToolAfter(phaseName: string, phaseOrder: readonly string[]): string {
+  const index = phaseOrder.indexOf(phaseName);
+  if (index === -1) return getPhaseToolName(COMMIT_PHASE);
+  return getPhaseToolName(phaseOrder[index + 1] ?? COMMIT_PHASE);
+}
+
+/**
+ * True when review is completed and no later phase has run since — i.e. review
+ * produced findings the orchestrator has not yet answered. Serves as the
+ * disk-resume fallback; in-session updates use `nextAwaitingReviewResponse`
+ * because `completedPhaseNames` never records a repeat of an already-completed
+ * phase.
+ */
+function isAwaitingReviewResponse(
+  completedPhaseNames: readonly string[],
+  phaseOrder: readonly string[],
+): boolean {
+  const reviewIndex = phaseOrder.indexOf(REVIEW_PHASE);
+  if (reviewIndex === -1 || !completedPhaseNames.includes(REVIEW_PHASE)) return false;
+  return !completedPhaseNames.some((name) => phaseOrder.indexOf(name) > reviewIndex);
+}
+
+/**
+ * Advance the resumable-fix flag for one completed phase. Review arms it; a
+ * phase after review (test/userguide/proof/commit) disarms it; earlier phases
+ * (scout, plan) leave it unchanged. An implement re-run re-arms it once review
+ * has run, because implement is the fix half of the loop — a late fix loop
+ * after test/userguide must still point back at review, not the next phase.
+ * Pure set membership on `completedPhaseNames` cannot express this.
+ */
+function nextAwaitingReviewResponse(options: {
+  awaiting: boolean;
+  completedPhaseName: string;
+  phaseOrder: readonly string[];
+  reviewCompleted: boolean;
+}): boolean {
+  const reviewIndex = options.phaseOrder.indexOf(REVIEW_PHASE);
+  if (reviewIndex === -1) return false;
+  if (options.completedPhaseName === REVIEW_PHASE) return true;
+  if (options.phaseOrder.indexOf(options.completedPhaseName) > reviewIndex) return false;
+  if (options.completedPhaseName === IMPLEMENT_PHASE && options.reviewCompleted) return true;
+  return options.awaiting;
+}
+
+/**
+ * The per-turn next-step directive shown in the gate context. Extracted so the
+ * three-way choice (wait / resumable fix loop / plain next phase) does not push
+ * gateContextMessage over the cognitive-complexity limit.
+ */
+function gateNextStepLine(options: {
+  activeRunCount: number;
+  awaitingReviewResponse: boolean;
+  remainingPhase: string;
+}): string {
+  if (options.activeRunCount > 0) {
+    return "Waiting for active runs to complete — see above.";
+  }
+  if (options.awaitingReviewResponse) {
+    return `Review findings need addressing. ${reviewLoopDirective(
+      getPhaseToolName(options.remainingPhase),
+    )}`;
+  }
+  return `Next required step: call \`${getPhaseToolName(options.remainingPhase)}\``;
 }
 
 // ── Extension factory ──────────────────────────────────────────────────
@@ -480,6 +653,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.userGuideContent = undefined;
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
+    state.awaitingReviewResponse = false;
     abortAndResetRunTracking(state);
     applyToolGate(state);
     reconcileWorkflowState(state, { taskId, cwd, options });
@@ -534,6 +708,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.completedPhaseNames = persisted.completedPhaseNames.filter((phase) =>
       state.phaseOrder.includes(phase),
     );
+    state.awaitingReviewResponse =
+      persisted.awaitingReviewResponse ??
+      isAwaitingReviewResponse(state.completedPhaseNames, state.phaseOrder);
   }
 
   function sendWorkflowMessage(
@@ -603,15 +780,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     // Only workflows that include a review phase need this rule; the reviewer
     // output otherwise never exists.
-    if (phases.includes("review")) {
-      lines.push(
-        "",
-        "**Review findings** (after `belayd_review`):",
-        "- Consider EVERY finding: Critical (must fix), Warnings (should fix), and Suggestions (consider).",
-        "- Address all Critical and Warnings findings — never dismiss them.",
-        "- You may decline only Suggestions, and only with a reason.",
-        "- In the task's Final Summary, list every finding you chose not to address, with a one-line reason each.",
-      );
+    if (phases.includes(REVIEW_PHASE)) {
+      lines.push(...reviewFindingsGuidanceLines(nextPhaseToolAfter(REVIEW_PHASE, phases)));
     }
 
     if (phases.includes("proof")) {
@@ -1208,6 +1378,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
     state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
     state.completedPhaseNames = [...persisted.completedPhaseNames];
+    state.awaitingReviewResponse =
+      persisted.awaitingReviewResponse ??
+      isAwaitingReviewResponse(persisted.completedPhaseNames, persisted.phaseOrder);
     applyToolGate(state);
 
     // Surface any phase runs that died with the previous orchestrator.
@@ -1231,6 +1404,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.userGuideContent = undefined;
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
+    state.awaitingReviewResponse = false;
     resetRunTracking(state);
     applyToolGate(state);
 
@@ -1374,16 +1548,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     // The reviewer's output has three severity sections. The orchestrator must
     // treat all of them as input — not just "Critical" — and disclose anything
-    // it declines so the human reviewer sees what was consciously skipped.
-    const reviewFindingsGuidance = phaseOrder.includes("review")
-      ? [
-          "",
-          "**Review findings** (after `belayd_review`):",
-          "- Consider EVERY finding: Critical (must fix), Warnings (should fix), and Suggestions (consider).",
-          "- Address all Critical and Warnings findings — you may NOT dismiss them.",
-          "- You may decline only Suggestions, and only with a reason.",
-          "- In the task's Final Summary, list every finding you chose not to address, each with a one-line reason.",
-        ]
+    // it declines so the human reviewer sees what was consciously skipped. The
+    // "then call X" phase is review's successor, not the next incomplete phase:
+    // before review runs, the latter would name review itself.
+    const reviewFindingsGuidance = phaseOrder.includes(REVIEW_PHASE)
+      ? reviewFindingsGuidanceLines(nextPhaseToolAfter(REVIEW_PHASE, phaseOrder))
       : [];
 
     // When phase runs are active, tell the orchestrator to wait instead of
@@ -1403,12 +1572,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       );
     }
 
-    // Build the next-step line: "wait" when runs are active, otherwise the
-    // normal directive to call the next phase tool.
-    const nextStepLine =
-      state.activeRuns.size > 0
-        ? "Waiting for active runs to complete — see above."
-        : `Next required step: call \`${getPhaseToolName(remaining)}\``;
+    // Build the next-step line: "wait" when runs are active; after review the
+    // gate used to say "call belayd_test" even though the findings were still
+    // unaddressed. Point the orchestrator back at the resumable fix loop until
+    // no Critical/Warnings remain.
+    const nextStepLine = gateNextStepLine({
+      activeRunCount: state.activeRuns.size,
+      awaitingReviewResponse: state.awaitingReviewResponse,
+      remainingPhase: remaining,
+    });
 
     return {
       message: {
@@ -1516,6 +1688,102 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /**
+   * Resolve a phase's session name across invocations: the first call mints a
+   * fresh session, later calls resume it (under the cross-run `-run-<n>` epoch
+   * scheme) so the implement/review review↔fix loop keeps its context. Only
+   * implement and review participate; other phases keep a fresh name per run.
+   *
+   * `ledgerWarning` is set when the handle could not be persisted, so the
+   * phase tool response can surface it instead of silently re-resolving the
+   * same attempt forever.
+   */
+  function resolveTrackedPhaseSession(options: {
+    cwd: string;
+    phaseName: string;
+    taskId: string;
+    freshSessionName: string;
+    env?: Record<string, string>;
+  }): { sessionName: string; resumeSession: boolean; ledgerWarning?: string } {
+    if (!isResumablePhase(options.phaseName) || options.taskId === "") {
+      return { sessionName: options.freshSessionName, resumeSession: false };
+    }
+    const persisted = readWorkflowState({ cwd: options.cwd });
+    // The ledger is keyed by (task, phase) but stored under the cwd's single
+    // workflow.json. A phase tool may pass a `cwd` other than the one that
+    // wrote the state; without this check we'd resume another task's session
+    // and then corrupt that task's ledger on write.
+    if (persisted === undefined || persisted.taskId !== options.taskId) {
+      return { sessionName: options.freshSessionName, resumeSession: false };
+    }
+    // Mirror spawn.ts's env resolution (merge over process.env) so this
+    // pre-check and the spawn layer's own shouldResumeSession check can never
+    // diverge on the session directory.
+    const sessionEnv = options.env === undefined ? process.env : { ...process.env, ...options.env };
+    const prior = persisted.phaseSessions?.[options.phaseName];
+    const resolved = advancePastExistingEpoch({
+      prior,
+      freshSessionName: options.freshSessionName,
+      exists: (sessionName) =>
+        resolveProjectSessionExists(sessionName, { cwd: options.cwd, env: sessionEnv }),
+    });
+    const saveResult = savePhaseSession({
+      cwd: options.cwd,
+      phaseName: options.phaseName,
+      record: resolved.next,
+      existingState: persisted,
+    });
+    const ledgerWarning = saveResult.ok
+      ? undefined
+      : `Phase-session ledger not saved (${saveResult.error}); this invocation may repeat the same session next time.`;
+    if (!saveResult.ok) {
+      console.warn(
+        `[belayd-harness] failed to persist phase session for ${options.phaseName}: ${saveResult.error}`,
+      );
+    }
+    // The spawn layer falls back to a fresh session when the resume target is
+    // not on disk (spawn.ts shouldResumeSession). Detect that here too so the
+    // caller still prepends the bead plan instead of sending a bare task to a
+    // fresh, transcript-less session.
+    const canResume =
+      resolved.resumeSession &&
+      resolveProjectSessionExists(resolved.sessionName, {
+        cwd: options.cwd,
+        env: sessionEnv,
+      });
+    return {
+      sessionName: resolved.sessionName,
+      resumeSession: canResume,
+      ledgerWarning,
+    };
+  }
+
+  /**
+   * Build the full phase prompt: the bead plan for implement, the change
+   * context for proof, or the raw task otherwise. Used for the initial spawn
+   * and to re-supply a fresh-epoch gate retry that has no transcript.
+   */
+  async function buildFullPhaseTask(options: {
+    phaseName: string;
+    taskId: string;
+    paramsTask: string;
+    cwd: string;
+    userGuideContent: string | undefined;
+  }): Promise<string> {
+    if (options.phaseName === IMPLEMENT_PHASE && options.taskId !== "") {
+      const plan = await readTaskPlan(options.taskId, options.cwd);
+      if (plan) {
+        return `## Bead plan (${options.taskId})\n${plan}\n\n${options.paramsTask}`;
+      }
+      return options.paramsTask;
+    }
+    if (options.phaseName === "proof") {
+      const proofContext = await collectChangeContext(options.cwd, options.userGuideContent);
+      return `${options.paramsTask}${proofContext}`;
+    }
+    return options.paramsTask;
+  }
+
+  /**
    * Start a phase run in the background and return its handle immediately.
    *
    * The run owns its abort signal — the tool-call signal belongs to the
@@ -1528,17 +1796,29 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state: SessionState,
     effectiveCwd: string | undefined,
     runId: string,
-  ): { handle: RunHandle; sessionName: string } {
+  ): { handle: RunHandle; sessionName: string; ledgerWarning?: string } {
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
     const resolvedModel = resolveModelSpec(agent);
     const effectiveModel = overrides?.model ?? resolvedModel.model;
     const effectiveModelClass = resolveEffectiveModelClass(resolvedModel.modelClass, overrides);
     const effectiveTools = overrides?.tools ?? agent.tools;
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
-    const subagentSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
-
     const cwd = effectiveCwd ?? process.cwd();
+    const freshSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
+    // Resolve the proof base before the session ledger so the same env (which
+    // may later carry session-dir overrides) feeds both existence checks.
     const { proofDir, spawnEnv } = preparePhaseProof(state, cwd);
+    const {
+      sessionName: subagentSessionName,
+      resumeSession,
+      ledgerWarning,
+    } = resolveTrackedPhaseSession({
+      cwd,
+      phaseName,
+      taskId: state.currentTaskId,
+      freshSessionName,
+      env: spawnEnv,
+    });
 
     persistRunningManifest({
       state,
@@ -1559,27 +1839,27 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const runStillRelevant = (): boolean =>
       state.gateActive && state.currentTaskId === taskIdAtStart;
 
-    // Captures the task actually sent to the agent (bead plan / change context
-    // included) so a fresh-epoch gate retry can re-supply it. spawnAgent runs
-    // before runGate (see spawnDetachedRun), so it is populated in time.
-    let initialTask: string = params.task;
+    // The full task (bead plan / change context included). A fresh-epoch gate
+    // retry has no transcript, so it must be re-supplied this full prompt even
+    // when the invocation itself resumed. spawnAgent runs before runGate (see
+    // spawnDetachedRun), so it is populated in time.
+    let fullTask: string = params.task;
 
     const spawnAgent = (): Promise<SpawnResult> => {
       const buildTask = async (): Promise<string> => {
-        if (phaseName === "implement" && state.currentTaskId !== "") {
-          const plan = await readTaskPlan(state.currentTaskId, cwd);
-          if (plan) {
-            initialTask = `## Bead plan (${state.currentTaskId})\n${plan}\n\n${params.task}`;
-            return initialTask;
-          }
-        }
-        if (phaseName !== "proof") {
-          initialTask = params.task;
-          return initialTask;
-        }
-        const proofContext = await collectChangeContext(cwd, state.userGuideContent);
-        initialTask = `${params.task}${proofContext}`;
-        return initialTask;
+        fullTask = await buildFullPhaseTask({
+          phaseName,
+          taskId: state.currentTaskId,
+          paramsTask: params.task,
+          cwd,
+          userGuideContent: state.userGuideContent,
+        });
+        // On a cross-run resume the transcript already contains the bead plan,
+        // so sending the full task would duplicate context; the orchestrator
+        // supplies the review findings it wants fixed in params.task instead.
+        // A fresh run — including a resume that fell back because the target
+        // session was missing — gets the full task.
+        return resumeSession && phaseName !== "proof" ? params.task : fullTask;
       };
       return buildTask().then((task) =>
         spawnAgentWithFallback({
@@ -1589,6 +1869,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           systemPrompt: effectiveSystemPrompt,
           task,
           sessionName: subagentSessionName,
+          resumeSession,
           cwd: effectiveCwd,
           signal: abortController.signal,
           // Background runs use detached:true so a terminal Ctrl-C in the
@@ -1606,7 +1887,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       runQualityGate({
         agent,
         result,
-        task: initialTask,
+        task: fullTask,
         cwd: effectiveCwd,
         proofDir,
         env: spawnEnv,
@@ -1655,6 +1936,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           state.completedPhaseNames,
           state.phaseOrder,
         );
+        // Order-sensitive: review arms the resumable-fix directive, a later
+        // phase disarms it, and an earlier re-run (e.g. implement) leaves it
+        // alone so a late re-review after test can re-arm it.
+        state.awaitingReviewResponse = nextAwaitingReviewResponse({
+          awaiting: state.awaitingReviewResponse,
+          completedPhaseName: info.phaseName,
+          phaseOrder: state.phaseOrder,
+          reviewCompleted: state.completedPhaseNames.includes(REVIEW_PHASE),
+        });
         captureUserGuideContent(info.phaseName, info.result, state);
         if (info.phaseName === "proof") {
           state.proofOutput = info.result.content?.[0]?.text ?? "";
@@ -1669,10 +1959,22 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         const failureGuidance = delivery.success
           ? ""
           : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
+        // Deliver the loop directive where the findings actually arrive, so
+        // the orchestrator does not have to wait for the next gate turn. The
+        // "advance" tool is the next incomplete phase, not just review's
+        // successor, so a late re-review after test points at the right phase.
+        const nextIncompletePhase =
+          getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? COMMIT_PHASE;
+        const reviewLoopHint =
+          delivery.success && delivery.phaseName === REVIEW_PHASE
+            ? `\n\n---\n**When review findings remain:** ${reviewLoopDirective(
+                getPhaseToolName(nextIncompletePhase),
+              )}`
+            : "";
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
-            content: `${header}\n\n${text}${failureGuidance}`,
+            content: `${header}\n\n${text}${failureGuidance}${reviewLoopHint}`,
             display: true,
             details: {
               runId: delivery.runId,
@@ -1690,7 +1992,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       },
     });
 
-    return { handle, sessionName: subagentSessionName };
+    return { handle, sessionName: subagentSessionName, ledgerWarning };
   }
 
   /**
@@ -1774,10 +2076,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Persist the completed phase list (best-effort, after a phase succeeds). */
-  function persistCompletedPhases(options: { cwd: string; completedPhaseNames: string[] }): void {
+  function persistCompletedPhases(options: {
+    cwd: string;
+    completedPhaseNames: string[];
+    awaitingReviewResponse: boolean;
+  }): void {
     const saveResult = saveCompletedPhases({
       cwd: options.cwd,
       completedPhaseNames: options.completedPhaseNames,
+      awaitingReviewResponse: options.awaitingReviewResponse,
     });
     if (!saveResult.ok) {
       console.warn(`[belayd-harness] failed to persist completed phases: ${saveResult.error}`);
@@ -1810,6 +2117,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       persistCompletedPhases({
         cwd: options.manifestCwd,
         completedPhaseNames: options.state.completedPhaseNames,
+        awaitingReviewResponse: options.state.awaitingReviewResponse,
       });
     }
   }
@@ -1832,7 +2140,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         const ctxWithCwd = ctx as PhaseToolContext;
         const effectiveCwd = params.cwd ?? ctxWithCwd.cwd;
         const runId = generateShortRunId();
-        const { sessionName } = startPhaseRun(agent, phaseName, params, state, effectiveCwd, runId);
+        const { sessionName, ledgerWarning } = startPhaseRun(
+          agent,
+          phaseName,
+          params,
+          state,
+          effectiveCwd,
+          runId,
+        );
+        const ledgerNotice = ledgerWarning === undefined ? "" : `\n\n⚠️ ${ledgerWarning}`;
         return {
           content: [
             {
@@ -1843,7 +2159,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
                 `The result will be delivered as a follow-up message when the run (and its quality gate) completes.\n` +
                 `Wait for the follow-up — do NOT call belayd_status on your own initiative.` +
                 ` Only call belayd_status if the user explicitly asks you to.` +
-                `\nDo not re-call this phase tool — the run is already in progress.`,
+                `\nDo not re-call this phase tool — the run is already in progress.` +
+                ledgerNotice,
             },
           ],
           details: { messages: [], usage: emptyUsage(), exitCode: 0 },
@@ -2318,6 +2635,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.userGuideContent = undefined;
       state.proofOutput = undefined;
       state.proofVerifierVerdict = undefined;
+      state.awaitingReviewResponse = false;
       applyToolGate(state);
       return {
         content: [
@@ -2588,9 +2906,17 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         options.state.completedPhaseNames,
         options.state.phaseOrder,
       );
+      // Commit is the last phase; completing it disarms the resumable-fix loop.
+      options.state.awaitingReviewResponse = nextAwaitingReviewResponse({
+        awaiting: options.state.awaitingReviewResponse,
+        completedPhaseName: COMMIT_PHASE,
+        phaseOrder: options.state.phaseOrder,
+        reviewCompleted: options.state.completedPhaseNames.includes(REVIEW_PHASE),
+      });
       persistCompletedPhases({
         cwd: options.cwd,
         completedPhaseNames: options.state.completedPhaseNames,
+        awaitingReviewResponse: options.state.awaitingReviewResponse,
       });
     }
   }
