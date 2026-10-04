@@ -33,7 +33,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**/*.ts", "**/*.json", "!templates"],
+    "includes": ["**/*.ts", "**/*.json"],
     "experimentalScannerIgnores": [
       "dist/**",
       "node_modules/**",
