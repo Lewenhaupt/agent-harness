@@ -81,9 +81,26 @@ flows into `devShells.default` and `pi-web-runtime-env` and is therefore on
 testable; re-pin the version + hash deliberately rather than tracking
 `releases/latest`.
 
-The `belayd_archify` pi tool wraps `render` / `validate` / `deliver`. It
-requests `--json` for `validate`/`deliver` and parses the plain output path
-that `render` prints (upstream `render` has no `--json` flag). The tool is
+The same `$out` also carries the upstream agent assets, so the wrapper,
+the devShell `shellHook`, and the pi-web runtime env all export
+`ARCHIFY_HOME=$out/libexec/archify`. A spawned session can therefore read
+`$ARCHIFY_HOME/SKILL.md` (the upstream authoring contract),
+`$ARCHIFY_HOME/schemas/`, `$ARCHIFY_HOME/examples/`, and
+`$ARCHIFY_HOME/references/` without knowing the store hash. The harness ships a
+thin router skill at `.agents/skills/archify/SKILL.md` (installed by
+`belayd-skills`) that tells the agent to read `$ARCHIFY_HOME/SKILL.md` and
+follow it.
+
+The `belayd_archify` pi tool wraps `render` / `validate` / `deliver` plus the
+read-only guidance subcommands `guide` (with optional `scenario`), `examples`,
+`inspect` (architecture only), and `check`. `guide` returns the recipe list
+without a `scenario` and a type recommendation with one; `inspect` is
+architecture-only; params irrelevant to a guidance command are echoed back as a
+`note: ... ignored for command=y` line instead of being dropped. `examples`
+lists the packaged `*.json` files directly instead of shelling out to
+`archify examples`, which would try to write rendered HTML into the read-only
+Nix store. It requests `--json` for `validate`/`deliver` and parses the path
+`render` prints (upstream `render` has no `--json` flag). The tool is
 opt-in (consult-callable, not a workflow phase). It is listed in
 `GATED_TOOLS` so it stays callable while the process gate is active, but it is
 **not** in `PLANNING_GATED_TOOLS`. Generated diagrams are committed under
