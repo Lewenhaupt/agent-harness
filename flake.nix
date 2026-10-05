@@ -494,7 +494,7 @@
             src = ./.;
             pnpm = pkgs.pnpm;
             fetcherVersion = 4;
-            hash = "sha256-Kyy2fK4lKdxd6UT9M41uuMIz+Hz1Nww0iFxEy0dmmtA=";
+            hash = "sha256-329HoB94hQ6laqIuBtoNdhN5SuX2XNygtLc06JFgkcg=";
           };
           dontBuild = true;
           installPhase = ''

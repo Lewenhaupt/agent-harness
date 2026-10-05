@@ -8,7 +8,38 @@ A workspace panel for pi-web that renders verifiable-proof artifacts from `proof
 
 Follow these steps to confirm the plugin is correctly installed and functioning.
 
-### 1. Set up the symlink
+### 1. Verify the plugin matches the installed pi-web browser apiVersion
+
+The pi-web host hard-rejects any browser plugin whose `apiVersion` does not match
+its own, so check this first after any pi-web upgrade. The plugin is plain
+JavaScript with no build step — these checks read it directly from source.
+
+```bash
+# Regression guard: derives the browser apiVersion from the installed host
+# artifact (not a hardcoded number) and asserts the plugin declares the same one.
+pnpm vitest run pi-web-plugins/proof-of-work/pi-web-plugin.test.js
+# Expected: Test Files  1 passed (1); Tests  2 passed (2)
+
+# What the plugin declares:
+grep -n apiVersion pi-web-plugins/proof-of-work/pi-web-plugin.js
+# Expected: 4:  apiVersion: 4,
+
+# What the installed host accepts (the PiWebPlugin contract):
+grep -n "apiVersion" node_modules/@jmfederico/pi-web/dist/plugin-api.d.ts
+# Expected: "apiVersion: 4;" in interface PiWebPlugin, and
+#           "readonly apiVersion: 4;" in interface PluginActivationContext
+```
+
+`pi-web-plugin.test.js` parses the expected value out of the host contract, so a
+future pi-web bump (for example 4 → 5) makes the guard **fail** until the plugin
+is migrated too — it never silently passes. To migrate, set `apiVersion` in
+`pi-web-plugins/proof-of-work/pi-web-plugin.js` to the version the installed host
+reports, then re-run the command above. If the bump also changes the pinned
+`@jmfederico/pi-web` devDependency, see
+[Regenerating `pnpm-lock.yaml` after a pi-web bump](#regenerating-pnpm-lockyaml-after-a-pi-web-bump)
+below.
+
+### 2. Set up the symlink
 
 ```bash
 ln -sf "$PWD/pi-web-plugins/proof-of-work" ~/.pi-web/plugins/proof-of-work
@@ -21,7 +52,7 @@ readlink -f ~/.pi-web/plugins/proof-of-work
 # Expected: <path-to-repo>/pi-web-plugins/proof-of-work
 ```
 
-### 2. Run a phase tool and verify the proof bridge
+### 3. Run a phase tool and verify the proof bridge
 
 In the workspace selected by pi-web, start or resume a task and run a phase
 tool (for example, `belayd_plan`) so the harness calls `ensureProofBridge()`.
@@ -49,7 +80,7 @@ The marker path is `<workspace>/.belayd/proof-dir`; its content must be the
 expanded absolute base, such as `/home/alice/.local/state/belayd/proof`, not a
 workspace-relative path. The `proof-of-work` symlink and marker are gitignored.
 
-### 3. Allow pi-web to read the external proof base
+### 4. Allow pi-web to read the external proof base
 
 The panel reads artifacts from the external proof base by absolute path, so that
 path must be listed in pi-web's allowed filesystem roots. Add it to the global
@@ -62,7 +93,7 @@ pi-web config (or the project `<workspace>/.pi-web/config.json`):
 If you set `BELAYD_PROOF_DIR`, list that path instead. Without this entry the
 panel shows: *"Could not access the proof-of-work directory."*
 
-### 4. Create test proof-of-work artifacts
+### 5. Create test proof-of-work artifacts
 
 Create a full set of demo artifacts in the external proof base. This step
 must write under `$PROOF_BASE/<task-id>/...`, not under
@@ -130,18 +161,25 @@ touch demo.webm
 echo "Test artifacts created in $PROOF_BASE/TASK-1/"
 ```
 
-### 5. Open the panel and verify each file type
+### 6. Open the panel and verify each file type
 
 1. Open pi-web in a browser (default: `http://127.0.0.1:8504`).
-2. Select the workspace whose proof base was configured in step 3.
+2. Select the workspace whose proof base was configured in step 4.
 3. In the workspace panel area (the left-hand column with Files, Git, Terminal tabs), look for the **Proof of Work** tab (shield badge icon). Click it.
    - If the tab is not visible, press `Ctrl+K` / `Cmd+K` to open the action palette and type **"Open Proof of Work"**, then press Enter.
+   - **Fixed vs. unfixed (bd-88).** If the tab never appears and the browser
+     console shows `Failed to register PI WEB plugin proof-of-work during validate`
+     together with `Unsupported browser plugin API version for proof-of-work: 2
+     (expected 4)`, the plugin's `apiVersion` predates the installed host. Re-run
+     step 1; a correct fix is a tab that opens and lists `TASK-1`, not one that is
+     absent. See also *"Unsupported browser plugin API version"* under
+     Troubleshooting.
 4. The panel shows a two-pane layout:
    - **Left sidebar:** lists task directories under the logical `proof-of-work/` root.
    - **Right viewer:** renders the selected file.
 
 Confirm that `TASK-1` and its files appear. The files must have been created at
-`$PROOF_BASE/TASK-1/...` in step 4, not at
+`$PROOF_BASE/TASK-1/...` in step 5, not at
 `$WORKSPACE_DIR/proof-of-work/TASK-1/...`; the panel reports the external files
 through the logical `proof-of-work/<task-id>/...` layout.
 
@@ -168,7 +206,7 @@ through the logical `proof-of-work/<task-id>/...` layout.
 > `loadeddata` and replaced with the same error state — there is no perpetual
 > spinner.
 
-### 6. Verify denied external access
+### 7. Verify denied external access
 
 Temporarily remove the proof base from every `pathAccess.allowedPaths` list that
 could apply (global and project config), or point the marker at a base that is
@@ -184,7 +222,7 @@ proof-of-work directory."** and this exact guidance:
 
 It must not silently show an empty artifact list. Restore the allowed path before continuing.
 
-### 7. Verify legacy workspace-relative fallback
+### 8. Verify legacy workspace-relative fallback
 
 Use a separate workspace that has no `.belayd/proof-dir` marker and has a real
 (non-symlink) `proof-of-work/` directory. Do not run a phase tool in this
@@ -203,7 +241,7 @@ Select that workspace in pi-web and open the Proof of Work panel. It must list
 `LEGACY-1/artifact.txt` from the workspace-relative `proof-of-work/` directory,
 without a marker or an external `allowedPaths` entry.
 
-### 8. Verify empty state
+### 9. Verify empty state
 
 | Scenario | Expected message |
 |---|---|
@@ -219,7 +257,7 @@ mkdir -p "$PROOF_BASE/EMPTY-TASK"
 # Then click the Refresh button (↻) in the panel toolbar
 ```
 
-### 9. Verify the Refresh button
+### 10. Verify the Refresh button
 
 1. With the panel open and TASK-1 visible, add a new file:
    ```bash
@@ -228,7 +266,7 @@ mkdir -p "$PROOF_BASE/EMPTY-TASK"
 2. Click the ↻ **Refresh** button in the panel toolbar.
 3. `new-file.txt` appears in the file list under TASK-1.
 
-### 10. Verify asciinema-player asset loading
+### 11. Verify asciinema-player asset loading
 
 1. Open browser Developer Tools (F12) → Network tab.
 2. Filter for `asciinema-player`.
@@ -240,14 +278,14 @@ mkdir -p "$PROOF_BASE/EMPTY-TASK"
 
 If the script fails to load, the viewer shows: *"Asciinema player failed to load. Cast recordings cannot be played."*
 
-### 11. Verify workspace-switch cleanup
+### 12. Verify workspace-switch cleanup
 
 1. Open a workspace that has artifacts and play a `.cast` recording.
 2. Switch to a different workspace (without artifacts).
 3. Switch back to the first workspace.
 4. The panel re-scans and restores its state. Old player instances and blob URLs are disposed (check via DevTools → Performance → Memory for no leaks).
 
-### 12. Verify the Trace Viewer hints (bd-69)
+### 13. Verify the Trace Viewer hints (bd-69)
 
 The panel opens Playwright traces with the host `playwright` binary provided by
 the Nix runtime env. On a pi-web build that does **not** expose
@@ -334,6 +372,33 @@ rm -rf ~/.pi-web/plugins/proof-of-work
 ```
 
 Then hard-reload the browser tab (`Cmd+Shift+R` or `Ctrl+Shift+R`).
+
+### Regenerating `pnpm-lock.yaml` after a pi-web bump
+
+The `@jmfederico/pi-web` devDependency lives in the repository root
+`package.json` (the plugin package itself has no devDependencies and no build
+step). It supplies the host API/types that the guard test reads. After changing
+it — or any other dependency — regenerate the lockfile and refresh the Nix
+fixed-output hash:
+
+```bash
+# 1. Update the devDependency in the root package.json, then regenerate the lockfile:
+pnpm install
+
+# 2. The bundled belayd-harness extension fetches its pnpm store from the
+#    lockfile, so flake.nix (belayd-harness.pnpmDeps.hash) no longer matches:
+nix build .#belayd-harness
+# Fails with: hash mismatch ... got: sha256-...
+
+# 3. Copy the reported `got:` hash into belayd-harness.pnpmDeps.hash in flake.nix,
+#    then re-run until it succeeds:
+nix build .#belayd-harness
+```
+
+> Restarting the pi-web host is only needed when you deploy a rebuilt host, not
+> for a plugin-only change. It **interrupts live sessions**:
+> `sudo systemctl restart pi-web pi-web-sessiond`. The browser plugin itself
+> picks up changes on the next hard-reload (`Cmd+Shift+R`).
 
 ### Access
 
@@ -575,17 +640,59 @@ The panel uses a context key (`machine.id` + `workspace.projectId` + `workspace.
 - Hard-reload the browser (`Cmd+Shift+R`).
 - Verify the manifest: `curl http://127.0.0.1:8504/pi-web-plugins/manifest.json | jq '.plugins[] | select(.id == "proof-of-work")'`.
 
+#### "Unsupported browser plugin API version" — panel missing after a pi-web upgrade
+
+After the host is rebuilt to a newer pi-web (this migration went
+`v1.202608.1` → `v1.202610.1`), a plugin that still declares the old browser
+`apiVersion` is rejected at registration and the **Proof of Work** tab is simply
+absent. The browser console (F12 → Console) logs:
+
+```text
+Failed to register PI WEB plugin proof-of-work during validate
+Unsupported browser plugin API version for proof-of-work: 2 (expected 4)
+```
+
+The error name is `BrowserPluginIncompatibleError` and pi-web emits it with
+`console.warn` (it is not rendered inside the panel). Fix:
+
+1. Bump `apiVersion` in `pi-web-plugins/proof-of-work/pi-web-plugin.js` to the
+   value the installed host accepts (see step 1 for how to read both values).
+2. Re-run the guard to confirm it passes:
+
+   ```bash
+   pnpm vitest run pi-web-plugins/proof-of-work/pi-web-plugin.test.js
+   # Expected: Test Files  1 passed (1); Tests  2 passed (2)
+   ```
+
+3. Confirm the panel loads: select a workspace → **Proof of Work** tab, or press
+   `Ctrl+K` / `Cmd+K` → type **"Open Proof of Work"** → Enter. If it still does
+   not appear, check **Settings → PI WEB plugins** and hard-reload
+   (`Cmd+Shift+R`). A browser-only plugin change never requires a service
+   restart.
+
 ### Internals overview
 
 The plugin is a plain JavaScript ES module with no build step. It consists of four modules:
 
 | File | Responsibility |
 |---|---|
-| `pi-web-plugin.js` | Plugin metadata and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
+| `pi-web-plugin.js` | Plugin metadata (browser plugin `apiVersion: 4`) and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
 | `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
 | `panel.js` | Custom element `<pi-web-proof-work-panel>` — all UI, state management, player lifecycle |
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
+
+The plugin targets browser plugin `apiVersion: 4`. Server plugin `apiVersion: 3`
+is N/A here: this package's `piWeb.plugins` entry declares only a browser entry
+(`browserRoot`/`module`) with no `server`, so there is no server plugin to
+migrate. The `@jmfederico/pi-web` dependency used for API/type parity lives in
+the repository root `package.json`; `pi-web-plugins/proof-of-work/package.json`
+intentionally declares no devDependencies because the plugin is a plain-JS,
+no-build package served directly from source by pi-web and is not an npm
+workspace member. `pi-web-plugin.test.js` derives the browser `apiVersion` from
+this repository's installed `@jmfederico/pi-web` and fails if the two drift. A
+future host bump therefore fails this guard — rather than silently passing —
+until `apiVersion` in `pi-web-plugin.js` is updated to match.
 
 Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step).
 
