@@ -27,6 +27,9 @@ import { Type } from "typebox";
 import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
   AgentDefinition,
+  ArchifyCommand,
+  ArchifyDiagramType,
+  ArchifyQuality,
   ModelClass,
   Phase,
   QualityGate,
@@ -37,8 +40,12 @@ import type {
 import {
   ALL_PHASE_NAMES,
   ALL_PHASE_TOOLS,
+  ARCHIFY_COMMANDS,
+  ARCHIFY_DIAGRAM_TYPES,
+  ARCHIFY_QUALITY_PROFILES,
   awaitWorktreeReady,
   bdCommandReadsStdin,
+  buildArchifyArgs,
   buildVerifierPrompt,
   checkToolAllowed,
   collectChangeContext,
@@ -46,11 +53,15 @@ import {
   extractProofArtifacts,
   findProofArtifactRefs,
   findWorkspaceRoot,
+  formatArchifyResult,
   formatProcessState,
   getAgentByShortName,
   getNextPhase,
   getPhasesForType,
   getPhaseToolName,
+  isArchifyCommand,
+  isArchifyDiagramType,
+  isArchifyQuality,
   isInsideWorktreeForBranch,
   isValidTaskId,
   isValidWorkflowType,
@@ -67,6 +78,7 @@ import {
   resolveModelSpec,
   resolveQualityGate,
   resolveWorkflowType,
+  runArchify,
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
@@ -566,6 +578,78 @@ function harnessAlreadyLoaded(pi: ExtensionAPI): boolean {
 // pi-web kept a pre-fallback extension in memory after a rebuild.
 const HARNESS_MODULE_PATH: string = import.meta.url;
 
+/** Normalized `belayd_archify` parameters after validation. */
+interface NormalizedArchifyParams {
+  type: ArchifyDiagramType;
+  command: ArchifyCommand;
+  quality: ArchifyQuality;
+  input: string;
+  output: string | undefined;
+  repoRoot: string | undefined;
+}
+
+type ArchifyParamValidation =
+  | { ok: true; value: NormalizedArchifyParams }
+  | { ok: false; error: string };
+
+/**
+ * Validate the raw `belayd_archify` params and apply command/quality defaults.
+ *
+ * Kept separate from the tool's `execute` so the rejection messages stay flat
+ * (and the tool body stays under the cognitive-complexity budget).
+ */
+function validateArchifyParams(params: {
+  type: string;
+  input: string;
+  output?: string;
+  command?: string;
+  quality?: string;
+  repoRoot?: string;
+}): ArchifyParamValidation {
+  if (!isArchifyDiagramType(params.type)) {
+    return {
+      ok: false,
+      error: `Unknown diagram type: ${params.type}. Supported types: ${ARCHIFY_DIAGRAM_TYPES.join(", ")}.`,
+    };
+  }
+
+  const command = params.command ?? "deliver";
+  if (!isArchifyCommand(command)) {
+    return {
+      ok: false,
+      error: `Unknown command: ${command}. Supported commands: ${ARCHIFY_COMMANDS.join(", ")}.`,
+    };
+  }
+
+  const quality = params.quality ?? "showcase";
+  if (!isArchifyQuality(quality)) {
+    return {
+      ok: false,
+      error: `Unknown quality profile: ${quality}. Supported profiles: ${ARCHIFY_QUALITY_PROFILES.join(", ")}.`,
+    };
+  }
+
+  if (params.repoRoot !== undefined && params.type !== "architecture") {
+    return {
+      ok: false,
+      error:
+        "repoRoot is only supported for architecture diagrams (archify rejects it for other types with exit 2).",
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      type: params.type,
+      command,
+      quality,
+      input: params.input,
+      output: params.output,
+      repoRoot: params.repoRoot,
+    },
+  };
+}
+
 export default function belaydAgentHarness(pi: ExtensionAPI): void {
   if (harnessAlreadyLoaded(pi)) return;
 
@@ -577,6 +661,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd_stop_task",
     "belayd_status",
     "belayd_proof_verifier",
+    "belayd_archify",
     "bd",
     "read",
     "grep",
@@ -2532,6 +2617,101 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           details: { messages: [], usage: emptyUsage(), exitCode: 1 },
         };
       }
+    },
+  });
+
+  // ── Register archify (diagram generation) tool ──────────────────────
+  // Archify compiles a typed JSON IR into one self-contained interactive
+  // HTML diagram. It is opt-in (consult-callable) and non-phase, so it is
+  // listed in GATED_TOOLS only to survive the process gate — never a
+  // required phase step, and never in PLANNING_GATED_TOOLS. `visual-check`
+  // and `preview` are excluded upstream subcommands.
+  pi.registerTool({
+    name: "belayd_archify",
+    label: "Archify diagram generator",
+    description:
+      "Compile a typed archify JSON IR into a self-contained interactive HTML " +
+      `diagram. Types: ${ARCHIFY_DIAGRAM_TYPES.join(", ")}. Commands: deliver ` +
+      "(default: renders, validates, and writes), render, validate. Output " +
+      "defaults to <cwd>/docs/diagrams/<type>.html; committed diagrams live " +
+      "under docs/diagrams/.",
+    parameters: Type.Object({
+      type: Type.Union(
+        ARCHIFY_DIAGRAM_TYPES.map((diagramType) => Type.Literal(diagramType)),
+        {
+          description: `Diagram type: ${ARCHIFY_DIAGRAM_TYPES.join(", ")}`,
+        },
+      ),
+      input: Type.String({ description: "Path to the archify JSON IR file" }),
+      output: Type.Optional(
+        Type.String({
+          description: "Output HTML path (default: <cwd>/docs/diagrams/<type>.html)",
+        }),
+      ),
+      command: Type.Optional(
+        Type.Union(
+          ARCHIFY_COMMANDS.map((archifyCommand) => Type.Literal(archifyCommand)),
+          {
+            description: "Archify command: deliver (default), render, validate",
+          },
+        ),
+      ),
+      quality: Type.Optional(
+        Type.Union(
+          ARCHIFY_QUALITY_PROFILES.map((profile) => Type.Literal(profile)),
+          {
+            description: "Composition profile: showcase (default) or standard",
+          },
+        ),
+      ),
+      repoRoot: Type.Optional(
+        Type.String({
+          description: "Repository root for architecture diagrams (architecture type only)",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const validation = validateArchifyParams(params);
+      if (!validation.ok) {
+        return {
+          content: [{ type: "text" as const, text: validation.error }],
+          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+        };
+      }
+
+      const { type, command, quality, input, output, repoRoot } = validation.value;
+      const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+      const defaultOutput = join(cwd, "docs", "diagrams", `${type}.html`);
+
+      // `validate` takes no output positional; only render/deliver write files.
+      const args = buildArchifyArgs({
+        command,
+        type,
+        input,
+        output: command === "validate" ? undefined : (output ?? defaultOutput),
+        quality,
+        repoRoot,
+      });
+
+      const result = await runArchify(args, {
+        cwd,
+        timeoutInMs: 60_000,
+        maxBufferInBytes: 8 * 1024 * 1024,
+      });
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${formatArchifyResult(result)}${command === "validate" && output !== undefined ? "\n\nnote: `output` is ignored for `validate`; only render/deliver write files." : ""}`,
+          },
+        ],
+        details: {
+          messages: [],
+          usage: emptyUsage(),
+          exitCode: result.ok && result.receipt.ok ? 0 : 1,
+        },
+      };
     },
   });
 

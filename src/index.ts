@@ -28,6 +28,32 @@ export {
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
 } from "./agent-registry.js";
+export type {
+  ArchifyArtifact,
+  ArchifyCommand,
+  ArchifyDiagnostic,
+  ArchifyDiagramType,
+  ArchifyQuality,
+  ArchifyReceipt,
+  ArchifyReceiptParse,
+  ArchifyRunResult,
+  ArchifySpecification,
+  ArchifyValidation,
+  BuildArchifyArgsOptions,
+  RunArchifyOptions,
+} from "./archify.js";
+export {
+  ARCHIFY_COMMANDS,
+  ARCHIFY_DIAGRAM_TYPES,
+  ARCHIFY_QUALITY_PROFILES,
+  buildArchifyArgs,
+  formatArchifyResult,
+  isArchifyCommand,
+  isArchifyDiagramType,
+  isArchifyQuality,
+  parseArchifyReceipt,
+  runArchify,
+} from "./archify.js";
 export type { BdCommandParse, BdCommandValidation } from "./bd-command.js";
 export {
   BD_ALLOWED_SUBCOMMANDS,
