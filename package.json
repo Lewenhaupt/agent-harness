@@ -51,7 +51,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",
-    "@jmfederico/pi-web": "1.202608.1",
+    "@jmfederico/pi-web": "1.202610.1",
     "@types/node": "^26.1.2",
     "lefthook": "^2.1.10",
     "typescript": "5.8.3",

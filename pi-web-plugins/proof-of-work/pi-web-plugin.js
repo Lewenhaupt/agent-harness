@@ -1,7 +1,7 @@
 import { defineProofPanelElement } from "./panel.js";
 
 const plugin = {
-  apiVersion: 2,
+  apiVersion: 4,
   name: "Proof of Work",
   activate: ({ runtimePluginId, html, svg }) => {
     defineProofPanelElement();
