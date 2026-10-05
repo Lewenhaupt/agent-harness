@@ -47,8 +47,8 @@ belayd-agent-harness/
 ## Build System
 
 - **`pnpm build`** runs `tsc` — compiles `src/` → `dist/` (library).
-- Extensions in `extensions/` are loaded directly by pi via `pi install -l`. They import from `dist/` at runtime.
-- `@earendil-works/pi-coding-agent` and `typebox` are listed as `peerDependencies` (pi provides them at runtime).
+- Extensions in `extensions/` are loaded directly by pi via `pi install -l`, which transpiles TypeScript on load (jiti); they import from `../src/*.js` source, not `dist/`. `dist/` exists only for library consumers.
+- `@earendil-works/pi-coding-agent` and `typebox` are listed as `peerDependencies` (pi provides them at runtime). The `pi-coding-agent` range (`^1.0.0`) must stay compatible with the flake's `pi-bare` version; it only needs to move on a major bump or when a newly adopted API has a higher minor floor.
 
 ### Nix dependency bundling (`belayd-harness`)
 
@@ -57,7 +57,9 @@ The flake's `belayd-harness` derivation bundles every `dependencies` entry from
 install of the lockfile stripped of `peerDependencies`/`devDependencies`).
 `peerDependencies` and `devDependencies` are **not** bundled.
 
-When adding, removing, or changing a `dependencies` entry:
+When the lockfile changes — adding, removing, or changing a `dependencies`
+entry, or bumping a `peerDependencies` range (`fetchPnpmDeps` hashes the store
+for the full lockfile, peers included):
 
 1. `pnpm install` — regenerate `pnpm-lock.yaml`.
 2. `nix build .#belayd-harness` — fails with `hash mismatch … got: sha256-…`.
