@@ -21,15 +21,22 @@ bundled chromium). The extension is loaded in three places:
 `src/agent-registry.ts`.
 
 The flake also exports `packages.${system}.pi-agent-browser-extension`, a
-directory artifact of the whole package, for the future pi-web orchestrator
-symlink.
+directory artifact of the whole package, for the pi-web orchestrator symlink.
 
-**Not wired yet.** The pi-web orchestrator discovers extensions from
-`~/.pi/agent/extensions/`; that symlink is **not** created. pi-web embeds
-`@earendil-works/pi-coding-agent` 0.84.1, below the extension's declared Pi
-`>= 1.0.0` floor, so registering it there would be ignored or fail. That work is
-tracked in bd-83. The Node engine divergence (extension declares Node
-`>= 24.21.0`, the devShell provides 24.18.0) is tracked in bd-82.
+**Wired in the flake.nix + nix-tmp working tree; blocked on the belayd push +
+nix-tmp flake.lock bump before a rebuild will evaluate.** pi-web is pinned to
+upstream tag v1.202610.1 (`flake.nix`), whose embedded
+`@earendil-works/pi-coding-agent` resolves to 1.0.0 — meeting the extension's
+declared Pi `>= 1.0.0` floor, so its `defaultActive`/`namespace`/`outputSchema`
+features are supported. The nix-tmp `belayd-pi-web` home-manager module now
+creates `~/.pi/agent/extensions/pi-agent-browser` pointing at that artifact
+(recorded here as `nix/nix-tmp-belayd-pi-web.patch`). A rebuild today errors
+because nix-tmp's `flake.lock` still pins `belayd` at a rev that predates the
+`pi-agent-browser-extension` export; see the full prerequisite chain under
+[pi-web orchestrator status](#pi-web-orchestrator-status). A live `agent_browser`
+run in an orchestrator session has **not** yet been verified. The Node engine
+divergence (extension declares Node `>= 24.21.0`, the devShell provides 24.18.0)
+is tracked in bd-82.
 
 ## How to Verify
 
@@ -213,21 +220,38 @@ Common operations:
   npm (`-e npm:pi-agent-browser-native@0.9.2`), so the first run needs registry
   access; with `PI_OFFLINE=1` (or no network) the fetch cannot happen and the
   tool is silently absent. This affects only the dev wrapper — the configured
-  `pi` binary and pi-web runtime read the extension from the Nix store.
+  `pi` binary reads the extension from the Nix store; pi-web will once the
+  rebuild lands (see the wiring chain below).
 
-### pi-web orchestrator limitation
+### pi-web orchestrator status
 
-The `agent_browser` tool is **not** available in pi-web orchestrator sessions
-yet. pi-web discovers extensions from `~/.pi/agent/extensions/` and embeds
-`@earendil-works/pi-coding-agent` 0.84.1, below the extension's declared Pi
-`>= 1.0.0` floor. The flake exports
-`packages.${system}.pi-agent-browser-extension` for the eventual NixOS symlink;
-the symlink plus the pi-web SDK bump are tracked in **bd-83**. When that lands,
-the NixOS side needs merely:
+The `agent_browser` tool is wired for pi-web orchestrator sessions in the
+flake.nix + nix-tmp working tree, but it is **not** active yet and the wiring is
+blocked before a rebuild will evaluate. pi-web discovers extensions from
+`~/.pi/agent/extensions/` and is now pinned to upstream tag v1.202610.1, whose
+embedded `@earendil-works/pi-coding-agent` resolves to 1.0.0 (satisfying the
+extension's Pi `>= 1.0.0` floor). The NixOS side adds:
 
 ```nix
 home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
 ```
+
+in the nix-tmp `belayd-pi-web` home-manager module (patch recorded at
+`nix/nix-tmp-belayd-pi-web.patch`). A rebuild **today errors**: nix-tmp's
+`flake.lock` still pins `belayd` at a rev older than the flake that exports
+`pi-agent-browser-extension`, so `belaydPkgs.pi-agent-browser-extension` is
+undefined. The prerequisite chain is:
+
+1. commit + push the belayd flake (bd-68/bd-81/bd-83);
+2. in nix-tmp: `nix flake lock --update-input belayd` (or equivalent flake.lock
+   bump);
+3. `nixos-rebuild` + `sudo systemctl restart pi-web pi-web-sessiond`;
+4. verify `readlink -f ~/.pi/agent/extensions/pi-agent-browser` and a real
+   `agent_browser` navigate/screenshot in an orchestrator session (bd-83).
+
+The runnable pre-rebuild checks, the expected blocked rebuild error, and the
+post-rebuild live verification steps are spelled out in
+[`agent_browser` in pi-web orchestrator sessions](pi-web-agent-browser.md).
 
 Related: the extension declares Node `>= 24.21.0` while the devShell provides
 24.18.0. It loads and registers fine today; the version alignment is tracked in
@@ -235,8 +259,11 @@ Related: the extension declares Node `>= 24.21.0` while the devShell provides
 
 ## Related documentation
 
+- [`agent_browser` in pi-web orchestrator sessions](pi-web-agent-browser.md) —
+  the bd-83 verification runbook: pre-rebuild checks, blocked-state proof, and
+  post-rebuild live checks.
 - [pi-web systemd system services](pi-web-service.md) — the service `PATH` and
-  `pi-web-runtime-env`, plus the extension-discovery limitation.
+  `pi-web-runtime-env`, plus the agent-browser extension wiring status.
 - [Playwright proof tooling in the Nix runtime env](playwright-proof-env.md) —
   the other browser stack (`playwright`, `playwright-cli`) available to agents.
 - [Proof verifier](proof-verifier.md) — how proof artifacts are validated.

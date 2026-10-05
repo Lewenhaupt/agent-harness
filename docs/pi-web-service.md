@@ -447,20 +447,33 @@ sudo systemctl restart pi-web pi-web-sessiond
 before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
 wrapper is unaffected — it reloads extensions on every launch.)
 
-### agent-browser extension (not wired yet)
+### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
-The `agent_browser` extension is **not** symlinked there yet: pi-web embeds
-`@earendil-works/pi-coding-agent` 0.84.1, which is below the extension's
-declared Pi `>= 1.0.0` floor, so registering it would be ignored or fail. The
-flake exports the packaged artifact as
-`packages.${system}.pi-agent-browser-extension`; wiring the symlink and bumping
-pi-web's embedded SDK is tracked in bd-83. When that lands, the NixOS side needs
-just:
+pi-web is now pinned to upstream tag v1.202610.1, whose embedded
+`@earendil-works/pi-coding-agent` resolves to 1.0.0 — meeting the
+`agent_browser` extension's declared Pi `>= 1.0.0` floor, so registering it is
+supported. The nix-tmp `belayd-pi-web` home-manager module adds the symlink
+(patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):
 
 ```nix
 home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
 ```
+
+A rebuild **today errors**: nix-tmp's `flake.lock` still pins `belayd` at a rev
+older than the flake that exports `pi-agent-browser-extension`, so
+`belaydPkgs.pi-agent-browser-extension` is undefined. The prerequisite chain is:
+
+1. commit + push the belayd flake (bd-68/bd-81/bd-83);
+2. in nix-tmp: `nix flake lock --update-input belayd` (or equivalent flake.lock
+   bump);
+3. `nixos-rebuild` + `sudo systemctl restart pi-web pi-web-sessiond`;
+4. verify `readlink -f ~/.pi/agent/extensions/pi-agent-browser` and a real
+   `agent_browser` navigate/screenshot in an orchestrator session (bd-83).
+
+The step-by-step runbook — pre-rebuild checks that pass today, the expected
+blocked rebuild error, and the post-rebuild live checks — is in
+[`agent_browser` in pi-web orchestrator sessions](pi-web-agent-browser.md).
 
 ### How the belayd harness dedupes duplicate copies
 
