@@ -16,15 +16,21 @@ JQ="${BELAYD_JQ:-@jq@}"
 belayd_warn() { printf 'belayd-shell: %s\n' "$1" >&2; }
 belayd_fail() { printf 'belayd-shell: %s\n' "$1" >&2; exit 1; }
 
-# On NixOS, an interactive non-login bash sources /etc/bashrc, which sources
-# /etc/profile (and thus /etc/set-environment) unless __ETC_PROFILE_DONE is set;
-# /etc/set-environment then unconditionally rewrites PATH to the plain system
-# profile. That clobbers the devShell env resolved below — and the ambient pi-web
-# runtime PATH when no devShell applies — as soon as a pi-web terminal starts,
-# dropping tools like bd/dolt/pnpm. Mark the profile as already applied so the
-# exported env survives. An explicit login shell (`exec bash -l`) still re-reads
-# /etc/profile, which remains the escape hatch; the variable is inert elsewhere.
+# On NixOS, /etc/set-environment unconditionally rewrites PATH to the plain
+# system profile, clobbering the devShell env resolved below — and the ambient
+# pi-web runtime PATH when no devShell applies — dropping tools like
+# bd/dolt/pnpm/playwright. Two startup paths reach it, gated by two different
+# variables, so both are set here:
+#   * interactive non-login bash reads /etc/bashrc, which sources /etc/profile
+#     unless __ETC_PROFILE_DONE is set (pi-web pty terminals, agent bash tool);
+#   * login bash reads /etc/profile directly, which sources /etc/set-environment
+#     unless __NIXOS_SET_ENVIRONMENT_DONE is set (pi-web terminal.runCommand
+#     uses a hardcoded `-lc`, so every plugin runCommand, e.g. the Trace Viewer
+#     button, hits this path).
+# The variables are inert elsewhere; an explicit `exec bash -l` after this
+# wrapper can still re-source /etc/profile as the escape hatch.
 export __ETC_PROFILE_DONE=1
+export __NIXOS_SET_ENVIRONMENT_DONE=1
 
 # Filter direnv's own status noise from the failure and success paths below.
 # This runs synchronously against a temp file (never as a process substitution),

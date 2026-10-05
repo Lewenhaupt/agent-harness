@@ -317,6 +317,30 @@ describe("belayd-shell wrapper (unit)", () => {
 
       expect(profileGuards()).toEqual(["1"]);
     });
+
+    // /etc/profile sources /etc/set-environment unless
+    // __NIXOS_SET_ENVIRONMENT_DONE is set; __ETC_PROFILE_DONE does not gate it.
+    // A login shell (`-lc`, as pi-web's terminal.runCommand uses for plugin
+    // commands) reads /etc/profile directly, so the wrapper must set both.
+    const nixosGuards = () => readArgvLog(harness.nixosGuardLog);
+
+    it("sets the set-environment guard on the direnv login handoff", () => {
+      run(fixtures.direnvRepo, ["-lc", "echo hi"]);
+
+      expect(nixosGuards()).toEqual(["1"]);
+    });
+
+    it("sets the set-environment guard on the flake login handoff", () => {
+      run(fixtures.flakeRepo, ["-lc", "echo hi"]);
+
+      expect(nixosGuards()).toEqual(["1"]);
+    });
+
+    it("sets the set-environment guard on transparent pass-through", () => {
+      run(fixtures.passRepo, ["-lc", "echo hi"]);
+
+      expect(nixosGuards()).toEqual(["1"]);
+    });
   });
 
   describe("fail-loud branches", () => {

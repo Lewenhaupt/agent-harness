@@ -151,6 +151,39 @@ describe("belayd-shell (integration, real binaries)", () => {
     expect(result.stdout).toContain("belayd-interactive-tool");
   });
 
+  it("keeps .envrc PATH additions through a login startup", () => {
+    if (DIRENV_PATH === null) {
+      console.warn("Skipping integration test: direnv not available");
+      return;
+    }
+    const dir = join(tmpRoot, "login-repo");
+    const bin = join(dir, "mybin");
+    mkdirSync(bin, { recursive: true });
+    const tool = join(bin, "belayd-login-tool");
+    writeFileSync(tool, "#!/bin/sh\necho tool-ran\n");
+    chmodSync(tool, 0o755);
+    writeFileSync(join(dir, ".envrc"), "PATH_add mybin\n");
+
+    const env = integrationEnv({
+      XDG_DATA_HOME: join(tmpRoot, "login-data"),
+      XDG_CONFIG_HOME: join(tmpRoot, "login-config"),
+    });
+    execFileSync("direnv", ["allow", dir], { cwd: dir, env, stdio: "pipe" });
+
+    // pi-web's terminal.runCommand always spawns the shell as `-lc`. A login
+    // bash reads /etc/profile directly, which sources /etc/set-environment
+    // unless __NIXOS_SET_ENVIRONMENT_DONE is set; that rewrites PATH and drops
+    // the devShell entries, which is what broke the Trace Viewer button while
+    // `-i -c` (interactive non-login) terminals still worked.
+    const result = runScript(renderWrapper(), ["-lc", "command -v belayd-login-tool"], {
+      cwd: dir,
+      env,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("belayd-login-tool");
+  });
+
   it("is a transparent pass-through in a plain directory", () => {
     const dir = join(tmpRoot, "plain");
     mkdirSync(dir, { recursive: true });
