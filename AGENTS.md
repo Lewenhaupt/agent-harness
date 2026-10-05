@@ -21,6 +21,7 @@ belayd-agent-harness/
 │   ├── process-gate.ts     # Phase order enforcement
 │   ├── workflow-registry.ts # Workflow sub-types (feature, bugfix, etc.)
 │   ├── quality-gates.ts    # Deterministic quality checks (typecheck, lint, tests, proof)
+│   ├── archify.ts          # Archify diagram wrapper (args, receipts, formatting, run)
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)
 │   ├── plannotator/
@@ -31,6 +32,8 @@ belayd-agent-harness/
 │   ├── index.ts            # Main belayd-harness extension
 │   └── stale-file-guard.ts # Stale-file guard extension
 ├── test/                   # Integration tests
+├── docs/
+│   └── diagrams/           # Committed archify HTML diagrams (see its README.md)
 ├── dist/                   # Build output (tsc)
 │   └── *.js, *.d.ts        # Compiled library
 ├── package.json
@@ -60,6 +63,36 @@ When adding, removing, or changing a `dependencies` entry:
 2. `nix build .#belayd-harness` — fails with `hash mismatch … got: sha256-…`.
 3. Copy the `got:` hash into `belayd-harness.pnpmDeps.hash` in `flake.nix`.
 4. Re-run `nix build .#belayd-harness`.
+
+### Archify diagram generation (`archify`)
+
+[archify](https://github.com/tt-a1i/archify) compiles a typed JSON IR into a
+single self-contained interactive HTML diagram (architecture / workflow /
+sequence / dataflow / lifecycle). It is distributed only as a GitHub release
+zip (the npm name `archify` is an unrelated 2016 package; `@pi-harness/plugin-archify`
+is a different Mermaid-emitting product).
+
+The flake defines an `archify` derivation that unpacks
+`releases/download/v<version>/archify.zip` into `$out/libexec/archify` and
+writes a wrapper that pins `ARCHIFY_UPDATE_CHECK_DISABLED=1` (the update
+checker does a fixed-manifest network GET). It is in `devShellTools`, so it
+flows into `devShells.default` and `pi-web-runtime-env` and is therefore on
+`PATH` for every spawned agent session. `nix build .#archify` is directly
+testable; re-pin the version + hash deliberately rather than tracking
+`releases/latest`.
+
+The `belayd_archify` pi tool wraps `render` / `validate` / `deliver`. It
+requests `--json` for `validate`/`deliver` and parses the plain output path
+that `render` prints (upstream `render` has no `--json` flag). The tool is
+opt-in (consult-callable, not a workflow phase). It is listed in
+`GATED_TOOLS` so it stays callable while the process gate is active, but it is
+**not** in `PLANNING_GATED_TOOLS`. Generated diagrams are committed under
+`docs/diagrams/` (see `docs/diagrams/README.md`); `belayd_commit`'s `git add
+-A` will include the generated HTML, and the stale-file guard does not track
+files written by the external CLI — both expected.
+
+`visual-check` (needs Chrome via `$ARCHIFY_CHROME`) and `preview` (opens a
+loopback HTTP server) are intentionally outside the tool surface.
 
 ## Checking local services
 

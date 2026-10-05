@@ -332,6 +332,43 @@
           '';
         };
 
+        # Archify — typed JSON-IR diagram renderer (architecture / workflow /
+        # sequence / dataflow / lifecycle) used by the belayd_archify tool.
+        # Distributed only as a GitHub release zip (the npm name `archify` is
+        # an unrelated 2016 package), so it is unpacked and wrapped here. The
+        # wrapper disables the update checker, whose fixed-manifest network
+        # GET would otherwise run in every spawned agent session.
+        #
+        # The zip's single top-level directory is `archify/`, so extracting
+        # into libexec yields $out/libexec/archify/bin/archify.mjs. Re-pin the
+        # version + hash deliberately; do not track `releases/latest` at build
+        # time (releases/latest reported v2.16.0 while main was on 2.17.0-dev).
+        archify = pkgs.stdenv.mkDerivation rec {
+          pname = "archify";
+          version = "2.16.0";
+
+          src = pkgs.fetchurl {
+            url = "https://github.com/tt-a1i/archify/releases/download/v${version}/archify.zip";
+            sha256 = "sha256-TFn6ZVeiOFvqrvjHIZzEFFc6zJ8MMKky1QU7CyBomkY=";
+          };
+
+          nativeBuildInputs = [ pkgs.unzip ];
+          phases = [ "installPhase" ];
+
+          installPhase = ''
+            mkdir -p $out/libexec
+            unzip -q "$src" -d $out/libexec
+
+            mkdir -p $out/bin
+            cat > $out/bin/archify <<WRAPPER
+            #!${pkgs.bash}/bin/bash
+            export ARCHIFY_UPDATE_CHECK_DISABLED=1
+            exec "${pkgs.nodejs_24}/bin/node" "$out/libexec/archify/bin/archify.mjs" "\$@"
+            WRAPPER
+            chmod +x $out/bin/archify
+          '';
+        };
+
         devShellTools = [
           pkgs.bash
           # nodejs_24 here is 24.18.0; pi-agent-browser-native declares
@@ -356,6 +393,7 @@
           pkgs.procps # bd's dolt-server liveness check runs `ps -axo`
           pkgs.asciinema
           playwright-cli
+          archify
           pkgs.playwright-test # `playwright` test runner + show-trace viewer
           pkgs.playwright-driver.browsers
         ];
@@ -687,7 +725,7 @@
       in
       {
         packages = {
-          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions pi-agent-browser-extension belayd-pi belayd-skills belayd-harness belayd-shell;
+          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions pi-agent-browser-extension belayd-pi belayd-skills belayd-harness belayd-shell archify;
         };
 
         # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`
