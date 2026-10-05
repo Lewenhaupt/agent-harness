@@ -2,9 +2,19 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildArchifyArgs, parseArchifyReceipt, runArchify } from "../src/archify.js";
+import {
+  buildArchifyArgs,
+  buildArchifyCheckArgs,
+  buildArchifyGuideArgs,
+  buildArchifyInspectArgs,
+  listArchifyExamples,
+  parseArchifyReceipt,
+  resolveArchifyHome,
+  runArchify,
+  runArchifyText,
+} from "../src/archify.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..");
 const FIXTURE = resolve(REPO_ROOT, "test/fixtures/archify/minimal.architecture.json");
@@ -28,6 +38,17 @@ function which(binary: string): string | null {
 }
 
 const ARCHIFY_PATH = which("archify");
+
+// The wrapper's $out is the parent of bin/, so the packaged agent assets live
+// at <out>/libexec/archify. Deriving it from the resolved binary tests the same
+// layout the flake exports, without hard-coding a store hash.
+function archifyHomeFromBinary(binary: string | null): string | null {
+  if (binary === null) return null;
+  if (!binary.endsWith("/bin/archify")) return null;
+  return join(dirname(dirname(binary)), "libexec", "archify");
+}
+
+const ARCHIFY_HOME = archifyHomeFromBinary(ARCHIFY_PATH);
 
 describe("archify (integration, real binary)", () => {
   let tmpRoot: string;
@@ -148,5 +169,96 @@ describe("archify (integration, real binary)", () => {
     if (result.ok) throw new Error("expected a failure result");
     expect(result.error).toContain("ENOENT");
     expect(existsSync(join(tmpRoot, "never.html"))).toBe(false);
+  });
+
+  it("guide --json returns a list or a recommendation receipt", async () => {
+    if (ARCHIFY_PATH === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    const result = await runArchifyText(buildArchifyGuideArgs({}), RUN_OPTIONS);
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) throw new Error("expected a text result");
+
+    const parsed: unknown = JSON.parse(result.text);
+    expect(parsed).toBeTypeOf("object");
+    if (parsed === null || typeof parsed !== "object") {
+      throw new Error("expected a JSON object from guide");
+    }
+    expect(parsed).toHaveProperty("ok", true);
+    expect(parsed).toHaveProperty("mode");
+  });
+
+  it("inspect architecture returns the compiled layout", async () => {
+    if (ARCHIFY_PATH === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    const result = await runArchifyText(
+      buildArchifyInspectArgs({ type: "architecture", input: FIXTURE }),
+      RUN_OPTIONS,
+    );
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) throw new Error("expected a text result");
+
+    const parsed: unknown = JSON.parse(result.text);
+    if (parsed === null || typeof parsed !== "object") {
+      throw new Error("expected a JSON object from inspect");
+    }
+    expect(parsed).toHaveProperty("ok", true);
+    expect(parsed).toHaveProperty("diagram_type", "architecture");
+    expect(parsed).toHaveProperty("layout");
+  });
+
+  it("check re-validates the delivered artifact", async () => {
+    if (ARCHIFY_PATH === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    const output = join(tmpRoot, "delivered.html");
+    const delivered = await runArchify(
+      buildArchifyArgs({
+        command: "deliver",
+        type: "architecture",
+        input: FIXTURE,
+        output,
+        quality: "showcase",
+      }),
+      RUN_OPTIONS,
+    );
+    expect(delivered).toHaveProperty("ok", true);
+    if (!delivered.ok) throw new Error("expected a run result");
+
+    const checked = await runArchifyText(buildArchifyCheckArgs(output), RUN_OPTIONS);
+    expect(checked).toHaveProperty("ok", true);
+    if (!checked.ok) throw new Error("expected a text result");
+
+    const parsed: unknown = JSON.parse(checked.text);
+    if (parsed === null || typeof parsed !== "object") {
+      throw new Error("expected a JSON object from check");
+    }
+    expect(parsed).toHaveProperty("ok", true);
+    expect(parsed).toHaveProperty("checks");
+  });
+
+  it("lists packaged example IRs from the resolved $ARCHIFY_HOME", () => {
+    if (ARCHIFY_HOME === null || !existsSync(join(ARCHIFY_HOME, "examples"))) {
+      console.warn("Skipping integration test: ARCHIFY_HOME not resolvable");
+      return;
+    }
+
+    const home = resolveArchifyHome({ ARCHIFY_HOME });
+    expect(home).toHaveProperty("ok", true);
+    if (!home.ok) throw new Error("expected a home result");
+
+    const listed = listArchifyExamples(home.home);
+    expect(listed).toHaveProperty("ok", true);
+    if (!listed.ok) throw new Error("expected an examples result");
+    expect(listed.examples.length).toBeGreaterThan(0);
+    expect(listed.examples.every((path) => path.endsWith(".json"))).toBe(true);
+    expect(listed.examples).toContain(join(home.home, "examples", "web-app.architecture.json"));
   });
 });

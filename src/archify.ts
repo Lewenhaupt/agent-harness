@@ -10,8 +10,8 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { existsSync, readdirSync } from "node:fs";
+import { join as joinPath, resolve as resolvePath } from "node:path";
 
 /** The five diagram IRs archify can render. Single source of truth. */
 export const ARCHIFY_DIAGRAM_TYPES = [
@@ -33,6 +33,21 @@ export const ARCHIFY_COMMANDS = ["render", "validate", "deliver"] as const;
 
 export type ArchifyCommand = (typeof ARCHIFY_COMMANDS)[number];
 
+/**
+ * Read-only guidance subcommands. They are deliberately NOT part of
+ * `ARCHIFY_COMMANDS`: `isArchifyCommand` is the renderer-command guard, so
+ * adding them there would let `guide`/`examples` masquerade as diagram
+ * commands. `ARCHIFY_TOOL_COMMANDS` is the union the pi tool accepts.
+ */
+export const ARCHIFY_GUIDANCE_COMMANDS = ["guide", "examples", "inspect", "check"] as const;
+
+export type ArchifyGuidanceCommand = (typeof ARCHIFY_GUIDANCE_COMMANDS)[number];
+
+/** Every subcommand the `belayd_archify` tool accepts (renderer + guidance). */
+export const ARCHIFY_TOOL_COMMANDS = [...ARCHIFY_COMMANDS, ...ARCHIFY_GUIDANCE_COMMANDS] as const;
+
+export type ArchifyToolCommand = (typeof ARCHIFY_TOOL_COMMANDS)[number];
+
 /** Composition quality profiles accepted by render/validate/deliver. */
 export const ARCHIFY_QUALITY_PROFILES = ["standard", "showcase"] as const;
 
@@ -53,6 +68,11 @@ export function isArchifyDiagramType(value: string): value is ArchifyDiagramType
 /** Narrow an arbitrary string to a supported command. */
 export function isArchifyCommand(value: string): value is ArchifyCommand {
   return (ARCHIFY_COMMANDS as readonly string[]).includes(value);
+}
+
+/** Narrow an arbitrary string to a tool command (renderer or guidance). */
+export function isArchifyToolCommand(value: string): value is ArchifyToolCommand {
+  return (ARCHIFY_TOOL_COMMANDS as readonly string[]).includes(value);
 }
 
 /** Narrow an arbitrary string to a supported quality profile. */
@@ -92,6 +112,86 @@ export function buildArchifyArgs(options: BuildArchifyArgsOptions): string[] {
   if (options.json ?? ARCHIFY_JSON_COMMANDS.includes(options.command)) args.push("--json");
 
   return args;
+}
+
+export interface BuildArchifyGuideArgsOptions {
+  scenario?: string;
+  lang?: string;
+  json?: boolean;
+}
+
+/**
+ * Build the argv for `archify guide [scenario] [--lang <lang>] [--json]`.
+ * `--json` defaults on so callers get the structured recommendation/receipt
+ * that is safe to parse; pass `json: false` only for raw prose output.
+ */
+export function buildArchifyGuideArgs(options: BuildArchifyGuideArgsOptions): string[] {
+  const args: string[] = ["guide"];
+  if (options.scenario !== undefined) args.push(options.scenario);
+  if (options.lang !== undefined) args.push("--lang", options.lang);
+  if (options.json ?? true) args.push("--json");
+  return args;
+}
+
+export interface BuildArchifyInspectArgsOptions {
+  type: ArchifyDiagramType;
+  input: string;
+}
+
+/** Build the argv for `archify inspect <type> <input>`. */
+export function buildArchifyInspectArgs(options: BuildArchifyInspectArgsOptions): string[] {
+  return ["inspect", options.type, options.input];
+}
+
+/** Build the argv for `archify check <input>`. */
+export function buildArchifyCheckArgs(input: string): string[] {
+  return ["check", input];
+}
+
+/** Parameters a guidance subcommand can receive from the `belayd_archify` schema. */
+export type ArchifyParamName = "type" | "input" | "output" | "quality" | "repoRoot" | "scenario";
+
+/** Canonical order for reporting supplied-but-ignored params (stable messages). */
+const ARCHIFY_PARAM_ORDER: readonly ArchifyParamName[] = [
+  "type",
+  "input",
+  "output",
+  "quality",
+  "repoRoot",
+  "scenario",
+];
+
+export type ArchifyParamSupply = Partial<Record<ArchifyParamName, string>>;
+
+/** Params each guidance command actually consumes; everything else is noise. */
+const ARCHIFY_GUIDANCE_USED_PARAMS: Record<ArchifyGuidanceCommand, readonly ArchifyParamName[]> = {
+  guide: ["scenario"],
+  examples: [],
+  check: ["input"],
+  inspect: ["type", "input"],
+};
+
+/**
+ * Names of the supplied params that `command` will not read, in canonical
+ * order. A guidance invocation must never silently drop, say, `quality` or
+ * `repoRoot`; the caller turns this into an explicit note.
+ */
+export function ignoredArchifyParams(
+  command: ArchifyGuidanceCommand,
+  supplied: ArchifyParamSupply,
+): ArchifyParamName[] {
+  const used = ARCHIFY_GUIDANCE_USED_PARAMS[command];
+  return ARCHIFY_PARAM_ORDER.filter((name) => supplied[name] !== undefined && !used.includes(name));
+}
+
+/** Render the ignored-params note; empty string when nothing was ignored. */
+export function formatArchifyIgnoredParamsNote(
+  command: ArchifyGuidanceCommand,
+  ignored: readonly ArchifyParamName[],
+): string {
+  if (ignored.length === 0) return "";
+  const list = ignored.map((name) => `\`${name}\``).join(", ");
+  return `\n\nnote: ${list} ignored for command=${command}.`;
 }
 
 /** One structured archify diagnostic (stable namespaced `code`). */
@@ -600,4 +700,100 @@ export function runArchify(
       (error, stdout, stderr) => resolve(buildRunResult(args, error, stdout, stderr, options.cwd)),
     );
   });
+}
+
+/** Result of a read-only guidance invocation that emits human/JSON text. */
+export type ArchifyTextResult = { ok: true; text: string } | { ok: false; error: string };
+
+/**
+ * Reduce one exec outcome for a text-emitting subcommand. Unlike
+ * `runArchify`, there is no structured receipt to parse: a clean exit means
+ * the stdout is the answer, and a non-zero exit prefers stdout (some
+ * diagnostics still print JSON there) over stderr over the exec error.
+ */
+function buildTextResult(error: unknown, stdout: string, stderr: string): ArchifyTextResult {
+  const interruption = describeExecFailure(error);
+  if (interruption !== undefined) return { ok: false, error: interruption };
+
+  const trimmed = stdout.trim();
+  if (error === null || error === undefined) {
+    return { ok: true, text: trimmed === "" ? "(no output)" : trimmed };
+  }
+  if (trimmed !== "") return { ok: false, error: trimmed };
+
+  const fromStderr = firstInformativeLine(stderr);
+  if (fromStderr !== undefined) return { ok: false, error: fromStderr };
+  const fromError = error instanceof Error ? firstInformativeLine(error.message) : undefined;
+  return { ok: false, error: fromError ?? "archify command failed" };
+}
+
+/**
+ * Execute a read-only guidance subcommand (`guide`/`inspect`/`check`) and
+ * return its text output. Uses the same exec shape and offline-safe env as
+ * `runArchify` so kills/timeouts/buffer overflows are handled identically.
+ */
+export function runArchifyText(
+  args: readonly string[],
+  options: RunArchifyOptions,
+): Promise<ArchifyTextResult> {
+  return new Promise((resolve) => {
+    execFile(
+      "archify",
+      [...args],
+      {
+        cwd: options.cwd,
+        timeout: options.timeoutInMs,
+        maxBuffer: options.maxBufferInBytes,
+        encoding: "utf-8",
+        env: { ...process.env, ARCHIFY_UPDATE_CHECK_DISABLED: "1" },
+      },
+      (error, stdout, stderr) => resolve(buildTextResult(error, stdout, stderr)),
+    );
+  });
+}
+
+export type ArchifyHomeResult = { ok: true; home: string } | { ok: false; error: string };
+
+/**
+ * Resolve `$ARCHIFY_HOME`, the stable path to the pinned package's agent
+ * assets. The wrapper, the devShell shellHook, and the pi-web runtime env all
+ * export it, so a spawned session inherits it without filesystem spelunking.
+ */
+export function resolveArchifyHome(env: Record<string, string | undefined>): ArchifyHomeResult {
+  const home = env.ARCHIFY_HOME;
+  if (home === undefined || home.trim() === "") {
+    return {
+      ok: false,
+      error:
+        "ARCHIFY_HOME is not set. It is exported by the archify wrapper and by the devShell / pi-web runtime env; run `nix develop` or use a harness-provided shell.",
+    };
+  }
+  return { ok: true, home };
+}
+
+export type ArchifyExamplesResult = { ok: true; examples: string[] } | { ok: false; error: string };
+
+/**
+ * List the packaged example IR files under `<home>/examples`.
+ *
+ * This intentionally reads the directory instead of shelling out to
+ * `archify examples`: that subcommand renders HTML into the (read-only) Nix
+ * store at `$ARCHIFY_HOME/examples/`, so it fails at runtime. Listing the
+ * packaged `*.json` IRs is the correct read-only behavior.
+ */
+export function listArchifyExamples(home: string): ArchifyExamplesResult {
+  const examplesDir = joinPath(home, "examples");
+  let entries: string[];
+  try {
+    entries = readdirSync(examplesDir);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `could not read archify examples at ${examplesDir}: ${message}` };
+  }
+
+  const examples = entries
+    .filter((entry) => entry.endsWith(".json"))
+    .map((entry) => joinPath(examplesDir, entry))
+    .sort();
+  return { ok: true, examples };
 }

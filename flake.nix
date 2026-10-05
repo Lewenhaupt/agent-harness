@@ -28,6 +28,7 @@
           # pull the matching gcc lib and CA bundle from that same package set.
           system = pkgs.stdenv.hostPlatform.system;
           belaydPkgs = self.inputs.nixpkgs.legacyPackages.${system};
+          archify = self.packages.${system}.archify;
           pi-web = self.packages.${system}.pi-web;
           pi-web-runtime-env = self.packages.${system}.pi-web-runtime-env;
           belayd-shell = self.packages.${system}.belayd-shell;
@@ -55,6 +56,9 @@
             "NIX_SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
             "PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}"
             "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1"
+            # Spawned agent sessions see this; the archify wrapper exports it
+            # too, but the runtime env is what reaches the agent's shell.
+            "ARCHIFY_HOME=${archify}/libexec/archify"
           ];
 
           # Runs before the session daemon: provision the direnv whitelist and
@@ -363,6 +367,12 @@
             cat > $out/bin/archify <<WRAPPER
             #!${pkgs.bash}/bin/bash
             export ARCHIFY_UPDATE_CHECK_DISABLED=1
+            # Exported here so a bare `archify` invocation is self-describing:
+            # the upstream SKILL.md, schemas/, examples/, and references/ all
+            # live beside bin/archify.mjs under the same $out. devShell and
+            # pi-web-runtime-env export the same value for agent shells that
+            # never go through this wrapper.
+            export ARCHIFY_HOME="$out/libexec/archify"
             exec "${pkgs.nodejs_24}/bin/node" "$out/libexec/archify/bin/archify.mjs" "\$@"
             WRAPPER
             chmod +x $out/bin/archify
@@ -749,6 +759,9 @@
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export PLAYWRIGHT_BROWSERS_PATH="${pkgs.playwright-driver.browsers}"
             export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS="1"
+            # Stable path to the upstream agent skill, schemas, examples, and
+            # references bundled with the pinned archify release.
+            export ARCHIFY_HOME="${archify}/libexec/archify"
             # Local pi wrapper (bin/pi): spawned belayd agents resolve their pi
             # binary via this var (src/spawn.ts) and would otherwise pick the
             # global /run/current-system/sw/bin/pi and dual-load extensions.
