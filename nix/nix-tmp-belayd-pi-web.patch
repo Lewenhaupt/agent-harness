@@ -1,0 +1,18 @@
+diff --git a/modules/core/belayd-pi-web.nix b/modules/core/belayd-pi-web.nix
+index e30ec82..c118f61 100644
+--- a/modules/core/belayd-pi-web.nix
++++ b/modules/core/belayd-pi-web.nix
+@@ -47,5 +47,13 @@ in
+     home.file.".pi/agent/extensions/belayd-stale-file-guard.ts".source = "${belaydPkgs.belayd-harness}/extensions/stale-file-guard.ts";
+     home.file.".pi/agent/extensions/belayd-worktree-guard.ts".source = "${belaydPkgs.belayd-harness}/extensions/worktree-guard.ts";
+     home.file.".pi/agent/src".source = "${belaydPkgs.belayd-harness}/src";
++
++    # pi-agent-browser-native exposes agent_browser + agent_browser_code (and
++    # the agent_browser_tools/agent_browser_action family). It declares a Pi
++    # >= 1.0.0 floor, satisfied by pi-web's embedded pi-coding-agent 1.0.0 as of
++    # the v1.202610.1 bump (see the belayd flake, bd-83). pi discovers the
++    # extension from its package.json `pi.extensions` entry and resolves its
++    # own node_modules from the exported pi-agent-browser-extension artifact.
++    home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
+   };
+ }

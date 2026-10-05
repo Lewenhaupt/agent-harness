@@ -228,20 +228,25 @@
         # those paths via a common environment.
         pi-web = pkgs.buildNpmPackage {
           pname = "pi-web";
-          version = "1.202608.1";
+          version = "1.202610.1";
           src = pkgs.fetchFromGitHub {
             owner = "jmfederico";
             repo = "pi-web";
-            # Upstream tag v1.202608.1.
-            rev = "e3cd03aa18c9b677c45dc8f1992b3fe76816bafc";
-            hash = "sha256-Py60R6rzcn7KnX5f2jF341Qn8nNq1YuE6zUUpjknzK4=";
+            # Upstream tag v1.202610.1. Its package-lock.json resolves
+            # @earendil-works/pi-coding-agent to 1.0.0 (and pi-agent-core/pi-ai
+            # to 1.0.0), which satisfies pi-agent-browser-native's declared Pi
+            # >= 1.0.0 floor so its defaultActive/namespace/outputSchema
+            # features are supported (should work) in pi-web orchestrator
+            # sessions; runtime behavior is not yet verified (bd-83).
+            rev = "3f5f39eb988810b468f486e4334f10adcdb96b21";
+            hash = "sha256-YU4eKjHPu7dmRELIyEyZY4c2MM3gQLRj6iKYq0pkhks=";
           };
           # Upstream's package-lock.json omits `integrity` for a few nested
           # @earendil-works deps of pi-coding-agent; prefetch-npm-deps refuses
           # non-git deps without integrity. Fill in the registry-published
           # dist.integrity values (see nix/pi-web-integrity.patch).
           patches = [ ./nix/pi-web-integrity.patch ];
-          npmDepsHash = "sha256-qaMOYKZpNGKxJRlra+lnbDb+KGodOA6GuR+3N/HCD9g=";
+          npmDepsHash = "sha256-aqeDeZhdr30vc+65WlHCvixSUkvc4ZsIYCDJ76gl33k=";
           npmFlags = [ "--no-audit" "--no-fund" ];
           # npm's cacache wants to rewrite index entries during `npm ci`; the
           # npmDeps store path is read-only, so give it a writable copy.
