@@ -464,6 +464,10 @@
         # ships agent-browser 0.38.2 + pi 1.0.2. This moved the pi base
         # 0.83.0 -> 1.0.2 and refreshed llm-agents' transitive pins
         # (nixpkgs, bun2nix, flake-parts).
+        #
+        # The lockfile's @earendil-works/pi-coding-agent@1.0.2 supplies the
+        # dev/test types, so bump it in the same commit as any llm-agents/pi-bare
+        # rev bump; otherwise the dev types and runtime drift apart.
         pi-bare = llm-agents.packages.${system}.pi;
 
         # The harness's agent skills (.agents/skills). Linked into
@@ -504,7 +508,7 @@
             src = ./.;
             pnpm = pkgs.pnpm;
             fetcherVersion = 4;
-            hash = "sha256-329HoB94hQ6laqIuBtoNdhN5SuX2XNygtLc06JFgkcg=";
+            hash = "sha256-bSr2uGMKf4m3k3BGVCfyZDcrXoEMuu86heM/JAhzicQ=";
           };
           dontBuild = true;
           installPhase = ''

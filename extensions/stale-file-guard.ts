@@ -17,7 +17,6 @@ import type {
   ToolCallEventResult,
   ToolResultEvent,
   UserBashEvent,
-  UserBashEventResult,
 } from "@earendil-works/pi-coding-agent";
 
 import { checkEdit, clearHashes, recordRead } from "../src/stale-file-guard.js";
@@ -95,8 +94,7 @@ export default function staleFileGuardExtension(pi: ExtensionAPI): void {
   });
 
   // Intercept bash execution to clear all tracked hashes (conservative invalidation)
-  pi.on("user_bash", (_event: UserBashEvent): UserBashEventResult => {
+  pi.on("user_bash", (_event: UserBashEvent): void => {
     clearHashes();
-    return {};
   });
 }
