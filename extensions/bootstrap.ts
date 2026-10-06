@@ -222,7 +222,17 @@ export function buildSummary(report: BootstrapReport): string {
 
 // ── Side-effecting helpers ────────────────────────────────────────────
 
-const TOOL_NAMES = ["nix", "pnpm", "git", "bd", "direnv"] as const;
+/**
+ * Tools the flow must have on the *host* PATH before it can write anything.
+ *
+ * `nix` locks and enters the new flake, `git` inits and stages the scaffold
+ * (Nix refuses to evaluate untracked files, so staging must precede
+ * `nix flake lock`), and `direnv` approves the generated `.envrc`. None of the
+ * three is provided by the scaffold's own devShell in time to be useful, so
+ * they cannot be self-provisioned the way `pnpm`/`bd`/`node` are.
+ */
+export const REQUIRED_TOOL_NAMES = ["nix", "git", "direnv"] as const;
+
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 const FLAKE_TIMEOUT_MS = 15 * 60_000;
 const DIRENV_TIMEOUT_MS = 60_000;
@@ -502,11 +512,14 @@ async function checkPreconditions(
     };
   }
 
-  const missing = findMissingTools(TOOL_NAMES, process.env.PATH ?? "", isExecutableFile);
+  const missing = findMissingTools(REQUIRED_TOOL_NAMES, process.env.PATH ?? "", isExecutableFile);
   if (missing.length > 0) {
     return {
       ok: false,
-      error: `missing tools on PATH: ${missing.join(", ")}. Run pi from the harness devShell (nix develop).`,
+      error:
+        `missing tools on PATH: ${missing.join(", ")}. ` +
+        `/bootstrap needs nix, git, and direnv on the host PATH; ` +
+        "pnpm and bd come from the scaffold's own devShell and are self-provisioned.",
     };
   }
 
@@ -539,6 +552,64 @@ interface StepRun {
   file: string;
   args: readonly string[];
   timeoutInMs: number;
+  /**
+   * Tools whose absence routes the step through the scaffold's own devShell
+   * (`nix develop <cwd> -c …`). Omit for host tools the precondition
+   * guarantees (`git`, `nix`, `direnv`). `node` is named for the lefthook
+   * step because the local `node_modules/.bin/lefthook` shebang needs it;
+   * `bd`/`dolt` are paired because `bd` shells out to `dolt` for SQL.
+   */
+  devShellTools?: readonly string[];
+}
+
+/** A command line after host PATH / scaffold-devShell resolution. */
+export interface ResolvedCommand {
+  file: string;
+  args: string[];
+  viaDevShell: boolean;
+}
+
+/**
+ * Resolve a command to its executable argv.
+ *
+ * When `devShellTools` is given and any of them is missing from the host PATH,
+ * the command runs as `nix develop <cwd> -c <file> <args…>`: the scaffold was
+ * copied before any devShell-provided step runs, so its flake already supplies
+ * pnpm/node/bd/dolt. This is what removes the old requirement that pi itself
+ * be launched from the harness devShell just to get `bd` on PATH.
+ */
+export function resolveCommand(input: {
+  file: string;
+  args: readonly string[];
+  cwd: string;
+  devShellTools?: readonly string[];
+  pathValue: string;
+  isExecutable: (candidate: string) => boolean;
+}): ResolvedCommand {
+  const tools = input.devShellTools ?? [];
+  if (
+    tools.length === 0 ||
+    findMissingTools(tools, input.pathValue, input.isExecutable).length === 0
+  ) {
+    return { file: input.file, args: [...input.args], viaDevShell: false };
+  }
+  return {
+    file: "nix",
+    args: ["develop", input.cwd, "-c", input.file, ...input.args],
+    viaDevShell: true,
+  };
+}
+
+/** Resolve using the live process PATH and filesystem (the impure wrapper). */
+function resolveStepCommand(run: StepRun): ResolvedCommand {
+  return resolveCommand({
+    file: run.file,
+    args: run.args,
+    cwd: run.controls.cwd,
+    devShellTools: run.devShellTools,
+    pathValue: process.env.PATH ?? "",
+    isExecutable: isExecutableFile,
+  });
 }
 
 interface SkippableStepRun extends StepRun {
@@ -547,9 +618,10 @@ interface SkippableStepRun extends StepRun {
 
 /** Run an idempotent command unconditionally, recording it on success. */
 async function invokeStep(run: StepRun): Promise<StepFailure | null> {
+  const command = resolveStepCommand(run);
   const result = await runCommand({
-    file: run.file,
-    args: run.args,
+    file: command.file,
+    args: command.args,
     cwd: run.controls.cwd,
     timeoutInMs: run.timeoutInMs,
   });
@@ -656,6 +728,7 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     file: "pnpm",
     args: ["install"],
     timeoutInMs: INSTALL_TIMEOUT_MS,
+    devShellTools: ["pnpm"],
   });
   if (installFailure) return installFailure;
 
@@ -666,6 +739,7 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     file: join(input.cwd, "node_modules", ".bin", "lefthook"),
     args: ["install"],
     timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["node"],
   });
   if (lefthookFailure) return lefthookFailure;
 
@@ -681,6 +755,7 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     file: "bd",
     args: ["init", "--shared-server", "--external", "--non-interactive", "--init-if-missing"],
     timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["bd", "dolt"],
   });
   if (bdInitFailure) return bdInitFailure;
 
@@ -690,14 +765,23 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     file: "bd",
     args: ["config", "set", "dolt.auto-start", "false"],
     timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["bd", "dolt"],
   });
   if (bdSetFailure) return bdSetFailure;
 
   // `bd config set` stores the value in config.yaml; verify it landed as the
   // boolean `false` (bd 1.2.2 does) rather than silently ignoring the key.
-  const bdAutoStartCheck = await runCommand({
+  const bdProbe = resolveCommand({
     file: "bd",
     args: ["config", "get", "dolt.auto-start"],
+    cwd: input.cwd,
+    devShellTools: ["bd", "dolt"],
+    pathValue: process.env.PATH ?? "",
+    isExecutable: isExecutableFile,
+  });
+  const bdAutoStartCheck = await runCommand({
+    file: bdProbe.file,
+    args: bdProbe.args,
     cwd: input.cwd,
     timeoutInMs: DEFAULT_TIMEOUT_MS,
   });
@@ -716,6 +800,7 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     file: "bd",
     args: ["prime"],
     timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["bd", "dolt"],
   });
   if (bdPrimeFailure) return bdPrimeFailure;
 
