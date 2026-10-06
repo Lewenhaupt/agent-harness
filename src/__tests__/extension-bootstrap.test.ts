@@ -9,6 +9,7 @@
  */
 
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -267,6 +268,48 @@ describe("copyTemplateTree and substituteTree", () => {
     );
     // The shared template tree must never be mutated in place.
     expect(readFileSync(templateFile, "utf-8")).toBe(templateBefore);
+  });
+
+  it("makes a copied read-only template tree writable (Nix-store modes)", async () => {
+    // The Nix-built pi runs templates straight from the read-only store
+    // (0444/0555); `cp` preserves that, so without normalisation the
+    // substitution write and every later resume fail with EACCES (bd-93).
+    const templateDir = mkdtempSync(join(tmpdir(), "bootstrap-template-"));
+    const targetDir = mkdtempSync(join(tmpdir(), "bootstrap-target-"));
+    tempDirs.push(templateDir, targetDir);
+
+    const nestedDir = join(templateDir, "packages", "core");
+    mkdirSync(nestedDir, { recursive: true });
+    const templateFile = join(nestedDir, "package.json");
+    writeFileSync(templateFile, '{"name": "@__PACKAGE_SCOPE__/core"}');
+    chmodSync(nestedDir, 0o555);
+    chmodSync(templateFile, 0o444);
+
+    const copied = await copyTemplateTree(templateDir, targetDir);
+    expect(copied.ok).toBe(true);
+    if (!copied.ok) return;
+
+    const targetFile = join(targetDir, "packages", "core", "package.json");
+    expect(statSync(targetFile).mode & 0o200).not.toBe(0);
+    expect(statSync(join(targetDir, "packages", "core")).mode & 0o200).not.toBe(0);
+
+    const substituted = await substituteTree(templateDir, targetDir, copied.value.files, {
+      projectName: "acme",
+      packageScope: "acme",
+    });
+    expect(substituted.ok).toBe(true);
+    expect(readFileSync(targetFile, "utf-8")).toBe('{"name": "@acme/core"}');
+
+    // A resume must also copy over a target the previous run left read-only.
+    chmodSync(targetFile, 0o444);
+    const recopied = await copyTemplateTree(templateDir, targetDir);
+    expect(recopied.ok).toBe(true);
+
+    // Restore writability so the shared afterEach rmSync can clean up the
+    // intentionally read-only template fixture.
+    chmodSync(templateFile, 0o644);
+    chmodSync(nestedDir, 0o755);
+    chmodSync(join(templateDir, "packages"), 0o755);
   });
 
   it("preserves a target file that already carries a bd-managed block", async () => {
