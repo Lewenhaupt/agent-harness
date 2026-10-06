@@ -33,14 +33,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["**/*.ts", "**/*.json"],
-    "experimentalScannerIgnores": [
-      "dist/**",
-      "node_modules/**",
-      ".turbo/**",
-      "coverage/**",
-      ".beads/**"
-    ]
+    "includes": ["**/*.ts", "**/*.json", "!**/dist", "!**/coverage", "!**/.turbo", "!**/.beads"]
   },
   "vcs": {
     "enabled": true,

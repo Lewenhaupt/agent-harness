@@ -74,6 +74,11 @@ Placeholders are uppercased and double-underscore delimited:
     then `bd config set dolt.auto-start false` (verified with
     `bd config get dolt.auto-start`), then `bd prime`. No `sync.remote` is set.
     `--init-if-missing` makes a re-run a no-op.
+11. `git add -A` again (always runs). The first staging pass (step 5) must
+    precede `nix flake lock`, so `flake.lock` and the `pnpm-lock.yaml` from step
+    8 are untracked when `bd init` snapshots the scaffold. This final pass
+    stages them (plus `.beads/config.yaml`) so the handoff's initial commit
+    covers a complete tree.
 
 The template intentionally omits the reference's
 `pnpm:devPreinstall: lefthook install` hook: pnpm runs it **before**
@@ -89,7 +94,10 @@ The template intentionally omits the reference's
    Structure tree, Documentation Map).
 3. Rename/extend `packages/core` (and the workspace globs) if the project needs
    more packages.
-4. Confirm `pnpm turbo run build typecheck lint test` is green.
+4. Confirm the acceptance gates are green:
+   `pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build`.
+   Root `pnpm lint` (`biome check .`) is the gate that catches config-level lint
+   failures; `pnpm turbo run … lint` only checks package sources.
 5. Create the initial commit.
 
 Only the identifier tokens are substituted by the script because `pnpm install`
@@ -161,7 +169,8 @@ existing lefthook hook into `.beads/hooks/` and appends its own section
 
 Note: this `bd` version creates a `bd init: initialize beads issue tracking`
 commit as part of init. The command itself stops before the project's initial
-commit, which the agent creates in the handoff turn.
+commit, which the agent creates in the handoff turn; the final `git add -A`
+(step 11) stages the generated lockfiles for that commit.
 
 ## `--no-extensions` (`-ne`) caveat
 
@@ -299,14 +308,16 @@ hook and appending `bd hooks run <hook>` — so on a completed run the effective
 `pre-commit` is the one under `core.hooksPath` and it chains lefthook first,
 then beads. Both outcomes are correct for their point in the flow.
 
-### 8. Turbo green in the generated repo
+### 8. Acceptance gates green in the generated repo
 
 ```bash
 cd /tmp/boot-test
-pnpm turbo run build typecheck lint test
+pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build
 ```
 
-All tasks for `@boot-test/core` must pass.
+All tasks for `@boot-test/core` must pass, and root `pnpm lint`
+(`biome check .`) must exit 0 — turbo's `lint` task is per-package
+(`biome check ./src`) and never exercises the root Biome config.
 
 ### 9. Beads wired to the shared Dolt server
 
@@ -326,26 +337,31 @@ server`, the shared Dolt server was not running when `bd init` ran (or `bd init`
 did not use `--shared-server --external`); start the server and re-run
 `/bootstrap` to resume.
 
-### 10. No commit created by the command
+### 10. No project commit created by the command
 
 The scripted steps stop before the project's initial commit.
 
 ```bash
 cd /tmp/boot-test
-git log --oneline --all
+git log --oneline --all          # only bd's scaffold commit
+git status --short               # every change staged, nothing unstaged/untracked
 ```
 
-The only commit that may exist is bd's own
-`bd init: initialize beads issue tracking`. The project's initial commit is
-agent-owned and appears only after the handoff turn (step 11). No commit
-containing the scaffold is created by `/bootstrap` itself.
+The only commit that exists is bd's own
+`bd init: initialize beads issue tracking`. Its snapshot predates `flake.lock`
+and `pnpm-lock.yaml`, so the scripted steps end with a second `git add -A` and
+those files sit staged until the agent's initial commit. The project's initial
+commit is agent-owned and appears only after the handoff turn (step 11). No
+project commit is created by `/bootstrap` itself.
 
 ### 11. Handoff turn
 
 The `belayd-bootstrap` message triggers a turn. The agent must replace
 `__PROJECT_DESCRIPTION__` / `__PROJECT_ONELINER__`, fill the AGENTS.md
 Technology Stack table, Project Structure tree, and Documentation Map, confirm
-`pnpm turbo run build typecheck lint test`, and create the initial commit.
+the acceptance gates
+(`pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build`),
+and create the initial commit.
 
 ```bash
 cd /tmp/boot-test
@@ -377,6 +393,7 @@ Finish the remaining steps manually from /tmp/boot-resume:
   bd init --shared-server --external --non-interactive --init-if-missing
   bd config set dolt.auto-start false
   bd prime
+  git add -A
 ```
 
 The scaffold stays in place. On re-run, the template files are copied again
@@ -389,8 +406,8 @@ error. A bd-injected `AGENTS.md` is preserved across the re-copy.
 
 Scripted: precondition checks, template copy, identifier substitution,
 `git init` → `git add -A` → `nix flake lock` → `direnv allow` → `pnpm install`
-→ `lefthook install` → `bd init`/`bd config`/`bd prime`, and the handoff
-message.
+→ `lefthook install` → `bd init`/`bd config`/`bd prime` → `git add -A`, and the
+handoff message.
 
 Agent-owned: the prose placeholders (`__PROJECT_DESCRIPTION__`,
 `__PROJECT_ONELINER__`), the AGENTS.md project sections, the package layout,
