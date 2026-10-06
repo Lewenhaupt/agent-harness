@@ -1,13 +1,24 @@
 # Lefthook — git hooks for Belayd
 # https://lefthook.dev/configuration/
+#
+# `no_tty` disables the spinner/interactive TUI, which avoids the known
+# TTY-only intermittent hang in lefthook (see evilmartians/lefthook#1256).
+no_tty: true
+
 pre-commit:
   jobs:
     - name: biome format + lint (staged)
       glob: "*.{ts,tsx,js,jsx,json}"
-      run: pnpm biome check --fix --no-errors-on-unmatched {staged_files} && git add {staged_files}
-    - name: typecheck
-      run: CI=1 pnpm typecheck
+      run: pnpm biome check --fix --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
     - name: lint (full)
       run: pnpm lint
+
+# Typecheck and tests moved off the commit path to keep pre-commit short —
+# the longer the hook runs, the larger the window for the TTY hang.
+pre-push:
+  jobs:
+    - name: typecheck
+      run: CI=1 pnpm typecheck
     - name: tests
       run: pnpm test
