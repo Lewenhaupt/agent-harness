@@ -191,6 +191,23 @@ function dependenciesReady(worktreePath: string): boolean {
 }
 
 /**
+ * Whether this worktree's dependency setup is expected to produce the pnpm
+ * completion marker (`node_modules/.modules.yaml`).
+ *
+ * The marker is pnpm-specific. Repositories that are not pnpm projects (for
+ * example a Neovim/Nix config with no `package.json` at all) never produce it,
+ * so polling for it would stall `/belayd` for the full timeout even though the
+ * worktree is already usable. Pnpm lock/workspace files are the signal that
+ * `wt`'s pre-start install hook (or a manual `pnpm install`) is relevant.
+ */
+function expectsPnpmDependencies(worktreePath: string): boolean {
+  return (
+    existsSync(join(worktreePath, "pnpm-lock.yaml")) ||
+    existsSync(join(worktreePath, "pnpm-workspace.yaml"))
+  );
+}
+
+/**
  * Wait for a worktree's dependencies to be installed.
  *
  * `wt switch` returns once the worktree is registered, but until this was
@@ -208,6 +225,14 @@ export async function awaitWorktreeReady(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const timeoutInMs = options.timeoutInMs ?? 60_000;
   const pollIntervalInMs = options.pollIntervalInMs ?? 200;
+
+  // Non-pnpm projects have no dependency install to wait for; treating them as
+  // "not ready" until the pnpm marker appears would block every `/belayd` run
+  // in such a repo (e.g. a Nix/Neovim config) for the whole timeout.
+  if (!expectsPnpmDependencies(worktreePath)) {
+    return { ok: true };
+  }
+
   const deadline = Date.now() + timeoutInMs;
 
   while (Date.now() < deadline) {

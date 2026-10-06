@@ -250,9 +250,10 @@ describe("awaitWorktreeReady", () => {
     expect(mockedExistsSync).toHaveBeenCalledWith("/repo/feat/node_modules/.modules.yaml");
   });
 
-  it("polls until .modules.yaml appears", async () => {
+  it("polls until .modules.yaml appears in a pnpm project", async () => {
     mockedExistsSync
-      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true) // pnpm-lock.yaml
+      .mockReturnValueOnce(false) // .modules.yaml
       .mockReturnValueOnce(false)
       .mockReturnValueOnce(true);
 
@@ -265,8 +266,9 @@ describe("awaitWorktreeReady", () => {
     expect(sleep).toHaveBeenCalledTimes(2);
   });
 
-  it("fails after the timeout elapses", async () => {
-    mockedExistsSync.mockReturnValue(false);
+  it("fails after the timeout elapses in a pnpm project", async () => {
+    mockedExistsSync.mockReturnValueOnce(true); // pnpm-lock.yaml
+    mockedExistsSync.mockReturnValue(false); // .modules.yaml never appears
 
     const result = await awaitWorktreeReady("/repo/feat", {
       timeoutInMs: 0,
@@ -277,5 +279,17 @@ describe("awaitWorktreeReady", () => {
       ok: false,
       error: "Worktree dependencies not ready within 0ms: /repo/feat",
     });
+  });
+
+  it("resolves immediately for a non-pnpm project without polling", async () => {
+    mockedExistsSync.mockReturnValue(false);
+
+    const result = await awaitWorktreeReady("/repo/feat", {
+      timeoutInMs: 1000,
+      pollIntervalInMs: 10,
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(sleep).not.toHaveBeenCalled();
   });
 });
