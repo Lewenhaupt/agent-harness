@@ -203,8 +203,8 @@ export function buildHandoffMessage(report: BootstrapReport): string {
     "1. Replace the remaining prose placeholders: `__PROJECT_DESCRIPTION__` in README.md and `__PROJECT_ONELINER__` in AGENTS.md.",
     "2. Fill the AGENTS.md project sections: the Technology Stack table, the Project Structure tree, and the Documentation Map.",
     "3. Rename/extend `packages/core` (and the `pnpm-workspace.yaml` globs) if the project needs more packages.",
-    "4. Confirm `pnpm turbo run build typecheck lint test` is green.",
-    "5. Create the initial commit (never commit secrets or `.env` files).",
+    "4. Confirm the acceptance gates are green: `pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build`. Root `pnpm lint` (`biome check .`) is the gate that catches config-level lint failures; `pnpm turbo run … lint` only checks package sources.",
+    "5. Create the project's initial commit (bd init already made a scaffold commit; the generated lockfiles are now staged for yours). Never commit secrets or `.env` files.",
     "",
     `Scripted steps already ran: ${report.commands.join(", ")}.`,
   ].join("\n");
@@ -247,7 +247,11 @@ const INSTALL_TIMEOUT_MS = 15 * 60_000;
  * `bd init --init-if-missing` are idempotent and always run. `git add -A` in
  * particular must not be skipped on `.git`'s existence: `nix flake lock`
  * refuses to evaluate files that Git does not track, so a resume after a
- * flake-lock failure has to re-stage the scaffold before retrying.
+ * flake-lock failure has to re-stage the scaffold before retrying. A second
+ * `git add -A` runs after `bd prime` because the artifacts generated after the
+ * first staging pass (`flake.lock`, `pnpm-lock.yaml`, `.beads/config.yaml`) are
+ * otherwise untracked when `bd init` snapshots the scaffold, leaving the
+ * handoff's initial commit to pick them up piecemeal.
  */
 export const STEP_DEFINITIONS = [
   { id: "git-init", command: "git init" },
@@ -262,6 +266,7 @@ export const STEP_DEFINITIONS = [
   },
   { id: "bd-config-auto-start", command: "bd config set dolt.auto-start false" },
   { id: "bd-prime", command: "bd prime" },
+  { id: "git-add-final", command: "git add -A" },
 ] as const satisfies readonly { id: string; command: string }[];
 
 /** Union of the step ids, so an unknown id is a compile error. */
@@ -833,6 +838,19 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     devShellTools: ["bd", "dolt"],
   });
   if (bdPrimeFailure) return bdPrimeFailure;
+
+  // Re-stage once the generated artifacts exist. The first `git add -A` must
+  // precede `nix flake lock`, so `flake.lock` (and `pnpm-lock.yaml`) are still
+  // untracked when `bd init` commits its scaffold snapshot; this final pass
+  // stages them so the handoff's initial commit covers a complete tree.
+  const gitAddFinalFailure = await invokeStep({
+    controls,
+    stepId: "git-add-final",
+    file: "git",
+    args: ["add", "-A"],
+    timeoutInMs: DEFAULT_TIMEOUT_MS,
+  });
+  if (gitAddFinalFailure) return gitAddFinalFailure;
 
   return {
     ok: true,

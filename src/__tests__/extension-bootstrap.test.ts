@@ -92,6 +92,13 @@ describe("STEP_DEFINITIONS", () => {
     const gitAdd = STEP_DEFINITIONS.find((step) => step.id === "git-add");
     expect(gitAdd).toHaveProperty("command", "git add -A");
   });
+
+  it("re-stages generated artifacts after bd prime for the initial commit", () => {
+    const ids = STEP_DEFINITIONS.map((step) => step.id);
+    const finalAdd = STEP_DEFINITIONS.find((step) => step.id === "git-add-final");
+    expect(finalAdd).toHaveProperty("command", "git add -A");
+    expect(ids.indexOf("git-add-final")).toBe(ids.indexOf("bd-prime") + 1);
+  });
 });
 
 describe("classifyTargetDir", () => {
@@ -452,6 +459,10 @@ describe("handoff and summary text", () => {
     expect(message).toContain("__PROJECT_DESCRIPTION__");
     expect(message).toContain("__PROJECT_ONELINER__");
     expect(message).toContain("initial commit");
+    // The shipped AGENTS.md acceptance criteria include root `pnpm lint` and
+    // `pnpm test:integration`, which turbo's per-package `lint`/`test` miss.
+    expect(message).toContain("pnpm lint");
+    expect(message).toContain("pnpm test:integration");
   });
 
   it("summarizes scripted vs agent-owned work", () => {
@@ -494,6 +505,20 @@ describe("bootstrap templates", () => {
       }
     }
     expect([...found].sort()).toEqual([...allowedPlaceholders].sort());
+  });
+
+  it("excludes generated trees via negated includes, not inert scanner ignores", () => {
+    // `files.experimentalScannerIgnores` accepts bare names, not globs, so the
+    // previous `".beads/**"` entry was silently ignored and `biome check .`
+    // failed on the tracked .beads/metadata.json (bd-94).
+    const config = JSON.parse(readFileSync(join(templateRoot, "biome.json"), "utf-8")) as {
+      files?: { includes?: string[]; experimentalScannerIgnores?: unknown };
+    };
+    expect(config.files?.experimentalScannerIgnores).toBeUndefined();
+    const includes = config.files?.includes ?? [];
+    for (const ignored of ["**/dist", "**/coverage", "**/.turbo", "**/.beads"]) {
+      expect(includes).toContain(`!${ignored}`);
+    }
   });
 });
 
