@@ -84,6 +84,9 @@ wiring, and beads wiring. It writes the files, runs `git init` / `git add -A`
 `bd init`, and
 hands the prose work (README/AGENTS placeholders, package layout, initial
 commit) to the agent. A re-run after a failure resumes from the failed step.
+Only `nix`, `git`, and `direnv` are required on the host `PATH`; `pnpm`/`node`/
+`bd`/`dolt` are self-provisioned from the scaffold's own devShell, so `pi` need
+not be launched from the harness devShell.
 
 ```bash
 mkdir ~/git/my-new-project && cd ~/git/my-new-project

@@ -15,7 +15,7 @@ single dash). Run it from an empty directory, e.g.:
 
 ```bash
 mkdir ~/git/my-new-project && cd ~/git/my-new-project
-pi            # from the harness devShell
+pi            # any pi launch; bd/pnpm self-provision from the scaffold devShell
 > /bootstrap
 ```
 
@@ -49,9 +49,13 @@ Placeholders are uppercased and double-underscore delimited:
 **Scripted by the command (mechanical):**
 
 1. Preconditions: target directory is empty (or only `.git`), **or** is a
-   resumable scaffold (see below); `nix` / `pnpm` / `git` / `bd` / `direnv` on
-   `PATH`; template directory resolvable from the extension module (works both
-   from the dev checkout and the Nix store copy).
+   resumable scaffold (see below); the **host** tools `nix` / `git` / `direnv`
+   on `PATH`; template directory resolvable from the extension module (works
+   both from the dev checkout and the Nix store copy). `pnpm`, `node` (for
+   lefthook), `bd`, and `dolt` come from the scaffold's own devShell and are
+   **self-provisioned**: when they are missing from the host `PATH`, the step
+   runs as `nix develop <project> -c …`. pi therefore no longer has to be
+   launched from the harness devShell just to get `bd` (bd-93).
 2. Copy `templates/bootstrap/**` into the target directory (overwriting
    existing template files, so a re-run does not collide).
 3. Substitute the **identifier** tokens (`__PROJECT_NAME__`,
@@ -237,9 +241,14 @@ is verified manually below.
 
 ```bash
 mkdir /tmp/boot-test && cd /tmp/boot-test
-nix develop --command pi        # or run belayd-agent-harness/bin/pi
+pi
 > /bootstrap
 ```
+
+Running `pi` from the harness devShell (`nix develop`) or `bin/pi` is still
+fine, but no longer required: a missing `bd`/`pnpm`/`node` is routed through
+the scaffold's own devShell with `nix develop <dir> -c …`. The host `PATH`
+still needs `nix`, `git`, and `direnv`.
 
 Expect an `info` notification naming the project, the template file count, the
 scripted commands, and the agent-owned remainder, followed by the
@@ -409,8 +418,11 @@ basename.
   contain only entries from the template tree or the generated-artifact set.
   Anything else is refused so a real repo is never overwritten. (`flake.nix` and
   `.pi` are deliberately not signatures.)
-- **Tools on PATH**: `nix`, `pnpm`, `git`, `bd`, `direnv`. Run `pi` from the
-  harness devShell (`nix develop`) or use `bin/pi`, which provides them.
+- **Host tools on PATH**: `nix`, `git`, `direnv` (these cannot come from the
+  scaffold devShell in time to be useful). `pnpm`/`node`/`bd`/`dolt` are
+  provided by the copy step's own devShell and run via `nix develop <dir> -c`
+  when absent from the host `PATH`, so `pi` does not need to be launched from
+  the harness devShell.
 - **Template tree**: `templates/bootstrap/` must be resolvable relative to the
   extension module — true both for the dev checkout and the Nix store copy.
 
@@ -463,7 +475,6 @@ explicitly by `bin/pi`.
 ### Minimal example
 
 ```bash
-# From the harness devShell (nix develop), in the harness checkout:
 mkdir ~/git/my-new-project && cd ~/git/my-new-project
 pi
 > /bootstrap

@@ -30,6 +30,8 @@ import bootstrapExtension, {
   GENERATED_TOP_LEVEL_ENTRIES,
   hasBeadsManagedBlock,
   hasOnlyGitEntry,
+  REQUIRED_TOOL_NAMES,
+  resolveCommand,
   resolveTemplateDir,
   STEP_DEFINITIONS,
   sanitizeProjectName,
@@ -311,6 +313,84 @@ describe("findMissingTools", () => {
 
   it("returns every tool when PATH is empty", () => {
     expect(findMissingTools(["nix", "pnpm"], "", () => true)).toEqual(["nix", "pnpm"]);
+  });
+});
+
+describe("resolveCommand", () => {
+  const isExecutable = (candidate: string): boolean =>
+    candidate === "/bin/bd" || candidate === "/bin/node";
+
+  it("runs the tool directly when it is on the host PATH", () => {
+    expect(
+      resolveCommand({
+        file: "pnpm",
+        args: ["install"],
+        cwd: "/tmp/new-project",
+        devShellTools: ["node"],
+        pathValue: "/bin",
+        isExecutable,
+      }),
+    ).toEqual({ file: "pnpm", args: ["install"], viaDevShell: false });
+  });
+
+  it("wraps a missing devShell tool in `nix develop <cwd> -c`", () => {
+    expect(
+      resolveCommand({
+        file: "pnpm",
+        args: ["install"],
+        cwd: "/tmp/new-project",
+        devShellTools: ["pnpm"],
+        pathValue: "/bin",
+        isExecutable,
+      }),
+    ).toEqual({
+      file: "nix",
+      args: ["develop", "/tmp/new-project", "-c", "pnpm", "install"],
+      viaDevShell: true,
+    });
+  });
+
+  it("wraps when any paired devShell tool is missing (bd without dolt)", () => {
+    // bd shells out to dolt, so a host bd alone is not enough.
+    const isBdOnly = (candidate: string): boolean => candidate === "/bin/bd";
+    expect(
+      resolveCommand({
+        file: "bd",
+        args: ["prime"],
+        cwd: "/tmp/new-project",
+        devShellTools: ["bd", "dolt"],
+        pathValue: "/bin",
+        isExecutable: isBdOnly,
+      }),
+    ).toEqual({
+      file: "nix",
+      args: ["develop", "/tmp/new-project", "-c", "bd", "prime"],
+      viaDevShell: true,
+    });
+  });
+
+  it("never wraps a command without a devShell tool (host tools)", () => {
+    // git/nix/direnv are precondition-guaranteed; wrapping them would be
+    // circular for nix and pointless for the others.
+    expect(
+      resolveCommand({
+        file: "git",
+        args: ["init"],
+        cwd: "/tmp/new-project",
+        pathValue: "",
+        isExecutable: () => false,
+      }),
+    ).toEqual({ file: "git", args: ["init"], viaDevShell: false });
+  });
+});
+
+describe("REQUIRED_TOOL_NAMES", () => {
+  it("requires only host tools the scaffold devShell cannot provide", () => {
+    expect([...REQUIRED_TOOL_NAMES]).toEqual(["nix", "git", "direnv"]);
+    // bd and pnpm must not be hard requirements: they are self-provisioned
+    // from the scaffold's own devShell (bd-93).
+    expect(REQUIRED_TOOL_NAMES).not.toContain("bd");
+    expect(REQUIRED_TOOL_NAMES).not.toContain("pnpm");
   });
 });
 
