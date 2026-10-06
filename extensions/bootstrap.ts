@@ -26,7 +26,7 @@
 
 import { execFile } from "node:child_process";
 import { accessSync, constants as fsConstants, statSync } from "node:fs";
-import { cp, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -399,6 +399,31 @@ export async function hasBeadsManagedBlock(path: string): Promise<boolean> {
 }
 
 /**
+ * Grant the owner write (and, for directories, execute) permission across
+ * `root`, preserving every other mode bit.
+ *
+ * The Nix-built pi runs `/bootstrap` with templates read straight from the
+ * read-only store (`templates/bootstrap` is mode 0444/0555 there), and `cp`
+ * preserves permission bits. Without this, a scaffold copied from the store
+ * lands read-only, so the token-substitution write — and every later resume —
+ * dies with EACCES. Only the template subtree is walked, so this never
+ * descends into `node_modules`. Symlinks are skipped rather than chmod'd
+ * through (a target symlink into the store is not ours to rewrite).
+ */
+async function makeTreeOwnerWritable(root: string): Promise<void> {
+  const entry = await lstat(root);
+  if (entry.isSymbolicLink()) return;
+  if (entry.isDirectory()) {
+    await chmod(root, entry.mode | 0o700);
+    for (const child of await readdir(root)) {
+      await makeTreeOwnerWritable(join(root, child));
+    }
+    return;
+  }
+  if (entry.isFile()) await chmod(root, entry.mode | 0o600);
+}
+
+/**
  * Copy the template tree into the target, overwriting existing template files.
  *
  * Overwriting (rather than `errorOnExist`) is what makes a re-run after a
@@ -426,11 +451,16 @@ export async function copyTemplateTree(
     for (const entry of topLevel) {
       const target = join(targetDir, entry.name);
       if (entry.name === "AGENTS.md" && (await hasBeadsManagedBlock(target))) continue;
+      // A previous run may have left `target` read-only (store modes); make it
+      // writable *before* `cp` so the overwrite itself cannot EACCES.
+      if (await pathExists(target)) await makeTreeOwnerWritable(target);
       await cp(join(templateDir, entry.name), target, {
         recursive: true,
         errorOnExist: false,
         force: true,
       });
+      // `cp` copies the source modes; normalise the freshly written tree.
+      await makeTreeOwnerWritable(target);
     }
     const files = await listFilesRecursive(templateDir);
     return { ok: true, value: { files } };
