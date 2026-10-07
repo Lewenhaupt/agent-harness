@@ -136,6 +136,26 @@ other connects to it instead of fighting over dolt's single-writer lock. No PID
 namespace sharing is required. The scotty image ships `dolt` and `procps` so bd
 can auto-start and verify a server when none is running.
 
+### Beads schema version
+
+The image's `bd` must support the schema of every project database it opens. A
+project migrated by a newer `bd` ends up "ahead" of an older image, and scotty
+answers `schema version mismatch: database is at vN, binary knows up to vM`
+(host `bd` from the devShell hits the same wall). Bump the `beads` flake input
+and reload the image — `arion up` alone leaves the existing tag/container in
+place:
+
+```bash
+nix flake update beads
+nix build .#scotty-image
+docker load -i result
+docker rm -f belayd-local-stack-scotty-1
+arion up -d scotty
+```
+
+The input tracks upstream `main`, not a release tag: a project can be ahead of
+the latest tag (schema v69 exists on `main` while v1.3.1 stops at v66).
+
 ## Environment overrides
 
 | Variable | Default | Meaning |
