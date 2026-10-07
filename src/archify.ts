@@ -54,9 +54,9 @@ export const ARCHIFY_QUALITY_PROFILES = ["standard", "showcase"] as const;
 export type ArchifyQuality = (typeof ARCHIFY_QUALITY_PROFILES)[number];
 
 /**
- * Subcommands that support `--json`. Upstream `render` does not: it prints the
- * output path on stdout instead of a receipt, so callers must handle it
- * separately.
+ * Subcommands that support `--json`. Upstream `render` rejects `--json` as an
+ * unknown option (exit 2), so it prints the output path on stdout instead of a
+ * receipt and callers must handle it separately.
  */
 const ARCHIFY_JSON_COMMANDS: readonly ArchifyCommand[] = ["validate", "deliver"];
 
@@ -94,11 +94,12 @@ export interface BuildArchifyArgsOptions {
  * Build the argv for one archify invocation (no shell).
  *
  * `--quality` defaults to `showcase` because generated diagrams are committed
- * documentation; callers opt down to `standard` explicitly. `--json` is added
- * for `validate`/`deliver` only, because upstream `render` silently ignores
- * `--json` (it still prints the output path and exits 0). The render fallback
- * in `parseRenderReceipt` handles that, so an explicit `json` is passed through
- * only when a caller asks for it.
+ * documentation; callers opt down to `standard` explicitly. `--json` is only
+ * ever appended for `validate`/`deliver`: archify 3.x rejects it for `render`
+ * as an unknown option (exit 2) and prints the output path on stdout instead.
+ * The `json` override therefore opts validate/deliver out of the receipt; it
+ * is ignored for render, whose result `parseRenderReceipt` synthesizes from
+ * that path.
  */
 export function buildArchifyArgs(options: BuildArchifyArgsOptions): string[] {
   const args: string[] = [options.command];
@@ -109,7 +110,8 @@ export function buildArchifyArgs(options: BuildArchifyArgsOptions): string[] {
   if (options.output !== undefined) args.push(options.output);
   args.push("--quality", options.quality ?? "showcase");
   if (options.repoRoot !== undefined) args.push("--repo-root", options.repoRoot);
-  if (options.json ?? ARCHIFY_JSON_COMMANDS.includes(options.command)) args.push("--json");
+  const wantsJson = options.json ?? true;
+  if (wantsJson && ARCHIFY_JSON_COMMANDS.includes(options.command)) args.push("--json");
 
   return args;
 }
@@ -461,10 +463,12 @@ function parseRenderPositionals(args: readonly string[]): RenderPositionals {
 /**
  * Whether stdout looks like the single output path `render` prints. Rejects
  * empty/multi-line output and usage/error banners so a warning line can never
- * be mistaken for a rendered artifact. The extension is not constrained: the
- * tool's `output` param is free-form and archify will write any path it is
- * given. Existence is verified separately in `buildRunResult`, where the
- * filesystem is available.
+ * be mistaken for a rendered artifact. Upstream 3.x enforces a non-empty
+ * `.html` CLI target (rejecting a non-.html path before rendering), but the
+ * harness stays extension-agnostic here: it only checks that stdout is a
+ * plausible path and separately verifies existence in `buildRunResult`, where
+ * the filesystem is available. That existence check is cheap and independent
+ * of the upstream validation rules.
  */
 function looksLikeRenderOutputPath(value: string): boolean {
   if (value === "" || value.includes("\n") || value.includes("\r")) return false;
@@ -474,12 +478,13 @@ function looksLikeRenderOutputPath(value: string): boolean {
 /**
  * Parse `render` output.
  *
- * Verified against archify 2.16.0: on success `render` has no `--json` and
- * prints exactly the output path followed by a newline. On any failure
- * (invalid IR, missing input file, unknown type, usage error) it prints
- * nothing to stdout, writes the diagnostic/stack to stderr, and exits
- * non-zero. Synthesize the minimal receipt the formatter expects from the
- * printed path; JSON is still honored if a caller explicitly requested it.
+ * Verified against archify 3.0.1: on success `render` prints exactly the
+ * output path followed by a newline; it has no `--json` flag and rejects one
+ * as an unknown option (exit 2). On other failures (invalid IR, missing input
+ * file, unknown type, non-.html target, usage error) it prints a human
+ * diagnostic to stderr and exits non-zero. Synthesize the minimal receipt the
+ * formatter expects from the printed path; a structured receipt is still
+ * honored if one ever appears here.
  */
 function parseRenderReceipt(stdout: string, args: readonly string[]): ArchifyReceiptParse {
   const asJson = parseArchifyReceipt(stdout);

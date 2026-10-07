@@ -141,6 +141,38 @@ describe("runArchify", () => {
     expect(result.receipt).toHaveProperty("ok", false);
   });
 
+  it("returns a 3.x argument-failure receipt on exit 2", async () => {
+    // validate emits its argument error as an ok:false JSON receipt on stdout
+    // with stage "arguments" and exits 2; runArchify must still surface it.
+    const promise = runArchify(
+      ["validate", "architecture", "in.json", "--bogus", "--json"],
+      OPTIONS,
+    );
+    const receipt = JSON.stringify({
+      schemaVersion: 1,
+      ok: false,
+      command: "validate",
+      stage: "arguments",
+      error: 'Unknown validate option "--bogus".',
+      diagnostics: [
+        {
+          code: "arguments/unknown-option",
+          severity: "error",
+          message: 'Unknown validate option "--bogus".',
+          supportedFixes: ["remove the unknown option and retry"],
+        },
+      ],
+    });
+    execCallback()(Object.assign(new Error("exit 2"), { code: 2 }), receipt, "");
+
+    const result = await promise;
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) throw new Error("expected a receipt");
+    expect(result.receipt).toHaveProperty("ok", false);
+    expect(result.receipt).toHaveProperty("stage", "arguments");
+    expect(result.receipt.diagnostics[0]).toHaveProperty("code", "arguments/unknown-option");
+  });
+
   it("injects ARCHIFY_UPDATE_CHECK_DISABLED for offline-safe sessions", async () => {
     const promise = runArchify(["validate", "architecture", "in.json", "--json"], OPTIONS);
     execCallback()(null, JSON.stringify({ ok: true, command: "validate" }), "");
@@ -182,6 +214,10 @@ describe("runArchify", () => {
   });
 
   it("accepts a render output path with a non-.html extension when the file exists", async () => {
+    // archify 3.x rejects a non-.html CLI target upstream before rendering, so
+    // the harness should never receive this stdout in practice. The existence
+    // check is a version-independent safety net, so a claimed path that does
+    // exist is still accepted rather than second-guessed here.
     const txtPath = join(tmpRoot, "out.txt");
     writeFileSync(txtPath, "diagram");
 

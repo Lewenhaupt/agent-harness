@@ -344,16 +344,18 @@
         # GET would otherwise run in every spawned agent session.
         #
         # The zip's single top-level directory is `archify/`, so extracting
-        # into libexec yields $out/libexec/archify/bin/archify.mjs. Re-pin the
-        # version + hash deliberately; do not track `releases/latest` at build
-        # time (releases/latest reported v2.16.0 while main was on 2.17.0-dev).
+        # into libexec yields $out/libexec/archify/bin/archify.mjs (unchanged
+        # in 3.x). Re-pin the version + hash deliberately; do not track
+        # `releases/latest` at build time. 2.17.0-dev.1 was only ever a dev
+        # identity on main, never a tagged release; 3.0.0/3.0.1 are immutable
+        # tagged releases and the 3.x line is the current stable one.
         archify = pkgs.stdenv.mkDerivation rec {
           pname = "archify";
-          version = "2.16.0";
+          version = "3.0.1";
 
           src = pkgs.fetchurl {
             url = "https://github.com/tt-a1i/archify/releases/download/v${version}/archify.zip";
-            sha256 = "sha256-TFn6ZVeiOFvqrvjHIZzEFFc6zJ8MMKky1QU7CyBomkY=";
+            sha256 = "sha256-sLI70o2zFPBMqKuWIP4g+MGsZHSjVGvY/kZ5UIqht/U=";
           };
 
           nativeBuildInputs = [ pkgs.unzip ];

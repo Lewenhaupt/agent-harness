@@ -69,7 +69,8 @@ describe("buildArchifyArgs", () => {
   });
 
   it("builds render and validate forms", () => {
-    // Upstream `render` silently ignores --json, so the fallback omits it.
+    // Upstream `render` has no --json flag (3.x rejects it, exit 2), so it is
+    // never added for render.
     expect(
       buildArchifyArgs({
         command: "render",
@@ -99,7 +100,9 @@ describe("buildArchifyArgs", () => {
     ]);
   });
 
-  it("lets callers override the --json decision", () => {
+  it("never adds --json for render and lets callers opt validate/deliver out", () => {
+    // `render` rejects --json as an unknown option in 3.x, so the override is
+    // ignored rather than passed through.
     expect(
       buildArchifyArgs({
         command: "render",
@@ -108,7 +111,7 @@ describe("buildArchifyArgs", () => {
         output: "out.html",
         json: true,
       }),
-    ).toContain("--json");
+    ).not.toContain("--json");
     expect(
       buildArchifyArgs({ command: "deliver", type: "architecture", input: "in.json", json: false }),
     ).not.toContain("--json");
@@ -207,6 +210,108 @@ describe("parseArchifyReceipt", () => {
     expect(parsed.receipt).toHaveProperty("stage", "render");
     expect(parsed.receipt.diagnostics).toHaveLength(1);
     expect(parsed.receipt.diagnostics[0]).toHaveProperty("code", "schema/required");
+  });
+
+  it("tolerates a 3.x deliver receipt with an update block", () => {
+    const stdout = JSON.stringify({
+      schemaVersion: 1,
+      receiptId: "bf015a72-da1d-42e8-98bc-4f2ec6d70299",
+      ok: true,
+      command: "deliver",
+      type: "architecture",
+      input: "/tmp/in.json",
+      output: "/tmp/out.html",
+      specification: { sha256: "spec-hash", bytes: 476 },
+      artifact: { sha256: "artifact-hash", bytes: 742130 },
+      validation: {
+        checksPassed: 9,
+        checkCount: 9,
+        compositionProfile: "showcase",
+        compositionStatus: "pass",
+        errors: 0,
+        warnings: 0,
+      },
+      update: {
+        status: "disabled",
+        installedVersion: null,
+        availableVersion: null,
+        noticeRequired: false,
+        reason: "disabled",
+      },
+    });
+
+    const parsed = parseArchifyReceipt(stdout);
+
+    expect(parsed).toHaveProperty("ok", true);
+    if (!parsed.ok) throw new Error("expected a parsed receipt");
+    expect(parsed.receipt).toHaveProperty("ok", true);
+    expect(parsed.receipt).toHaveProperty("artifact.bytes", 742130);
+    expect(parsed.receipt.validation).toHaveProperty("checksPassed", 9);
+  });
+
+  it("tolerates a 3.x validate receipt with candidate/engineeringProfile/nextAction", () => {
+    const stdout = JSON.stringify({
+      schemaVersion: 1,
+      ok: true,
+      command: "validate",
+      type: "architecture",
+      input: "/tmp/in.json",
+      candidate: { path: "/tmp/in.json", sha256: "cand-hash", bytes: 476 },
+      candidateFrozen: true,
+      engineeringProfile: { profile: "standard", checks: 9 },
+      nextAction: {},
+      checks: [
+        { name: "single_svg", ok: true, details: [] },
+        { name: "finite_svg", ok: true, details: [] },
+      ],
+      composition: {
+        schemaVersion: 1,
+        profile: "standard",
+        status: "pass",
+        summary: { errors: 0, warnings: 0 },
+      },
+    });
+
+    const parsed = parseArchifyReceipt(stdout);
+
+    expect(parsed).toHaveProperty("ok", true);
+    if (!parsed.ok) throw new Error("expected a parsed receipt");
+    expect(parsed.receipt.validation).toHaveProperty("checksPassed", 2);
+    expect(parsed.receipt.validation).toHaveProperty("checkCount", 2);
+    expect(parsed.receipt.validation).toHaveProperty("compositionStatus", "pass");
+    // Unknown 3.x keys (candidate, candidateFrozen, engineeringProfile,
+    // nextAction) are ignored, not copied onto the normalized receipt.
+    expect(parsed.receipt).not.toHaveProperty("candidate");
+    expect(parsed.receipt).not.toHaveProperty("engineeringProfile");
+  });
+
+  it("parses a 3.x argument-failure receipt (stage arguments)", () => {
+    const stdout = JSON.stringify({
+      schemaVersion: 1,
+      ok: false,
+      command: "validate",
+      stage: "arguments",
+      error: 'Unknown validate option "--bogus".',
+      diagnostics: [
+        {
+          code: "arguments/unknown-option",
+          severity: "error",
+          message: 'Unknown validate option "--bogus".',
+          subject: { command: "validate", option: "--bogus" },
+          evidence: {},
+          supportedFixes: ["remove the unknown option and retry"],
+        },
+      ],
+    });
+
+    const parsed = parseArchifyReceipt(stdout);
+
+    expect(parsed).toHaveProperty("ok", true);
+    if (!parsed.ok) throw new Error("expected a parsed receipt");
+    expect(parsed.receipt).toHaveProperty("ok", false);
+    expect(parsed.receipt).toHaveProperty("stage", "arguments");
+    expect(parsed.receipt.diagnostics).toHaveLength(1);
+    expect(parsed.receipt.diagnostics[0]).toHaveProperty("code", "arguments/unknown-option");
   });
 
   it("rejects empty stdout", () => {

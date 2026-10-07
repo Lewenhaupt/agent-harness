@@ -1,7 +1,11 @@
 {
   "schema_version": 1,
   "diagram_type": "architecture",
-  "meta": { "title": "Minimal Harness Fixture", "quality_profile": "standard" },
+  "meta": {
+    "title": "Minimal Harness Fixture",
+    "output": "minimal.html",
+    "quality_profile": "standard"
+  },
   "components": [
     { "id": "client", "type": "external", "label": "Client", "pos": [40, 40], "size": [120, 60] },
     { "id": "api", "type": "backend", "label": "API", "pos": [260, 40], "size": [120, 60] }

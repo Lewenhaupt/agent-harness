@@ -8,6 +8,7 @@ description: Use when authoring, generating, or validating a standalone interact
 [archify](https://github.com/tt-a1i/archify) compiles a small typed JSON IR into
 one self-contained interactive HTML document. This skill is a thin router to the
 pinned upstream material — it does not reproduce the authoring contract itself.
+The harness pins upstream **v3.0.1** (the 3.x line).
 
 ## Authoritative source
 
@@ -24,7 +25,9 @@ Then read only what you need:
   `${ARCHIFY_HOME}/examples/` — or run `belayd_archify command=examples` to list
   the packaged `*.json` files.
 - Deeper contracts: `${ARCHIFY_HOME}/references/` (`authoring-contract.md`,
-  `delivery-contract.md`, `brand-marks.md`, `viewer-runtime.md`).
+  `authoring-defaults.md`, `delivery-contract.md`, `brand-marks.md`,
+  `viewer-runtime.md`, plus the 3.x-only `repository-authoring.md`,
+  `architecture-layout-repair.md`, and `update-awareness.md`).
 
 `${ARCHIFY_HOME}` is exported by the `archify` wrapper and by the devShell /
 pi-web runtime env, and `archify` is on `PATH` in spawned sessions. If

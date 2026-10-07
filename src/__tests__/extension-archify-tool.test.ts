@@ -193,6 +193,34 @@ describe("belayd_archify tool", () => {
     expect(textOf(result)).toContain("archify deliver architecture: ok");
   });
 
+  it("forwards repoRoot for a non-architecture type (3.x supports all five types)", async () => {
+    execFileMock.state.respond = () =>
+      respondText(
+        JSON.stringify({ schemaVersion: 1, ok: true, command: "validate", type: "workflow" }),
+      );
+
+    const result = await tool.execute(
+      "c1b",
+      { command: "validate", type: "workflow", input: "in.json", repoRoot: "/repo" },
+      undefined,
+      undefined,
+      { cwd },
+    );
+
+    const call = execFileMock.calls[0];
+    expect(call?.args).toEqual([
+      "validate",
+      "workflow",
+      "in.json",
+      "--quality",
+      "showcase",
+      "--repo-root",
+      "/repo",
+      "--json",
+    ]);
+    expect(result.details.exitCode).toBe(0);
+  });
+
   it("routes command=guide with a scenario to the guide text path, not a diagram argv", async () => {
     execFileMock.state.respond = () => respondText('{"ok":true,"mode":"recommendation"}');
 

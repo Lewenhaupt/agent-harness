@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -126,16 +126,17 @@ describe("archify (integration, real binary)", () => {
     }
 
     const output = join(tmpRoot, "rendered.html");
-    const result = await runArchify(
-      buildArchifyArgs({
-        command: "render",
-        type: "architecture",
-        input: FIXTURE,
-        output,
-        quality: "showcase",
-      }),
-      RUN_OPTIONS,
-    );
+    const args = buildArchifyArgs({
+      command: "render",
+      type: "architecture",
+      input: FIXTURE,
+      output,
+      quality: "showcase",
+    });
+    // render never takes --json; 3.x rejects it as an unknown option.
+    expect(args).not.toContain("--json");
+
+    const result = await runArchify(args, RUN_OPTIONS);
 
     expect(result).toHaveProperty("ok", true);
     if (!result.ok) throw new Error("expected a run result");
@@ -144,6 +145,106 @@ describe("archify (integration, real binary)", () => {
     expect(result.receipt).toHaveProperty("output", output);
     expect(existsSync(output)).toBe(true);
     expect(statSync(output).size).toBeGreaterThan(0);
+  });
+
+  it("rejects a render --json probe with a failure (3.x unknown-option exit 2)", async () => {
+    if (ARCHIFY_PATH === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    // Pins the observed 3.0.1 behaviour: render has no --json flag, so the
+    // harness must pass the path-synthesis branch, never relying on a receipt.
+    const result = await runArchify(
+      [
+        "render",
+        "architecture",
+        FIXTURE,
+        join(tmpRoot, "probe.html"),
+        "--quality",
+        "showcase",
+        "--json",
+      ],
+      RUN_OPTIONS,
+    );
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) throw new Error("expected a failure result");
+    expect(result.error).toContain("--json");
+    expect(existsSync(join(tmpRoot, "probe.html"))).toBe(false);
+  });
+
+  it("forwards --repo-root for architecture and workflow validation", async () => {
+    if (ARCHIFY_PATH === null || ARCHIFY_HOME === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    const architected = await runArchify(
+      buildArchifyArgs({
+        command: "validate",
+        type: "architecture",
+        input: FIXTURE,
+        repoRoot: REPO_ROOT,
+      }),
+      RUN_OPTIONS,
+    );
+    expect(architected).toHaveProperty("ok", true);
+    if (!architected.ok) throw new Error("expected a run result");
+    expect(architected.receipt).toHaveProperty("ok", true);
+
+    // 3.x accepts --repo-root for every diagram type, not just architecture.
+    const workflowExample = join(ARCHIFY_HOME, "examples", "agent-tool-call.workflow.json");
+    if (!existsSync(workflowExample)) {
+      console.warn("Skipping workflow repo-root probe: example not packaged");
+      return;
+    }
+    const workflow = await runArchify(
+      buildArchifyArgs({
+        command: "validate",
+        type: "workflow",
+        input: workflowExample,
+        repoRoot: REPO_ROOT,
+      }),
+      RUN_OPTIONS,
+    );
+    expect(workflow).toHaveProperty("ok", true);
+    if (!workflow.ok) throw new Error("expected a run result");
+    expect(workflow.receipt).toHaveProperty("ok", true);
+  });
+
+  it("reports unknown provenance when checking a sidecar-less copy", async () => {
+    if (ARCHIFY_PATH === null) {
+      console.warn("Skipping integration test: archify not available");
+      return;
+    }
+
+    const deliveredPath = join(tmpRoot, "delivered.html");
+    const delivered = await runArchify(
+      buildArchifyArgs({
+        command: "deliver",
+        type: "architecture",
+        input: FIXTURE,
+        output: deliveredPath,
+        quality: "showcase",
+      }),
+      RUN_OPTIONS,
+    );
+    expect(delivered).toHaveProperty("ok", true);
+    if (!delivered.ok) throw new Error("expected a run result");
+
+    const plainPath = join(tmpRoot, "plain.html");
+    copyFileSync(deliveredPath, plainPath);
+    const checked = await runArchifyText(buildArchifyCheckArgs(plainPath), RUN_OPTIONS);
+    expect(checked).toHaveProperty("ok", true);
+    if (!checked.ok) throw new Error("expected a text result");
+
+    const parsed: unknown = JSON.parse(checked.text);
+    if (parsed === null || typeof parsed !== "object") {
+      throw new Error("expected a JSON object from check");
+    }
+    expect(parsed).toHaveProperty("ok", true);
+    expect(parsed).toHaveProperty("provenance", "unknown");
   });
 
   it("reports a real failure through runArchify when the IR does not exist", async () => {
@@ -257,7 +358,7 @@ describe("archify (integration, real binary)", () => {
     const listed = listArchifyExamples(home.home);
     expect(listed).toHaveProperty("ok", true);
     if (!listed.ok) throw new Error("expected an examples result");
-    expect(listed.examples.length).toBeGreaterThan(0);
+    expect(listed.examples.length).toBe(15);
     expect(listed.examples.every((path) => path.endsWith(".json"))).toBe(true);
     expect(listed.examples).toContain(join(home.home, "examples", "web-app.architecture.json"));
   });
