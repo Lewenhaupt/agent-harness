@@ -738,6 +738,17 @@
 
       in
       {
+        # Curated dev-tool set, exposed so sibling repos can splice it into
+        # their own devShells:
+        #
+        #   packages = [ ... ] ++ agent-harness.devShellTools.${system};
+        #
+        # It is a plain list rather than a buildEnv so consumers keep control of
+        # PATH order, and can filter entries whose versions they pin themselves.
+        # Note that this list carries nodejs_24 and pnpm, which will shadow a
+        # repo that pins nodejs_22 unless the consumer filters them out.
+        inherit devShellTools;
+
         packages = {
           inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions pi-agent-browser-extension belayd-pi belayd-skills belayd-harness belayd-shell archify;
         };
