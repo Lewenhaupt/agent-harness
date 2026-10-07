@@ -265,6 +265,7 @@ export const STEP_DEFINITIONS = [
     command: "bd init --shared-server --external --non-interactive --init-if-missing",
   },
   { id: "bd-config-auto-start", command: "bd config set dolt.auto-start false" },
+  { id: "bd-config-id-mode", command: "bd config set issue_id_mode counter" },
   { id: "bd-prime", command: "bd prime" },
   { id: "git-add-final", command: "git add -A" },
 ] as const satisfies readonly { id: string; command: string }[];
@@ -674,6 +675,82 @@ async function runStepOrSkip(run: SkippableStepRun): Promise<StepFailure | null>
   return invokeStep(run);
 }
 
+/** A bd config value the scaffold must establish, with its manual fallback. */
+export interface BdConfigSetting {
+  stepId: BootstrapStepId;
+  key: string;
+  value: string;
+  /** Shown when `bd config get` does not read back the set value. */
+  manualHint: string;
+}
+
+/**
+ * Config values `/bootstrap` pins after `bd init`. `dolt.auto-start` lands in
+ * `.beads/config.yaml`; `issue_id_mode` is a database-stored setting. Beads
+ * defaults to hash-based IDs, so `counter` is what gives the sequential IDs
+ * (`<prefix>-1`, `<prefix>-2`, …) the workflow expects.
+ */
+export const BD_CONFIG_SETTINGS: readonly BdConfigSetting[] = [
+  {
+    stepId: "bd-config-auto-start",
+    key: "dolt.auto-start",
+    value: "false",
+    manualHint: "Set `dolt.auto-start: false` in .beads/config.yaml manually.",
+  },
+  {
+    stepId: "bd-config-id-mode",
+    key: "issue_id_mode",
+    value: "counter",
+    manualHint: "Run `bd config set issue_id_mode counter` manually.",
+  },
+];
+
+/**
+ * Set a bd config value, then verify it round-trips through `bd config get`.
+ *
+ * `bd config set` exits 0 while silently ignoring an unrecognized value (bd
+ * 1.2.2 warns about `issue_id_mode` and rejects a bad value without a non-zero
+ * exit), so the set is only trusted after the get reads it back.
+ */
+async function setBdConfigAndVerify(
+  controls: StepControls,
+  setting: BdConfigSetting,
+): Promise<StepFailure | null> {
+  const setFailure = await invokeStep({
+    controls,
+    stepId: setting.stepId,
+    file: "bd",
+    args: ["config", "set", setting.key, setting.value],
+    timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["bd", "dolt"],
+  });
+  if (setFailure) return setFailure;
+
+  const probe = resolveCommand({
+    file: "bd",
+    args: ["config", "get", setting.key],
+    cwd: controls.cwd,
+    devShellTools: ["bd", "dolt"],
+    pathValue: process.env.PATH ?? "",
+    isExecutable: isExecutableFile,
+  });
+  const check = await runCommand({
+    file: probe.file,
+    args: probe.args,
+    cwd: controls.cwd,
+    timeoutInMs: DEFAULT_TIMEOUT_MS,
+  });
+  if (!check.ok) return controls.fail(check.error);
+  const observed = check.value.stdout.trim();
+  if (observed !== setting.value) {
+    return controls.fail(
+      `bd config get ${setting.key} returned "${observed}" (expected "${setting.value}"). ` +
+        setting.manualHint,
+    );
+  }
+  return null;
+}
+
 /** Run the mechanical steps in order; stop at the first failure. */
 async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<BootstrapReport>> {
   const tokens: BootstrapTokens = {
@@ -794,39 +871,9 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
   });
   if (bdInitFailure) return bdInitFailure;
 
-  const bdSetFailure = await invokeStep({
-    controls,
-    stepId: "bd-config-auto-start",
-    file: "bd",
-    args: ["config", "set", "dolt.auto-start", "false"],
-    timeoutInMs: DEFAULT_TIMEOUT_MS,
-    devShellTools: ["bd", "dolt"],
-  });
-  if (bdSetFailure) return bdSetFailure;
-
-  // `bd config set` stores the value in config.yaml; verify it landed as the
-  // boolean `false` (bd 1.2.2 does) rather than silently ignoring the key.
-  const bdProbe = resolveCommand({
-    file: "bd",
-    args: ["config", "get", "dolt.auto-start"],
-    cwd: input.cwd,
-    devShellTools: ["bd", "dolt"],
-    pathValue: process.env.PATH ?? "",
-    isExecutable: isExecutableFile,
-  });
-  const bdAutoStartCheck = await runCommand({
-    file: bdProbe.file,
-    args: bdProbe.args,
-    cwd: input.cwd,
-    timeoutInMs: DEFAULT_TIMEOUT_MS,
-  });
-  if (!bdAutoStartCheck.ok) return controls.fail(bdAutoStartCheck.error);
-  const autoStartValue = bdAutoStartCheck.value.stdout.trim();
-  if (autoStartValue !== "false") {
-    return controls.fail(
-      `bd config get dolt.auto-start returned "${autoStartValue}" (expected "false"). ` +
-        "Set `dolt.auto-start: false` in .beads/config.yaml manually.",
-    );
+  for (const setting of BD_CONFIG_SETTINGS) {
+    const configFailure = await setBdConfigAndVerify(controls, setting);
+    if (configFailure) return configFailure;
   }
 
   const bdPrimeFailure = await invokeStep({

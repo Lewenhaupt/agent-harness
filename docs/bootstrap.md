@@ -71,9 +71,10 @@ Placeholders are uppercased and double-underscore delimited:
 8. `pnpm install` (skipped when `node_modules` already exists).
 9. `lefthook install` (skipped when `.git/hooks/pre-commit` already exists).
 10. `bd init --shared-server --external --non-interactive --init-if-missing`,
-    then `bd config set dolt.auto-start false` (verified with
-    `bd config get dolt.auto-start`), then `bd prime`. No `sync.remote` is set.
-    `--init-if-missing` makes a re-run a no-op.
+    then `bd config set dolt.auto-start false` and
+    `bd config set issue_id_mode counter` (each verified with `bd config get`),
+    then `bd prime`. No `sync.remote` is set. `--init-if-missing` makes a
+    re-run a no-op.
 11. `git add -A` again (always runs). The first staging pass (step 5) must
     precede `nix flake lock`, so `flake.lock` and the `pnpm-lock.yaml` from step
     8 are untracked when `bd init` snapshots the scaffold. This final pass
@@ -158,6 +159,11 @@ uses `--shared-server --external` rather than a plain `bd init` followed by
   `bd config get dolt.auto-start` (bd 1.2.2 returns `false`). If a future `bd`
   stops honouring the key, set `dolt.auto-start: false` in `.beads/config.yaml`
   by hand.
+- `bd config set issue_id_mode counter` switches beads off its hash-based ID
+  default to sequential IDs (`<prefix>-1`, `<prefix>-2`, …). The value is
+  database-stored rather than a `config.yaml` key, and bd 1.2.2 exits 0 while
+  warning about the setting (and silently ignores an invalid value), so it is
+  only trusted after `bd config get issue_id_mode` reads `counter` back.
 
 If the shared server is not running, the beads step fails and the scaffold is
 left in place — start the shared server and re-run `/bootstrap` to resume.
@@ -327,12 +333,13 @@ bd ready
 bd list
 bd config get dolt.shared-server   # true
 bd config get dolt.auto-start      # false
+bd config get issue_id_mode        # counter
 bd config get sync.remote          # not set
 ```
 
 `bd ready` / `bd list` must answer from the new repo. Assert
-`dolt.shared-server` is `true`, `dolt.auto-start` is `false`, and no
-`sync.remote` is configured. If `bd` reports `database "…" not found on Dolt
+`dolt.shared-server` is `true`, `dolt.auto-start` is `false`,
+`issue_id_mode` is `counter`, and no `sync.remote` is configured. If `bd` reports `database "…" not found on Dolt
 server`, the shared Dolt server was not running when `bd init` ran (or `bd init`
 did not use `--shared-server --external`); start the server and re-run
 `/bootstrap` to resume.
@@ -392,6 +399,7 @@ Finish the remaining steps manually from /tmp/boot-resume:
   ./node_modules/.bin/lefthook install
   bd init --shared-server --external --non-interactive --init-if-missing
   bd config set dolt.auto-start false
+  bd config set issue_id_mode counter
   bd prime
   git add -A
 ```
@@ -457,8 +465,9 @@ basename.
 | 6 | `./node_modules/.bin/lefthook install` | skipped when `.git/hooks/pre-commit` exists |
 | 7 | `bd init --shared-server --external --non-interactive --init-if-missing` | idempotent |
 | 8 | `bd config set dolt.auto-start false` | verified with `bd config get` |
-| 9 | `bd prime` | safe to re-run |
-| 10 | Handoff turn | `belayd-bootstrap` message, `triggerTurn: true` |
+| 9 | `bd config set issue_id_mode counter` | verified with `bd config get`; database-stored |
+| 10 | `bd prime` | safe to re-run |
+| 11 | Handoff turn | `belayd-bootstrap` message, `triggerTurn: true` |
 
 The first failure aborts, shows the failing step plus the exact remaining
 commands, and leaves the scaffold in place.

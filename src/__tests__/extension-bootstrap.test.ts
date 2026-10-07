@@ -23,6 +23,7 @@ import { join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import bootstrapExtension, {
+  BD_CONFIG_SETTINGS,
   buildHandoffMessage,
   buildSummary,
   classifyTargetDir,
@@ -98,6 +99,29 @@ describe("STEP_DEFINITIONS", () => {
     const finalAdd = STEP_DEFINITIONS.find((step) => step.id === "git-add-final");
     expect(finalAdd).toHaveProperty("command", "git add -A");
     expect(ids.indexOf("git-add-final")).toBe(ids.indexOf("bd-prime") + 1);
+  });
+
+  it("pins sequential beads IDs before bd prime", () => {
+    const ids = STEP_DEFINITIONS.map((step) => step.id);
+    const idMode = STEP_DEFINITIONS.find((step) => step.id === "bd-config-id-mode");
+    expect(idMode).toHaveProperty("command", "bd config set issue_id_mode counter");
+    expect(ids.indexOf("bd-config-id-mode")).toBeGreaterThan(ids.indexOf("bd-init"));
+    expect(ids.indexOf("bd-config-id-mode")).toBeLessThan(ids.indexOf("bd-prime"));
+  });
+});
+
+describe("BD_CONFIG_SETTINGS", () => {
+  it("maps every pinned config value to a real step command", () => {
+    for (const setting of BD_CONFIG_SETTINGS) {
+      const step = STEP_DEFINITIONS.find((entry) => entry.id === setting.stepId);
+      expect(step).toHaveProperty("command", `bd config set ${setting.key} ${setting.value}`);
+    }
+  });
+
+  it("switches beads off hash-based IDs", () => {
+    expect(BD_CONFIG_SETTINGS).toContainEqual(
+      expect.objectContaining({ key: "issue_id_mode", value: "counter" }),
+    );
   });
 });
 
