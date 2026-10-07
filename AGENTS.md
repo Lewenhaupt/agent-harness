@@ -74,14 +74,16 @@ sequence / dataflow / lifecycle). It is distributed only as a GitHub release
 zip (the npm name `archify` is an unrelated 2016 package; `@pi-harness/plugin-archify`
 is a different Mermaid-emitting product).
 
-The flake defines an `archify` derivation that unpacks
-`releases/download/v<version>/archify.zip` into `$out/libexec/archify` and
-writes a wrapper that pins `ARCHIFY_UPDATE_CHECK_DISABLED=1` (the update
-checker does a fixed-manifest network GET). It is in `devShellTools`, so it
-flows into `devShells.default` and `pi-web-runtime-env` and is therefore on
-`PATH` for every spawned agent session. `nix build .#archify` is directly
-testable; re-pin the version + hash deliberately rather than tracking
-`releases/latest`.
+The flake defines an `archify` derivation (pinned to upstream **v3.0.1**) that
+unpacks `releases/download/v<version>/archify.zip` into `$out/libexec/archify`
+(the zip layout `archify/bin/archify.mjs` is unchanged in 3.x) and writes a
+wrapper that pins `ARCHIFY_UPDATE_CHECK_DISABLED=1` (the update checker does a
+fixed-manifest network GET; the `update.noticeRequired` flag it would feed is
+inert while disabled). It is in `devShellTools`, so it flows into
+`devShells.default` and `pi-web-runtime-env` and is therefore on `PATH` for
+every spawned agent session. `nix build .#archify` is directly testable;
+re-pin the version + hash deliberately rather than tracking `releases/latest`
+(2.17.0-dev.1 was only a dev identity, never a tagged release).
 
 The same `$out` also carries the upstream agent assets, so the wrapper,
 the devShell `shellHook`, and the pi-web runtime env all export
@@ -102,7 +104,9 @@ architecture-only; params irrelevant to a guidance command are echoed back as a
 lists the packaged `*.json` files directly instead of shelling out to
 `archify examples`, which would try to write rendered HTML into the read-only
 Nix store. It requests `--json` for `validate`/`deliver` and parses the path
-`render` prints (upstream `render` has no `--json` flag). The tool is
+`render` prints (3.x rejects `--json` for `render` as an unknown option, exit
+2, so it is never passed). `repoRoot` is forwarded for all five diagram types
+(3.x accepts it for each). The tool is
 opt-in (consult-callable, not a workflow phase). It is listed in
 `GATED_TOOLS` so it stays callable while the process gate is active, but it is
 **not** in `PLANNING_GATED_TOOLS`. Generated diagrams are committed under
@@ -110,8 +114,9 @@ opt-in (consult-callable, not a workflow phase). It is listed in
 -A` will include the generated HTML, and the stale-file guard does not track
 files written by the external CLI — both expected.
 
-`visual-check` (needs Chrome via `$ARCHIFY_CHROME`) and `preview` (opens a
-loopback HTTP server) are intentionally outside the tool surface.
+`finalize`, `compare`, `preview` (opens a loopback HTTP server), `visual-check`
+/ `browser-check` (need Chrome via `$ARCHIFY_CHROME`), and `migrate` are
+intentionally outside the tool surface.
 
 ## Checking local services
 

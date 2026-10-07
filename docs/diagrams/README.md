@@ -12,6 +12,11 @@ diffs. The stale-file guard tracks pi's `edit`/`write` path only, so files
 written here by the `archify` CLI are not hash-tracked — that is expected, not
 a bug.
 
+archify 3.x `deliver` writes only the HTML document; it does not leave
+`.delivery.json` / `.archify-delivery-lock.json` sidecars next to the output
+(only `finalize --receipt` writes a receipt, which the tool does not use), so
+there is nothing extra to ignore here.
+
 ## The typed JSON IR
 
 Archify consumes a JSON IR whose top-level `diagram_type` selects one of five
@@ -20,11 +25,14 @@ written, and the last-good artifact is only replaced after validation passes.
 
 | `diagram_type` | Use for |
 | --- | --- |
-| `architecture` | Components, boundaries, and connections (supports `--repo-root`) |
+| `architecture` | Components, boundaries, and connections |
 | `workflow` | Lane-ordered process steps |
 | `sequence` | Actor message ordering over time |
 | `dataflow` | Data movement between stores and processors |
 | `lifecycle` | State transitions over a lifecycle |
+
+All five types accept the optional `--repo-root` flag (verified repository
+source evidence).
 
 See `${ARCHIFY_HOME}/references/authoring-contract.md` for the full authoring
 contract and `${ARCHIFY_HOME}/schemas/` for the per-type schemas
@@ -41,7 +49,8 @@ The harness exposes an opt-in pi tool, `belayd_archify`, which wraps the
 archify CLI (`render` / `validate` / `deliver`) and adds four read-only
 guidance commands. It requests `--json` for `validate` and `deliver` (which
 emit a receipt) and parses the plain output path that `render` prints, since
-upstream `render` has no `--json` flag:
+upstream `render` has no `--json` flag (3.x rejects one as an unknown option,
+exit 2):
 
 ```
 belayd_archify type=architecture input=docs/diagrams/web-app.architecture.json
@@ -56,19 +65,20 @@ belayd_archify type=architecture input=docs/diagrams/web-app.architecture.json
 - `command` — `deliver` (default), `render`, `validate`, `guide`, `examples`,
   `inspect`, or `check`.
 - `quality` — `showcase` (default) or `standard`.
-- `repoRoot` — repository root, `architecture` diagrams only.
+- `repoRoot` — repository root for verified source evidence (all five
+  diagram types).
 - `scenario` — optional plain-language prompt for `command=guide` (must not
   start with `--`).
 
 Read-only guidance commands:
 
 - `command=guide` (optional `scenario=`) — returns the recipe list
-  (`"mode": "list"`, 11 recipes), or a type recommendation
+  (`"mode": "list"`, 12 recipes), or a type recommendation
   (`"mode": "recommendation"`, with `confidence` and `recommendation.type`)
   when a `scenario` is given. Params irrelevant to the command are reported in
   a `note:` line rather than silently dropped.
 - `command=examples` — lists the packaged example IRs under
-  `$ARCHIFY_HOME/examples/` (read directly, never rendered; 14 `*.json` files
+  `$ARCHIFY_HOME/examples/` (read directly, never rendered; 15 `*.json` files
   in the pinned release).
 - `command=inspect type=architecture input=<ir.json>` — dumps the compiled
   layout (architecture only).
@@ -95,12 +105,12 @@ Inside a devShell the shellHook already exports the pinned path:
 
 ```bash
 nix develop -c bash -c 'echo "$ARCHIFY_HOME"'
-# …-archify-2.16.0/libexec/archify
+# …-archify-3.0.1/libexec/archify
 ls "$ARCHIFY_HOME/SKILL.md" "$ARCHIFY_HOME/examples" \
    "$ARCHIFY_HOME/schemas" "$ARCHIFY_HOME/references"
 ```
 
-Expected: the store path ends in `-archify-2.16.0/libexec/archify`, and all
+Expected: the store path ends in `-archify-3.0.1/libexec/archify`, and all
 four asset paths resolve (including
 `$ARCHIFY_HOME/examples/web-app.architecture.json` and
 `$ARCHIFY_HOME/references/authoring-contract.md`). Outside a devShell the built
@@ -109,7 +119,7 @@ wrapper is self-describing:
 ```bash
 nix build .#archify
 grep 'export ARCHIFY_HOME' result/bin/archify
-# export ARCHIFY_HOME="/nix/store/…-archify-2.16.0/libexec/archify"
+# export ARCHIFY_HOME="/nix/store/…-archify-3.0.1/libexec/archify"
 ```
 
 The router skill is installed by the `belayd-skills` package, which copies

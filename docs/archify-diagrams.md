@@ -4,7 +4,8 @@
 single self-contained interactive HTML diagram (architecture / workflow /
 sequence / dataflow / lifecycle). bd-85 adds two things to the harness:
 
-- a Nix package `archify` (upstream release zip v2.16.0), added to
+- a Nix package `archify` (upstream release zip v3.0.1; the 3.x line, current
+  stable), added to
   `devShellTools` so the binary is on `PATH` in `devShells.default` and in the
   `pi-web-runtime-env` used by every spawned agent session, and
 - an **opt-in** pi tool `belayd_archify` that wraps `render` / `validate` /
@@ -24,7 +25,28 @@ bd-87 makes the upstream agent material discoverable:
   and follow it, then routes to the schema / example / reference directories.
 - `belayd_archify` gains read-only guidance subcommands: `guide` (optional
   `scenario`), `examples`, `inspect` (architecture only), and `check`.
-  `visual-check` and `preview` remain excluded.
+  `finalize`, `compare`, `preview`, `visual-check`/`browser-check`, and
+  `migrate` remain excluded.
+
+## 3.x upgrade notes
+
+- The pin is now upstream **v3.0.1**. `2.17.0-dev.1` was only a dev identity,
+  never a tagged release; 3.0.0/3.0.1 are immutable tagged releases.
+- The Workflow and Lifecycle schemas gained a **schema v2**; v1 IRs are still
+  accepted (the fixture stays v1).
+- CLI output targets must end in `.html`: `render`/`deliver`/`finalize` reject
+  a non-`.html` (or hardlinked) target with an `output/cli-extension`
+  diagnostic. The harness passes the tool's `output` straight through and still
+  verifies the printed path exists.
+- `render` still has **no `--json`** flag; 3.x now rejects one as an unknown
+  option (exit 2). `validate`/`deliver` argument errors arrive as an
+  `ok: false` receipt with `stage: "arguments"` on stdout, exit 2.
+- `--repo-root` (verified repository source evidence) is now accepted for all
+  five diagram types, not just `architecture`.
+- `deliver` writes only the HTML document; it does not drop
+  `.delivery.json`/`.archify-delivery-lock.json` sidecars next to the output, so
+  nothing new needs ignoring in `docs/diagrams/`. `check` reports
+  `provenance: "unknown"` for a sidecar-less copy.
 
 Generated diagrams are committed under `docs/diagrams/` (see
 `docs/diagrams/README.md`). The tool is consult-callable and is **not** part of
@@ -52,8 +74,8 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    pnpm typecheck && pnpm lint && pnpm test && pnpm build
    ```
 
-   Expected: no type errors, Biome clean (`Checked 101 files`), all **1102 unit
-   tests in 51 files** pass, and `tsc` emits `dist/`.
+   Expected: no type errors, Biome clean (`Checked 102 files`), all **1136 unit
+   tests in 53 files** pass, and `tsc` emits `dist/`.
 
 2. **Integration tests run against the real binary.** The suite skips (with
    `Skipping integration test: archify not available`) when `archify` is not on
@@ -63,16 +85,18 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    PATH="$(nix build .#archify --print-out-paths)/bin:$PATH" pnpm test:integration
    ```
 
-   Expected: `Test Files 4 passed (4)`, `Tests 50 passed (50)`, of which
-   `test/archify.integration.test.ts` contributes **8 tests**: the four bd-85
+   Expected: `Test Files 4 passed (4)`, `Tests 54 passed (54)`, of which
+   `test/archify.integration.test.ts` contributes **11 tests**: the four bd-85
    render paths (normalized `9/9` check summary from `validate`, `deliver`
    re-computing the artifact `sha256` and matching `artifact.bytes`, `render`
    printing a path and writing the file, and a missing IR surfacing `ENOENT` via
-   `render`) plus the four bd-87 guidance paths (`guide --json` returning an
-   `ok` receipt with a `mode`, `inspect architecture` returning
-   `diagram_type: "architecture"` and a `layout`, `check` re-validating a
-   delivered artifact, and packaged example IRs listing from a resolved
-   `$ARCHIFY_HOME`).
+   `render`), the three bd-99 3.x paths (a `render --json` probe failing as an
+   unknown option, `--repo-root` reaching the binary for architecture and
+   workflow, and a sidecar-less `check` reporting `provenance: "unknown"`), plus
+   the four bd-87 guidance paths (`guide --json` returning an `ok` receipt with
+   a `mode`, `inspect architecture` returning `diagram_type: "architecture"` and
+   a `layout`, `check` re-validating a delivered artifact, and packaged example
+   IRs listing from a resolved `$ARCHIFY_HOME`).
 
 3. **The standalone CLI works.**
 
@@ -99,9 +123,11 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    ```
 
    Expected: exit 0 and a receipt with
-   `"ok": true`, `"specification": { "sha256": "a896dc...", "bytes": 450 }`,
-   `"artifact": { "sha256": "4358...", "bytes": 697021 }` (the artifact hash
-   changes if the input changes), and
+   `"ok": true`, `"specification": { "sha256":
+   "2aab02926ae0875cd11cb464c93200394faa15827de3e8bc44bbce51ec22ea50", "bytes": 476 }`,
+   `"artifact": { "sha256":
+   "a4a10b02120e81816e96c98245d951d4012013b6dc9bcb45df464c6a7a1c2097", "bytes": 742130 }`
+   (the artifact hash changes if the input changes), and
    `"validation": { "checksPassed": 9, "checkCount": 9, "compositionProfile":
    "showcase", "compositionStatus": "pass", "errors": 0, "warnings": 0 }`.
    The HTML file opens as an interactive diagram with no network requests.
@@ -112,7 +138,7 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    ```
    archify deliver architecture: ok
    artifact: /abs/path/docs/diagrams/architecture.html
-     sha256: 4358... (697021 bytes)
+     sha256: a4a10b... (742130 bytes)
    validation: 9/9 checks passed, showcase, pass
    ```
 
@@ -123,7 +149,7 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    nix develop -c bash -c 'echo "$ARCHIFY_HOME"'
    ```
 
-   Expected: a store path ending in `-archify-2.16.0/libexec/archify`. Then,
+   Expected: a store path ending in `-archify-3.0.1/libexec/archify`. Then,
    inside that devShell (or after exporting the value as shown below), confirm
    the four asset groups exist next to the binary:
 
@@ -145,8 +171,8 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    ```
 
    Expected: `grep` prints
-   `export ARCHIFY_HOME="/nix/store/…-archify-2.16.0/libexec/archify"` (`$out`
-   already expanded to the concrete store path), and the count is **14**
+   `export ARCHIFY_HOME="/nix/store/…-archify-3.0.1/libexec/archify"` (`$out`
+   already expanded to the concrete store path), and the count is **15**
    packaged example IRs. `nix develop -c bash -c 'echo "$ARCHIFY_HOME"'` and the
    pi-web runtime env resolve to the same path.
 
@@ -192,7 +218,7 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
 
    Expected, in order: `list`; then `recommendation` and `sequence`; then `true`
    and `architecture`; then (no output from `deliver`); then `true` and `9`.
-   `guide` without a scenario returns the recipe list (11 recipes), with a
+   `guide` without a scenario returns the recipe list (12 recipes), with a
    scenario it returns a recommendation with `confidence` and `recommendation`.
 
    Through the pi tool (an agent session), the same behavior with harness-shaped
@@ -208,7 +234,7 @@ is on `PATH`, the `direnv` form works; otherwise wrap commands with
    ```
 
    Expected: `guide` prints the recipe-list JSON; with `scenario` it prints a
-   `"mode": "recommendation"` receipt; `examples` prints `archify examples (14):`
+   `"mode": "recommendation"` receipt; `examples` prints `archify examples (15):`
    followed by one `$ARCHIFY_HOME/examples/*.json` path per line; the
    `quality=showcase` call still answers and appends
    `note: quality ignored for command=guide.`; `inspect` and `check` print
@@ -238,7 +264,7 @@ path; `output` defaults to `<cwd>/docs/diagrams/<type>.html`.
 | `output` | no | path | `<cwd>/docs/diagrams/<type>.html` | **Ignored for `validate`** — only `render`/`deliver` write files. |
 | `command` | no | `deliver`, `render`, `validate`, `guide`, `examples`, `inspect`, `check` | `deliver` | `deliver` = render + validate + write; `render` writes the HTML; `validate` only checks; the rest are read-only guidance. |
 | `quality` | no | `showcase`, `standard` | `showcase` | Composition profile. Commit-diagrams default to `showcase`. |
-| `repoRoot` | no | path | — | `architecture` only; archify rejects it for other types with exit 2, and the tool rejects it early. |
+| `repoRoot` | no | path | — | Repository root for verified source evidence; supported for all five diagram types in 3.x. |
 | `scenario` | no | text | — | Plain-language prompt for `command=guide`. Must not start with `--`. |
 
 Example calls:

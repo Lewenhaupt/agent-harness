@@ -650,14 +650,6 @@ function validateDiagramParams(
     };
   }
 
-  if (params.repoRoot !== undefined && type !== "architecture") {
-    return {
-      ok: false,
-      error:
-        "repoRoot is only supported for architecture diagrams (archify rejects it for other types with exit 2).",
-    };
-  }
-
   return {
     ok: true,
     value: {
@@ -2871,7 +2863,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       ),
       repoRoot: Type.Optional(
         Type.String({
-          description: "Repository root for architecture diagrams (architecture type only)",
+          description:
+            "Repository root for verified repository source evidence (supported for all five diagram types)",
         }),
       ),
       scenario: Type.Optional(Type.String({ description: "Scenario/question for command=guide" })),
