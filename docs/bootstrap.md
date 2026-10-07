@@ -73,8 +73,9 @@ Placeholders are uppercased and double-underscore delimited:
 10. `bd init --shared-server --external --non-interactive --init-if-missing`,
     then `bd config set dolt.auto-start false` and
     `bd config set issue_id_mode counter` (each verified with `bd config get`),
-    then `bd prime`. No `sync.remote` is set. `--init-if-missing` makes a
-    re-run a no-op.
+    then `bd rename-prefix bd-` (guarded by a `bd config get issue_prefix`
+    probe, so a resume is a no-op), then `bd prime`. No `sync.remote` is set.
+    `--init-if-missing` makes a re-run a no-op.
 11. `git add -A` again (always runs). The first staging pass (step 5) must
     precede `nix flake lock`, so `flake.lock` and the `pnpm-lock.yaml` from step
     8 are untracked when `bd init` snapshots the scaffold. This final pass
@@ -164,6 +165,32 @@ uses `--shared-server --external` rather than a plain `bd init` followed by
   database-stored rather than a `config.yaml` key, and bd 1.2.2 exits 0 while
   warning about the setting (and silently ignores an invalid value), so it is
   only trusted after `bd config get issue_id_mode` reads `counter` back.
+- The issue prefix is pinned to `bd` with `bd rename-prefix bd-` **after**
+  init. `bd init` normally resolves the prefix from the directory basename, so
+  a scaffold would mint `<dirname>-N` IDs while the harness hardcodes `bd-`
+  (`src/session-naming.ts`, `/belayd` task-id validation,
+  `templates/bootstrap/.config/wt.toml` hooks). `bd init --prefix bd` is **not**
+  used: `bd` also derives the Dolt database name from the prefix
+  (`dbName = prefix.replace("-", "_")`), so every bootstrapped repo would land
+  in the single `bd` database on the shared server, which bd rejects with
+  `PROJECT IDENTITY MISMATCH`; `--prefix bd` also makes `--init-if-missing`
+  abort on resume with an `initIfMissingPrefixMismatch`. `bd rename-prefix`
+  rewrites the stored `issue_prefix` (and any existing issue IDs/text) but
+  never renames the Dolt database, and its guard probe makes an already-correct
+  resume a no-op (`bd rename-prefix` errors when old and new prefixes match).
+- `bd config set issue_prefix` is not used because bd ≥ 1.3.0 rejects it; the
+  supported post-init paths are `bd init --prefix`, `bd bootstrap`, and
+  `bd rename-prefix`.
+- `issue_prefix` is deliberately **not** written into `.beads/config.yaml`: a
+  fresh `bd init` would then resolve the Dolt database name from `bd` and
+  collide on the shared server. The value lives only in the shared database.
+
+Because the harness hardcodes the `bd-` prefix (`src/session-naming.ts`,
+`/belayd` task-id validation, `templates/bootstrap/.config/wt.toml` hooks),
+bootstrapped repos must use it; `/bootstrap` pins it instead of teaching the
+harness to accept a per-project prefix. Migration of repos bootstrapped before
+this fix is out of scope — the manual remedy is `bd rename-prefix bd-` from
+that repo.
 
 If the shared server is not running, the beads step fails and the scaffold is
 left in place — start the shared server and re-run `/bootstrap` to resume.
@@ -248,9 +275,9 @@ pnpm test -- extension-bootstrap
 ```
 
 Covers `sanitizeProjectName`, `classifyTargetDir`, `substituteIdentifierTokens`,
-`hasBeadsManagedBlock`, the copy/substitution round-trip, the handoff text, the
-`/bootstrap` registration, and the empty-directory abort. The scripted I/O flow
-is verified manually below.
+`hasBeadsManagedBlock`, `shouldRenameIssuePrefix`, the copy/substitution
+round-trip, the handoff text, the `/bootstrap` registration, and the
+empty-directory abort. The scripted I/O flow is verified manually below.
 
 ### 3. Scaffold into an empty directory
 
@@ -334,12 +361,19 @@ bd list
 bd config get dolt.shared-server   # true
 bd config get dolt.auto-start      # false
 bd config get issue_id_mode        # counter
+bd config get issue_prefix         # bd
 bd config get sync.remote          # not set
 ```
 
 `bd ready` / `bd list` must answer from the new repo. Assert
 `dolt.shared-server` is `true`, `dolt.auto-start` is `false`,
-`issue_id_mode` is `counter`, and no `sync.remote` is configured. If `bd` reports `database "…" not found on Dolt
+`issue_id_mode` is `counter`, `issue_prefix` is `bd`, and no `sync.remote` is
+configured. A newly created issue then gets a `bd-N` ID (e.g.
+`bd create "smoke"` → `bd-1`), which is what the harness's `/belayd` flow and
+the worktrunk hooks expect. Crucially, `.beads/metadata.json`'s
+`dolt_database` is still the sanitized project name (e.g. `boot_test`), **not**
+`bd` — the prefix rename must not have touched the shared-server database. If
+`bd` reports `database "…" not found on Dolt
 server`, the shared Dolt server was not running when `bd init` ran (or `bd init`
 did not use `--shared-server --external`); start the server and re-run
 `/bootstrap` to resume.
@@ -400,6 +434,7 @@ Finish the remaining steps manually from /tmp/boot-resume:
   bd init --shared-server --external --non-interactive --init-if-missing
   bd config set dolt.auto-start false
   bd config set issue_id_mode counter
+  bd rename-prefix bd-
   bd prime
   git add -A
 ```
@@ -408,14 +443,17 @@ The scaffold stays in place. On re-run, the template files are copied again
 (overwriting the previous attempt), `git add -A` always re-runs, and
 `git init` / `nix flake lock` / `pnpm install` / `lefthook install` are skipped
 or re-run based on their artifacts — the run must finish without a collision
-error. A bd-injected `AGENTS.md` is preserved across the re-copy.
+error. `bd rename-prefix` is guarded by a `bd config get issue_prefix` probe,
+so an already-pinned prefix makes the resume a no-op instead of hitting bd's
+`new prefix is the same as current prefix` error. A bd-injected `AGENTS.md` is
+preserved across the re-copy.
 
 ### What is scripted vs. agent-owned (recap)
 
 Scripted: precondition checks, template copy, identifier substitution,
 `git init` → `git add -A` → `nix flake lock` → `direnv allow` → `pnpm install`
-→ `lefthook install` → `bd init`/`bd config`/`bd prime` → `git add -A`, and the
-handoff message.
+→ `lefthook install` → `bd init`/`bd config`/`bd rename-prefix`/`bd prime` →
+`git add -A`, and the handoff message.
 
 Agent-owned: the prose placeholders (`__PROJECT_DESCRIPTION__`,
 `__PROJECT_ONELINER__`), the AGENTS.md project sections, the package layout,
@@ -466,8 +504,9 @@ basename.
 | 7 | `bd init --shared-server --external --non-interactive --init-if-missing` | idempotent |
 | 8 | `bd config set dolt.auto-start false` | verified with `bd config get` |
 | 9 | `bd config set issue_id_mode counter` | verified with `bd config get`; database-stored |
-| 10 | `bd prime` | safe to re-run |
-| 11 | Handoff turn | `belayd-bootstrap` message, `triggerTurn: true` |
+| 10 | `bd rename-prefix bd-` | guarded by `bd config get issue_prefix`; leaves the Dolt database name alone |
+| 11 | `bd prime` | safe to re-run |
+| 12 | Handoff turn | `belayd-bootstrap` message, `triggerTurn: true` |
 
 The first failure aborts, shows the failing step plus the exact remaining
 commands, and leaves the scaffold in place.

@@ -24,6 +24,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import bootstrapExtension, {
   BD_CONFIG_SETTINGS,
+  BD_ISSUE_PREFIX,
   buildHandoffMessage,
   buildSummary,
   classifyTargetDir,
@@ -37,6 +38,7 @@ import bootstrapExtension, {
   resolveTemplateDir,
   STEP_DEFINITIONS,
   sanitizeProjectName,
+  shouldRenameIssuePrefix,
   substituteIdentifierTokens,
   substituteTree,
 } from "../../extensions/bootstrap.js";
@@ -107,6 +109,29 @@ describe("STEP_DEFINITIONS", () => {
     expect(idMode).toHaveProperty("command", "bd config set issue_id_mode counter");
     expect(ids.indexOf("bd-config-id-mode")).toBeGreaterThan(ids.indexOf("bd-init"));
     expect(ids.indexOf("bd-config-id-mode")).toBeLessThan(ids.indexOf("bd-prime"));
+  });
+
+  it("pins the beads issue prefix after the config steps and before bd prime", () => {
+    const ids = STEP_DEFINITIONS.map((step) => step.id);
+    const rename = STEP_DEFINITIONS.find((step) => step.id === "bd-rename-prefix");
+    expect(rename).toHaveProperty("command", "bd rename-prefix bd-");
+    expect(ids.indexOf("bd-rename-prefix")).toBeGreaterThan(ids.indexOf("bd-init"));
+    expect(ids.indexOf("bd-rename-prefix")).toBeGreaterThan(ids.indexOf("bd-config-id-mode"));
+    expect(ids.indexOf("bd-rename-prefix")).toBeLessThan(ids.indexOf("bd-prime"));
+    expect(ids.indexOf("bd-rename-prefix")).toBeLessThan(ids.indexOf("git-add-final"));
+  });
+});
+
+describe("shouldRenameIssuePrefix", () => {
+  it("accepts the pinned prefix, including surrounding whitespace", () => {
+    expect(BD_ISSUE_PREFIX).toBe("bd");
+    expect(shouldRenameIssuePrefix("bd")).toBe(false);
+    expect(shouldRenameIssuePrefix("  bd\n")).toBe(false);
+  });
+
+  it("leaves an empty probe alone but requests a rename for a project-derived prefix", () => {
+    expect(shouldRenameIssuePrefix("")).toBe(false);
+    expect(shouldRenameIssuePrefix("belayd-agent-harness")).toBe(true);
   });
 });
 

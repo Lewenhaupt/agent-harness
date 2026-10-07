@@ -6,8 +6,9 @@
  * directory. The directory must be empty (or hold only `.git`), or be a
  * resumable `/bootstrap` scaffold from an earlier failed run. It then runs the
  * mechanical setup steps (`git init`, `git add -A`, `nix flake lock`, `direnv allow`,
- * `pnpm install`, `lefthook install`, `bd init`) and hands the prose work off
- * to the agent with a `belayd-bootstrap` message.
+ * `pnpm install`, `lefthook install`, `bd init`, the `bd config` pins, the
+ * `bd rename-prefix` issue-prefix pin, `bd prime`, and a final `git add -A`)
+ * and hands the prose work off to the agent with a `belayd-bootstrap` message.
  *
  * Only the identifier tokens `__PROJECT_NAME__` / `__PACKAGE_SCOPE__` are
  * substituted by the script. The prose tokens (`__PROJECT_DESCRIPTION__`,
@@ -117,6 +118,29 @@ export function substituteIdentifierTokens(content: string, tokens: BootstrapTok
   return content
     .replaceAll("__PROJECT_NAME__", tokens.projectName)
     .replaceAll("__PACKAGE_SCOPE__", tokens.packageScope);
+}
+
+/**
+ * Beads issue prefix every `/bootstrap` scaffold is pinned to after `bd init`.
+ *
+ * `bd init` derives the issue prefix from the directory basename unless told
+ * otherwise, so a scaffold would otherwise mint `<dirname>-N` IDs while the
+ * harness hardcodes `bd-` (`src/session-naming.ts`, `/belayd` task-id
+ * validation, `.config/wt.toml` hooks). The prefix is pinned *after* init
+ * because `bd init --prefix bd` would also collapse the shared-server database
+ * name to `bd`.
+ */
+export const BD_ISSUE_PREFIX = "bd";
+
+/**
+ * True when the stored beads issue prefix still needs renaming to
+ * {@link BD_ISSUE_PREFIX}. Callers only reach this with a non-empty probe, so
+ * the predicate is effectively "is the stored prefix not `bd`"; an empty probe
+ * returns false and is failed by the caller before this is consulted.
+ */
+export function shouldRenameIssuePrefix(observed: string): boolean {
+  const trimmed = observed.trim();
+  return trimmed !== "" && trimmed !== BD_ISSUE_PREFIX;
 }
 
 /** True when a directory holds nothing but an optional `.git` entry. */
@@ -266,6 +290,7 @@ export const STEP_DEFINITIONS = [
   },
   { id: "bd-config-auto-start", command: "bd config set dolt.auto-start false" },
   { id: "bd-config-id-mode", command: "bd config set issue_id_mode counter" },
+  { id: "bd-rename-prefix", command: `bd rename-prefix ${BD_ISSUE_PREFIX}-` },
   { id: "bd-prime", command: "bd prime" },
   { id: "git-add-final", command: "git add -A" },
 ] as const satisfies readonly { id: string; command: string }[];
@@ -726,9 +751,27 @@ async function setBdConfigAndVerify(
   });
   if (setFailure) return setFailure;
 
+  const check = await readBdConfig(controls, setting.key);
+  if (!check.ok) return controls.fail(check.error);
+  const observed = check.value;
+  if (observed !== setting.value) {
+    return controls.fail(
+      `bd config get ${setting.key} returned "${observed}" (expected "${setting.value}"). ` +
+        setting.manualHint,
+    );
+  }
+  return null;
+}
+
+/**
+ * Read a bd config value from the scaffold database, routed through its
+ * devShell when `bd`/`dolt` are absent from the host PATH. Returns the trimmed
+ * stdout, or the command failure untouched for the caller to surface.
+ */
+async function readBdConfig(controls: StepControls, key: string): Promise<StepResult<string>> {
   const probe = resolveCommand({
     file: "bd",
-    args: ["config", "get", setting.key],
+    args: ["config", "get", key],
     cwd: controls.cwd,
     devShellTools: ["bd", "dolt"],
     pathValue: process.env.PATH ?? "",
@@ -740,12 +783,57 @@ async function setBdConfigAndVerify(
     cwd: controls.cwd,
     timeoutInMs: DEFAULT_TIMEOUT_MS,
   });
-  if (!check.ok) return controls.fail(check.error);
-  const observed = check.value.stdout.trim();
-  if (observed !== setting.value) {
+  if (!check.ok) return { ok: false, error: check.error };
+  return { ok: true, value: check.value.stdout.trim() };
+}
+
+/**
+ * Pin the stored beads issue prefix to {@link BD_ISSUE_PREFIX}.
+ *
+ * Guards on `bd config get issue_prefix` first: `bd rename-prefix` errors when
+ * the old and new prefixes match, so an already-correct scaffold (a resume)
+ * must be a no-op instead of re-running the command. The rename rewrites the
+ * stored prefix (and any existing issue text) but leaves the Dolt database name
+ * alone, which is why it is preferred over `bd init --prefix`.
+ */
+async function ensureBdIssuePrefix(controls: StepControls): Promise<StepFailure | null> {
+  const existing = await readBdConfig(controls, "issue_prefix");
+  if (!existing.ok) return controls.fail(existing.error);
+
+  // A successful `bd config get` that prints nothing means the prefix could not
+  // be verified. Fail loudly rather than treating the scaffold as pinned and
+  // silently leaving it on the project-derived prefix.
+  if (existing.value === "") {
     return controls.fail(
-      `bd config get ${setting.key} returned "${observed}" (expected "${setting.value}"). ` +
-        setting.manualHint,
+      `bd config get issue_prefix returned no value, so the beads issue prefix could not be verified. ` +
+        `Run \`bd rename-prefix ${BD_ISSUE_PREFIX}-\` from \`${controls.cwd}\`.`,
+    );
+  }
+
+  if (!shouldRenameIssuePrefix(existing.value)) {
+    // Already pinned: record the step as skipped so a later failure's
+    // remaining-command list does not tell the user to re-run
+    // `bd rename-prefix bd-`, which would error on a matching prefix.
+    controls.markSkipped("bd-rename-prefix");
+    return null;
+  }
+
+  const renameFailure = await invokeStep({
+    controls,
+    stepId: "bd-rename-prefix",
+    file: "bd",
+    args: ["rename-prefix", `${BD_ISSUE_PREFIX}-`],
+    timeoutInMs: DEFAULT_TIMEOUT_MS,
+    devShellTools: ["bd", "dolt"],
+  });
+  if (renameFailure) return renameFailure;
+
+  const verified = await readBdConfig(controls, "issue_prefix");
+  if (!verified.ok) return controls.fail(verified.error);
+  if (verified.value !== BD_ISSUE_PREFIX) {
+    return controls.fail(
+      `bd config get issue_prefix returned "${verified.value}" (expected "${BD_ISSUE_PREFIX}"). ` +
+        `Run \`bd rename-prefix ${BD_ISSUE_PREFIX}-\` from \`${controls.cwd}\`.`,
     );
   }
   return null;
@@ -875,6 +963,12 @@ async function runScriptedSteps(input: ScriptedStepInput): Promise<StepResult<Bo
     const configFailure = await setBdConfigAndVerify(controls, setting);
     if (configFailure) return configFailure;
   }
+
+  // Pin the issue prefix after init so the shared-server database name, which
+  // `bd init` derived from the project name, stays project-derived. Runs before
+  // `bd prime` and the final staging so both observe the final prefix.
+  const prefixFailure = await ensureBdIssuePrefix(controls);
+  if (prefixFailure) return prefixFailure;
 
   const bdPrimeFailure = await invokeStep({
     controls,
