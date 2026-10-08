@@ -10,6 +10,7 @@ import {
   PROOF_VERIFIER_SYSTEM_PROMPT,
   PROOF_VERIFIER_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
+  RESEARCHER_TOOLS,
 } from "../agent-registry.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
 
@@ -378,5 +379,22 @@ describe("RESEARCHER_SYSTEM_PROMPT", () => {
   it("tells the researcher to record notes via the stdin parameter", () => {
     expect(RESEARCHER_SYSTEM_PROMPT).toContain("--stdin");
     expect(RESEARCHER_SYSTEM_PROMPT).toContain("stdin");
+  });
+
+  it("tells the researcher bash is for inspecting CLI tools, not editing", () => {
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("bash");
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("CLI tools");
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("edit repository files");
+  });
+});
+
+describe("RESEARCHER_TOOLS", () => {
+  it("includes bash so research can explore CLI tools", () => {
+    expect(RESEARCHER_TOOLS).toContain("bash");
+  });
+
+  it("stays read-only (no edit/write)", () => {
+    expect(RESEARCHER_TOOLS).not.toContain("edit");
+    expect(RESEARCHER_TOOLS).not.toContain("write");
   });
 });

@@ -106,6 +106,9 @@ describe("WORKFLOW_REGISTRY", () => {
     expect(WORKFLOW_REGISTRY.research.proofRequired).toBe(false);
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.systemPrompt).toBeDefined();
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bd");
+    // Research often needs to run and inspect CLI tools, so the research
+    // workflow's plan phase keeps bash (unlike planning mode's scout).
+    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bash");
   });
 
   it("every agentOverride systemPrompt still carries the stale-worktree rebase guidance", () => {

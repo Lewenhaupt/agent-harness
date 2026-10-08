@@ -2484,6 +2484,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         {
           name: "belayd-plan-research",
           modelClass: "frontier",
+          // Keep bash (research must be able to run CLI tools); strip only bd so
+          // planning sub-agents never create or mutate beads. Scout still drops
+          // bash to stay strictly read-only.
           tools: RESEARCHER_TOOLS.filter((t) => t !== "bd"),
           systemPrompt: RESEARCHER_SYSTEM_PROMPT,
         },
