@@ -29,5 +29,7 @@ mark-in-progress = 'bd_id="$(printf "%s" "{{ branch }}" | sed "s#^[^/]*/##")"; c
 # Human reviewed + merged — close the bead (never done by agents)
 close = 'bd_id="$(printf "%s" "{{ branch }}" | sed "s#^[^/]*/##")"; case "$bd_id" in bd-*) bd close "$bd_id" --reason "merged via wt" ;; esac'
 
-[merge]
-squash = false
+# NOTE: merge settings (e.g. `squash`) are honored only in the *user* config
+# (~/.config/worktrunk/config.toml), never here — worktrunk ignores `[merge]`
+# in a project config and warns on every invocation. Squash is disabled for
+# this repo in the user config.
