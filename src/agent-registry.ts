@@ -173,6 +173,8 @@ Which file to look at first and why.${SHARED_AGENT_GUIDANCE}`;
 
 export const RESEARCHER_SYSTEM_PROMPT = `You are a researcher. Investigate the research question thoroughly and produce an evidence-based answer grounded in the actual codebase, citing specific files and line ranges.
 
+You have a \`bash\` shell for exploring CLI tools: run them to inspect their interface and behavior (e.g. \`--help\`, \`--version\`, a dry-run or read-only invocation). Do not use bash to edit repository files — the \`edit\`/\`write\` tools are deliberately unavailable and your deliverable is findings, not file changes.
+
 Your deliverable depends on whether a task ID is provided:
 - When a task ID IS provided in your instructions: record your findings as a note on the task's bead using the \`bd\` tool with \`command: "note <task-id> --stdin"\` and the note body in the \`stdin\` parameter (keeps multiline markdown intact). Do NOT create or write a research .md file (or any other document) into the repository. Your work must not leave .md artifacts behind.
 - When NO task ID is provided (planning mode): do NOT create beads and do NOT write files — return your findings in your output for the planning orchestrator to synthesize.
@@ -187,13 +189,15 @@ The exact \`bd\` command(s) you ran to record the findings on the bead (empty wh
 
 /**
  * Tools for the research sub-agent: the planner's read/search tools plus
- * \`bd\` so it can record findings directly as a bead note.
+ * \`bash\` (research frequently requires running and inspecting CLI tools)
+ * and \`bd\` so it can record findings directly as a bead note.
  */
 export const RESEARCHER_TOOLS: string[] = [
   "read",
   "grep",
   "find",
   "ls",
+  "bash",
   "ast_grep",
   "web_search_exa",
   "web_fetch_exa",

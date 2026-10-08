@@ -310,6 +310,8 @@ describe("/plan command (bd-51)", () => {
     const spawn = spawnCalls.calls[spawnCalls.calls.length - 1];
     expect(spawn?.tools).toEqual(expect.arrayContaining(["read"]));
     expect(spawn?.tools).not.toContain("bd");
+    // Planning-mode research has bash for CLI exploration; only bd is stripped.
+    expect(spawn?.tools).toContain("bash");
     expect(spawn?.systemPrompt).toContain("researcher");
     // The planning research run uses a frontier-class spec; spawnAgentWithFallback
     // expands it to a concrete model via its modelClass and leaves the spec's
