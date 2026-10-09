@@ -193,7 +193,15 @@ function fallbackResult(
       content: [{ type: "text", text }],
       details: {
         messages: [],
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
         exitCode: 0,
         model,
       },

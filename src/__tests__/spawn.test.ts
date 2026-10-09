@@ -703,6 +703,94 @@ describe("collectSpawnResult (bd-41)", () => {
     const result = await promise;
     expect(result.details).toHaveProperty("exitCode", 128);
   });
+
+  it("counts executed tool calls from tool_execution_end events (pi 1.0.2)", async () => {
+    const mod = await import("../spawn.js");
+    const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+    const built = mod.buildSpawnArgs(options);
+    const handle = mod.launchAgentProcess(options, built);
+
+    const promise = mod.collectSpawnResult(handle);
+    simulateStdoutData(
+      `${JSON.stringify({ type: "tool_execution_end", toolCallId: "t1", toolName: "read" })}\n`,
+    );
+    simulateStdoutData(
+      `${JSON.stringify({ type: "tool_execution_end", toolCallId: "t2", toolName: "bash" })}\n`,
+    );
+    simulateProcessComplete(0);
+
+    const result = await promise;
+    expect(result.details.usage).toHaveProperty("toolCalls", 2);
+  });
+
+  it("does not double count an assistant toolCall block and its execution event", async () => {
+    const mod = await import("../spawn.js");
+    const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+    const built = mod.buildSpawnArgs(options);
+    const handle = mod.launchAgentProcess(options, built);
+
+    const promise = mod.collectSpawnResult(handle);
+    simulateStdoutData(
+      `${JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "c1", name: "read" }],
+          usage: { input: 1, output: 1 },
+        },
+      })}\n`,
+    );
+    simulateStdoutData(
+      `${JSON.stringify({ type: "tool_execution_end", toolCallId: "c1", toolName: "read" })}\n`,
+    );
+    simulateProcessComplete(0);
+
+    const result = await promise;
+    expect(result.details.usage).toHaveProperty("toolCalls", 1);
+    expect(result.details.usage).toHaveProperty("turns", 1);
+  });
+
+  it("counts an assistant toolCall that never produced an execution event", async () => {
+    const mod = await import("../spawn.js");
+    const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+    const built = mod.buildSpawnArgs(options);
+    const handle = mod.launchAgentProcess(options, built);
+
+    const promise = mod.collectSpawnResult(handle);
+    simulateStdoutData(
+      `${JSON.stringify({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "c9", name: "bash" }],
+          usage: { input: 1, output: 1 },
+        },
+      })}\n`,
+    );
+    simulateProcessComplete(0);
+
+    const result = await promise;
+    expect(result.details.usage).toHaveProperty("toolCalls", 1);
+  });
+
+  it("counts a legacy tool_result_end event", async () => {
+    const mod = await import("../spawn.js");
+    const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+    const built = mod.buildSpawnArgs(options);
+    const handle = mod.launchAgentProcess(options, built);
+
+    const promise = mod.collectSpawnResult(handle);
+    simulateStdoutData(
+      `${JSON.stringify({
+        type: "tool_result_end",
+        message: { role: "toolResult", toolCallId: "legacy-1" },
+      })}\n`,
+    );
+    simulateProcessComplete(0);
+
+    const result = await promise;
+    expect(result.details.usage).toHaveProperty("toolCalls", 1);
+  });
 });
 
 describe("spawn abort handling (bd-41)", () => {

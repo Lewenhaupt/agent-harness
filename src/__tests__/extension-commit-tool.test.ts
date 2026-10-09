@@ -22,7 +22,7 @@ const mockSpawnAgentProcess = vi.hoisted(() =>
     content: [{ type: "text" as const, text: "## How to Verify\n1. Run tests\n" }],
     details: {
       messages: [],
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 1 },
       exitCode: 0,
     },
     sessionName: "mocked",
@@ -322,7 +322,15 @@ describe("belayd_commit shell safety (bd-70)", () => {
       content: [{ type: "text" as const, text: userGuide }],
       details: {
         messages: [],
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
         exitCode: 0,
       },
       sessionName: "mocked-userguide",
@@ -373,7 +381,15 @@ describe("belayd_commit shell safety (bd-70)", () => {
       content: [{ type: "text" as const, text: userGuideWithCrlf }],
       details: {
         messages: [],
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
         exitCode: 0,
       },
       sessionName: "mocked-userguide-crlf",

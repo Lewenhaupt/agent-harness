@@ -56,6 +56,12 @@ export interface SpawnUsage {
   cacheWrite: number;
   cost: number;
   turns: number;
+  /**
+   * Number of distinct tool invocations the agent executed. Used to detect a
+   * zero-work run (provider/infra failure) that pi exits 0 on: a phase agent
+   * that never called a tool cannot have completed real phase work.
+   */
+  toolCalls: number;
 }
 
 /** Details returned by spawnAgentProcess(). */
@@ -66,6 +72,16 @@ export interface SpawnDetails {
   model?: string;
   /** Stderr output from the spawned process, if any. */
   stderr?: string;
+  /**
+   * Tool-call count of the final fallback attempt, separate from `usage.toolCalls`.
+   *
+   * `usage.toolCalls` aggregates every fallback attempt for reporting; the run
+   * classifier must instead see the last attempt's own count, otherwise real
+   * work from an earlier attempt can mask a silent no-op final attempt (exit 0,
+   * zero tool calls). Absent for single-attempt spawns, where `usage.toolCalls`
+   * is authoritative.
+   */
+  finalAttemptToolCalls?: number;
 }
 
 /** Result returned by spawnAgentProcess(). */

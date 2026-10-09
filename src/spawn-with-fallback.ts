@@ -56,7 +56,7 @@ export interface SpawnWithFallbackOptions extends SpawnOptions {
 }
 
 function zeroUsage(): SpawnUsage {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 0 };
 }
 
 function sumUsage(total: SpawnUsage, next: SpawnUsage): SpawnUsage {
@@ -67,11 +67,19 @@ function sumUsage(total: SpawnUsage, next: SpawnUsage): SpawnUsage {
     cacheWrite: total.cacheWrite + next.cacheWrite,
     cost: total.cost + next.cost,
     turns: total.turns + next.turns,
+    toolCalls: total.toolCalls + next.toolCalls,
   };
 }
 
-function withUsage(result: SpawnResult, usage: SpawnUsage): SpawnResult {
-  return { ...result, details: { ...result.details, usage } };
+function withAggregatedUsage(
+  result: SpawnResult,
+  usage: SpawnUsage,
+  finalAttemptToolCalls: number,
+): SpawnResult {
+  return {
+    ...result,
+    details: { ...result.details, usage, finalAttemptToolCalls },
+  };
 }
 
 function exhaustedResult(models: string[]): SpawnResult {
@@ -215,13 +223,28 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
     lastResult = outcome.result;
     totalUsage = sumUsage(totalUsage, outcome.result.details.usage);
 
-    if (outcome.stop) return { result: withUsage(outcome.result, totalUsage), attempts };
+    if (outcome.stop) {
+      // The classifier reads `finalAttemptToolCalls`, so record the stopping
+      // attempt's own count rather than the summed reporting total.
+      return {
+        result: withAggregatedUsage(
+          outcome.result,
+          totalUsage,
+          outcome.result.details.usage.toolCalls,
+        ),
+        attempts,
+      };
+    }
 
     recordCooldown(deps.store, candidate, provider, outcome.classification);
   }
 
   return {
-    result: withUsage(lastResult ?? exhaustedResult(deps.candidates), totalUsage),
+    result: withAggregatedUsage(
+      lastResult ?? exhaustedResult(deps.candidates),
+      totalUsage,
+      lastResult?.details.usage.toolCalls ?? 0,
+    ),
     attempts,
   };
 }
