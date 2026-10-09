@@ -18,11 +18,7 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
@@ -37,6 +33,7 @@ import type {
   RunDelivery,
   RunHandle,
   SpawnResult,
+  StackNode,
   WorkflowSubType,
 } from "../src/index.js";
 import {
@@ -55,7 +52,10 @@ import {
   buildVerifierPrompt,
   checkToolAllowed,
   collectChangeContext,
+  currentBranch,
   DEFAULT_AGENTS,
+  DEFAULT_BASE_BRANCH,
+  defaultGitExec,
   extractProofArtifacts,
   findProofArtifactRefs,
   findWorkspaceRoot,
@@ -84,12 +84,16 @@ import {
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
+  readStackNode,
   resolveArchifyHome,
+  resolveAutoRebaseEnabled,
   resolveModelSpec,
   resolveQualityGate,
+  resolveStackChain,
   resolveWorkflowType,
   runArchify,
   runArchifyText,
+  runStackRebase,
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
@@ -757,6 +761,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   const GATED_TOOLS = [
     ...ALL_PHASE_TOOLS,
     "belayd_start_task",
+    "belayd_start_followup",
+    "belayd_stack_rebase",
     "belayd_stop_task",
     "belayd_status",
     "belayd_proof_verifier",
@@ -1258,11 +1264,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   // ── Worktree creation helper ────────────────────────────────────────
-  function ensureWorktree(projectRoot: string, branch: string): string | undefined {
+  function ensureWorktree(projectRoot: string, branch: string, base?: string): string | undefined {
     try {
       return isInsideWorktreeForBranch(projectRoot, branch)
         ? projectRoot
-        : setupWorktree(projectRoot, { branch });
+        : setupWorktree(projectRoot, { branch, base });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       pi.sendMessage({
@@ -1416,17 +1422,19 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   /** Delegate a worktree workflow to the pi-web session daemon. */
   async function createOrchestratorSession(
-    ctx: ExtensionCommandContext,
+    ctx: ExtensionContext,
     taskId: string,
     workflowType: WorkflowSubType,
     branch: string,
     worktreePath: string,
+    base?: string,
   ): Promise<void> {
     const originalCwd = process.cwd();
     const phaseOrder = getPhasesForType(workflowType);
     const prompt = [
       `Start the Belayd ${workflowType} workflow for ${taskId}.`,
       `The worktree is \`${branch}\`.`,
+      ...(base !== undefined ? [`Stacked on \`${base}\`.`] : []),
       "",
       `Follow the enforced phase order: ${phaseOrder.join(" → ")}.`,
       `Begin by calling \`belayd_${phaseOrder[0] ?? "commit"}\` to start.`,
@@ -1476,6 +1484,45 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     });
 
     ctx.ui.notify(`Belayd ${workflowType} workflow started for ${taskId} (${branch}).`, "info");
+  }
+
+  /**
+   * Shared tail of the `/belayd` command and `belayd_start_followup`: ensure the
+   * worktree (stacking on `base` when given), wait for its dependencies, then
+   * delegate the orchestrator session. Returns an error result instead of
+   * throwing so callers can render their own tool/notify response.
+   */
+  async function launchWorktreeWorkflow(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    workflowType: WorkflowSubType;
+    branch: string;
+    base?: string;
+  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    const worktreePath = ensureWorktree(options.ctx.cwd, options.branch, options.base);
+    if (!worktreePath) {
+      return {
+        ok: false,
+        error:
+          "Worktree creation failed. Use --no-worktree to skip isolation, or check that wt is installed.",
+      };
+    }
+
+    // Hardening: `wt switch` can return before background post-start hooks
+    // finish installing deps. Wait for them so the new session does not fail
+    // to load the harness extension (e.g. "Cannot find module 'zod'").
+    const ready = await awaitWorktreeReady(worktreePath);
+    if (!ready.ok) return { ok: false, error: `Worktree not ready: ${ready.error}` };
+
+    await createOrchestratorSession(
+      options.ctx,
+      options.taskId,
+      options.workflowType,
+      options.branch,
+      worktreePath,
+      options.base,
+    );
+    return { ok: true };
   }
 
   // ── Slash command: /plan <description> | /plan bd-x ───────────────
@@ -1601,26 +1648,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       }
 
       const branch = `feat/${taskId}`;
-      const worktreePath = ensureWorktree(ctx.cwd, branch);
-
-      if (!worktreePath) {
-        ctx.ui.notify(
-          "Worktree creation failed. Use --no-worktree to skip isolation, or check that wt is installed.",
-          "error",
-        );
+      const outcome = await launchWorktreeWorkflow({
+        ctx,
+        taskId,
+        workflowType,
+        branch,
+      });
+      if (!outcome.ok) {
+        ctx.ui.notify(outcome.error, "error");
         return;
       }
-
-      // Hardening: `wt switch` can return before background post-start hooks
-      // finish installing deps. Wait for them so the new session does not fail
-      // to load the harness extension (e.g. "Cannot find module 'zod'").
-      const ready = await awaitWorktreeReady(worktreePath);
-      if (!ready.ok) {
-        ctx.ui.notify(`Worktree not ready: ${ready.error}`, "error");
-        return;
-      }
-
-      await createOrchestratorSession(ctx, taskId, workflowType, branch, worktreePath);
     },
   });
 
@@ -1792,6 +1829,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       "- The worktree branch may be behind the base branch (`main`); a task closed elsewhere may simply not be in this branch yet — check `main` before duplicating work.",
       "- If the work already landed on `main`, rebase with `git rebase main` instead of re-implementing apparently-missing work.",
       "- Mid-rebase conflicts are expected: when the branch re-implements merged work, prefer the already-landed `main` implementation over the duplicate.",
+      "",
+      "**Stacked follow-up worktree?**",
+      "- A branch created with `belayd_start_followup` records its base in `branch.<name>.belaydBase` and fork point in `branch.<name>.belaydForkPoint`.",
+      "- When the recorded base lands, replay only this branch with `belayd_stack_rebase` (or `git rebase --onto main <belaydForkPoint> <branch>`), never a plain `git rebase <parent>` — the parent's commits are already in `main`.",
     ];
   }
 
@@ -2974,6 +3015,176 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  // ── Register start-followup tool ────────────────────────────────────
+  //
+  // A follow-up workflow is cut from the orchestrator's *current* branch
+  // instead of `main`, so the new task builds on the parent's unmerged work.
+  // The worktree create path records `branch.<b>.belaydBase` +
+  // `.belaydForkPoint` so the stack can later be replayed onto `main` with
+  // `git rebase --onto`, even after the parent branch is deleted.
+  /** Short human summary of the resolved stack the follow-up branch joins. */
+  function describeFollowupStack(cwd: string, leaf: string, base: string): string {
+    const resolved = resolveStackChain(cwd, leaf);
+    if (resolved.ok && resolved.chain.length > 0) {
+      return `Stack: ${resolved.chain.map((node) => node.branch).join(" → ")} → ${DEFAULT_BASE_BRANCH}`;
+    }
+    return `Stacked on ${base}.`;
+  }
+
+  pi.registerTool({
+    name: "belayd_start_followup",
+    label: "Start stacked follow-up workflow",
+    description:
+      "Start a new Belayd workflow for a follow-up bead, stacked on the current branch " +
+      "instead of main. Records the base branch and fork point so it can later be rebased " +
+      "onto main with belayd_stack_rebase.",
+    parameters: Type.Object({
+      taskId: Type.String({ description: "Beads issue ID for the follow-up, e.g. bd-43" }),
+      workflowType: Type.Optional(
+        Type.String({
+          description:
+            "Workflow sub-type: feature (default), bugfix, research, chore, documentation, refactor, hotfix",
+        }),
+      ),
+      base: Type.Optional(
+        Type.String({
+          description: "Base branch to stack on (defaults to the current branch)",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!isValidTaskId(params.taskId)) {
+        return textToolResult(
+          `Invalid task id: ${params.taskId}. Expected a beads id like "bd-42" or "bd-42.1".`,
+          1,
+        );
+      }
+
+      const cwd = ctx.cwd ?? process.cwd();
+      const branch = `feat/${params.taskId}`;
+      const base = params.base ?? currentBranch(cwd);
+      if (base === undefined) {
+        return textToolResult(
+          "Cannot determine the base branch: the repository is in a detached HEAD state. Pass `base` explicitly.",
+          1,
+        );
+      }
+      if (base === branch) {
+        return textToolResult(`The follow-up branch ${branch} cannot be stacked on itself.`, 1);
+      }
+
+      const metadata = await readTaskMetadata(params.taskId, cwd);
+      const workflowType = resolveWorkflowType(
+        params.workflowType,
+        metadata?.labels,
+        metadata?.title,
+      );
+
+      const outcome = await launchWorktreeWorkflow({
+        ctx,
+        taskId: params.taskId,
+        workflowType,
+        branch,
+        base,
+      });
+      if (!outcome.ok) return textToolResult(outcome.error, 1);
+
+      const chainText = describeFollowupStack(cwd, branch, base);
+      return textToolResult(
+        `Follow-up ${workflowType} workflow started for ${params.taskId} on ${branch}, stacked on ${base}.\n\n${chainText}`,
+        0,
+      );
+    },
+  });
+
+  /**
+   * Whether a resolved chain has nothing to replay: either it carries no
+   * recorded stack metadata, or it is a single level already rooted at main
+   * (unless an explicit landed signal forces a replay).
+   */
+  function isStackAlreadyOnMain(chain: readonly StackNode[], forceLanded: boolean): boolean {
+    if (chain.length === 0) return true;
+    if (forceLanded || chain.length !== 1) return false;
+    const only = chain[0];
+    return (
+      only !== undefined && only.base === DEFAULT_BASE_BRANCH && only.landedParent === undefined
+    );
+  }
+
+  // ── Register stack-rebase tool ──────────────────────────────────────
+  pi.registerTool({
+    name: "belayd_stack_rebase",
+    label: "Rebase stacked workflow",
+    description:
+      "Replay the current stacked branch onto its base after the base has landed, using " +
+      "`git rebase --onto` so the base's commits are not replayed. Pass `baseLanded: true` " +
+      "when the immediate parent landed but its branch ref still exists (squash-merge case).",
+    parameters: Type.Object({
+      baseLanded: Type.Optional(
+        Type.Boolean({
+          description:
+            "Explicit confirmation that the immediate parent has landed; forces the branch onto main even if the parent ref still exists.",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = ctx.cwd ?? process.cwd();
+      const branch = currentBranch(cwd);
+      if (branch === undefined) {
+        return textToolResult(
+          "Cannot determine the current branch (detached HEAD?); nothing to rebase.",
+          1,
+        );
+      }
+
+      const forceLanded = params.baseLanded === true;
+      const resolved = resolveStackChain(cwd, branch);
+      if (!resolved.ok) {
+        return textToolResult(`Stack resolution failed: ${resolved.error}`, 1);
+      }
+      if (isStackAlreadyOnMain(resolved.chain, forceLanded)) {
+        return textToolResult(
+          `${branch} is already based on ${DEFAULT_BASE_BRANCH}; nothing to rebase.`,
+          0,
+        );
+      }
+
+      const result = runStackRebase(defaultGitExec, {
+        cwd,
+        leaf: branch,
+        stash: true,
+        forceLanded,
+      });
+      if (!result.ok) {
+        return textToolResult(
+          formatStackRebaseFailure({
+            result,
+            fallbackBranch: branch,
+            fallbackCwd: cwd,
+            retryCommand: "belayd_stack_rebase",
+          }),
+          1,
+        );
+      }
+
+      if (result.rebased.length === 0) {
+        const reasons = result.skipped
+          .map((skip) => `  - ${skip.branch}: ${skip.reason}`)
+          .join("\n");
+        return textToolResult(
+          `${branch} is already up to date with its base; nothing to rebase.${reasons === "" ? "" : `\n${reasons}`}`,
+          0,
+        );
+      }
+
+      const lines = [
+        `Rebased ${result.rebased.length} branch(es) stepwise onto their bases:`,
+        ...result.rebased.map((name) => `  - ${name}`),
+      ];
+      return textToolResult(lines.join("\n"), 0);
+    },
+  });
+
   // ── Register stop-task tool ─────────────────────────────────────────
   pi.registerTool({
     name: "belayd_stop_task",
@@ -3070,6 +3281,103 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   // only partly fixed. `--` shields `git add` paths and the `bd update`/`bd
   // note` taskId positionals; taskId safety additionally rests on the
   // `isValidTaskId` guard at the `belayd_commit` entry point.
+
+  /**
+   * Recovery note for a pre-rebase `git stash` entry, which is deliberately left
+   * in place on any conflict so uncommitted work is never lost. The two kinds
+   * differ: an interrupted rebase still needs the stash reapplied, while a
+   * failed `git stash pop` already applied its changes (with conflicts) and only
+   * needs the stale entry dropped.
+   */
+  function stashRecoveryNote(result: { stashed?: boolean; stashPopConflicted?: boolean }): string {
+    if (result.stashed !== true) return "";
+    if (result.stashPopConflicted === true) {
+      return (
+        "\n\nA `git stash` entry created before this rebase is still present. The rebase " +
+        "itself succeeded but restoring the stash conflicted; resolve those conflicts, then run " +
+        "`git stash drop` (the changes are already in the worktree)."
+      );
+    }
+    return (
+      "\n\nYour uncommitted changes were stashed before this rebase and the stash entry is " +
+      "still present; run `git stash pop` after the rebase conflict is resolved to restore them."
+    );
+  }
+
+  /**
+   * Render a failed stack-rebase result as actionable text. Conflicts include
+   * the branch's worktree and the continue/abort/retry steps so the agent (or
+   * human) can recover without guessing where the rebase stopped.
+   */
+  function formatStackRebaseFailure(options: {
+    result: {
+      error: string;
+      branch?: string;
+      worktree?: string;
+      conflicts?: boolean;
+      stashed?: boolean;
+      stashPopConflicted?: boolean;
+    };
+    fallbackBranch: string;
+    fallbackCwd: string;
+    retryCommand: string;
+  }): string {
+    const branch = options.result.branch ?? options.fallbackBranch;
+    if (options.result.conflicts !== true) {
+      return `Stack rebase failed for ${branch}: ${options.result.error}`;
+    }
+    const location = options.result.worktree ?? options.fallbackCwd;
+    return (
+      `Stack rebase failed for ${branch}: ${options.result.error}\n\n` +
+      `Resolve the conflicts in ${location}, then run \`git rebase --continue\` ` +
+      `(or \`git rebase --abort\` to back out), and re-run \`${options.retryCommand}\`.` +
+      stashRecoveryNote(options.result)
+    );
+  }
+
+  /**
+   * Rebase a stacked branch before committing when its base has landed.
+   *
+   * The landed signal is authoritative only when explicit (`rebaseStack`) or
+   * corroborated by a recorded parent that is gone; ambiguous cases are left
+   * untouched so a wrong guess never rewrites history. Toggle off with
+   * `BELAYD_STACK_AUTO_REBASE` or `git config belayd.stack.autoRebase false`.
+   */
+  async function maybeAutoRebaseBeforeCommit(options: {
+    cwd: string;
+    force: boolean;
+  }): Promise<{ ok: true; rebased: string[] } | { ok: false; error: string }> {
+    const branch = currentBranch(options.cwd);
+    if (branch === undefined || readStackNode(options.cwd, branch) === undefined) {
+      return { ok: true, rebased: [] };
+    }
+
+    const resolved = resolveStackChain(options.cwd, branch);
+    if (!resolved.ok) return { ok: false, error: `Stack resolution failed: ${resolved.error}` };
+    const hasLandedParent = resolved.chain.some((node) => node.landedParent !== undefined);
+    if (!options.force && !hasLandedParent) return { ok: true, rebased: [] };
+    if (!resolveAutoRebaseEnabled(options.cwd)) return { ok: true, rebased: [] };
+
+    const result = runStackRebase(defaultGitExec, {
+      cwd: options.cwd,
+      leaf: branch,
+      stash: true,
+      forceLanded: options.force,
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: formatStackRebaseFailure({
+          result,
+          fallbackBranch: branch,
+          fallbackCwd: options.cwd,
+          retryCommand: "belayd_commit",
+        }),
+      };
+    }
+    return { ok: true, rebased: result.rebased };
+  }
+
   async function _stageChanges(cwd: string, files?: string[]): Promise<string | null> {
     try {
       const paths = (files ?? []).filter((file) => file.length > 0);
@@ -3331,6 +3639,30 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /** Tool failure result for an invalid commit task id. */
+  function invalidCommitTaskIdResult(taskId: string) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Invalid task id: ${taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`,
+        },
+      ],
+      details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+    };
+  }
+
+  /** Flag a task for human review and append its notes, when a task id was given. */
+  async function maybeFlagTaskForHumanReview(
+    taskId: string | undefined,
+    state: SessionState,
+    cwd: string,
+  ): Promise<void> {
+    if (taskId === undefined) return;
+    await flagForHumanReview(taskId, cwd);
+    await appendTaskNotes(taskId, state, cwd);
+  }
+
   // ── Register commit tool ────────────────────────────────────────────
   pi.registerTool({
     name: "belayd_commit",
@@ -3355,18 +3687,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       taskId: Type.Optional(
         Type.String({ description: "Beads issue ID to flag for human review (e.g. bd-42)" }),
       ),
+      rebaseStack: Type.Optional(
+        Type.Boolean({
+          description:
+            "Force a stack rebase before committing (confirm the parent landed). Also controlled by BELAYD_STACK_AUTO_REBASE / git config belayd.stack.autoRebase.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.taskId !== undefined && !isValidTaskId(params.taskId)) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Invalid task id: ${params.taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`,
-            },
-          ],
-          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
-        };
+        return invalidCommitTaskIdResult(params.taskId);
       }
 
       const cwd = ctx?.cwd ?? process.cwd();
@@ -3374,12 +3704,21 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       const runId = generateShortRunId();
       const gateCommit = startCommitRunManifest({ state, cwd, runId });
 
+      // Rebase before staging so the commit lands on the landed base. Abort on
+      // failure: committing a half-rebased tree would produce a broken history.
+      const rebase = await maybeAutoRebaseBeforeCommit({
+        cwd,
+        force: params.rebaseStack === true,
+      });
+      if (!rebase.ok) {
+        finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Failed });
+        return commitFailure(rebase.error);
+      }
+      const rebasedBranches = rebase.rebased;
+
       // Flag the issue for human review (agents never close — human closes on wt merge).
       // Done before staging so the JSONL export (export.auto + git-add) is committed.
-      if (params.taskId) {
-        await flagForHumanReview(params.taskId, cwd);
-        await appendTaskNotes(params.taskId, state, cwd);
-      }
+      await maybeFlagTaskForHumanReview(params.taskId, state, cwd);
 
       const stageError = await _stageChanges(cwd, params.files);
       if (stageError) {
@@ -3398,8 +3737,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       finalizeCommitRun({ state, cwd, runId, gateCommit, status: RunStatus.Completed });
 
+      const rebaseNote =
+        rebasedBranches.length > 0
+          ? `\nRebased stacked branch(es): ${rebasedBranches.join(", ")}`
+          : "";
       return {
-        content: [{ type: "text" as const, text: `Committed as ${commitResult.hash}` }],
+        content: [
+          { type: "text" as const, text: `Committed as ${commitResult.hash}${rebaseNote}` },
+        ],
         details: { messages: [], usage: emptyUsage(), exitCode: 0 },
       };
     },

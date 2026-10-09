@@ -1,7 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   awaitWorktreeReady,
   isInsideWorktreeForBranch,
@@ -131,11 +131,23 @@ describe("isInsideWorktreeForBranch", () => {
 });
 
 describe("setupWorktree", () => {
+  // Stacking defaults to the caller's current branch. Inject a "main" current
+  // branch so the non-stacked tests keep their exact `--base main` argv and do
+  // not consume an extra execFileSync call for `rev-parse`.
+  let deps: {
+    currentBranch: () => string | undefined;
+    captureStack: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    deps = { currentBranch: () => "main", captureStack: vi.fn() };
+  });
+
   it("returns the worktree path immediately when already registered in git", () => {
     // The initial resolveWorktreePath check finds the worktree — no wt call needed.
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // resolveWorktreePath → found
 
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" });
+    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
     // wt must NOT be called — the worktree is already set up.
@@ -150,7 +162,7 @@ describe("setupWorktree", () => {
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
     mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
 
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" });
+    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
@@ -168,7 +180,7 @@ describe("setupWorktree", () => {
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
     mockedExistsSync.mockReturnValueOnce(true); // directory exists (orphaned)
 
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" });
+    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
@@ -185,7 +197,7 @@ describe("setupWorktree", () => {
       .mockReturnValueOnce(""); // wt switch → success
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
 
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" });
+    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
@@ -193,6 +205,8 @@ describe("setupWorktree", () => {
       ["switch", "feat/bd-42", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
+    // An existing branch already carries whatever stack metadata it had.
+    expect(deps.captureStack).not.toHaveBeenCalled();
   });
 
   it("throws when the wt command fails", () => {
@@ -203,7 +217,7 @@ describe("setupWorktree", () => {
       throw new Error("wt not found");
     }); // wt switch fails
 
-    expect(() => setupWorktree("/repo", { branch: "feat/bd-42" })).toThrow(
+    expect(() => setupWorktree("/repo", { branch: "feat/bd-42" }, deps)).toThrow(
       "Failed to set up worktree: wt not found. Make sure `wt` (Worktrunk) is installed.",
     );
   });
@@ -216,7 +230,7 @@ describe("setupWorktree", () => {
     mockedExecSync.mockReturnValueOnce(""); // final resolveWorktreePath → no match
     mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
 
-    expect(() => setupWorktree("/repo", { branch: "feat/bd-42" })).toThrow(
+    expect(() => setupWorktree("/repo", { branch: "feat/bd-42" }, deps)).toThrow(
       "Could not resolve worktree path after creation. Check `git worktree list`.",
     );
   });
@@ -229,7 +243,7 @@ describe("setupWorktree", () => {
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
     mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
 
-    const result = setupWorktree("/repo", { branch: "feat/bd-42", base: "develop" });
+    const result = setupWorktree("/repo", { branch: "feat/bd-42", base: "develop" }, deps);
 
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
@@ -237,6 +251,72 @@ describe("setupWorktree", () => {
       ["switch", "--create", "feat/bd-42", "--base", "develop", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
+  });
+
+  it("defaults the base to the caller's current branch and captures stack metadata", () => {
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
+    mockedExecFileSync
+      .mockReturnValueOnce("") // git branch --list → empty
+      .mockReturnValueOnce(""); // wt switch --create → success
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
+    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
+
+    const result = setupWorktree(
+      "/repo",
+      { branch: "feat/bd-42" },
+      {
+        currentBranch: () => "feat/bd-41",
+        captureStack: deps.captureStack,
+      },
+    );
+
+    expect(result).toBe("/repo/feat");
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      "wt",
+      ["switch", "--create", "feat/bd-42", "--base", "feat/bd-41", "-y"],
+      expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
+    );
+    expect(deps.captureStack).toHaveBeenCalledWith({
+      cwd: "/repo",
+      branch: "feat/bd-42",
+      base: "feat/bd-41",
+    });
+  });
+
+  it("skips capturing stack metadata when the base is main", () => {
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
+    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
+    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
+
+    setupWorktree("/repo", { branch: "feat/bd-42", base: "main" }, deps);
+
+    expect(deps.captureStack).not.toHaveBeenCalled();
+  });
+
+  it("does not fail when stack capture fails", () => {
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
+    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
+    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
+    const captureStack = vi.fn(() => {
+      throw new Error("config failed");
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = setupWorktree(
+      "/repo",
+      { branch: "feat/bd-42" },
+      {
+        currentBranch: () => "feat/bd-41",
+        captureStack,
+      },
+    );
+
+    expect(result).toBe("/repo/feat");
+    expect(captureStack).toHaveBeenCalled();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });
 

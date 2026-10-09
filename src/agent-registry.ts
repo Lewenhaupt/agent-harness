@@ -152,7 +152,11 @@ const WORKTREE_SYNC_GUIDANCE = `
 ## Stale worktree branch
 - Your worktree branch may be behind the base branch (\`main\`). A task marked finished/closed elsewhere may simply not be present in this branch yet — check \`main\` before duplicating work.
 - If the work already landed on \`main\`, rebase the branch onto the base branch with \`git rebase main\` instead of re-implementing apparently-missing work.
-- Mid-rebase conflicts are expected: when this branch re-implements work already merged to \`main\`, resolve conflicts by preferring the already-landed \`main\` implementation over the duplicate.`;
+- Mid-rebase conflicts are expected: when this branch re-implements work already merged to \`main\`, resolve conflicts by preferring the already-landed \`main\` implementation over the duplicate.
+
+## Stacked follow-up worktree
+- A branch created with \`belayd_start_followup\` records its base in \`branch.<name>.belaydBase\` and fork point in \`branch.<name>.belaydForkPoint\`.
+- When the recorded base lands, replay only this branch with \`belayd_stack_rebase\` (or \`git rebase --onto main <belaydForkPoint> <branch>\`), never a plain \`git rebase <parent>\` — the parent's commits are already in \`main\`.`;
 
 const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}`;
 

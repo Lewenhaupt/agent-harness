@@ -63,6 +63,10 @@ describe("DEFAULT_AGENTS", () => {
       // Criterion 3: resolve mid-rebase conflicts toward the landed base work.
       expect(prompt, agent.name).toContain("Mid-rebase conflicts are expected");
       expect(prompt, agent.name).toContain("already-landed `main` implementation");
+      // Stacked follow-ups replay with --onto, never a plain parent rebase.
+      expect(prompt, agent.name).toContain("Stacked follow-up worktree");
+      expect(prompt, agent.name).toContain("belaydForkPoint");
+      expect(prompt, agent.name).toContain("belayd_stack_rebase");
     }
   });
 
@@ -278,6 +282,8 @@ describe("PROOF_VERIFIER_AGENT", () => {
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("check `main` before duplicating work");
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("Mid-rebase conflicts are expected");
     expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("already-landed `main` implementation");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("Stacked follow-up worktree");
+    expect(PROOF_VERIFIER_SYSTEM_PROMPT).toContain("belayd_stack_rebase");
   });
 
   it("lists the expected tool names", () => {

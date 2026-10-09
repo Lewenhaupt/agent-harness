@@ -137,6 +137,11 @@ describe("WORKFLOW_REGISTRY", () => {
         expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
           "already-landed `main` implementation",
         );
+        // Stacked follow-ups replay with --onto, never a plain parent rebase.
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain(
+          "Stacked follow-up worktree",
+        );
+        expect(override.systemPrompt, `${config.name}/${phase}`).toContain("belayd_stack_rebase");
       }
     }
   });
