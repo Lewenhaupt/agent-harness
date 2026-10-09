@@ -77,7 +77,7 @@ Expected behavior:
   | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-reviewer` | `standard` → `opencode-go/glm-5.2` |
-  | `belayd-tester` | `standard` → `opencode-go/glm-5.2` |
+  | `belayd-tester` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
