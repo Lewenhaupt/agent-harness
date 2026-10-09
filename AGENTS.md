@@ -23,6 +23,7 @@ belayd-agent-harness/
 │   ├── quality-gates.ts    # Deterministic quality checks (typecheck, lint, tests, proof)
 │   ├── archify.ts          # Archify diagram wrapper (args, receipts, formatting, run)
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
+│   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)
 │   ├── plannotator/
 │   │   ├── signal-protocol.ts  # Signal file contract (SYNC WARNING: duplicated in pi-web-plugins)

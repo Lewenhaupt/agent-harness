@@ -223,6 +223,27 @@ export type {
   SpawnWithFallbackResult,
 } from "./spawn-with-fallback.js";
 export { spawnAgentWithFallback } from "./spawn-with-fallback.js";
+export type {
+  GitExec,
+  StackNode,
+  StackRebaseResult,
+  StackRebaseSkip,
+  StackRebaseStep,
+} from "./stack-rebase.js";
+export {
+  AUTO_REBASE_CONFIG_KEY,
+  AUTO_REBASE_ENV_KEY,
+  branchExists,
+  currentBranch,
+  DEFAULT_BASE_BRANCH,
+  defaultGitExec,
+  planStackRebase,
+  readStackNode,
+  resolveAutoRebaseEnabled,
+  resolveStackChain,
+  runStackRebase,
+  writeStackBase,
+} from "./stack-rebase.js";
 export {
   checkEdit,
   clearHashes,
@@ -250,7 +271,7 @@ export {
   workflowStateFilePath,
   writeWorkflowState,
 } from "./workflow-state.js";
-export type { RepoKeyExec, RepoKeyResult, WorktreeOptions } from "./worktree.js";
+export type { RepoKeyExec, RepoKeyResult, WorktreeDeps, WorktreeOptions } from "./worktree.js";
 export {
   awaitWorktreeReady,
   isInsideWorktreeForBranch,

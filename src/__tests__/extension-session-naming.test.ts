@@ -1972,6 +1972,8 @@ describe("session_start resume from disk (bd-40)", () => {
     // an apparently-missing task may simply be unrebased.
     expect(message).toContain("**Stale worktree?**");
     expect(message).toContain("git rebase main");
+    expect(message).toContain("**Stacked follow-up worktree?**");
+    expect(message).toContain("belayd_stack_rebase");
     expect(message).not.toContain("call `belayd_scout`");
   });
 
@@ -2006,6 +2008,8 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(message).toContain("git rebase main");
     expect(message).toContain("not be in this branch yet");
     expect(message).toContain("Mid-rebase conflicts are expected");
+    expect(message).toContain("**Stacked follow-up worktree?**");
+    expect(message).toContain("belayd_stack_rebase");
   });
 
   it("clears a fully-complete workflow and leaves the gate inactive", async () => {

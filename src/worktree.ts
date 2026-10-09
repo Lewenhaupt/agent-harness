@@ -3,13 +3,35 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import {
+  DEFAULT_BASE_BRANCH,
+  defaultGitExec,
+  currentBranch as readCurrentBranch,
+  writeStackBase,
+} from "./stack-rebase.js";
 
 /** Options for creating an isolated git worktree for agent processes. */
 export interface WorktreeOptions {
   /** Branch name for the worktree, e.g. "feat/bd-42". */
   branch: string;
-  /** Base branch to create from (defaults to "main"). Only used when creating a new worktree. */
+  /**
+   * Base branch to create from. Defaults to the base branch the caller is
+   * currently on, so a follow-up workflow stacks on the orchestrator's branch;
+   * falls back to "main". Only used when creating a new worktree.
+   */
   base?: string;
+}
+
+/**
+ * Injectable seams for {@link setupWorktree}. Production uses the real git
+ * helpers; tests replace them to avoid shelling out and to assert that stack
+ * metadata is captured (or deliberately not captured) on the create path.
+ */
+export interface WorktreeDeps {
+  /** Resolve the caller's current branch (stacking default). */
+  currentBranch?: (cwd: string) => string | undefined;
+  /** Record base + fork point for a newly created stacked branch. */
+  captureStack?: (input: { cwd: string; branch: string; base: string }) => void;
 }
 
 /**
@@ -57,6 +79,72 @@ function defaultWorktreeDir(projectRoot: string, branch: string): string {
   return `${projectRoot}.${sanitized}`;
 }
 
+/** Capture base + fork point for a freshly created stacked branch. */
+function captureStackBase(input: { cwd: string; branch: string; base: string }): void {
+  // At capture time the branch was just cut from `base`, so `rev-parse` is exact
+  // and cheap. Runtime resolution deliberately prefers `merge-base --fork-point`
+  // (which survives a rewritten base tip) with this recorded value as fallback,
+  // so do not "fix" this to merge-base after the fact.
+  const forkPoint = defaultGitExec(["rev-parse", `${input.base}^{commit}`], input.cwd).trim();
+  const result = writeStackBase(defaultGitExec, {
+    cwd: input.cwd,
+    branch: input.branch,
+    base: input.base,
+    forkPoint,
+  });
+  if (!result.ok) throw new Error(result.error);
+}
+
+/** Whether `branch` already exists as a local branch (git failure = assume not). */
+function branchAlreadyExists(projectRoot: string, branch: string): boolean {
+  try {
+    return (
+      execFileSync("git", ["branch", "--list", branch], {
+        cwd: projectRoot,
+        timeout: 10_000,
+        encoding: "utf8",
+      }).trim().length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Build the `wt switch` argv for switching to or creating the worktree. */
+function planWtArgs(
+  projectRoot: string,
+  branch: string,
+  base: string,
+  branchExists: boolean,
+): string[] {
+  if (branchExists) return ["switch", branch, "-y"];
+  // An orphaned directory from a prior failed attempt is clobbered so the
+  // retry does not fail on the leftover path; a fresh path needs no clobber.
+  const clobber = existsSync(defaultWorktreeDir(projectRoot, branch)) ? ["--clobber"] : [];
+  return ["switch", "--create", branch, "--base", base, ...clobber, "-y"];
+}
+
+/**
+ * Record stack metadata for a branch this call created, best-effort. Reusing an
+ * existing branch must not overwrite the config it already carries, and a
+ * main-based branch has nothing to stack on.
+ */
+function captureStackForNewBranch(
+  options: { cwd: string; branch: string; base: string; branchExists: boolean },
+  captureStack: (input: { cwd: string; branch: string; base: string }) => void,
+): void {
+  if (options.branchExists || options.base === DEFAULT_BASE_BRANCH) return;
+  try {
+    captureStack({ cwd: options.cwd, branch: options.branch, base: options.base });
+  } catch (error) {
+    console.warn(
+      `[belayd-harness] failed to capture stack base for ${options.branch}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
 /**
  * Set up the worktree for a workflow run.
  *
@@ -73,8 +161,14 @@ function defaultWorktreeDir(projectRoot: string, branch: string): string {
  *
  * Throws if the worktree cannot be set up or the path cannot be resolved.
  */
-export function setupWorktree(projectRoot: string, options: WorktreeOptions): string {
-  const base = options.base ?? "main";
+export function setupWorktree(
+  projectRoot: string,
+  options: WorktreeOptions,
+  deps: WorktreeDeps = {},
+): string {
+  const resolveCurrentBranch = deps.currentBranch ?? readCurrentBranch;
+  const captureStack = deps.captureStack ?? captureStackBase;
+  const base = options.base ?? resolveCurrentBranch(projectRoot) ?? DEFAULT_BASE_BRANCH;
 
   // Step 1: Check if the worktree is already registered in git
   const existingPath = resolveWorktreePath(projectRoot, options.branch);
@@ -82,38 +176,11 @@ export function setupWorktree(projectRoot: string, options: WorktreeOptions): st
     return existingPath;
   }
 
-  // Step 2: Check if the branch already exists
-  let branchExists = false;
-  try {
-    const branches = execFileSync("git", ["branch", "--list", options.branch], {
-      cwd: projectRoot,
-      timeout: 10_000,
-      encoding: "utf8",
-    }).trim();
-    branchExists = branches.length > 0;
-  } catch {
-    // If git fails, assume branch doesn't exist
-  }
+  // Step 2: Check if the branch already exists, then pick the switch arguments.
+  const branchExists = branchAlreadyExists(projectRoot, options.branch);
+  const wtArgs = planWtArgs(projectRoot, options.branch, base, branchExists);
 
-  // Step 3: Determine the right wt arguments
-  let wtArgs: string[];
-  if (branchExists) {
-    // Branch exists but worktree not registered — just switch to it.
-    // wt will create the directory and register the worktree.
-    wtArgs = ["switch", options.branch, "-y"];
-  } else {
-    // Branch doesn't exist — need --create.
-    const dirPath = defaultWorktreeDir(projectRoot, options.branch);
-    const dirExists = existsSync(dirPath);
-    if (dirExists) {
-      // Orphaned directory from a prior failed attempt — clobber it.
-      wtArgs = ["switch", "--create", options.branch, "--base", base, "--clobber", "-y"];
-    } else {
-      wtArgs = ["switch", "--create", options.branch, "--base", base, "-y"];
-    }
-  }
-
-  // Step 4: Create or switch to the worktree
+  // Step 3: Create or switch to the worktree
   try {
     execFileSync("wt", wtArgs, {
       cwd: projectRoot,
@@ -129,11 +196,18 @@ export function setupWorktree(projectRoot: string, options: WorktreeOptions): st
     );
   }
 
-  // Step 5: Resolve the worktree path
+  // Step 4: Resolve the worktree path
   const worktreePath = resolveWorktreePath(projectRoot, options.branch);
   if (!worktreePath) {
     throw new Error("Could not resolve worktree path after creation. Check `git worktree list`.");
   }
+
+  // Best-effort: a missing config degrades stacked rebases to a warning, never
+  // a failed worktree setup.
+  captureStackForNewBranch(
+    { cwd: projectRoot, branch: options.branch, base, branchExists },
+    captureStack,
+  );
 
   return worktreePath;
 }

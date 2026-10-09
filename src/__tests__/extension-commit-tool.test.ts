@@ -33,6 +33,105 @@ vi.mock("../spawn.js", () => ({
   spawnAgentProcess: mockSpawnAgentProcess,
 }));
 
+// Synchronous git seam used by the pre-commit stack check (`currentBranch`,
+// `readStackNode`, `runStackRebase`). Default responder behaves like a
+// non-stacked repo: every `git config --get` misses and `rev-parse` succeeds.
+interface SyncCall {
+  file: string;
+  args: string[];
+}
+
+type SyncResponder = (file: string, args: readonly string[]) => string;
+
+/**
+ * Shared responder for the stacked-commit tests: a branch whose recorded parent
+ * ref is gone (it landed), with optional auto-rebase config and a rebase that
+ * conflicts. Keeping it here lets each test opt into just the behavior it needs.
+ */
+function landedStackConfigValue(config: Record<string, string>, key: string | undefined): string {
+  const value = config[key ?? ""];
+  if (value === undefined) throw new Error("no such key");
+  return value;
+}
+
+function landedStackRevParse(args: readonly string[], parentExists: boolean): string {
+  if (args[1] === "--abbrev-ref") return "feat/child\n";
+  if (args[1] === "--verify") {
+    if (!parentExists) throw new Error("missing parent");
+    return "parent-sha\n";
+  }
+  return "main-sha\n";
+}
+
+/** Handle the responder's `status` and `worktree` commands, or undefined. */
+function landedStackStatusOrWorktree(
+  cwd: string,
+  dirty: boolean,
+  args: readonly string[],
+): string | undefined {
+  if (args[0] === "status") return dirty ? " M changed.ts\n" : "";
+  if (args[0] === "worktree") {
+    return `worktree ${cwd}\nHEAD 0\nbranch refs/heads/feat/child\n`;
+  }
+  return undefined;
+}
+
+function makeLandedStackResponder(
+  cwd: string,
+  options: {
+    autoRebaseDisabled?: boolean;
+    rebaseThrows?: boolean;
+    dirty?: boolean;
+    parentExists?: boolean;
+  } = {},
+): SyncResponder {
+  const config: Record<string, string> = {
+    "branch.feat/child.belaydBase": "feat/parent\n",
+    "branch.feat/child.belaydForkPoint": "fork-point\n",
+  };
+  if (options.autoRebaseDisabled === true) config["belayd.stack.autoRebase"] = "false\n";
+
+  return (file, args) => {
+    if (file !== "git") return "";
+    if (args[0] === "config") return landedStackConfigValue(config, args[2]);
+    if (args[0] === "rev-parse") return landedStackRevParse(args, options.parentExists === true);
+    const statusOrWorktree = landedStackStatusOrWorktree(cwd, options.dirty === true, args);
+    if (statusOrWorktree !== undefined) return statusOrWorktree;
+    if (args[0] === "rebase" && options.rebaseThrows === true) throw new Error("CONFLICT");
+    return "";
+  };
+}
+
+const callOrder = vi.hoisted(() => [] as string[]);
+
+const mockSync = vi.hoisted(() => {
+  const calls: SyncCall[] = [];
+  const defaultResponder: SyncResponder = (file, args) => {
+    if (file === "git" && args[0] === "config" && args[1] === "--get") {
+      throw new Error("no such key");
+    }
+    if (file === "git" && args[0] === "rev-parse") return "sha\n";
+    return "";
+  };
+  let responder: SyncResponder = defaultResponder;
+  const fn = vi.fn((file: string, args: readonly string[]) => {
+    calls.push({ file, args: [...args] });
+    callOrder.push(`sync:${args[0] ?? ""}`);
+    return responder(file, args);
+  });
+  return {
+    fn,
+    calls,
+    setResponder: (next: SyncResponder) => {
+      responder = next;
+    },
+    reset: () => {
+      calls.length = 0;
+      responder = defaultResponder;
+    },
+  };
+});
+
 // Any quality gate that shells out must not run real pnpm in the test env.
 const mockExec = vi.hoisted(() =>
   vi.fn(
@@ -77,6 +176,7 @@ const mockExecFile = vi.hoisted(() => {
     ) => {
       const record: ExecFileRecord = { file, args, stdin: "", cwd: options?.cwd };
       calls.push(record);
+      callOrder.push(`execfile:${args[0] ?? ""}`);
       const childStdin = {
         on: () => {},
         end: (chunk?: string) => {
@@ -116,7 +216,7 @@ const mockExecFile = vi.hoisted(() => {
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, exec: mockExec, execFile: mockExecFile.fn };
+  return { ...actual, exec: mockExec, execFile: mockExecFile.fn, execFileSync: mockSync.fn };
 });
 
 interface CommitResult {
@@ -194,6 +294,9 @@ describe("belayd_commit shell safety (bd-70)", () => {
     mockExecFile.reset();
     mockExec.mockClear();
     mockSpawnAgentProcess.mockClear();
+    mockSync.reset();
+    callOrder.length = 0;
+    delete process.env.BELAYD_STACK_AUTO_REBASE;
     const loaded = await loadTools();
     tools = loaded.tools;
     messages = loaded.messages;
@@ -500,5 +603,74 @@ describe("belayd_commit shell safety (bd-70)", () => {
     mockExec.mockClear();
     await commit({ message: "feat: no exec", taskId: "bd-42" });
     expect(mockExec).not.toHaveBeenCalled();
+  });
+
+  it("does not inspect a non-stacked branch", async () => {
+    const result = await commit({ message: "feat: plain" });
+
+    expect(result.details.exitCode).toBe(0);
+    expect(mockSync.calls.some((call) => call.args[0] === "rebase")).toBe(false);
+  });
+
+  it("rebases a stacked branch onto main before staging when the parent landed", async () => {
+    mockSync.setResponder(makeLandedStackResponder(cwd));
+
+    const result = await commit({ message: "feat: stacked" });
+
+    expect(result.details.exitCode).toBe(0);
+    expect(result.content[0]?.text).toContain("Rebased stacked branch(es): feat/child");
+    const rebaseCall = mockSync.calls.find(
+      (call) => call.file === "git" && call.args[0] === "rebase",
+    );
+    expect(rebaseCall?.args).toEqual(["rebase", "--onto", "main-sha", "fork-point", "feat/child"]);
+  });
+
+  it("skips the automatic rebase when disabled in git config", async () => {
+    mockSync.setResponder(makeLandedStackResponder(cwd, { autoRebaseDisabled: true }));
+
+    const result = await commit({ message: "feat: skip", rebaseStack: true });
+
+    expect(result.details.exitCode).toBe(0);
+    expect(mockSync.calls.some((call) => call.args[0] === "rebase")).toBe(false);
+  });
+
+  it("force-rebases a live parent's branch before staging when rebaseStack is explicit", async () => {
+    mockSync.setResponder(makeLandedStackResponder(cwd, { parentExists: true }));
+
+    const result = await commit({ message: "feat: forced", rebaseStack: true });
+
+    expect(result.details.exitCode).toBe(0);
+    expect(result.content[0]?.text).toContain("Rebased stacked branch(es): feat/child");
+    const rebaseCall = mockSync.calls.find(
+      (call) => call.file === "git" && call.args[0] === "rebase",
+    );
+    expect(rebaseCall?.args).toEqual(["rebase", "--onto", "main-sha", "fork-point", "feat/child"]);
+
+    // The explicit signal must fire before staging, or the commit would land on
+    // the un-rebased tree. Ordering is asserted through the shared call log so
+    // it spans the sync (execFileSync) and async (execFile) seams.
+    const rebaseIndex = callOrder.indexOf("sync:rebase");
+    const addIndex = callOrder.indexOf("execfile:add");
+    expect(rebaseIndex).toBeGreaterThanOrEqual(0);
+    expect(addIndex).toBeGreaterThan(rebaseIndex);
+  });
+
+  it("aborts the commit when the automatic rebase conflicts", async () => {
+    mockSync.setResponder(makeLandedStackResponder(cwd, { rebaseThrows: true }));
+
+    const result = await commit({ message: "feat: conflict" });
+
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("Stack rebase failed");
+    expect(callsFor("git").some((call) => call.args[0] === "commit")).toBe(false);
+  });
+
+  it("tells the user to recover the stash after a dirty rebase conflict", async () => {
+    mockSync.setResponder(makeLandedStackResponder(cwd, { rebaseThrows: true, dirty: true }));
+
+    const result = await commit({ message: "feat: stash conflict" });
+
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("git stash pop");
   });
 });
