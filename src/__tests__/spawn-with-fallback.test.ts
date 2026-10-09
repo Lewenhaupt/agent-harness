@@ -16,7 +16,7 @@ beforeEach(() => {
 });
 
 function zeroUsage(): SpawnUsage {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 0 };
 }
 
 function makeResult(model: string, exitCode = 0, usage?: Partial<SpawnUsage>): SpawnResult {
@@ -461,8 +461,8 @@ describe("spawnAgentWithFallback", () => {
 
   it("aggregates usage across attempts", async () => {
     mockSpawnAgentProcess
-      .mockResolvedValueOnce(makeResult("a", 0, { turns: 1, input: 5, cost: 0.1 }))
-      .mockResolvedValueOnce(makeResult("b", 0, { turns: 1, input: 10, cost: 0.2 }));
+      .mockResolvedValueOnce(makeResult("a", 0, { turns: 1, input: 5, cost: 0.1, toolCalls: 4 }))
+      .mockResolvedValueOnce(makeResult("b", 0, { turns: 1, input: 10, cost: 0.2, toolCalls: 2 }));
 
     const { result } = await spawnAgentWithFallback({
       model: "unknown/x",
@@ -475,7 +475,30 @@ describe("spawnAgentWithFallback", () => {
 
     expect(result.details.usage).toHaveProperty("turns", 2);
     expect(result.details.usage).toHaveProperty("input", 15);
+    expect(result.details.usage).toHaveProperty("toolCalls", 6);
     expect(result.details.usage.cost).toBeCloseTo(0.3);
+    // The classifier's view is the final attempt's own count, not the sum.
+    expect(result.details.finalAttemptToolCalls).toBe(2);
+  });
+
+  it("exposes the final attempt's own tool-call count separately from the sum", async () => {
+    // Attempt 1 does real work then quota-fails; attempt 2 silently exits 0 with
+    // no tool calls. The aggregate is > 0, but the final attempt is a no-op.
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("a", 0, { toolCalls: 3 }))
+      .mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 0 }));
+
+    const { result } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["a", "b"],
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(result.details.usage).toHaveProperty("toolCalls", 3);
+    expect(result.details.finalAttemptToolCalls).toBe(0);
   });
 
   it("honors maxAttempts by stopping after the configured depth", async () => {

@@ -34,6 +34,7 @@ import type {
   ModelClass,
   Phase,
   QualityGate,
+  RunDelivery,
   RunHandle,
   SpawnResult,
   WorkflowSubType,
@@ -459,6 +460,25 @@ function advancePastExistingEpoch(options: {
  */
 function reviewLoopDirective(nextPhaseTool: string): string {
   return `If any Critical/Warnings remain, ${REVIEW_LOOP_FIX_STEP}. Only once no Critical/Warnings remain, call \`${nextPhaseTool}\`.`;
+}
+
+/**
+ * Compose the body of the `belayd-run-complete` follow-up. Extracted from the
+ * `deliver` callback so the callback stays under the complexity budget.
+ */
+function buildRunCompleteContent(delivery: RunDelivery, reviewLoopHint: string): string {
+  const text = delivery.result.content?.[0]?.text ?? "";
+  const header = delivery.success
+    ? `✅ **${delivery.phaseName} phase completed** (run \`${delivery.runId}\`)`
+    : `❌ **${delivery.phaseName} phase failed** (run \`${delivery.runId}\`)`;
+  // Surface the classifier's reason so a zero-tool-call no-op is
+  // distinguishable from a genuine agent failure without reading the log.
+  const reasonNote =
+    !delivery.success && delivery.failureReason ? `\n\n**Reason:** ${delivery.failureReason}` : "";
+  const failureGuidance = delivery.success
+    ? ""
+    : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
+  return `${header}${reasonNote}\n\n${text}${failureGuidance}${reviewLoopHint}`;
 }
 
 /**
@@ -962,6 +982,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     cacheWrite: 0,
     cost: 0,
     turns: 0,
+    toolCalls: 0,
   });
 
   /** Shape a plain-text tool response with an explicit exit code. */
@@ -2182,6 +2203,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           runId: info.runId,
           status: info.success ? RunStatus.Completed : RunStatus.Failed,
           exitCode: info.result.details.exitCode,
+          failureReason: info.failureReason,
         });
       },
       onPhaseComplete: (info) => {
@@ -2207,13 +2229,6 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       },
       deliver: (delivery) => {
         if (!runStillRelevant()) return;
-        const text = delivery.result.content?.[0]?.text ?? "";
-        const header = delivery.success
-          ? `✅ **${delivery.phaseName} phase completed** (run \`${delivery.runId}\`)`
-          : `❌ **${delivery.phaseName} phase failed** (run \`${delivery.runId}\`)`;
-        const failureGuidance = delivery.success
-          ? ""
-          : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
         // Deliver the loop directive where the findings actually arrive, so
         // the orchestrator does not have to wait for the next gate turn. The
         // "advance" tool is the next incomplete phase, not just review's
@@ -2229,13 +2244,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
-            content: `${header}\n\n${text}${failureGuidance}${reviewLoopHint}`,
+            content: buildRunCompleteContent(delivery, reviewLoopHint),
             display: true,
             details: {
               runId: delivery.runId,
               phaseName: delivery.phaseName,
               taskId: state.currentTaskId,
               exitCode: delivery.result.details.exitCode,
+              ...(delivery.failureReason !== undefined
+                ? { failureReason: delivery.failureReason }
+                : {}),
             },
           },
           { deliverAs: "followUp", triggerTurn: true },
@@ -2353,6 +2371,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     runId: string;
     status: RunStatus.Completed | RunStatus.Failed;
     exitCode: number;
+    failureReason?: string;
   }): void {
     if (!options.state.gateActive || options.state.currentTaskId === "") return;
     const statusResult = setRunStatus({
@@ -2360,6 +2379,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       runId: options.runId,
       status: options.status,
       exitCode: options.exitCode,
+      ...(options.failureReason !== undefined ? { failureReason: options.failureReason } : {}),
     });
     if (!statusResult.ok) {
       console.warn(`[belayd-harness] failed to update run manifest: ${statusResult.error}`);
@@ -2939,7 +2959,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         ],
         details: {
           messages: [],
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+            toolCalls: 0,
+          },
           exitCode: 0,
         },
       };
@@ -2985,7 +3013,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         ],
         details: {
           messages: [],
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+            toolCalls: 0,
+          },
           exitCode: 0,
         },
       };
@@ -3013,7 +3049,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         ],
         details: {
           messages: [],
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+            toolCalls: 0,
+          },
           exitCode: 0,
         },
       };

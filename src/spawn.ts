@@ -55,6 +55,13 @@ export interface SpawnStream {
   messages: unknown[];
   usage: SpawnUsage;
   stderr: string;
+  /**
+   * Tool-call ids seen so far. An assistant message advertises its planned
+   * tool calls as `toolCall` content blocks, and pi then emits a matching
+   * execution/lifecycle event for each; keying on the id dedupes the two so a
+   * single invocation is never counted twice.
+   */
+  toolCallIds: Set<string>;
 }
 
 /** A running (or runnable) child process plus the state needed to collect it. */
@@ -202,8 +209,9 @@ export function launchAgentProcess(
 ): AgentProcessHandle {
   const stream: SpawnStream = {
     messages: [],
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 0 },
     stderr: "",
+    toolCallIds: new Set<string>(),
   };
 
   // Build the child environment explicitly, dropping BELAYD_SHELL_ACTIVE and
@@ -238,7 +246,7 @@ export function launchAgentProcess(
   let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
 
   proc.stdout.on("data", (data: Buffer) => {
-    buffer = processChunk(data, buffer, stream.messages, stream.usage);
+    buffer = processChunk(data, buffer, stream.messages, stream.usage, stream.toolCallIds);
   });
 
   // Drain stderr to prevent deadlock
@@ -251,7 +259,7 @@ export function launchAgentProcess(
     if (sigkillTimer) clearTimeout(sigkillTimer);
 
     // Process remaining buffer before collectSpawnResult reads the stream
-    flushBuffer(buffer, stream.messages, stream.usage);
+    flushBuffer(buffer, stream.messages, stream.usage, stream.toolCallIds);
   });
 
   // Handle abort signal
@@ -361,6 +369,7 @@ function processChunk(
   buffer: string,
   messages: unknown[],
   usage: SpawnUsage,
+  toolCallIds: Set<string>,
 ): string {
   let buf = buffer + data.toString();
   const lines = buf.split("\n");
@@ -377,47 +386,121 @@ function processChunk(
       continue;
     }
 
-    trackEvent(event, messages, usage);
+    trackEvent(event, messages, usage, toolCallIds);
   }
 
   return buf;
 }
 
-/** Track usage from a pi JSON event. */
-function trackEvent(event: Record<string, unknown>, messages: unknown[], usage: SpawnUsage): void {
-  if (event.type === "message_end" && event.message) {
-    const msg = event.message as Record<string, unknown>;
-    messages.push(msg);
+/**
+ * Increment the tool-call counter for one invocation, deduping on its id.
+ *
+ * An id-less lifecycle event still means a tool ran, so it counts too; the id
+ * set exists only to reconcile the assistant toolCall block with its matching
+ * execution event.
+ */
+function recordToolCall(usage: SpawnUsage, toolCallIds: Set<string>, id: unknown): void {
+  if (typeof id !== "string" || id === "") {
+    usage.toolCalls++;
+    return;
+  }
+  if (toolCallIds.has(id)) return;
+  toolCallIds.add(id);
+  usage.toolCalls++;
+}
 
-    if (msg.role === "assistant") {
-      usage.turns++;
-      const eventUsage = msg.usage as
-        | {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-            cost?: { total?: number };
-            totalTokens?: number;
-          }
-        | undefined;
-      if (eventUsage) {
-        usage.input += eventUsage.input ?? 0;
-        usage.output += eventUsage.output ?? 0;
-        usage.cacheRead += eventUsage.cacheRead ?? 0;
-        usage.cacheWrite += eventUsage.cacheWrite ?? 0;
-        usage.cost += eventUsage.cost?.total ?? 0;
+/** Add one assistant message's usage numbers onto the running total. */
+function accumulateAssistantUsage(usage: SpawnUsage, msg: Record<string, unknown>): void {
+  const eventUsage = msg.usage as
+    | {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        cost?: { total?: number };
+        totalTokens?: number;
       }
+    | undefined;
+  if (!eventUsage) return;
+  usage.input += eventUsage.input ?? 0;
+  usage.output += eventUsage.output ?? 0;
+  usage.cacheRead += eventUsage.cacheRead ?? 0;
+  usage.cacheWrite += eventUsage.cacheWrite ?? 0;
+  usage.cost += eventUsage.cost?.total ?? 0;
+}
+
+/**
+ * Count the assistant's planned tool calls as soon as they appear. If the
+ * process dies mid-call no execution event ever follows, but the attempt still
+ * means the agent was doing work rather than failing instantly.
+ */
+function countContentToolCalls(
+  usage: SpawnUsage,
+  toolCallIds: Set<string>,
+  content: unknown,
+): void {
+  if (!Array.isArray(content)) return;
+  for (const item of content as unknown[]) {
+    if (item === null || typeof item !== "object") continue;
+    const block = item as { type?: unknown; id?: unknown };
+    if (block.type === "toolCall" || block.type === "tool_use") {
+      recordToolCall(usage, toolCallIds, block.id);
     }
+  }
+}
+
+/** Handle a `message_end` event: record the message, its usage, and its tool calls. */
+function trackMessageEnd(
+  event: Record<string, unknown>,
+  messages: unknown[],
+  usage: SpawnUsage,
+  toolCallIds: Set<string>,
+): void {
+  if (event.type !== "message_end" || !event.message) return;
+  const msg = event.message as Record<string, unknown>;
+  messages.push(msg);
+
+  if (msg.role === "assistant") {
+    usage.turns++;
+    accumulateAssistantUsage(usage, msg);
+    countContentToolCalls(usage, toolCallIds, msg.content);
+  }
+
+  // A finalized tool-result message is proof that a tool ran, even when the
+  // stream never emitted a separate execution event.
+  if (msg.role === "toolResult") {
+    recordToolCall(usage, toolCallIds, msg.toolCallId);
+  }
+}
+
+/** Track usage from a pi JSON event. */
+function trackEvent(
+  event: Record<string, unknown>,
+  messages: unknown[],
+  usage: SpawnUsage,
+  toolCallIds: Set<string>,
+): void {
+  trackMessageEnd(event, messages, usage, toolCallIds);
+
+  // pi 1.0.2 emits `tool_execution_end`; older/newer streams have used
+  // `tool_result_end`. Both carry the executed invocation, so accept either.
+  if (event.type === "tool_execution_end") {
+    recordToolCall(usage, toolCallIds, event.toolCallId);
   }
 
   if (event.type === "tool_result_end" && event.message) {
     messages.push(event.message);
+    recordToolCall(usage, toolCallIds, (event.message as { toolCallId?: unknown }).toolCallId);
   }
 }
 
 /** Parse any remaining data in the buffer. */
-function flushBuffer(buffer: string, messages: unknown[], usage: SpawnUsage): void {
+function flushBuffer(
+  buffer: string,
+  messages: unknown[],
+  usage: SpawnUsage,
+  toolCallIds: Set<string>,
+): void {
   const trimmed = buffer.trim();
   if (!trimmed) return;
 
@@ -428,7 +511,7 @@ function flushBuffer(buffer: string, messages: unknown[], usage: SpawnUsage): vo
     return;
   }
 
-  trackEvent(event, messages, usage);
+  trackEvent(event, messages, usage, toolCallIds);
 }
 
 /** Extract final assistant content from messages. */

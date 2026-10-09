@@ -131,7 +131,15 @@ describe("belayd_proof_verifier (bd-48)", () => {
         ],
         details: {
           messages: [],
-          usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+          usage: {
+            input: 0,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 1,
+            toolCalls: 0,
+          },
           exitCode: 0,
         },
       },
@@ -243,7 +251,15 @@ describe("belayd_proof_verifier (bd-48)", () => {
         ],
         details: {
           messages: [],
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 1,
+            toolCalls: 0,
+          },
           exitCode: 1,
         },
       },

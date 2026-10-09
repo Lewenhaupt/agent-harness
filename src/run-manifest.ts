@@ -33,6 +33,8 @@ const RunManifestSchema = z.object({
   completedAt: z.number().finite().optional(),
   exitCode: z.number().finite().optional(),
   model: z.string().optional(),
+  /** Why a failed run failed; absent on completed/interrupted manifests. */
+  failureReason: z.string().optional(),
 });
 
 export type RunManifest = z.infer<typeof RunManifestSchema>;
@@ -59,6 +61,7 @@ export interface SetRunStatusOptions {
   runId: string;
   status: RunStatus;
   exitCode?: number;
+  failureReason?: string;
   fs?: RunManifestFs;
   now?: () => number;
 }
@@ -154,6 +157,10 @@ export function setRunStatus(
     // manifest never carries a past completion timestamp.
     completedAt: terminalStatus(options.status) ? (options.now ?? Date.now)() : undefined,
     ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+    // Only a Failed status carries a reason; a later Completed/Running/
+    // Interrupted transition must clear a stale one (the schema promises the
+    // field is absent outside failure).
+    failureReason: options.status === RunStatus.Failed ? options.failureReason : undefined,
   };
   return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
 }

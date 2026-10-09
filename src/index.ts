@@ -183,9 +183,10 @@ export type {
   DetachedRunOptions,
   RunDelivery,
   RunHandle,
+  RunOutcome,
   WatchRunDeps,
 } from "./run-detached.js";
-export { spawnDetachedRun, watchRunCompletion } from "./run-detached.js";
+export { classifyRunOutcome, spawnDetachedRun, watchRunCompletion } from "./run-detached.js";
 export type { RunManifest } from "./run-manifest.js";
 export {
   listRuns,

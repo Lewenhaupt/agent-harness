@@ -5,30 +5,42 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SpawnResult } from "../agent-registry.js";
 import {
+  classifyRunOutcome,
+  type RunDelivery,
   RunStatus,
   spawnDetachedRun,
   type WatchRunDeps,
   watchRunCompletion,
 } from "../run-detached.js";
 
-function result(exitCode: number, text = "output"): SpawnResult {
+function result(
+  exitCode: number,
+  text = "output",
+  toolCalls = 1,
+  finalAttemptToolCalls?: number,
+): SpawnResult {
   return {
     content: [{ type: "text" as const, text }],
     details: {
       messages: [],
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls },
       exitCode,
+      ...(finalAttemptToolCalls !== undefined ? { finalAttemptToolCalls } : {}),
     },
   };
 }
 
 interface Deps {
   calls: string[];
+  reasons: Array<string | undefined>;
+  deliveries: RunDelivery[];
   deps: WatchRunDeps;
 }
 
 function makeDeps(overrides: Partial<WatchRunDeps> = {}): Deps {
   const calls: string[] = [];
+  const reasons: Array<string | undefined> = [];
+  const deliveries: RunDelivery[] = [];
   const delivered = new Set<string>();
   const deps: WatchRunDeps = {
     onSettled: (info) => {
@@ -36,12 +48,14 @@ function makeDeps(overrides: Partial<WatchRunDeps> = {}): Deps {
     },
     persistStatus: (info) => {
       calls.push(`persist:${info.success}`);
+      reasons.push(info.failureReason);
     },
     onPhaseComplete: (info) => {
       calls.push(`complete:${info.phaseName}`);
     },
     deliver: (delivery) => {
       calls.push(`deliver:${delivery.success}`);
+      deliveries.push(delivery);
     },
     isDelivered: (runId) => delivered.has(runId),
     markDelivered: (runId) => {
@@ -50,7 +64,7 @@ function makeDeps(overrides: Partial<WatchRunDeps> = {}): Deps {
     },
     ...overrides,
   };
-  return { calls, deps };
+  return { calls, reasons, deliveries, deps };
 }
 
 describe("spawnDetachedRun", () => {
@@ -107,7 +121,7 @@ describe("spawnDetachedRun", () => {
   it("treats a gate-wrapped result as success when exitCode is 0, even if the gate text says failing", async () => {
     // withGateResult (extensions/index.ts) appends a gate header to the content
     // but preserves details — so a gate note alone must never flip the verdict.
-    // Success semantics are exitCode-driven by design.
+    // Success semantics are the outcome classifier's, by design.
     const handle = spawnDetachedRun({
       runId: "r3b",
       phaseName: "implement",
@@ -129,9 +143,137 @@ describe("spawnDetachedRun", () => {
   });
 });
 
+describe("classifyRunOutcome", () => {
+  it("fails a non-zero exit code and includes the code", () => {
+    const outcome = classifyRunOutcome(result(7));
+    expect(outcome.success).toBe(false);
+    if (outcome.success) return;
+    expect(outcome.reason).toContain("code 7");
+  });
+
+  it("appends a truncated stderr tail to the non-zero exit reason", () => {
+    const base = result(1);
+    const longStderr = "x".repeat(1000);
+    const outcome = classifyRunOutcome({
+      ...base,
+      details: { ...base.details, stderr: longStderr },
+    });
+    expect(outcome.success).toBe(false);
+    if (outcome.success) return;
+    expect(outcome.reason).toContain("code 1");
+    expect(outcome.reason.length).toBeLessThan(longStderr.length);
+  });
+
+  it("fails an exit-0 run with zero tool calls and no output", () => {
+    const outcome = classifyRunOutcome(result(0, "", 0));
+    expect(outcome.success).toBe(false);
+    if (outcome.success) return;
+    expect(outcome.reason).toContain("no tool calls");
+    expect(outcome.reason).toContain("turns=0");
+    expect(outcome.reason).toContain("output=0 chars");
+  });
+
+  it("fails an exit-0 run with zero tool calls even when assistant text exists", () => {
+    const outcome = classifyRunOutcome(result(0, "I did the thing", 0));
+    expect(outcome.success).toBe(false);
+    if (outcome.success) return;
+    expect(outcome.reason).toContain("output=15 chars");
+  });
+
+  it("succeeds an exit-0 run with at least one tool call", () => {
+    expect(classifyRunOutcome(result(0, "done", 1))).toEqual({ success: true });
+  });
+
+  it("fails when the final fallback attempt made no tool calls even if earlier attempts did", () => {
+    // usage.toolCalls aggregates every attempt (here > 0); the final attempt was
+    // a silent no-op, so the classifier must fail on the final count.
+    const outcome = classifyRunOutcome(result(0, "", 3, 0));
+    expect(outcome.success).toBe(false);
+    if (outcome.success) return;
+    expect(outcome.reason).toContain("no tool calls");
+  });
+
+  it("succeeds when the final fallback attempt itself made tool calls", () => {
+    expect(classifyRunOutcome(result(0, "done", 5, 2))).toEqual({ success: true });
+  });
+
+  it("falls back to usage.toolCalls when finalAttemptToolCalls is absent (single attempt)", () => {
+    expect(classifyRunOutcome(result(0, "done", 1))).toEqual({ success: true });
+    expect(classifyRunOutcome(result(0, "", 0))).toHaveProperty("success", false);
+  });
+});
+
 describe("watchRunCompletion", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("fails a zero-tool-call exit-0 run, persists the reason, and never completes the phase", async () => {
+    const { calls, reasons, deliveries, deps } = makeDeps();
+    const handle = spawnDetachedRun({
+      runId: "r-zero",
+      phaseName: "implement",
+      startedAtInMs: 3_950,
+      spawnAgent: async () => result(0, "", 0),
+      runGate: async (r) => r,
+    });
+
+    watchRunCompletion(handle, deps);
+    await handle.promise;
+    await vi.waitFor(() => {
+      expect(handle.status).toBe(RunStatus.Failed);
+      expect(calls).toEqual(["settled:false", "persist:false", "deliver:false", "mark"]);
+    });
+    expect(reasons[0]).toContain("no tool calls");
+    expect(deliveries[0]?.failureReason).toContain("no tool calls");
+    expect(calls.some((c) => c.startsWith("complete:"))).toBe(false);
+  });
+
+  it("fails a fallback run whose final attempt was a zero-tool-call no-op", async () => {
+    // Summed usage is > 0 from an earlier attempt, but the final attempt made
+    // no tool calls; this is exactly the masked no-op bd-60 must catch.
+    const { calls, reasons, deliveries, deps } = makeDeps();
+    const handle = spawnDetachedRun({
+      runId: "r-fallback-noop",
+      phaseName: "implement",
+      startedAtInMs: 3_955,
+      spawnAgent: async () => result(0, "", 3, 0),
+      runGate: async (r) => r,
+    });
+
+    watchRunCompletion(handle, deps);
+    await handle.promise;
+    await vi.waitFor(() => {
+      expect(handle.status).toBe(RunStatus.Failed);
+      expect(calls).toEqual(["settled:false", "persist:false", "deliver:false", "mark"]);
+    });
+    expect(reasons[0]).toContain("no tool calls");
+    expect(deliveries[0]?.failureReason).toContain("no tool calls");
+    expect(calls.some((c) => c.startsWith("complete:"))).toBe(false);
+  });
+
+  it("keeps the exit-0 tool-call run as a completion", async () => {
+    const { calls, deps } = makeDeps();
+    const handle = spawnDetachedRun({
+      runId: "r-tools",
+      phaseName: "implement",
+      startedAtInMs: 3_960,
+      spawnAgent: async () => result(0, "did work", 3),
+      runGate: async (r) => r,
+    });
+
+    watchRunCompletion(handle, deps);
+    await handle.promise;
+    await vi.waitFor(() => {
+      expect(handle.status).toBe(RunStatus.Completed);
+      expect(calls).toEqual([
+        "settled:true",
+        "complete:implement",
+        "persist:true",
+        "deliver:true",
+        "mark",
+      ]);
+    });
   });
 
   it("keeps status Running while the promise is pending, then transitions to Completed", async () => {
@@ -181,7 +323,7 @@ describe("watchRunCompletion", () => {
     });
   });
 
-  it("success verdict is exitCode-driven: a failure-sounding text with exitCode 1 is not a phase completion", async () => {
+  it("a failure-sounding text with exitCode 1 is not a phase completion", async () => {
     const { calls, deps } = makeDeps();
     const handle = spawnDetachedRun({
       runId: "r3e",
@@ -199,9 +341,9 @@ describe("watchRunCompletion", () => {
     });
   });
 
-  it("marks a gate-failed-text result with exitCode 0 as success (exitCode drives the verdict)", async () => {
+  it("marks a gate-failed-text result with exitCode 0 and a tool call as success", async () => {
     // withGateResult preserves details, so a gate that only annotates content
-    // cannot flip success. Only exitCode decides phase completion.
+    // cannot flip success. Only the outcome classifier decides completion.
     const { calls, deps } = makeDeps();
     const handle = spawnDetachedRun({
       runId: "r3f",

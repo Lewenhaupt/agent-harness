@@ -154,6 +154,75 @@ describe("run manifest", () => {
     expect(reloaded).toHaveProperty("model", "gpt-5-mini");
   });
 
+  it("setRunStatus records a failureReason and it round-trips through read", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+
+    const result = setRunStatus({
+      cwd,
+      runId: "abc123",
+      status: RunStatus.Failed,
+      exitCode: 0,
+      failureReason: "Sub-agent completed with exit code 0 but made no tool calls",
+      fs,
+      now: () => 5_000,
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("status", "failed");
+    expect(reloaded).toHaveProperty("exitCode", 0);
+    expect(reloaded).toHaveProperty(
+      "failureReason",
+      "Sub-agent completed with exit code 0 but made no tool calls",
+    );
+  });
+
+  it("parses a legacy manifest without failureReason", () => {
+    const legacy = sampleManifest();
+    expect(legacy).not.toHaveProperty("failureReason");
+    const parsed = parseRunManifest(legacy);
+    expect(parsed).toHaveProperty("runId", "abc123");
+    expect(parsed).not.toHaveProperty("failureReason");
+  });
+
+  it("setRunStatus clears a stale failureReason on a Completed transition", () => {
+    const fs = createFakeFs();
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({
+        status: RunStatus.Failed,
+        failureReason: "stale reason from a prior attempt",
+      }),
+      fs,
+    });
+
+    const result = setRunStatus({
+      cwd,
+      runId: "abc123",
+      status: RunStatus.Completed,
+      exitCode: 0,
+      fs,
+      now: () => 6_000,
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("status", "completed");
+    expect(reloaded).not.toHaveProperty("failureReason");
+  });
+
+  it("setRunStatus keeps failureReason absent when Failed is written without one", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+
+    setRunStatus({ cwd, runId: "abc123", status: RunStatus.Failed, fs, now: () => 7_000 });
+
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("status", "failed");
+    expect(reloaded).not.toHaveProperty("failureReason");
+  });
+
   it("setRunStatus drops a stale completedAt when status returns to running", () => {
     const fs = createFakeFs();
     writeRunManifest({
