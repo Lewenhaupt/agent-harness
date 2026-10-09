@@ -562,7 +562,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   {
     name: "belayd-tester",
     description: "Writes thorough tests — covers happy path, edge cases, error conditions",
-    modelClass: "standard",
+    modelClass: "frontier",
     tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep", "agent_browser"],
     systemPrompt: TESTER_SYSTEM_PROMPT,
     qualityGate: gateTests,

@@ -95,10 +95,12 @@ describe("DEFAULT_AGENTS", () => {
     expect(committer?.modelClass).toBe("fast");
   });
 
-  it("proof-generator declares the frontier class", () => {
+  it("proof-generator and tester declare the frontier class", () => {
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    const tester = DEFAULT_AGENTS.find((a) => a.name === "belayd-tester");
     expect(proofGen).toBeDefined();
     expect(proofGen?.modelClass).toBe("frontier");
+    expect(tester?.modelClass).toBe("frontier");
   });
 
   it("implementer has write tools", () => {
