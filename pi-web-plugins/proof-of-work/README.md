@@ -306,8 +306,10 @@ run `playwright show-trace` manually; that hint must never say `npx playwright`.
 
 2. **Open the primary path.** Open the Proof of Work panel, select a
    `.trace.zip` file, and click **Open in Trace Viewer**. A workspace terminal
-   starts `playwright show-trace --port 9323 <trace.zip>` and a new tab opens the
-   local viewer at `http://localhost:9323` (`TRACE_VIEWER_PORT` is `9323`).
+   starts `playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>` and a new
+   tab opens the viewer through the Tailscale service at
+   `https://playwright-trace.platy-ilish.ts.net/` (`TRACE_VIEWER_HOST` is
+   `0.0.0.0`, `TRACE_VIEWER_PORT` is `9323`, `TRACE_VIEWER_URL` is that service).
 
    > The `openTrace()` fallback message (the `npx` → `playwright` change) is only
    > rendered when the pi-web build does not expose
@@ -319,7 +321,7 @@ run `playwright show-trace` manually; that hint must never say `npx playwright`.
 
    ```text
    ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set.
-   Or run it via the project devShell: direnv exec <repo> playwright show-trace --port 9323 "/tmp/my proof dir/trace.zip", or nix develop -c playwright show-trace --port 9323 "/tmp/my proof dir/trace.zip"
+   Or run it via the project devShell: direnv exec <repo> playwright show-trace --host 0.0.0.0 --port 9323 "/tmp/my proof dir/trace.zip", or nix develop -c playwright show-trace --host 0.0.0.0 --port 9323 "/tmp/my proof dir/trace.zip"
    ```
 
    The trace argument is emitted quoted, so the command is copy-pasteable even
@@ -443,7 +445,7 @@ are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 | Extension | Renderer | Notes |
 |---|---|---|
 | `.cast` | [asciinema-player](https://github.com/asciinema/asciinema-player) — terminal playback with play/pause, speed control, resize | Loaded from `vendor/asciinema-player.min.js`. Configured with `fit: "width"`, `terminalFontSize: "small"` |
-| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the local Trace Viewer (DOM snapshots, scrubbable screencast, network, console). If `playwright` is not on `PATH`, run it from the devShell: `direnv exec . playwright show-trace --port 9323 <trace.zip>` (or `nix develop -c playwright show-trace --port 9323 <trace.zip>`) |
+| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace --host 0.0.0.0 --port 9323` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the viewer through the Tailscale service at `https://playwright-trace.platy-ilish.ts.net/` (DOM snapshots, scrubbable screencast, network, console). `--host 0.0.0.0` is Playwright's documented tailnet-facing bind host (`TRACE_VIEWER_HOST`), so the server covers the `127.0.0.1` backend the Tailscale serve target uses. If `playwright` is not on `PATH`, run it from the devShell: `direnv exec . playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>` (or `nix develop -c playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>`) |
 | `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen; or an explicit "Could not load media preview" error if preview bytes are unavailable |
 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; fitted with `max-width`/`max-height` + `object-fit: contain`, `referrerpolicy="no-referrer"`, `decoding="async"` |
 | `.md` | [marked](https://marked.js.org/) → sanitized HTML | GFM tables, autolinks, task lists. Script tags and `on*` attributes are stripped |
@@ -565,14 +567,35 @@ path.
 Clicking **Open in Trace Viewer** shows *"Could not start the Trace Viewer."*
 
 - Cause: the pi-web build does not expose `context.terminal.runCommand`, or the
-  viewer launch failed. Run `playwright show-trace <file>` in a terminal; the
-  project devShell provides it. If it is not on `PATH`, use
-  `direnv exec <repo> playwright show-trace <file>` or
-  `nix develop -c playwright show-trace <file>`.
+  viewer launch failed. Run `playwright show-trace --host 0.0.0.0 <file>` in a
+  terminal; the project devShell provides it. If it is not on `PATH`, use
+  `direnv exec <repo> playwright show-trace --host 0.0.0.0 <file>` or
+  `nix develop -c playwright show-trace --host 0.0.0.0 <file>`.
 - See [docs/playwright-proof-env.md](../../docs/playwright-proof-env.md) for how
   the devShell/pi-web toolchain provides `playwright`.
 - Do not run `npx playwright` or `playwright install`; see the same doc for why
   `playwright install` is forbidden on this host.
+
+#### Trace Viewer tab opens `about:blank` (remote browser)
+
+Clicking **Open in Trace Viewer** opens a blank `about:blank` tab that never
+loads, usually after a ~10s wait.
+
+- Cause: the browser is remote (a laptop on the tailnet), so it cannot reach the
+  loopback URL. The panel binds Playwright's viewer to `TRACE_VIEWER_HOST`
+  (`0.0.0.0`, Playwright's documented tailnet-facing host) and navigates the tab
+  to the approved Tailscale service `TRACE_VIEWER_URL`
+  (`https://playwright-trace.platy-ilish.ts.net/`), not `http://localhost:9323`.
+- Confirm the service is fronting the viewer port on the host:
+  `tailscale serve status` must show the `playwright-trace` entry proxying
+  `https://…/` to `http://127.0.0.1:9323`. If the serve target uses a different
+  port, the service serves a stale or absent viewer — align it with
+  `TRACE_VIEWER_PORT` (`9323`).
+- Confirm the host terminal shows
+  `playwright show-trace --host 0.0.0.0 --port 9323 <trace>`; a missing `--host`
+  means the viewer is bound to loopback only and is unreachable remotely.
+- The browser must resolve the MagicDNS name and trust the Tailscale cert
+  (already true for the pi-web URL).
 
 #### "ERROR: playwright CLI not found on PATH."
 

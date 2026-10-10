@@ -152,9 +152,14 @@ Producing proof from an agent session:
 
   ```bash
   playwright show-trace proof-of-work/<task-id>/<name>.trace.zip
-  # or serve it and print the URL:
-  playwright show-trace --port 9323 proof-of-work/<task-id>/<name>.trace.zip
+  # or serve it (bound to the tailnet-facing host) and print the URL:
+  playwright show-trace --host=0.0.0.0 --port 9323 proof-of-work/<task-id>/<name>.trace.zip
   ```
+
+  The pi-web panel launches the second form and opens the approved Tailscale
+  service `https://playwright-trace.platy-ilish.ts.net/`, which fronts
+  `127.0.0.1:9323`; using `--host=0.0.0.0` keeps the viewer reachable for a
+  remote (tailnet) browser instead of loopback only.
 
 ### Why `--browser=chromium`
 

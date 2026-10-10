@@ -39,7 +39,7 @@ describe("showTraceCommand", () => {
   const tracePath = "/abs/proof-of-work/bd-63/trace.zip";
 
   it("escapes the find parentheses so bash groups them", () => {
-    const command = showTraceCommand({ port: 9323, tracePath });
+    const command = showTraceCommand({ port: 9323, host: "0.0.0.0", tracePath });
 
     // These assert the runtime string, not the source template literal: each
     // grouping paren find uses must carry one literal backslash. The pre-fix
@@ -48,18 +48,37 @@ describe("showTraceCommand", () => {
     expect(command).toContain("\\) -prune");
     expect(command).toContain("\\( -type f -o -type l \\)");
     expect(command).toContain('TRACE="/abs/proof-of-work/bd-63/trace.zip"');
-    expect(command).toContain("PORT=9323");
+    expect(command).toContain('PORT="9323"');
+    expect(command).toContain('HOST="0.0.0.0"');
+    expect(command).toContain('show-trace --host "$HOST" --port "$PORT"');
   });
 
   it.skipIf(!bashAvailable)("is valid bash syntax (bash -n)", () => {
-    expect(bashSyntaxError(showTraceCommand({ port: 9323, tracePath }))).toBeUndefined();
+    expect(bashSyntaxError(showTraceCommand({ port: 9323, host: "0.0.0.0", tracePath }))).toBeUndefined();
   });
 
   it.skipIf(!bashAvailable)("quotes the trace path so the shell cannot expand it", () => {
-    const command = showTraceCommand({ port: 9323, tracePath: "/a b/$(whoami)/x.zip" });
+    const command = showTraceCommand({ port: 9323, host: "0.0.0.0", tracePath: "/a b/$(whoami)/x.zip" });
 
     expect(command).toContain('TRACE="/a b/\\$(whoami)/x.zip"');
     expect(command).not.toContain('TRACE="/a b/$(whoami)/x.zip"');
     expect(bashSyntaxError(command)).toBeUndefined();
+  });
+
+  it.skipIf(!bashAvailable)("quotes the host so metacharacters cannot expand", () => {
+    const host = "$(whoami)`id`; echo pwned";
+    const command = showTraceCommand({ port: 9323, host, tracePath });
+
+    expect(command).toContain('HOST="\\$(whoami)\\`id\\`; echo pwned"');
+    expect(command).not.toContain('HOST="$(whoami)`id`; echo pwned"');
+    expect(bashSyntaxError(command)).toBeUndefined();
+
+    // Execute just the assignment: if shellQuote leaked, the command
+    // substitution / backticks would run and HOST would not round-trip.
+    const hostLine = command.split("\n").find((line) => line.startsWith("HOST="));
+    if (hostLine === undefined) throw new Error("HOST assignment not found in command");
+    const result = spawnSync("bash", ["-c", `${hostLine}\nprintf '%s' "$HOST"`], { encoding: "utf8" });
+    expect(result.error).toBeUndefined();
+    expect(result.stdout).toBe(host);
   });
 });

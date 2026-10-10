@@ -219,8 +219,9 @@ class PiWebProofOfWorkPanel extends HTMLElement {
    * show-trace` in a workspace terminal (which serves both the viewer and the
    * trace over HTTP) and points a new tab at it once it is listening.
    *
-   * Assumes the workspace runs on the same machine as the browser (the local
-   * case this panel is used for), hence the loopback URL.
+   * The browser is often remote (a laptop on the tailnet), so the viewer is
+   * reached through the approved Tailscale service rather than via loopback: a
+   * `http://localhost:9323` URL would be unreachable from the remote browser.
    */
   openTrace(filePath) {
     const context = this.contextValue;
@@ -229,12 +230,12 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     if (typeof context.terminal?.runCommand !== "function") {
       this.viewer.innerHTML = renderErrorState(
         "Could not start the Trace Viewer.",
-        "This pi-web build does not expose the terminal helper needed to launch it. Run `playwright show-trace <file>` in a terminal instead (the project devShell provides it); if it is not on PATH use `direnv exec <repo> playwright show-trace <file>` or `nix develop -c playwright show-trace <file>`.",
+        "This pi-web build does not expose the terminal helper needed to launch it. Run `playwright show-trace --host 0.0.0.0 <file>` in a terminal instead (the project devShell provides it); if it is not on PATH use `direnv exec <repo> playwright show-trace --host 0.0.0.0 <file>` or `nix develop -c playwright show-trace --host 0.0.0.0 <file>`.",
       );
       return;
     }
 
-    const viewerUrl = `http://localhost:${TRACE_VIEWER_PORT}`;
+    const viewerUrl = TRACE_VIEWER_URL;
     const absolutePath = joinWorkspacePath(context.workspace.path, filePath);
 
     // Open a blank tab synchronously (still inside the user gesture) so popup
@@ -244,7 +245,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     try {
       void context.terminal.runCommand({
         title: `Trace viewer: ${fileName(filePath)}`,
-        command: showTraceCommand({ port: TRACE_VIEWER_PORT, tracePath: absolutePath }),
+        command: showTraceCommand({ port: TRACE_VIEWER_PORT, host: TRACE_VIEWER_HOST, tracePath: absolutePath }),
         open: true,
       });
     } catch (error) {
@@ -663,6 +664,15 @@ function refreshIconSvg() {
 }
 
 const TRACE_VIEWER_PORT = 9323;
+// The browser is often remote (a laptop on the tailnet), so the trace viewer is
+// reached through the approved Tailscale service, not loopback. `0.0.0.0` is
+// Playwright's documented tailnet-facing bind host and its wildcard IPv4 also
+// covers the `127.0.0.1` backend the Tailscale serve target uses.
+const TRACE_VIEWER_HOST = "0.0.0.0";
+// Deployment constant: the approved Tailscale service URL fronting the viewer.
+// A tailnet rename must update panel.js and README.md and
+// docs/playwright-proof-env.md together, or the tab will open a dead URL.
+const TRACE_VIEWER_URL = "https://playwright-trace.platy-ilish.ts.net/";
 
 /** Join a workspace root and a workspace-relative path into an absolute path. */
 function joinWorkspacePath(workspacePath, filePath) {
@@ -678,19 +688,20 @@ function shellQuote(value) {
 /**
  * Build a `playwright show-trace` command that locates the CLI (global PATH
  * first, then a pruned workspace search) and serves the viewer plus trace over
- * HTTP on the given port.
+ * HTTP bound to the given host and port.
  */
-export function showTraceCommand({ port, tracePath }) {
+export function showTraceCommand({ port, host, tracePath }) {
   return [
-    `PORT=${port}`,
+    `PORT=${shellQuote(String(port))}`,
+    `HOST=${shellQuote(host)}`,
     `TRACE=${shellQuote(tracePath)}`,
     "if command -v playwright >/dev/null 2>&1; then",
     `  PW="playwright"`,
     "else",
     `  PW="$(find . \\( -name .pnpm -o -name .git -o -name proof-of-work \\) -prune -o \\( -type f -o -type l \\) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
     "fi",
-    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; printf 'Or run it via the project devShell: direnv exec <repo> playwright show-trace --port %s "%s", or nix develop -c playwright show-trace --port %s "%s"\n' "$PORT" "$TRACE" "$PORT" "$TRACE"; exit 1; fi`,
-    `"$PW" show-trace --port "$PORT" "$TRACE"`,
+    `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; printf 'Or run it via the project devShell: direnv exec <repo> playwright show-trace --host %s --port %s "%s", or nix develop -c playwright show-trace --host %s --port %s "%s"\n' "$HOST" "$PORT" "$TRACE" "$HOST" "$PORT" "$TRACE"; exit 1; fi`,
+    `"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE"`,
   ].join("\n");
 }
 
