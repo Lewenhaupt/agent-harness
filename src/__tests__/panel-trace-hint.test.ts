@@ -94,6 +94,41 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
     expect(source).toContain('"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE"');
   });
 
+  it("showTraceCommand reclaims the viewer pidfile and records the new server PID", () => {
+    const source = requireSource(panelSource, panelPath);
+    // bd-108: Playwright treats --port as a preference and silently binds a
+    // random port when :9323 is taken, so the pinned port must be reclaimed from
+    // the previous viewer and the new PID recorded for the next click.
+    expect(source).toContain("playwright-trace.pid");
+    expect(source).toContain('kill -0 "$OLD_PID"');
+    expect(source).toContain("grep -q 'show-trace'");
+    // bd-108: the previous-PID guard must also require a playwright cmdline.
+    expect(source).toContain("grep -Eq 'playwright(-core)?'");
+    expect(source).toContain("could not stop the previous trace viewer");
+    expect(source).toContain("VIEWER_PID=$!");
+    expect(source).toContain('wait "$VIEWER_PID"');
+    // bd-108: after launch, :9323 ownership is verified against the launched
+    // PID before the pidfile is written, so a stale owner aborts our launch.
+    expect(source).toContain("ss -ltnp");
+    expect(source).toContain("pid=$VIEWER_PID,");
+    expect(source).toContain("another process owns :$PORT");
+    // bd-108 W-1: an unrecorded foreign owner on :$PORT aborts before launch,
+    // and the post-launch abort escalates to SIGKILL for our own PID.
+    expect(source).toContain("another process already owns :$PORT");
+    expect(source).toContain('kill -9 "$VIEWER_PID"');
+    // bd-108 W-2: the reclaimed viewer's children are signaled too, and the
+    // pre-launch foreign-owner abort is gated behind a bounded wait for the
+    // reclaimed socket to clear.
+    expect(source).toContain('pkill -P "$OLD_PID"');
+    expect(source).toContain("ss -ltn 2>/dev/null | grep -Eq");
+    const portFreeWaitIndex = source.indexOf("ss -ltn 2>/dev/null | grep -Eq");
+    const foreignOwnerIndex = source.indexOf("another process already owns :$PORT");
+    expect(portFreeWaitIndex).toBeGreaterThan(-1);
+    expect(portFreeWaitIndex).toBeLessThan(foreignOwnerIndex);
+    // The viewer must be backgrounded for $! to be the server PID.
+    expect(source).toContain('"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE" &');
+  });
+
   it("README trace-viewer row documents the manual `playwright show-trace` fallback", () => {
     const source = requireSource(readmeSource, readmePath);
     const match = source.match(/^\| `\.trace\.zip`.*$/m);

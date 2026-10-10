@@ -161,6 +161,34 @@ Producing proof from an agent session:
   `127.0.0.1:9323`; using `--host=0.0.0.0` keeps the viewer reachable for a
   remote (tailnet) browser instead of loopback only.
 
+- **Pinned port and the viewer pidfile (bd-108).** Playwright treats `--port` as
+  a *preference*: if `9323` is already taken it prints
+  `Listening on http://0.0.0.0:<random>` and the Tailscale service keeps fronting
+  the stale server. The panel therefore records the PID of the viewer it started
+  in `${XDG_RUNTIME_DIR:-$HOME/.cache/belayd}/playwright-trace.pid` and, on the
+  next click, stops only that PID before starting the new server (the kill is
+  guarded by `kill -0` plus a `playwright ... show-trace` cmdline check, so a
+  recycled PID can never take down an unrelated process). If the pidfile records
+  a live non-`show-trace` process, the command refuses to kill it and exits with
+  `ERROR: … which is not a playwright show-trace process.` instead of leaving the
+  Tailscale URL pointed at a stale viewer. Before launching, the command checks
+  with `ss -ltn` that `:9323` has no LISTEN socket; an unrecorded foreign owner
+  makes it exit without launching (never killing that unknown process). After
+  launching, the command confirms with `ss -ltnp` that the launched PID (or a
+  direct child) actually owns `:9323` before writing the pidfile; if a
+  pre-existing process still owns the port it stops its own launch (escalating
+  to `kill -9` for its own PID only) and exits with a clear error. The panel then
+  waits a short grace window on the terminal run's completion before navigating
+  the pending tab, so an abort never lands the browser on the stale viewer. If
+  `ss` is unavailable it prints a warning and proceeds best-effort.
+  Reclaiming `:9323` stops any currently-open viewer tab — acceptable for the
+  single-user flow. The pidfile handshake is not atomic, so near-simultaneous
+  clicks can still race (accepted limitation). The trace path is resolved
+  against the persistent external proof base, so it still loads after a worktree
+  is removed; a genuinely missing artifact shows
+  *"This proof artifact is no longer available."* in the panel instead of the
+  generic Playwright Local Network Access error.
+
 ### Why `--browser=chromium`
 
 `playwright-cli open` without the flag probes for a system Google Chrome / Edge
