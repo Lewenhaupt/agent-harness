@@ -37,11 +37,13 @@ import type {
   QualityGate,
   RunDelivery,
   RunHandle,
+  RunManifest,
   SpawnResult,
   StackNode,
   WorkflowResolution,
   WorkflowResolutionSource,
   WorkflowState,
+  SubagentSessionRef,
   WorkflowSubType,
 } from "../src/index.js";
 import {
@@ -82,7 +84,9 @@ import {
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
+  lastAssistantText,
   listArchifyExamples,
+  listPendingUserCompletions,
   listRuns,
   markPhaseCompleted,
   PLANNING_MODE_SYSTEM_PROMPT,
@@ -90,6 +94,7 @@ import {
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
   parseWorkflowLabel,
+  parseSubagentSessionName,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
@@ -120,7 +125,14 @@ import {
   resolveProjectProofBase,
   resolveProofBase,
 } from "../src/proof-dir.js";
-import { scanForInterruptedRuns, setRunStatus, writeRunManifest } from "../src/run-manifest.js";
+import {
+  completeRunByUser,
+  markRunDelivered,
+  readRunManifest,
+  scanForInterruptedRuns,
+  setRunStatus,
+  writeRunManifest,
+} from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
 import type { PhaseSessionRecord } from "../src/session-naming.js";
 import {
@@ -560,6 +572,43 @@ function nextAwaitingReviewResponse(options: {
   if (options.phaseOrder.indexOf(options.completedPhaseName) > reviewIndex) return false;
   if (options.completedPhaseName === IMPLEMENT_PHASE && options.reviewCompleted) return true;
   return options.awaiting;
+}
+
+/**
+ * Apply one phase completion to the in-memory gate state. Shared by the run
+ * watcher and the user-completion reconcile path so a recovered sub-agent
+ * result advances the gate exactly like a normal settle.
+ *
+ * `outputText` is the phase's report: the spawn result's first text block on a
+ * normal run, or the manifest's `completionReport` on a `/belayd-complete`
+ * recovery. It feeds the userguide capture and the proof output the commit
+ * phase consumes.
+ */
+function applyPhaseCompletion(
+  state: SessionState,
+  phaseName: string,
+  outputText: string | undefined,
+): void {
+  state.completedPhaseNames = markPhaseCompleted(
+    getPhaseToolName(phaseName),
+    state.completedPhaseNames,
+    state.phaseOrder,
+  );
+  // Order-sensitive: review arms the resumable-fix directive, a later phase
+  // disarms it, and an earlier re-run (e.g. implement) leaves it alone so a
+  // late re-review after test can re-arm it.
+  state.awaitingReviewResponse = nextAwaitingReviewResponse({
+    awaiting: state.awaitingReviewResponse,
+    completedPhaseName: phaseName,
+    phaseOrder: state.phaseOrder,
+    reviewCompleted: state.completedPhaseNames.includes(REVIEW_PHASE),
+  });
+  if (phaseName === "userguide" && outputText !== undefined && outputText !== "") {
+    state.userGuideContent = outputText;
+  }
+  if (phaseName === "proof") {
+    state.proofOutput = outputText ?? "";
+  }
 }
 
 /**
@@ -1931,6 +1980,247 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  // ── Slash command: /belayd-complete [report] ───────────────────────
+  //
+  // Manual, out-of-band recovery for a phase sub-agent whose result was lost:
+  // the child died/stalled, or the orchestrator restarted and its in-process
+  // watcher vanished. Runs inside the sub-agent session, persists the report
+  // into the run manifest, and wakes the orchestrator (or lets its
+  // session_start / before_agent_start reconcile pick it up from disk).
+  pi.registerCommand("belayd-complete", {
+    description:
+      "Mark this phase sub-agent run complete and feed its last assistant response back to the " +
+      "orchestrator. Usage: /belayd-complete [report text]",
+    handler: async (args, ctx) => {
+      const sessionName = ctx.sessionManager.getSessionName();
+      const parsed = sessionName === undefined ? undefined : parseSubagentSessionName(sessionName);
+      if (sessionName === undefined || parsed === undefined) {
+        ctx.ui.notify(
+          "/belayd-complete is only available inside a phase sub-agent session " +
+            "(belayd-<taskId>-sub-<phase>-<runId>).",
+          "error",
+        );
+        return;
+      }
+
+      const provided = args.trim();
+      const report =
+        provided !== "" ? provided : (lastAssistantText(ctx.sessionManager.getBranch()) ?? "");
+      if (report === "") {
+        ctx.ui.notify(
+          "No report text found. Pass the report explicitly: /belayd-complete <report text>",
+          "error",
+        );
+        return;
+      }
+
+      const manifest = findRunForSession({ cwd: ctx.cwd, sessionName, parsed });
+      if (manifest === undefined) {
+        ctx.ui.notify(
+          `No run manifest in ${ctx.cwd}/.belayd/runs matches session ${sessionName}.`,
+          "error",
+        );
+        return;
+      }
+
+      const completed = completeRunByUser({ cwd: ctx.cwd, runId: manifest.runId, report });
+      if (!completed.ok) {
+        ctx.ui.notify(`Failed to mark run ${manifest.runId} complete: ${completed.error}`, "error");
+        return;
+      }
+
+      // Best-effort: the manifest record plus the orchestrator's reconcile
+      // scans still recover the result if the daemon is unavailable.
+      await wakeOrchestrator({ taskId: parsed.taskId, runId: manifest.runId, cwd: ctx.cwd });
+
+      pi.appendEntry("belayd-complete", {
+        runId: manifest.runId,
+        taskId: parsed.taskId,
+        phase: parsed.phase,
+      });
+      ctx.ui.notify(
+        `Run ${manifest.runId} (${parsed.phase}) marked complete; the orchestrator will resume it.`,
+        "info",
+      );
+    },
+  });
+
+  /** Find the run manifest for a sub-agent session, by exact name or parsed components. */
+  function findRunForSession(options: {
+    cwd: string;
+    sessionName: string;
+    parsed: SubagentSessionRef;
+  }): RunManifest | undefined {
+    const runs = listRuns({ cwd: options.cwd });
+    const exact = runs.find((run) => run.sessionName === options.sessionName);
+    if (exact !== undefined) return exact;
+    return runs.find((run) => {
+      const named = parseSubagentSessionName(run.sessionName);
+      if (named !== undefined) {
+        return (
+          named.taskId === options.parsed.taskId &&
+          named.phase === options.parsed.phase &&
+          named.shortRunId === options.parsed.shortRunId
+        );
+      }
+      return (
+        run.runId === options.parsed.shortRunId &&
+        run.taskId === options.parsed.taskId &&
+        run.phase === options.parsed.phase
+      );
+    });
+  }
+
+  /**
+   * Narrow an untrusted daemon response's session list. `daemonRequest` returns
+   * `Record<string, unknown>`, so a malformed entry must not reach a URL path
+   * (`/sessions/<id>/prompt`) as `[object Object]`.
+   */
+  function parseDaemonSessions(
+    response: Record<string, unknown>,
+  ): Array<{ id: string; name?: string }> {
+    const raw = response.sessions;
+    if (!Array.isArray(raw)) return [];
+    const sessions: Array<{ id: string; name?: string }> = [];
+    for (const entry of raw) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const record = entry as Record<string, unknown>;
+      if (typeof record.id !== "string" || record.id === "") continue;
+      sessions.push({
+        id: record.id,
+        ...(typeof record.name === "string" ? { name: record.name } : {}),
+      });
+    }
+    return sessions;
+  }
+
+  /**
+   * Ask the pi-web session daemon to prompt the orchestrator with the recovery
+   * sentinel. Failures are swallowed: the persisted manifest and the
+   * orchestrator-side reconcile are the authoritative recovery path.
+   */
+  async function wakeOrchestrator(options: {
+    taskId: string;
+    runId: string;
+    cwd: string;
+  }): Promise<void> {
+    try {
+      const response = await daemonRequest("GET", "/sessions");
+      const targetName = computeOrchestratorSessionName(options.taskId);
+      const session = parseDaemonSessions(response).find(
+        (candidate) => candidate.name === targetName,
+      );
+      if (session === undefined) return;
+      await daemonRequest("POST", `/sessions/${session.id}/prompt`, {
+        cwd: options.cwd,
+        text: `[belayd-complete:${options.runId}]`,
+      });
+    } catch (err) {
+      console.warn(`[belayd-harness] failed to wake orchestrator for ${options.taskId}`, err);
+    }
+  }
+
+  /** Body of the user-completion follow-up delivered to the orchestrator. */
+  function buildUserCompletionContent(run: RunManifest): string {
+    const report = run.completionReport ?? "";
+    return (
+      `✅ **${run.phase} phase completed by user** (run \`${run.runId}\`)\n\n` +
+      `${report}\n\n---\nThis result was supplied manually via \`/belayd-complete\`; ` +
+      "treat it as the sub-agent's final answer and continue the workflow."
+    );
+  }
+
+  /** Resolve the pending user completions to reconcile: one run or all. */
+  function pendingCompletionsFor(cwd: string, runId: string | undefined): RunManifest[] {
+    if (runId === undefined) return listPendingUserCompletions({ cwd });
+    const manifest = readRunManifest({ cwd, runId });
+    if (manifest === undefined || manifest.completedBy !== "user") return [];
+    if (manifest.deliveredAt !== undefined) return [];
+    if (manifest.completionReport === undefined || manifest.completionReport === "") return [];
+    return [manifest];
+  }
+
+  /**
+   * Deliver any user-completed runs whose report has not been delivered yet.
+   *
+   * Both the daemon sentinel and the orchestrator restart path converge here.
+   * `deliveredAt` on the manifest is the persistent delivery-once marker, so a
+   * repeated sentinel, a later normal settle, or a second restart never
+   * duplicates the follow-up. The in-memory `deliveredRunIds` set is a fallback
+   * for when the disk marker cannot be written, so this process still delivers
+   * at most once.
+   */
+  function reconcileUserCompletions(options: {
+    state: SessionState;
+    cwd: string;
+    runId?: string;
+  }): void {
+    const { state, cwd } = options;
+    if (!state.gateActive || state.currentTaskId === "") return;
+
+    /** Record delivery once, in memory and on disk; a failed write still suppresses a retry. */
+    const markDeliveredOnce = (runId: string): void => {
+      state.deliveredRunIds.add(runId);
+      const result = markRunDelivered({ cwd, runId });
+      if (!result.ok) {
+        console.warn(`[belayd-harness] failed to mark run ${runId} delivered: ${result.error}`);
+      }
+    };
+
+    for (const run of pendingCompletionsFor(cwd, options.runId)) {
+      if (run.taskId !== state.currentTaskId) continue;
+      if (state.deliveredRunIds.has(run.runId)) continue;
+      // A phase already completed here must not stall the scan: mark the
+      // manifest delivered so it is never replayed.
+      if (state.completedPhaseNames.includes(run.phase)) {
+        markDeliveredOnce(run.runId);
+        continue;
+      }
+      applyPhaseCompletion(state, run.phase, run.completionReport);
+      persistCompletedPhases({
+        cwd,
+        completedPhaseNames: state.completedPhaseNames,
+        awaitingReviewResponse: state.awaitingReviewResponse,
+      });
+      pi.sendMessage(
+        {
+          customType: "belayd-run-complete",
+          content: buildUserCompletionContent(run),
+          display: true,
+          details: {
+            runId: run.runId,
+            phaseName: run.phase,
+            taskId: run.taskId,
+            exitCode: 0,
+            completedBy: "user",
+          },
+        },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+      markDeliveredOnce(run.runId);
+    }
+  }
+
+  // ── Input sentinel: daemon-injected /belayd-complete wake ───────────
+  //
+  // The orchestrator is woken with `[belayd-complete:<runId>]`; reconcile it
+  // and swallow the raw prompt so it never reaches the LLM as user input. The
+  // match is end-anchored so a sentinel-looking prefix with trailing user text
+  // is treated as ordinary input, not silently dropped. A well-formed sentinel
+  // is always handled (even with no active gate) so the control token can
+  // never leak to the model.
+  pi.on("input", (event, ctx) => {
+    const match = /^\[belayd-complete:([^\]]+)\]$/.exec(event.text.trim());
+    if (match === null) return { action: "continue" };
+    const runId = match[1];
+    if (runId === undefined) return { action: "continue" };
+    const state = getSessionState(ctx);
+    if (state.gateActive && state.currentTaskId !== "") {
+      reconcileUserCompletions({ state, cwd: ctx.cwd, runId });
+    }
+    return { action: "handled" };
+  });
+
   /**
    * Resume the gate from the persisted workflow state written by /belayd.
    * A completed workflow is cleared instead of resurrected; a sub-agent never
@@ -1998,6 +2288,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const isSubAgent = sessionName?.includes("-sub-");
     if (!ctx.sessionManager.getSessionFile() || isSubAgent) return;
     resumeWorkflowFromDisk(state, ctx.cwd);
+    // A user completion persisted before an orchestrator restart is recovered
+    // from disk; the in-memory delivery marker was lost with the process.
+    reconcileUserCompletions({ state, cwd: ctx.cwd });
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -2199,19 +2492,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const state = getSessionState(ctx);
+    // File-only fallback: if the daemon wake path never fired (e.g. restart),
+    // a pending user completion is still recovered on the next turn.
+    if (state.gateActive) reconcileUserCompletions({ state, cwd: ctx.cwd });
     return planningContextMessage(state) ?? gateContextMessage(state);
   });
-
-  /** Capture the userguide output so the commit tool can append it to notes. */
-  function captureUserGuideContent(
-    phaseName: string,
-    result: SpawnResult,
-    state: SessionState,
-  ): void {
-    if (phaseName !== "userguide") return;
-    const content = result.content[0]?.text ?? "";
-    if (content) state.userGuideContent = content;
-  }
 
   // ── Map agent tool names to phase names ────────────────────────────
   const AGENT_TO_PHASE: Record<string, string> = {
@@ -2371,6 +2656,23 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /**
+   * The review loop directive appended to a successful review delivery, or ""
+   * for any other delivery. Extracted so the `deliver` watcher callback stays
+   * within the cognitive-complexity budget.
+   */
+  function reviewLoopHintFor(delivery: RunDelivery, state: SessionState): string {
+    if (!delivery.success || delivery.phaseName !== REVIEW_PHASE) return "";
+    // The "advance" tool is the next incomplete phase, not just review's
+    // successor, so a late re-review after test points at the right phase.
+    const nextIncompletePhase =
+      getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? COMMIT_PHASE;
+    return (
+      `\n\n---\n**When review findings remain:** ` +
+      reviewLoopDirective(getPhaseToolName(nextIncompletePhase))
+    );
+  }
+
+  /**
    * Start a phase run in the background and return its handle immediately.
    *
    * The run owns its abort signal — the tool-call signal belongs to the
@@ -2409,7 +2711,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     persistRunningManifest({
       state,
-      manifestCwd: effectiveCwd ?? process.cwd(),
+      manifestCwd: cwd,
       runId,
       phaseName,
       subagentSessionName,
@@ -2497,6 +2799,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     state.activeRuns.set(runId, { handle, abortController });
 
+    /** True once this run's result has been delivered (in-memory or persisted). */
+    const isRunDelivered = (id: string): boolean =>
+      state.deliveredRunIds.has(id) ||
+      readRunManifest({ cwd, runId: id })?.deliveredAt !== undefined;
+
     watchRunCompletion(handle, {
       onSettled: (info) => {
         // A failed run must still release its activeRuns entry; skip only when
@@ -2508,9 +2815,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         // to "interrupted" by scanForInterruptedRuns on the next session start
         // (bd-40 semantics) — never persist completion under the wrong task.
         if (!runStillRelevant()) return;
+        // A manual `/belayd-complete` owns the manifest; a later settle of the
+        // resumed/recovered child must not downgrade a user completion.
+        if (readRunManifest({ cwd, runId: info.runId })?.completedBy === "user") return;
         persistRunStatus({
           state,
-          manifestCwd: effectiveCwd ?? process.cwd(),
+          manifestCwd: cwd,
           runId: info.runId,
           status: info.success ? RunStatus.Completed : RunStatus.Failed,
           exitCode: info.result.details.exitCode,
@@ -2519,43 +2829,26 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       },
       onPhaseComplete: (info) => {
         if (!runStillRelevant()) return;
-        state.completedPhaseNames = markPhaseCompleted(
-          getPhaseToolName(info.phaseName),
-          state.completedPhaseNames,
-          state.phaseOrder,
-        );
-        // Order-sensitive: review arms the resumable-fix directive, a later
-        // phase disarms it, and an earlier re-run (e.g. implement) leaves it
-        // alone so a late re-review after test can re-arm it.
-        state.awaitingReviewResponse = nextAwaitingReviewResponse({
-          awaiting: state.awaitingReviewResponse,
-          completedPhaseName: info.phaseName,
-          phaseOrder: state.phaseOrder,
-          reviewCompleted: state.completedPhaseNames.includes(REVIEW_PHASE),
-        });
-        captureUserGuideContent(info.phaseName, info.result, state);
-        if (info.phaseName === "proof") {
-          state.proofOutput = info.result.content?.[0]?.text ?? "";
-        }
+        // A `/belayd-complete` recovery owns the run: once the user's report is
+        // delivered (or the manifest is tagged completedBy "user"), a
+        // still-running child that settles later must not overwrite the
+        // recovered output (state.userGuideContent / state.proofOutput).
+        if (isRunDelivered(info.runId)) return;
+        if (readRunManifest({ cwd, runId: info.runId })?.completedBy === "user") return;
+        applyPhaseCompletion(state, info.phaseName, info.result.content?.[0]?.text);
       },
       deliver: (delivery) => {
         if (!runStillRelevant()) return;
-        // Deliver the loop directive where the findings actually arrive, so
-        // the orchestrator does not have to wait for the next gate turn. The
-        // "advance" tool is the next incomplete phase, not just review's
-        // successor, so a late re-review after test points at the right phase.
-        const nextIncompletePhase =
-          getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? COMMIT_PHASE;
-        const reviewLoopHint =
-          delivery.success && delivery.phaseName === REVIEW_PHASE
-            ? `\n\n---\n**When review findings remain:** ${reviewLoopDirective(
-                getPhaseToolName(nextIncompletePhase),
-              )}`
-            : "";
+        // A `/belayd-complete` recovery owns delivery: a still-running child
+        // that settles after the user marked the run must not deliver its raw
+        // output. `reconcileUserCompletions` owns the follow-up and the phase
+        // completion for user-completed runs.
+        if (isRunDelivered(delivery.runId)) return;
+        if (readRunManifest({ cwd, runId: delivery.runId })?.completedBy === "user") return;
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
-            content: buildRunCompleteContent(delivery, reviewLoopHint),
+            content: buildRunCompleteContent(delivery, reviewLoopHintFor(delivery, state)),
             display: true,
             details: {
               runId: delivery.runId,
@@ -2570,8 +2863,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           { deliverAs: "followUp", triggerTurn: true },
         );
       },
-      isDelivered: (id) => state.deliveredRunIds.has(id),
+      isDelivered: isRunDelivered,
       markDelivered: (id) => {
+        // The watcher marks delivery after `deliver`; a user-completed run must
+        // stay undelivered so the sentinel reconcile still owns it. Without
+        // this, the in-memory marker would make reconcile skip the user report.
+        if (readRunManifest({ cwd, runId: id })?.completedBy === "user") return;
         state.deliveredRunIds.add(id);
       },
     });

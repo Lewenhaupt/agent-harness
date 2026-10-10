@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  completeRunByUser,
+  listPendingUserCompletions,
   listRuns,
+  markRunDelivered,
   parseRunManifest,
   type RunManifest,
   type RunManifestFs,
@@ -299,5 +302,131 @@ describe("run manifest", () => {
     expect(parseRunManifest({ ...sampleManifest(), schemaVersion: 2 })).toBe(undefined);
     expect(parseRunManifest({ ...sampleManifest(), status: "paused" })).toBe(undefined);
     expect(parseRunManifest({ ...sampleManifest(), startedAt: "now" })).toBe(undefined);
+  });
+
+  it("parses a legacy manifest without the user-completion fields", () => {
+    const parsed = parseRunManifest(sampleManifest());
+    expect(parsed).toHaveProperty("runId", "abc123");
+    expect(parsed).not.toHaveProperty("completionReport");
+    expect(parsed).not.toHaveProperty("completedBy");
+    expect(parsed).not.toHaveProperty("deliveredAt");
+  });
+
+  it("completeRunByUser records the report, clears failureReason, and round-trips", () => {
+    const fs = createFakeFs();
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({ status: RunStatus.Failed, failureReason: "stale failure" }),
+      fs,
+    });
+
+    const result = completeRunByUser({
+      cwd,
+      runId: "abc123",
+      report: "recovered final answer",
+      fs,
+      now: () => 8_000,
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("status", "completed");
+    expect(reloaded).toHaveProperty("completedAt", 8_000);
+    expect(reloaded).toHaveProperty("completionReport", "recovered final answer");
+    expect(reloaded).toHaveProperty("completedBy", "user");
+    expect(reloaded).not.toHaveProperty("failureReason");
+    expect(reloaded).not.toHaveProperty("deliveredAt");
+  });
+
+  it("completeRunByUser returns an error for an unknown run id", () => {
+    const fs = createFakeFs();
+    const result = completeRunByUser({ cwd, runId: "missing", report: "x", fs });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No run manifest");
+  });
+
+  it("markRunDelivered stamps deliveredAt and preserves completion fields", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+    completeRunByUser({ cwd, runId: "abc123", report: "answer", fs, now: () => 1_000 });
+
+    const result = markRunDelivered({ cwd, runId: "abc123", fs, now: () => 9_000 });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("deliveredAt", 9_000);
+    expect(reloaded).toHaveProperty("completionReport", "answer");
+    expect(reloaded).toHaveProperty("completedBy", "user");
+  });
+
+  it("listPendingUserCompletions returns only undelivered user completions", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest({ runId: "pending" }), fs });
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({ runId: "delivered" }),
+      fs,
+    });
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({ runId: "watcher", status: RunStatus.Completed }),
+      fs,
+    });
+    completeRunByUser({ cwd, runId: "pending", report: "p", fs });
+    completeRunByUser({ cwd, runId: "delivered", report: "d", fs });
+    markRunDelivered({ cwd, runId: "delivered", fs });
+
+    const pending = listPendingUserCompletions({ cwd, fs });
+
+    expect(pending.map((run) => run.runId)).toEqual(["pending"]);
+  });
+
+  it("listPendingUserCompletions is empty when there are no user completions", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+    expect(listPendingUserCompletions({ cwd, fs })).toEqual([]);
+  });
+
+  it("listPendingUserCompletions excludes a user completion with no report", () => {
+    const fs = createFakeFs();
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({ runId: "noreport", completedBy: "user" }),
+      fs,
+    });
+
+    expect(listPendingUserCompletions({ cwd, fs })).toEqual([]);
+  });
+
+  it("listPendingUserCompletions excludes a user completion with an empty report string", () => {
+    const fs = createFakeFs();
+    writeRunManifest({
+      cwd,
+      manifest: sampleManifest({ runId: "emptyreport", completedBy: "user", completionReport: "" }),
+      fs,
+    });
+
+    expect(listPendingUserCompletions({ cwd, fs })).toEqual([]);
+  });
+
+  it("markRunDelivered returns an error for an unknown run id", () => {
+    const fs = createFakeFs();
+    const result = markRunDelivered({ cwd, runId: "missing", fs });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No run manifest");
+  });
+
+  it("completeRunByUser leaves an existing deliveredAt intact so a re-completion cannot re-deliver", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+    completeRunByUser({ cwd, runId: "abc123", report: "first", fs, now: () => 1_000 });
+    markRunDelivered({ cwd, runId: "abc123", fs, now: () => 2_000 });
+
+    completeRunByUser({ cwd, runId: "abc123", report: "second", fs, now: () => 3_000 });
+
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("deliveredAt", 2_000);
+    expect(reloaded).toHaveProperty("completionReport", "second");
+    expect(listPendingUserCompletions({ cwd, fs })).toEqual([]);
   });
 });

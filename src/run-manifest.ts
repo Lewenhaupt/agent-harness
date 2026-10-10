@@ -35,6 +35,12 @@ const RunManifestSchema = z.object({
   model: z.string().optional(),
   /** Why a failed run failed; absent on completed/interrupted manifests. */
   failureReason: z.string().optional(),
+  /** Report text fed back by `/belayd-complete`; absent on normal runs. */
+  completionReport: z.string().optional(),
+  /** Set to "user" only by `/belayd-complete`, distinguishing manual recovery. */
+  completedBy: z.literal("user").optional(),
+  /** Orchestrator delivery-once marker; set after the report is delivered. */
+  deliveredAt: z.number().finite().optional(),
 });
 
 export type RunManifest = z.infer<typeof RunManifestSchema>;
@@ -67,6 +73,26 @@ export interface SetRunStatusOptions {
 }
 
 export interface ListRunsOptions {
+  cwd: string;
+  fs?: RunManifestFs;
+}
+
+export interface CompleteRunByUserOptions {
+  cwd: string;
+  runId: string;
+  report: string;
+  fs?: RunManifestFs;
+  now?: () => number;
+}
+
+export interface MarkRunDeliveredOptions {
+  cwd: string;
+  runId: string;
+  fs?: RunManifestFs;
+  now?: () => number;
+}
+
+export interface ListPendingUserCompletionsOptions {
   cwd: string;
   fs?: RunManifestFs;
 }
@@ -184,6 +210,63 @@ export function listRuns(options: ListRunsOptions): RunManifest[] {
   }
   runs.sort((a, b) => a.startedAt - b.startedAt);
   return runs;
+}
+
+/**
+ * Mark a run completed from a `/belayd-complete` invocation. Unlike
+ * `setRunStatus`, this records the recovered report, tags the run as
+ * user-completed, and clears any stale failure reason so a later settle cannot
+ * downgrade the phase. `deliveredAt` is intentionally left untouched.
+ */
+export function completeRunByUser(
+  options: CompleteRunByUserOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
+  if (existing === undefined) {
+    return { ok: false, error: `No run manifest found for ${options.runId}` };
+  }
+  const updated: RunManifest = {
+    ...existing,
+    status: RunStatus.Completed,
+    completedAt: (options.now ?? Date.now)(),
+    completionReport: options.report,
+    completedBy: "user",
+    failureReason: undefined,
+  };
+  return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
+}
+
+/** Record that a user-completed run's report has been delivered exactly once. */
+export function markRunDelivered(
+  options: MarkRunDeliveredOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
+  if (existing === undefined) {
+    return { ok: false, error: `No run manifest found for ${options.runId}` };
+  }
+  const updated: RunManifest = { ...existing, deliveredAt: (options.now ?? Date.now)() };
+  return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
+}
+
+/**
+ * User-completed runs whose report has not yet been delivered. This is the
+ * file-only recovery path: after an orchestrator restart the in-memory delivery
+ * marker is gone, but the persisted manifest still carries the pending report.
+ * A user completion without a report is excluded: delivering it would advance
+ * the gate with an empty body instead of the recovered answer.
+ */
+export function listPendingUserCompletions(
+  options: ListPendingUserCompletionsOptions,
+): RunManifest[] {
+  return listRuns(options).filter(
+    (run) =>
+      run.completedBy === "user" &&
+      run.deliveredAt === undefined &&
+      run.completionReport !== undefined &&
+      run.completionReport !== "",
+  );
 }
 
 /**

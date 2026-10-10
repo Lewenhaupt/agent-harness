@@ -80,6 +80,50 @@ export function computePlanningSubagentSessionName(phaseName: string, shortRunId
 }
 
 /**
+ * Epoch suffixes a phase session name may carry on top of its base name:
+ * gate retries (`-retry-<n>`), cross-run epochs (`-run-<n>`), and model
+ * fallback attempts (`-fallback-<n>`). Parsing strips one before matching.
+ */
+const SESSION_EPOCH_SUFFIX = /-(?:retry|run|fallback)-\d+$/;
+
+/**
+ * `belayd-{taskId}-sub-{phase}-{shortRunId}` with an optional trailing epoch
+ * suffix. `taskId` is the beads ID pattern; `phase` is a single lowercase
+ * token; `shortRunId` is a base-36 timestamp. Case-sensitive on purpose:
+ * session names are lowercase by construction, so the recovered taskId
+ * round-trips exactly to computeOrchestratorSessionName.
+ */
+const SUBAGENT_SESSION_PATTERN = /^belayd-(bd-[a-z0-9]+(?:\.[a-z0-9]+)*)-sub-([a-z]+)-([a-z0-9]+)$/;
+
+/** Components recovered from a phase sub-agent session name. */
+export interface SubagentSessionRef {
+  taskId: string;
+  phase: string;
+  shortRunId: string;
+}
+
+/**
+ * Parse a phase sub-agent session name back into its components.
+ *
+ * Tolerates a trailing retry/run/fallback epoch suffix so a session resumed
+ * for a gate retry still resolves to the run that created it. Planning session
+ * names (`belayd-planning-sub-...`) are deliberately not parseable: planning
+ * runs have no task id, no run manifest, and no recovery path. Anything that
+ * is not a phase sub-agent name yields undefined so callers can no-op.
+ */
+export function parseSubagentSessionName(name: string): SubagentSessionRef | undefined {
+  if (typeof name !== "string" || name === "") return undefined;
+  const base = name.replace(SESSION_EPOCH_SUFFIX, "");
+  const match = SUBAGENT_SESSION_PATTERN.exec(base);
+  if (match === null) return undefined;
+  const taskId = match[1];
+  const phase = match[2];
+  const shortRunId = match[3];
+  if (taskId === undefined || phase === undefined || shortRunId === undefined) return undefined;
+  return { taskId, phase, shortRunId };
+}
+
+/**
  * Number of consecutive quality-gate retries that resume the same pi session.
  *
  * Resuming replays the prior transcript, so retries are grouped into
