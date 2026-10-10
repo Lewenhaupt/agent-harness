@@ -39,6 +39,9 @@ import type {
   RunHandle,
   SpawnResult,
   StackNode,
+  WorkflowResolution,
+  WorkflowResolutionSource,
+  WorkflowState,
   WorkflowSubType,
 } from "../src/index.js";
 import {
@@ -86,6 +89,7 @@ import {
   PLANNING_MODE_TOOLS,
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
+  parseWorkflowLabel,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
@@ -96,7 +100,7 @@ import {
   resolveModelSpec,
   resolveQualityGate,
   resolveStackChain,
-  resolveWorkflowType,
+  resolveWorkflowSelection,
   runArchify,
   runArchifyText,
   runStackRebase,
@@ -104,7 +108,9 @@ import {
   spawnAgentWithFallback,
   spawnDetachedRun,
   validateBdCommand,
+  WF_LABEL_PREFIX,
   WORKFLOW_REGISTRY,
+  WORKFLOW_SUB_TYPES,
   watchRunCompletion,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
@@ -833,6 +839,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     cwd: string;
     branch?: string;
     originalCwd?: string;
+    resolutionSource?: WorkflowResolutionSource;
+    matchedLabel?: string;
   }): SessionState {
     const { ctx, taskId, workflowType, cwd } = options;
     const state = getSessionState(ctx);
@@ -861,31 +869,59 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
   }
 
+  /** Build the workflow.json identity payload for a freshly-activated gate. */
+  function buildPersistedWorkflowState(options: {
+    state: SessionState;
+    taskId: string;
+    cwd: string;
+    branch?: string;
+    originalCwd?: string;
+    resolutionSource?: WorkflowResolutionSource;
+    matchedLabel?: string;
+  }): WorkflowState {
+    const now = Date.now();
+    return {
+      schemaVersion: 1,
+      taskId: options.taskId,
+      workflowType: options.state.workflowType,
+      resolutionSource: options.resolutionSource ?? "default",
+      ...(options.matchedLabel !== undefined ? { matchedLabel: options.matchedLabel } : {}),
+      branch: options.branch ?? "",
+      originalCwd: options.originalCwd ?? options.cwd,
+      phaseOrder: [...options.state.phaseOrder],
+      completedPhaseNames: [],
+      startedAt: now,
+      updatedAt: now,
+    };
+  }
+
   /** Reconcile a newly-activated gate with persisted workflow state. */
   function reconcileWorkflowState(
     state: SessionState,
     input: {
       taskId: string;
       cwd: string;
-      options: { branch?: string; originalCwd?: string };
+      options: {
+        branch?: string;
+        originalCwd?: string;
+        resolutionSource?: WorkflowResolutionSource;
+        matchedLabel?: string;
+      };
     },
   ): void {
     const persisted = readWorkflowState({ cwd: input.cwd });
     if (persisted === undefined || persisted.taskId !== input.taskId) {
-      const now = Date.now();
       const writeResult = writeWorkflowState({
         cwd: input.cwd,
-        state: {
-          schemaVersion: 1,
+        state: buildPersistedWorkflowState({
+          state,
           taskId: input.taskId,
-          workflowType: state.workflowType,
-          branch: input.options.branch ?? "",
-          originalCwd: input.options.originalCwd ?? input.cwd,
-          phaseOrder: [...state.phaseOrder],
-          completedPhaseNames: [],
-          startedAt: now,
-          updatedAt: now,
-        },
+          cwd: input.cwd,
+          branch: input.options.branch,
+          originalCwd: input.options.originalCwd,
+          resolutionSource: input.options.resolutionSource,
+          matchedLabel: input.options.matchedLabel,
+        }),
       });
       if (!writeResult.ok) {
         console.warn(`[belayd-harness] failed to persist workflow state: ${writeResult.error}`);
@@ -907,47 +943,186 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       isAwaitingReviewResponse(state.completedPhaseNames, state.phaseOrder);
   }
 
-  function sendWorkflowMessage(
-    sender: { sendMessage: ExtensionAPI["sendMessage"] },
-    taskId: string,
-    branch: string | null,
-    workflowType?: WorkflowSubType,
-    phaseOrder?: readonly string[],
-  ): void {
-    const type = workflowType ?? "feature";
-    const phases = phaseOrder ?? getPhasesForType(type);
-    const consultPhases = WORKFLOW_REGISTRY[type].consultPhases ?? [];
+  /** One-line phases/proof summary for a workflow type. */
+  function describeWorkflowType(type: WorkflowSubType): string {
+    const config = WORKFLOW_REGISTRY[type];
+    const proof = config.proofRequired ? "proof required" : "no proof";
+    return `${type}: ${config.phases.join(" → ")} (${proof})`;
+  }
 
-    const typeDescriptions: Record<string, string> = {
-      feature: "This is a FEATURE task — new functionality.",
-      bugfix: "This is a BUGFIX task — fixing a bug.",
-      research: "This is a RESEARCH task — no code changes expected.",
-      chore: "This is a CHORE task — tooling/config changes, no review needed.",
-      documentation: "This is a DOCUMENTATION task — docs-only changes.",
-      refactor: "This is a REFACTOR task — internal code changes, no behavioral change.",
-      hotfix: "This is a HOTFIX task — urgent fix, minimal process.",
+  /** Human-facing provenance phrase for the resolved workflow type. */
+  function describeResolutionSource(resolution: {
+    source: WorkflowResolutionSource;
+    matchedLabel?: string;
+  }): string {
+    switch (resolution.source) {
+      case "arg":
+        return "type set explicitly";
+      case "label":
+        return `resolved from label ${resolution.matchedLabel ?? `${WF_LABEL_PREFIX}<type>`}`;
+      case "default":
+        return "defaulted to feature (no explicit type)";
+    }
+  }
+
+  /**
+   * Persist the effective type back to the bead as a `wf:<type>` label so a
+   * later run resolves without prompting. Best-effort: a bd failure is logged
+   * but never blocks an already-resolved workflow.
+   */
+  async function writeWorkflowTypeLabel(options: {
+    taskId: string;
+    type: WorkflowSubType;
+    cwd: string;
+    existingLabels?: string[];
+  }): Promise<void> {
+    if (parseWorkflowLabel(options.existingLabels)?.type === options.type) return;
+    const label = `${WF_LABEL_PREFIX}${options.type}`;
+    try {
+      await runBdCommand(["update", "--add-label", label, "--", options.taskId], {
+        cwd: options.cwd,
+        stdin: undefined,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+    } catch (error) {
+      console.warn(
+        `[belayd-harness] could not write ${label} to ${options.taskId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  type WorkflowConfirmationOutcome =
+    | { kind: "confirmed"; type: WorkflowSubType; source: WorkflowResolutionSource }
+    | { kind: "cancelled" };
+
+  /**
+   * Confirm a wf: label-driven resolution and write the effective type back to
+   * the bead as a `wf:<type>` label. A non-label resolution passes straight
+   * through. Returns `cancelled` when the user declines (or no UI is present).
+   *
+   * `persisted` reports whether this helper already wrote the confirmed label,
+   * so a caller must not issue a second identical `bd update` (the label was
+   * written from a stale label snapshot and would otherwise round-trip).
+   */
+  async function confirmAndPersistResolution(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    resolution: WorkflowResolution;
+    existingLabels?: string[];
+  }): Promise<
+    { kind: "resolved"; resolution: WorkflowResolution; persisted: boolean } | { kind: "cancelled" }
+  > {
+    const { ctx, taskId, resolution, existingLabels } = options;
+    if (!resolution.requiresConfirmation) {
+      return { kind: "resolved", resolution, persisted: false };
+    }
+
+    const confirmation = await confirmLabelWorkflowType({ ctx, resolution });
+    if (confirmation.kind === "cancelled") return { kind: "cancelled" };
+
+    const resolved: WorkflowResolution = {
+      type: confirmation.type,
+      source: confirmation.source,
+      matchedLabel: resolution.matchedLabel,
+      requiresConfirmation: false,
     };
-
-    const lines: string[] = [
-      `**Belayd ${type} workflow started for ${taskId}.**`,
-      ...(branch ? [`Worktree: \`${branch}\``, ""] : []),
-      "",
-      typeDescriptions[type] ?? `Workflow type: ${type}.`,
-      `Phases: ${phases.join(" → ")}`,
-      "",
-      "Editing and writing tools are DISABLED. You MUST delegate to phase tools:",
-    ];
-
-    phases.forEach((phase, i) => {
-      lines.push(`${i + 1}. \`belayd_${phase}\` — ${describePhase(phase, type)}`);
+    await writeWorkflowTypeLabel({
+      taskId,
+      type: confirmation.type,
+      cwd: ctx.cwd,
+      existingLabels,
     });
+    return { kind: "resolved", resolution: resolved, persisted: true };
+  }
 
-    lines.push("", `Next required step: call \`belayd_${phases[0] ?? "commit"}\``);
+  /** Explain why a wf:-driven workflow was not started, without side effects. */
+  function deniedConfirmationText(resolution: WorkflowResolution): string {
+    return (
+      `Workflow type "${resolution.type}" comes from bead label "${resolution.matchedLabel}" ` +
+      "and requires confirmation, but no interactive confirmation was available. " +
+      "No workflow was started. Confirm with /belayd, or pass workflowType explicitly to override."
+    );
+  }
 
+  /**
+   * Resolve a wf: label for a *tool* call. Tools prompt only when the session
+   * reports UI ({@link ExtensionContext.hasUI}); a headless `pi --mode json`
+   * subagent denies instead of silently defaulting.
+   */
+  async function resolveToolWorkflowResolution(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    resolution: WorkflowResolution;
+    existingLabels?: string[];
+  }): Promise<
+    | { kind: "resolved"; resolution: WorkflowResolution; persisted: boolean }
+    | { kind: "denied"; text: string }
+  > {
+    const { ctx, taskId, resolution, existingLabels } = options;
+    if (!resolution.requiresConfirmation) {
+      return { kind: "resolved", resolution, persisted: false };
+    }
+    if (ctx.hasUI !== true) return { kind: "denied", text: deniedConfirmationText(resolution) };
+
+    const confirmed = await confirmAndPersistResolution({
+      ctx,
+      taskId,
+      resolution,
+      existingLabels,
+    });
+    if (confirmed.kind === "cancelled") {
+      return { kind: "denied", text: deniedConfirmationText(resolution) };
+    }
+    return { kind: "resolved", resolution: confirmed.resolution, persisted: confirmed.persisted };
+  }
+
+  /**
+   * Confirm a label-driven workflow type before any side effects. A choose-
+   * another-type pick is explicit, so it is reported with `source: "arg"` and
+   * does not prompt again. A dismissed dialog — or a JSON-mode subagent whose
+   * `ctx.ui` has no interactive implementation — resolves to `undefined`, which
+   * is treated as cancel rather than a silent default.
+   */
+  async function confirmLabelWorkflowType(options: {
+    ctx: ExtensionContext;
+    resolution: WorkflowResolution;
+  }): Promise<WorkflowConfirmationOutcome> {
+    const { ctx, resolution } = options;
+    const matchedLabel = resolution.matchedLabel ?? `${WF_LABEL_PREFIX}<type>`;
+    const choice = await ctx.ui.select(
+      `Workflow type "${resolution.type}" came from label "${matchedLabel}".\n${describeWorkflowType(
+        resolution.type,
+      )}\nConfirm this workflow type?`,
+      [`Confirm ${resolution.type}`, "Choose another type", "Cancel"],
+    );
+    if (choice === undefined || choice === "Cancel") return { kind: "cancelled" };
+    if (choice === "Choose another type") {
+      const picked = await ctx.ui.select(
+        "Choose a workflow type",
+        WORKFLOW_SUB_TYPES.map((type) => describeWorkflowType(type)),
+      );
+      if (picked === undefined) return { kind: "cancelled" };
+      const type = WORKFLOW_SUB_TYPES.find((candidate) => picked.startsWith(`${candidate}:`));
+      if (type === undefined) return { kind: "cancelled" };
+      return { kind: "confirmed", type, source: "arg" };
+    }
+    return { kind: "confirmed", type: resolution.type, source: "label" };
+  }
+
+  /** Append type-specific guidance bullets to an in-progress workflow message. */
+  function appendWorkflowGuidance(
+    lines: string[],
+    type: WorkflowSubType,
+    phases: readonly string[],
+  ): void {
     // When the workflow declares consult phases, the bead's description/design/
     // notes are the plan — /plan already wrote it. The scout/plan tools remain
     // available only as consultation when that plan is unclear, and are NOT
     // required steps in the phase order.
+    const consultPhases = WORKFLOW_REGISTRY[type].consultPhases ?? [];
     if (consultPhases.length > 0) {
       const consultTools = consultPhases.map((p) => `\`belayd_${p}\``).join(" and ");
       lines.push(
@@ -985,6 +1160,50 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         "For UI changes, the `belayd_proof` task MUST require both a Playwright trace and playwright-cli screenshots of the changed pages; a missing test-runner browser is not a skip reason.",
       );
     }
+  }
+
+  function sendWorkflowMessage(
+    sender: { sendMessage: ExtensionAPI["sendMessage"] },
+    taskId: string,
+    branch: string | null,
+    workflowType?: WorkflowSubType,
+    phaseOrder?: readonly string[],
+    resolution?: { source: WorkflowResolutionSource; matchedLabel?: string },
+  ): void {
+    const type = workflowType ?? "feature";
+    const phases = phaseOrder ?? getPhasesForType(type);
+
+    const typeDescriptions: Record<string, string> = {
+      feature: "This is a FEATURE task — new functionality.",
+      bugfix: "This is a BUGFIX task — fixing a bug.",
+      research: "This is a RESEARCH task — no code changes expected.",
+      chore:
+        "This is a CHORE task — small, low-risk tooling/config changes; no review or proof phase.",
+      documentation: "This is a DOCUMENTATION task — docs-only changes.",
+      refactor: "This is a REFACTOR task — internal code changes, no behavioral change.",
+      hotfix: "This is a HOTFIX task — urgent fix, minimal process.",
+    };
+
+    const provenanceLine = resolution
+      ? [`Type provenance: ${describeResolutionSource(resolution)}.`]
+      : [];
+    const lines: string[] = [
+      `**Belayd ${type} workflow started for ${taskId}.**`,
+      ...(branch ? [`Worktree: \`${branch}\``, ""] : []),
+      "",
+      typeDescriptions[type] ?? `Workflow type: ${type}.`,
+      ...provenanceLine,
+      `Phases: ${phases.join(" → ")}`,
+      "",
+      "Editing and writing tools are DISABLED. You MUST delegate to phase tools:",
+    ];
+
+    phases.forEach((phase, i) => {
+      lines.push(`${i + 1}. \`belayd_${phase}\` — ${describePhase(phase, type)}`);
+    });
+
+    lines.push("", `Next required step: call \`belayd_${phases[0] ?? "commit"}\``);
+    appendWorkflowGuidance(lines, type, phases);
 
     lines.push("", "**After workflow completion:**");
     lines.push(
@@ -1302,13 +1521,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   // ── Task file helpers ─────────────────────────────────────────────────
 
-  /** Title and labels resolved from a beads issue. */
+  /** Labels resolved from a beads issue. */
   interface TaskMetadata {
-    title?: string;
     labels?: string[];
   }
 
-  /** Read title and labels from a beads issue via `bd show --json`. */
+  /** Read labels from a beads issue via `bd show --json`. */
   async function readTaskMetadata(taskId: string, cwd: string): Promise<TaskMetadata | undefined> {
     try {
       const { stdout } = await runBdCommand(["show", taskId, "--json"], {
@@ -1329,9 +1547,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       const parsed: unknown = JSON.parse(stdout);
       const item = Array.isArray(parsed) ? parsed[0] : parsed;
       if (!item || typeof item !== "object") return undefined;
-      const record = item as { title?: unknown; labels?: unknown };
+      const record = item as { labels?: unknown };
       return {
-        title: typeof record.title === "string" ? record.title : undefined,
         labels: Array.isArray(record.labels)
           ? record.labels.filter((l): l is string => typeof l === "string")
           : undefined,
@@ -1448,6 +1665,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     branch: string,
     worktreePath: string,
     base?: string,
+    resolutionSource?: WorkflowResolutionSource,
+    matchedLabel?: string,
   ): Promise<void> {
     const originalCwd = process.cwd();
     const phaseOrder = getPhasesForType(workflowType);
@@ -1469,6 +1688,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         schemaVersion: 1,
         taskId,
         workflowType,
+        resolutionSource: resolutionSource ?? "default",
+        ...(matchedLabel !== undefined ? { matchedLabel } : {}),
         branch,
         originalCwd,
         phaseOrder,
@@ -1518,6 +1739,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     workflowType: WorkflowSubType;
     branch: string;
     base?: string;
+    resolutionSource?: WorkflowResolutionSource;
+    matchedLabel?: string;
   }): Promise<{ ok: true } | { ok: false; error: string }> {
     const worktreePath = ensureWorktree(options.ctx.cwd, options.branch, options.base);
     if (!worktreePath) {
@@ -1541,6 +1764,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       options.branch,
       worktreePath,
       options.base,
+      options.resolutionSource,
+      options.matchedLabel,
     );
     return { ok: true };
   }
@@ -1619,7 +1844,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   // ── Slash command: /belayd bd-42 [type] ────────────────────────────
   pi.registerCommand("belayd", {
-    description: "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree]",
+    description:
+      "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree]. " +
+      "Omit type to use the bead's wf:<type> label (confirmed before launch).",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
       const taskId = parts[0] ?? "";
@@ -1632,23 +1859,40 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         ctx.ui.notify(
           "Usage: /belayd bd-42 [type] [--no-worktree]\n" +
             "  taskId: beads issue or subtask ID (e.g. bd-42, bd-42.1)\n" +
-            "  type: feature (default), bugfix, research, chore, documentation, refactor, hotfix\n" +
+            "  type: optional; omit to use the bead's wf:<type> label. Valid: feature (default), bugfix, research, chore, documentation, refactor, hotfix\n" +
             "  --no-worktree: activate gate in the current directory, no worktree or daemon",
           "error",
         );
         return;
       }
 
-      // Resolve workflow type from CLI argument, task labels, and title
+      // Explicit signals only: a CLI arg or a namespaced wf:<type> label. Title
+      // keywords and plain labels never drive the choice (bd-106).
       const metadata = await readTaskMetadata(taskId, ctx.cwd);
-      const workflowType = resolveWorkflowType(typeArg, metadata?.labels, metadata?.title);
+      let resolution = resolveWorkflowSelection(typeArg, metadata?.labels);
 
       if (typeArg && !isValidWorkflowType(typeArg)) {
         ctx.ui.notify(
-          `Unknown workflow type: "${typeArg}".\nValid types: feature, bugfix, research, chore, documentation, refactor, hotfix\nFalling back to "${workflowType}".`,
+          `Unknown workflow type: "${typeArg}".\nValid types: feature, bugfix, research, chore, documentation, refactor, hotfix\nFalling back to "${resolution.type}".`,
           "warning",
         );
       }
+
+      // A wf: label drives the type -> confirm before any side effects. A
+      // cancelled (or unavailable) dialog aborts the run untouched.
+      const confirmed = await confirmAndPersistResolution({
+        ctx,
+        taskId,
+        resolution,
+        existingLabels: metadata?.labels,
+      });
+      if (confirmed.kind === "cancelled") {
+        ctx.ui.notify("Belayd workflow cancelled — no changes made.", "info");
+        return;
+      }
+      resolution = confirmed.resolution;
+
+      const workflowType = resolution.type;
 
       // --no-worktree mode: activate gate in-place, no isolation
       if (noWorktree) {
@@ -1658,12 +1902,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           workflowType,
           cwd: ctx.cwd,
           originalCwd: process.cwd(),
+          resolutionSource: resolution.source,
+          matchedLabel: resolution.matchedLabel,
         });
         ctx.ui.notify(
-          `Belayd ${workflowType} workflow started for ${taskId} (no worktree).`,
+          `Belayd ${workflowType} workflow started for ${taskId} (no worktree). ${describeResolutionSource(
+            resolution,
+          )}.`,
           "info",
         );
-        sendWorkflowMessage(pi, taskId, null, workflowType);
+        sendWorkflowMessage(pi, taskId, null, workflowType, undefined, resolution);
         return;
       }
 
@@ -1673,6 +1921,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         taskId,
         workflowType,
         branch,
+        resolutionSource: resolution.source,
+        matchedLabel: resolution.matchedLabel,
       });
       if (!outcome.ok) {
         ctx.ui.notify(outcome.error, "error");
@@ -2999,17 +3249,36 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         };
       }
 
-      const metadata = await readTaskMetadata(params.taskId, ctx.cwd ?? process.cwd());
-      const workflowType = resolveWorkflowType(
-        params.workflowType,
-        metadata?.labels,
-        metadata?.title,
-      );
+      const cwd = ctx.cwd ?? process.cwd();
+      const metadata = await readTaskMetadata(params.taskId, cwd);
+      const toolResolution = await resolveToolWorkflowResolution({
+        ctx,
+        taskId: params.taskId,
+        resolution: resolveWorkflowSelection(params.workflowType, metadata?.labels),
+        existingLabels: metadata?.labels,
+      });
+      if (toolResolution.kind === "denied") return textToolResult(toolResolution.text, 1);
+
+      const resolution = toolResolution.resolution;
+      const workflowType = resolution.type;
+      // A choose-another-type confirmation already persisted the label; only an
+      // explicit arg needs the write-back here.
+      if (resolution.source === "arg" && !toolResolution.persisted) {
+        await writeWorkflowTypeLabel({
+          taskId: params.taskId,
+          type: workflowType,
+          cwd,
+          existingLabels: metadata?.labels,
+        });
+      }
+
       const state = activateGate({
         ctx,
         taskId: params.taskId,
         workflowType,
-        cwd: ctx.cwd ?? process.cwd(),
+        cwd,
+        resolutionSource: resolution.source,
+        matchedLabel: resolution.matchedLabel,
       });
       return {
         content: [
@@ -3094,11 +3363,26 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       }
 
       const metadata = await readTaskMetadata(params.taskId, cwd);
-      const workflowType = resolveWorkflowType(
-        params.workflowType,
-        metadata?.labels,
-        metadata?.title,
-      );
+      const toolResolution = await resolveToolWorkflowResolution({
+        ctx,
+        taskId: params.taskId,
+        resolution: resolveWorkflowSelection(params.workflowType, metadata?.labels),
+        existingLabels: metadata?.labels,
+      });
+      if (toolResolution.kind === "denied") return textToolResult(toolResolution.text, 1);
+
+      const resolution = toolResolution.resolution;
+      const workflowType = resolution.type;
+      // A choose-another-type confirmation already persisted the label; only an
+      // explicit arg needs the write-back here.
+      if (resolution.source === "arg" && !toolResolution.persisted) {
+        await writeWorkflowTypeLabel({
+          taskId: params.taskId,
+          type: workflowType,
+          cwd,
+          existingLabels: metadata?.labels,
+        });
+      }
 
       const outcome = await launchWorktreeWorkflow({
         ctx,
@@ -3106,6 +3390,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         workflowType,
         branch,
         base,
+        resolutionSource: resolution.source,
+        matchedLabel: resolution.matchedLabel,
       });
       if (!outcome.ok) return textToolResult(outcome.error, 1);
 

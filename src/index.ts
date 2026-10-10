@@ -257,12 +257,20 @@ export {
   reset,
 } from "./stale-file-guard.js";
 // Workflow registry
-export type { WorkflowSubType, WorkflowSubTypeConfig } from "./workflow-registry.js";
+export type {
+  WorkflowResolution,
+  WorkflowResolutionSource,
+  WorkflowSubType,
+  WorkflowSubTypeConfig,
+} from "./workflow-registry.js";
 export {
   getPhasesForType,
   isValidWorkflowType,
+  parseWorkflowLabel,
   resolveQualityGate,
+  resolveWorkflowSelection,
   resolveWorkflowType,
+  WF_LABEL_PREFIX,
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";

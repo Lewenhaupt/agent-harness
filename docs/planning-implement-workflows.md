@@ -182,7 +182,7 @@ the same bead has been updated.
 ### Implement from a bead (the new `/belayd` flow)
 
 ```
-/belayd bd-42                 # resolves workflow type from labels/title (default feature)
+/belayd bd-42                 # uses the bead's wf:<type> label, else feature
 /belayd bd-42 bugfix --no-worktree
 ```
 
@@ -192,3 +192,30 @@ prepended to its task, so write the plan into the bead (via `/plan` or
 manually) before implementing. If the plan is sparse or unclear during the
 workflow, `belayd_scout` / `belayd_plan` remain callable as consultation (they
 do not gate progress and are not required steps).
+
+### Workflow type resolution (explicit signals only, bd-106)
+
+A non-default workflow type is chosen **only** by:
+
+1. an explicit type argument (`/belayd bd-42 bugfix` for the command, or the
+   `workflowType` parameter for the `belayd_start_task` / `belayd_start_followup`
+   tools), or
+2. a namespaced `wf:<type>` bead label, e.g. `wf:chore`, `wf:bugfix`.
+
+Precedence is argument > `wf:<type>` label > `feature`. Title keywords and
+plain labels (including `chore`, `bug`, `investigation`) are **ignored** — an
+incidental word like `CI` in a title must never silently demote a task. When a
+`wf:` label drives the choice, `/belayd` shows the resolved type, its phases,
+and whether proof is required, and asks you to **confirm**, **choose another
+type**, or **cancel**. Cancel aborts with no side effects. After confirmation
+the type is written back to the bead as a `wf:<type>` label (skipped when
+already present) and recorded, with provenance, in `.belayd/workflow.json`.
+
+A tool call (`belayd_start_task` / `belayd_start_followup`) has no interactive
+UI, so a `wf:`-driven type cannot be confirmed there: the tool denies with a
+needs-confirmation message and starts nothing, rather than silently defaulting.
+
+**Migration note.** Existing beads whose type came from a plain `chore` /
+`bugfix` / ... label no longer resolve to that type — they now default to
+`feature`. To preserve them, do a one-time relabel, e.g.
+`bd update <id> --add-label wf:chore` (and `--remove-label chore`).

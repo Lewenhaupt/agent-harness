@@ -172,61 +172,69 @@ export function getPhasesForType(type?: WorkflowSubType): Phase[] {
   return [...WORKFLOW_REGISTRY.feature.phases];
 }
 
-/** Labels that map to workflow types when no exact match is found. */
-const LABEL_TO_TYPE: Record<string, WorkflowSubType> = {
-  bug: "bugfix",
-  investigation: "research",
-};
-
-/** Title/description keyword patterns → workflow type. Checked in order. */
-const TITLE_PATTERNS: Array<{ pattern: RegExp; type: WorkflowSubType }> = [
-  { pattern: /\b(urgent|hotfix|critical|production|incident)\b/i, type: "hotfix" },
-  { pattern: /\b(fix|bug|bugfix|broken|crash|regression)\b/i, type: "bugfix" },
-  { pattern: /\b(refactor|cleanup|rename|restructure|reorgani[sz]e)\b/i, type: "refactor" },
-  { pattern: /\b(docs?|documentation|readme|changelog)\b/i, type: "documentation" },
-  {
-    pattern: /\b(research|investigate|explore|spike|feasibility|prototype|poc)\b/i,
-    type: "research",
-  },
-  {
-    pattern:
-      /\b(chore|tooling|config|ci|deps?|dependencies|upgrade|update|bump|maintenance|setup|provision)\b/i,
-    type: "chore",
-  },
-];
+/** Namespace prefix for machine-readable workflow-type labels. */
+export const WF_LABEL_PREFIX = "wf:";
 
 /**
- * Resolve the workflow type from CLI argument, task labels, and title/description.
- * Priority: CLI arg > label > label mapping > title keywords > "feature".
+ * How a workflow type was chosen. Recorded for provenance so a run can be
+ * audited: `arg` is an explicit CLI/tool argument, `label` is a namespaced
+ * `wf:<type>` bead label (which needs user confirmation), and `default` is the
+ * feature fallback when no explicit signal exists.
  */
-export function resolveWorkflowType(
-  typeArg?: string,
-  labels?: string[],
-  title?: string,
-): WorkflowSubType {
-  if (typeArg && isValidWorkflowType(typeArg)) return typeArg;
+export type WorkflowResolutionSource = "arg" | "label" | "default";
 
-  return resolveFromLabels(labels) ?? resolveFromTitle(title) ?? "feature";
+/** Structured workflow-type resolution with provenance. */
+export interface WorkflowResolution {
+  type: WorkflowSubType;
+  source: WorkflowResolutionSource;
+  matchedLabel?: string;
+  requiresConfirmation: boolean;
 }
 
-/** Resolve the workflow type from a task's labels, if any match. */
-function resolveFromLabels(labels?: string[]): WorkflowSubType | undefined {
+/**
+ * Parse the first valid `wf:<type>` label. The prefix is lowercase and the
+ * suffix must be an exact workflow type; invalid suffixes are ignored rather
+ * than treated as an error so an unrelated `wf:` label cannot hijack the choice.
+ */
+export function parseWorkflowLabel(
+  labels?: string[],
+): { type: WorkflowSubType; label: string } | undefined {
   if (!labels) return undefined;
   for (const label of labels) {
-    if (isValidWorkflowType(label)) return label;
-    const mapped = LABEL_TO_TYPE[label];
-    if (mapped) return mapped;
+    if (!label.startsWith(WF_LABEL_PREFIX)) continue;
+    const candidate = label.slice(WF_LABEL_PREFIX.length);
+    if (isValidWorkflowType(candidate)) return { type: candidate, label };
   }
   return undefined;
 }
 
-/** Resolve the workflow type from a task's title keywords, if any match. */
-function resolveFromTitle(title?: string): WorkflowSubType | undefined {
-  if (!title) return undefined;
-  for (const { pattern, type: resolvedType } of TITLE_PATTERNS) {
-    if (pattern.test(title)) return resolvedType;
+/**
+ * Resolve the workflow type from an explicit argument or a namespaced
+ * `wf:<type>` label. Precedence: valid arg > `wf:` label > feature. Title
+ * heuristics and plain type labels are intentionally ignored — a single
+ * keyword or legacy label must never silently demote a task below feature.
+ */
+export function resolveWorkflowSelection(typeArg?: string, labels?: string[]): WorkflowResolution {
+  if (typeArg && isValidWorkflowType(typeArg)) {
+    return { type: typeArg, source: "arg", requiresConfirmation: false };
   }
-  return undefined;
+
+  const fromLabel = parseWorkflowLabel(labels);
+  if (fromLabel) {
+    return {
+      type: fromLabel.type,
+      source: "label",
+      matchedLabel: fromLabel.label,
+      requiresConfirmation: true,
+    };
+  }
+
+  return { type: "feature", source: "default", requiresConfirmation: false };
+}
+
+/** Thin wrapper over resolveWorkflowSelection for callers that only need the type. */
+export function resolveWorkflowType(typeArg?: string, labels?: string[]): WorkflowSubType {
+  return resolveWorkflowSelection(typeArg, labels).type;
 }
 
 /**
