@@ -40,10 +40,10 @@ import type {
   RunManifest,
   SpawnResult,
   StackNode,
+  SubagentSessionRef,
   WorkflowResolution,
   WorkflowResolutionSource,
   WorkflowState,
-  SubagentSessionRef,
   WorkflowSubType,
 } from "../src/index.js";
 import {
@@ -93,8 +93,8 @@ import {
   PLANNING_MODE_TOOLS,
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
-  parseWorkflowLabel,
   parseSubagentSessionName,
+  parseWorkflowLabel,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
