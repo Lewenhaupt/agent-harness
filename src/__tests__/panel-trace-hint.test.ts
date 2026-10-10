@@ -84,14 +84,14 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
     expect(block).toContain("playwright show-trace");
     // The hint must quote the trace argument so paths with spaces survive a
     // copy-paste (bd-69's core bug class); the printf format supplies the quotes.
-    expect(block).toContain('--port %s "%s"');
+    expect(block).toContain('--host %s --port %s "%s"');
   });
 
-  it("showTraceCommand invocation quotes the port and trace arguments", () => {
+  it("showTraceCommand invocation quotes the host, port and trace arguments", () => {
     const source = requireSource(panelSource, panelPath);
     // Guards shellQuote/quoting behaviour: bare `$TRACE` inside the double-quoted
     // echo would word-split on spaces, so the real invocation must keep quoting.
-    expect(source).toContain('"$PW" show-trace --port "$PORT" "$TRACE"');
+    expect(source).toContain('"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE"');
   });
 
   it("README trace-viewer row documents the manual `playwright show-trace` fallback", () => {
@@ -125,16 +125,16 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
     // real shell text — the branch itself is otherwise unmodified.
     const branchLine = lineMatch[0].replace(/^\s*`/, "").replace(/`,?$/, "");
 
-    // A structural guard: the printf format must consume exactly 4 `%s`
-    // conversions and be fed exactly 4 quoted arguments. A future edit that
+    // A structural guard: the printf format must consume exactly 6 `%s`
+    // conversions and be fed exactly 6 quoted arguments. A future edit that
     // unbalances either side silently changes the emitted message.
     const percentConversions = branchLine.match(/%s/g);
-    const quotedArgs = branchLine.match(/"\$PORT"|"\$TRACE"/g);
+    const quotedArgs = branchLine.match(/"\$HOST"|"\$PORT"|"\$TRACE"/g);
     if (percentConversions === null || quotedArgs === null) {
       throw new Error("printf %s conversions or quoted args not found in branch");
     }
-    expect(percentConversions.length).toBe(4);
-    expect(quotedArgs.length).toBe(4);
+    expect(percentConversions.length).toBe(6);
+    expect(quotedArgs.length).toBe(6);
 
     // Run the branch verbatim through real bash with PW unset/empty, a fixed
     // PORT, and a TRACE containing a space. The branch ends with `exit 1`, so
@@ -142,6 +142,7 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
     // and the subprocess exits 0 with stdout captured normally. A trailing
     // `true` is a second neutraliser in case a future edit drops the `exit`
     // override scope. The branch text itself is NOT rewritten.
+    const host = "0.0.0.0";
     const port = "9323";
     const tracePath = "/tmp/my proof dir/trace.zip";
     const script = `exit() { return 0; }\n${branchLine}\ntrue`;
@@ -159,7 +160,7 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
     try {
       const buf = execFileSync(bashBin, ["-c", script], {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, PW: "", PORT: port, TRACE: tracePath },
+        env: { ...process.env, PW: "", HOST: host, PORT: port, TRACE: tracePath },
         timeout: 10_000,
         encoding: "utf8",
       });
@@ -171,8 +172,8 @@ describe("bd-69: proof panel trace-viewer fallback hint", () => {
 
     // The exact assertion that fails on the pre-fix `echo` version: the spaced
     // path must appear as one correctly quoted argument, not word-split.
-    expect(stdout).toContain(`--port ${port} "${tracePath}"`);
-    expect(stdout).not.toContain(`--port ${port} ${tracePath}`);
+    expect(stdout).toContain(`--host ${host} --port ${port} "${tracePath}"`);
+    expect(stdout).not.toContain(`--host ${host} --port ${port} ${tracePath}`);
 
     // Message content is still asserted by the executable path, not only the
     // source-text guards.
