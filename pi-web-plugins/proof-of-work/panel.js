@@ -1,4 +1,4 @@
-import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot, mediaPreviewUrl } from "./discovery.js";
+import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot, resolveTracePath, traceFileAvailable, mediaPreviewUrl } from "./discovery.js";
 import { renderFileContent, renderTracePlaceholder, isTraceFile, renderMediaLoadError } from "./renderers.js";
 
 export const proofPanelTagName = "pi-web-proof-of-work-panel";
@@ -236,20 +236,43 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     }
 
     const viewerUrl = TRACE_VIEWER_URL;
-    const absolutePath = joinWorkspacePath(context.workspace.path, filePath);
+    const absolutePath = resolveTracePath(this.proofRoot, context.workspace.path, filePath);
 
     // Open a blank tab synchronously (still inside the user gesture) so popup
-    // blockers allow it, then navigate it once the server is listening.
+    // blockers allow it. The server is launched only after confirming the
+    // artifact still exists, so a removed worktree/proof dir cannot leave the
+    // Tailscale service pointed at a viewer for a file that is gone.
     const windowRef = window.open("", "_blank");
 
+    void this.launchTraceViewer(context, windowRef, { filePath, absolutePath, viewerUrl });
+  }
+
+  /**
+   * Confirm the selected trace still exists, then start `playwright show-trace`
+   * and navigate the pending tab to the viewer URL.
+   */
+  async launchTraceViewer(context, windowRef, { filePath, absolutePath, viewerUrl }) {
+    // traceFileAvailable already never rejects, but a defensive catch keeps a
+    // synchronous throw from leaving the synchronously-opened blank tab open.
+    const available = await traceFileAvailable(context.files, absolutePath).catch(() => false);
+    if (!available) {
+      if (windowRef !== null && !windowRef.closed) windowRef.close();
+      this.viewer.innerHTML = renderErrorState(
+        "This proof artifact is no longer available.",
+        `The selected trace (${fileName(filePath)}) is gone from the resolved proof path. The worktree or proof directory may have been removed; click Refresh to rescan.`,
+      );
+      return;
+    }
+
+    let handle;
     try {
-      void context.terminal.runCommand({
+      handle = await context.terminal.runCommand({
         title: `Trace viewer: ${fileName(filePath)}`,
         command: showTraceCommand({ port: TRACE_VIEWER_PORT, host: TRACE_VIEWER_HOST, tracePath: absolutePath }),
         open: true,
       });
     } catch (error) {
-      if (windowRef !== null) windowRef.close();
+      if (windowRef !== null && !windowRef.closed) windowRef.close();
       this.viewer.innerHTML = renderErrorState(
         "Could not start the Trace Viewer.",
         error instanceof Error ? error.message : String(error),
@@ -257,14 +280,28 @@ class PiWebProofOfWorkPanel extends HTMLElement {
       return;
     }
 
-    void this.waitForServer(viewerUrl, 10_000, 250).then((ready) => {
-      if (windowRef === null || windowRef.closed) return;
-      if (ready) {
-        windowRef.location.href = viewerUrl;
-      } else {
-        windowRef.document.write("<p style='font-family: sans-serif; padding: 1rem'>Trace viewer did not start in time. Check the workspace terminal.</p>");
-      }
-    });
+    const ready = await this.waitForServer(viewerUrl, 10_000, 250);
+    if (windowRef === null || windowRef.closed) return;
+
+    if (!ready) {
+      windowRef.document.write("<p style='font-family: sans-serif; padding: 1rem'>Trace viewer did not start in time. Check the workspace terminal.</p>");
+      return;
+    }
+
+    // A ready URL only proves *something* listens on the trace port; a shell
+    // abort (a foreign owner was refused rather than killed) must win over
+    // navigating to what could be the stale viewer. Give the run a short grace
+    // window and navigate only when it did not fail.
+    if (await runFailedWithinGrace(handle, TRACE_LAUNCH_GRACE_IN_MS)) {
+      if (!windowRef.closed) windowRef.close();
+      this.viewer.innerHTML = renderErrorState(
+        "Could not start the Trace Viewer.",
+        "The launch aborted before the viewer could bind its port. Another process (likely a stale `playwright show-trace`) may already own the trace port: stop it and retry, then check the workspace terminal for details.",
+      );
+      return;
+    }
+
+    if (!windowRef.closed) windowRef.location.href = viewerUrl;
   }
 
   /** Poll a URL until it responds or the timeout elapses. */
@@ -673,11 +710,33 @@ const TRACE_VIEWER_HOST = "0.0.0.0";
 // A tailnet rename must update panel.js and README.md and
 // docs/playwright-proof-env.md together, or the tab will open a dead URL.
 const TRACE_VIEWER_URL = "https://playwright-trace.platy-ilish.ts.net/";
+// How long to let the shell's port-ownership abort surface before navigating
+// the pending tab to a URL that may belong to a stale viewer.
+const TRACE_LAUNCH_GRACE_IN_MS = 1_500;
 
-/** Join a workspace root and a workspace-relative path into an absolute path. */
-function joinWorkspacePath(workspacePath, filePath) {
-  if (filePath.startsWith("/")) return filePath;
-  return `${workspacePath.replace(/\/+$/, "")}/${filePath}`;
+/**
+ * Whether a terminal run reports `status: "failed"` within a short grace
+ * window. A shell abort (e.g. a foreign owner already on the trace port) must
+ * be observed before the pending tab is navigated to what may be a stale
+ * viewer. Never rejects: a malformed handle or rejected completion is treated
+ * as "not failed", preserving the pre-existing navigation behavior.
+ */
+async function runFailedWithinGrace(handle, timeoutInMs) {
+  if (handle === null || handle === undefined) return false;
+  const completed = handle.completed;
+  if (completed === null || completed === undefined) return false;
+  let timer;
+  const timedOut = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutInMs);
+  });
+  try {
+    const failed = Promise.resolve(completed)
+      .then((run) => run !== null && run !== undefined && run.status === "failed")
+      .catch(() => false);
+    return (await Promise.race([failed, timedOut])) === true;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Quote a value for safe embedding inside a double-quoted POSIX shell string. */
@@ -695,13 +754,115 @@ export function showTraceCommand({ port, host, tracePath }) {
     `PORT=${shellQuote(String(port))}`,
     `HOST=${shellQuote(host)}`,
     `TRACE=${shellQuote(tracePath)}`,
+    // `playwright show-trace` treats --port as a preference and silently binds a
+    // random port when it is taken, leaving the Tailscale service pointed at the
+    // previous viewer. A viewer-owned pidfile lets a later click stop only the
+    // server this panel started before reclaiming the pinned port.
+    `PIDDIR="\${XDG_RUNTIME_DIR:-$HOME/.cache/belayd}"`,
+    `PIDFILE="$PIDDIR/playwright-trace.pid"`,
+    `mkdir -p "$PIDDIR" 2>/dev/null || { PIDDIR="$HOME/.cache/belayd"; PIDFILE="$PIDDIR/playwright-trace.pid"; mkdir -p "$PIDDIR" 2>/dev/null || true; }`,
+    `if [ -f "$PIDFILE" ]; then`,
+    `  OLD_PID="$(cat "$PIDFILE" 2>/dev/null)"`,
+    `  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then`,
+    `    OLD_CMDLINE="$(tr '\\0' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null)"`,
+    `    if printf '%s' "$OLD_CMDLINE" | grep -q 'show-trace' && printf '%s' "$OLD_CMDLINE" | grep -Eq 'playwright(-core)?'; then`,
+    `      if command -v pkill >/dev/null 2>&1; then`,
+    `        pkill -P "$OLD_PID" 2>/dev/null || true`,
+    `      fi`,
+    `      kill "$OLD_PID" 2>/dev/null || true`,
+    `      for _ in 1 2 3 4 5; do`,
+    `        kill -0 "$OLD_PID" 2>/dev/null || break`,
+    `        sleep 1`,
+    `      done`,
+    `      if kill -0 "$OLD_PID" 2>/dev/null; then`,
+    `        echo "ERROR: could not stop the previous trace viewer (PID $OLD_PID); refusing to start a second viewer on a random port."`,
+    `        exit 1`,
+    `      fi`,
+    // The previous viewer's direct children can briefly outlive it while still
+    // holding the LISTEN socket, which would make the pre-launch foreign-owner
+    // check below a transient false positive. Wait it out before that check
+    // treats a remaining listener as an unknown owner.
+    `      if command -v ss >/dev/null 2>&1; then`,
+    `        for _ in 1 2 3 4 5; do`,
+    `          ss -ltn 2>/dev/null | grep -Eq ":$PORT[[:space:]]" || break`,
+    `          sleep 1`,
+    `        done`,
+    `      fi`,
+    `    else`,
+    `      echo "ERROR: $PIDFILE points at PID $OLD_PID, which is not a playwright show-trace process. Refusing to kill it; remove $PIDFILE manually if it is stale."`,
+    `      exit 1`,
+    `    fi`,
+    `  fi`,
+    `  rm -f "$PIDFILE" 2>/dev/null || true`,
+    `fi`,
+    // After the recorded-PID reclaim, any LISTEN socket still on :$PORT belongs
+    // to an unknown owner. Abort before launching so the server cannot silently
+    // bind a random port while the Tailscale URL points at the stale viewer. The
+    // unknown owner is never killed.
+    `if command -v ss >/dev/null 2>&1; then`,
+    `  PRE_LINES="$(ss -ltn 2>/dev/null | grep -E ":$PORT[[:space:]]")"`,
+    `  if [ -n "$PRE_LINES" ]; then`,
+    `    echo "ERROR: another process already owns :$PORT (likely a stale playwright show-trace); refusing to launch a viewer that would bind a random port. Stop that process and retry."`,
+    `    rm -f "$PIDFILE" 2>/dev/null || true`,
+    `    exit 1`,
+    `  fi`,
+    `fi`,
     "if command -v playwright >/dev/null 2>&1; then",
     `  PW="playwright"`,
     "else",
     `  PW="$(find . \\( -name .pnpm -o -name .git -o -name proof-of-work \\) -prune -o \\( -type f -o -type l \\) -path '*/node_modules/.bin/playwright' -print -quit 2>/dev/null)"`,
     "fi",
     `if [ -z "$PW" ]; then echo "ERROR: playwright CLI not found on PATH. The Nix runtime env ships playwright; check that the session PATH includes it and that PLAYWRIGHT_BROWSERS_PATH points at the provided browser set."; printf 'Or run it via the project devShell: direnv exec <repo> playwright show-trace --host %s --port %s "%s", or nix develop -c playwright show-trace --host %s --port %s "%s"\n' "$HOST" "$PORT" "$TRACE" "$HOST" "$PORT" "$TRACE"; exit 1; fi`,
-    `"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE"`,
+    `"$PW" show-trace --host "$HOST" --port "$PORT" "$TRACE" &`,
+    `VIEWER_PID=$!`,
+    // Verify the process we launched actually owns the pinned port before
+    // trusting the Tailscale URL. Playwright treats --port as a preference, so a
+    // pre-existing stale owner (never recorded in our pidfile) would leave our
+    // server on a random port while the service still fronts :$PORT. We never
+    // kill the unknown owner; we abort our own launch instead.
+    `SS_AVAILABLE=1`,
+    `if ! command -v ss >/dev/null 2>&1; then`,
+    `  SS_AVAILABLE=0`,
+    `  echo "warning: ss not found; cannot verify :$PORT ownership" >&2`,
+    `fi`,
+    `PORT_OWNED=0`,
+    `if [ "$SS_AVAILABLE" -eq 1 ]; then`,
+    `  for _ in 1 2 3 4 5 6 7 8 9 10; do`,
+    `    SS_OUT="$(ss -ltnp 2>/dev/null)"`,
+    `    PORT_LINES="$(printf '%s\\n' "$SS_OUT" | grep -E ":$PORT[[:space:]]")"`,
+    `    if [ -n "$PORT_LINES" ] && printf '%s\\n' "$PORT_LINES" | grep -q "pid=$VIEWER_PID,"; then`,
+    `      PORT_OWNED=1`,
+    `      break`,
+    `    fi`,
+    `    if command -v pgrep >/dev/null 2>&1; then`,
+    `      for CHILD_PID in $(pgrep -P "$VIEWER_PID" 2>/dev/null); do`,
+    `        if printf '%s\\n' "$PORT_LINES" | grep -q "pid=$CHILD_PID,"; then`,
+    `          PORT_OWNED=1`,
+    `          break`,
+    `        fi`,
+    `      done`,
+    `      if [ "$PORT_OWNED" -eq 1 ]; then break; fi`,
+    `    fi`,
+    `    sleep 1`,
+    `  done`,
+    `fi`,
+    `if [ "$SS_AVAILABLE" -eq 1 ] && [ "$PORT_OWNED" -ne 1 ]; then`,
+    `  echo "ERROR: another process owns :$PORT (likely a stale playwright show-trace); refusing to leave the Tailscale URL pointed at it. Stop that process and retry."`,
+    `  kill "$VIEWER_PID" 2>/dev/null || true`,
+    `  for _ in 1 2 3; do`,
+    `    kill -0 "$VIEWER_PID" 2>/dev/null || break`,
+    `    sleep 1`,
+    `  done`,
+    `  kill -9 "$VIEWER_PID" 2>/dev/null || true`,
+    `  rm -f "$PIDFILE" 2>/dev/null || true`,
+    `  exit 1`,
+    `fi`,
+    // Only record the PID after ownership is confirmed, so the pidfile never
+    // claims a port the launched server failed to bind.
+    `if ! printf '%s\\n' "$VIEWER_PID" > "$PIDFILE" 2>/dev/null; then`,
+    `  echo "warning: could not record pidfile $PIDFILE; port reclaim is disabled for this session." >&2`,
+    `fi`,
+    `wait "$VIEWER_PID"`,
   ].join("\n");
 }
 

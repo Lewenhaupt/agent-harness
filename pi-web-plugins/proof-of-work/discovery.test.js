@@ -8,6 +8,8 @@ import {
   mediaPreviewUrl,
   readProofFile,
   resolveProofRoot,
+  resolveTracePath,
+  traceFileAvailable,
 } from "./discovery.js";
 
 /**
@@ -216,6 +218,136 @@ describe("readProofFile", () => {
     const result = await readProofFile(files, "/abs/base/bd-1/notes.md");
 
     expect(result).toEqual({ kind: "denied", detail: "Path traversal is not allowed" });
+  });
+});
+
+describe("resolveTracePath", () => {
+  it("maps the logical proof-of-work path onto the external proof base", () => {
+    const result = resolveTracePath(
+      { kind: "external", path: "/abs/base" },
+      "/home/alice/wt",
+      "proof-of-work/bd-108/trace.zip",
+    );
+
+    expect(result).toBe("/abs/base/bd-108/trace.zip");
+  });
+
+  it("trims a trailing slash from the external base", () => {
+    const result = resolveTracePath(
+      { kind: "external", path: "/abs/base/" },
+      "/home/alice/wt",
+      "proof-of-work/bd-108/trace.zip",
+    );
+
+    expect(result).toBe("/abs/base/bd-108/trace.zip");
+  });
+
+  it("passes an already-absolute external path through unchanged", () => {
+    const result = resolveTracePath(
+      { kind: "external", path: "/abs/base" },
+      "/home/alice/wt",
+      "/abs/base/bd-108/trace.zip",
+    );
+
+    expect(result).toBe("/abs/base/bd-108/trace.zip");
+  });
+
+  it("joins the workspace path when the proof root is workspace-relative", () => {
+    const result = resolveTracePath(
+      { kind: "workspace", path: "proof-of-work" },
+      "/home/alice/wt/",
+      "proof-of-work/bd-108/trace.zip",
+    );
+
+    expect(result).toBe("/home/alice/wt/proof-of-work/bd-108/trace.zip");
+  });
+
+  it("falls back to the workspace path for a non-proof-relative path", () => {
+    const result = resolveTracePath(
+      { kind: "external", path: "/abs/base" },
+      "/home/alice/wt",
+      "other/dir/trace.zip",
+    );
+
+    expect(result).toBe("/home/alice/wt/other/dir/trace.zip");
+  });
+
+  it("falls back to the workspace path when the proof root is unknown", () => {
+    const result = resolveTracePath(undefined, "/home/alice/wt", "proof-of-work/bd-108/trace.zip");
+
+    expect(result).toBe("/home/alice/wt/proof-of-work/bd-108/trace.zip");
+  });
+});
+
+describe("traceFileAvailable", () => {
+  it("is true when the trace entry is listed", async () => {
+    const files = fakeFiles({
+      listFiles: async (path) => ({
+        path,
+        entries: [
+          { name: "notes.md", path: `${path}/notes.md`, type: "file" },
+          { name: "trace.zip", path: `${path}/trace.zip`, type: "file" },
+        ],
+      }),
+    });
+
+    await expect(traceFileAvailable(files, "/abs/base/bd-108/trace.zip")).resolves.toBe(true);
+  });
+
+  it("is false when the trace entry is gone", async () => {
+    const files = fakeFiles({
+      listFiles: async (path) => ({
+        path,
+        entries: [{ name: "notes.md", path: `${path}/notes.md`, type: "file" }],
+      }),
+    });
+
+    await expect(traceFileAvailable(files, "/abs/base/bd-108/trace.zip")).resolves.toBe(false);
+  });
+
+  it("is false when the directory listing rejects", async () => {
+    const files = fakeFiles({ listFiles: () => rejectWith("Path does not exist") });
+
+    await expect(traceFileAvailable(files, "/abs/base/bd-108/trace.zip")).resolves.toBe(false);
+  });
+
+  it("is false when the matching entry is a directory", async () => {
+    const files = fakeFiles({
+      listFiles: async (path) => ({
+        path,
+        entries: [{ name: "trace.zip", path: `${path}/trace.zip`, type: "directory" }],
+      }),
+    });
+
+    await expect(traceFileAvailable(files, "/abs/base/bd-108/trace.zip")).resolves.toBe(false);
+  });
+
+  it("is false for the filesystem root without listing a directory", async () => {
+    const listed = [];
+    const files = fakeFiles({
+      listFiles: async (path) => {
+        listed.push(path);
+        return { path, entries: [{ name: "", path, type: "file" }] };
+      },
+    });
+
+    await expect(traceFileAvailable(files, "/")).resolves.toBe(false);
+    // The empty basename must short-circuit before any listing, so an empty-name
+    // entry can never be treated as the trace.
+    expect(listed).toEqual([]);
+  });
+
+  it("is false for a trailing-slash path without looking up a parent", async () => {
+    const listed = [];
+    const files = fakeFiles({
+      listFiles: async (path) => {
+        listed.push(path);
+        return { path, entries: [{ name: "trace.zip", path, type: "file" }] };
+      },
+    });
+
+    await expect(traceFileAvailable(files, "/abs/base/bd-108/trace.zip/")).resolves.toBe(false);
+    expect(listed).toEqual([]);
   });
 });
 

@@ -445,7 +445,7 @@ are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 | Extension | Renderer | Notes |
 |---|---|---|
 | `.cast` | [asciinema-player](https://github.com/asciinema/asciinema-player) — terminal playback with play/pause, speed control, resize | Loaded from `vendor/asciinema-player.min.js`. Configured with `fit: "width"`, `terminalFontSize: "small"` |
-| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace --host 0.0.0.0 --port 9323` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the viewer through the Tailscale service at `https://playwright-trace.platy-ilish.ts.net/` (DOM snapshots, scrubbable screencast, network, console). `--host 0.0.0.0` is Playwright's documented tailnet-facing bind host (`TRACE_VIEWER_HOST`), so the server covers the `127.0.0.1` backend the Tailscale serve target uses. If `playwright` is not on `PATH`, run it from the devShell: `direnv exec . playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>` (or `nix develop -c playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>`) |
+| `.trace.zip`, `.zip` | **Open in Trace Viewer** button | Starts `playwright show-trace --host 0.0.0.0 --port 9323` (provided by the Nix runtime env on `PATH`) in a workspace terminal and opens the viewer through the Tailscale service at `https://playwright-trace.platy-ilish.ts.net/` (DOM snapshots, scrubbable screencast, network, console). Before launching, the panel stops only the previous viewer recorded in its viewer-owned pidfile (`${XDG_RUNTIME_DIR:-$HOME/.cache/belayd}/playwright-trace.pid`) so `--port 9323` is reclaimed instead of Playwright silently binding a random port; after launching it verifies via `ss -ltnp` that the launched PID owns `:9323` before writing the pidfile, and aborts its own launch (never killing an unknown owner) if a pre-existing process still owns the port. `--host 0.0.0.0` is Playwright's documented tailnet-facing bind host (`TRACE_VIEWER_HOST`), so the server covers the `127.0.0.1` backend the Tailscale serve target uses. The command resolves the trace against the persistent external proof base, so a trace still loads after its worktree is merged/removed; if the artifact is actually gone, the panel shows a clear "no longer available" state instead of launching. If `playwright` is not on `PATH`, run it from the devShell: `direnv exec . playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>` (or `nix develop -c playwright show-trace --host 0.0.0.0 --port 9323 <trace.zip>`) |
 | `.webm` (legacy) | Native HTML5 `<video>` with controls | Play, pause, volume, fullscreen; or an explicit "Could not load media preview" error if preview bytes are unavailable |
 | `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.ico`, `.avif` | Inline `<img>` | Rendered via pi-web's streaming preview endpoint; fitted with `max-width`/`max-height` + `object-fit: contain`, `referrerpolicy="no-referrer"`, `decoding="async"` |
 | `.md` | [marked](https://marked.js.org/) → sanitized HTML | GFM tables, autolinks, task lists. Script tags and `on*` attributes are stripped |
@@ -561,6 +561,46 @@ path.
   (`BELAYD_PROOF_DIR` users list that path instead).
 - The setting applies on the next file request; click ↻ **Refresh** or reload
   the browser tab if the existing view is stale.
+
+#### Trace Viewer opens but shows "Could not load trace … Local Network Access"
+
+A valid trace can show Playwright's generic *"Could not load trace from file?path=…"*
+message when the tab reaches a **different** viewer than the one just launched
+(bd-108).
+
+- Cause 1 — stale server on `:9323`: `playwright show-trace` treats `--port` as a
+  preference. If a previous viewer still owns `:9323`, the new process silently
+  binds a random port while the Tailscale service stays fronting `:9323`, so the
+  tab talks to the stale server. The panel now records the viewer PID in
+  `${XDG_RUNTIME_DIR:-$HOME/.cache/belayd}/playwright-trace.pid` and stops only
+  that PID (after confirming its cmdline is a `playwright ... show-trace`
+  process) before starting the new server. Before launching it checks with
+  `ss -ltn` that `:9323` has no LISTEN socket; if an **unrecorded** foreign owner
+  still holds it, the command prints an error and exits without launching (it
+  never kills that unknown process). After launching, it verifies with
+  `ss -ltnp` that the launched PID (or a direct child) actually owns `:9323`
+  before writing the pidfile and pointing the tab at the Tailscale URL; if
+  another process still owns the port it stops its own launch (escalating to
+  `kill -9` for its own PID only) and exits with an error. The panel waits a
+  short grace window on the terminal run's completion and only then navigates
+  the pending tab, so a shell abort never lands the browser on the stale viewer.
+  If the pidfile points at a live non-`show-trace` process, the command refuses
+  to kill it and exits with an error. If `ss` is not available, ownership cannot
+  be verified: the command prints a warning and proceeds best-effort.
+- Cause 2 — worktree-relative trace path: after a worktree is merged/removed,
+  its `proof-of-work/<task>/...` path no longer resolves, so the server 404s and
+  the viewer shows the same generic message. The panel now resolves the trace
+  against the persistent external proof base (`resolveTracePath`), so the
+  artifact survives worktree removal.
+- If the artifact truly is gone, the panel renders *"This proof artifact is no
+  longer available."* before launching anything (instead of the generic LNA
+  text). Click ↻ **Refresh** to rescan.
+
+**Known limitation — concurrent clicks.** The pidfile handshake is not atomic.
+Two near-simultaneous **Open in Trace Viewer** clicks can race (each reads the
+same previous PID, or the second launches before the first records its PID), so
+one launch may be refused or its pidfile overwritten. This is accepted for the
+single-user flow; wait a moment and click again if it happens.
 
 #### "Could not start the Trace Viewer."
 

@@ -105,6 +105,74 @@ export async function readProofFile(files, filePath) {
   }
 }
 
+/**
+ * Resolve a panel file path to the absolute path `playwright show-trace`
+ * should serve.
+ *
+ * External mode lists the proof base by absolute path, so an absolute panel
+ * path passes through unchanged. Legacy or logical callers may hand us the
+ * workspace-relative `proof-of-work/<rest>` view; map that onto the persistent
+ * external base so a trace survives worktree removal. Workspace mode keeps the
+ * workspace-relative path, which is the real location in that mode.
+ */
+export function resolveTracePath(proofRoot, workspacePath, filePath) {
+  if (proofRoot !== undefined && proofRoot.kind === "external" && !filePath.startsWith("/")) {
+    const rest = stripProofOfWorkPrefix(filePath);
+    if (rest !== undefined) {
+      return joinPath(proofRoot.path, rest);
+    }
+  }
+  return joinPath(workspacePath, filePath);
+}
+
+/**
+ * Confirm a resolved absolute proof file still exists by listing its parent
+ * directory. Returns false when the directory or entry is gone, or when the
+ * listing is denied. Never rejects.
+ */
+export async function traceFileAvailable(files, absolutePath) {
+  const { dir, name } = splitAbsolutePath(absolutePath);
+  // A trailing-slash/empty path (or the filesystem root) has no basename, so it
+  // must never be allowed to match a listing entry by an empty name.
+  if (name === "" || name === "." || name === "..") return false;
+  try {
+    const listing = await files.listFiles(dir);
+    return listing.entries.some((entry) => entry.name === name && entry.type !== "directory");
+  } catch {
+    return false;
+  }
+}
+
+function stripProofOfWorkPrefix(filePath) {
+  if (filePath === PROOF_OF_WORK_ROOT) return "";
+  const prefix = `${PROOF_OF_WORK_ROOT}/`;
+  return filePath.startsWith(prefix) ? filePath.slice(prefix.length) : undefined;
+}
+
+function joinPath(base, filePath) {
+  if (filePath.startsWith("/")) return filePath;
+  const trimmed = base.replace(/\/+$/, "");
+  return filePath === "" ? `${trimmed}/` : `${trimmed}/${filePath}`;
+}
+
+function splitAbsolutePath(absolutePath) {
+  // A file path with a trailing slash, or the empty string, has no basename.
+  // Return an empty name so the caller's entry match can never succeed, and
+  // point `dir` at the normalized path rather than an unintended parent.
+  if (absolutePath === "" || /\/+$/.test(absolutePath)) {
+    const dir = absolutePath.replace(/\/+$/, "") || "/";
+    return { dir, name: "" };
+  }
+  if (!absolutePath.startsWith("/")) {
+    const slash = absolutePath.lastIndexOf("/");
+    if (slash === -1) return { dir: ".", name: absolutePath };
+    return { dir: absolutePath.slice(0, slash) || ".", name: absolutePath.slice(slash + 1) };
+  }
+  const slash = absolutePath.lastIndexOf("/");
+  if (slash <= 0) return { dir: "/", name: absolutePath.slice(1) };
+  return { dir: absolutePath.slice(0, slash), name: absolutePath.slice(slash + 1) };
+}
+
 /** Return the lowercase file extension including the leading dot. */
 export function getFileExtension(path) {
   const dot = path.lastIndexOf(".");
