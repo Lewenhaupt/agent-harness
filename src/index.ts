@@ -194,7 +194,10 @@ export type {
 export { classifyRunOutcome, spawnDetachedRun, watchRunCompletion } from "./run-detached.js";
 export type { RunManifest } from "./run-manifest.js";
 export {
+  completeRunByUser,
+  listPendingUserCompletions,
   listRuns,
+  markRunDelivered,
   RunStatus,
   readRunManifest,
   runManifestPath,
@@ -203,7 +206,7 @@ export {
   setRunStatus,
   writeRunManifest,
 } from "./run-manifest.js";
-export type { PhaseSessionRecord } from "./session-naming.js";
+export type { PhaseSessionRecord, SubagentSessionRef } from "./session-naming.js";
 export {
   computeOrchestratorSessionName,
   computePlanningSubagentSessionName,
@@ -212,9 +215,12 @@ export {
   generateShortRunId,
   IN_SESSION_RETRY_LIMIT,
   isValidTaskId,
+  parseSubagentSessionName,
   resolvePhaseInvocation,
   resolveProjectSessionExists,
 } from "./session-naming.js";
+export type { TranscriptEntry } from "./session-transcript.js";
+export { lastAssistantText } from "./session-transcript.js";
 export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
 export {
   buildSpawnArgs,

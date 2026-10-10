@@ -10,6 +10,7 @@ import {
   generateShortRunId,
   isValidTaskId,
   type PhaseSessionRecord,
+  parseSubagentSessionName,
   resolvePhaseInvocation,
   resolveProjectSessionExists,
 } from "../session-naming.js";
@@ -44,6 +45,110 @@ describe("computeSubagentSessionName", () => {
   it("works with subtask notation", () => {
     const name = computeSubagentSessionName("bd-16.2", "scout", "abc");
     expect(name).toBe("belayd-bd-16.2-sub-scout-abc");
+  });
+});
+
+describe("parseSubagentSessionName", () => {
+  it("parses a plain phase sub-agent session name", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-a1b2c3")).toEqual({
+      taskId: "bd-42",
+      phase: "implement",
+      shortRunId: "a1b2c3",
+    });
+  });
+
+  it("parses a subtask id", () => {
+    expect(parseSubagentSessionName("belayd-bd-42.1-sub-review-x9y8z7")).toEqual({
+      taskId: "bd-42.1",
+      phase: "review",
+      shortRunId: "x9y8z7",
+    });
+  });
+
+  it("strips a trailing -retry-N epoch suffix", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-abc123-retry-3")).toEqual({
+      taskId: "bd-42",
+      phase: "implement",
+      shortRunId: "abc123",
+    });
+  });
+
+  it("strips a trailing -run-N epoch suffix", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-abc123-run-5")).toEqual({
+      taskId: "bd-42",
+      phase: "implement",
+      shortRunId: "abc123",
+    });
+  });
+
+  it("strips a trailing -fallback-N epoch suffix", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-test-abc123-fallback-1")).toEqual({
+      taskId: "bd-42",
+      phase: "test",
+      shortRunId: "abc123",
+    });
+  });
+
+  it("returns undefined for a planning session name", () => {
+    expect(parseSubagentSessionName("belayd-planning-sub-scout-abc123")).toBe(undefined);
+  });
+
+  it("returns undefined for an orchestrator session name", () => {
+    expect(parseSubagentSessionName("belayd-bd-42")).toBe(undefined);
+  });
+
+  it("returns undefined for malformed names", () => {
+    expect(parseSubagentSessionName("")).toBe(undefined);
+    expect(parseSubagentSessionName("belayd-bd-42-sub--abc123")).toBe(undefined);
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement")).toBe(undefined);
+    expect(parseSubagentSessionName("belayd-bd-42-implement-abc123")).toBe(undefined);
+    expect(parseSubagentSessionName("belayd-99-sub-implement-abc123")).toBe(undefined);
+  });
+
+  it("rejects a phase containing a dash", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-user-guide-abc123")).toBe(undefined);
+  });
+
+  it("round-trips a computed session name", () => {
+    const name = computeSubagentSessionName("bd-77", "proof", "run42");
+    expect(parseSubagentSessionName(name)).toEqual({
+      taskId: "bd-77",
+      phase: "proof",
+      shortRunId: "run42",
+    });
+  });
+
+  it("is case-sensitive so the taskId round-trips to the orchestrator name", () => {
+    // Session names are lowercase by construction; an uppercase id must not
+    // silently parse into a differently-cased taskId.
+    expect(parseSubagentSessionName("belayd-BD-42-sub-implement-abc123")).toBe(undefined);
+  });
+
+  it("is case-sensitive on the phase token", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-Implement-abc123")).toBe(undefined);
+  });
+
+  it("strips a multi-digit epoch suffix", () => {
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-abc123-retry-12")).toEqual({
+      taskId: "bd-42",
+      phase: "implement",
+      shortRunId: "abc123",
+    });
+  });
+
+  it("does not strip an epoch-like suffix that is not numeric", () => {
+    // The trailing token must be exactly `<kind>-<digits>`, otherwise the
+    // name is not a recognizable session name at all.
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-abc123-retry-x")).toBe(undefined);
+    expect(parseSubagentSessionName("belayd-bd-42-sub-implement-abc123-run-")).toBe(undefined);
+  });
+
+  it("returns undefined for a non-string input", () => {
+    // The public shape is string, but this parser is part of the recovery
+    // path and must no-op rather than throw on a malformed ctx value.
+    expect(parseSubagentSessionName(undefined as unknown as string)).toBe(undefined);
+    expect(parseSubagentSessionName(null as unknown as string)).toBe(undefined);
+    expect(parseSubagentSessionName(42 as unknown as string)).toBe(undefined);
   });
 });
 

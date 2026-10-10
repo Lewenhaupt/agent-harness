@@ -198,6 +198,55 @@ ls -lt ~/.pi/agent/sessions/--home-alice-code-myproject--/ | head
 
 You can also use `pi --resume | grep belayd-bd-42`.
 
+## Recovering an interrupted sub-agent (`/belayd-complete`)
+
+Phase sub-agent runs are spawned detached and their result is delivered by an
+in-process watcher (`watchRunCompletion`) owned by the orchestrator. Delivery
+only happens when **both** the child settles and the orchestrator that owns the
+watcher is still alive. If either side is interrupted the phase appears stuck:
+
+- **Orchestrator restarted** — the watcher is gone; `scanForInterruptedRuns`
+  flips `.belayd/runs/<runId>.json` to `interrupted`.
+- **Child killed/stalled** — a failure follow-up is delivered, but the
+  sub-agent's actual final answer is lost.
+
+`/belayd-complete` is the manual, out-of-band recovery path. Run it **inside
+the sub-agent session** (e.g. after resuming the dead child's session, or after
+the orchestrator restarted):
+
+```
+/belayd-complete [report text]
+```
+
+With no argument it uses the session's **last assistant message**; pass an
+explicit report to override it. The handler:
+
+1. Parses the current session name (`parseSubagentSessionName`) — only phase
+   sub-agent sessions (`belayd-<taskId>-sub-<phase>-<runId>`) are eligible;
+   planning sessions and orchestrator sessions get a clear no-op message.
+   A trailing `-retry-<n>` / `-run-<n>` / `-fallback-<n>` epoch is tolerated.
+2. Finds the matching run manifest in `.belayd/runs/` (by session name, then by
+   parsed components / run id). No manifest is an error — the run cannot be
+   mapped back to the gate.
+3. `completeRunByUser` marks the manifest `completed` with `completedBy:
+   "user"`, `completionReport`, `completedAt`, and clears `failureReason`.
+4. Best-effort wakes the orchestrator through the pi-web session daemon by
+   prompting it with the sentinel `[belayd-complete:<runId>]`.
+
+The orchestrator recovers the result through any of three paths:
+
+- the **input sentinel** (daemon wake) reconciles the specific run;
+- `session_start` (after `resumeWorkflowFromDisk`) reconciles all pending
+  completions — covers an orchestrator restart;
+- `before_agent_start` reconciles on the next turn — file-only fallback.
+
+Delivery is exactly once: `deliveredAt` is persisted in the manifest, so a
+repeated sentinel, a later normal settle, or a second restart never duplicates
+the follow-up. A normal settle of the recovered child also leaves the manifest
+alone (`persistStatus` skips a `completedBy: "user"` manifest). On delivery the
+phase is marked complete in the in-memory and persisted gate state, so the
+process gate lets the next phase run.
+
 ## Implementation Details
 
 Session naming is implemented purely in `src/session-naming.ts`:
