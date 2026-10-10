@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   getPhasesForType,
   isValidWorkflowType,
+  parseWorkflowLabel,
   resolveQualityGate,
+  resolveWorkflowSelection,
   resolveWorkflowType,
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
@@ -189,73 +191,88 @@ describe("isValidWorkflowType", () => {
   });
 });
 
+describe("parseWorkflowLabel", () => {
+  it("parses the first valid wf: label", () => {
+    expect(parseWorkflowLabel(["implementation", "wf:chore"])).toEqual({
+      type: "chore",
+      label: "wf:chore",
+    });
+  });
+
+  it("ignores an invalid wf: suffix and keeps scanning", () => {
+    expect(parseWorkflowLabel(["wf:nope", "wf:bugfix"])).toEqual({
+      type: "bugfix",
+      label: "wf:bugfix",
+    });
+  });
+
+  it("returns undefined when no valid wf: label exists", () => {
+    expect(parseWorkflowLabel(["chore", "wf:Nope", "WF:chore"])).toBeUndefined();
+    expect(parseWorkflowLabel([])).toBeUndefined();
+    expect(parseWorkflowLabel()).toBeUndefined();
+  });
+});
+
+describe("resolveWorkflowSelection", () => {
+  it("uses a valid arg with no confirmation", () => {
+    expect(resolveWorkflowSelection("bugfix")).toEqual({
+      type: "bugfix",
+      source: "arg",
+      requiresConfirmation: false,
+    });
+  });
+
+  it("uses a wf: label and requires confirmation", () => {
+    expect(resolveWorkflowSelection(undefined, ["wf:chore"])).toEqual({
+      type: "chore",
+      source: "label",
+      matchedLabel: "wf:chore",
+      requiresConfirmation: true,
+    });
+  });
+
+  it("arg beats a wf: label and skips confirmation", () => {
+    const resolution = resolveWorkflowSelection("hotfix", ["wf:chore"]);
+    expect(resolution).toEqual({ type: "hotfix", source: "arg", requiresConfirmation: false });
+  });
+
+  it("ignores an invalid wf: label", () => {
+    expect(resolveWorkflowSelection(undefined, ["wf:nope"])).toEqual({
+      type: "feature",
+      source: "default",
+      requiresConfirmation: false,
+    });
+  });
+
+  it("ignores plain workflow-name and legacy labels", () => {
+    for (const label of ["chore", "bug", "investigation", "bugfix", "feature"]) {
+      expect(resolveWorkflowSelection(undefined, [label]).type).toBe("feature");
+    }
+  });
+
+  it("does not infer a type from a bd-17-style title", () => {
+    // Title is deliberately not an input anymore: this string previously
+    // matched the chore pattern on the word "CI".
+    expect(resolveWorkflowSelection(undefined, []).type).toBe("feature");
+  });
+
+  it("returns feature by default", () => {
+    expect(resolveWorkflowSelection()).toEqual({
+      type: "feature",
+      source: "default",
+      requiresConfirmation: false,
+    });
+    expect(resolveWorkflowSelection("invalid", ["unknown"]).type).toBe("feature");
+    expect(resolveWorkflowSelection("").type).toBe("feature");
+  });
+});
+
 describe("resolveWorkflowType", () => {
-  it("returns the typeArg when valid", () => {
+  it("is a thin wrapper returning the resolved type", () => {
     expect(resolveWorkflowType("bugfix")).toBe("bugfix");
-    expect(resolveWorkflowType("chore")).toBe("chore");
-  });
-
-  it("falls back to labels when typeArg is undefined", () => {
-    expect(resolveWorkflowType(undefined, ["chore"])).toBe("chore");
-  });
-
-  it("picks the first matching label", () => {
-    expect(resolveWorkflowType(undefined, ["bugfix", "chore"])).toBe("bugfix");
-  });
-
-  it("returns feature when typeArg is invalid and no labels match", () => {
-    expect(resolveWorkflowType("invalid", ["unknown"])).toBe("feature");
-  });
-
-  it("returns feature when no typeArg and no labels", () => {
+    expect(resolveWorkflowType(undefined, ["wf:chore"])).toBe("chore");
+    expect(resolveWorkflowType(undefined, ["chore"])).toBe("feature");
     expect(resolveWorkflowType()).toBe("feature");
-    expect(resolveWorkflowType(undefined)).toBe("feature");
-    expect(resolveWorkflowType(undefined, [])).toBe("feature");
-  });
-
-  it("ignores empty string typeArg", () => {
-    expect(resolveWorkflowType("")).toBe("feature");
-  });
-
-  it("typeArg takes priority over labels", () => {
-    expect(resolveWorkflowType("hotfix", ["feature"])).toBe("hotfix");
-  });
-
-  it("maps label 'bug' to bugfix", () => {
-    expect(resolveWorkflowType(undefined, ["bug"])).toBe("bugfix");
-  });
-
-  it("maps label 'investigation' to research", () => {
-    expect(resolveWorkflowType(undefined, ["investigation"])).toBe("research");
-  });
-
-  it("exact workflow type label still works", () => {
-    expect(resolveWorkflowType(undefined, ["chore", "bug"])).toBe("chore");
-  });
-
-  it("resolves from title keywords", () => {
-    expect(resolveWorkflowType(undefined, undefined, "Fix login bug")).toBe("bugfix");
-    expect(resolveWorkflowType(undefined, undefined, "Refactor auth module")).toBe("refactor");
-    expect(resolveWorkflowType(undefined, undefined, "Research new DB options")).toBe("research");
-    expect(resolveWorkflowType(undefined, undefined, "Investigate performance issue")).toBe(
-      "research",
-    );
-    expect(resolveWorkflowType(undefined, undefined, "Setup CI pipeline")).toBe("chore");
-    expect(resolveWorkflowType(undefined, undefined, "Update README")).toBe("documentation");
-    expect(resolveWorkflowType(undefined, undefined, "URGENT: fix production bug")).toBe("hotfix");
-  });
-
-  it("label mapping beats title keywords", () => {
-    // Label "bug" maps to bugfix — checked before title keywords
-    expect(resolveWorkflowType(undefined, ["bug"], "Refactor auth module")).toBe("bugfix");
-  });
-
-  it("falls back to feature for unrecognized title", () => {
-    expect(resolveWorkflowType(undefined, undefined, "Add user authentication")).toBe("feature");
-  });
-
-  it("typeArg takes priority over title", () => {
-    expect(resolveWorkflowType("hotfix", undefined, "Implement new feature")).toBe("hotfix");
   });
 });
 

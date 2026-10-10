@@ -181,7 +181,9 @@ Portainer UI: `https://localhost:9443`.
 Tasks live in **Beads** (`bd`). Load the **beads** skill for the CLI reference.
 **Never close tasks** — move finished work to `in_progress` with the `human` label
 (`bd update <ID> --status in_progress --add-label human`);
-the human closes via `wt merge`. Workflow type is resolved from task labels.
+the human closes via `wt merge`. Workflow type is resolved only from an explicit
+type argument or a namespaced `wf:<type>` label (e.g. `wf:chore`); title
+keywords and plain labels are ignored and default to `feature`.
 
 ## Code exploration
 

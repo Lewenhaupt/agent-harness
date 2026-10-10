@@ -23,6 +23,10 @@ const WorkflowStateSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   taskId: z.string(),
   workflowType: z.string(),
+  // Provenance for the resolved type (bd-106). Optional so a workflow.json
+  // written before this change still parses.
+  resolutionSource: z.enum(["arg", "label", "default"]).optional(),
+  matchedLabel: z.string().optional(),
   branch: z.string(),
   originalCwd: z.string(),
   phaseOrder: z.array(z.string()),
