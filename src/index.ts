@@ -74,6 +74,11 @@ export {
   runArchify,
   runArchifyText,
 } from "./archify.js";
+export {
+  BASH_DEFAULT_TIMEOUT_SECONDS,
+  BASH_MAX_TIMEOUT_SECONDS,
+  resolveBashTimeout,
+} from "./bash-timeout.js";
 export type { BdCommandParse, BdCommandValidation } from "./bd-command.js";
 export {
   BD_ALLOWED_SUBCOMMANDS,
