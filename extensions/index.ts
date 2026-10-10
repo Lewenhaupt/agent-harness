@@ -18,7 +18,12 @@ import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  BashToolCallEvent,
+  ExtensionAPI,
+  ExtensionContext,
+  ToolCallEvent,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
@@ -87,6 +92,7 @@ import {
   readStackNode,
   resolveArchifyHome,
   resolveAutoRebaseEnabled,
+  resolveBashTimeout,
   resolveModelSpec,
   resolveQualityGate,
   resolveStackChain,
@@ -751,6 +757,20 @@ function validateArchifyParams(params: ArchifyRawParams): ArchifyParamValidation
     default:
       return { ok: false, error: `Unknown command: ${command}.` };
   }
+}
+
+/**
+ * Narrow a `tool_call` event to pi's built-in bash input.
+ *
+ * Pi's `ToolCallEvent` union does not discriminate on `toolName` because
+ * `CustomToolCallEvent.toolName` is `string` and therefore overlaps every
+ * literal, so a direct `event.toolName === "bash"` check does not narrow. The
+ * predicate accepts pi's canonical "bash" plus the legacy "Bash" casing used
+ * by the other guards in this extension, and narrows `input` to `BashToolInput`
+ * so the in-place timeout patch typechecks without widening it to `unknown`.
+ */
+function isBashToolCallEvent(event: ToolCallEvent): event is BashToolCallEvent {
+  return event.toolName === "bash" || event.toolName === "Bash";
 }
 
 export default function belaydAgentHarness(pi: ExtensionAPI): void {
@@ -3748,6 +3768,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         details: { messages: [], usage: emptyUsage(), exitCode: 0 },
       };
     },
+  });
+
+  // ── Bash timeout enforcement ───────────────────────────────────────
+  // Separate from the process-gate `tool_call` handler below so the gate's
+  // early returns cannot skip it. Mutates `event.input` in place (pi applies
+  // the patch before execution and does not re-validate) instead of blocking,
+  // guaranteeing every bash call — orchestrator or sub-agent — is bounded.
+  // Registered first, do not reorder: pi's emitToolCall short-circuits once a
+  // handler returns `block: true`, so moving this below the process gate would
+  // let a rejected call skip the timeout patch.
+  pi.on("tool_call", (event) => {
+    if (!isBashToolCallEvent(event)) return {};
+    event.input.timeout = resolveBashTimeout(event.input);
+    return {};
   });
 
   // ── Process gate: block out-of-sequence tool calls ──────────────────

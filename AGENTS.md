@@ -119,6 +119,22 @@ files written by the external CLI — both expected.
 / `browser-check` (need Chrome via `$ARCHIFY_CHROME`), and `migrate` are
 intentionally outside the tool surface.
 
+### Bash timeout enforcement (`bash-timeout.ts`)
+
+Every agent bash call is bounded by hardcoded constants in `src/bash-timeout.ts`
+(no env var or settings knob): an omitted or unusable timeout becomes
+`BASH_DEFAULT_TIMEOUT_SECONDS` (600s), and an explicit timeout above
+`BASH_MAX_TIMEOUT_SECONDS` (1800s) is clamped. `resolveBashTimeout` returns a
+positive finite value no greater than the cap — required because pi does not
+re-validate mutated `tool_call` input.
+
+The extension registers a dedicated `tool_call` handler in `extensions/index.ts`
+(separate from the process-gate handler so the gate's early returns cannot skip
+it). It mutates `event.input.timeout` in place for the `bash`/`Bash` tool rather
+than blocking, so it applies to orchestrator and sub-agent sessions alike.
+Commands that legitimately need more than 30 minutes must be restructured
+(background/detached).
+
 ## Checking local services
 
 Two runtimes back the harness. Inspect them when diagnosing session,
