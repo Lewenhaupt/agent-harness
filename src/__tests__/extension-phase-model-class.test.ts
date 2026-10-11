@@ -329,10 +329,10 @@ describe("extension modelClass threading", () => {
     const ctx = makeCtx("mc-override", workDir);
     await commands.get("belayd")?.handler("bd-91 feature --no-worktree", ctx);
 
-    // glm-5.2 is "standard" by itself and the implementer agent declares
+    // glm-5.3-flash is "standard" by itself and the implementer agent declares
     // "frontier"; the explicit override class must beat both.
     registryState.featureOverrides = {
-      implement: { model: "opencode-go/glm-5.2", modelClass: "fast" },
+      implement: { model: "opencode-go/glm-5.3-flash", modelClass: "fast" },
     };
 
     const implement = tools.get("belayd_implement");
@@ -344,7 +344,7 @@ describe("extension modelClass threading", () => {
     const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
       | { model: string; modelClass?: string }
       | undefined;
-    expect(options?.model).toBe("opencode-go/glm-5.2");
+    expect(options?.model).toBe("opencode-go/glm-5.3-flash");
     expect(options?.modelClass).toBe("fast");
   });
 

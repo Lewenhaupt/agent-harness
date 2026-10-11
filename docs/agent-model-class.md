@@ -76,7 +76,7 @@ Expected behavior:
   | `belayd-scout` | `fast` → `opencode-go/mimo-v2.5` |
   | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-reviewer` | `standard` → `opencode-go/glm-5.2` |
+  | `belayd-reviewer` | `standard` → `opencode-go/glm-5.3-flash` |
   | `belayd-tester` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
@@ -88,17 +88,17 @@ The tier-to-primary mapping used by `primaryModelOf` is:
 | `modelClass` | Primary model |
 | --- | --- |
 | `frontier` | `opencode-go/deepseek-v4.1-flash` |
-| `standard` | `opencode-go/glm-5.2` |
+| `standard` | `opencode-go/glm-5.3-flash` |
 | `fast` | `opencode-go/mimo-v2.5` |
 
 - On a quota or transient failure, the next attempt stays within that class:
   the same model on each alternate provider (in `PROVIDER_PREFERENCE` order —
   `opencode-go`, then `llmgateway`, then `openrouter`) is preferred before
   another model in the class. OpenRouter serves the same models under
-  vendor-qualified ids (`glm-5.2` → `z-ai/glm-5.2`, `mimo-v2.5` →
+  vendor-qualified ids (`glm-5.3-flash` → `z-ai/glm-5.3-flash`, `mimo-v2.5` →
   `xiaomi/mimo-v2.5`, `gpt-5.6-luna` → `openai/gpt-5.6-luna`,
   `deepseek-*` → `deepseek/deepseek-*`), so a candidate looks like
-  `openrouter/z-ai/glm-5.2`. A successful result may include a trailing
+  `openrouter/z-ai/glm-5.3-flash`. A successful result may include a trailing
   `[belayd model fallback] ...` note showing the attempted models. With no
   failure, no fallback note is added.
 - A provider-entitlement 403 — a 403 whose body carries subscription wording
@@ -152,15 +152,15 @@ Alternatively, pin an explicit model instead of a class (never both):
 const customAgent: AgentDefinition = {
   name: "belayd-custom-reviewer",
   description: "Review repository changes",
-  model: "opencode-go/glm-5.2",
+  model: "opencode-go/glm-5.3-flash",
   tools: ["read", "grep", "find", "ls", "ast_grep"],
   systemPrompt: "Review the changes and report actionable findings.",
 };
 ```
 
 The model arm still receives class-derived fallback for known models:
-`resolveModelSpec({ model: "opencode-go/glm-5.2" })` returns
-`{ model: "opencode-go/glm-5.2", modelClass: "standard" }`. An unknown
+`resolveModelSpec({ model: "opencode-go/glm-5.3-flash" })` returns
+`{ model: "opencode-go/glm-5.3-flash", modelClass: "standard" }`. An unknown
 explicit model has `modelClass: undefined` and is attempted as-is without
 class expansion. To use a fallback class for an otherwise unknown model,
 declare the `modelClass` arm instead.
@@ -179,7 +179,7 @@ primaryModelOf("fast");
 // "opencode-go/mimo-v2.5"
 
 resolveModelSpec({ modelClass: "standard" });
-// { model: "opencode-go/glm-5.2", modelClass: "standard" }
+// { model: "opencode-go/glm-5.3-flash", modelClass: "standard" }
 
 resolveModelSpec({ model: "vendor/x" });
 // { model: "vendor/x", modelClass: undefined }
@@ -197,9 +197,9 @@ const candidates = candidatesForModel("opencode-go/glm-5.3", "fast");
 //   "opencode-go/deepseek-v4-flash",
 //   "llmgateway/deepseek-v4-flash",
 //   "openrouter/deepseek/deepseek-v4-flash",
-//   "opencode-go/glm-5.2",
-//   "llmgateway/glm-5.2",
-//   "openrouter/z-ai/glm-5.2",
+//   "opencode-go/glm-5.3-flash",
+//   "llmgateway/glm-5.3-flash",
+//   "openrouter/z-ai/glm-5.3-flash",
 // ]
 ```
 
@@ -269,6 +269,6 @@ Assume the agent defaults to model
 | absent | set | Explicit override class | The explicit class replaces the agent class, even if it differs from the agent model's implicit class. |
 | set | set | Explicit override class | The explicit class wins over both the agent class and the override model's implicit class. |
 
-For example, an implement override of `{ model: "opencode-go/glm-5.2" }`
+For example, an implement override of `{ model: "opencode-go/glm-5.3-flash" }`
 passes no explicit class, so it derives `standard`; an override of
-`{ model: "opencode-go/glm-5.2", modelClass: "fast" }` uses `fast` instead.
+`{ model: "opencode-go/glm-5.3-flash", modelClass: "fast" }` uses `fast` instead.

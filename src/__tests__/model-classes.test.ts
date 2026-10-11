@@ -65,11 +65,11 @@ describe("modelClassOf", () => {
   it("resolves a class from a provider-qualified model", () => {
     expect(modelClassOf("opencode-go/mimo-v2.5")).toBe("fast");
     expect(modelClassOf("llmgateway/deepseek-v4.1-flash")).toBe("frontier");
-    expect(modelClassOf("opencode-go/glm-5.2")).toBe("standard");
+    expect(modelClassOf("opencode-go/glm-5.3-flash")).toBe("standard");
   });
 
   it("resolves a class from an OpenRouter vendor-qualified id", () => {
-    expect(modelClassOf("openrouter/z-ai/glm-5.2")).toBe("standard");
+    expect(modelClassOf("openrouter/z-ai/glm-5.3-flash")).toBe("standard");
     expect(modelClassOf("openrouter/deepseek/deepseek-v4.1-flash")).toBe("frontier");
     expect(modelClassOf("openrouter/xiaomi/mimo-v2.5")).toBe("fast");
   });
@@ -93,9 +93,9 @@ describe("resolveModelCandidates", () => {
       "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
-      "opencode-go/glm-5.2",
-      "llmgateway/glm-5.2",
-      "openrouter/z-ai/glm-5.2",
+      "opencode-go/glm-5.3-flash",
+      "llmgateway/glm-5.3-flash",
+      "openrouter/z-ai/glm-5.3-flash",
     ]);
   });
 
@@ -182,15 +182,15 @@ describe("candidatesForModel", () => {
   it("expands a bare id when an explicit class is provided", () => {
     expect(candidatesForModel("glm-5.2", "fast")).toEqual([
       "glm-5.2",
-      "opencode-go/glm-5.2",
-      "llmgateway/glm-5.2",
-      "openrouter/z-ai/glm-5.2",
       "opencode-go/mimo-v2.5",
       "llmgateway/mimo-v2.5",
       "openrouter/xiaomi/mimo-v2.5",
       "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
+      "opencode-go/glm-5.3-flash",
+      "llmgateway/glm-5.3-flash",
+      "openrouter/z-ai/glm-5.3-flash",
     ]);
   });
 });
@@ -241,7 +241,7 @@ describe("model class coverage", () => {
 describe("primaryModelOf", () => {
   it("resolves each class to its first-preference-provider primary", () => {
     expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(primaryModelOf("standard")).toBe("opencode-go/glm-5.2");
+    expect(primaryModelOf("standard")).toBe("opencode-go/glm-5.3-flash");
     expect(primaryModelOf("fast")).toBe("opencode-go/mimo-v2.5");
   });
 });
@@ -249,7 +249,7 @@ describe("primaryModelOf", () => {
 describe("resolveModelSpec", () => {
   it("resolves a modelClass-only spec to the class primary", () => {
     expect(resolveModelSpec({ modelClass: "standard" })).toEqual({
-      model: "opencode-go/glm-5.2",
+      model: "opencode-go/glm-5.3-flash",
       modelClass: "standard",
     });
   });
