@@ -14,11 +14,23 @@ pre-commit:
     - name: lint (full)
       run: pnpm lint
 
-# Typecheck and tests moved off the commit path to keep pre-commit short —
-# the longer the hook runs, the larger the window for the TTY hang.
+# Typecheck, tests, build, and the flake package build are moved off the
+# commit path to keep pre-commit short — the longer the hook runs, the larger
+# the window for the TTY hang.
 pre-push:
   jobs:
     - name: typecheck
       run: CI=1 pnpm typecheck
     - name: tests
       run: pnpm test
+    # `tsc --noEmit` (typecheck above) skips declaration emit, which can still
+    # fail on private-name leaks; the emit is an explicit acceptance criterion.
+    - name: build
+      run: pnpm build
+    # belayd-harness.pnpmDeps.hash is a fixed-output hash over the full
+    # pnpm-lock.yaml store, so any lockfile change (devDependencies included)
+    # invalidates it. Nothing else in the hook can see that. Gated on the files
+    # that can move the hash; fast when the pinned store is already cached.
+    - name: flake package build (belayd-harness)
+      glob: "{flake.nix,flake.lock,pnpm-lock.yaml,package.json}"
+      run: nix build .#belayd-harness --no-link

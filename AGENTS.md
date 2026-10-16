@@ -58,14 +58,20 @@ The flake's `belayd-harness` derivation bundles every `dependencies` entry from
 install of the lockfile stripped of `peerDependencies`/`devDependencies`).
 `peerDependencies` and `devDependencies` are **not** bundled.
 
-When the lockfile changes — adding, removing, or changing a `dependencies`
-entry, or bumping a `peerDependencies` range (`fetchPnpmDeps` hashes the store
-for the full lockfile, peers included):
+When the lockfile changes — adding, removing, or changing any
+`dependencies`, `devDependencies`, or `peerDependencies` entry
+(`fetchPnpmDeps` hashes the pnpm store for the *full* lockfile, so a dev-only
+bump such as a `lefthook` upgrade moves it too, even though the install later
+strips dev and peer deps):
 
 1. `pnpm install` — regenerate `pnpm-lock.yaml`.
 2. `nix build .#belayd-harness` — fails with `hash mismatch … got: sha256-…`.
 3. Copy the `got:` hash into `belayd-harness.pnpmDeps.hash` in `flake.nix`.
 4. Re-run `nix build .#belayd-harness`.
+
+The `pre-push` lefthook job "flake package build (belayd-harness)" runs step 2
+whenever `flake.nix`, `flake.lock`, `package.json`, or `pnpm-lock.yaml` changes,
+so a stale hash fails the push instead of landing on `main`.
 
 ### Archify diagram generation (`archify`)
 
