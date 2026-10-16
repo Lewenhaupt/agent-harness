@@ -20,7 +20,13 @@
       ...
     }:
     {
-      nixosModules.pi-web = { config, lib, pkgs, ... }:
+      nixosModules.pi-web =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         let
           cfg = config.services.belayd-pi-web;
 
@@ -69,7 +75,9 @@
             set -euo pipefail
             ${belayd-shell}/bin/belayd-direnv-setup \
               --toml ${lib.escapeShellArg "${userHome}/.config/direnv/direnv.toml"} \
-              ${lib.concatMapStringsSep " " (p: "--prefix ${lib.escapeShellArg p}") cfg.devShellWhitelistPrefixes}
+              ${lib.concatMapStringsSep " " (
+                p: "--prefix ${lib.escapeShellArg p}"
+              ) cfg.devShellWhitelistPrefixes}
             ${belayd-shell}/bin/belayd-shell-path-setup
           '';
         in
@@ -169,7 +177,10 @@
             hash = "sha256-NZDins8ZZdbFdTk8MBXbD83Q89INz/ZXWDFc6jKkfNo=";
           };
           npmDepsHash = "sha256-Yr3l6WD1B1sTD3UxiHW5yZUiSNAfyrZpL0nFvBBUZcU=";
-          npmFlags = [ "--no-audit" "--no-fund" ];
+          npmFlags = [
+            "--no-audit"
+            "--no-fund"
+          ];
           NEXT_TELEMETRY_DISABLED = "1";
 
           # Drop next/font/google so the build works in the Nix sandbox (no
@@ -251,7 +262,10 @@
           # dist.integrity values (see nix/pi-web-integrity.patch).
           patches = [ ./nix/pi-web-integrity.patch ];
           npmDepsHash = "sha256-aqeDeZhdr30vc+65WlHCvixSUkvc4ZsIYCDJ76gl33k=";
-          npmFlags = [ "--no-audit" "--no-fund" ];
+          npmFlags = [
+            "--no-audit"
+            "--no-fund"
+          ];
           # npm's cacache wants to rewrite index entries during `npm ci`; the
           # npmDeps store path is read-only, so give it a writable copy.
           makeCacheWritable = true;
@@ -510,7 +524,7 @@
             src = ./.;
             pnpm = pkgs.pnpm;
             fetcherVersion = 4;
-            hash = "sha256-bSr2uGMKf4m3k3BGVCfyZDcrXoEMuu86heM/JAhzicQ=";
+            hash = "sha256-daPL7YuRbkvHSNEoyyUOX/DuvZ53/e8qhG6V8jrB8qQ=";
           };
           dontBuild = true;
           installPhase = ''
@@ -618,43 +632,45 @@
         # sessions and the wrapper-managed models.json/settings.json.
         belayd-pi = pi-nix.lib.mkCodingAgent {
           inherit pkgs;
-          modules = [{
-            pi.coding-agent = {
-              # Keep the llm-agents pi build as the base binary; pi.nix only
-              # supplies the wrapper-generation logic here (no pi.cachix.org).
-              package = pi-bare;
-              extensions = [
-                "${belayd-harness}/extensions/index.ts"
-                "${belayd-harness}/extensions/bootstrap.ts"
-                "${belayd-harness}/extensions/honcho-memory.ts"
-                "${belayd-harness}/extensions/llmgateway-refresh.ts"
-                "${belayd-harness}/extensions/stale-file-guard.ts"
-                "${belayd-harness}/extensions/worktree-guard.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-exa/src/index.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-ast-grep/src/index.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-vision-tool/extensions/vision-tool.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@plannotator/pi-extension/index.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@robhowley/pi-openrouter/extensions/openrouter/index.ts"
-                "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native/dist/extensions/agent-browser/index.js"
-              ];
-              skills = [ belayd-skills ];
-              models = ./models.json;
-              settings = {
-                defaultProvider = "llmgateway";
-                defaultModel = "deepseek-v4.1-flash";
-                defaultThinkingLevel = "high";
-                theme = "dark";
+          modules = [
+            {
+              pi.coding-agent = {
+                # Keep the llm-agents pi build as the base binary; pi.nix only
+                # supplies the wrapper-generation logic here (no pi.cachix.org).
+                package = pi-bare;
+                extensions = [
+                  "${belayd-harness}/extensions/index.ts"
+                  "${belayd-harness}/extensions/bootstrap.ts"
+                  "${belayd-harness}/extensions/honcho-memory.ts"
+                  "${belayd-harness}/extensions/llmgateway-refresh.ts"
+                  "${belayd-harness}/extensions/stale-file-guard.ts"
+                  "${belayd-harness}/extensions/worktree-guard.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-exa/src/index.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-ast-grep/src/index.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-vision-tool/extensions/vision-tool.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@plannotator/pi-extension/index.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@robhowley/pi-openrouter/extensions/openrouter/index.ts"
+                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native/dist/extensions/agent-browser/index.js"
+                ];
+                skills = [ belayd-skills ];
+                models = ./models.json;
+                settings = {
+                  defaultProvider = "llmgateway";
+                  defaultModel = "deepseek-v4.1-flash";
+                  defaultThinkingLevel = "high";
+                  theme = "dark";
+                };
+                # -ne disables extension auto-discovery (global dirs, the
+                # settings `extensions`/`packages` arrays, and project
+                # .pi/settings.json) and pi's built-in extensions (explicit -e
+                # paths still work), so the only extensions that load are the
+                # explicit --extension flags above. This is the same trick as
+                # bin/pi: it makes the binary self-contained and immune to
+                # leftover global config double-loading the same tools.
+                extraArgs = [ "-ne" ];
               };
-              # -ne disables extension auto-discovery (global dirs, the
-              # settings `extensions`/`packages` arrays, and project
-              # .pi/settings.json) and pi's built-in extensions (explicit -e
-              # paths still work), so the only extensions that load are the
-              # explicit --extension flags above. This is the same trick as
-              # bin/pi: it makes the binary self-contained and immune to
-              # leftover global config double-loading the same tools.
-              extraArgs = [ "-ne" ];
-            };
-          }];
+            }
+          ];
         };
 
         # The configured pi binary, exposed as `pi` so nix-tmp and the NixOS
@@ -698,9 +714,15 @@
         # streamLayeredImage even though its output is a plain tarball. Arion
         # keys off that flag to decide between executing the image and
         # `docker load`-ing it, so reset it to keep the tarball semantics.
-        tarballImage = args: (pkgs.dockerTools.buildLayeredImage args).overrideAttrs (final: prev: {
-          passthru = (prev.passthru or {}) // { isExe = false; };
-        });
+        tarballImage =
+          args:
+          (pkgs.dockerTools.buildLayeredImage args).overrideAttrs (
+            final: prev: {
+              passthru = (prev.passthru or { }) // {
+                isExe = false;
+              };
+            }
+          );
 
         # Container image for scotty. Arion loads this image and runs it with
         # --no-open (no browser inside the container). /config is created here
@@ -734,7 +756,14 @@
               "HOME=/config"
               "XDG_CONFIG_HOME=/config"
             ];
-            Cmd = [ "scotty" "--host" "0.0.0.0" "--port" "7687" "--no-open" ];
+            Cmd = [
+              "scotty"
+              "--host"
+              "0.0.0.0"
+              "--port"
+              "7687"
+              "--no-open"
+            ];
           };
         };
 
@@ -752,7 +781,21 @@
         inherit devShellTools;
 
         packages = {
-          inherit bead-me-up-scotty pi-web scotty-image pi-web-runtime-env pi pi-bare pi-extensions pi-agent-browser-extension belayd-pi belayd-skills belayd-harness belayd-shell archify;
+          inherit
+            bead-me-up-scotty
+            pi-web
+            scotty-image
+            pi-web-runtime-env
+            pi
+            pi-bare
+            pi-extensions
+            pi-agent-browser-extension
+            belayd-pi
+            belayd-skills
+            belayd-harness
+            belayd-shell
+            archify
+            ;
         };
 
         # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`
