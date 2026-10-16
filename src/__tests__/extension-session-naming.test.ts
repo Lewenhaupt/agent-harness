@@ -1726,6 +1726,112 @@ describe("non-blocking phase runs (bd-41)", () => {
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it("delivers a phase run started with no active gate (post-completion rework)", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-gate-off-deliver-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `gate-off-deliver-${Date.now()}`, cwd });
+
+      // The workflow completed and tore the gate down: gateActive is false but
+      // `currentTaskId` lingers (exactly like the post-commit rework case), so
+      // the orchestrator can still re-delegate a phase outside a workflow.
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+      await tools.get("belayd_stop_task")?.execute("stop", {}, undefined, undefined, ctx);
+
+      const result = (await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "re-review the rework" }, undefined, undefined, ctx)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      expect(result.content[0]?.text).toContain("run started in the background");
+
+      // The promised follow-up must actually arrive.
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(1);
+      });
+      const completion = messages.find((m) => m.customType === "belayd-run-complete");
+      expect(completion).toHaveProperty("details.phaseName", "scout");
+
+      // ...but a run outside a workflow must not resurrect workflow/phase state
+      // or leave a workflow-scoped run manifest behind.
+      expect(readWorkflowStateFromDisk({ cwd })).toBeUndefined();
+      expect(listRuns({ cwd })).toHaveLength(0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not deliver an in-flight run torn down by belayd_stop_task", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-stop-nodeliver-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `stop-nodeliver-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+
+      let releaseScout: (value: unknown) => void = () => {};
+      mockSpawnAgentProcess.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseScout = resolve;
+        }),
+      );
+      await tools
+        .get("belayd_scout")
+        ?.execute("scout", { task: "investigate" }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      });
+
+      // Teardown without a task switch: currentTaskId is unchanged, so only the
+      // run epoch can invalidate the pending watcher.
+      await tools.get("belayd_stop_task")?.execute("stop", {}, undefined, undefined, ctx);
+
+      releaseScout({
+        content: [{ type: "text" as const, text: "done" }],
+        details: {
+          messages: [],
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+            toolCalls: 1,
+          },
+          exitCode: 0,
+        },
+        sessionName: "mocked-scout",
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(runCompletionCount(messages)).toBe(0);
+      expect(readWorkflowStateFromDisk({ cwd })).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("belayd_commit file staging", () => {

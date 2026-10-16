@@ -196,6 +196,16 @@ type SessionState = {
   proofVerifierVerdict?: string;
   /** True after a review run completes and before a later phase runs again. */
   awaitingReviewResponse: boolean;
+  /**
+   * Monotonic teardown counter, bumped whenever the active workflow is torn
+   * down (start/stop task, /plan entry, workflow completion, session restart).
+   * A run captures it at launch so runs started before a teardown can be told
+   * apart from runs started after it. The gate flag alone cannot do this:
+   * `currentTaskId` lingers after a completed/stopped workflow, and a run
+   * started after that teardown begins with `gateActive === false` — exactly
+   * like an in-flight run whose gate was just torn down.
+   */
+  runEpoch: number;
   deliveredRunIds: Set<string>;
   activeRuns: Map<string, { handle: RunHandle; abortController: AbortController }>;
 };
@@ -294,6 +304,7 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
       workflowType: "feature",
       phaseOrder: getPhasesForType("feature"),
       optionalPhases: WORKFLOW_REGISTRY.feature.optionalPhases ?? [],
+      runEpoch: 0,
       deliveredRunIds: new Set(),
       activeRuns: new Map(),
       awaitingReviewResponse: false,
@@ -380,6 +391,9 @@ function resetRunTracking(state: SessionState): void {
 /** Abort every active background run, then forget run bookkeeping. */
 function abortAndResetRunTracking(state: SessionState): void {
   abortActiveRuns(state);
+  // Invalidate the aborted runs' watchers: they must not deliver or mutate
+  // state after the teardown (see SessionState.runEpoch).
+  state.runEpoch += 1;
   state.deliveredRunIds.clear();
 }
 
@@ -2278,6 +2292,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
     state.awaitingReviewResponse = false;
+    state.runEpoch = 0;
     resetRunTracking(state);
     applyToolGate(state);
 
@@ -2662,6 +2677,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
    */
   function reviewLoopHintFor(delivery: RunDelivery, state: SessionState): string {
     if (!delivery.success || delivery.phaseName !== REVIEW_PHASE) return "";
+    // Outside an active workflow there is no next phase to advance to, so the
+    // loop directive would name a phase tool the gate is not driving.
+    if (!state.gateActive) return "";
     // The "advance" tool is the next incomplete phase, not just review's
     // successor, so a late re-review after test points at the right phase.
     const nextIncompletePhase =
@@ -2720,13 +2738,24 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     const abortController = new AbortController();
 
-    // Guard watcher callbacks against a task switch: once a new
-    // belayd_start_task (or stop) aborts and clears these runs, their
-    // still-pending promises must not mutate the new task's state or deliver
-    // the old task's follow-up.
+    // Guard watcher callbacks against a workflow teardown: once
+    // belayd_start_task, belayd_stop_task, or /plan bumps the run epoch (and
+    // aborts/clears these runs), their still-pending promises must not mutate
+    // the new task's state or deliver the old task's follow-up.
+    //
+    // The gate flag alone cannot express this: `currentTaskId` lingers after a
+    // completed/stopped workflow, and a run started AFTER that teardown begins
+    // with `gateActive === false` — exactly like an in-flight run whose gate
+    // was just torn down. The epoch tells the two apart, so a post-completion
+    // rework run still delivers while a torn-down run never does.
+    const epochAtStart = state.runEpoch;
     const taskIdAtStart = state.currentTaskId;
-    const runStillRelevant = (): boolean =>
-      state.gateActive && state.currentTaskId === taskIdAtStart;
+    const runNotSuperseded = (): boolean =>
+      state.runEpoch === epochAtStart && state.currentTaskId === taskIdAtStart;
+    // Workflow state is only advanced while the gate owns the run. A report
+    // run started outside a workflow (e.g. rework after completion) delivers
+    // its output but must not resurrect workflow.json or phase state.
+    const gateOwnsRun = (): boolean => state.gateActive && runNotSuperseded();
 
     // The full task (bead plan / change context included). A fresh-epoch gate
     // retry has no transcript, so it must be re-supplied this full prompt even
@@ -2808,13 +2837,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       onSettled: (info) => {
         // A failed run must still release its activeRuns entry; skip only when
         // the task has already switched (the new task cleared activeRuns).
-        if (runStillRelevant()) state.activeRuns.delete(info.runId);
+        if (runNotSuperseded()) state.activeRuns.delete(info.runId);
       },
       persistStatus: (info) => {
         // An aborted/abandoned run's manifest stays "running" and is flipped
         // to "interrupted" by scanForInterruptedRuns on the next session start
         // (bd-40 semantics) — never persist completion under the wrong task.
-        if (!runStillRelevant()) return;
+        // Manifest and phase state are workflow-scoped: a post-completion
+        // rework run reports its result but leaves no workflow state behind.
+        if (!gateOwnsRun()) return;
         // A manual `/belayd-complete` owns the manifest; a later settle of the
         // resumed/recovered child must not downgrade a user completion.
         if (readRunManifest({ cwd, runId: info.runId })?.completedBy === "user") return;
@@ -2828,7 +2859,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         });
       },
       onPhaseComplete: (info) => {
-        if (!runStillRelevant()) return;
+        if (!gateOwnsRun()) return;
         // A `/belayd-complete` recovery owns the run: once the user's report is
         // delivered (or the manifest is tagged completedBy "user"), a
         // still-running child that settles later must not overwrite the
@@ -2838,7 +2869,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         applyPhaseCompletion(state, info.phaseName, info.result.content?.[0]?.text);
       },
       deliver: (delivery) => {
-        if (!runStillRelevant()) return;
+        if (!runNotSuperseded()) return;
         // A `/belayd-complete` recovery owns delivery: a still-running child
         // that settles after the user marked the run must not deliver its raw
         // output. `reconcileUserCompletions` owns the follow-up and the phase
@@ -4414,6 +4445,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       clearWorkflowState({ cwd: ctx.cwd });
 
       state.gateActive = false;
+      // Any watcher still pending across completion is now stale.
+      state.runEpoch += 1;
       state.completedPhaseNames = [];
       state.workflowType = "feature";
       state.phaseOrder = getPhasesForType("feature");
