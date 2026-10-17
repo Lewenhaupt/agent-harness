@@ -144,7 +144,9 @@ const CODE_EXPLORATION_GUIDANCE = `
 ## Code exploration
 - Prefer \`ast_grep\` over \`grep\`/\`find\` for syntax-aware code searches — use it for structural patterns (function definitions, call expressions, imports) or when text grep would produce false positives.
 - \`ast_grep\` is read-only. Inspect matches before making changes.
-- Use \`grep\`/\`find\` for plain-text and filename searches.`;
+- Use \`grep\`/\`find\` for plain-text and filename searches.
+- Your working directory is already the worktree root — run commands directly, never prefix \`cd <absolute worktree path> &&\`.
+- After an edit, do NOT re-read the file to locate the next anchor — use \`belayd_outline\` for the symbol map or a targeted \`grep -n\` for text.`;
 
 const COMMUNICATION_GUIDANCE = `
 
@@ -554,7 +556,17 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     description:
       "Fast codebase recon — returns structured findings (files, key code, architecture)",
     modelClass: "fast",
-    tools: ["read", "grep", "find", "ls", "bash", "ast_grep", "web_search_exa", "web_fetch_exa"],
+    tools: [
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "bash",
+      "ast_grep",
+      "belayd_outline",
+      "web_search_exa",
+      "web_fetch_exa",
+    ],
     systemPrompt: SCOUT_SYSTEM_PROMPT,
   },
   {
@@ -568,6 +580,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
       "find",
       "ls",
       "ast_grep",
+      "belayd_outline",
       "web_search_exa",
       "web_fetch_exa",
       "deep_search_exa",
@@ -579,7 +592,17 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-implementer",
     description: "Implements code changes following a plan — writes code and tests",
     modelClass: "frontier",
-    tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep", "agent_browser"],
+    tools: [
+      "read",
+      "edit",
+      "write",
+      "bash",
+      "ls",
+      "find",
+      "ast_grep",
+      "belayd_outline",
+      "agent_browser",
+    ],
     systemPrompt: IMPLEMENTER_SYSTEM_PROMPT,
     qualityGate: gateFullValidation,
   },
@@ -594,6 +617,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
       "ls",
       "bash",
       "ast_grep",
+      "belayd_outline",
       "web_search_exa",
       "web_fetch_exa",
       "deep_search_exa",
@@ -607,7 +631,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     modelClass: "frontier",
     // bd-114: no agent_browser. Tester made 0 browser calls across 55 sessions,
     // while the browser prompt section costs ~8.7k tokens every turn.
-    tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep"],
+    tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep", "belayd_outline"],
     systemPrompt: TESTER_SYSTEM_PROMPT,
     qualityGate: gateTests,
   },
@@ -615,7 +639,17 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-userguide",
     description: "Generates user-facing How to Verify and How to Use documentation",
     modelClass: "frontier",
-    tools: ["read", "grep", "find", "ls", "bash", "ast_grep", "web_search_exa", "web_fetch_exa"],
+    tools: [
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "bash",
+      "ast_grep",
+      "belayd_outline",
+      "web_search_exa",
+      "web_fetch_exa",
+    ],
     systemPrompt: USER_GUIDE_SYSTEM_PROMPT,
     qualityGate: gateUserGuide,
   },
@@ -623,7 +657,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-proof-generator",
     description: "Captures proof artifacts — browser traces, screenshots, terminal recordings",
     modelClass: "frontier",
-    tools: ["read", "bash", "ls", "find", "ast_grep", "agent_browser"],
+    tools: ["read", "bash", "ls", "find", "ast_grep", "belayd_outline", "agent_browser"],
     systemPrompt: PROOF_GENERATOR_SYSTEM_PROMPT,
     qualityGate: gateProofContent,
   },
@@ -639,6 +673,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
       "ls",
       "find",
       "ast_grep",
+      "belayd_outline",
       "web_search_exa",
       "web_fetch_exa",
     ],
@@ -648,7 +683,7 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-committer",
     description: "Commits changes with conventional commit messages and updates task status",
     modelClass: "fast",
-    tools: ["bash", "ls", "find", "ast_grep"],
+    tools: ["bash", "ls", "find", "ast_grep", "belayd_outline"],
     systemPrompt: COMMITTER_SYSTEM_PROMPT,
   },
 ];

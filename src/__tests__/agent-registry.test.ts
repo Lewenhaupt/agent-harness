@@ -71,6 +71,21 @@ describe("DEFAULT_AGENTS", () => {
     }
   });
 
+  it("every agent prompt carries the worktree-cwd and large-file navigation guidance", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      const prompt = agent.systemPrompt;
+      expect(prompt, agent.name).toContain("already the worktree root");
+      expect(prompt, agent.name).toContain("never prefix `cd");
+      expect(prompt, agent.name).toContain("belayd_outline");
+    }
+  });
+
+  it("every agent exposes the read-only belayd_outline tool (shared guidance references it)", () => {
+    for (const agent of DEFAULT_AGENTS) {
+      expect(agent.tools, agent.name).toContain("belayd_outline");
+    }
+  });
+
   it("scout has read-only tools (no edit/write)", () => {
     const scout = DEFAULT_AGENTS.find((a) => a.name === "belayd-scout");
     expect(scout).toBeDefined();
@@ -128,10 +143,10 @@ describe("DEFAULT_AGENTS", () => {
     expect(tester?.tools).not.toContain("agent_browser");
   });
 
-  it("committer has bash, ls, find, and ast_grep", () => {
+  it("committer has bash, ls, find, ast_grep, and belayd_outline", () => {
     const committer = DEFAULT_AGENTS.find((a) => a.name === "belayd-committer");
     expect(committer).toBeDefined();
-    expect(committer?.tools).toEqual(["bash", "ls", "find", "ast_grep"]);
+    expect(committer?.tools).toEqual(["bash", "ls", "find", "ast_grep", "belayd_outline"]);
   });
 
   it("userguide has read-only tools (no edit/write) and a quality gate", () => {
@@ -184,7 +199,15 @@ describe("DEFAULT_AGENTS", () => {
   it("proof-generator has the functional-proof tool allowlist", () => {
     const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
     expect(proofGen).toBeDefined();
-    expect(proofGen?.tools).toEqual(["read", "bash", "ls", "find", "ast_grep", "agent_browser"]);
+    expect(proofGen?.tools).toEqual([
+      "read",
+      "bash",
+      "ls",
+      "find",
+      "ast_grep",
+      "belayd_outline",
+      "agent_browser",
+    ]);
   });
 
   it("proof-generator prompt presents proof tools as bash commands, not standalone tools", () => {

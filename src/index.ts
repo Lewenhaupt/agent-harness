@@ -206,6 +206,31 @@ export {
   sumModelTelemetryStats,
   writeModelTelemetry,
 } from "./model-telemetry.js";
+export type {
+  OutlineAppliedFilters,
+  OutlineFile,
+  OutlineFilesOptions,
+  OutlineKind,
+  OutlineResult,
+  OutlineSourceFile,
+  OutlineSymbol,
+  OutlineTargetResolution,
+  OutlineTruncationCause,
+  ResolveOutlineTargetsOptions,
+} from "./outline.js";
+export {
+  formatOutline,
+  isOutlineKind,
+  OUTLINE_FILE_EXTENSIONS,
+  OUTLINE_KINDS,
+  OUTLINE_MAX_FILES,
+  OUTLINE_MAX_OUTPUT_BYTES,
+  OUTLINE_MAX_WALK_ENTRIES,
+  outlineFiles,
+  outlineSource,
+  resolveOutlineTargets,
+} from "./outline.js";
+
 export type { Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,
