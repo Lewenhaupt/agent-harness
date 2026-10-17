@@ -13,6 +13,7 @@ import {
   RESEARCHER_TOOLS,
 } from "../agent-registry.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
+import { PROOF_ARTIFACT_EXTENSIONS } from "../proof-verification.js";
 
 describe("DEFAULT_AGENTS", () => {
   it("defines all 9 agents", () => {
@@ -252,6 +253,23 @@ describe("DEFAULT_AGENTS", () => {
     expect(description).toContain("browser traces");
     expect(prompt).toContain("vitest");
     expect(prompt).toContain("jest");
+  });
+
+  it("proof-generator prompt requires canonical refs and lists the gate's accepted extensions", () => {
+    const proofGen = DEFAULT_AGENTS.find((a) => a.name === "belayd-proof-generator");
+    expect(proofGen).toBeDefined();
+    const prompt = proofGen?.systemPrompt ?? "";
+    expect(prompt).toContain("## Artifacts");
+    expect(prompt).toContain("proof-of-work/<task-id>/<file>");
+    for (const extension of PROOF_ARTIFACT_EXTENSIONS) {
+      expect(prompt).toContain(extension);
+    }
+    expect(prompt).toContain("`.txt`, `.log`, `.json`, and `.md` files are NOT accepted");
+    // The prompt must state the two gate tolerances that absolute-path-only
+    // proof output depends on: case-insensitive extensions and the delimiters
+    // that make an absolute ref parseable.
+    expect(prompt).toContain("matched case-insensitively");
+    expect(prompt).toContain("start of a line");
   });
 });
 

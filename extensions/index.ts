@@ -60,6 +60,7 @@ import {
   ARCHIFY_GUIDANCE_COMMANDS,
   ARCHIFY_QUALITY_PROFILES,
   ARCHIFY_TOOL_COMMANDS,
+  acceptedProofRefsFromScan,
   awaitWorktreeReady,
   bdCommandReadsStdin,
   buildArchifyArgs,
@@ -75,7 +76,6 @@ import {
   DEFAULT_BASE_BRANCH,
   defaultGitExec,
   extractProofArtifacts,
-  findProofArtifactRefs,
   findWorkspaceRoot,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
@@ -121,6 +121,7 @@ import {
   runArchify,
   runArchifyText,
   runStackRebase,
+  scanProofRefs,
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
@@ -190,6 +191,8 @@ export interface RunQualityGateOptions {
   phaseName: string;
   cwd?: string;
   proofDir?: string;
+  /** Epoch ms when this phase run's spawn started (proof-gate freshness floor). */
+  proofRunStartMs?: number;
   env?: Record<string, string>;
   signal?: AbortSignal;
   model?: string;
@@ -1562,19 +1565,29 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }).then((r) => r.result);
   }
 
+  /** Gate context forwarded into `GateOptions` for the run that produced the output. */
+  interface GateRunContext {
+    cwd?: string;
+    proofDir?: string;
+    proofRequired?: boolean;
+    proofRunStartMs?: number;
+  }
+
   /** Run a quality gate over a result, normalizing the feedback text. */
   async function evaluateGate(
     gate: QualityGate,
     result: SpawnResult,
-    cwd?: string,
-    proofDir?: string,
-    proofRequired?: boolean,
+    context: GateRunContext,
   ): Promise<{ passed: boolean; feedback: string }> {
-    const text = result.content?.[0]?.text ?? "";
+    const { cwd, proofDir, proofRequired, proofRunStartMs } = context;
     const options =
-      cwd !== undefined || proofDir !== undefined || proofRequired !== undefined
-        ? { cwd, proofDir, proofRequired }
+      cwd !== undefined ||
+      proofDir !== undefined ||
+      proofRequired !== undefined ||
+      proofRunStartMs !== undefined
+        ? { cwd, proofDir, proofRequired, proofRunStartMs }
         : undefined;
+    const text = result.content?.[0]?.text ?? "";
     const outcome = await gate(text, result.details, options);
     return {
       passed: outcome.passed,
@@ -1595,14 +1608,17 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // total passes are exhausted. Retries resume the prior session for the
     // first IN_SESSION_RETRY_LIMIT attempts, then alternate fresh epochs and
     // resumes so context growth stays bounded.
+    //
+    // `options.proofRunStartMs` is this phase run's spawn time and is reused for
+    // every attempt by design — do NOT refresh it per attempt, or a retry could
+    // accept artifacts written before the run began.
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
-      const verdict = await evaluateGate(
-        effectiveGate,
-        current,
-        options.cwd,
-        options.proofDir,
-        WORKFLOW_REGISTRY[workflowType].proofRequired,
-      );
+      const verdict = await evaluateGate(effectiveGate, current, {
+        cwd: options.cwd,
+        proofDir: options.proofDir,
+        proofRequired: WORKFLOW_REGISTRY[workflowType].proofRequired,
+        proofRunStartMs: options.proofRunStartMs,
+      });
 
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
@@ -2925,6 +2941,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       );
     };
 
+    // Captured immediately before the spawn so the proof gate can distinguish
+    // artifacts produced by this run from a previous attempt's leftovers. The
+    // floor is deliberately per PHASE RUN, not per gate attempt: it is passed
+    // down as a plain value and never refreshed inside the attempt loop, so
+    // every attempt's artifacts are >= the first attempt's start while pre-run
+    // leftovers stay filtered out.
+    const proofRunStartMs = Date.now();
     const runGate = (result: SpawnResult): Promise<SpawnResult> =>
       runQualityGate({
         agent,
@@ -2932,6 +2955,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         task: fullTask,
         cwd: effectiveCwd,
         proofDir,
+        proofRunStartMs,
         env: spawnEnv,
         workflowType: state.workflowType,
         phaseName,
@@ -3448,13 +3472,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const taskText = params.task ?? state.currentTaskId;
     const proofOutput = params.proof ?? state.proofOutput ?? "";
     const changeContext = await collectChangeContext(cwd, state.userGuideContent);
-    const refs = proofOutput === "" ? [] : findProofArtifactRefs(proofOutput);
+    // A single scan classifies canonical refs without the proof base, so the
+    // early return below skips before any git-backed base derivation. Raw
+    // absolute candidates are carried forward and normalized once the base is
+    // known instead of scanning the output a second time.
+    const scan = scanProofRefs(proofOutput);
 
-    if (refs.length === 0 && changeContext === "") {
+    if (scan.accepted.length === 0 && changeContext === "") {
       return { prompt: "", cwd, skipped: true };
     }
 
     const proofDir = proofDirForActiveTask(state, cwd);
+    // Accept absolute proof-dir paths here too, so the advisory verifier sees the
+    // same artifacts the deterministic gate accepts.
+    const refs = acceptedProofRefsFromScan(scan, proofDir);
     const proofWorkRoot = findWorkspaceRoot(cwd);
     const extraction = await extractProofArtifacts(refs, proofWorkRoot, proofDir);
     const artifacts = extraction.ok ? extraction.artifacts : [];

@@ -243,4 +243,98 @@ describe("proof base cache (bd-58)", () => {
       "NAMESPACED-CAST-MARKER",
     );
   });
+
+  it("skips proof-base derivation when the verifier has no refs and no change context", async () => {
+    // Clean repo: git succeeds with empty output, so collectChangeContext is empty.
+    mockExec.mockImplementation(
+      (
+        _cmd: string,
+        _opts: unknown,
+        cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
+      ) => cb(null, { stdout: "", stderr: "" }),
+    );
+
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("pbc-skip", workDir);
+    // A task is active but no phase has spawned, so the proof base is uncached.
+    await commands.get("belayd")?.handler("bd-42 feature --no-worktree", ctx);
+    mockResolveProjectProofBase.mockClear();
+
+    const verifier = tools.get("belayd_proof_verifier");
+    expect(verifier).toBeDefined();
+    const result = await verifier?.execute(
+      "call-skip",
+      { task: "bd-42", proof: "" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(mockResolveProjectProofBase).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).toContain("Proof verifier skipped");
+  });
+
+  it("normalizes an absolute proof-dir path in the verifier when change context exists", async () => {
+    // bd-103/bd-104-style proof output lists only absolute $BELAYD_PROOF_TASK_DIR
+    // paths. With non-empty change context the verifier runs and must normalize
+    // those absolute candidates against the lazy proof base (single scan), so the
+    // judge sees the same artifacts the deterministic gate accepts.
+    const namespacedBase = join(workDir, "abs-proof");
+    mockResolveProjectProofBase.mockImplementation(() => ({ ok: true, base: namespacedBase }));
+    mockExec.mockImplementation(
+      (
+        cmd: string,
+        _opts: unknown,
+        cb: (err: Error | null, result: { stdout: string; stderr: string }) => void,
+      ) => {
+        if (cmd.startsWith("git diff --stat")) {
+          cb(null, { stdout: "src/x.ts | 1 +\n", stderr: "" });
+          return;
+        }
+        if (cmd.startsWith("git status")) {
+          cb(null, { stdout: "", stderr: "" });
+          return;
+        }
+        cb(new Error("bd not available"), { stdout: "", stderr: "" });
+      },
+    );
+
+    const proofDir = join(namespacedBase, "bd-42");
+    mkdirSync(proofDir, { recursive: true });
+    const cast = [
+      JSON.stringify({ version: 3, command: "ABS-PATH-CAST-MARKER" }),
+      JSON.stringify([0.0, "o", "ok\n"]),
+      JSON.stringify([1.0, "x", "0"]),
+    ].join("\n");
+    writeFileSync(join(proofDir, "abs-evidence.cast"), cast, "utf-8");
+
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("pbc-abs", workDir);
+    await commands.get("belayd")?.handler("bd-42 feature --no-worktree", ctx);
+
+    const verifier = tools.get("belayd_proof_verifier");
+    expect(verifier).toBeDefined();
+    const result = await verifier?.execute(
+      "call-abs",
+      { task: "bd-42", proof: `Recording: ${join(proofDir, "abs-evidence.cast")}` },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(JSON.stringify(result)).not.toContain("Proof verifier skipped");
+    const verifierCall = mockSpawnAgentWithFallback.mock.calls.find((call) =>
+      String((call[0] as { sessionName?: string }).sessionName).startsWith(
+        "belayd-proof-verifier-",
+      ),
+    );
+    expect(verifierCall).toBeDefined();
+    expect(String((verifierCall?.[0] as { task?: string }).task)).toContain("ABS-PATH-CAST-MARKER");
+  });
 });
