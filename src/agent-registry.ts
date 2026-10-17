@@ -147,7 +147,7 @@ const CODE_EXPLORATION_GUIDANCE = `
 - \`ast_grep\` is read-only. Inspect matches before making changes.
 - Use \`grep\`/\`find\` for plain-text and filename searches.
 - Your working directory is already the worktree root — run commands directly, never prefix \`cd <absolute worktree path> &&\`.
-- After an edit, do NOT re-read the file to locate the next anchor — use \`belayd_outline\` for the symbol map or a targeted \`grep -n\` for text.`;
+- After an edit, do NOT re-read the file to locate the next anchor — use \`belayd_outline\` for the symbol map or a targeted \`grep -n\` for text. \`belayd_outline\` is multi-language (universal-ctags + ast-grep) and needs \`ctags\` and \`ast-grep\` on PATH (the devShell provides them).`;
 
 const COMMUNICATION_GUIDANCE = `
 

@@ -209,11 +209,13 @@ export {
 export type {
   OutlineAppliedFilters,
   OutlineFile,
+  OutlineFileSymbols,
   OutlineFilesOptions,
   OutlineKind,
+  OutlineLanguage,
   OutlineResult,
-  OutlineSourceFile,
   OutlineSymbol,
+  OutlineSymbolGroup,
   OutlineTargetResolution,
   OutlineTruncationCause,
   ResolveOutlineTargetsOptions,
@@ -221,15 +223,53 @@ export type {
 export {
   formatOutline,
   isOutlineKind,
+  isOutlineSupportedFile,
+  mergeOutlineSymbols,
   OUTLINE_FILE_EXTENSIONS,
   OUTLINE_KINDS,
+  OUTLINE_LANGUAGES,
   OUTLINE_MAX_FILES,
   OUTLINE_MAX_OUTPUT_BYTES,
   OUTLINE_MAX_WALK_ENTRIES,
+  OUTLINE_TS_EXTENSIONS,
+  outlineAstGrepLanguage,
   outlineFiles,
-  outlineSource,
   resolveOutlineTargets,
 } from "./outline.js";
+export {
+  buildAstGrepArgs,
+  buildAstGrepRule,
+  OUTLINE_AST_GREP_DEFAULT,
+  OUTLINE_AST_GREP_ENV,
+  parseAstGrepJson,
+  runAstGrep,
+} from "./outline-ast-grep.js";
+export type {
+  OutlineBinaryResolution,
+  OutlineBinarySpec,
+  OutlineSpawnOptions,
+  OutlineSpawnOutcome,
+} from "./outline-binary.js";
+export {
+  findExecutableOnPath,
+  formatSpawnFailure,
+  resolveOutlineBinary,
+  spawnOutlineBinary,
+} from "./outline-binary.js";
+export {
+  buildCtagsArgs,
+  mapCtagsKind,
+  OUTLINE_CTAGS_DEFAULT,
+  OUTLINE_CTAGS_ENV,
+  OUTLINE_CTAGS_MAP_OVERRIDES,
+  parseCtagsJson,
+  runCtags,
+} from "./outline-ctags.js";
+export type {
+  OutlineExtractionOptions,
+  OutlineExtractionResult,
+} from "./outline-extract.js";
+export { extractOutlineSymbols } from "./outline-extract.js";
 
 export type { Phase } from "./process-gate.js";
 export {

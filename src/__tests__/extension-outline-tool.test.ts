@@ -1,9 +1,10 @@
 /**
  * Tests for the `belayd_outline` pi tool surface in extensions/index.ts.
  *
- * The real param validation and src/outline.ts scanner run unchanged; only
+ * The real param validation, resolver, and formatter run unchanged. Only the
+ * extraction step (`extractOutlineSymbols`, which spawns ctags/ast-grep) is
+ * mocked so the suite never depends on a CLI being on PATH, and
  * `node:child_process` is mocked so gate activation's `bd` calls are inert.
- * `belayd_outline` itself never shells out — it only reads files.
  */
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -13,6 +14,39 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
+
+interface FixtureSymbol {
+  name: string;
+  kind: string;
+  startLine: number;
+  endLine: number;
+  exported: boolean;
+}
+
+const extraction = vi.hoisted(() => ({
+  symbols: [] as FixtureSymbol[],
+  notes: [] as string[],
+}));
+
+vi.mock("../../src/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/index.js")>();
+  const { readFileSync } = await import("node:fs");
+  return {
+    ...actual,
+    extractOutlineSymbols: (files: readonly string[]) => ({
+      ok: true,
+      files: files.map((path) => {
+        const source = readFileSync(path, "utf8");
+        return {
+          path,
+          lineCount: source.length === 0 ? 0 : source.split("\n").length,
+          symbols: extraction.symbols.map((entry) => ({ ...entry })),
+        };
+      }),
+      ...(extraction.notes.length > 0 ? { notes: [...extraction.notes] } : {}),
+    }),
+  };
+});
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -91,6 +125,8 @@ describe("belayd_outline tool", () => {
   beforeEach(() => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-outline-tool-"));
     roots = [cwd];
+    extraction.symbols = [];
+    extraction.notes = [];
   });
 
   afterEach(() => {
@@ -111,24 +147,26 @@ describe("belayd_outline tool", () => {
     expect(tool).toBeDefined();
     if (tool === undefined) return;
 
-    // The description must list every scanned extension, not just .ts/.tsx.
-    for (const extension of [".ts", ".tsx", ".mts", ".cts"]) {
+    // The description must advertise the multi-language extension set.
+    for (const extension of [".ts", ".tsx", ".mts", ".cts", ".py", ".go"]) {
       expect(tool.description, extension).toContain(extension);
     }
+    expect(tool.description).toContain("ast-grep");
 
-    const source = [
-      "export function alpha(): number {",
-      "  return 1;",
-      "}",
-      "export const beta = 2;",
-    ].join("\n");
+    extraction.symbols = [
+      { name: "alpha", kind: "function", startLine: 1, endLine: 3, exported: true },
+      { name: "beta", kind: "const", startLine: 4, endLine: 4, exported: true },
+    ];
     const file = join(cwd, "sample.ts");
-    writeFileSync(file, source);
+    writeFileSync(
+      file,
+      ["export function alpha(): number {", "  return 1;", "}", "export const beta = 2;"].join(
+        "\n",
+      ),
+    );
     const before = readFileSync(file, "utf8");
 
-    const result = await tool.execute("c1", { path: "sample.ts" }, undefined, undefined, {
-      cwd,
-    });
+    const result = await tool.execute("c1", { path: "sample.ts" }, undefined, undefined, { cwd });
 
     expect(result.details.exitCode).toBe(0);
     const text = textOf(result);
@@ -139,16 +177,42 @@ describe("belayd_outline tool", () => {
     expect(readFileSync(file, "utf8")).toBe(before);
   });
 
+  it("renders a partial-extraction note exactly once", async () => {
+    const mock = await loadOutlineExtension();
+    const tool = mock.tools.get("belayd_outline");
+    if (tool === undefined) throw new Error("belayd_outline was not registered");
+
+    writeFileSync(join(cwd, "partial.ts"), "export function alpha() {}\n");
+    extraction.notes = [
+      "note: ctags timed out before completing; the outline lists only the symbols recovered from its partial output.",
+    ];
+    const result = await tool.execute("partial", { path: "partial.ts" }, undefined, undefined, {
+      cwd,
+    });
+    expect(result.details.exitCode).toBe(0);
+    const text = textOf(result);
+    expect(text.split("note: ctags timed out").length - 1).toBe(1);
+  });
+
   it("rejects a missing path with an error result", async () => {
     const mock = await loadOutlineExtension();
     const tool = mock.tools.get("belayd_outline");
     if (tool === undefined) throw new Error("belayd_outline was not registered");
 
-    const result = await tool.execute("c2", { path: "missing.ts" }, undefined, undefined, {
-      cwd,
-    });
+    const result = await tool.execute("c2", { path: "missing.ts" }, undefined, undefined, { cwd });
     expect(result.details.exitCode).toBe(1);
     expect(textOf(result)).toContain("No such file");
+  });
+
+  it("rejects an unsupported single file with the supported-extension list", async () => {
+    const mock = await loadOutlineExtension();
+    const tool = mock.tools.get("belayd_outline");
+    if (tool === undefined) throw new Error("belayd_outline was not registered");
+
+    writeFileSync(join(cwd, "notes.txt"), "hello");
+    const result = await tool.execute("c2b", { path: "notes.txt" }, undefined, undefined, { cwd });
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain("Unsupported file extension");
   });
 
   it("rejects an unknown kind", async () => {
@@ -163,6 +227,28 @@ describe("belayd_outline tool", () => {
     expect(textOf(result)).toContain("Unknown kind");
   });
 
+  it("accepts an extended non-TypeScript kind", async () => {
+    const mock = await loadOutlineExtension();
+    const tool = mock.tools.get("belayd_outline");
+    if (tool === undefined) throw new Error("belayd_outline was not registered");
+
+    writeFileSync(join(cwd, "lib.py"), "def alpha():\n    return 1\n");
+    extraction.symbols = [
+      { name: "alpha", kind: "function", startLine: 1, endLine: 2, exported: false },
+    ];
+    const result = await tool.execute(
+      "c3b",
+      { path: "lib.py", kind: ["function"] },
+      undefined,
+      undefined,
+      {
+        cwd,
+      },
+    );
+    expect(result.details.exitCode).toBe(0);
+    expect(textOf(result)).toContain("alpha");
+  });
+
   it("filters by name through the registered tool", async () => {
     const mock = await loadOutlineExtension();
     const tool = mock.tools.get("belayd_outline");
@@ -172,6 +258,10 @@ describe("belayd_outline tool", () => {
       join(cwd, "names.ts"),
       ["export function alpha() {}", "export function beta() {}"].join("\n"),
     );
+    extraction.symbols = [
+      { name: "alpha", kind: "function", startLine: 1, endLine: 1, exported: true },
+      { name: "beta", kind: "function", startLine: 2, endLine: 2, exported: true },
+    ];
 
     const result = await tool.execute(
       "c4",
@@ -193,8 +283,17 @@ describe("belayd_outline tool", () => {
 
     writeFileSync(
       join(cwd, "many.ts"),
-      ["export function a() {}", "export function b() {}", "export function c() {}"].join("\n"),
+      [
+        "export function first() {}",
+        "export function second() {}",
+        "export function third() {}",
+      ].join("\n"),
     );
+    extraction.symbols = [
+      { name: "first", kind: "function", startLine: 1, endLine: 1, exported: true },
+      { name: "second", kind: "function", startLine: 2, endLine: 2, exported: true },
+      { name: "third", kind: "function", startLine: 3, endLine: 3, exported: true },
+    ];
 
     const result = await tool.execute(
       "c5",
@@ -206,7 +305,7 @@ describe("belayd_outline tool", () => {
     expect(result.details.exitCode).toBe(0);
     const text = textOf(result);
     expect(text).toContain("note: symbol output truncated by maxSymbols");
-    expect(text).not.toContain("  b  ");
+    expect(text).not.toContain("second");
   });
 
   it("rejects non-positive or fractional maxSymbols", async () => {
@@ -230,7 +329,7 @@ describe("belayd_outline tool", () => {
 
     const started = await startTask.execute(
       "gate-1",
-      { taskId: "bd-115" },
+      { taskId: "bd-118" },
       undefined,
       undefined,
       makeCtx(cwd, "outline-gate-session"),
