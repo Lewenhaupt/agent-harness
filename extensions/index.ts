@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +40,8 @@ import type {
   ArchifyQuality,
   ArchifyTextResult,
   ModelClass,
+  OutlineFilesOptions,
+  OutlineKind,
   Phase,
   QualityGate,
   RunDelivery,
@@ -79,6 +81,7 @@ import {
   findWorkspaceRoot,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
+  formatOutline,
   formatProcessState,
   getAgentByShortName,
   getNextPhase,
@@ -90,6 +93,7 @@ import {
   isArchifyQuality,
   isArchifyToolCommand,
   isInsideWorktreeForBranch,
+  isOutlineKind,
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
@@ -101,6 +105,9 @@ import {
   manageInstructionGroupsWarning,
   markPhaseCompleted,
   NO_GROUP_REGISTERED_WARNING,
+  OUTLINE_FILE_EXTENSIONS,
+  OUTLINE_KINDS,
+  outlineFiles,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_MODE_TOOLS,
   PROOF_VERIFIER_AGENT,
@@ -115,6 +122,7 @@ import {
   resolveAutoRebaseEnabled,
   resolveBashTimeout,
   resolveModelSpec,
+  resolveOutlineTargets,
   resolveQualityGate,
   resolveStackChain,
   resolveWorkflowSelection,
@@ -889,6 +897,111 @@ function validateArchifyParams(params: ArchifyRawParams): ArchifyParamValidation
   }
 }
 
+/** Raw `belayd_outline` parameters before validation. */
+interface OutlineRawParams {
+  path?: string;
+  kind?: string[];
+  name?: string;
+  maxSymbols?: number;
+}
+
+/** Validated `belayd_outline` params. */
+interface OutlineValidatedParams {
+  path: string;
+  kind: OutlineKind[] | undefined;
+  name: string | undefined;
+  maxSymbols: number | undefined;
+}
+
+type OutlineParamValidation =
+  | { ok: true; value: OutlineValidatedParams }
+  | { ok: false; error: string };
+
+/**
+ * Validate the raw `belayd_outline` params.
+ *
+ * Kept separate from `execute` so rejection messages stay flat and the tool
+ * body stays under the cognitive-complexity budget.
+ */
+function validateOutlineParams(params: OutlineRawParams): OutlineParamValidation {
+  const path = params.path;
+  if (path === undefined || path.trim() === "") {
+    return {
+      ok: false,
+      error: "path is required (a file, directory, or glob such as src/**/*.ts).",
+    };
+  }
+
+  const rawKinds = params.kind;
+  let kind: OutlineKind[] | undefined;
+  if (rawKinds !== undefined) {
+    for (const value of rawKinds) {
+      if (!isOutlineKind(value)) {
+        return {
+          ok: false,
+          error: `Unknown kind: ${value}. Supported kinds: ${OUTLINE_KINDS.join(", ")}.`,
+        };
+      }
+    }
+    kind = rawKinds.filter(isOutlineKind);
+  }
+
+  const maxSymbols = params.maxSymbols;
+  if (maxSymbols !== undefined && (!Number.isInteger(maxSymbols) || maxSymbols < 1)) {
+    return { ok: false, error: "maxSymbols must be a positive integer." };
+  }
+
+  return { ok: true, value: { path, kind, name: params.name, maxSymbols } };
+}
+
+/**
+ * Read every resolved outline target into memory.
+ *
+ * Returns an error value (never throws) so the tool can report a partial
+ * failure as text instead of crashing the session.
+ */
+function readOutlineSources(
+  paths: string[],
+): { ok: true; files: Array<{ path: string; source: string }> } | { ok: false; error: string } {
+  const files: Array<{ path: string; source: string }> = [];
+  for (const path of paths) {
+    try {
+      files.push({ path, source: readFileSync(path, "utf8") });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: `Failed to read ${path}: ${message}` };
+    }
+  }
+  return { ok: true, files };
+}
+
+/** Resolve, read, and format an outline. Errors are values, never throws. */
+function buildOutlineText(
+  cwd: string,
+  params: OutlineValidatedParams,
+): { ok: true; text: string } | { ok: false; error: string } {
+  const resolved = resolveOutlineTargets(cwd, params.path);
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+
+  const sources = readOutlineSources(resolved.files);
+  if (!sources.ok) return { ok: false, error: sources.error };
+
+  const options: OutlineFilesOptions = {};
+  if (params.kind !== undefined) options.kind = params.kind;
+  if (params.name !== undefined) options.nameMatches = params.name;
+  if (params.maxSymbols !== undefined) options.maxSymbols = params.maxSymbols;
+
+  // A walk-capped resolution knows no true match total (the walk stopped
+  // early), so the file-cap "matched N files" wording would be a false claim.
+  // Distinguish the two causes so the note never overstates coverage.
+  const truncatedNote =
+    resolved.truncatedBy === "walk-cap"
+      ? "\n\nnote: walk stopped at the entry cap; results may be incomplete."
+      : `\n\nnote: matched ${resolved.totalMatches ?? resolved.files.length} files; showing the first ${resolved.files.length}.`;
+  const note = resolved.truncated ? truncatedNote : "";
+  return { ok: true, text: `${formatOutline(outlineFiles(sources.files, options))}${note}` };
+}
+
 /**
  * Narrow a `tool_call` event to pi's built-in bash input.
  *
@@ -917,6 +1030,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd_status",
     "belayd_proof_verifier",
     "belayd_archify",
+    "belayd_outline",
     "bd",
     "read",
     "grep",
@@ -3783,6 +3897,54 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       const ignored = ignoredArchifyParams(value.kind, params);
       const note = formatArchifyIgnoredParamsNote(value.kind, ignored);
       return archifyGuidanceToolResult(value, cwd, note);
+    },
+  });
+
+  // ── Register outline (read-only symbol map) tool ────────────────────
+  // A read-only symbol map with line ranges for large TypeScript files.
+  // Sub-agents otherwise re-read a file in offset windows to locate the next
+  // edit anchor. It is consult-callable and non-phase, so it is listed in
+  // GATED_TOOLS only to survive the process gate — never a required workflow
+  // step, and never in PLANNING_GATED_TOOLS. The tool only reads files
+  // (resolveOutlineTargets + outlineFiles); it exposes no edit/write/bash path.
+  pi.registerTool({
+    name: "belayd_outline",
+    label: "Belayd outline",
+    description:
+      "Read-only symbol map with line ranges for a TypeScript file, directory, or glob " +
+      `(supports *, ?, **; directories are walked for ${OUTLINE_FILE_EXTENSIONS.join("/")}). ` +
+      "Returns top-level " +
+      "functions, consts, classes, types, interfaces, and enums plus pi.registerTool / " +
+      "pi.on registrations, in line order. Use this instead of re-reading a large file " +
+      "in offset windows to locate the next edit anchor; pair with `grep -n` for text. " +
+      "Output is bounded (~16 KB) and can be narrowed with `kind` or a `name` substring.",
+    parameters: Type.Object({
+      path: Type.String({
+        description:
+          "File, directory, or glob relative to the working directory (e.g. src/**/*.ts)",
+      }),
+      kind: Type.Optional(
+        Type.Array(
+          Type.Union(
+            OUTLINE_KINDS.map((outlineKind) => Type.Literal(outlineKind)),
+            { description: `Restrict to kinds: ${OUTLINE_KINDS.join(", ")}` },
+          ),
+        ),
+      ),
+      name: Type.Optional(
+        Type.String({ description: "Case-insensitive substring filter on the symbol name" }),
+      ),
+      maxSymbols: Type.Optional(
+        Type.Number({ description: "Cap the total number of symbols returned" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const validation = validateOutlineParams(params);
+      if (!validation.ok) return textToolResult(validation.error, 1);
+
+      const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+      const built = buildOutlineText(cwd, validation.value);
+      return built.ok ? textToolResult(built.text, 0) : textToolResult(built.error, 1);
     },
   });
 

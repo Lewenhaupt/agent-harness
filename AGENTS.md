@@ -213,6 +213,8 @@ keywords and plain labels are ignored and default to `feature`.
 - **Prefer `ast_grep` over `grep`/`find` for syntax-aware code searches** — use it when you need to find structural patterns (function definitions, call expressions, imports) or when text grep would produce false positives.
 - `ast_grep` is read-only. Inspect matches with `read`/`edit`/`write` only after deciding on concrete changes.
 - Use `grep`/`find` for plain-text and filename searches.
+- Your working directory is already the worktree root — run commands directly, never prefix `cd <absolute worktree path> &&`.
+- After an edit, do NOT re-read the file to locate the next anchor — use `belayd_outline` for the symbol map or a targeted `grep -n` for text.
 
 ## Code Style
 
