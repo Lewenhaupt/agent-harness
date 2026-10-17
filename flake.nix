@@ -420,6 +420,14 @@
           pkgs.asciinema
           playwright-cli
           archify
+          # belayd_outline extraction backends: universal-ctags is the
+          # multi-language symbol extractor (`ctags --output-format=json`, one
+          # process per file set) and ast-grep supplies the structured
+          # `pi.registerTool` / `pi.on` registrations ctags cannot express.
+          # Binaries only — the extension spawns them from PATH, never from
+          # npm, so `fetchPnpmDeps` must not move for this.
+          pkgs.universal-ctags
+          pkgs.ast-grep
           pkgs.playwright-test # `playwright` test runner + show-trace viewer
           pkgs.playwright-driver.browsers
         ];

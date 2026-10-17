@@ -1,545 +1,732 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+/**
+ * Unit tests for the pure `belayd_outline` layer.
+ *
+ * The ctags and ast-grep JSON parsers are driven by inline fixture strings —
+ * no binaries, no mocks. Real-binary coverage (which skips when a CLI is
+ * absent) lives in `outline-extract.test.ts`. Every lexer-behaviour case from
+ * bd-115 was deleted rather than adapted, because the lexer no longer exists.
+ */
+
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import ts from "typescript";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { OutlineResult, OutlineSymbol } from "../outline.js";
+import type {
+  OutlineFileSymbols,
+  OutlineKind,
+  OutlineSymbol,
+  OutlineSymbolGroup,
+} from "../outline.js";
 import {
   formatOutline,
+  isOutlineKind,
+  mergeOutlineSymbols,
   OUTLINE_MAX_FILES,
   OUTLINE_MAX_OUTPUT_BYTES,
+  outlineAstGrepLanguage,
   outlineFiles,
-  outlineSource,
   resolveOutlineTargets,
 } from "../outline.js";
+import { buildAstGrepArgs, buildAstGrepRule, parseAstGrepJson } from "../outline-ast-grep.js";
+import { buildCtagsArgs, mapCtagsKind, parseCtagsJson } from "../outline-ctags.js";
 
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-
-function lines(...parts: string[]): string {
-  return parts.join("\n");
+/** Compact symbol factory for merge/compose tests. */
+function symbol(
+  name: string,
+  kind: OutlineKind,
+  startLine: number,
+  endLine: number,
+  exported = false,
+): OutlineSymbol {
+  return { name, kind, startLine, endLine, exported };
 }
 
-describe("outlineSource", () => {
-  it("detects top-level exported and non-exported declarations with line ranges", () => {
-    const source = lines(
-      "export function alpha(a: string): number {",
-      "  return a.length;",
-      "}",
-      "",
-      "const beta = 7;",
-      "",
-      "export class Gamma {",
-      "  method() {",
-      "    const nested = 1;",
-      "    return nested;",
-      "  }",
-      "}",
-      "",
-      "export interface Delta {",
-      "  value: number;",
-      "}",
-      "",
-      'export type Epsilon = "a" | "b";',
-      "",
-      "export enum Zeta {",
-      "  One,",
-      "}",
-    );
+function groupOf(
+  groups: readonly OutlineSymbolGroup[],
+  path: string,
+): OutlineSymbolGroup | undefined {
+  return groups.find((group) => group.path === path);
+}
 
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.kind, s.startLine, s.endLine, s.exported])).toEqual([
-      ["alpha", "function", 1, 3, true],
-      ["beta", "const", 5, 5, false],
-      ["Gamma", "class", 7, 12, true],
-      ["Delta", "interface", 14, 16, true],
-      ["Epsilon", "type", 18, 18, true],
-      ["Zeta", "enum", 20, 22, true],
+function namesOf(groups: readonly OutlineSymbolGroup[], path: string): string[] {
+  return (groupOf(groups, path)?.symbols ?? []).map((entry) => entry.name);
+}
+
+describe("mapCtagsKind", () => {
+  it("maps the universal kinds onto the outline vocabulary", () => {
+    expect(mapCtagsKind("function", undefined)).toBe("function");
+    expect(mapCtagsKind("func", undefined)).toBe("function");
+    expect(mapCtagsKind("generator", undefined)).toBe("function");
+    expect(mapCtagsKind("method", undefined)).toBe("method");
+    expect(mapCtagsKind("class", undefined)).toBe("class");
+    expect(mapCtagsKind("interface", undefined)).toBe("interface");
+    expect(mapCtagsKind("alias", undefined)).toBe("type");
+    expect(mapCtagsKind("constant", undefined)).toBe("const");
+    expect(mapCtagsKind("variable", undefined)).toBe("var");
+    expect(mapCtagsKind("enum", undefined)).toBe("enum");
+    expect(mapCtagsKind("struct", undefined)).toBe("struct");
+    expect(mapCtagsKind("union", undefined)).toBe("union");
+    expect(mapCtagsKind("trait", undefined)).toBe("trait");
+    expect(mapCtagsKind("namespace", undefined)).toBe("namespace");
+    expect(mapCtagsKind("module", undefined)).toBe("module");
+    expect(mapCtagsKind("macro", undefined)).toBe("macro");
+    expect(mapCtagsKind("property", undefined)).toBe("property");
+    expect(mapCtagsKind("field", undefined)).toBe("field");
+  });
+
+  it("disambiguates `member` by enclosing scope", () => {
+    expect(mapCtagsKind("member", "class")).toBe("method");
+    expect(mapCtagsKind("member", "implementation")).toBe("method");
+    expect(mapCtagsKind("member", "trait")).toBe("method");
+    expect(mapCtagsKind("member", "struct")).toBe("field");
+    expect(mapCtagsKind("member", "package")).toBe("field");
+    expect(mapCtagsKind("member", undefined)).toBe("field");
+  });
+
+  it("promotes a function-like declaration in a member scope to a method", () => {
+    // C++ member functions, Go methods, and PHP trait methods are
+    // `function`/`func` + a type scope.
+    for (const scope of ["class", "struct", "union", "interface", "record", "trait"]) {
+      expect(mapCtagsKind("function", scope), scope).toBe("method");
+      expect(mapCtagsKind("func", scope), scope).toBe("method");
+    }
+    // A free declaration, or one nested in a namespace/package, stays a function.
+    expect(mapCtagsKind("function", undefined)).toBe("function");
+    expect(mapCtagsKind("func", "package")).toBe("function");
+    expect(mapCtagsKind("function", "namespace")).toBe("function");
+  });
+
+  it("maps the audited per-language kinds onto the outline vocabulary", () => {
+    expect(mapCtagsKind("singletonMethod", "class")).toBe("method");
+    expect(mapCtagsKind("methodSpec", "interface")).toBe("method");
+    expect(mapCtagsKind("const", "package")).toBe("const");
+    expect(mapCtagsKind("define", "namespace")).toBe("const");
+    expect(mapCtagsKind("talias", "package")).toBe("type");
+    expect(mapCtagsKind("typealias", undefined)).toBe("type");
+    expect(mapCtagsKind("accessor", "class")).toBe("property");
+    expect(mapCtagsKind("getter", "class")).toBe("property");
+    expect(mapCtagsKind("setter", "class")).toBe("property");
+    expect(mapCtagsKind("event", "class")).toBe("property");
+    expect(mapCtagsKind("anonMember", "struct")).toBe("field");
+    expect(mapCtagsKind("RecordField", undefined)).toBe("field");
+    expect(mapCtagsKind("object", undefined)).toBe("class");
+    expect(mapCtagsKind("annotation", undefined)).toBe("interface");
+    expect(mapCtagsKind("partition", undefined)).toBe("module");
+    expect(mapCtagsKind("delegate", undefined)).toBe("function");
+    expect(mapCtagsKind("guard", undefined)).toBe("function");
+    expect(mapCtagsKind("operator", undefined)).toBe("function");
+    expect(mapCtagsKind("record", undefined)).toBe("struct");
+    expect(mapCtagsKind("protocol", undefined)).toBe("interface");
+    expect(mapCtagsKind("val", undefined)).toBe("var");
+  });
+
+  it("drops unmapped kinds deterministically", () => {
+    expect(mapCtagsKind("enumerator", "enum")).toBeUndefined();
+    expect(mapCtagsKind("enumConstant", "enum")).toBeUndefined();
+    expect(mapCtagsKind("package", undefined)).toBeUndefined();
+    expect(mapCtagsKind("packageName", undefined)).toBeUndefined();
+    expect(mapCtagsKind("implementation", undefined)).toBeUndefined();
+    expect(mapCtagsKind("unknown", "module")).toBeUndefined();
+    expect(mapCtagsKind("heredoc", undefined)).toBeUndefined();
+    expect(mapCtagsKind("callback", undefined)).toBeUndefined();
+    expect(mapCtagsKind("test", undefined)).toBeUndefined();
+    expect(mapCtagsKind("exception", undefined)).toBeUndefined();
+    expect(mapCtagsKind("constructor", undefined)).toBeUndefined();
+    expect(mapCtagsKind("Constructor", undefined)).toBeUndefined();
+    expect(mapCtagsKind("Exception", undefined)).toBeUndefined();
+    expect(mapCtagsKind("totally-unknown", undefined)).toBeUndefined();
+  });
+
+  it("drops reference-only kinds the default ctags args never request", () => {
+    // C/C++ `header` (#include), Ruby `library` (require), and Sh `script` are
+    // enabled but REFONLY; `buildCtagsArgs` never passes `--extras=+r`, so these
+    // cannot reach the parser. Pinned so a future `--extras` change cannot
+    // silently surface them as declarations.
+    expect(mapCtagsKind("header", undefined)).toBeUndefined();
+    expect(mapCtagsKind("library", undefined)).toBeUndefined();
+    expect(mapCtagsKind("script", undefined)).toBeUndefined();
+  });
+});
+
+describe("parseCtagsJson", () => {
+  const sampleTs = "/w/sample.ts";
+  const samplePy = "/w/lib.py";
+
+  const stdout = [
+    JSON.stringify({
+      _type: "tag",
+      name: "alpha",
+      path: sampleTs,
+      pattern: "/^export function alpha(a: number): number {$/",
+      line: 1,
+      kind: "function",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "Beta",
+      path: sampleTs,
+      pattern: "/^interface Beta {$/",
+      line: 5,
+      kind: "interface",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "gamma",
+      path: sampleTs,
+      pattern: "/^const gamma = 1;$/",
+      line: 6,
+      kind: "constant",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "nested",
+      path: sampleTs,
+      pattern: "/^  const nested = 1;$/",
+      line: 7,
+      kind: "constant",
+      scope: "alpha",
+      scopeKind: "function",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "A",
+      path: sampleTs,
+      pattern: "/^enum E { A, B }$/",
+      line: 8,
+      kind: "enumerator",
+      scope: "E",
+      scopeKind: "enum",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "F",
+      path: sampleTs,
+      pattern: "/^struct F {$/",
+      line: 9,
+      kind: "struct",
+      end: 12,
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "lost",
+      path: sampleTs,
+      pattern: "/^const lost = 1;$/",
+      line: 13,
+      kind: "totally-unknown",
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "bar",
+      path: samplePy,
+      pattern: "/^def bar(x):$/",
+      line: 1,
+      kind: "function",
+      signature: "(x)",
+      end: 3,
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "Baz",
+      path: samplePy,
+      pattern: "/^class Baz:$/",
+      line: 5,
+      kind: "class",
+      end: 9,
+    }),
+    JSON.stringify({
+      _type: "tag",
+      name: "m",
+      path: samplePy,
+      pattern: "/^    def m(self):$/",
+      line: 6,
+      kind: "member",
+      scope: "Baz",
+      scopeKind: "class",
+      end: 8,
+    }),
+    "not json at all",
+    JSON.stringify({ _type: "ptag", name: "!TAG_KIND_DESCRIPTION", path: "NONE" }),
+  ].join("\n");
+
+  it("groups tags by path and maps kinds", () => {
+    const groups = parseCtagsJson(stdout);
+    expect(groups.map((group) => group.path).sort()).toEqual([samplePy, sampleTs]);
+
+    const ts = groupOf(groups, sampleTs);
+    expect(ts?.symbols.map((entry) => [entry.name, entry.kind])).toEqual([
+      ["alpha", "function"],
+      ["Beta", "interface"],
+      ["gamma", "const"],
+      ["F", "struct"],
     ]);
   });
 
-  it("excludes nested helpers declared inside a function body", () => {
-    const source = lines(
-      "export function outer() {",
-      "  function inner() {",
-      "    return 1;",
-      "  }",
-      "  const local = 2;",
-      "  return inner() + local;",
-      "}",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => s.name)).toEqual(["outer"]);
-    expect(symbols[0]?.endLine).toBe(7);
+  it("marks exported declarations from the pattern's first source line", () => {
+    const ts = groupOf(parseCtagsJson(stdout), sampleTs);
+    expect(ts?.symbols.find((entry) => entry.name === "alpha")?.exported).toBe(true);
+    expect(ts?.symbols.find((entry) => entry.name === "Beta")?.exported).toBe(false);
   });
 
-  it("excludes a nested let at depth > 0", () => {
-    const source = lines(
-      "export function outer() {",
-      "  let counter = 0;",
-      "  return counter;",
-      "}",
-      "let top = 1;",
-    );
+  it("uses the end field when present and falls back to the start line", () => {
+    const groups = parseCtagsJson(stdout);
+    const tsF = groupOf(groups, sampleTs)?.symbols.find((entry) => entry.name === "F");
+    expect(tsF?.startLine).toBe(9);
+    expect(tsF?.endLine).toBe(12);
 
-    expect(outlineSource(source).map((s) => s.name)).toEqual(["outer", "top"]);
+    const tsAlpha = groupOf(groups, sampleTs)?.symbols.find((entry) => entry.name === "alpha");
+    expect(tsAlpha?.startLine).toBe(1);
+    expect(tsAlpha?.endLine).toBe(1);
   });
 
-  it("emits pi registrations inside a plugin entry function but excludes nested declarations", () => {
-    const source = lines(
-      "export default function plugin(pi) {",
-      "  function helper() {}",
-      "  pi.registerTool({",
-      '    name: "belayd_x",',
-      "  });",
-      "}",
-    );
+  it("drops function-local, unknown-kind, malformed, and non-tag records", () => {
+    const groups = parseCtagsJson(stdout);
+    const names = namesOf(groups, sampleTs);
+    expect(names).not.toContain("nested");
+    expect(names).not.toContain("A");
+    expect(names).not.toContain("lost");
+  });
 
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.kind, s.startLine, s.endLine])).toEqual([
-      ["plugin", "function", 1, 6],
-      ["belayd_x", "registerTool", 3, 5],
+  it("maps a Python class method through the class scope", () => {
+    const py = groupOf(parseCtagsJson(stdout), samplePy);
+    expect(py?.symbols.map((entry) => [entry.name, entry.kind])).toEqual([
+      ["bar", "function"],
+      ["Baz", "class"],
+      ["m", "method"],
     ]);
+    expect(py?.symbols.find((entry) => entry.name === "bar")?.endLine).toBe(3);
   });
 
-  it("detects pi.registerTool and pi.on with string-literal names", () => {
-    const source = lines(
-      "pi.registerTool({",
-      '  name: "belayd_x",',
-      "  async execute() {},",
-      "});",
-      "",
-      'pi.on("tool_call", () => {});',
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.kind, s.startLine, s.endLine, s.detail])).toEqual([
-      ["belayd_x", "registerTool", 1, 4, "pi.registerTool"],
-      ["tool_call", "on", 6, 6, "pi.on"],
-    ]);
-  });
-
-  it("falls back to a line-based name when a registration name cannot be extracted", () => {
-    const source = lines("pi.registerTool({", "  label: nope,", "});");
-    const symbols = outlineSource(source);
-    expect(symbols[0]?.name).toBe("registerTool@1");
-  });
-
-  it("does not let braces inside strings, templates, or comments corrupt depth", () => {
-    const source = lines(
-      'export const tricky = "}";',
-      "export const template = `{`;",
-      "// } </div> comment",
-      "/* { unbalanced */",
-      "export function after() {}",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.kind, s.startLine, s.endLine])).toEqual([
-      ["tricky", "const", 1, 1],
-      ["template", "const", 2, 2],
-      ["after", "function", 5, 5],
-    ]);
-  });
-
-  it("does not let regex literals containing quotes/backticks/braces corrupt the lexer", () => {
-    const source = lines(
-      "const reQuotes = /[\"'`]/g;",
-      "const reBraces = /[{}()]/;",
-      "const reClose = /}/;",
-      "export function after() {}",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.startLine, s.endLine])).toEqual([
-      ["reQuotes", 1, 1],
-      ["reBraces", 2, 2],
-      ["reClose", 3, 3],
-      ["after", 4, 4],
-    ]);
-  });
-
-  it("keeps division after identifiers/strings and allows regex after a keyword or operator", () => {
-    const source = lines(
-      "const ratio = total / count;",
-      "const doubled = ratio / 2;",
-      'const match = "a" / 2;',
-      "function scan() {",
-      "  return /a\\/b/.test(source);",
-      "}",
-      "const computed = a + /b/.source;",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => s.name)).toEqual(["ratio", "doubled", "match", "scan", "computed"]);
-    expect(symbols[3]?.endLine).toBe(6);
-  });
-
-  it("does not treat a `/` after `}` as a regex", () => {
-    const source = lines("function f() {", "  return {} / value;", "}", "const after = 1;");
-
-    expect(outlineSource(source).map((s) => s.name)).toEqual(["f", "after"]);
-  });
-
-  it("does not read a JSX closing tag as a regex", () => {
-    const source = lines("export const B = () => <div>v</div>;", "export const tail = 1;");
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.startLine, s.endLine])).toEqual([
-      ["B", 1, 1],
-      ["tail", 2, 2],
-    ]);
-  });
-
-  it("handles self-closing, nested, and fragment JSX tags without over-running", () => {
-    const selfClosing = lines(
-      "export function C() {",
-      "  return <img src={x} />;",
-      "}",
-      "export const tail = 1;",
-    );
-    expect(outlineSource(selfClosing).map((s) => [s.name, s.endLine])).toEqual([
-      ["C", 3],
-      ["tail", 4],
-    ]);
-
-    const nested = lines(
-      "export const D = () => (",
-      "  <div>",
-      "    <span>{x}</span>",
-      "  </div>",
-      ");",
-      "export const tail = 1;",
-    );
-    expect(outlineSource(nested).map((s) => [s.name, s.endLine])).toEqual([
-      ["D", 5],
-      ["tail", 6],
-    ]);
-
-    const fragment = lines("export const E = () => <>frag</>;", "export const tail = 1;");
-    expect(outlineSource(fragment).map((s) => [s.name, s.endLine])).toEqual([
-      ["E", 1],
-      ["tail", 2],
-    ]);
-  });
-
-  it("emits `export { default }` re-exports instead of dropping them", () => {
-    const symbols = outlineSource('export { default } from "./m";');
-    expect(symbols).toEqual([
-      expect.objectContaining({
-        kind: "export",
-        name: "default",
-        detail: "(default)",
-        startLine: 1,
-        endLine: 1,
+  it("drops a keyword-named declaration tag as destructuring noise", () => {
+    const noise = [
+      JSON.stringify({
+        _type: "tag",
+        name: "const",
+        path: "/w/ab.tsx",
+        pattern: "/^const { const: x } = obj;$/",
+        line: 3,
+        kind: "constant",
       }),
+      JSON.stringify({
+        _type: "tag",
+        name: "x",
+        path: "/w/ab.tsx",
+        pattern: "/^const { const: x } = obj;$/",
+        line: 3,
+        kind: "constant",
+      }),
+    ].join("\n");
+    expect(namesOf(parseCtagsJson(noise), "/w/ab.tsx")).toEqual(["x"]);
+  });
+
+  it("keeps keyword-named member tags (they are legal field/method names)", () => {
+    const members = ["public", "static", "interface", "implements", "function", "with", "const"]
+      .map((name, index) =>
+        JSON.stringify({
+          _type: "tag",
+          name,
+          path: "/w/access.ts",
+          pattern: `/^  ${name} = 1;$/`,
+          line: index + 2,
+          kind: "property",
+          scope: "Access",
+          scopeKind: "class",
+        }),
+      )
+      .join("\n");
+    expect(namesOf(parseCtagsJson(members), "/w/access.ts")).toEqual([
+      "public",
+      "static",
+      "interface",
+      "implements",
+      "function",
+      "with",
+      "const",
     ]);
   });
 
-  it("ends a multi-line signature at the closing brace and orders ascending", () => {
-    const source = lines(
-      "export function multiLine(",
-      "  a: string,",
-      "  b: number,",
-      "): string {",
-      "  return a + b;",
-      "}",
-      "export const tail = 1;",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.startLine, s.endLine, s.name])).toEqual([
-      [1, 6, "multiLine"],
-      [7, 7, "tail"],
-    ]);
+  it("drops ctags' anonymousObject object-literal holder tags", () => {
+    const holder = JSON.stringify({
+      _type: "tag",
+      name: "anonymousObject3e2a7b710105",
+      path: "/w/reg.cjs",
+      pattern: '/^pi.registerTool({ name: "x", execute() {} });$/',
+      line: 1,
+      kind: "variable",
+    });
+    expect(parseCtagsJson(holder)).toEqual([]);
   });
 
-  it("handles inline object type literals in params without ending the declaration early", () => {
-    const source = lines(
-      "export function withOptions(options: {",
-      "  retries: number;",
-      "}): void {",
-      "  console.log(options);",
-      "}",
-      "export const tail = 1;",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.startLine, s.endLine])).toEqual([
-      ["withOptions", 1, 5],
-      ["tail", 6, 6],
-    ]);
+  it("keeps a non-JS/TS tag whose name happens to be a JS keyword", () => {
+    const python = JSON.stringify({
+      _type: "tag",
+      name: "type",
+      path: "/w/lib.py",
+      pattern: "/^def type():$/",
+      line: 1,
+      kind: "function",
+    });
+    expect(namesOf(parseCtagsJson(python), "/w/lib.py")).toEqual(["type"]);
   });
 
-  it("terminates an overload signature with an inline object return type", () => {
-    const source = lines(
-      "export function over(): { a: 1 };",
-      "export function over(): { a: 1 } {",
-      "  return { a: 1 };",
-      "}",
-      "export const tail = 1;",
-    );
-
-    expect(outlineSource(source).map((s) => [s.name, s.startLine, s.endLine])).toEqual([
-      ["over", 1, 1],
-      ["over", 2, 4],
-      ["tail", 5, 5],
-    ]);
+  it("returns an empty list for empty output", () => {
+    expect(parseCtagsJson("")).toEqual([]);
   });
+});
 
-  it("handles a type alias whose union members contain inline object literals", () => {
-    const source = lines(
-      "export type Union =",
-      '  | { kind: "a"; value: number }',
-      '  | { kind: "b"; value: string };',
-      "export const tail = 1;",
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.name, s.startLine, s.endLine])).toEqual([
-      ["Union", 1, 3],
-      ["tail", 4, 4],
-    ]);
-  });
-
-  it("surfaces export { … } / export type { … } re-exports by name", () => {
-    const source = lines(
-      'export type { Foo, Bar } from "./x";',
-      "export {",
-      "  Baz,",
-      "  Qux,",
-      '} from "./y";',
-    );
-
-    const symbols = outlineSource(source);
-    expect(symbols.map((s) => [s.kind, s.name, s.startLine, s.endLine])).toEqual([
-      ["export", "Foo, Bar", 1, 1],
-      ["export", "Baz, Qux", 2, 5],
-    ]);
-  });
-
-  it("does not emit anonymous destructuring declarations", () => {
-    const source = lines(
-      "export const { a, b } = obj;",
-      "export const [c, d] = list;",
-      "export const named = 1;",
-    );
-
-    expect(outlineSource(source).map((s) => s.name)).toEqual(["named"]);
-  });
-
-  it("handles an anonymous default export", () => {
-    const source = lines("export default function () {", "  return 1;", "}");
-    const symbols = outlineSource(source);
-    expect(symbols[0]?.name).toBe("default");
-    expect(symbols[0]?.detail).toBe("anonymous default export");
-    expect(symbols[0]?.exported).toBe(true);
-  });
-
-  it("handles const enum as an enum body", () => {
-    const source = lines("export const enum Mode {", "  A,", "}");
-    expect(outlineSource(source).map((s) => [s.kind, s.name, s.endLine])).toEqual([
-      ["enum", "Mode", 3],
+describe("buildCtagsArgs", () => {
+  it("adds language-map overrides for the extensions ctags does not map by default", () => {
+    expect(buildCtagsArgs(["/w/a.ts", "/w/b.py"])).toEqual([
+      "--output-format=json",
+      "--fields=+neKS",
+      "-f",
+      "-",
+      "--map-TypeScript=+.tsx",
+      "--map-TypeScript=+.mts",
+      "--map-TypeScript=+.cts",
+      "--map-JavaScript=+.cjs",
+      "/w/a.ts",
+      "/w/b.py",
     ]);
   });
 });
 
-describe("outlineSource against real repo files (parser-verified ranges)", () => {
-  function symbolsFrom(relativePath: string): OutlineSymbol[] {
-    return outlineSource(readFileSync(join(REPO_ROOT, relativePath), "utf8"));
-  }
+describe("parseAstGrepJson", () => {
+  const stream = [
+    JSON.stringify({
+      text: "export function alpha(a: number): number {\n  return a + 1;\n}",
+      range: { start: { line: 0, column: 7 }, end: { line: 3, column: 1 } },
+      file: "/w/sample.ts",
+      lines: "export function alpha(a: number): number {\n  return a + 1;\n}",
+      metaVariables: { single: { FUNCTION: { text: "alpha" } } },
+    }),
+    JSON.stringify({
+      text: "const arrow = (x: string) => x;",
+      range: { start: { line: 4, column: 7 }, end: { line: 4, column: 38 } },
+      file: "/w/sample.ts",
+      lines: "export const arrow = (x: string) => x;",
+      metaVariables: { single: { LEXICAL: { text: "arrow" } } },
+    }),
+    JSON.stringify({
+      text: "let topLet = 2;",
+      range: { start: { line: 5, column: 0 }, end: { line: 5, column: 14 } },
+      file: "/w/sample.ts",
+      lines: "let topLet = 2;",
+      metaVariables: { single: { LEXICAL: { text: "topLet" } } },
+    }),
+    JSON.stringify({
+      text: "const { x, y } = obj;",
+      range: { start: { line: 6, column: 0 }, end: { line: 6, column: 20 } },
+      file: "/w/sample.ts",
+      lines: "const { x, y } = obj;",
+      metaVariables: { single: { LEXICAL: { text: "{ x, y }" } } },
+    }),
+    JSON.stringify({
+      text: 'pi.registerTool({ name: "belayd_outline", label: "x" })',
+      range: { start: { line: 9, column: 2 }, end: { line: 9, column: 60 } },
+      file: "/w/harness.ts",
+      lines: '  pi.registerTool({ name: "belayd_outline", label: "x" });',
+      metaVariables: { single: { REGISTER_TOOL: { text: '"belayd_outline"' } } },
+    }),
+    JSON.stringify({
+      text: 'pi.on("tool_call", async (e) => {})',
+      range: { start: { line: 10, column: 2 }, end: { line: 10, column: 37 } },
+      file: "/w/harness.ts",
+      lines: '  pi.on("tool_call", async (e) => {});',
+      metaVariables: { single: { ON: { text: '"tool_call"' } } },
+    }),
+    JSON.stringify({
+      text: "pi.on(eventName, handler)",
+      range: { start: { line: 11, column: 2 }, end: { line: 11, column: 28 } },
+      file: "/w/harness.ts",
+      lines: "  pi.on(eventName, handler);",
+      metaVariables: { single: { ON: { text: "eventName" } } },
+    }),
+    "{ this line is not valid json",
+  ].join("\n");
 
-  // These assertions used to hardcode absolute line numbers, so every rebase
-  // that inserted lines above a symbol failed them without the scanner having
-  // regressed. Derive the truth from the TypeScript parser instead — the same
-  // cross-check the original review performed by hand — so they stay valid as
-  // the files grow and cover every top-level declaration rather than a
-  // hand-picked subset. `typescript` is a devDependency the build already uses.
-  function parserRanges(relativePath: string): Map<string, [number, number]> {
-    const file = join(REPO_ROOT, relativePath);
-    const sourceFile = ts.createSourceFile(
-      file,
-      readFileSync(file, "utf8"),
-      ts.ScriptTarget.Latest,
-      true,
-    );
-    const ranges = new Map<string, [number, number]>();
-    for (const statement of sourceFile.statements) {
-      const name = parserDeclaredName(statement);
-      if (name === undefined) continue;
-      ranges.set(name, [
-        lineOf(sourceFile, statement.getStart(sourceFile)),
-        lineOf(sourceFile, statement.getEnd()),
-      ]);
-    }
-    return ranges;
-  }
-
-  function parserDeclaredName(statement: ts.Statement): string | undefined {
-    if (
-      ts.isFunctionDeclaration(statement) ||
-      ts.isClassDeclaration(statement) ||
-      ts.isInterfaceDeclaration(statement) ||
-      ts.isTypeAliasDeclaration(statement) ||
-      ts.isEnumDeclaration(statement)
-    ) {
-      const { name } = statement;
-      return name === undefined ? undefined : name.text;
-    }
-    if (ts.isVariableStatement(statement)) {
-      const declarations = statement.declarationList.declarations;
-      // Multi-declarator statements (`const a = 1, b = 2;`) have no single
-      // declaration line, so they are not comparable 1:1 with a symbol row.
-      if (declarations.length !== 1) return undefined;
-      const only = declarations[0];
-      if (only === undefined || !ts.isIdentifier(only.name)) return undefined;
-      return only.name.text;
-    }
-    return undefined;
-  }
-
-  function lineOf(sourceFile: ts.SourceFile, position: number): number {
-    return sourceFile.getLineAndCharacterOfPosition(position).line + 1;
-  }
-
-  const PARSER_COMPARED_FILES = [
-    "extensions/index.ts",
-    "src/agent-registry.ts",
-    "src/archify.ts",
-    "src/outline.ts",
-    "src/process-gate.ts",
-    "src/quality-gates.ts",
-    "src/spawn.ts",
-    "src/stack-rebase.ts",
-    "src/worktree.ts",
-  ];
-
-  it.each(PARSER_COMPARED_FILES)(
-    "agrees with the parser on every top-level declaration in %s",
-    (relativePath) => {
-      const expected = parserRanges(relativePath);
-      // `registerTool`/`on`/`export` rows come from call expressions and
-      // re-export statements, which `parserRanges` does not map.
-      const actual = new Map(
-        symbolsFrom(relativePath)
-          .filter((symbol) => symbol.kind !== "registerTool" && symbol.kind !== "on")
-          .map((symbol) => [symbol.name, [symbol.startLine, symbol.endLine] as [number, number]]),
-      );
-
-      const mismatches: string[] = [];
-      for (const [name, [expectedStart, expectedEnd]] of expected) {
-        const found = actual.get(name);
-        if (found === undefined) {
-          mismatches.push(`${name}: missing (parser says ${expectedStart}-${expectedEnd})`);
-          continue;
-        }
-        if (found[0] !== expectedStart || found[1] !== expectedEnd) {
-          mismatches.push(
-            `${name}: ${found[0]}-${found[1]}, parser says ${expectedStart}-${expectedEnd}`,
-          );
-        }
-      }
-
-      expect(mismatches).toEqual([]);
-      expect(expected.size).toBeGreaterThan(1);
-    },
-  );
-
-  it("still finds declarations past the regex literals in src/outline.ts", () => {
-    // Regression: before regex-literal handling, the `["'\`]` patterns in this
-    // file left the lexer opaque and dropped every declaration after them.
-    const names = symbolsFrom("src/outline.ts").map((s) => s.name);
-    for (const expected of [
-      "outlineSource",
-      "outlineFiles",
-      "formatOutline",
-      "resolveOutlineTargets",
-      "detectDeclaration",
-      "detectReExport",
-      "findBodyEnd",
-      "findStatementEnd",
-      "findCallEnd",
-      "scanSourceLines",
-    ]) {
-      expect(names, expected).toContain(expected);
-    }
-    expect(names).not.toContain("(anonymous)");
+  it("converts ast-grep's 0-based lines to 1-based inclusive ranges", () => {
+    const ts = groupOf(parseAstGrepJson(stream), "/w/sample.ts");
+    const alpha = ts?.symbols.find((entry) => entry.name === "alpha");
+    expect(alpha).toMatchObject({ kind: "function", startLine: 1, endLine: 4, exported: true });
   });
 
-  it("does not emit bogus anonymous re-export rows for src/index.ts", () => {
-    const symbols = symbolsFrom("src/index.ts");
-    expect(symbols.some((s) => s.name === "(anonymous)")).toBe(false);
-    expect(symbols.filter((s) => s.kind === "export").length).toBeGreaterThan(0);
+  it("distinguishes const from let via the matched text", () => {
+    const ts = groupOf(parseAstGrepJson(stream), "/w/sample.ts");
+    expect(ts?.symbols.find((entry) => entry.name === "arrow")).toMatchObject({
+      kind: "const",
+      startLine: 5,
+      endLine: 5,
+      exported: true,
+    });
+    expect(ts?.symbols.find((entry) => entry.name === "topLet")).toMatchObject({
+      kind: "let",
+      startLine: 6,
+      endLine: 6,
+      exported: false,
+    });
+  });
+
+  it("drops a destructuring capture that is not an identifier", () => {
+    expect(namesOf(parseAstGrepJson(stream), "/w/sample.ts")).not.toContain("{ x, y }");
+  });
+
+  it("drops a keyword-named declaration capture but keeps keyword-named members", () => {
+    const memberNames = [
+      "public",
+      "static",
+      "interface",
+      "implements",
+      "function",
+      "with",
+      "const",
+    ];
+    const members = memberNames
+      .map((name, index) =>
+        JSON.stringify({
+          text: `${name} = 1;`,
+          range: { start: { line: index + 1, column: 2 }, end: { line: index + 1, column: 12 } },
+          file: "/w/access.ts",
+          lines: `  ${name} = 1;`,
+          metaVariables: { single: { PROPERTY: { text: name } } },
+        }),
+      )
+      .join("\n");
+    expect(namesOf(parseAstGrepJson(members), "/w/access.ts")).toEqual(memberNames);
+
+    const declarationNoise = JSON.stringify({
+      text: "const =",
+      range: { start: { line: 0, column: 0 }, end: { line: 0, column: 6 } },
+      file: "/w/access.ts",
+      lines: "const =",
+      metaVariables: { single: { FUNCTION: { text: "const" } } },
+    });
+    expect(parseAstGrepJson(declarationNoise)).toEqual([]);
+  });
+
+  it("unquotes tool and event names and keeps identifiers", () => {
+    const harness = groupOf(parseAstGrepJson(stream), "/w/harness.ts");
+    expect(harness?.symbols.map((entry) => [entry.name, entry.kind])).toEqual([
+      ["belayd_outline", "registerTool"],
+      ["tool_call", "on"],
+      ["eventName", "on"],
+    ]);
+  });
+
+  it("skips malformed lines instead of aborting", () => {
+    expect(parseAstGrepJson(stream).length).toBe(2);
+    expect(parseAstGrepJson("").length).toBe(0);
   });
 });
 
-describe("outlineFiles", () => {
+describe("buildAstGrepRule / buildAstGrepArgs", () => {
+  it("selects the tree-sitter language and includes the registration branches", () => {
+    expect(buildAstGrepRule("ts")).toContain("language: TypeScript");
+    expect(buildAstGrepRule("tsx")).toContain("language: Tsx");
+    expect(buildAstGrepRule("js")).toContain("language: JavaScript");
+    expect(buildAstGrepRule("ts")).toContain("pi.registerTool");
+    expect(buildAstGrepRule("ts")).toContain("pi.on($ON, $$$REST)");
+
+    const args = buildAstGrepArgs("ts", ["/w/a.ts"]);
+    expect(args.slice(0, 2)).toEqual(["scan", "--inline-rules"]);
+    expect(args).toContain("--json=stream");
+    expect(args.at(-1)).toBe("/w/a.ts");
+  });
+});
+
+describe("mergeOutlineSymbols", () => {
+  it("keeps ctags-only rows and lets ast-grep refine an end line", () => {
+    const base = [symbol("alpha", "function", 1, 1, true), symbol("b", "const", 1, 1)];
+    const extra = [symbol("alpha", "function", 1, 4, true)];
+    const merged = mergeOutlineSymbols(base, extra);
+    expect(merged.map((entry) => entry.name)).toEqual(["alpha", "b"]);
+    expect(merged.find((entry) => entry.name === "alpha")?.endLine).toBe(4);
+  });
+
+  it("sorts ascending by start line then name", () => {
+    const merged = mergeOutlineSymbols(
+      [symbol("zeta", "function", 5, 5), symbol("beta", "const", 1, 1)],
+      [symbol("alpha", "const", 1, 1)],
+    );
+    expect(merged.map((entry) => entry.name)).toEqual(["alpha", "beta", "zeta"]);
+  });
+
+  it("collapses ctags' miskinded arrow-function and generator twins onto ast-grep", () => {
+    const arrow = mergeOutlineSymbols(
+      [symbol("arrow", "function", 1, 1)],
+      [symbol("arrow", "const", 1, 1)],
+    );
+    expect(arrow).toEqual([symbol("arrow", "const", 1, 1)]);
+
+    // ctags tags `function* Producer() {}` as `class`; ast-grep refines it to
+    // `function` with the real range. The shared identity collapses the twin.
+    const generator = mergeOutlineSymbols(
+      [symbol("Producer", "class", 1, 1)],
+      [symbol("Producer", "function", 1, 3)],
+    );
+    expect(generator).toEqual([symbol("Producer", "function", 1, 3)]);
+  });
+
+  it("keeps a property and a method with the same name on the same line", () => {
+    const merged = mergeOutlineSymbols(
+      [symbol("foo", "property", 1, 1)],
+      [symbol("foo", "method", 1, 1)],
+    );
+    expect(merged).toHaveLength(2);
+    expect(merged.map((entry) => entry.kind)).toEqual(["method", "property"]);
+  });
+
+  it("keeps the const and registerTool captures of one assignment line", () => {
+    const merged = mergeOutlineSymbols(
+      [],
+      [symbol("t", "registerTool", 1, 1), symbol("t", "const", 1, 1)],
+    );
+    expect(merged).toHaveLength(2);
+    expect(merged.map((entry) => entry.kind)).toEqual(["const", "registerTool"]);
+  });
+
+  it("still collapses a ctags `var` into the ast-grep `let` refinement", () => {
+    const merged = mergeOutlineSymbols([symbol("x", "var", 3, 3)], [symbol("x", "let", 3, 3)]);
+    expect(merged).toEqual([symbol("x", "let", 3, 3)]);
+  });
+});
+
+describe("outlineFiles / formatOutline", () => {
+  function file(path: string, lineCount: number, symbols: OutlineSymbol[]): OutlineFileSymbols {
+    return { path, lineCount, symbols };
+  }
+
   const files = [
-    {
-      path: "a.ts",
-      source: lines(
-        "export function alpha() {}",
-        "export const beta = 1;",
-        "export interface Gamma {",
-        "  x: number;",
-        "}",
-      ),
-    },
-    { path: "b.ts", source: "export function delta() {}" },
+    file("/w/a.ts", 3, [symbol("alpha", "function", 1, 3, true), symbol("Beta", "class", 4, 8)]),
+    file("/w/b.py", 2, [symbol("gamma", "const", 1, 1)]),
   ];
 
   it("aggregates per-file symbols and line counts", () => {
     const result = outlineFiles(files);
-    expect(result.totalSymbols).toBe(4);
+    expect(result.totalSymbols).toBe(3);
+    expect(result.files[0]).toMatchObject({ path: "/w/a.ts", lineCount: 3 });
     expect(result.truncated).toBe(false);
-    expect(result.files.map((f) => [f.path, f.lineCount, f.symbols.length])).toEqual([
-      ["a.ts", 5, 3],
-      ["b.ts", 1, 1],
-    ]);
   });
 
   it("filters by kind and case-insensitive name substring", () => {
-    const filtered = outlineFiles(files, { kind: ["function"], nameMatches: "DELT" });
-    expect(filtered.files[0]?.symbols).toEqual([]);
-    expect(filtered.files[1]?.symbols.map((s) => s.name)).toEqual(["delta"]);
-    expect(filtered.appliedFilters).toEqual({ kind: ["function"], nameMatches: "DELT" });
+    const byKind = outlineFiles(files, { kind: ["class"] });
+    expect(byKind.files[0]?.symbols.map((entry) => entry.name)).toEqual(["Beta"]);
+
+    const byName = outlineFiles(files, { nameMatches: "ALPH" });
+    expect(byName.files[0]?.symbols.map((entry) => entry.name)).toEqual(["alpha"]);
+    expect(byName.files[1]?.symbols).toEqual([]);
   });
 
-  it("caps symbols across files and stops scanning further files", () => {
+  it("caps symbols globally and reports the truncation note", () => {
     const result = outlineFiles(files, { maxSymbols: 2 });
-    expect(result.truncated).toBe(true);
     expect(result.totalSymbols).toBe(2);
-    expect(result.files.map((f) => f.path)).toEqual(["a.ts"]);
-    expect(result.files[0]?.symbols.map((s) => s.name)).toEqual(["alpha", "beta"]);
+    expect(result.truncated).toBe(true);
+    expect(formatOutline(result)).toContain("note: symbol output truncated by maxSymbols");
   });
 
-  it("formats a bounded header/rows/footer summary", () => {
-    const result = outlineFiles(files, { maxSymbols: 2 });
-    const text = formatOutline(result);
-    expect(text).toContain("a.ts (5 lines)");
-    expect(text).toContain("1-1");
+  it("applies `name` + `maxSymbols` across files in file order and stops scanning early", () => {
+    const multi = [
+      file("/w/one.ts", 3, [
+        symbol("alpha", "function", 1, 1),
+        symbol("alpine", "function", 2, 2),
+        symbol("beta", "function", 3, 3),
+      ]),
+      file("/w/two.ts", 3, [symbol("alarm", "function", 1, 1), symbol("amber", "function", 2, 2)]),
+      file("/w/three.ts", 1, [symbol("azure", "function", 1, 1)]),
+    ];
+
+    // `al` matches alpha/alpine/alarm. The global cap of 3 is filled across
+    // the first two files; `three.ts` is never scanned once the cap is hit.
+    const result = outlineFiles(multi, { nameMatches: "al", maxSymbols: 3 });
+    expect(result.files.map((entry) => entry.path)).toEqual(["/w/one.ts", "/w/two.ts"]);
+    expect(result.files[0]?.symbols.map((entry) => entry.name)).toEqual(["alpha", "alpine"]);
+    expect(result.files[1]?.symbols.map((entry) => entry.name)).toEqual(["alarm"]);
+    expect(result.totalSymbols).toBe(3);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("can render the maxSymbols note, a partial-output note, and the 16 KB note together", () => {
+    // Long names push the body past the 16 KB budget while `maxSymbols` still
+    // truncates the symbol set, proving the three footer notes coexist and the
+    // reserved-footer arithmetic survives the combination.
+    const longName = "n".repeat(6000);
+    const huge = file(
+      "/w/huge.ts",
+      4,
+      [1, 2, 3, 4].map((line) => symbol(`${longName}${line}`, "function", line, line)),
+    );
+    const partial =
+      "note: ctags timed out before completing; the outline lists only the symbols recovered from its partial output.";
+
+    const capped = outlineFiles([huge], { maxSymbols: 3 });
+    expect(capped.truncated).toBe(true);
+    const text = formatOutline(capped, [partial]);
+
+    const maxSymbolsIndex = text.indexOf("note: symbol output truncated by maxSymbols");
+    const partialIndex = text.indexOf(partial);
+    const bytecapIndex = text.indexOf("note: output truncated at");
+    expect(maxSymbolsIndex).toBeGreaterThan(-1);
+    expect(partialIndex).toBeGreaterThan(maxSymbolsIndex);
+    expect(bytecapIndex).toBeGreaterThan(partialIndex);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(OUTLINE_MAX_OUTPUT_BYTES);
+  });
+
+  it("renders a header, rows, and filter notes", () => {
+    const text = formatOutline(outlineFiles(files, { kind: ["function"], nameMatches: "a" }));
+    expect(text).toContain("/w/a.ts (3 lines)");
+    expect(text).toContain("1-3");
     expect(text).toContain("alpha [exported]");
-    expect(text).toContain("note: symbol output truncated by maxSymbols");
+    expect(text).toContain("filters: kind=function, name~=a");
   });
 
   it("bounds output by UTF-8 bytes and reserves the truncation footer", () => {
-    const symbols: OutlineSymbol[] = Array.from({ length: 4000 }, (_, index) => ({
-      name: `sym_${index}_${"é".repeat(8)}`,
-      kind: "function",
-      startLine: index + 1,
-      endLine: index + 1,
-      exported: false,
-    }));
-    const result: OutlineResult = {
-      files: [{ path: "日本語/ファイル.ts", lineCount: 1, symbols }],
-      totalSymbols: symbols.length,
-      truncated: false,
-      appliedFilters: {},
-    };
-
-    const text = formatOutline(result);
+    const many: OutlineSymbol[] = [];
+    for (let index = 0; index < 500; index++) {
+      many.push(
+        symbol(`symbolNumber${String(index).padStart(4, "0")}`, "function", index + 1, index + 1),
+      );
+    }
+    const text = formatOutline(outlineFiles([file("/w/big.ts", 500, many)]));
     expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(OUTLINE_MAX_OUTPUT_BYTES);
-    expect(text).toContain("output truncated at");
+    expect(text).toContain("note: output truncated at");
+  });
+
+  it("filters and renders distinct same-line kinds independently", () => {
+    const collision = file(
+      "/w/collide.ts",
+      1,
+      mergeOutlineSymbols([symbol("foo", "property", 1, 1)], [symbol("foo", "method", 1, 1)]),
+    );
+
+    const byMethod = outlineFiles([collision], { kind: ["method"] });
+    expect(byMethod.totalSymbols).toBe(1);
+    expect(byMethod.files[0]?.symbols.map((entry) => entry.kind)).toEqual(["method"]);
+
+    const text = formatOutline(outlineFiles([collision]));
+    expect(text).toContain("method        foo");
+    expect(text).toContain("property      foo");
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(OUTLINE_MAX_OUTPUT_BYTES);
+  });
+});
+
+describe("outlineAstGrepLanguage", () => {
+  it("routes the TypeScript family (including .cjs) to ast-grep", () => {
+    expect(outlineAstGrepLanguage("a.ts")).toBe("ts");
+    expect(outlineAstGrepLanguage("a.mts")).toBe("ts");
+    expect(outlineAstGrepLanguage("a.cts")).toBe("ts");
+    expect(outlineAstGrepLanguage("a.cjs")).toBe("js");
+    expect(outlineAstGrepLanguage("Comp.tsx")).toBe("tsx");
+    expect(outlineAstGrepLanguage("a.py")).toBeUndefined();
+    expect(outlineAstGrepLanguage("a.rs")).toBeUndefined();
+  });
+});
+
+describe("isOutlineKind", () => {
+  it("accepts every curated kind and rejects others", () => {
+    expect(isOutlineKind("struct")).toBe(true);
+    expect(isOutlineKind("registerTool")).toBe(true);
+    expect(isOutlineKind("on")).toBe(true);
+    expect(isOutlineKind("export")).toBe(false);
+    expect(isOutlineKind("bogus")).toBe(false);
   });
 });
 
@@ -559,10 +746,13 @@ describe("resolveOutlineTargets", () => {
     mkdirSync(join(root, ".hidden"));
     writeFileSync(join(root, "a.ts"), "export const a = 1;");
     writeFileSync(join(root, "b.tsx"), "export const b = 1;");
-    writeFileSync(join(root, "c.txt"), "not typescript");
-    writeFileSync(join(root, "sub", "d.ts"), "export const d = 1;");
-    writeFileSync(join(root, "node_modules", "e.ts"), "export const e = 1;");
-    writeFileSync(join(root, ".hidden", "f.ts"), "export const f = 1;");
+    writeFileSync(join(root, "c.py"), "def c():\n    return 1\n");
+    writeFileSync(join(root, "d.rs"), "pub fn d() {}\n");
+    writeFileSync(join(root, "e.go"), "package main\n");
+    writeFileSync(join(root, "notes.txt"), "not source");
+    writeFileSync(join(root, "sub", "f.ts"), "export const f = 1;");
+    writeFileSync(join(root, "node_modules", "g.ts"), "export const g = 1;");
+    writeFileSync(join(root, ".hidden", "h.ts"), "export const h = 1;");
     return root;
   }
 
@@ -571,15 +761,18 @@ describe("resolveOutlineTargets", () => {
     roots.length = 0;
   });
 
-  it("walks a directory for .ts/.tsx, skipping node_modules and dot-directories", () => {
+  it("walks a directory across languages, skipping node_modules and dot-directories", () => {
     const root = tempTree();
     const resolved = resolveOutlineTargets(root, ".");
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
-    expect(resolved.files.map((f) => f.slice(root.length + 1))).toEqual([
+    expect(resolved.files.map((entry) => entry.slice(root.length + 1))).toEqual([
       "a.ts",
       "b.tsx",
-      "sub/d.ts",
+      "c.py",
+      "d.rs",
+      "e.go",
+      "sub/f.ts",
     ]);
   });
 
@@ -590,8 +783,8 @@ describe("resolveOutlineTargets", () => {
     expect(deep.ok).toBe(true);
     expect(shallow.ok).toBe(true);
     if (!deep.ok || !shallow.ok) return;
-    expect(deep.files.map((f) => f.slice(root.length + 1))).toEqual(["a.ts", "sub/d.ts"]);
-    expect(shallow.files.map((f) => f.slice(root.length + 1))).toEqual(["a.ts"]);
+    expect(deep.files.map((entry) => entry.slice(root.length + 1))).toEqual(["a.ts", "sub/f.ts"]);
+    expect(shallow.files.map((entry) => entry.slice(root.length + 1))).toEqual(["a.ts"]);
   });
 
   it("resolves a single file and reports a missing path as an error value", () => {
@@ -606,13 +799,16 @@ describe("resolveOutlineTargets", () => {
     });
   });
 
-  it("rejects a non-TS single file with a clear error", () => {
+  it("accepts non-TypeScript source extensions and rejects unsupported ones", () => {
     const root = tempTree();
-    const resolved = resolveOutlineTargets(root, "c.txt");
-    expect(resolved.ok).toBe(false);
-    if (resolved.ok) return;
-    expect(resolved.error).toContain("Unsupported file extension");
-    expect(resolved.error).toContain(".ts");
+    for (const name of ["c.py", "d.rs", "e.go", "a.ts"]) {
+      expect(resolveOutlineTargets(root, name)).toMatchObject({ ok: true });
+    }
+    const rejected = resolveOutlineTargets(root, "notes.txt");
+    expect(rejected.ok).toBe(false);
+    if (rejected.ok) return;
+    expect(rejected.error).toContain("Unsupported file extension");
+    expect(rejected.error).toContain(".py");
   });
 
   it("resolves absolute and outside-cwd targets", () => {
@@ -631,47 +827,83 @@ describe("resolveOutlineTargets", () => {
     const resolved = resolveOutlineTargets(root, ".");
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
-    const relative = resolved.files.map((f) => f.slice(root.length + 1));
+    const relative = resolved.files.map((entry) => entry.slice(root.length + 1));
     expect(relative).toContain("link.ts");
     expect(relative.length).toBeLessThan(20);
   });
 
   it("collapses star runs in a glob (no runaway regex)", () => {
     const root = tempTree();
-    // `***` collapses to one `(?:.*/)?` group and still matches.
-    const resolved = resolveOutlineTargets(root, "sub/***/d.ts");
+    const resolved = resolveOutlineTargets(root, "sub/***/f.ts");
     expect(resolved.ok).toBe(true);
     if (resolved.ok) {
-      expect(resolved.files.map((f) => f.slice(root.length + 1))).toEqual(["sub/d.ts"]);
+      expect(resolved.files.map((entry) => entry.slice(root.length + 1))).toEqual(["sub/f.ts"]);
     }
-
-    // A long run must not throw/hang.
     expect(resolveOutlineTargets(root, "a************b.ts").ok).toBe(false);
-  });
-
-  it("walks .tsx files without JSX over-runs", () => {
-    const root = tempRoot();
-    writeFileSync(
-      join(root, "Comp.tsx"),
-      lines("export const B = () => <div>v</div>;", "export const tail = 1;"),
-    );
-    const resolved = resolveOutlineTargets(root, ".");
-    expect(resolved.ok).toBe(true);
-    if (!resolved.ok) return;
-    expect(resolved.files.map((f) => f.slice(root.length + 1))).toEqual(["Comp.tsx"]);
-
-    const files = resolved.files.map((path) => ({ path, source: readFileSync(path, "utf8") }));
-    const result = outlineFiles(files);
-    expect(result.files[0]?.symbols.map((s) => [s.name, s.endLine])).toEqual([
-      ["B", 1],
-      ["tail", 2],
-    ]);
   });
 
   it("returns an error for a glob with no matches", () => {
     const root = tempTree();
-    const resolved = resolveOutlineTargets(root, "sub/**/*.js");
-    expect(resolved).toEqual({ ok: false, error: "No matching TypeScript files found." });
+    const resolved = resolveOutlineTargets(root, "sub/**/*.lua");
+    expect(resolved).toEqual({ ok: false, error: "No matching source files found." });
+  });
+
+  it("resolves a symlinked file as a single target, not only inside a walk", () => {
+    const root = tempTree();
+    const link = join(root, "direct-link.ts");
+    symlinkSync(join(root, "a.ts"), link);
+
+    const resolved = resolveOutlineTargets(root, "direct-link.ts");
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.files).toEqual([link]);
+  });
+
+  it("matches extensions case-insensitively for a single file and a directory walk", () => {
+    const root = tempRoot();
+    writeFileSync(join(root, "Upper.TS"), "export const a = 1;");
+    writeFileSync(join(root, "Script.PY"), "def a():\n    return 1\n");
+
+    const upper = resolveOutlineTargets(root, "Upper.TS");
+    expect(upper.ok).toBe(true);
+    if (upper.ok) expect(upper.files).toEqual([join(root, "Upper.TS")]);
+
+    const walked = resolveOutlineTargets(root, ".");
+    expect(walked.ok).toBe(true);
+    if (!walked.ok) return;
+    const names = walked.files.map((entry) => entry.slice(root.length + 1));
+    expect(names).toContain("Upper.TS");
+    expect(names).toContain("Script.PY");
+  });
+
+  it("returns No matching source files for a directory with only unsupported extensions", () => {
+    const root = tempRoot();
+    writeFileSync(join(root, "notes.txt"), "not source");
+    writeFileSync(join(root, "Makefile"), "all:");
+
+    expect(resolveOutlineTargets(root, ".")).toEqual({
+      ok: false,
+      error: "No matching source files found.",
+    });
+  });
+
+  it("counts only accepted extensions toward the 200-file cap", () => {
+    const root = tempRoot();
+    const supported = OUTLINE_MAX_FILES + 1;
+    for (let index = 0; index < supported; index++) {
+      writeFileSync(join(root, `s${String(index).padStart(4, "0")}.ts`), "export const x = 1;");
+    }
+    // Noise that must not consume cap slots: the cap is on outline files.
+    for (let index = 0; index < 25; index++) {
+      writeFileSync(join(root, `n${String(index).padStart(4, "0")}.txt`), "not source");
+    }
+
+    const resolved = resolveOutlineTargets(root, ".");
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    expect(resolved.files.length).toBe(OUTLINE_MAX_FILES);
+    expect(resolved.truncatedBy).toBe("file-cap");
+    expect(resolved.totalMatches).toBe(supported);
+    expect(resolved.files.every((entry) => entry.endsWith(".ts"))).toBe(true);
   });
 
   it("stops a directory walk at the injectable entry cap and reports the walk-cap cause", () => {
@@ -684,7 +916,6 @@ describe("resolveOutlineTargets", () => {
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
     expect(resolved.truncated).toBe(true);
-    // A capped walk cannot know the true match count, so it must not claim one.
     expect(resolved.truncatedBy).toBe("walk-cap");
     expect(resolved.totalMatches).toBeUndefined();
     expect(resolved.files.length).toBeGreaterThan(0);
@@ -704,7 +935,7 @@ describe("resolveOutlineTargets", () => {
     expect(resolved.files.length).toBeLessThan(3);
   });
 
-  it("reports the file-cap cause with the true match count when more than OUTLINE_MAX_FILES match", () => {
+  it("reports the file-cap cause with the true match count", () => {
     const root = tempRoot();
     const total = OUTLINE_MAX_FILES + 1;
     for (let index = 0; index < total; index++) {
@@ -715,7 +946,6 @@ describe("resolveOutlineTargets", () => {
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;
     expect(resolved.files.length).toBe(OUTLINE_MAX_FILES);
-    expect(resolved.truncated).toBe(true);
     expect(resolved.truncatedBy).toBe("file-cap");
     expect(resolved.totalMatches).toBe(total);
   });
@@ -727,8 +957,6 @@ describe("resolveOutlineTargets", () => {
       writeFileSync(join(root, `g${String(index).padStart(4, "0")}.ts`), "export const x = 1;");
     }
 
-    // The cap stops before every file is visited, leaving more than
-    // OUTLINE_MAX_FILES collected — both the walk and file caps are hit.
     const resolved = resolveOutlineTargets(root, ".", { maxWalkEntries: total - 2 });
     expect(resolved.ok).toBe(true);
     if (!resolved.ok) return;

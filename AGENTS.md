@@ -22,6 +22,11 @@ belayd-agent-harness/
 │   ├── workflow-registry.ts # Workflow sub-types (feature, bugfix, etc.)
 │   ├── quality-gates.ts    # Deterministic quality checks (typecheck, lint, tests, proof)
 │   ├── archify.ts          # Archify diagram wrapper (args, receipts, formatting, run)
+│   ├── outline.ts          # belayd_outline pure layer (kinds, filters, formatter, resolver)
+│   ├── outline-ctags.ts    # universal-ctags argv + pure JSON parser
+│   ├── outline-ast-grep.ts # ast-grep inline rule + pure stream parser (TS family)
+│   ├── outline-extract.ts  # ctags+ast-grep orchestration (merge, line counts)
+│   ├── outline-binary.ts   # BELAYD_CTAGS_BIN / BELAYD_AST_GREP_BIN resolution
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
 │   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
 │   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
@@ -214,7 +219,7 @@ keywords and plain labels are ignored and default to `feature`.
 - `ast_grep` is read-only. Inspect matches with `read`/`edit`/`write` only after deciding on concrete changes.
 - Use `grep`/`find` for plain-text and filename searches.
 - Your working directory is already the worktree root — run commands directly, never prefix `cd <absolute worktree path> &&`.
-- After an edit, do NOT re-read the file to locate the next anchor — use `belayd_outline` for the symbol map or a targeted `grep -n` for text.
+- After an edit, do NOT re-read the file to locate the next anchor — use `belayd_outline` for the symbol map or a targeted `grep -n` for text. `belayd_outline` is multi-language (universal-ctags + ast-grep, no hand-rolled lexer); it needs `ctags` and `ast-grep` on PATH (devShell). Note that editing this tool shifts `extensions/index.ts` line anchors, so prefer `belayd_outline`/`ast_grep` over hard-coded line numbers in docs and tests.
 
 ## Code Style
 

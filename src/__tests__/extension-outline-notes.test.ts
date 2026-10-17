@@ -14,14 +14,39 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OutlineTargetResolution } from "../outline.js";
+import { OUTLINE_MAX_OUTPUT_BYTES } from "../outline.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
 const mockResolveOutlineTargets = vi.hoisted(() => vi.fn());
 
+// Partial-extraction notes the mocked extractor reports back, so the tool's
+// note ordering and budget can be exercised without a real ctags timeout.
+const mockExtractionNotes = vi.hoisted(() => ({ current: [] as string[] }));
+
+// Extraction spawns ctags/ast-grep; stub it so the truncation-note wording is
+// tested without depending on either binary being on PATH.
+const mockExtractOutlineSymbols = vi.hoisted(() =>
+  vi.fn((files: readonly string[]) => ({
+    ok: true as const,
+    files: files.map((path) => ({
+      path,
+      lineCount: 1,
+      symbols: [
+        { name: "alpha", kind: "function" as const, startLine: 1, endLine: 1, exported: true },
+      ],
+    })),
+    ...(mockExtractionNotes.current.length > 0 ? { notes: [...mockExtractionNotes.current] } : {}),
+  })),
+);
+
 vi.mock("../../src/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/index.js")>();
-  return { ...actual, resolveOutlineTargets: mockResolveOutlineTargets };
+  return {
+    ...actual,
+    resolveOutlineTargets: mockResolveOutlineTargets,
+    extractOutlineSymbols: mockExtractOutlineSymbols,
+  };
 });
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -84,6 +109,7 @@ describe("belayd_outline truncation notes", () => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-outline-notes-"));
     writeFileSync(join(cwd, "a.ts"), "export function alpha() {}\n");
     mockResolveOutlineTargets.mockReset();
+    mockExtractionNotes.current = [];
   });
 
   afterEach(() => {
@@ -126,5 +152,27 @@ describe("belayd_outline truncation notes", () => {
     const text = await runOutlineTool(cwd);
     expect(text).toContain("alpha");
     expect(text).not.toContain("note:");
+  });
+
+  it("renders a partial-extraction note once, after the truncation note, inside the budget", async () => {
+    mockResolveOutlineTargets.mockReturnValue({
+      ok: true,
+      files: [join(cwd, "a.ts")],
+      truncated: true,
+      truncatedBy: "file-cap",
+      totalMatches: 3,
+    } satisfies OutlineTargetResolution);
+    mockExtractionNotes.current = [
+      "note: ctags timed out before completing; the outline lists only the symbols recovered from its partial output.",
+    ];
+
+    const text = await runOutlineTool(cwd);
+    const partialIndex = text.indexOf("note: ctags timed out");
+    const truncationIndex = text.indexOf("note: matched 3 files");
+    expect(partialIndex).toBeGreaterThan(-1);
+    expect(truncationIndex).toBeGreaterThan(-1);
+    expect(partialIndex).toBeGreaterThan(truncationIndex);
+    expect(text.split("note: ctags timed out").length - 1).toBe(1);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(OUTLINE_MAX_OUTPUT_BYTES);
   });
 });

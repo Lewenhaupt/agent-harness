@@ -1,18 +1,20 @@
 /**
- * Structural symbol outline for large TypeScript files.
+ * Multi-language symbol outline for large source files.
  *
- * Sub-agents otherwise locate an edit anchor by re-reading a file in
- * `read` offset windows (pi truncates at 2000 lines / 50 KB). This module
- * produces a compact, line-ranged symbol map instead.
+ * Sub-agents otherwise locate an edit anchor by re-reading a file in `read`
+ * offset windows (pi truncates at 2000 lines / 50 KB). This module composes a
+ * compact, line-ranged symbol map instead.
  *
- * The scanner is intentionally dependency-free: `typescript` is a
- * devDependency and is NOT bundled into the Nix `belayd-harness` derivation,
- * so a compiler-API import would break the packaged extension at runtime.
- * Everything here uses a small state-machine lexer over the raw source.
+ * Extraction is delegated to real parsers, not a hand-rolled lexer:
+ * `outline-ctags.ts` (universal-ctags) supplies declarations for ~150
+ * languages, and `outline-ast-grep.ts` (ast-grep) supplies the TypeScript
+ * family's accurate declaration ranges plus the `pi.registerTool` / `pi.on`
+ * registrations that sit inside a function body and are invisible to ctags.
  *
- * `outlineSource` / `outlineFiles` / `formatOutline` are pure. The only
- * side-effecting function is `resolveOutlineTargets`, which reads the
- * filesystem to turn a path/dir/glob into a sorted file list.
+ * This module stays pure and synchronous: kind mapping, filters, the
+ * byte-bounded formatter, symbol merging, and the target resolver. The only
+ * side effect is `resolveOutlineTargets`, which reads the filesystem to turn a
+ * path/dir/glob into a sorted file list.
  */
 
 import type { Dirent, Stats } from "node:fs";
@@ -22,24 +24,31 @@ import { join, resolve, sep } from "node:path";
 /**
  * Symbol kinds the outline emits.
  *
- * `function` covers `function`/`async function`/generator declarations;
- * `const`/`let`/`var` cover variable declarations (including arrow-function
- * consts); the rest are the matching named declarations. `registerTool` and
- * `on` are pi plugin registrations (`pi.registerTool` / `pi.on`). `export`
- * covers `export { … }` / `export type { … }` re-export lists, whose names
- * are surfaced instead of an anonymous `type` row. Nested declarations are
- * intentionally not emitted (see `outlineSource`).
+ * The first group is shared: `function` covers `function`/`async function`/
+ * generator declarations, `const`/`let`/`var` cover variable declarations, and
+ * `registerTool`/`on` are pi plugin registrations. The second group
+ * (`struct`/`union`/`trait`/`module`/`namespace`/`macro`/`field`) covers the
+ * non-TypeScript languages ctags parses. Nested function-local declarations
+ * are intentionally not emitted (see the extractors).
  */
 export const OUTLINE_KINDS = [
   "function",
+  "method",
+  "class",
+  "interface",
+  "type",
   "const",
   "let",
   "var",
-  "class",
-  "type",
-  "interface",
   "enum",
-  "export",
+  "struct",
+  "union",
+  "trait",
+  "module",
+  "namespace",
+  "macro",
+  "field",
+  "property",
   "registerTool",
   "on",
 ] as const;
@@ -54,9 +63,9 @@ export interface OutlineSymbol {
   startLine: number;
   /** 1-based line of the declaration's closing brace or terminating `;`. */
   endLine: number;
-  /** True when the declaration starts with `export`. */
+  /** True when the declaration is exported (`export …`). */
   exported: boolean;
-  /** Short human hint for ambiguous cases (e.g. anonymous default exports). */
+  /** Short human hint for ambiguous cases. */
   detail?: string;
 }
 
@@ -67,10 +76,17 @@ export interface OutlineFile {
   symbols: OutlineSymbol[];
 }
 
-/** Input file for `outlineFiles` (source already read by the caller). */
-export interface OutlineSourceFile {
+/** Symbols extracted for one file, before line counting. */
+export interface OutlineSymbolGroup {
   path: string;
-  source: string;
+  symbols: OutlineSymbol[];
+}
+
+/** A file with resolved symbols and its line count, ready for filtering. */
+export interface OutlineFileSymbols {
+  path: string;
+  lineCount: number;
+  symbols: OutlineSymbol[];
 }
 
 /** Filters applied while building an outline. */
@@ -108,14 +124,155 @@ export const OUTLINE_MAX_FILES = 200;
  */
 export const OUTLINE_MAX_OUTPUT_BYTES = 16 * 1024;
 
-/** File extensions the outline scans (TS-family only, no JS). */
-export const OUTLINE_FILE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts"] as const;
-
 /**
  * Hard cap on directory-walk entries so a glob rooted at `/` cannot traverse
  * the whole filesystem before the smaller `OUTLINE_MAX_FILES` result cap.
  */
 export const OUTLINE_MAX_WALK_ENTRIES = 50_000;
+
+/**
+ * Static language table.
+ *
+ * `ctags` is the universal-ctags language name (documentation only — ctags
+ * auto-detects from the extension once {@link ./outline-ctags.js} has added its
+ * explicit `--map-<LANG>` overrides). A defined `astGrep` language marks the
+ * files ast-grep extracts, because ctags' TypeScript parser does not emit end
+ * lines; it also supplies coverage for extensions ctags does not map by
+ * default (`.tsx`/`.mts`/`.cts`/`.cjs`).
+ */
+export interface OutlineLanguage {
+  extension: string;
+  ctags: string;
+  astGrep?: "ts" | "tsx" | "js";
+}
+
+export const OUTLINE_LANGUAGES: readonly OutlineLanguage[] = [
+  { extension: ".ts", ctags: "TypeScript", astGrep: "ts" },
+  { extension: ".tsx", ctags: "TypeScript", astGrep: "tsx" },
+  { extension: ".mts", ctags: "TypeScript", astGrep: "ts" },
+  { extension: ".cts", ctags: "TypeScript", astGrep: "ts" },
+  { extension: ".js", ctags: "JavaScript" },
+  { extension: ".jsx", ctags: "JavaScript" },
+  { extension: ".mjs", ctags: "JavaScript" },
+  { extension: ".cjs", ctags: "JavaScript", astGrep: "js" },
+  { extension: ".py", ctags: "Python" },
+  { extension: ".rs", ctags: "Rust" },
+  { extension: ".go", ctags: "Go" },
+  { extension: ".rb", ctags: "Ruby" },
+  { extension: ".java", ctags: "Java" },
+  { extension: ".c", ctags: "C" },
+  { extension: ".h", ctags: "C" },
+  { extension: ".cc", ctags: "C++" },
+  { extension: ".cpp", ctags: "C++" },
+  { extension: ".hpp", ctags: "C++" },
+  { extension: ".cs", ctags: "C#" },
+  { extension: ".php", ctags: "PHP" },
+  { extension: ".lua", ctags: "Lua" },
+  { extension: ".sh", ctags: "Sh" },
+  { extension: ".bash", ctags: "Sh" },
+  { extension: ".zsh", ctags: "Sh" },
+  { extension: ".kt", ctags: "Kotlin" },
+  { extension: ".ex", ctags: "Elixir" },
+  { extension: ".exs", ctags: "Elixir" },
+  { extension: ".hs", ctags: "Haskell" },
+  { extension: ".ml", ctags: "OCaml" },
+  { extension: ".mli", ctags: "OCaml" },
+];
+
+/** Every extension the outline accepts, derived from {@link OUTLINE_LANGUAGES}. */
+export const OUTLINE_FILE_EXTENSIONS: readonly string[] = OUTLINE_LANGUAGES.map(
+  (language) => language.extension,
+);
+
+/** TypeScript-family extensions, which ast-grep extracts. */
+export const OUTLINE_TS_EXTENSIONS: readonly string[] = OUTLINE_LANGUAGES.filter(
+  (language) => language.astGrep !== undefined,
+).map((language) => language.extension);
+
+/**
+ * JS/TS words that cannot name a declaration.
+ *
+ * Only declaration/lexical positions use this: a declaration name can never be
+ * a reserved word, so a keyword there is parser noise (ctags' JavaScript
+ * parser emits a `constant const` row for `const { const: x } = obj;`).
+ * Member names are checked separately, because `class C { public = 1; const =
+ * 1 }` are legal keyword-named fields and must not be dropped.
+ */
+export const OUTLINE_JS_TS_KEYWORDS: ReadonlySet<string> = new Set([
+  "await",
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "implements",
+  "import",
+  "in",
+  "instanceof",
+  "interface",
+  "let",
+  "new",
+  "null",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "return",
+  "static",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+]);
+
+/** True when `name` is a JS/TS word that cannot be a declaration. */
+export function isOutlineJsTsKeyword(name: string): boolean {
+  return OUTLINE_JS_TS_KEYWORDS.has(name);
+}
+
+/**
+ * ast-grep language for a path, or undefined when only ctags covers it.
+ * Extension matching is case-insensitive; `.mts`/`.cts`/`.d.ts` map to `ts`,
+ * `.tsx` maps to `tsx`, and `.cjs` maps to `js` (the JavaScript grammar, since
+ * ast-grep's scan resolves the grammar from the file extension).
+ */
+export function outlineAstGrepLanguage(path: string): "ts" | "tsx" | "js" | undefined {
+  const lower = path.toLowerCase();
+  for (const language of OUTLINE_LANGUAGES) {
+    if (language.astGrep !== undefined && lower.endsWith(language.extension)) {
+      return language.astGrep;
+    }
+  }
+  return undefined;
+}
+
+/** True when the path has an extension the outline can parse. */
+export function isOutlineSupportedFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return OUTLINE_LANGUAGES.some((language) => lower.endsWith(language.extension));
+}
 
 /**
  * Why a successful resolution was truncated.
@@ -128,7 +285,7 @@ export const OUTLINE_MAX_WALK_ENTRIES = 50_000;
 export type OutlineTruncationCause = "file-cap" | "walk-cap";
 
 /**
- * Result of resolving a path/dir/glob to TypeScript files.
+ * Result of resolving a path/dir/glob to source files.
  * Truncation is reported as a value so the caller can surface it.
  */
 export type OutlineTargetResolution =
@@ -158,722 +315,65 @@ export function isOutlineKind(value: unknown): value is OutlineKind {
   return typeof value === "string" && (OUTLINE_KINDS as readonly string[]).includes(value);
 }
 
-// ── Source scanner ─────────────────────────────────────────────────────
+// ── Symbol merging ─────────────────────────────────────────────────────
 
 /**
- * Lexer state. `regex` and `jsx-tag` span at most one line; neither can wrap.
- */
-type ScanState =
-  | "code"
-  | "line-comment"
-  | "block-comment"
-  | "single"
-  | "double"
-  | "template"
-  | "regex"
-  | "jsx-tag";
-
-interface ScanLine {
-  /** Brace depth at the first character of the line. */
-  braceBefore: number;
-  /** Paren depth at the first character of the line. */
-  parenBefore: number;
-  /** Bracket depth at the first character of the line. */
-  bracketBefore: number;
-  /** True when the line begins inside a block comment / multi-line string. */
-  startedInOpaque: boolean;
-  /** The line with comments/strings/regexes blanked to spaces. */
-  code: string;
-  /** The untouched source line (used to extract registration names). */
-  raw: string;
-}
-
-/** Mutable lexer state threaded across a single file's lines. */
-interface LexState {
-  braceDepth: number;
-  parenDepth: number;
-  bracketDepth: number;
-  state: ScanState;
-  escaped: boolean;
-  /** True while inside a regex `[...]` character class. */
-  regexInClass: boolean;
-  /** Last significant code character, or "" at file start. */
-  previousSignificant: string;
-  /** Last completed identifier/keyword, used to allow regex after keywords. */
-  previousWord: string;
-  /** Identifier currently being accumulated. */
-  word: string;
-}
-
-interface LexStep {
-  output: string;
-  consumed: number;
-}
-
-interface AdvanceInput {
-  lex: LexState;
-  ch: string;
-  next: string;
-}
-
-/** Keywords after which a `/` starts a regex literal, not division. */
-const REGEX_PRECEDING_KEYWORDS: ReadonlySet<string> = new Set([
-  "return",
-  "case",
-  "typeof",
-  "instanceof",
-  "in",
-  "of",
-  "new",
-  "delete",
-  "void",
-  "do",
-  "else",
-  "yield",
-  "await",
-  "throw",
-]);
-
-const IDENTIFIER_CHAR_RE = /[\w$]/;
-
-function isIdentifierChar(ch: string): boolean {
-  return IDENTIFIER_CHAR_RE.test(ch);
-}
-
-/**
- * Decide whether a `/` at this point starts a regex literal.
+ * Identity for de-duplication across extractors.
  *
- * A regex may follow an operator/punctuator or an expression-expecting
- * keyword; it may not follow an identifier, number, `)`, `]`, or `}` (the
- * standard heuristic). See `REGEX_PRECEDING_KEYWORDS` for the keyword case.
+ * The two extractors disagree on kind for the same lexical declaration, so
+ * `const`/`let`/`var`/`function`/`class` collapse into one identity and
+ * ast-grep wins the kind. `function`/`class` join the variable identity
+ * because ctags' JavaScript parser miskinds an arrow function as `function`
+ * and a generator declaration as `class`, while ast-grep refines them to
+ * `const` and `function`; without the shared identity the miskinded ctags row
+ * survives as a contradictory twin. A genuine same-line, same-name pair drawn
+ * from these declaration forms cannot exist in valid source, so collapsing is
+ * safe. Genuinely distinct kinds on the same line stay separate: a property
+ * and a method (`foo: () => number; foo() {}`) and the two captures of
+ * `const t = pi.registerTool({ name: "t" })` (`const` and `registerTool`) are
+ * different symbols and must not overwrite each other.
  */
-function regexAllowed(lex: LexState): boolean {
-  const prev = lex.previousSignificant;
-  if (prev === "") return true;
-  // `)`, `]`, `}` end a value/expression, so a following `/` is division.
-  if (prev === ")" || prev === "]" || prev === "}") return false;
-  if (isIdentifierChar(prev)) return REGEX_PRECEDING_KEYWORDS.has(lex.previousWord);
-  return true;
-}
-
-/** Handle one character while in `code` (lexical) state. */
-function advanceCode(lex: LexState, ch: string, next: string): LexStep {
-  const isWordChar = isIdentifierChar(ch);
-  if (!isWordChar && lex.word !== "") {
-    lex.previousWord = lex.word;
-    lex.word = "";
-  }
-
-  if (ch === "/" && next === "/") {
-    lex.state = "line-comment";
-    return { output: "  ", consumed: 2 };
-  }
-  if (ch === "/" && next === "*") {
-    lex.state = "block-comment";
-    return { output: "  ", consumed: 2 };
-  }
-  if (ch === "/" && lex.previousSignificant === "<") {
-    // A JSX closing tag (`</div>`) is not a regex: blank the tag up to `>`.
-    lex.state = "jsx-tag";
-    return { output: " ", consumed: 1 };
-  }
-  if (ch === "/" && regexAllowed(lex)) {
-    lex.state = "regex";
-    lex.regexInClass = false;
-    lex.escaped = false;
-    return { output: " ", consumed: 1 };
-  }
-
-  if (isWordChar) {
-    lex.word += ch;
-    lex.previousSignificant = ch;
-    return { output: ch, consumed: 1 };
-  }
-
-  if (ch.trim() !== "") lex.previousSignificant = ch;
-
-  switch (ch) {
-    case "(":
-      lex.parenDepth += 1;
-      break;
-    case ")":
-      lex.parenDepth = Math.max(0, lex.parenDepth - 1);
-      break;
-    case "[":
-      lex.bracketDepth += 1;
-      break;
-    case "]":
-      lex.bracketDepth = Math.max(0, lex.bracketDepth - 1);
-      break;
-    case "{":
-      lex.braceDepth += 1;
-      break;
-    case "}":
-      lex.braceDepth = Math.max(0, lex.braceDepth - 1);
-      break;
-    case '"':
-      lex.state = "double";
-      // A string literal is a value: the next `/` is division, not a regex.
-      lex.previousSignificant = ")";
-      break;
-    case "'":
-      lex.state = "single";
-      lex.previousSignificant = ")";
-      break;
-    case "`":
-      lex.state = "template";
-      lex.previousSignificant = ")";
-      break;
-    default:
-      break;
-  }
-  return { output: ch, consumed: 1 };
-}
-
-/** Advance one character inside a single/double-quoted string or template. */
-function advanceQuoted(lex: LexState, ch: string, quote: string): LexStep {
-  if (lex.escaped) {
-    lex.escaped = false;
-  } else if (ch === "\\") {
-    lex.escaped = true;
-  } else if (ch === quote) {
-    lex.state = "code";
-  }
-  return { output: " ", consumed: 1 };
-}
-
-/** Advance one character inside a regex literal. */
-function advanceRegex(lex: LexState, ch: string): LexStep {
-  if (lex.escaped) {
-    lex.escaped = false;
-  } else if (ch === "\\") {
-    lex.escaped = true;
-  } else if (ch === "[") {
-    lex.regexInClass = true;
-  } else if (ch === "]") {
-    lex.regexInClass = false;
-  } else if (ch === "/" && !lex.regexInClass) {
-    lex.state = "code";
-    // The closed regex is a value; a following `/` is division.
-    lex.previousSignificant = ")";
-  }
-  return { output: " ", consumed: 1 };
-}
-
-/** Advance one character while blanking an opaque JSX tag. */
-function advanceJsxTag(lex: LexState, ch: string): LexStep {
-  if (ch === ">") {
-    lex.state = "code";
-    // A JSX element is a value; a following `/` is division, not a regex.
-    lex.previousSignificant = ")";
-  }
-  return { output: " ", consumed: 1 };
-}
-
-/** Dispatch one character through the lexer state machine. */
-function advanceScan(input: AdvanceInput): LexStep {
-  const { lex, ch, next } = input;
-  switch (lex.state) {
-    case "code":
-      return advanceCode(lex, ch, next);
-    case "line-comment":
-      return { output: " ", consumed: 1 };
-    case "block-comment":
-      if (ch === "*" && next === "/") {
-        lex.state = "code";
-        return { output: "  ", consumed: 2 };
-      }
-      return { output: " ", consumed: 1 };
-    case "single":
-      return advanceQuoted(lex, ch, "'");
-    case "double":
-      return advanceQuoted(lex, ch, '"');
-    case "template":
-      return advanceQuoted(lex, ch, "`");
-    case "regex":
-      return advanceRegex(lex, ch);
-    case "jsx-tag":
-      return advanceJsxTag(lex, ch);
-  }
-}
-
-function createLexState(): LexState {
-  return {
-    braceDepth: 0,
-    parenDepth: 0,
-    bracketDepth: 0,
-    state: "code",
-    escaped: false,
-    regexInClass: false,
-    previousSignificant: "",
-    previousWord: "",
-    word: "",
-  };
-}
-
-/**
- * Split source into lines annotated with the brace/paren/bracket depth at
- * each line start.
- *
- * Comments, single/double-quoted strings, template literals, and regex
- * literals are blanked so braces/quotes inside them cannot desync depth or
- * flip the lexer into a bogus string state. Template `${}` expressions are
- * treated as opaque template content — a documented simplification.
- */
-function scanSourceLines(source: string): ScanLine[] {
-  const scanned: ScanLine[] = [];
-  const lex = createLexState();
-
-  for (const raw of source.split("\n")) {
-    const braceBefore = lex.braceDepth;
-    const parenBefore = lex.parenDepth;
-    const bracketBefore = lex.bracketDepth;
-    const startedInOpaque = lex.state !== "code";
-    let code = "";
-    let i = 0;
-    while (i < raw.length) {
-      const step = advanceScan({ lex, ch: raw.charAt(i), next: raw.charAt(i + 1) });
-      code += step.output;
-      i += step.consumed;
-    }
-    // Regex literals cannot span lines; treat an unterminated one as code so
-    // the next line is not swallowed.
-    if (lex.state === "line-comment" || lex.state === "regex" || lex.state === "jsx-tag") {
-      lex.state = "code";
-    }
-    scanned.push({ braceBefore, parenBefore, bracketBefore, startedInOpaque, code, raw });
-  }
-  return scanned;
-}
-
-// ── Declaration detection ──────────────────────────────────────────────
-
-/** How the end of a declaration is located. */
-type DetectionEndStyle = "body" | "statement" | "call";
-
-/** Mutual brace/paren/bracket/angle depth while locating a declaration end. */
-interface DepthState {
-  brace: number;
-  paren: number;
-  bracket: number;
-  /**
-   * Approximate `<…>` generic depth. Tracked only outside parens/brackets in
-   * declaration headers so a generic type literal like `Promise<{ x: 1 }>`
-   * does not register as the declaration body.
-   */
-  angle: number;
-}
-
-interface DetectedDeclaration {
-  kind: OutlineKind;
-  name: string | undefined;
-  exported: boolean;
-  endStyle: DetectionEndStyle;
-  detail?: string;
-}
-
-const DECLARATION_RE =
-  /^(?<exported>export\s+)?(?<default>default\s+)?(?<async>async\s+)?(?<abstract>abstract\s+)?(?<declare>declare\s+)?(?<keyword>function\s*\*?|class|const\s+enum|const|let|var|type|interface|enum)\s*(?<name>[A-Za-z_$][\w$]*)?/;
-
-const RE_EXPORT_RE = /^export\s+(type\s+)?\{/;
-
-const KEYWORD_TO_KIND: Record<string, OutlineKind> = {
-  class: "class",
-  const: "const",
-  let: "let",
-  var: "var",
-  type: "type",
-  interface: "interface",
-  enum: "enum",
-  "const enum": "enum",
-};
-
-function outlineKindForKeyword(keyword: string): OutlineKind | undefined {
-  if (keyword.startsWith("function")) return "function";
-  return KEYWORD_TO_KIND[keyword];
-}
-
-function endStyleForKind(kind: OutlineKind): DetectionEndStyle {
+function lexicalIdentity(kind: OutlineKind): string {
   switch (kind) {
+    case "const":
+    case "let":
+    case "var":
     case "function":
     case "class":
-    case "interface":
-    case "enum":
-      return "body";
+      return "declaration";
     default:
-      return "statement";
+      return kind;
   }
 }
 
-function detectDeclaration(trimmed: string): DetectedDeclaration | undefined {
-  const match = DECLARATION_RE.exec(trimmed);
-  const groups = match?.groups;
-  if (groups === undefined) return undefined;
-  const kind = outlineKindForKeyword(groups.keyword ?? "");
-  if (kind === undefined) return undefined;
-
-  const isDefault = groups.default !== undefined;
-  const rawName = groups.name;
-  // Destructuring (`const { a } = …`) and other anonymous declarations have no
-  // stable name; skip them rather than emitting a bogus "(anonymous)" row.
-  const name = rawName ?? (isDefault ? "default" : undefined);
-  if (name === undefined) return undefined;
-
-  const detail = rawName === undefined && isDefault ? "anonymous default export" : undefined;
-  return {
-    kind,
-    name,
-    exported: groups.exported !== undefined,
-    endStyle: endStyleForKind(kind),
-    ...(detail !== undefined ? { detail } : {}),
-  };
-}
-
-/** Detect pi plugin registrations that are not ordinary declarations. */
-function detectRegistration(trimmed: string): DetectedDeclaration | undefined {
-  if (/^pi\.registerTool\s*\(/.test(trimmed)) {
-    return {
-      kind: "registerTool",
-      name: undefined,
-      exported: false,
-      endStyle: "call",
-      detail: "pi.registerTool",
-    };
-  }
-  if (/^pi\.on\s*\(/.test(trimmed)) {
-    return { kind: "on", name: undefined, exported: false, endStyle: "call", detail: "pi.on" };
-  }
-  return undefined;
-}
-
-/** Reserved words that can appear inside a re-export brace list. */
-const RE_EXPORT_NON_NAMES: ReadonlySet<string> = new Set(["default", "as", "type"]);
-
-/**
- * Detect `export { a, b }` / `export type { … } from "…"` and surface the
- * exported names. `DECLARATION_RE` would otherwise read `export type` as an
- * anonymous type declaration.
- */
-function detectReExport(lines: ScanLine[], index: number): DetectedDeclaration | undefined {
-  const line = lines[index];
-  if (line === undefined || !RE_EXPORT_RE.test(line.code.trim())) return undefined;
-  const all = collectBraceNames(lines, index);
-  if (all.length === 0) return undefined;
-
-  const names = all.filter((name) => !RE_EXPORT_NON_NAMES.has(name));
-  if (names.length === 0) {
-    // `export { default } from "…"` has no non-reserved name; keep the row
-    // (with a marker) instead of silently dropping the re-export.
-    if (!all.includes("default")) return undefined;
-    return {
-      kind: "export",
-      name: "default",
-      exported: true,
-      endStyle: "statement",
-      detail: "(default)",
-    };
-  }
-  return {
-    kind: "export",
-    name: formatExportName(names),
-    exported: true,
-    endStyle: "statement",
-    detail: "re-export",
-  };
-}
-
-/** Only the next few lines can hold a re-export brace list. */
-const RE_EXPORT_WINDOW_LINES = 16;
-
-/** Collect the identifiers inside the first `{…}` starting at `startIndex`. */
-function collectBraceNames(lines: ScanLine[], startIndex: number): string[] {
-  const code = lines
-    .slice(startIndex, startIndex + RE_EXPORT_WINDOW_LINES)
-    .map((line) => line?.code ?? "")
-    .join("\n");
-  const open = code.indexOf("{");
-  if (open === -1) return [];
-
-  let depth = 0;
-  for (let i = open; i < code.length; i++) {
-    const ch = code.charAt(i);
-    if (ch === "{") {
-      depth += 1;
-    } else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) return extractIdentifiers(code.slice(open + 1, i));
-    }
-  }
-  return [];
-}
-
-function extractIdentifiers(text: string): string[] {
-  const matches = text.match(/[A-Za-z_$][\w$]*/g);
-  return matches ?? [];
-}
-
-function formatExportName(names: string[]): string {
-  const joined = names.join(", ");
-  if (joined.length <= 120) return joined;
-  return `${names.slice(0, 8).join(", ")} (+${names.length - 8} more)`;
+function symbolKey(symbol: OutlineSymbol): string {
+  return `${symbol.startLine}:${lexicalIdentity(symbol.kind)}:${symbol.name}`;
 }
 
 /**
- * Find the last line of a `function`/`class`/`interface`/`enum` body.
+ * Merge two symbol sets for one file.
  *
- * Only a `{` opened at paren===0 && bracket===0 && brace===0 is the body-open;
- * inline object type literals inside parameters/generics therefore cannot end
- * the declaration early. A `;` before the body opens terminates an overload
- * signature. The declaration ends at the brace matching the body-open.
+ * `extra` (ast-grep) refines `base` (ctags) on a same-line, same-identity
+ * collision: it wins the end line, kind, and exported flag. Symbols present in
+ * only one set are kept, so ctags' multi-declarator rows survive ast-grep's
+ * single-name captures and distinct same-line kinds coexist. Result is sorted
+ * ascending by start line, then name (then kind, to keep the order stable).
  */
-interface BodyScanResult {
-  bodyOpened: boolean;
-  terminated: boolean;
-}
-
-/** Advance the body scan one character; report the matching body close. */
-function advanceBodyScan(state: DepthState, bodyOpened: boolean, ch: string): BodyScanResult {
-  switch (ch) {
-    case "(":
-      state.paren += 1;
-      return { bodyOpened, terminated: false };
-    case ")":
-      state.paren = Math.max(0, state.paren - 1);
-      return { bodyOpened, terminated: false };
-    case "[":
-      state.bracket += 1;
-      return { bodyOpened, terminated: false };
-    case "]":
-      state.bracket = Math.max(0, state.bracket - 1);
-      return { bodyOpened, terminated: false };
-    case "<":
-      if (state.paren === 0 && state.bracket === 0) state.angle += 1;
-      return { bodyOpened, terminated: false };
-    case ">":
-      if (state.paren === 0 && state.bracket === 0) state.angle = Math.max(0, state.angle - 1);
-      return { bodyOpened, terminated: false };
-    case "{": {
-      const opened =
-        bodyOpened ||
-        (state.paren === 0 && state.bracket === 0 && state.angle === 0 && state.brace === 0);
-      state.brace += 1;
-      return { bodyOpened: opened, terminated: false };
-    }
-    case "}":
-      state.brace = Math.max(0, state.brace - 1);
-      // Termination is deferred to end-of-line (see findBodyEnd): a mid-line
-      // `}` may be an inline object-literal return type, not the body close.
-      return { bodyOpened, terminated: false };
-    case ";":
-      // A top-level `;` ends an overload signature. It can occur after an
-      // inline object return type, so do not gate on `bodyOpened` here.
-      return {
-        bodyOpened,
-        terminated:
-          state.brace === 0 && state.paren === 0 && state.bracket === 0 && state.angle === 0,
-      };
-    default:
-      return { bodyOpened, terminated: false };
-  }
-}
-
-function findBodyEnd(lines: ScanLine[], startIndex: number): number {
-  const state: DepthState = { brace: 0, paren: 0, bracket: 0, angle: 0 };
-  let bodyOpened = false;
-  for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) break;
-    for (const ch of line.code) {
-      const result = advanceBodyScan(state, bodyOpened, ch);
-      bodyOpened = result.bodyOpened;
-      if (result.terminated) return i;
-    }
-    // Only a body close that ends the line terminates: an inline object return
-    // type (`): { a: 1 } {`) returns brace to 0 mid-line but is followed by
-    // the real body `{`. A one-liner body (`function f() { return 1; }`) ends
-    // the line on `}` at depth 0, so it still terminates here.
-    if (bodyOpened && state.brace === 0 && line.code.trimEnd().endsWith("}")) return i;
-  }
-  return Math.max(0, lines.length - 1);
-}
-
-/**
- * Find the last line of a `const`/`let`/`var`/`type` declaration.
- *
- * Braces/parens/brackets are balanced so a `;` nested in an object literal or
- * call argument does not terminate early; the declaration ends at the first
- * `;` with all three depths at zero.
- */
-function findStatementEnd(lines: ScanLine[], startIndex: number): number {
-  const state: DepthState = { brace: 0, paren: 0, bracket: 0, angle: 0 };
-  for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) break;
-    for (const ch of line.code) {
-      switch (ch) {
-        case "{":
-          state.brace += 1;
-          break;
-        case "}":
-          state.brace = Math.max(0, state.brace - 1);
-          break;
-        case "(":
-          state.paren += 1;
-          break;
-        case ")":
-          state.paren = Math.max(0, state.paren - 1);
-          break;
-        case "[":
-          state.bracket += 1;
-          break;
-        case "]":
-          state.bracket = Math.max(0, state.bracket - 1);
-          break;
-        case ";":
-          if (state.brace === 0 && state.paren === 0 && state.bracket === 0) return i;
-          break;
-        default:
-          break;
-      }
-    }
-  }
-  return Math.max(0, lines.length - 1);
-}
-
-/** Mutual paren state while locating the end of a registration call. */
-interface CallScanState {
-  paren: number;
-  opened: boolean;
-}
-
-/** Advance the call scan one character; true when the call's `)` closes. */
-function advanceCallScan(state: CallScanState, ch: string): boolean {
-  switch (ch) {
-    case "(":
-      state.paren += 1;
-      state.opened = true;
-      return false;
-    case ")":
-      state.paren = Math.max(0, state.paren - 1);
-      return state.opened && state.paren === 0;
-    case ";":
-      return !state.opened;
-    default:
-      return false;
-  }
-}
-
-/** Find the line where the `pi.registerTool(` / `pi.on(` call's `)` closes. */
-function findCallEnd(lines: ScanLine[], startIndex: number): number {
-  const state: CallScanState = { paren: 0, opened: false };
-  for (let i = startIndex; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) break;
-    for (const ch of line.code) {
-      if (advanceCallScan(state, ch)) return i;
-    }
-  }
-  return Math.max(0, lines.length - 1);
-}
-
-function endDeclaration(lines: ScanLine[], startIndex: number, style: DetectionEndStyle): number {
-  switch (style) {
-    case "body":
-      return findBodyEnd(lines, startIndex);
-    case "call":
-      return findCallEnd(lines, startIndex);
-    case "statement":
-      return findStatementEnd(lines, startIndex);
-  }
-}
-
-function extractRegistrationName(rawLines: string[], pattern: RegExp): string | undefined {
-  const match = pattern.exec(rawLines.join("\n"));
-  return match?.[1];
-}
-
-function resolveSymbolName(
-  detected: DetectedDeclaration,
-  rawLines: string[],
-  startLine: number,
-): string {
-  if (detected.kind === "registerTool") {
-    return (
-      extractRegistrationName(rawLines, /name\s*:\s*["'`]([^"'`]+)["'`]/) ??
-      `registerTool@${startLine}`
-    );
-  }
-  if (detected.kind === "on") {
-    return extractRegistrationName(rawLines, /pi\.on\(\s*["'`]([^"'`]+)["'`]/) ?? `on@${startLine}`;
-  }
-  return detected.name ?? "(anonymous)";
-}
-
-/** Materialize a detected symbol with its resolved line range and name. */
-function buildSymbol(
-  lines: ScanLine[],
-  index: number,
-  detected: DetectedDeclaration,
-): OutlineSymbol {
-  const startLine = index + 1;
-  const endIndex = endDeclaration(lines, index, detected.endStyle);
-  const rawLines = lines.slice(index, endIndex + 1).map((scanLine) => scanLine.raw);
-  return {
-    name: resolveSymbolName(detected, rawLines, startLine),
-    kind: detected.kind,
-    startLine,
-    endLine: endIndex + 1,
-    exported: detected.exported,
-    ...(detected.detail !== undefined ? { detail: detected.detail } : {}),
-  };
-}
-
-/**
- * Pure structural scan of TypeScript source.
- *
- * Emits top-level declarations and pi registrations, ordered by ascending
- * start line. Nested declarations/object methods are excluded (they start at
- * brace/paren/bracket depth > 0); `pi.registerTool` / `pi.on` are emitted at
- * any depth because plugin entry points register tools inside their
- * default-export function.
- */
-export function outlineSource(source: string): OutlineSymbol[] {
-  const lines = scanSourceLines(source);
-  const symbols: OutlineSymbol[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const symbol = detectSymbolAt(lines, i);
-    if (symbol !== undefined) symbols.push(symbol);
-  }
-  return symbols;
-}
-
-/** Detect one symbol at `index`, or undefined when there is none. */
-function detectSymbolAt(lines: ScanLine[], index: number): OutlineSymbol | undefined {
-  const line = lines[index];
-  if (line === undefined || line.startedInOpaque) return undefined;
-  const trimmed = line.code.trim();
-  if (trimmed === "") return undefined;
-
-  const registration = detectRegistration(trimmed);
-  if (registration !== undefined) return buildSymbol(lines, index, registration);
-
-  if (line.braceBefore !== 0 || line.parenBefore !== 0 || line.bracketBefore !== 0) {
-    return undefined;
-  }
-
-  const reExport = detectReExport(lines, index);
-  if (reExport !== undefined) return buildSymbol(lines, index, reExport);
-
-  const declaration = detectDeclaration(trimmed);
-  if (declaration === undefined) return undefined;
-  return buildSymbol(lines, index, declaration);
+export function mergeOutlineSymbols(
+  base: readonly OutlineSymbol[],
+  extra: readonly OutlineSymbol[],
+): OutlineSymbol[] {
+  const byKey = new Map<string, OutlineSymbol>();
+  for (const symbol of base) byKey.set(symbolKey(symbol), symbol);
+  for (const symbol of extra) byKey.set(symbolKey(symbol), symbol);
+  return [...byKey.values()].sort((a, b) => {
+    if (a.startLine !== b.startLine) return a.startLine - b.startLine;
+    const byName = a.name.localeCompare(b.name);
+    return byName !== 0 ? byName : a.kind.localeCompare(b.kind);
+  });
 }
 
 // ── Aggregation & formatting ───────────────────────────────────────────
-
-function countLines(source: string): number {
-  return source.length === 0 ? 0 : source.split("\n").length;
-}
 
 function matchesFilters(
   symbol: OutlineSymbol,
@@ -892,14 +392,14 @@ function matchesFilters(
 }
 
 /**
- * Pure aggregation of `outlineSource` across files with optional filters.
+ * Pure aggregation of pre-extracted symbols across files with optional filters.
  *
  * `maxSymbols` caps the global symbol count in file order. Once the cap is
  * reached the remaining files are not scanned at all (they add no headers),
  * and `truncated` is set.
  */
 export function outlineFiles(
-  files: readonly OutlineSourceFile[],
+  files: readonly OutlineFileSymbols[],
   options?: OutlineFilesOptions,
 ): OutlineResult {
   const kindFilter = options?.kind;
@@ -912,17 +412,13 @@ export function outlineFiles(
   for (let index = 0; index < files.length; index++) {
     const file = files[index];
     if (file === undefined) continue;
-    const filtered = outlineSource(file.source).filter((symbol) =>
+    const filtered = file.symbols.filter((symbol) =>
       matchesFilters(symbol, kindFilter, nameFilter),
     );
     const capped = applySymbolCap(filtered, totalSymbols, maxSymbols);
     if (capped.truncated) truncated = true;
     totalSymbols += capped.kept.length;
-    resultFiles.push({
-      path: file.path,
-      lineCount: countLines(file.source),
-      symbols: capped.kept,
-    });
+    resultFiles.push({ path: file.path, lineCount: file.lineCount, symbols: capped.kept });
 
     if (maxSymbols !== undefined && totalSymbols >= maxSymbols) {
       if (index < files.length - 1) truncated = true;
@@ -991,13 +487,15 @@ function utf8ByteLength(text: string): number {
  * Token-cheap text rendering of an outline.
  *
  * One header per file (`path (N lines)`), then
- * `startLine-endLine  kind  name` rows, then optional filter/truncation notes.
- * Total output is bounded by `OUTLINE_MAX_OUTPUT_BYTES` (UTF-8 bytes); the
- * footer is reserved up front so it can never be dropped by the budget.
+ * `startLine-endLine  kind  name` rows, then optional filter/truncation notes
+ * and any caller-supplied `extraNotes`. Total output is bounded by
+ * `OUTLINE_MAX_OUTPUT_BYTES` (UTF-8 bytes); the footer — including
+ * `extraNotes` — is reserved up front so a caller note (partial extraction,
+ * file-cap truncation) can never push the result past the budget.
  */
-export function formatOutline(result: OutlineResult): string {
+export function formatOutline(result: OutlineResult, extraNotes: readonly string[] = []): string {
   const body = collectOutlineLines(result);
-  const footerNotes = formatOutlineFooter(result);
+  const footerNotes = [...formatOutlineFooter(result), ...extraNotes];
   const truncationNote = `note: output truncated at ${OUTLINE_MAX_OUTPUT_BYTES} bytes; narrow with a path/kind/name filter.`;
   const reservedFooterBytes = [...footerNotes, truncationNote].reduce(
     (sum, line) => sum + utf8ByteLength(line) + 1,
@@ -1038,7 +536,8 @@ function toPosix(path: string): string {
 }
 
 function hasOutlineExtension(name: string): boolean {
-  return OUTLINE_FILE_EXTENSIONS.some((extension) => name.endsWith(extension));
+  const lower = name.toLowerCase();
+  return OUTLINE_FILE_EXTENSIONS.some((extension) => lower.endsWith(extension));
 }
 
 function escapeRegExpChar(ch: string): string {
@@ -1121,7 +620,7 @@ function classifyDirent(entry: Dirent, fullPath: string): "directory" | "file" |
   return "other";
 }
 
-function walkTypeScriptFiles(dir: string, out: string[], state: WalkState): void {
+function walkSourceFiles(dir: string, out: string[], state: WalkState): void {
   if (state.visitedEntries >= state.maxWalkEntries) {
     state.capped = true;
     return;
@@ -1164,7 +663,7 @@ function visitEntry(entry: Dirent, dir: string, out: string[], state: WalkState)
   const kind = classifyDirent(entry, fullPath);
   if (kind === "directory") {
     if (entry.name.startsWith(".") || OUTLINE_SKIP_DIRS.has(entry.name)) return;
-    walkTypeScriptFiles(fullPath, out, state);
+    walkSourceFiles(fullPath, out, state);
     return;
   }
   if (kind === "file" && hasOutlineExtension(entry.name)) out.push(fullPath);
@@ -1181,7 +680,7 @@ function createWalkState(maxWalkEntries: number): WalkState {
 
 function capFiles(files: string[], walkCapped: boolean): OutlineTargetResolution {
   const unique = [...new Set(files)].sort((a, b) => a.localeCompare(b));
-  if (unique.length === 0) return { ok: false, error: "No matching TypeScript files found." };
+  if (unique.length === 0) return { ok: false, error: "No matching source files found." };
   // A capped walk may have missed entries entirely, so no collected count is
   // authoritative. Report the walk cap ahead of the list-slice cap: "results
   // may be incomplete" is always true, whereas "matched N" would not be.
@@ -1229,7 +728,7 @@ function resolveSingleTarget(
   if (stat.isDirectory()) {
     const files: string[] = [];
     const state = createWalkState(maxWalkEntries);
-    walkTypeScriptFiles(absolute, files, state);
+    walkSourceFiles(absolute, files, state);
     return capFiles(files, state.capped);
   }
   return { ok: false, error: `Not a file or directory: ${normalized}` };
@@ -1256,7 +755,7 @@ function resolveGlobTarget(
   const matcher = globToRegExp(resolve(cwd, normalized));
   const candidates: string[] = [];
   const state = createWalkState(maxWalkEntries);
-  walkTypeScriptFiles(base, candidates, state);
+  walkSourceFiles(base, candidates, state);
   return capFiles(
     candidates.filter((candidate) => matcher.test(toPosix(candidate))),
     state.capped,
@@ -1265,7 +764,7 @@ function resolveGlobTarget(
 
 /**
  * Resolve a file path, directory, or glob (`*`, `?`, `**`) to a sorted,
- * de-duplicated list of TypeScript files relative to `cwd`.
+ * de-duplicated list of parseable source files relative to `cwd`.
  *
  * This is the module's only filesystem side effect. Absolute paths and paths
  * that resolve outside `cwd` are allowed: the tool that consumes this output

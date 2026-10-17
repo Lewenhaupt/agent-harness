@@ -14,7 +14,7 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -79,6 +79,7 @@ import {
   DEFAULT_AGENTS,
   DEFAULT_BASE_BRANCH,
   defaultGitExec,
+  extractOutlineSymbols,
   extractProofArtifacts,
   findWorkspaceRoot,
   formatArchifyIgnoredParamsNote,
@@ -1041,36 +1042,22 @@ function validateOutlineParams(params: OutlineRawParams): OutlineParamValidation
 }
 
 /**
- * Read every resolved outline target into memory.
+ * Resolve, extract, and format an outline. Errors are values, never throws.
  *
- * Returns an error value (never throws) so the tool can report a partial
- * failure as text instead of crashing the session.
+ * Extraction shells out to universal-ctags and ast-grep through an async
+ * `execFile` seam, so a slow or hung parser never blocks pi's event loop; a
+ * missing binary, a bad exit, or a partial-output recovery all come back as
+ * values the tool renders as plain text.
  */
-function readOutlineSources(
-  paths: string[],
-): { ok: true; files: Array<{ path: string; source: string }> } | { ok: false; error: string } {
-  const files: Array<{ path: string; source: string }> = [];
-  for (const path of paths) {
-    try {
-      files.push({ path, source: readFileSync(path, "utf8") });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { ok: false, error: `Failed to read ${path}: ${message}` };
-    }
-  }
-  return { ok: true, files };
-}
-
-/** Resolve, read, and format an outline. Errors are values, never throws. */
-function buildOutlineText(
+async function buildOutlineText(
   cwd: string,
   params: OutlineValidatedParams,
-): { ok: true; text: string } | { ok: false; error: string } {
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const resolved = resolveOutlineTargets(cwd, params.path);
   if (!resolved.ok) return { ok: false, error: resolved.error };
 
-  const sources = readOutlineSources(resolved.files);
-  if (!sources.ok) return { ok: false, error: sources.error };
+  const extracted = await extractOutlineSymbols(resolved.files);
+  if (!extracted.ok) return { ok: false, error: extracted.error };
 
   const options: OutlineFilesOptions = {};
   if (params.kind !== undefined) options.kind = params.kind;
@@ -1079,13 +1066,22 @@ function buildOutlineText(
 
   // A walk-capped resolution knows no true match total (the walk stopped
   // early), so the file-cap "matched N files" wording would be a false claim.
-  // Distinguish the two causes so the note never overstates coverage.
-  const truncatedNote =
-    resolved.truncatedBy === "walk-cap"
-      ? "\n\nnote: walk stopped at the entry cap; results may be incomplete."
-      : `\n\nnote: matched ${resolved.totalMatches ?? resolved.files.length} files; showing the first ${resolved.files.length}.`;
-  const note = resolved.truncated ? truncatedNote : "";
-  return { ok: true, text: `${formatOutline(outlineFiles(sources.files, options))}${note}` };
+  // Distinguish the two causes so the note never overstates coverage. Notes
+  // are rendered through the formatter's footer so they stay inside the 16 KB
+  // output budget instead of being appended past it.
+  const extraNotes: string[] = [];
+  if (resolved.truncated) {
+    extraNotes.push(
+      resolved.truncatedBy === "walk-cap"
+        ? "note: walk stopped at the entry cap; results may be incomplete."
+        : `note: matched ${resolved.totalMatches ?? resolved.files.length} files; showing the first ${resolved.files.length}.`,
+    );
+  }
+  extraNotes.push(...(extracted.notes ?? []));
+  return {
+    ok: true,
+    text: formatOutline(outlineFiles(extracted.files, options), extraNotes),
+  };
 }
 
 /**
@@ -4059,23 +4055,35 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   });
 
   // ── Register outline (read-only symbol map) tool ────────────────────
-  // A read-only symbol map with line ranges for large TypeScript files.
-  // Sub-agents otherwise re-read a file in offset windows to locate the next
-  // edit anchor. It is consult-callable and non-phase, so it is listed in
+  // A read-only, multi-language symbol map with line ranges. Sub-agents
+  // otherwise re-read a file in offset windows to locate the next edit anchor.
+  // Declarations come from universal-ctags (with explicit `--map-<LANG>`
+  // overrides for the TypeScript-family extensions ctags 6.2.1 does not map:
+  // .tsx/.mts/.cts/.cjs); ast-grep supplies accurate
+  // TypeScript-family ranges plus the pi.registerTool / pi.on registrations
+  // that live inside belaydAgentHarness's body (there is no hand-rolled
+  // lexer). It is consult-callable and non-phase, so it is listed in
   // GATED_TOOLS only to survive the process gate — never a required workflow
   // step, and never in PLANNING_GATED_TOOLS. The tool only reads files
-  // (resolveOutlineTargets + outlineFiles); it exposes no edit/write/bash path.
+  // (resolveOutlineTargets + extractOutlineSymbols); it exposes no
+  // edit/write/bash path.
   pi.registerTool({
     name: "belayd_outline",
     label: "Belayd outline",
     description:
-      "Read-only symbol map with line ranges for a TypeScript file, directory, or glob " +
-      `(supports *, ?, **; directories are walked for ${OUTLINE_FILE_EXTENSIONS.join("/")}). ` +
-      "Returns top-level " +
-      "functions, consts, classes, types, interfaces, and enums plus pi.registerTool / " +
-      "pi.on registrations, in line order. Use this instead of re-reading a large file " +
-      "in offset windows to locate the next edit anchor; pair with `grep -n` for text. " +
-      "Output is bounded (~16 KB) and can be narrowed with `kind` or a `name` substring.",
+      "Read-only, multi-language symbol map with line ranges for a source file, directory, " +
+      `or glob (supports *, ?, **; directories are walked for ${OUTLINE_FILE_EXTENSIONS.join("/")}). ` +
+      "Extracts top-level functions, methods, classes, interfaces, types, enums, consts, and " +
+      "structs/fields across the languages universal-ctags recognizes (map overrides add the " +
+      "TypeScript-family extensions ctags does not map by default), and refines TypeScript-family " +
+      "ranges plus pi.registerTool / pi.on registrations via ast-grep. Neither extractor is a " +
+      "catch-all; the accepted extension set is explicit and rejects the rest. Returns rows in " +
+      "line order. Re-export " +
+      "barrels are not emitted (the bd-115 `export` kind was removed). Use this instead of " +
+      "re-reading a large file in offset windows to locate the next edit anchor; pair with " +
+      "`grep -n` for text. Output is bounded (~16 KB) and can be narrowed with `kind` or a " +
+      "`name` substring. Requires the `ctags` and `ast-grep` binaries on PATH (the devShell " +
+      "provides them; BELAYD_CTAGS_BIN / BELAYD_AST_GREP_BIN override).",
     parameters: Type.Object({
       path: Type.String({
         description:
@@ -4101,7 +4109,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       if (!validation.ok) return textToolResult(validation.error, 1);
 
       const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
-      const built = buildOutlineText(cwd, validation.value);
+      const built = await buildOutlineText(cwd, validation.value);
       return built.ok ? textToolResult(built.text, 0) : textToolResult(built.error, 1);
     },
   });
