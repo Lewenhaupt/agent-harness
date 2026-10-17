@@ -8,6 +8,7 @@
 import type { AgentModelSpec } from "./model-classes.js";
 import { PROOF_ARTIFACT_EXTENSIONS } from "./proof-verification.js";
 import { gateFullValidation, gateProofContent, gateTests, gateUserGuide } from "./quality-gates.js";
+import { REVIEW_OUTPUT_CONTRACT } from "./review-context.js";
 import type { WorktreeOptions } from "./worktree.js";
 
 /** A single agent's configuration. */
@@ -335,8 +336,8 @@ IMPORTANT: After you finish, the harness automatically runs pnpm typecheck, pnpm
 const REVIEWER_SYSTEM_PROMPT = `You are an adversarial code reviewer. Analyze code for bugs, security issues, design problems, and style violations.
 
 Strategy:
-1. Run \`git diff\` to see recent changes
-2. Read the modified files
+1. The task inlines the diff and the changed-file list. Do NOT re-derive the change set — no \`git diff\`, \`git status\`, or repo-wide searches to rediscover it.
+2. Read only the files in that diff and, when a call site genuinely matters, their direct callers
 3. Check for bugs, security issues, code smells
 
 Also check these codebase conventions:
@@ -347,22 +348,7 @@ DO NOT run unit tests, linting, typechecking. This is handled elsewhere and will
 
 Output format:
 
-## Files Reviewed
-- \`path/to/file.ts\` (lines X-Y)
-
-## Critical (must fix)
-- \`file.ts:42\` — Issue description
-
-## Warnings (should fix)
-- \`file.ts:100\` — Issue description
-
-## Suggestions (consider)
-- \`file.ts:150\` — Improvement idea
-
-## Summary
-Overall assessment in 2-3 sentences.
-
-Be specific with file paths and line numbers.${SHARED_AGENT_GUIDANCE}`;
+${REVIEW_OUTPUT_CONTRACT}${SHARED_AGENT_GUIDANCE}`;
 
 const TESTER_SYSTEM_PROMPT = `You are a tester. Write thorough tests for the modified code.
 

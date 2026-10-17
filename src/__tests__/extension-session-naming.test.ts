@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REVIEW_SECTION_LIMITS } from "../review-context.js";
 import {
   listRuns,
   RunStatus,
@@ -94,6 +95,20 @@ interface ExecFileRecord {
 const mockExecFile = vi.hoisted(() => {
   const calls: ExecFileRecord[] = [];
   let mode: "fail" | "succeed" = "fail";
+  // Per-test override: lets one test fail (or succeed) a specific argv while
+  // every other call keeps the mode default. Returning undefined defers.
+  type ArgOutcome = { stdout?: string; error?: Error } | undefined;
+  let argHandler: ((file: string, args: readonly string[]) => ArgOutcome) | null = null;
+  /** Resolve one call: per-test override first, then the mode default. */
+  const resolveOutcome = (file: string, args: readonly string[]): ArgOutcome => {
+    const handled = argHandler?.(file, args);
+    if (handled !== undefined) return handled;
+    if (mode === "fail") {
+      return { error: new Error("execFile not found in test environment") };
+    }
+    if (file === "git" && args[0] === "rev-parse") return { stdout: "abc1234\n" };
+    return { stdout: "[feat/x abc1234] commit done" };
+  };
   const fn = vi.fn(
     (
       file: string,
@@ -107,15 +122,12 @@ const mockExecFile = vi.hoisted(() => {
         on: () => {},
         end: (chunk?: string) => {
           record.stdin = chunk ?? "";
-          if (mode === "fail") {
-            callback(new Error("execFile not found in test environment"), "", "Command failed");
+          const outcome = resolveOutcome(file, args);
+          if (outcome?.error) {
+            callback(outcome.error, "", "Command failed");
             return;
           }
-          if (file === "git" && args[0] === "rev-parse") {
-            callback(null, "abc1234\n", "");
-            return;
-          }
-          callback(null, "[feat/x abc1234] commit done", "");
+          callback(null, outcome?.stdout ?? "", "");
         },
       };
       return { stdin: childStdin };
@@ -129,6 +141,9 @@ const mockExecFile = vi.hoisted(() => {
     },
     setMode: (next: "fail" | "succeed") => {
       mode = next;
+    },
+    setArgHandler: (next: ((file: string, args: readonly string[]) => ArgOutcome) | null) => {
+      argHandler = next;
     },
   };
 });
@@ -1999,6 +2014,7 @@ describe("session_start resume from disk (bd-40)", () => {
     surface.clear();
     mockSpawnAgentProcess.mockClear();
     mockExec.mockClear();
+    mockExecFile.setArgHandler(null);
     // Restore the default success spawn result other describe blocks expect.
     mockSpawnAgentProcess.mockResolvedValue({
       content: [{ type: "text" as const, text: "done" }],
@@ -2038,6 +2054,18 @@ describe("session_start resume from disk (bd-40)", () => {
       updatedAt: 1_000,
       ...overrides,
     };
+  }
+
+  /** Task text handed to the most recent review sub-agent spawn. */
+  function lastReviewTask(): string {
+    return String(
+      mockSpawnAgentProcess.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .filter(
+          (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-review-"),
+        )
+        .at(-1)?.task ?? "",
+    );
   }
 
   /**
@@ -2612,6 +2640,408 @@ describe("session_start resume from disk (bd-40)", () => {
       .at(-1);
     expect(secondReview?.sessionName).toBe(base);
     expect(secondReview?.resumeSession).toBe(true);
+  });
+
+  it("inlines the diff in a first review and scopes a re-review to the fix diff (bd-113)", async () => {
+    setExecToSucceed();
+    mockResolveProjectSessionExists.mockReturnValue(true);
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "first review");
+
+    const reviewCalls = (): Array<Record<string, unknown>> =>
+      mockSpawnAgentProcess.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .filter(
+          (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-review-"),
+        );
+    const firstTask = String(reviewCalls()[0]?.task ?? "");
+    expect(firstTask).toContain("## Review scope — diff inlined, do NOT re-derive the change set");
+    expect(firstTask).toContain("mode: first review");
+    expect(firstTask).toContain("```diff");
+    expect(firstTask).toContain("Do not run `git diff`");
+    expect(firstTask).toContain("## Output contract");
+    expect(firstTask).not.toContain("## Prior findings to verify");
+
+    // The completed review records the reviewed HEAD so the next review can be
+    // diffed against the fix round instead of re-deriving the whole change set.
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("abc1234");
+    });
+
+    await runPhase("review", "re-review after fixes");
+    const rereviewTask = String(reviewCalls().at(-1)?.task ?? "");
+    expect(rereviewTask).toContain("mode: re-review of fixes");
+    expect(rereviewTask).toContain("range: abc1234");
+    expect(rereviewTask).toContain("re-review after fixes");
+    // The task text already enumerates the findings, so there is no separate
+    // prior-findings section duplicating it.
+    expect(rereviewTask).not.toContain("## Prior findings to verify");
+  });
+
+  it("bounds a delivered review and drops its narration bullets (bd-113)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+    await runPhase("implement", "implement");
+
+    const critical = Array.from(
+      { length: REVIEW_SECTION_LIMITS.critical + 1 },
+      (_, index) => `- \`src/a.ts:${index + 1}\` — defect ${index + 1}`,
+    );
+    mockSpawnAgentProcess.mockResolvedValueOnce({
+      content: [
+        {
+          type: "text" as const,
+          text: [
+            "## Critical (must fix)",
+            ...critical,
+            "",
+            "## Warnings (should fix)",
+            "- ✓ All error paths look correct",
+            "- None",
+          ].join("\n"),
+        },
+      ],
+      details: {
+        messages: [],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
+        exitCode: 0,
+      },
+      sessionName: "mocked-review",
+    });
+
+    await runPhase("review", "review");
+
+    const delivered = messages
+      .filter((message) => message.customType === "belayd-run-complete")
+      .at(-1)?.content;
+    expect(delivered).toContain("## Critical (must fix)");
+    expect(delivered).toContain(
+      "- (+1 more omitted; see the full findings in the review transcript)",
+    );
+    expect(delivered).not.toContain(`defect ${REVIEW_SECTION_LIMITS.critical + 1}`);
+    expect(delivered).not.toContain("✓ All error paths look correct");
+    expect(delivered).toContain("## Warnings (should fix)\n- None");
+  });
+
+  it("discloses an unavailable diff instead of silently sending the bare task (W3)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    // Every git call now fails, so neither a first-review nor a fix diff can be
+    // collected. The task must say so rather than pretend the scope is empty.
+    setExecToFail();
+    await runPhase("review", "review the fix");
+
+    const reviewTask = String(
+      mockSpawnAgentProcess.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .filter(
+          (opts) => typeof opts.sessionName === "string" && opts.sessionName.includes("-review-"),
+        )
+        .at(-1)?.task ?? "",
+    );
+    expect(reviewTask).toContain("## Review scope — diff unavailable");
+    expect(reviewTask).toContain("diff unavailable (");
+    expect(reviewTask).toContain("fall back to your own `git diff`/`git status`");
+    expect(reviewTask).toContain("## Task\nreview the fix");
+    expect(reviewTask).not.toContain("do NOT re-derive the change set");
+  });
+
+  /** Diff outputs for the bd-113 fallback test, keyed by the git diff flag. */
+  function wholeChangeSetDiffOutput(args: readonly string[]): { stdout: string } {
+    if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
+    if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
+    return { stdout: "diff --git a/src/a.ts b/src/a.ts\n+fixed\n" };
+  }
+
+  it("discloses the whole-change-set fallback when the fix diff cannot be computed (bd-113)", async () => {
+    setExecToSucceed();
+    mockExecFile.clear();
+    mockExecFile.setArgHandler((file, args) => {
+      if (file !== "git") return undefined;
+      // Only the fix-only range is broken (a reviewed sha dropped by a rebase);
+      // the whole-change-set collection must still succeed.
+      if (args[0] === "diff" && args.includes("abc1234")) {
+        return { error: new Error("unknown revision abc1234") };
+      }
+      switch (args[0]) {
+        case "merge-base":
+          return { stdout: "base1234\n" };
+        case "status":
+          return { stdout: "?? src/new.ts\n" };
+        case "diff":
+          return wholeChangeSetDiffOutput(args);
+        default:
+          // `rev-parse HEAD` falls through to the mode default ("abc1234").
+          return undefined;
+      }
+    });
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "first review");
+
+    const firstTask = lastReviewTask();
+    expect(firstTask).toContain("mode: first review");
+    expect(firstTask).toContain("range: base1234");
+    // Untracked files never appear in `git diff`, so the task must list them.
+    expect(firstTask).toContain("New (untracked) files — read these directly");
+    expect(firstTask).toContain("- `src/new.ts`");
+    expect(firstTask).not.toContain("could not be computed");
+
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("abc1234");
+    });
+
+    await runPhase("review", "re-review after fixes");
+
+    const rereviewTask = lastReviewTask();
+    // Falling back to the whole change set is allowed, but never silently.
+    expect(rereviewTask).toContain(
+      "> Note: the fix-only diff since the previously reviewed revision could not be computed",
+    );
+    expect(rereviewTask).toContain("unknown revision abc1234");
+    expect(rereviewTask).toContain("This review covers the whole change set instead.");
+    expect(rereviewTask).toContain("mode: first review");
+    expect(rereviewTask).toContain("range: base1234");
+    expect(rereviewTask).toContain("- `src/new.ts`");
+  });
+
+  it("never bounds a failed review delivery and records no reviewed sha (bd-113)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    const criticals = Array.from(
+      { length: REVIEW_SECTION_LIMITS.critical + 3 },
+      (_, index) => `- \`src/a.ts:${index + 1}\` — defect ${index + 1}`,
+    );
+    mockSpawnAgentProcess.mockResolvedValueOnce({
+      content: [
+        {
+          type: "text" as const,
+          text: [
+            "## Critical (must fix)",
+            ...criticals,
+            "",
+            "## Warnings (should fix)",
+            "- ✓ Checked state transitions and shell quoting by hand",
+          ].join("\n"),
+        },
+      ],
+      details: {
+        messages: [],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
+        exitCode: 1,
+      },
+      sessionName: "mocked-review",
+    });
+
+    await runPhase("review", "review");
+
+    const delivered =
+      messages.filter((message) => message.customType === "belayd-run-complete").at(-1)?.content ??
+      "";
+    // A failed run's text is error output; every line must survive bounding so
+    // the orchestrator can act on it.
+    for (const bullet of criticals) expect(delivered).toContain(bullet);
+    expect(delivered).toContain("- ✓ Checked state transitions and shell quoting by hand");
+    expect(delivered).not.toContain("more omitted");
+    expect(delivered).not.toContain("malformed bullets dropped");
+    // Only a successful review may scope the next re-review.
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(undefined);
+  });
+
+  it("ignores a foreign task's reviewed sha when scoping a review (bd-113)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    // A stale workflow.json from another task must not narrow (or widen) this
+    // task's review scope.
+    writeWorkflowState({
+      cwd,
+      state: featureState({
+        taskId: "bd-99",
+        completedPhaseNames: ["implement"],
+        reviewedSha: "deadbee",
+      }),
+    });
+
+    await runPhase("review", "review");
+
+    const reviewTask = lastReviewTask();
+    expect(reviewTask).toContain("mode: first review");
+    expect(reviewTask).not.toContain("mode: re-review of fixes");
+    expect(reviewTask).not.toContain("deadbee");
+  });
+
+  it("records the reviewed sha only for the current task's workflow state (bd-113)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    // Swap in another task's state, then review. The read side ignores the
+    // foreign sha; the write side must ignore the foreign file too and warn so
+    // the mis-scoped state incident is observable.
+    writeWorkflowState({
+      cwd,
+      state: featureState({ taskId: "bd-99", completedPhaseNames: ["implement"] }),
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await runPhase("review", "review the foreign state");
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("workflow state belongs to bd-99, not bd-42"),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+
+    const foreignState = readWorkflowStateFromDisk({ cwd });
+    expect(foreignState).toHaveProperty("taskId", "bd-99");
+    expect(foreignState?.reviewedSha).toBe(undefined);
+
+    // Restore the current task's state: the normal same-task path still records
+    // the reviewed sha for the next re-review.
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["implement", "review"] }),
+    });
+    await runPhase("review", "review the current state");
+
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("abc1234");
+    });
   });
 
   it("points the gate context at the resumable fix loop after review", async () => {

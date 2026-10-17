@@ -14,6 +14,7 @@ import {
 } from "../agent-registry.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
 import { PROOF_ARTIFACT_EXTENSIONS } from "../proof-verification.js";
+import { REVIEW_OUTPUT_CONTRACT } from "../review-context.js";
 
 describe("DEFAULT_AGENTS", () => {
   it("defines all 9 agents", () => {
@@ -106,6 +107,29 @@ describe("DEFAULT_AGENTS", () => {
     const reviewer = DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer");
     expect(reviewer).toBeDefined();
     expect(reviewer?.modelClass).toBe("standard");
+  });
+
+  it("reviewer prompt keeps the adversarial security mandate and the bounded output contract (bd-113)", () => {
+    const reviewer = DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer");
+    expect(reviewer).toBeDefined();
+    const prompt = reviewer?.systemPrompt ?? "";
+
+    // bd-113 narrows scope and output shape, never review depth: the measured
+    // criticals were real, so the adversarial/security instructions and the
+    // review-capable tools must survive.
+    expect(prompt).toContain("adversarial code reviewer");
+    expect(prompt).toContain("security issues");
+    expect(prompt).toContain("bugs");
+    expect(prompt).toContain("validate external/untrusted data at the boundary with a schema");
+    expect(reviewer?.tools).toContain("bash");
+    expect(reviewer?.tools).toContain("ast_grep");
+    expect(reviewer?.modelClass).toBe("standard");
+
+    // The harness and the agent definition share one output contract.
+    expect(prompt).toContain(REVIEW_OUTPUT_CONTRACT);
+    expect(prompt).toContain("Do NOT re-derive the change set");
+    // The narration-inviting "Files Reviewed" section must not come back.
+    expect(prompt).not.toContain("## Files Reviewed");
   });
 
   it("scout and committer declare the fast class", () => {

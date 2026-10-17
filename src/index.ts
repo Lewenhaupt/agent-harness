@@ -294,6 +294,23 @@ export {
   parseQuotaResetSeconds,
 } from "./quota-failure.js";
 export type {
+  CollectReviewDiffOptions,
+  CollectReviewDiffResult,
+  DiffScope,
+  FormatReviewTaskOptions,
+  ReviewDiff,
+  ReviewSeverity,
+} from "./review-context.js";
+export {
+  boundReviewOutput,
+  classifyDiffScope,
+  collectReviewDiff,
+  formatReviewTask,
+  REVIEW_OUTPUT_CONTRACT,
+  REVIEW_SCOPE_INSTRUCTION,
+  REVIEW_SECTION_LIMITS,
+} from "./review-context.js";
+export type {
   DetachedRunOptions,
   RunDelivery,
   RunHandle,
@@ -390,12 +407,19 @@ export {
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";
-export type { SavePhaseSessionOptions, WorkflowFs, WorkflowState } from "./workflow-state.js";
+export type {
+  SavePhaseSessionOptions,
+  SaveReviewedShaOptions,
+  SaveReviewedShaResult,
+  WorkflowFs,
+  WorkflowState,
+} from "./workflow-state.js";
 export {
   clearWorkflowState,
   readWorkflowState,
   saveCompletedPhases,
   savePhaseSession,
+  saveReviewedSha,
   workflowStateDir,
   workflowStateFilePath,
   writeWorkflowState,
