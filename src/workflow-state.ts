@@ -38,6 +38,10 @@ const WorkflowStateSchema = z.object({
   // the completed phase list on resume. Persisted so a late re-review after a
   // later phase completed still re-arms the resumable-fix directive.
   awaitingReviewResponse: z.boolean().optional(),
+  // HEAD sha covered by the most recent completed review (bd-113). A re-review
+  // diffs from here, so it sees only the fix round. Optional so a workflow.json
+  // written before bd-113 still parses.
+  reviewedSha: z.string().optional(),
   startedAt: z.number().finite(),
   updatedAt: z.number().finite(),
 });
@@ -101,6 +105,30 @@ export interface ClearWorkflowStateOptions {
   cwd: string;
   fs?: WorkflowFs;
 }
+
+export interface SaveReviewedShaOptions {
+  cwd: string;
+  sha: string;
+  /**
+   * Task id the caller expects the on-disk workflow.json to belong to. The
+   * check runs against the read immediately preceding the write, so a state
+   * swap during an earlier await cannot redirect this task's sha into another
+   * task's state. Omit to skip the identity check.
+   */
+  expectedTaskId?: string;
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+/**
+ * Distinct failure reasons so callers can keep the benign missing-state case
+ * silent while surfacing a cross-task write as an observable incident.
+ */
+export type SaveReviewedShaResult =
+  | { ok: true }
+  | { ok: false; reason: "missing-state"; error: string }
+  | { ok: false; reason: "task-mismatch"; actualTaskId: string; error: string }
+  | { ok: false; reason: "write-failed"; error: string };
 
 const nodeFsSeam: WorkflowFs = {
   existsSync: (path) => nodeFs.existsSync(path),
@@ -247,6 +275,42 @@ export function savePhaseSession(
     updatedAt: nowMs(options.now),
   };
   return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+}
+
+/**
+ * Read-modify-write: record the revision the latest review covered and
+ * `updatedAt`, preserving every identity field, the phase ledger, and the
+ * awaiting-review flag. Mirrors savePhaseSession so a re-review can still be
+ * scoped to the fix diff after an orchestrator restart.
+ */
+export function saveReviewedSha(options: SaveReviewedShaOptions): SaveReviewedShaResult {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
+  if (existing === undefined) {
+    return {
+      ok: false,
+      reason: "missing-state",
+      error: `No Belayd workflow state found in ${options.cwd}`,
+    };
+  }
+  if (options.expectedTaskId !== undefined && existing.taskId !== options.expectedTaskId) {
+    return {
+      ok: false,
+      reason: "task-mismatch",
+      actualTaskId: existing.taskId,
+      error: `Workflow state belongs to task ${existing.taskId}, not ${options.expectedTaskId}`,
+    };
+  }
+  const updated: WorkflowState = {
+    ...existing,
+    reviewedSha: options.sha,
+    updatedAt: nowMs(options.now),
+  };
+  const writeResult = writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+  if (!writeResult.ok) {
+    return { ok: false, reason: "write-failed", error: writeResult.error };
+  }
+  return { ok: true };
 }
 
 /** Remove the current workflow state file, tolerating a missing file. */

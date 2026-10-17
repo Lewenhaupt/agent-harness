@@ -65,6 +65,7 @@ import {
   acceptedProofRefsFromScan,
   awaitWorktreeReady,
   bdCommandReadsStdin,
+  boundReviewOutput,
   buildArchifyArgs,
   buildArchifyCheckArgs,
   buildArchifyGuideArgs,
@@ -72,6 +73,7 @@ import {
   buildVerifierPrompt,
   checkToolAllowed,
   collectChangeContext,
+  collectReviewDiff,
   createInstructionGroupCollector,
   currentBranch,
   DEFAULT_AGENTS,
@@ -83,6 +85,7 @@ import {
   formatArchifyResult,
   formatOutline,
   formatProcessState,
+  formatReviewTask,
   getAgentByShortName,
   getNextPhase,
   getPhasesForType,
@@ -185,6 +188,7 @@ import {
   readWorkflowState,
   saveCompletedPhases,
   savePhaseSession,
+  saveReviewedSha,
   writeWorkflowState,
 } from "../src/workflow-state.js";
 
@@ -590,6 +594,88 @@ function buildRunCompleteContent(delivery: RunDelivery, reviewLoopHint: string):
     ? ""
     : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
   return `${header}${reasonNote}\n\n${text}${failureGuidance}${reviewLoopHint}`;
+}
+
+/**
+ * Apply the review output contract to a delivery (bd-113). Only a successful
+ * review is bounded: a failed run's text is error output and must survive
+ * intact for the orchestrator to act on.
+ */
+function boundReviewDelivery(delivery: RunDelivery): RunDelivery {
+  if (!delivery.success || delivery.phaseName !== REVIEW_PHASE) return delivery;
+  const [first, ...rest] = delivery.result.content;
+  if (first === undefined) return delivery;
+  return {
+    ...delivery,
+    result: {
+      ...delivery.result,
+      content: [{ ...first, text: boundReviewOutput(first.text).text }, ...rest],
+    },
+  };
+}
+
+/**
+ * Build the review phase prompt with the change set inlined (bd-113).
+ *
+ * A first review sees the whole change; a re-review sees only the fix diff
+ * since the sha the previous review recorded. When nothing can be collected
+ * the task discloses the gap instead of silently sending a bare task. Any git
+ * failure falls back to a disclosed scope rather than failing the phase.
+ */
+async function buildReviewTask(options: {
+  taskId: string;
+  paramsTask: string;
+  cwd: string;
+}): Promise<string> {
+  const persisted = readWorkflowState({ cwd: options.cwd });
+  // Only this task's recorded sha may scope the review; a stale workflow.json
+  // from another task must not narrow (or widen) this task's diff.
+  const reviewedSha =
+    persisted !== undefined && persisted.taskId === options.taskId
+      ? persisted.reviewedSha
+      : undefined;
+  if (reviewedSha === undefined || reviewedSha === "") {
+    const firstReview = await collectReviewDiff({ cwd: options.cwd });
+    if (!firstReview.ok) {
+      return formatReviewTask({
+        paramsTask: options.paramsTask,
+        diffUnavailable: firstReview.error,
+      });
+    }
+    return formatReviewTask({ paramsTask: options.paramsTask, diff: firstReview.value });
+  }
+  const rereview = await collectReviewDiff({ cwd: options.cwd, reviewedSha });
+  if (rereview.ok) {
+    return formatReviewTask({
+      paramsTask: options.paramsTask,
+      diff: rereview.value,
+      priorFindings: options.paramsTask,
+    });
+  }
+  // The whole-change-set diff is only needed for this fallback, so it is
+  // collected lazily: paying for it on every re-review would re-introduce the
+  // cost bd-113 removes.
+  const firstReview = await collectReviewDiff({ cwd: options.cwd });
+  if (!firstReview.ok) {
+    return formatReviewTask({
+      paramsTask: options.paramsTask,
+      // Both scopes failed: disclose both reasons so the reviewer can pick up
+      // the change set itself.
+      diffUnavailable: `fix-only diff failed (${rereview.error}); whole-change-set diff failed (${firstReview.error})`,
+      priorFindings: options.paramsTask,
+    });
+  }
+  // The fix-only diff could not be computed (commonly: the recorded sha was
+  // removed by a rebase). Fall back to the whole change set and say so, so the
+  // reviewer knows the scope is wider than the fix round.
+  const fallbackNote =
+    `> Note: the fix-only diff since the previously reviewed revision could not be computed ` +
+    `(${rereview.error}). This review covers the whole change set instead.`;
+  return `${fallbackNote}\n\n${formatReviewTask({
+    paramsTask: options.paramsTask,
+    diff: firstReview.value,
+    priorFindings: options.paramsTask,
+  })}`;
 }
 
 /**
@@ -2890,9 +2976,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /**
-   * Build the full phase prompt: the bead plan for implement, the change
-   * context for proof, or the raw task otherwise. Used for the initial spawn
-   * and to re-supply a fresh-epoch gate retry that has no transcript.
+   * Build the full phase prompt: the bead plan for implement, the inlined diff
+   * for review, the change context for proof, or the raw task otherwise. Used
+   * for the initial spawn and to re-supply a fresh-epoch gate retry that has no
+   * transcript.
    */
   async function buildFullPhaseTask(options: {
     phaseName: string;
@@ -2907,6 +2994,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         return `## Bead plan (${options.taskId})\n${plan}\n\n${options.paramsTask}`;
       }
       return options.paramsTask;
+    }
+    if (options.phaseName === REVIEW_PHASE) {
+      return buildReviewTask({
+        taskId: options.taskId,
+        paramsTask: options.paramsTask,
+        cwd: options.cwd,
+      });
     }
     if (options.phaseName === "proof") {
       const proofContext = await collectChangeContext(options.cwd, options.userGuideContent);
@@ -3008,6 +3102,58 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // its output but must not resurrect workflow.json or phase state.
     const gateOwnsRun = (): boolean => state.gateActive && runNotSuperseded();
 
+    /**
+     * True when a settled run may be delivered to the orchestrator. A
+     * `/belayd-complete` recovery owns delivery: a still-running child that
+     * settles after the user marked the run must not deliver its raw output
+     * (`reconcileUserCompletions` owns the follow-up and the phase completion
+     * for user-completed runs).
+     */
+    const shouldDeliverRun = (delivery: RunDelivery): boolean => {
+      if (!runNotSuperseded()) return false;
+      if (isRunDelivered(delivery.runId)) return false;
+      return readRunManifest({ cwd, runId: delivery.runId })?.completedBy !== "user";
+    };
+
+    /**
+     * Deliver one settled run. Extracted from the `deliver` callback so the
+     * callback stays under the cognitive-complexity budget. Async so the
+     * reviewed sha lands on disk before the follow-up turn can start a
+     * re-review that depends on it.
+     */
+    const deliverRunCompletion = async (delivery: RunDelivery): Promise<void> => {
+      if (!shouldDeliverRun(delivery)) return;
+      // The watcher does not await this callback, so any throw would become an
+      // unhandled rejection instead of reaching the watcher's own catch.
+      try {
+        // Only a gate-owned, successful review records the reviewed sha — a
+        // post-completion rework run must not scope the next task's review.
+        if (gateOwnsRun() && delivery.success && delivery.phaseName === REVIEW_PHASE) {
+          await persistReviewedSha({ cwd, taskId: state.currentTaskId });
+        }
+        const delivered = boundReviewDelivery(delivery);
+        pi.sendMessage(
+          {
+            customType: "belayd-run-complete",
+            content: buildRunCompleteContent(delivered, reviewLoopHintFor(delivered, state)),
+            display: true,
+            details: {
+              runId: delivery.runId,
+              phaseName: delivery.phaseName,
+              taskId: state.currentTaskId,
+              exitCode: delivery.result.details.exitCode,
+              ...(delivery.failureReason !== undefined
+                ? { failureReason: delivery.failureReason }
+                : {}),
+            },
+          },
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+      } catch (error) {
+        console.warn(`[belayd-harness] failed to deliver run ${delivery.runId}`, error);
+      }
+    };
+
     // The full task (bead plan / change context included). A fresh-epoch gate
     // retry has no transcript, so it must be re-supplied this full prompt even
     // when the invocation itself resumed. spawnAgent runs before runGate (see
@@ -3026,9 +3172,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         // On a cross-run resume the transcript already contains the bead plan,
         // so sending the full task would duplicate context; the orchestrator
         // supplies the review findings it wants fixed in params.task instead.
-        // A fresh run — including a resume that fell back because the target
-        // session was missing — gets the full task.
-        return resumeSession && phaseName !== "proof" ? params.task : fullTask;
+        // Review and proof are exempt: their full task carries context the
+        // session has never seen — a freshly computed diff (the fix diff on a
+        // re-review) and fresh change context, respectively. Returning
+        // params.task there would hand a resumed re-review no diff at all.
+        const needsFullTask = !resumeSession || phaseName === "proof" || phaseName === REVIEW_PHASE;
+        return needsFullTask ? fullTask : params.task;
       };
       return buildTask().then((task) =>
         spawnAgentWithFallback({
@@ -3132,32 +3281,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         if (readRunManifest({ cwd, runId: info.runId })?.completedBy === "user") return;
         applyPhaseCompletion(state, info.phaseName, info.result.content?.[0]?.text);
       },
-      deliver: (delivery) => {
-        if (!runNotSuperseded()) return;
-        // A `/belayd-complete` recovery owns delivery: a still-running child
-        // that settles after the user marked the run must not deliver its raw
-        // output. `reconcileUserCompletions` owns the follow-up and the phase
-        // completion for user-completed runs.
-        if (isRunDelivered(delivery.runId)) return;
-        if (readRunManifest({ cwd, runId: delivery.runId })?.completedBy === "user") return;
-        pi.sendMessage(
-          {
-            customType: "belayd-run-complete",
-            content: buildRunCompleteContent(delivery, reviewLoopHintFor(delivery, state)),
-            display: true,
-            details: {
-              runId: delivery.runId,
-              phaseName: delivery.phaseName,
-              taskId: state.currentTaskId,
-              exitCode: delivery.result.details.exitCode,
-              ...(delivery.failureReason !== undefined
-                ? { failureReason: delivery.failureReason }
-                : {}),
-            },
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-      },
+      deliver: deliverRunCompletion,
       isDelivered: isRunDelivered,
       markDelivered: (id) => {
         // The watcher marks delivery after `deliver`; a user-completed run must
@@ -3323,6 +3447,40 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const stats = modelState.telemetry.stats();
     if (stats.length === 0) return;
     console.log(formatModelTelemetrySummary(stats, modelState.telemetry.totals()));
+  }
+
+  /**
+   * Record the revision a completed review covered, so the next re-review can
+   * diff only the fix round (bd-113). Best-effort: a git or disk failure must
+   * never affect an otherwise successful review delivery.
+   */
+  async function persistReviewedSha(options: { cwd: string; taskId: string }): Promise<void> {
+    let sha: string;
+    try {
+      const { stdout } = await runGitCommand(["rev-parse", "HEAD"], {
+        cwd: options.cwd,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      sha = stdout.trim();
+    } catch (error) {
+      console.warn(`[belayd-harness] failed to resolve HEAD for the reviewed sha:`, error);
+      return;
+    }
+    if (sha === "") return;
+    // The identity check lives in saveReviewedSha so it shares the read that
+    // immediately precedes the write: a state swap during the rev-parse await
+    // must not redirect this task's sha into another task's workflow.json.
+    const saveResult = saveReviewedSha({ cwd: options.cwd, sha, expectedTaskId: options.taskId });
+    if (saveResult.ok) return;
+    if (saveResult.reason === "missing-state") return;
+    if (saveResult.reason === "task-mismatch") {
+      console.warn(
+        `[belayd-harness] skipped the reviewed sha: workflow state belongs to ${saveResult.actualTaskId}, not ${options.taskId}`,
+      );
+      return;
+    }
+    console.warn(`[belayd-harness] failed to persist the reviewed sha: ${saveResult.error}`);
   }
 
   /** Mark a completed/failed phase run in its manifest. */

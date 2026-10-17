@@ -6,6 +6,7 @@ import {
   readWorkflowState,
   saveCompletedPhases,
   savePhaseSession,
+  saveReviewedSha,
   type WorkflowFs,
   type WorkflowState,
   workflowStateFilePath,
@@ -163,6 +164,93 @@ describe("workflow state", () => {
         ?.awaitingReviewResponse,
     ).toBe(true);
     expect(parseWorkflowState({ ...sampleState(), awaitingReviewResponse: "yes" })).toBe(undefined);
+  });
+
+  it("saveReviewedSha round-trips the sha and preserves every other field", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({
+        startedAt: 5_000,
+        updatedAt: 5_000,
+        completedPhaseNames: ["implement"],
+        awaitingReviewResponse: true,
+        phaseSessions: { review: { base: "rev", invocations: 2 } },
+      }),
+      fs,
+    });
+
+    const result = saveReviewedSha({ cwd, fs, now: () => 9_000, sha: "abc1234" });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readWorkflowState({ cwd, fs });
+    expect(reloaded).toHaveProperty("reviewedSha", "abc1234");
+    expect(reloaded).toHaveProperty("taskId", "bd-42");
+    expect(reloaded).toHaveProperty("startedAt", 5_000);
+    expect(reloaded).toHaveProperty("updatedAt", 9_000);
+    expect(reloaded).toHaveProperty("completedPhaseNames", ["implement"]);
+    expect(reloaded).toHaveProperty("awaitingReviewResponse", true);
+    expect(reloaded?.phaseSessions).toEqual({ review: { base: "rev", invocations: 2 } });
+  });
+
+  it("saveReviewedSha returns an error when no state exists", () => {
+    const fs = createFakeFs();
+    const result = saveReviewedSha({ cwd, fs, sha: "abc1234" });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("missing-state");
+      expect(result.error).toContain("No Belayd workflow state");
+    }
+  });
+
+  it("saveReviewedSha skips a mismatched expected task id without writing", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({ taskId: "bd-99", completedPhaseNames: ["implement"] }),
+      fs,
+    });
+    const before = fs.files.get(workflowStateFilePath(cwd));
+
+    const result = saveReviewedSha({
+      cwd,
+      fs,
+      now: () => 9_000,
+      sha: "abc1234",
+      expectedTaskId: "bd-42",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("task-mismatch");
+      if (result.reason === "task-mismatch") expect(result.actualTaskId).toBe("bd-99");
+    }
+    // The foreign state file must be byte-for-byte unchanged.
+    expect(fs.files.get(workflowStateFilePath(cwd))).toBe(before);
+    expect(readWorkflowState({ cwd, fs })?.reviewedSha).toBe(undefined);
+  });
+
+  it("saveReviewedSha persists when the expected task id matches", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-42" }), fs });
+
+    const result = saveReviewedSha({
+      cwd,
+      fs,
+      now: () => 9_000,
+      sha: "abc1234",
+      expectedTaskId: "bd-42",
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(readWorkflowState({ cwd, fs })?.reviewedSha).toBe("abc1234");
+  });
+
+  it("parses a pre-bd-113 workflow.json without a reviewed sha", () => {
+    const raw = { ...sampleState(), completedPhaseNames: ["implement", "review"] };
+    expect(parseWorkflowState(raw)?.reviewedSha).toBe(undefined);
+    expect(parseWorkflowState({ ...raw, reviewedSha: "abc1234" })?.reviewedSha).toBe("abc1234");
+    expect(parseWorkflowState({ ...raw, reviewedSha: 42 })).toBe(undefined);
   });
 
   it("savePhaseSession upserts one entry and preserves identity fields", () => {
