@@ -86,6 +86,27 @@ export {
   parseBdCommand,
   validateBdCommand,
 } from "./bd-command.js";
+export type {
+  CapacityCache,
+  CapacityCacheOptions,
+  CapacityProbe,
+  CapacityProbeResult,
+  CapacityWindow,
+  EndpointCapacityProbeOptions,
+} from "./capacity-cache.js";
+export {
+  CAPACITY_PROBE_URL_ENV,
+  createCapacityCache,
+  createEndpointCapacityProbe,
+  createFallbackCapacityProbe,
+  DEFAULT_CAPACITY_BODY_LIMIT_BYTES,
+  DEFAULT_CAPACITY_PROBE_TIMEOUT_MS,
+  DEFAULT_CAPACITY_TTL_MS,
+  MAX_CAPACITY_WINDOWS,
+  orderCandidatesByCapacity,
+  parseCapacityWindows,
+  probeFromCooldownStore,
+} from "./capacity-cache.js";
 export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export * from "./honcho-memory/index.js";
@@ -130,6 +151,42 @@ export type {
   ModelCooldownStoreOptions,
 } from "./model-cooldown.js";
 export { createModelCooldownStore, defaultModelCooldownPath } from "./model-cooldown.js";
+export type {
+  CreateModelSessionStateOptions,
+  FlushAndResetModelTelemetryOptions,
+  FlushModelTelemetryOptions,
+  FlushModelTelemetryResult,
+  ModelSessionState,
+  ModelTelemetryAppendFn,
+} from "./model-session-state.js";
+export {
+  createModelSessionState,
+  flushAndResetModelTelemetry,
+  flushModelTelemetry,
+  resetModelSessionState,
+} from "./model-session-state.js";
+export type {
+  AppendModelTelemetryOptions,
+  AppendModelTelemetryResult,
+  ModelPhaseEvent,
+  ModelPhaseStats,
+  ModelTelemetrySnapshot,
+  ModelTelemetryStore,
+  ModelTelemetryTotals,
+} from "./model-telemetry.js";
+export {
+  appendModelTelemetry,
+  combineModelTelemetryStores,
+  createModelTelemetryStore,
+  diffModelTelemetryStats,
+  formatModelTelemetrySummary,
+  ModelTelemetryTotalsSchema,
+  mergeModelTelemetry,
+  modelTelemetryPath,
+  readModelTelemetry,
+  sumModelTelemetryStats,
+  writeModelTelemetry,
+} from "./model-telemetry.js";
 export type { Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,
@@ -192,7 +249,7 @@ export type {
   WatchRunDeps,
 } from "./run-detached.js";
 export { classifyRunOutcome, spawnDetachedRun, watchRunCompletion } from "./run-detached.js";
-export type { RunManifest } from "./run-manifest.js";
+export type { RunManifest, RunTelemetryTotals } from "./run-manifest.js";
 export {
   completeRunByUser,
   listPendingUserCompletions,
@@ -204,6 +261,7 @@ export {
   runsDir,
   scanForInterruptedRuns,
   setRunStatus,
+  setRunTelemetry,
   writeRunManifest,
 } from "./run-manifest.js";
 export type { PhaseSessionRecord, SubagentSessionRef } from "./session-naming.js";

@@ -25,6 +25,13 @@ import type {
   ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  CAPACITY_PROBE_URL_ENV,
+  createCapacityCache,
+  createEndpointCapacityProbe,
+  createFallbackCapacityProbe,
+  probeFromCooldownStore,
+} from "../src/capacity-cache.js";
 import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
   AgentDefinition,
@@ -120,6 +127,19 @@ import {
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
 import {
+  createModelSessionState,
+  flushAndResetModelTelemetry,
+  flushModelTelemetry,
+  shouldWarnFlushFailure,
+} from "../src/model-session-state.js";
+import {
+  combineModelTelemetryStores,
+  createModelTelemetryStore,
+  formatModelTelemetrySummary,
+  type ModelTelemetryStore,
+  type ModelTelemetryTotals,
+} from "../src/model-telemetry.js";
+import {
   ensureProofBridge,
   proofDirForTask,
   resolveProjectProofBase,
@@ -131,6 +151,7 @@ import {
   readRunManifest,
   scanForInterruptedRuns,
   setRunStatus,
+  setRunTelemetry,
   writeRunManifest,
 } from "../src/run-manifest.js";
 import { countUncommittedFiles } from "../src/session-conditions.js";
@@ -170,6 +191,8 @@ export interface RunQualityGateOptions {
   modelClass?: ModelClass;
   tools?: string[];
   sessionName?: string;
+  /** Telemetry sink for gate-retry spawns; defaults to the workflow store. */
+  telemetry?: ModelTelemetryStore;
 }
 
 // ── Process gate state ─────────────────────────────────────────────────
@@ -287,6 +310,36 @@ function runGitCommand(
 // Persisted to disk so cooldowns survive orchestrator restarts.
 // Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
 const modelCooldown = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+// Pre-dispatch capacity signal. When a usage/reset endpoint is configured it
+// is probed directly; otherwise the persisted cooldown store's provider windows
+// stand in. Results are cached (TTL) so a multi-phase workflow re-probes at
+// most once per TTL, and mid-workflow 429s are recorded back into the cache.
+const capacityProbeUrl = process.env[CAPACITY_PROBE_URL_ENV];
+// Session-scoped model-routing state (bd-116): the pre-dispatch capacity
+// cache, the per-workflow telemetry store, and the per-destination telemetry
+// flush cursors. This one object is the documented module-level mutable-state
+// exception for model routing; the module owns its reset semantics.
+const modelState = createModelSessionState({
+  capacity:
+    capacityProbeUrl !== undefined && capacityProbeUrl !== ""
+      ? createCapacityCache({
+          // A configured-but-unreachable endpoint must not silently disable the
+          // capacity signal: fall back to the persisted cooldown store and warn
+          // (throttled inside the probe) that the endpoint is not delivering.
+          probe: createFallbackCapacityProbe(
+            createEndpointCapacityProbe({
+              url: capacityProbeUrl,
+              onFailure: (reason) => {
+                console.warn(
+                  `[belayd-harness] ${CAPACITY_PROBE_URL_ENV} produced no capacity signal (${reason}); falling back to the cooldown store.`,
+                );
+              },
+            }),
+            probeFromCooldownStore(modelCooldown),
+          ),
+        })
+      : createCapacityCache({ probe: probeFromCooldownStore(modelCooldown) }),
+});
 const modelFallbackEnabled = process.env.BELAYD_MODEL_FALLBACK !== "0";
 
 function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }): SessionState {
@@ -906,6 +959,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     matchedLabel?: string;
   }): SessionState {
     const { ctx, taskId, workflowType, cwd } = options;
+    // A new workflow starts a fresh per-workflow telemetry store; flush the
+    // previous workflow's rows first so they are not lost on reset.
+    resetModelTelemetry(cwd);
     const state = getSessionState(ctx);
     state.gateActive = true;
     state.planningActive = false;
@@ -1421,6 +1477,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       .map((a) => {
         if (a.skippedCooldown) return `${a.model} (cooldown)`;
         if (a.skippedProvider) return `${a.model} (provider ${a.skippedProvider} exhausted)`;
+        if (a.skippedCapacity)
+          return `${a.model} (provider ${a.skippedCapacity} capacity-exhausted)`;
         return `${a.model} (${a.classification.kind})`;
       })
       .join(" → ");
@@ -1443,6 +1501,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     sessionName?: string;
     attempt: number;
     env?: Record<string, string>;
+    /** Phase name for telemetry grouping. */
+    phaseName: string;
+    /** Telemetry sink for this run; defaults to the workflow store. */
+    telemetry?: ModelTelemetryStore;
     /** The phase's original task prompt, prepended on a fresh epoch. */
     originalTask: string;
     /** Every gate verdict so far, oldest first. */
@@ -1489,6 +1551,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       resumeSession,
       cooldownStore: modelCooldown,
       enabled: modelFallbackEnabled,
+      phase: options.phaseName,
+      telemetry: options.telemetry ?? modelState.telemetry,
+      capacity: modelState.capacity,
     }).then((r) => r.result);
   }
 
@@ -1557,6 +1622,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         sessionName: options.sessionName,
         attempt,
         env: options.env,
+        phaseName,
+        telemetry: options.telemetry,
         originalTask: task,
         feedbackHistory,
       });
@@ -2280,6 +2347,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    // A session can restart mid-workflow (compaction/resume). Flush pending
+    // rows before dropping the store, otherwise telemetry recorded since the
+    // last settle is lost. Per-run stores keep an open run's own delta exact.
+    resetModelTelemetry(ctx.cwd);
     const state = getSessionState(ctx);
     state.gateActive = false;
     state.planningActive = false;
@@ -2309,6 +2380,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    // Flush telemetry recorded after the last run settle (e.g. the proof
+    // verifier) and log the workflow summary once before the store is dropped.
+    resetModelTelemetry(ctx.cwd, { log: true });
     const id = ctx.sessionManager.getSessionId();
     const state = sessionStates.get(id);
     if (state) {
@@ -2736,6 +2810,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       model: effectiveModel,
     });
 
+    // A private store gives this run an exact per-run manifest delta even when
+    // another run overlaps; the fan-out also feeds the shared workflow store
+    // that owns persistence and logging.
+    const runTelemetry = createModelTelemetryStore();
+    const runTelemetrySink = combineModelTelemetryStores(modelState.telemetry, runTelemetry);
+
     const abortController = new AbortController();
 
     // Guard watcher callbacks against a workflow teardown: once
@@ -2797,6 +2877,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           env: spawnEnv,
           cooldownStore: modelCooldown,
           enabled: modelFallbackEnabled,
+          phase: phaseName,
+          telemetry: runTelemetrySink,
+          capacity: modelState.capacity,
         }).then((r) => withFallbackNote(r.result, r.attempts)),
       );
     };
@@ -2816,6 +2899,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         modelClass: effectiveModelClass,
         tools: effectiveTools,
         sessionName: subagentSessionName,
+        telemetry: runTelemetrySink,
       }).then((gateResult) => gateResult ?? result);
 
     const handle = spawnDetachedRun({
@@ -2856,6 +2940,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           status: info.success ? RunStatus.Completed : RunStatus.Failed,
           exitCode: info.result.details.exitCode,
           failureReason: info.failureReason,
+          telemetry: runTelemetry.totals(),
         });
       },
       onPhaseComplete: (info) => {
@@ -2945,6 +3030,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         detached: true,
         cooldownStore: modelCooldown,
         enabled: modelFallbackEnabled,
+        phase: phaseName,
+        telemetry: modelState.telemetry,
+        capacity: modelState.capacity,
       }).then((r) => r.result);
 
     const handle = spawnDetachedRun({
@@ -2977,6 +3065,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           },
           { deliverAs: "followUp", triggerTurn: true },
         );
+        persistModelTelemetry(effectiveCwd ?? process.cwd());
       },
       isDelivered: (id) => state.deliveredRunIds.has(id),
       markDelivered: (id) => {
@@ -3003,6 +3092,60 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Merge only the rows added since this destination's last flush into
+   * `.belayd/telemetry.json`. `appendModelTelemetry` read-merge-writes, so an
+   * overwrite of the full store would re-append every earlier row on each
+   * settle and grow counts quadratically. The per-cwd flush cursor tracks what
+   * is already on disk for that destination; a failed write leaves the cursor
+   * unchanged so the rows are retried. Logs the summary only when `log` is set,
+   * so the 6+ phase settles do not each emit the full cumulative breakdown;
+   * workflow completion and session shutdown request the log once.
+   */
+  function persistModelTelemetry(cwd: string, options?: { log?: boolean }): void {
+    const flushed = flushModelTelemetry({ state: modelState, cwd });
+    if (!flushed.ok) {
+      warnModelTelemetryFlushFailure(flushed.error);
+      return;
+    }
+    if (options?.log === true) logModelTelemetrySummary();
+  }
+
+  /**
+   * Flush the finished workflow's telemetry, then start a fresh per-workflow
+   * store. The store and every destination cursor are dropped only after the
+   * flush succeeds: a failed final write must not discard rows that never
+   * reached disk, and the cursor stays so the next flush retries them.
+   */
+  function resetModelTelemetry(cwd: string, options?: { log?: boolean }): void {
+    const shouldLog = options?.log === true;
+    const result = flushAndResetModelTelemetry({
+      state: modelState,
+      cwd,
+      beforeReset: () => {
+        if (shouldLog) logModelTelemetrySummary();
+      },
+    });
+    if (!result.ok) {
+      warnModelTelemetryFlushFailure(result.error);
+    }
+  }
+
+  /**
+   * Warn about a failed telemetry flush at most once per throttle window, so a
+   * full disk does not spam the log on every settle, stop, and shutdown.
+   */
+  function warnModelTelemetryFlushFailure(error: string): void {
+    if (!shouldWarnFlushFailure(modelState)) return;
+    console.warn(`[belayd-harness] failed to persist model telemetry: ${error}`);
+  }
+
+  function logModelTelemetrySummary(): void {
+    const stats = modelState.telemetry.stats();
+    if (stats.length === 0) return;
+    console.log(formatModelTelemetrySummary(stats, modelState.telemetry.totals()));
+  }
+
   /** Mark a completed/failed phase run in its manifest. */
   function persistRunStatus(options: {
     state: SessionState;
@@ -3011,6 +3154,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     status: RunStatus.Completed | RunStatus.Failed;
     exitCode: number;
     failureReason?: string;
+    /** This run's own telemetry totals (from its private run store). */
+    telemetry: ModelTelemetryTotals;
   }): void {
     if (!options.state.gateActive || options.state.currentTaskId === "") return;
     const statusResult = setRunStatus({
@@ -3023,6 +3168,23 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (!statusResult.ok) {
       console.warn(`[belayd-harness] failed to update run manifest: ${statusResult.error}`);
     }
+    // Attach this run's own telemetry totals to its manifest. A private
+    // per-run store (not a process-cumulative delta) keeps attribution exact
+    // even when another run overlaps, and a mid-run workflow-store reset cannot
+    // collapse it to zero.
+    if (options.telemetry.attempts > 0) {
+      const telemetryResult = setRunTelemetry({
+        cwd: options.manifestCwd,
+        runId: options.runId,
+        telemetry: options.telemetry,
+      });
+      if (!telemetryResult.ok) {
+        console.warn(
+          `[belayd-harness] failed to attach telemetry to run manifest: ${telemetryResult.error}`,
+        );
+      }
+    }
+    persistModelTelemetry(options.manifestCwd);
     if (options.status === RunStatus.Completed) {
       // The in-memory phase list is marked in the run watcher's
       // onPhaseComplete, and disk only records a phase once its run actually
@@ -3290,6 +3452,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         detached: false,
         cooldownStore: modelCooldown,
         enabled: modelFallbackEnabled,
+        phase: "proof-verifier",
+        telemetry: modelState.telemetry,
+        capacity: modelState.capacity,
       });
       const text = result.result.content?.[0]?.text ?? "Proof verifier produced no output.";
       state.proofVerifierVerdict = text;
@@ -3827,6 +3992,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
+      const telemetryCwd = ctx.cwd;
 
       // In-flight background runs must not survive task teardown.
       abortAndResetRunTracking(state);
@@ -3849,6 +4015,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       state.proofVerifierVerdict = undefined;
       state.awaitingReviewResponse = false;
       applyToolGate(state);
+      // Flush and log the stopped workflow's telemetry once, then reset.
+      resetModelTelemetry(telemetryCwd, { log: true });
       return {
         content: [
           {
@@ -4443,6 +4611,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       // Workflow complete: the persisted state file is no longer needed.
       clearWorkflowState({ cwd: ctx.cwd });
+      // Log the workflow's telemetry summary exactly once here, then start a
+      // fresh store so a later phase-run settle cannot re-log it.
+      resetModelTelemetry(ctx.cwd, { log: true });
 
       state.gateActive = false;
       // Any watcher still pending across completion is now stale.

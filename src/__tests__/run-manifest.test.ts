@@ -13,6 +13,7 @@ import {
   runManifestPath,
   scanForInterruptedRuns,
   setRunStatus,
+  setRunTelemetry,
   writeRunManifest,
 } from "../run-manifest.js";
 
@@ -428,5 +429,38 @@ describe("run manifest", () => {
     expect(reloaded).toHaveProperty("deliveredAt", 2_000);
     expect(reloaded).toHaveProperty("completionReport", "second");
     expect(listPendingUserCompletions({ cwd, fs })).toEqual([]);
+  });
+
+  it("setRunTelemetry attaches totals and preserves the rest of the manifest", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+
+    const result = setRunTelemetry({
+      cwd,
+      runId: "abc123",
+      telemetry: { attempts: 3, fallbacks: 1, quotaFailures: 1, noOps: 1, cost: 0.42 },
+      fs,
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("telemetry.attempts", 3);
+    expect(reloaded).toHaveProperty("telemetry.fallbacks", 1);
+    expect(reloaded).toHaveProperty("telemetry.quotaFailures", 1);
+    expect(reloaded).toHaveProperty("telemetry.noOps", 1);
+    expect(reloaded).toHaveProperty("telemetry.cost", 0.42);
+    expect(reloaded).toHaveProperty("phase", "plan");
+  });
+
+  it("setRunTelemetry returns an error for an unknown run id", () => {
+    const fs = createFakeFs();
+    const result = setRunTelemetry({
+      cwd,
+      runId: "missing",
+      telemetry: { attempts: 0, fallbacks: 0, quotaFailures: 0, noOps: 0, cost: 0 },
+      fs,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No run manifest");
   });
 });

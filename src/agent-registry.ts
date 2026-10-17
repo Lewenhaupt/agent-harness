@@ -667,7 +667,9 @@ evidence: ...${SHARED_AGENT_GUIDANCE}`;
 export const PROOF_VERIFIER_AGENT: AgentDefinition = {
   name: "belayd-proof-verifier",
   description: "Advisory, non-blocking proof reasonableness reviewer",
-  modelClass: "standard",
+  // Cheap class: the verdict is advisory and non-blocking, so a frontier model
+  // would spend capability on a judge whose failure cannot fail the workflow.
+  modelClass: "fast",
   tools: PROOF_VERIFIER_TOOLS,
   systemPrompt: PROOF_VERIFIER_SYSTEM_PROMPT,
 };
