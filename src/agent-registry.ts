@@ -583,7 +583,9 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
     name: "belayd-tester",
     description: "Writes thorough tests — covers happy path, edge cases, error conditions",
     modelClass: "frontier",
-    tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep", "agent_browser"],
+    // bd-114: no agent_browser. Tester made 0 browser calls across 55 sessions,
+    // while the browser prompt section costs ~8.7k tokens every turn.
+    tools: ["read", "edit", "write", "bash", "ls", "find", "ast_grep"],
     systemPrompt: TESTER_SYSTEM_PROMPT,
     qualityGate: gateTests,
   },

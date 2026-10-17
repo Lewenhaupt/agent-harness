@@ -305,8 +305,9 @@ or call it with the same argv-style `args` array the other surfaces use:
 Key points for orchestrator sessions:
 
 - **The orchestrator can use it directly** — the reason for bd-83 — and the
-  `belayd-implementer`, `belayd-tester`, and `belayd-proof-generator`
-  sub-agents keep it via their existing allowlists (`src/agent-registry.ts`).
+  `belayd-implementer` and `belayd-proof-generator` sub-agents keep it via
+  their existing allowlists (`src/agent-registry.ts`). `belayd-tester` dropped
+  it in bd-114 (0 browser calls in 55 sessions).
 - **`agent-browser` plus its chromium must be on the session `PATH`.** In
   pi-web that is `pi-web-runtime-env`; the same tool outside pi-web needs the
   devShell. The extension ships no browser.
@@ -322,6 +323,9 @@ Key points for orchestrator sessions:
 
 - [docs/agent-browser-tool.md](agent-browser-tool.md) — the tool itself:
   every load surface, the CLI prerequisite, and the full argument reference.
+- [docs/instruction-groups.md](instruction-groups.md) — bd-114: the prompt-section
+  tool allowlist gate (why non-browser agents no longer pay ~8.7k tokens/turn)
+  and its verification runbook.
 - [docs/pi-web-service.md](pi-web-service.md) — the systemd services, the
   `pi-web-runtime-env` `PATH`, and why a restart is required after a rebuild.
 - [docs/playwright-proof-env.md](playwright-proof-env.md) — the other browser

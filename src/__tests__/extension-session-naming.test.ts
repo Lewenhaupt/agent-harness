@@ -238,6 +238,34 @@ function createMockEventBus(): {
   };
 }
 
+/**
+ * Run every `before_agent_start` handler like pi's `emitBeforeAgentStart`:
+ * per-handler try/catch isolation, all `message`s collected, and the last
+ * defined `systemPrompt` folded into the options as `forceSystemPrompt`.
+ */
+async function runBeforeAgentStartHandlers(
+  handlers: Array<(...args: unknown[]) => void>,
+  args: unknown[],
+): Promise<{ messages: unknown[]; systemPromptOptions: Record<string, unknown> }> {
+  const messages: unknown[] = [];
+  let systemPrompt: unknown;
+  for (const handler of handlers) {
+    try {
+      const result = (await handler(...args)) as
+        | { message?: unknown; systemPrompt?: unknown }
+        | undefined;
+      if (result?.message !== undefined) messages.push(result.message);
+      if (result?.systemPrompt !== undefined) systemPrompt = result.systemPrompt;
+    } catch {
+      // Isolated per handler, matching pi.
+    }
+  }
+  return {
+    messages,
+    systemPromptOptions: systemPrompt === undefined ? {} : { forceSystemPrompt: systemPrompt },
+  };
+}
+
 function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   api: ExtensionAPI;
   tools: Map<string, { name: string; execute: (...args: unknown[]) => Promise<unknown> }>;
@@ -258,6 +286,9 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   >();
   const commands = new Map<string, unknown>();
   const eventHandlers = new Map<string, (...args: unknown[]) => void>();
+  // before_agent_start runs every registered handler in pi; keep the full list
+  // so the mock can emulate emitBeforeAgentStart faithfully (see `on`).
+  const beforeAgentStartHandlers: Array<(...args: unknown[]) => void> = [];
   const messages: Array<{
     customType: string;
     content: string;
@@ -279,7 +310,17 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
       commands.set(name, cmd);
     },
     on: (event: string, handler: (...args: unknown[]) => void) => {
-      eventHandlers.set(event, handler);
+      if (event !== "before_agent_start") {
+        eventHandlers.set(event, handler);
+        return;
+      }
+      beforeAgentStartHandlers.push(handler);
+      // Mirror pi's emitBeforeAgentStart (runner.js); see
+      // runBeforeAgentStartHandlers. The harness registers the process gate and
+      // the managed instruction-group gate on this event.
+      eventHandlers.set(event, (...args: unknown[]) =>
+        runBeforeAgentStartHandlers(beforeAgentStartHandlers, args),
+      );
     },
     sendMessage: (
       msg: {
@@ -2046,13 +2087,12 @@ describe("session_start resume from disk (bd-40)", () => {
   ): Promise<string | undefined> {
     const handler = eventHandlers.get("before_agent_start");
     expect(handler).toBeDefined();
-    // before_agent_start is async and returns { message: { content } } when the
-    // gate is active, or undefined when it is not; the loose mock types it as
-    // void so cast through unknown to read the shape we care about.
+    // The mock mirrors pi's emitBeforeAgentStart and returns the collected
+    // messages; the gate handler's `message` is the first entry.
     const result = (await handler?.({}, ctx)) as unknown as
-      | { message?: { content?: string } }
+      | { messages?: Array<{ content?: string }> }
       | undefined;
-    return result?.message?.content;
+    return result?.messages?.[0]?.content;
   }
 
   it("restores completedPhaseNames from disk and resumes at the next unfinished phase", async () => {
