@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { afterEach, describe, expect, it } from "vitest";
 import type { OutlineResult, OutlineSymbol } from "../outline.js";
 import {
@@ -348,44 +349,101 @@ describe("outlineSource against real repo files (parser-verified ranges)", () =>
     return outlineSource(readFileSync(join(REPO_ROOT, relativePath), "utf8"));
   }
 
-  function rangeOf(
-    symbols: OutlineSymbol[],
-    name: string,
-  ): [number | undefined, number | undefined] {
-    const found = symbols.find((s) => s.name === name);
-    expect(found, name).toBeDefined();
-    return [found?.startLine, found?.endLine];
+  // These assertions used to hardcode absolute line numbers, so every rebase
+  // that inserted lines above a symbol failed them without the scanner having
+  // regressed. Derive the truth from the TypeScript parser instead — the same
+  // cross-check the original review performed by hand — so they stay valid as
+  // the files grow and cover every top-level declaration rather than a
+  // hand-picked subset. `typescript` is a devDependency the build already uses.
+  function parserRanges(relativePath: string): Map<string, [number, number]> {
+    const file = join(REPO_ROOT, relativePath);
+    const sourceFile = ts.createSourceFile(
+      file,
+      readFileSync(file, "utf8"),
+      ts.ScriptTarget.Latest,
+      true,
+    );
+    const ranges = new Map<string, [number, number]>();
+    for (const statement of sourceFile.statements) {
+      const name = parserDeclaredName(statement);
+      if (name === undefined) continue;
+      ranges.set(name, [
+        lineOf(sourceFile, statement.getStart(sourceFile)),
+        lineOf(sourceFile, statement.getEnd()),
+      ]);
+    }
+    return ranges;
   }
 
-  it("matches the six cross-checked declaration ranges", () => {
-    expect(rangeOf(symbolsFrom("src/agent-registry.ts"), "DEFAULT_AGENTS")).toEqual([531, 675]);
-    expect(rangeOf(symbolsFrom("src/worktree.ts"), "setupWorktree")).toEqual([164, 213]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "runFileCommand")).toEqual([233, 270]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "PlanningTarget")).toEqual([185, 187]);
-    expect(rangeOf(symbolsFrom("src/outline.ts"), "resolveSymbolName")).toEqual([795, 810]);
-    expect(rangeOf(symbolsFrom("src/quality-gates.ts"), "unwrapShellWrapper")).toEqual([172, 180]);
-  });
+  function parserDeclaredName(statement: ts.Statement): string | undefined {
+    if (
+      ts.isFunctionDeclaration(statement) ||
+      ts.isClassDeclaration(statement) ||
+      ts.isInterfaceDeclaration(statement) ||
+      ts.isTypeAliasDeclaration(statement) ||
+      ts.isEnumDeclaration(statement)
+    ) {
+      const { name } = statement;
+      return name === undefined ? undefined : name.text;
+    }
+    if (ts.isVariableStatement(statement)) {
+      const declarations = statement.declarationList.declarations;
+      // Multi-declarator statements (`const a = 1, b = 2;`) have no single
+      // declaration line, so they are not comparable 1:1 with a symbol row.
+      if (declarations.length !== 1) return undefined;
+      const only = declarations[0];
+      if (only === undefined || !ts.isIdentifier(only.name)) return undefined;
+      return only.name.text;
+    }
+    return undefined;
+  }
 
-  it("ends inline object-literal return types at the real body close", () => {
-    // Regression (bd-115 round 2): a `): { a: 1 } {` body-open was mistaken
-    // for the return type's matching `}`, truncating the declaration mid-line.
-    expect(rangeOf(symbolsFrom("src/process-gate.ts"), "checkToolAllowed")).toEqual([65, 101]);
-    expect(rangeOf(symbolsFrom("src/process-gate.ts"), "checkToolOutsideOrder")).toEqual([
-      108, 125,
-    ]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "evaluateToolCallGate")).toEqual([342, 383]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "advancePastExistingEpoch")).toEqual([
-      477, 504,
-    ]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "readOutlineSources")).toEqual([902, 915]);
-    expect(rangeOf(symbolsFrom("extensions/index.ts"), "buildOutlineText")).toEqual([918, 942]);
-    expect(rangeOf(symbolsFrom("src/outline.ts"), "applySymbolCap")).toEqual([941, 950]);
-    expect(rangeOf(symbolsFrom("src/stack-rebase.ts"), "writeStackBase")).toEqual([91, 103]);
-    expect(rangeOf(symbolsFrom("src/stack-rebase.ts"), "resolveStackChain")).toEqual([155, 192]);
-    expect(rangeOf(symbolsFrom("src/stack-rebase.ts"), "planStackRebase")).toEqual([212, 237]);
-    expect(rangeOf(symbolsFrom("src/spawn.ts"), "appendSystemPromptArgs")).toEqual([161, 192]);
-    expect(rangeOf(symbolsFrom("src/archify.ts"), "countChecks")).toEqual([333, 344]);
-  });
+  function lineOf(sourceFile: ts.SourceFile, position: number): number {
+    return sourceFile.getLineAndCharacterOfPosition(position).line + 1;
+  }
+
+  const PARSER_COMPARED_FILES = [
+    "extensions/index.ts",
+    "src/agent-registry.ts",
+    "src/archify.ts",
+    "src/outline.ts",
+    "src/process-gate.ts",
+    "src/quality-gates.ts",
+    "src/spawn.ts",
+    "src/stack-rebase.ts",
+    "src/worktree.ts",
+  ];
+
+  it.each(PARSER_COMPARED_FILES)(
+    "agrees with the parser on every top-level declaration in %s",
+    (relativePath) => {
+      const expected = parserRanges(relativePath);
+      // `registerTool`/`on`/`export` rows come from call expressions and
+      // re-export statements, which `parserRanges` does not map.
+      const actual = new Map(
+        symbolsFrom(relativePath)
+          .filter((symbol) => symbol.kind !== "registerTool" && symbol.kind !== "on")
+          .map((symbol) => [symbol.name, [symbol.startLine, symbol.endLine] as [number, number]]),
+      );
+
+      const mismatches: string[] = [];
+      for (const [name, [expectedStart, expectedEnd]] of expected) {
+        const found = actual.get(name);
+        if (found === undefined) {
+          mismatches.push(`${name}: missing (parser says ${expectedStart}-${expectedEnd})`);
+          continue;
+        }
+        if (found[0] !== expectedStart || found[1] !== expectedEnd) {
+          mismatches.push(
+            `${name}: ${found[0]}-${found[1]}, parser says ${expectedStart}-${expectedEnd}`,
+          );
+        }
+      }
+
+      expect(mismatches).toEqual([]);
+      expect(expected.size).toBeGreaterThan(1);
+    },
+  );
 
   it("still finds declarations past the regex literals in src/outline.ts", () => {
     // Regression: before regex-literal handling, the `["'\`]` patterns in this
