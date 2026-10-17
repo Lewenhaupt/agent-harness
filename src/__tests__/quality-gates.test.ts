@@ -10,7 +10,7 @@ import {
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GateOptions, SpawnDetails } from "../agent-registry.js";
 import {
   ensureProofBridge,
@@ -18,7 +18,73 @@ import {
   proofDirForTask,
   resolveProofBase,
 } from "../proof-dir.js";
-import { gateProofContent, gateUserGuide, validateCastRecording } from "../quality-gates.js";
+import {
+  extractFailingLocations,
+  gateLint,
+  gateProofContent,
+  gateTests,
+  gateTypecheck,
+  gateUserGuide,
+  validateCastRecording,
+} from "../quality-gates.js";
+
+// `node:child_process` is mocked at the module boundary (repo convention) so
+// the gate commands can fail with controlled stdout/stderr shapes without
+// spawning a real pnpm process.
+type GateExecCallback = (error: unknown, result: { stdout: string; stderr: string }) => void;
+
+interface MockExecRejection extends Error {
+  stdout?: string;
+  stderr?: string;
+  code?: number | string;
+  killed?: boolean;
+}
+
+interface GateFailureProps {
+  message?: string;
+  stdout?: string;
+  stderr?: string;
+  code?: number | string;
+  killed?: boolean;
+}
+
+const gateExec = vi.hoisted(() => {
+  const state: {
+    failure: MockExecRejection | null;
+    rejectValue: { value: unknown } | null;
+    stdout: string;
+    stderr: string;
+    calls: Array<{ command: string; options: unknown }>;
+  } = { failure: null, rejectValue: null, stdout: "", stderr: "", calls: [] };
+
+  const fn = vi.fn((_command: string, _options: unknown, _callback: GateExecCallback) => undefined);
+
+  // Give the mock exec the same custom promisify hook Node's real exec has so
+  // tests can control rejected values, including string/undefined/non-Error
+  // rejections that a callback-style mock cannot express.
+  Object.defineProperty(fn, Symbol.for("nodejs.util.promisify.custom"), {
+    value: (command: string, options: unknown) =>
+      new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        state.calls.push({ command, options });
+        if (state.rejectValue !== null) {
+          reject(state.rejectValue.value);
+          return;
+        }
+        if (state.failure !== null) {
+          reject(state.failure);
+          return;
+        }
+        resolve({ stdout: state.stdout, stderr: state.stderr });
+      }),
+  });
+
+  return { fn, state };
+});
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, exec: gateExec.fn };
+});
 
 const MOCK_DETAILS: SpawnDetails = {
   messages: [],
@@ -926,5 +992,331 @@ describe("gateUserGuide", () => {
     const result = await gateUserGuide(output, MOCK_DETAILS);
     expect(result).toHaveProperty("passed", false);
     expect(result.feedback).toContain("too short");
+  });
+});
+
+describe("quality gate command feedback", () => {
+  const GATE_OPTIONS: GateOptions = { cwd: "/tmp/gate-cwd", timeoutInMs: 1_000 };
+
+  /** Build an exec-style rejection carrying Node's extra diagnostic fields. */
+  function gateFailure(props: GateFailureProps): MockExecRejection {
+    return Object.assign(new Error(props.message ?? "Command failed"), props);
+  }
+
+  beforeEach(() => {
+    gateExec.state.failure = null;
+    gateExec.state.rejectValue = null;
+    gateExec.state.stdout = "";
+    gateExec.state.stderr = "";
+    gateExec.state.calls.length = 0;
+  });
+
+  it("returns stdout diagnostics for a stdout-only lint failure", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm lint",
+      stdout: "src/index.ts:174:3 lint/style/useImportType  FIXABLE  ━━━━━\n",
+      code: 1,
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("src/index.ts:174:3");
+    expect(result.feedback).toContain("lint/style/useImportType");
+    expect(result.feedback).toContain("--- stdout ---");
+    expect(result.feedback).toContain("Failing files:");
+    expect(result.feedback).toContain("src/index.ts:174");
+  });
+
+  it("returns stderr diagnostics for a stderr-only typecheck failure", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm typecheck",
+      stderr: "src/agent-registry.ts(27,5): error TS2322: Type mismatch.\n",
+      code: 2,
+    });
+
+    const result = await gateTypecheck("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("error TS2322");
+    expect(result.feedback).toContain("--- stderr ---");
+    expect(result.feedback).toContain("src/agent-registry.ts:27");
+  });
+
+  it("renders stdout before stderr when both streams carry diagnostics", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm test",
+      stdout: "FAIL  src/__tests__/x.test.ts > suite > test\n",
+      stderr: "stderr-diagnostic-marker\n",
+      code: 1,
+    });
+
+    const result = await gateTests("", MOCK_DETAILS, GATE_OPTIONS);
+    const feedback = result.feedback ?? "";
+
+    expect(feedback).toContain("FAIL  src/__tests__/x.test.ts");
+    expect(feedback).toContain("stderr-diagnostic-marker");
+    expect(feedback.indexOf("--- stdout ---")).toBeLessThan(feedback.indexOf("--- stderr ---"));
+    expect(feedback.indexOf("FAIL  src/__tests__/x.test.ts")).toBeLessThan(
+      feedback.indexOf("stderr-diagnostic-marker"),
+    );
+  });
+
+  it("includes the failed command and exit code in the header", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm lint",
+      stdout: "src/foo.ts:12:3 lint/style/noNonNullAssertion\n",
+      code: 1,
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("Lint failed (pnpm lint, exit 1):");
+    expect(gateExec.state.calls).toHaveLength(1);
+    expect(gateExec.state.calls[0]?.command).toBe("pnpm lint");
+    expect(gateExec.state.calls[0]?.options).toHaveProperty("maxBuffer", 10 * 1024 * 1024);
+  });
+
+  it("truncates huge stdout and keeps the feedback bounded", async () => {
+    const hugeStdout = Array.from(
+      { length: 200 },
+      (_, index) => `src/foo.ts:${index + 1}:1 diagnostic line ${index + 1}`,
+    ).join("\n");
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm lint",
+      stdout: hugeStdout,
+      code: 1,
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+    const feedback = result.feedback ?? "";
+
+    expect(feedback).toContain("more lines truncated");
+    expect(feedback).toContain("Run `pnpm lint` for the full output.");
+    // 50 diagnostic lines + capped failing-file header + fixed scaffolding.
+    expect(feedback.split("\n").length).toBeLessThan(100);
+  });
+
+  it("still returns non-empty feedback for a plain Error without streams", async () => {
+    gateExec.state.failure = gateFailure({ message: "spawn pnpm ENOENT" });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("spawn pnpm ENOENT");
+    expect(result.feedback).toContain("Run `pnpm lint` for the full output.");
+  });
+
+  it("labels a killed command as timed out instead of reporting an exit code", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm test",
+      killed: true,
+    });
+
+    const result = await gateTests("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("Tests failed (pnpm test, timed out after 1s):");
+    expect(result.feedback).not.toContain("exit");
+  });
+
+  it("reports a maxBuffer overflow explicitly", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "stdout maxBuffer length exceeded",
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("capture limit");
+    expect(result.feedback).not.toContain("undefined");
+  });
+
+  it("bounds feedback for a single pathological line", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm lint",
+      stdout: "a".repeat(1_000_000),
+      code: 1,
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+    const feedback = result.feedback ?? "";
+
+    expect(feedback).toContain("more chars truncated");
+    expect(feedback).toContain("Run `pnpm lint` for the full output.");
+    // 32 KiB stream cap plus header/markers/footer.
+    expect(feedback.length).toBeLessThan(40_000);
+  });
+
+  it("turns a string rejection into feedback", async () => {
+    gateExec.state.rejectValue = { value: "pnpm lint exploded" };
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("pnpm lint exploded");
+  });
+
+  it("handles an undefined rejection without throwing", async () => {
+    gateExec.state.rejectValue = { value: undefined };
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Command failed");
+    expect(result.feedback).toContain("Run `pnpm lint` for the full output.");
+  });
+
+  it("handles a non-Error rejection object", async () => {
+    gateExec.state.rejectValue = { value: { code: "ENOENT" } };
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("Lint failed (pnpm lint, spawn error ENOENT):");
+  });
+
+  it("renders a spawn-error phrase for a string exit code", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "spawn pnpm ENOENT",
+      code: "ENOENT",
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("Lint failed (pnpm lint, spawn error ENOENT):");
+  });
+
+  it("reports only the char bound when both caps fire", async () => {
+    const manyLines = Array.from(
+      { length: 1_000 },
+      (_, index) => `line ${index} ${"x".repeat(80)}`,
+    ).join("\n");
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm lint",
+      stdout: manyLines,
+      code: 1,
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+    const feedback = result.feedback ?? "";
+
+    expect(feedback).toContain("more chars truncated");
+    // The line remainder from the char-capped slice would understate the real
+    // total, so the line marker must not be emitted alongside the char marker.
+    expect(feedback).not.toContain("more lines truncated");
+  });
+
+  it("falls back to a clear message for whitespace-only streams", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "   ",
+      stdout: " \n\t\n",
+      stderr: "  ",
+    });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("No diagnostic output captured.");
+  });
+
+  it("falls back to a clear message for an empty Error message", async () => {
+    gateExec.state.failure = gateFailure({ message: "" });
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result.feedback).toContain("No diagnostic output captured.");
+  });
+
+  it("passes without feedback when the command succeeds", async () => {
+    gateExec.state.stdout = "ok";
+
+    const result = await gateLint("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result).not.toHaveProperty("feedback");
+  });
+});
+
+describe("extractFailingLocations", () => {
+  it("extracts biome, tsc, and vitest locations in order without duplicates", () => {
+    const output = [
+      "src/foo.ts:12:34 lint/suspicious/noExplicitAny",
+      "src/foo.ts(12,5): error TS2322: Type 'string' is not assignable to 'number'.",
+      "FAIL  src/__tests__/x.test.ts > suite > test",
+      " ❯ src/bar.ts:9:5",
+      "src/foo.ts:12:90 lint/suspicious/noExplicitAny",
+      "/repo/node_modules/pkg/index.js:1:1",
+    ].join("\n");
+
+    expect(extractFailingLocations(output)).toEqual([
+      "src/foo.ts:12",
+      "src/__tests__/x.test.ts",
+      "src/bar.ts:9",
+    ]);
+  });
+
+  it("caps the number of surfaced locations", () => {
+    const output = Array.from(
+      { length: 15 },
+      (_, index) => `src/file-${index}.ts:${index + 1}:1 diagnostic`,
+    ).join("\n");
+
+    expect(extractFailingLocations(output)).toHaveLength(10);
+  });
+
+  it("returns no locations for output without file references", () => {
+    expect(extractFailingLocations("Command failed: pnpm lint")).toEqual([]);
+  });
+
+  it("returns an empty result for empty input", () => {
+    expect(extractFailingLocations("")).toEqual([]);
+  });
+
+  it("preserves absolute paths and dedupes by file path", () => {
+    const output = [
+      "/repo/src/a.ts:12:3 lint/style/noNonNullAssertion",
+      "FAIL  /repo/src/b.ts > suite > test",
+      " ❯ /repo/src/b.ts:9:5",
+    ].join("\n");
+
+    expect(extractFailingLocations(output)).toEqual(["/repo/src/a.ts:12", "/repo/src/b.ts"]);
+  });
+
+  it("skips node_modules locations", () => {
+    const output = [
+      "node_modules/pkg/index.js:1:1 lint/style/noNonNullAssertion",
+      "src/a.ts:3:1 lint/style/noNonNullAssertion",
+    ].join("\n");
+
+    expect(extractFailingLocations(output)).toEqual(["src/a.ts:3"]);
+  });
+
+  it("extracts a diagnostic from the tail of a large stream", () => {
+    const noise = Array.from(
+      { length: 1_200 },
+      (_, index) => `noise line ${index} ${"x".repeat(80)}`,
+    ).join("\n");
+    const output = `${noise}\n ❯ src/late.ts:9:5\n`;
+
+    expect(output.length).toBeGreaterThan(64 * 1024);
+
+    const startedAt = performance.now();
+    const locations = extractFailingLocations(output);
+    const elapsedInMs = performance.now() - startedAt;
+
+    expect(locations).toContain("src/late.ts:9");
+    expect(locations.length).toBeLessThanOrEqual(10);
+    expect(elapsedInMs).toBeLessThan(1_000);
+  });
+
+  it("returns promptly for pathological long lines", () => {
+    const wordRun = "a".repeat(200_000);
+    const singleMegabyteLine = "b".repeat(1024 * 1024);
+    const output = `${wordRun}\n${singleMegabyteLine}\n`;
+
+    const startedAt = performance.now();
+    const locations = extractFailingLocations(output);
+    const elapsedInMs = performance.now() - startedAt;
+
+    expect(locations).toEqual([]);
+    expect(elapsedInMs).toBeLessThan(1_000);
   });
 });

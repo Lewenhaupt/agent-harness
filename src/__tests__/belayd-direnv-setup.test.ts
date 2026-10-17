@@ -696,5 +696,7 @@ describe("belayd-direnv-setup (unit)", () => {
     };
 
     cases.forEach(assertCase);
-  });
+    // Real direnv subprocesses per case; under parallel suite load this can
+    // exceed the default 5s timeout on a busy machine.
+  }, 30_000);
 });
