@@ -15,8 +15,12 @@ import {
   checkPathTraversal,
   checkProofArtifactsExist,
   checkProofDirTraversal,
+  enumerateProofDirArtifacts,
+  findOutsideProofDirRefs,
   findProofArtifactRefs,
+  findTraversalProofRefs,
   findWorkspaceRoot,
+  hasExtensionIgnoreCase,
   resolveProofRefInDir,
 } from "./proof-verification.js";
 
@@ -647,13 +651,47 @@ async function validateCastArtifact(
   return validateCastRecording(resolve(proofWorkRoot, artifact));
 }
 
+/** Proof refs for a run, plus whether they were recovered from the task dir. */
+interface ResolvedProofArtifacts {
+  refs: string[];
+  recoveredFromTaskDir: boolean;
+}
+
+/**
+ * Resolve accepted proof refs for the output, falling back to fresh artifacts
+ * left in the task dir. The fallback is freshness-floored so a retry cannot
+ * pass on a failed attempt's leftovers.
+ */
+function resolveProofArtifacts(
+  output: string,
+  proofDir: string | undefined,
+  proofRunStartMs: number | undefined,
+): ResolvedProofArtifacts {
+  const refs = findProofArtifactRefs(output, proofDir);
+  if (refs.length > 0 || proofDir === undefined) {
+    return { refs, recoveredFromTaskDir: false };
+  }
+  const recovered = enumerateProofDirArtifacts(proofDir, { newerThanMs: proofRunStartMs });
+  return { refs: recovered, recoveredFromTaskDir: recovered.length > 0 };
+}
+
+/** Failure feedback naming artifact-shaped paths that were ignored as outside the proof dir. */
+function noProofArtifactsFeedback(output: string, proofDir: string | undefined): string {
+  const ignoredRefs = proofDir === undefined ? [] : findOutsideProofDirRefs(output, proofDir);
+  if (ignoredRefs.length === 0) return "No proof artifacts produced or referenced";
+  return `No proof artifacts produced or referenced (${ignoredRefs.length} artifact path(s) outside the proof task dir ignored: ${ignoredRefs.join(", ")})`;
+}
+
 /**
  * Quality gate for proof-of-work content.
  *
  * Resolution order: optional proofRequired, documented skip reason, then
- * artifact validation. Artifacts must be referenced in the output; .cast
- * recordings are content-validated and every other accepted artifact type
- * must exist on disk. Never judges whether a proof is relevant.
+ * artifact validation. Artifacts must be referenced in the output (canonical
+ * `proof-of-work/...` refs or absolute paths inside the proof task dir); when
+ * nothing is recognized but the task dir holds accepted artifacts, those are
+ * used instead of failing. .cast recordings are content-validated and every
+ * other accepted artifact type must exist on disk. Never judges whether a
+ * proof is relevant.
  */
 export async function gateProofContent(
   output: string,
@@ -669,16 +707,27 @@ export async function gateProofContent(
     return { passed: true, feedback: `Proof skipped: ${skipReason}` };
   }
 
-  const artifacts = findProofArtifactRefs(output);
-  if (artifacts.length === 0) {
-    return { passed: false, feedback: "No proof artifacts produced or referenced" };
-  }
-
   const cwd = options?.cwd ?? process.cwd();
   const proofDir = options?.proofDir !== undefined ? resolve(options.proofDir) : undefined;
 
+  // Fail closed on traversal-shaped refs before the enumeration fallback can
+  // rescue a fabricated ref with artifacts that do happen to exist on disk.
+  const traversalRefs = findTraversalProofRefs(output, proofDir);
+  if (traversalRefs.length > 0) {
+    return { passed: false, feedback: `Path traversal detected: ${traversalRefs.join(", ")}` };
+  }
+
+  const { refs: artifacts, recoveredFromTaskDir } = resolveProofArtifacts(
+    output,
+    proofDir,
+    options?.proofRunStartMs,
+  );
+  if (artifacts.length === 0) {
+    return { passed: false, feedback: noProofArtifactsFeedback(output, proofDir) };
+  }
+
   for (const artifact of artifacts) {
-    if (artifact.endsWith(".cast")) {
+    if (hasExtensionIgnoreCase(artifact, ".cast")) {
       const castResult = await validateCastArtifact(artifact, cwd, proofDir);
       if (!castResult.passed) return castResult;
     }
@@ -688,7 +737,12 @@ export async function gateProofContent(
   const missingRefsCheck = checkProofArtifactsExist(output, proofWorkRoot, proofDir);
   if (missingRefsCheck) return missingRefsCheck;
 
-  return { passed: true, feedback: `${artifacts.length} proof artifact(s) validated` };
+  return {
+    passed: true,
+    feedback: recoveredFromTaskDir
+      ? `${artifacts.length} proof artifact(s) recovered from the task dir (none referenced in output)`
+      : `${artifacts.length} proof artifact(s) validated`,
+  };
 }
 
 /**

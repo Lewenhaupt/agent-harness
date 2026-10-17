@@ -227,24 +227,32 @@ export {
   resolveProofBase,
 } from "./proof-dir.js";
 export type {
+  EnumerateProofDirOptions,
   ExtractedProofArtifact,
+  ProofRefScan,
   ResolvedProofRef,
   VerifierInputs,
 } from "./proof-verification.js";
 export {
+  acceptedProofRefsFromScan,
   buildVerifierPrompt,
   checkPathTraversal,
   checkProofArtifactsExist,
   checkProofDirTraversal,
   collectChangeContext,
+  enumerateProofDirArtifacts,
   extractHowToVerify,
   extractProofArtifacts,
+  findOutsideProofDirRefs,
   findProofArtifactRefs,
+  findTraversalProofRefs,
   findWorkspaceRoot,
+  hasExtensionIgnoreCase,
   isProofArtifactPath,
   PROOF_ARTIFACT_EXTENSIONS,
   resolveProofArtifactPath,
   resolveProofRefInDir,
+  scanProofRefs,
 } from "./proof-verification.js";
 export {
   gateFullValidation,

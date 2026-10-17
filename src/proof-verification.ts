@@ -6,9 +6,9 @@
  */
 
 import { exec, execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GateResult } from "./agent-registry.js";
 
@@ -24,16 +24,335 @@ export const PROOF_ARTIFACT_EXTENSIONS: readonly string[] = [
   ".cast",
 ];
 
-/** True when a path ends with one of the accepted proof artifact extensions. */
-export function isProofArtifactPath(path: string): boolean {
-  return PROOF_ARTIFACT_EXTENSIONS.some((ext) => path.endsWith(ext));
+/** True when a path ends with the given extension, ignoring case. */
+export function hasExtensionIgnoreCase(path: string, extension: string): boolean {
+  return path.toLowerCase().endsWith(extension.toLowerCase());
 }
 
-/** All proof-of-work/... references in the output that point at accepted artifact types. */
-export function findProofArtifactRefs(output: string): string[] {
-  const matches = output.match(/\bproof-of-work\/[\w/.-]+\b/g);
-  if (!matches) return [];
-  return matches.filter(isProofArtifactPath);
+/** True when a path ends with one of the accepted proof artifact extensions. */
+export function isProofArtifactPath(path: string): boolean {
+  return PROOF_ARTIFACT_EXTENSIONS.some((ext) => hasExtensionIgnoreCase(path, ext));
+}
+
+/** Canonical reference prefix for workspace-relative proof refs. */
+const PROOF_OF_WORK_REF_PREFIX = "proof-of-work/";
+
+/**
+ * Accepted reference forms: canonical `proof-of-work/<task-id>/...` refs and
+ * absolute filesystem paths. Absolute paths only count when they resolve inside
+ * the external proof task dir (see `normalizeAbsoluteProofRef`).
+ *
+ * The absolute branch is anchored to a start-of-line/string or a preceding
+ * delimiter so a relative prose path like `dist/base/bd-42/x.png` is not
+ * re-read as `/base/bd-42/x.png`; the trailing `\b` trims a sentence-final dot
+ * the same way the canonical branch does. Delimiters match the prompt's
+ * tolerated set (whitespace, backtick, quote, paren, bracket, `=`, `,`, `;`).
+ */
+const PROOF_REF_CANDIDATE_PATTERN =
+  /\bproof-of-work\/[\w/.-]+\b|(?<=^|[\s`"'(=,[\];])\/[\w./-]+\b/g;
+
+/**
+ * Maximum directory depth enumerated below the proof task dir. Bounds
+ * `enumerateProofDirArtifacts` so a runaway proof dir cannot stall the gate.
+ */
+const MAX_PROOF_DIR_DEPTH_LEVELS = 3;
+
+/** Default width cap for fallback enumeration of the proof task dir. */
+const MAX_ENUMERATED_PROOF_REFS = 200;
+
+/** Keep the first occurrence of each ref while preserving appearance order. */
+function dedupeRefs(refs: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const ref of refs) {
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    deduped.push(ref);
+  }
+  return deduped;
+}
+
+/**
+ * Resolve a path for containment checks, following symlinks when the path
+ * exists. Falls back to a textual resolve when realpath fails (e.g. a fabricated
+ * artifact path) so the ref is still existence-checked rather than dropped.
+ */
+function canonicalizePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * True when any path segment is exactly `..` (a genuine traversal). A dotted
+ * filename such as `shot..png` is a legitimate artifact name and must pass.
+ */
+function hasParentSegment(path: string): boolean {
+  return path.split("/").includes("..");
+}
+
+/**
+ * Normalize an absolute artifact path inside the external proof task dir into
+ * the canonical `proof-of-work/<task-id>/<relative>` form so every downstream
+ * resolver keeps working unchanged.
+ *
+ * Returns null for non-artifacts, traversal attempts, and paths outside
+ * `proofDir` — an unrelated absolute path must never satisfy the proof gate.
+ */
+function normalizeAbsoluteProofRef(candidate: string, proofDir: string): string | null {
+  if (!candidate.startsWith("/")) return null;
+  if (!isProofArtifactPath(candidate)) return null;
+  if (hasParentSegment(candidate)) return null;
+
+  const canonicalProofDir = canonicalizePath(proofDir);
+  const canonicalCandidate = canonicalizePath(candidate);
+  if (!canonicalCandidate.startsWith(canonicalProofDir + sep)) return null;
+
+  const relative = canonicalCandidate.slice(canonicalProofDir.length + sep.length);
+  return `proof-of-work/${basename(resolve(proofDir))}/${relative.split(sep).join("/")}`;
+}
+
+/**
+ * Recover the canonical ref embedded in an absolute path that failed the
+ * inside-proofDir check — e.g. a workspace `proof-of-work/` symlink path when
+ * realpath could not resolve it. The embedded task segment must match the proof
+ * dir's task id, so an unrelated path cannot smuggle in another task's ref.
+ */
+function extractEmbeddedProofRef(candidate: string, proofDir: string): string | null {
+  const marker = `/${PROOF_OF_WORK_REF_PREFIX}`;
+  const index = candidate.indexOf(marker);
+  if (index === -1) return null;
+  const embedded = candidate.slice(index + 1);
+  if (!isProofArtifactPath(embedded)) return null;
+  if (hasParentSegment(embedded)) return null;
+  const segments = embedded.split("/");
+  if (segments[1] !== basename(resolve(proofDir))) return null;
+  return embedded;
+}
+
+/**
+ * Result of scanning output for proof artifact refs: accepted refs, absolute
+ * artifact paths ignored as outside the proof dir, traversal-shaped refs
+ * reported separately, and raw absolute candidates that still need a proof dir
+ * to normalize.
+ */
+export interface ProofRefScan {
+  accepted: string[];
+  outsideProofDir: string[];
+  traversalRefs: string[];
+  /**
+   * Artifact-shaped absolute candidates collected when no `proofDir` was
+   * supplied. Callers that resolve a proof dir later can normalize these with
+   * `acceptedProofRefsFromScan` instead of scanning the output again.
+   */
+  absoluteCandidates: string[];
+}
+
+/** How a single matched candidate relates to the proof gate. */
+type ProofRefClassification =
+  | { kind: "accepted"; ref: string }
+  | { kind: "outside"; ref: string }
+  | { kind: "traversal"; ref: string }
+  | { kind: "absolute"; ref: string }
+  | { kind: "ignore" };
+
+/**
+ * Classify one matched candidate. Only artifact-shaped refs can be accepted,
+ * reported outside, or flagged as traversal; a `..` in an unrelated prose path
+ * (e.g. `/usr/local/../lib`) is ignored. Absolute candidates are collected
+ * unresolved when no `proofDir` was supplied.
+ */
+function classifyProofRefCandidate(
+  candidate: string,
+  proofDir: string | undefined,
+): ProofRefClassification {
+  if (candidate.startsWith(PROOF_OF_WORK_REF_PREFIX)) {
+    if (!isProofArtifactPath(candidate)) return { kind: "ignore" };
+    if (hasParentSegment(candidate)) return { kind: "traversal", ref: candidate };
+    return { kind: "accepted", ref: candidate };
+  }
+  if (!isProofArtifactPath(candidate)) return { kind: "ignore" };
+  if (proofDir === undefined) return { kind: "absolute", ref: candidate };
+  if (hasParentSegment(candidate)) return { kind: "traversal", ref: candidate };
+  const normalized =
+    normalizeAbsoluteProofRef(candidate, proofDir) ?? extractEmbeddedProofRef(candidate, proofDir);
+  if (normalized !== null) return { kind: "accepted", ref: normalized };
+  return { kind: "outside", ref: candidate };
+}
+
+/**
+ * Match and classify every proof ref candidate in the output. Passing a
+ * `proofDir` normalizes absolute candidates; without one they are returned in
+ * `absoluteCandidates` so a caller can reuse this scan after resolving a base.
+ */
+export function scanProofRefs(output: string, proofDir?: string): ProofRefScan {
+  const accepted: string[] = [];
+  const outsideProofDir: string[] = [];
+  const traversalRefs: string[] = [];
+  const absoluteCandidates: string[] = [];
+  for (const candidate of output.match(PROOF_REF_CANDIDATE_PATTERN) ?? []) {
+    const classification = classifyProofRefCandidate(candidate, proofDir);
+    switch (classification.kind) {
+      case "accepted":
+        accepted.push(classification.ref);
+        break;
+      case "outside":
+        outsideProofDir.push(classification.ref);
+        break;
+      case "traversal":
+        traversalRefs.push(classification.ref);
+        break;
+      case "absolute":
+        absoluteCandidates.push(classification.ref);
+        break;
+      case "ignore":
+        break;
+    }
+  }
+  return {
+    accepted: dedupeRefs(accepted),
+    outsideProofDir: dedupeRefs(outsideProofDir),
+    traversalRefs: dedupeRefs(traversalRefs),
+    absoluteCandidates: dedupeRefs(absoluteCandidates),
+  };
+}
+
+/**
+ * Accepted refs from a scan once the proof dir is known: canonical refs already
+ * accepted plus the scan's absolute candidates normalized against `proofDir`.
+ * This is the single-scan replacement for re-running `findProofArtifactRefs`
+ * with a proof dir in the advisory verifier path.
+ */
+export function acceptedProofRefsFromScan(
+  scan: ProofRefScan,
+  proofDir: string | undefined,
+): string[] {
+  if (proofDir === undefined) return scan.accepted;
+  const normalized: string[] = [];
+  for (const candidate of scan.absoluteCandidates) {
+    const ref =
+      normalizeAbsoluteProofRef(candidate, proofDir) ??
+      extractEmbeddedProofRef(candidate, proofDir);
+    if (ref !== null) normalized.push(ref);
+  }
+  return dedupeRefs([...scan.accepted, ...normalized]);
+}
+
+/**
+ * All proof artifact references in the output that point at accepted types.
+ *
+ * The proof generator is told to save into `$BELAYD_PROOF_TASK_DIR/<task-id>/`
+ * (an absolute path outside the worktree), so when `proofDir` is provided its
+ * absolute paths are accepted and normalized alongside `proof-of-work/...`
+ * refs. Without `proofDir` only canonical refs are recognized.
+ */
+export function findProofArtifactRefs(output: string, proofDir?: string): string[] {
+  return acceptedProofRefsFromScan(scanProofRefs(output, proofDir), proofDir);
+}
+
+/**
+ * Artifact-shaped absolute paths in the output that were ignored because they
+ * resolve outside `proofDir`. Lets the gate explain the failure instead of
+ * reporting a bare "no artifacts".
+ */
+export function findOutsideProofDirRefs(output: string, proofDir: string): string[] {
+  return scanProofRefs(output, proofDir).outsideProofDir;
+}
+
+/**
+ * Traversal-shaped proof refs in the output — artifact-shaped candidates with a
+ * real `..` segment, in canonical or absolute form. `gateProofContent` fails on
+ * a non-empty list before the enumeration fallback, so a fabricated traversal
+ * ref can never be papered over by freshly enumerated artifacts and the two
+ * forms of the same semantic ref fail identically. Non-artifact prose paths
+ * (e.g. `/usr/local/../lib`) are ignored, and the advisory verifier path simply
+ * does not extract these refs.
+ */
+export function findTraversalProofRefs(output: string, proofDir?: string): string[] {
+  return scanProofRefs(output, proofDir).traversalRefs;
+}
+
+/** Options for `enumerateProofDirArtifacts`. */
+export interface EnumerateProofDirOptions {
+  /** Only artifacts with an mtime at or after this epoch-ms floor are returned. */
+  newerThanMs?: number;
+  /** Upper bound on returned refs; bounds gate cost on a runaway proof dir. */
+  maxRefs?: number;
+}
+
+/** True when the file's mtime is at or after the floor (or no floor was given). */
+function isFreshEnough(path: string, newerThanMs: number | undefined): boolean {
+  if (newerThanMs === undefined) return true;
+  try {
+    return statSync(path).mtimeMs >= newerThanMs;
+  } catch {
+    return false;
+  }
+}
+
+/** Directory entries, or [] when the directory is unreadable (gate never throws). */
+function listEntriesOrEmpty(dir: string): Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * True when an entry is a fresh, accepted artifact file. Enumeration skips
+ * symlink entries (isFile() is false for them) so a readdir walk cannot loop;
+ * referenced paths inside the dir are still followed by existsSync/reads, and
+ * the agent owns that directory, so that is not a privilege boundary.
+ */
+function isFreshArtifactEntry(
+  entry: Dirent,
+  fullPath: string,
+  newerThanMs: number | undefined,
+): boolean {
+  if (!entry.isFile()) return false;
+  if (!isProofArtifactPath(entry.name)) return false;
+  return isFreshEnough(fullPath, newerThanMs);
+}
+
+/**
+ * Recursively list accepted artifacts under the proof task dir as canonical
+ * `proof-of-work/<task-id>/<relative>` refs, sorted for determinism.
+ *
+ * Never throws: a missing or unreadable directory yields an empty list so the
+ * gate degrades to its normal "no artifacts" verdict instead of crashing.
+ */
+export function enumerateProofDirArtifacts(
+  proofDir: string,
+  options?: EnumerateProofDirOptions,
+): string[] {
+  const root = resolve(proofDir);
+  const taskId = basename(root);
+  const maxRefs = options?.maxRefs ?? MAX_ENUMERATED_PROOF_REFS;
+  const refs: string[] = [];
+
+  const walk = (dir: string, depthInLevels: number): void => {
+    if (depthInLevels > MAX_PROOF_DIR_DEPTH_LEVELS) return;
+    for (const entry of listEntriesOrEmpty(dir)) {
+      if (refs.length >= maxRefs) return;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath, depthInLevels + 1);
+        continue;
+      }
+      if (!isFreshArtifactEntry(entry, fullPath, options?.newerThanMs)) continue;
+      const relative = fullPath
+        .slice(root.length + sep.length)
+        .split(sep)
+        .join("/");
+      refs.push(`proof-of-work/${taskId}/${relative}`);
+    }
+  };
+
+  walk(root, 0);
+  return refs.sort();
 }
 
 /**
@@ -96,15 +415,16 @@ export function checkProofDirTraversal(castPath: string, proofDir: string): Gate
 /**
  * Check that referenced proof artifacts exist on disk.
  * Resolves accepted artifact refs (including .cast) against either the
- * workspace proof-of-work root or the external proof dir. Returns a failed
- * GateResult listing missing refs, or null when every referenced artifact exists.
+ * workspace proof-of-work root or the external proof dir; absolute refs inside
+ * the proof dir are normalized first. Returns a failed GateResult listing
+ * missing refs, or null when every referenced artifact exists.
  */
 export function checkProofArtifactsExist(
   output: string,
   proofWorkRoot: string,
   proofDir?: string,
 ): GateResult | null {
-  const refs = findProofArtifactRefs(output);
+  const refs = findProofArtifactRefs(output, proofDir);
   if (refs.length === 0) {
     return null;
   }
@@ -112,7 +432,7 @@ export function checkProofArtifactsExist(
   const missingRefs: string[] = [];
   for (const ref of refs) {
     const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
-    if (normalizedRef.includes("..")) {
+    if (hasParentSegment(normalizedRef)) {
       return { passed: false, feedback: `Path traversal detected: ${normalizedRef}` };
     }
     // Workspace refs resolve proof-of-work/<task>/... directly under proofWorkRoot
@@ -160,7 +480,7 @@ export function resolveProofArtifactPath(
   proofDir?: string,
 ): { ok: true; resolved: ResolvedProofRef } | { ok: false; error: string } {
   const normalizedRef = ref.startsWith("/") ? ref.slice(1) : ref;
-  if (normalizedRef.includes("..")) {
+  if (hasParentSegment(normalizedRef)) {
     return { ok: false, error: `Path traversal detected: ${normalizedRef}` };
   }
 
@@ -261,7 +581,7 @@ async function extractProofArtifact(artifact: ResolvedProofRef): Promise<Extract
     };
   }
 
-  if (artifact.path.endsWith(".cast")) {
+  if (hasExtensionIgnoreCase(artifact.path, ".cast")) {
     const { readCastToText } = await import("./cast-utils.js");
     const result = await readCastToText(artifact.path);
     if (!result.ok) {
@@ -270,7 +590,7 @@ async function extractProofArtifact(artifact: ResolvedProofRef): Promise<Extract
     return { ref: artifact.ref, kind: "cast", text: result.text };
   }
 
-  if (artifact.path.endsWith(".trace.zip")) {
+  if (hasExtensionIgnoreCase(artifact.path, ".trace.zip")) {
     return {
       ref: artifact.ref,
       kind: "trace.zip",
@@ -279,9 +599,9 @@ async function extractProofArtifact(artifact: ResolvedProofRef): Promise<Extract
   }
 
   if (
-    artifact.path.endsWith(".png") ||
-    artifact.path.endsWith(".jpg") ||
-    artifact.path.endsWith(".jpeg")
+    hasExtensionIgnoreCase(artifact.path, ".png") ||
+    hasExtensionIgnoreCase(artifact.path, ".jpg") ||
+    hasExtensionIgnoreCase(artifact.path, ".jpeg")
   ) {
     return {
       ref: artifact.ref,

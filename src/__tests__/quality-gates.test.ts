@@ -481,6 +481,305 @@ describe("gateProofContent accepted artifact existence", () => {
   });
 });
 
+describe("gateProofContent proof-dir artifact resolution", () => {
+  let tmpDir: string;
+  let proofDir: string;
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "proof-dir-resolution-"));
+    proofDir = join(tmpDir, "external-proof", "bd-99");
+    await mkdir(proofDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  async function writeArtifact(relativePath: string): Promise<string> {
+    const path = join(proofDir, relativePath);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, "fake-content", "utf-8");
+    return path;
+  }
+
+  it("accepts an artifact listed only as an absolute proof-dir path", async () => {
+    const absolutePath = await writeArtifact("shot.png");
+    const output = `## Artifacts\n${absolutePath}\n`;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("accepts mixed canonical and absolute refs", async () => {
+    await writeArtifact("a.png");
+    const absoluteTrace = await writeArtifact("b.trace.zip");
+    const output = ["## Artifacts", "proof-of-work/bd-99/a.png", `${absoluteTrace}`].join("\n");
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("still fails when an absolute ref is missing on disk", async () => {
+    const output = `## Artifacts\n${join(proofDir, "missing.png")}\n`;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("not found on disk");
+  });
+
+  it("falls back to artifacts present under the proof dir when nothing is referenced", async () => {
+    await writeArtifact("evidence.png");
+    const output = "Captured the dashboard in a browser but listed no paths.\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).not.toContain("No proof artifacts produced or referenced");
+    expect(result.feedback).toContain("recovered from the task dir");
+  });
+
+  it("still applies .cast validation to fallback-derived artifacts", async () => {
+    await writeArtifact("bad.cast");
+    const output = "Captured the terminal but listed no paths.\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain(".cast");
+  });
+
+  it("still applies .cast validation to a fallback-enumerated uppercase .CAST artifact", async () => {
+    // writeArtifact writes "fake-content", which is not parseable as a cast.
+    // The uppercase extension must not let the fallback enumeration path skip
+    // content validation.
+    await writeArtifact("e.CAST");
+    const output = "Captured the terminal but listed no paths.\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain(".CAST");
+  });
+
+  it("does not rescue a retry with a stale leftover artifact", async () => {
+    await writeArtifact("leftover.png");
+    const output = "Retry produced no new evidence.\n";
+    const proofRunStartMs = Date.now() + 60_000;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir,
+      proofRunStartMs,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+
+  it("recovers an artifact written during the run", async () => {
+    await writeArtifact("fresh.png");
+    const output = "Captured the dashboard but listed no paths.\n";
+    const proofRunStartMs = Date.now() - 60_000;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir,
+      proofRunStartMs,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain("recovered from the task dir");
+  });
+
+  it("fails a fabricated trailing-dot ref beside a valid cast", async () => {
+    const castPath = join(proofDir, "valid.cast");
+    const validCast = [
+      JSON.stringify({ version: 3, command: "curl http://localhost:3000/health" }),
+      JSON.stringify([0.0, "o", "PASS health check\n"]),
+      JSON.stringify([1.0, "x", "0"]),
+    ].join("\n");
+    await writeFile(castPath, validCast, "utf-8");
+    const output = [
+      "## Artifacts",
+      "proof-of-work/bd-99/valid.cast",
+      `${join(proofDir, "missing.png")}.`,
+    ].join("\n");
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("not found on disk");
+  });
+
+  it("does not rescue an empty proof dir", async () => {
+    const output = "Captured the dashboard in a browser but listed no paths.\n";
+    const emptyProofDir = join(tmpDir, "external-proof", "bd-empty");
+
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir: emptyProofDir,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+
+  it("rejects an absolute path outside the proof dir", async () => {
+    const outsidePath = join(tmpDir, "outside.png");
+    await writeFile(outsidePath, "fake-content", "utf-8");
+    const output = `## Artifacts\n${outsidePath}\n`;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+    expect(result.feedback).toContain("outside the proof task dir");
+  });
+
+  it("does not accept non-artifact extensions even when present on disk", async () => {
+    const transcriptPath = await writeArtifact("transcript.txt");
+    const output = `## Artifacts\n${transcriptPath}\n`;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("No proof artifacts produced or referenced");
+  });
+
+  it("applies .cast validation to an uppercase .CAST ref", async () => {
+    // writeArtifact writes "fake-content", which is not parseable as a cast.
+    await writeArtifact("e.CAST");
+    const output = "## Artifacts\nproof-of-work/bd-99/e.CAST\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain(".CAST");
+  });
+
+  it("accepts a valid uppercase .CAST ref", async () => {
+    const validCast = [
+      JSON.stringify({ version: 3, command: "curl http://localhost:3000/health" }),
+      JSON.stringify([0.0, "o", "PASS health check\n"]),
+      JSON.stringify([1.0, "x", "0"]),
+    ].join("\n");
+    await writeFile(join(proofDir, "valid.CAST"), validCast, "utf-8");
+    const output = "## Artifacts\nproof-of-work/bd-99/valid.CAST\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("accepts a referenced dotted filename", async () => {
+    await writeArtifact("shot..png");
+
+    const canonical = await gateProofContent(
+      "## Artifacts\nproof-of-work/bd-99/shot..png\n",
+      MOCK_DETAILS,
+      { proofDir } satisfies GateOptions,
+    );
+    expect(canonical).toHaveProperty("passed", true);
+
+    const absolute = await gateProofContent(
+      `## Artifacts\n${join(proofDir, "shot..png")}\n`,
+      MOCK_DETAILS,
+      { proofDir } satisfies GateOptions,
+    );
+    expect(absolute).toHaveProperty("passed", true);
+  });
+
+  it("still rejects genuine parent-segment traversal", async () => {
+    const output = "## Artifacts\nproof-of-work/bd-99/../../../etc/passwd.png\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Path traversal detected");
+  });
+
+  it("rejects a canonical task-relative parent-segment ref", async () => {
+    const output = "## Artifacts\nproof-of-work/bd-99/../escape.png\n";
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Path traversal detected");
+  });
+
+  it("rejects an absolute parent-segment ref instead of silently dropping it", async () => {
+    // Build the ref textually: path.join would collapse the `..` segment.
+    const output = `## Artifacts\n${proofDir}/../escape.png\n`;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Path traversal detected");
+  });
+
+  it("fails a traversal ref even when fresh artifacts exist", async () => {
+    await writeArtifact("fresh.png");
+    // Build the ref textually: path.join would collapse the `..` segment.
+    const output = ["## Artifacts", `${proofDir}/../escape.png`].join("\n");
+    const proofRunStartMs = Date.now() - 60_000;
+
+    const result = await gateProofContent(output, MOCK_DETAILS, {
+      proofDir,
+      proofRunStartMs,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Path traversal detected");
+    expect(result.feedback).not.toContain("recovered from the task dir");
+  });
+
+  it("ignores a non-artifact prose path with a parent segment", async () => {
+    await writeArtifact("shot.png");
+    const output = [
+      "## Artifacts",
+      "proof-of-work/bd-99/shot.png",
+      "Also fixed a path bug under /usr/local/../lib mention.",
+    ].join("\n");
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("ignores a non-artifact canonical ref with a parent segment", async () => {
+    await writeArtifact("shot.png");
+    const output = [
+      "## Artifacts",
+      "proof-of-work/bd-99/shot.png",
+      "Context: proof-of-work/../notes.md",
+    ].join("\n");
+
+    const result = await gateProofContent(output, MOCK_DETAILS, { proofDir } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("accepts comma-separated absolute refs and checks every one", async () => {
+    await writeArtifact("a.png");
+    await writeArtifact("b.png");
+
+    const listed = await gateProofContent(
+      `## Artifacts\n${join(proofDir, "a.png")},${join(proofDir, "b.png")}\n`,
+      MOCK_DETAILS,
+      { proofDir } satisfies GateOptions,
+    );
+    expect(listed).toHaveProperty("passed", true);
+
+    const fabricated = await gateProofContent(
+      `## Artifacts\n${join(proofDir, "a.png")},${join(proofDir, "missing.png")}\n`,
+      MOCK_DETAILS,
+      { proofDir } satisfies GateOptions,
+    );
+    expect(fabricated).toHaveProperty("passed", false);
+    expect(fabricated.feedback).toContain("not found on disk");
+  });
+});
+
 describe("resolveProofBase", () => {
   it("returns BELAYD_PROOF_DIR when set", () => {
     expect(resolveProofBase({ BELAYD_PROOF_DIR: "/tmp/proofs" })).toBe("/tmp/proofs");

@@ -6,6 +6,7 @@
  */
 
 import type { AgentModelSpec } from "./model-classes.js";
+import { PROOF_ARTIFACT_EXTENSIONS } from "./proof-verification.js";
 import { gateFullValidation, gateProofContent, gateTests, gateUserGuide } from "./quality-gates.js";
 import type { WorktreeOptions } from "./worktree.js";
 
@@ -39,6 +40,12 @@ export interface GateOptions {
   proofDir?: string;
   /** When false, the proof gate passes without artifacts (workflow declares proof optional). */
   proofRequired?: boolean;
+  /**
+   * Epoch ms when the phase run that produced this output started. The proof
+   * gate uses it as a freshness floor for artifacts recovered from the task dir,
+   * so a retry cannot pass on a previous attempt's leftovers.
+   */
+  proofRunStartMs?: number;
 }
 
 /** Deterministic quality gate: takes the agent's output and returns pass/fail. */
@@ -372,6 +379,8 @@ Output format:
 ## Test Strategy
 Brief explanation of what each test covers and why.${SHARED_AGENT_GUIDANCE}`;
 
+const PROOF_ARTIFACT_EXTENSION_LIST = PROOF_ARTIFACT_EXTENSIONS.join("`, `");
+
 const PROOF_GENERATOR_SYSTEM_PROMPT = `You are a proof generator. Capture verifiable evidence that the work was completed — functional proof, not test recordings.
 
 ## Tools
@@ -438,6 +447,19 @@ done
 
 Save all artifacts to the directory specified by the \`BELAYD_PROOF_TASK_DIR\` environment variable. Create a subdirectory named after the task ID. The harness creates a symlink at \`proof-of-work/\` pointing to the external directory, so artifacts referenced as \`proof-of-work/<task-id>/...\` resolve correctly.
 
+## Artifact references (required)
+
+End your output with a \`## Artifacts\` section containing exactly one line per produced artifact, in this exact format:
+
+\`\`\`
+proof-of-work/<task-id>/<file-name>
+\`\`\`
+
+- Use the canonical \`proof-of-work/<task-id>/...\` form, NOT the absolute \`$BELAYD_PROOF_TASK_DIR\` path. Absolute paths are tolerated only when they begin at the start of a line or follow one of: whitespace, backtick, quote, paren, bracket, \`=\`, \`,\`, or \`;\`. The canonical form is what the gate validates and what reviewers read.
+- Only these extensions count as proof artifacts: \`${PROOF_ARTIFACT_EXTENSION_LIST}\`. Extensions are matched case-insensitively but everything else is ignored by the quality gate.
+- \`.txt\`, \`.log\`, \`.json\`, and \`.md\` files are NOT accepted proof artifacts. Record terminal evidence as an asciinema \`.cast\`; capture state snapshots as \`.png\`/\`.jpeg\`.
+- Re-check that every listed ref exists on disk before finishing: a ref that does not resolve fails the gate even if other artifacts exist.
+
 ## Quality requirements for .cast recordings
 
 All asciinema recordings MUST meet these standards:
@@ -455,7 +477,7 @@ where <reason> is one of: \`rename/refactor\`, \`config-only\`, \`doc-only\`, \`
 
 Browser-proof trouble is NOT a skippable reason. A missing or incompatible Playwright browser revision, a failing E2E spec, or an unavailable test runner never justify skipping visual proof for a UI change — use playwright-cli (independent browser) or fix the browser path instead.
 
-When done, output the full filepaths of all produced artifacts so the quality gate can validate them.${SHARED_AGENT_GUIDANCE}`;
+When done, output the \`## Artifacts\` section described above listing every produced artifact in the canonical \`proof-of-work/<task-id>/<file>\` form so the quality gate can validate them.${SHARED_AGENT_GUIDANCE}`;
 
 const DOCUMENTER_SYSTEM_PROMPT = `You are a documenter. Update project documentation to reflect the changes made.
 
