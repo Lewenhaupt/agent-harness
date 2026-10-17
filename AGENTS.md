@@ -142,6 +142,22 @@ than blocking, so it applies to orchestrator and sub-agent sessions alike.
 Commands that legitimately need more than 30 minutes must be restructured
 (background/detached).
 
+### Managed instruction groups (`instruction-groups.ts`)
+
+Some extensions (notably `pi-agent-browser-native`) attach a large prompt
+section and only gate it on tool availability through pi's
+`pi:instruction-groups` event channel — which pi 1.0.2 never emits, so their
+eager fallback writes the section every turn. `src/instruction-groups.ts`
+implements the collector contract; a dedicated `before_agent_start` handler in
+extensions/index.ts emits the channel lazily each turn (until a group
+registers, independent of extension load order) and applies the registered
+groups to `systemPromptOptions.sections`. Sections are keyed by group name (`browser`),
+and a group is included only when at least one of its tools is in the session's
+`selectedTools`; the legacy `agent_browser` key is deleted whenever the
+collector owns any group, so a session whose allowlist excludes every browser
+tool carries no browser prompt section at all (bd-114; runbook:
+`docs/instruction-groups.md`).
+
 ## Checking local services
 
 Two runtimes back the harness. Inspect them when diagnosing session,

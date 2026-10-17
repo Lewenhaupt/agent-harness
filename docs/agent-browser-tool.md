@@ -16,9 +16,12 @@ bundled chromium). The extension is loaded in three places:
   was added to the shared `devShellTools` list, which also feeds
   `pi-web-runtime-env` (the `PATH` for the `pi-web` systemd services).
 
-`agent_browser` was added to the tool allowlists of the `belayd-implementer`,
-`belayd-tester`, and `belayd-proof-generator` agents in
-`src/agent-registry.ts`.
+`agent_browser` is in the tool allowlists of the `belayd-implementer` and
+`belayd-proof-generator` agents in `src/agent-registry.ts`. bd-114 removed it
+from `belayd-tester` (0 browser calls across 55 sessions) and switched the
+prompt section to a managed instruction group so sessions whose allowlist
+excludes every browser tool no longer receive the ~35k-char section at all —
+see [Managed instruction-group gate](#managed-instruction-group-gate).
 
 The flake also exports `packages.${system}.pi-agent-browser-extension`, a
 directory artifact of the whole package, for the pi-web orchestrator symlink.
@@ -103,10 +106,15 @@ devShell (`direnv exec . bash`, or `nix develop -c bash -c '<cmd>'`).
    pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build
    ```
 
-   Expected (observed on the bd-68 verification host): 45 unit test files / 931
-   tests pass, 3 integration files / 42 tests pass, `tsc --noEmit` is clean,
-   `biome check .` reports "Checked 164 files … No fixes applied", and `tsc`
-   emits `dist/`.
+   Expected: `tsc --noEmit` is clean, `biome check .` reports "Checked 117
+   files … No fixes applied", and `tsc` emits `dist/`.
+
+   The suite sizes quoted here were originally observed on the bd-68
+   verification host: 45 unit test files / 931 tests and 3 integration files /
+   42 tests. **Those counts are superseded by bd-114** — the bd-114 verification
+   host observes 63 unit test files / 1361 tests and 5 integration files / 58
+   tests. Do not treat the bd-68 numbers as live; see
+   [instruction-groups.md](instruction-groups.md) for the current counts.
 
 5. **Smoke-test the real `agent_browser` tool in the configured `pi`.** This is
    the end-to-end check: a store-path extension loading into Pi 1.0.2, launching
@@ -138,8 +146,8 @@ devShell (`direnv exec . bash`, or `nix develop -c bash -c '<cmd>'`).
    A cheap no-model fallback that only proves the browser engine works is the
    raw CLI: `nix develop -c agent-browser open "data:text/html,<h1>ok</h1>"`.
 
-6. **Confirm the three agent allowlists include `agent_browser`.** After
-   `pnpm build`:
+6. **Confirm the two agent allowlists include `agent_browser` and the tester
+   does not.** After `pnpm build`:
 
    ```bash
    node -e 'const {DEFAULT_AGENTS}=require("./dist/src/agent-registry.js"); for (const n of ["belayd-implementer","belayd-tester","belayd-proof-generator"]) { const a=DEFAULT_AGENTS.find(x=>x.name===n); console.log(n, "agent_browser="+a.tools.includes("agent_browser")); }'
@@ -149,12 +157,14 @@ devShell (`direnv exec . bash`, or `nix develop -c bash -c '<cmd>'`).
 
    ```text
    belayd-implementer agent_browser=true
-   belayd-tester agent_browser=true
+   belayd-tester agent_browser=false
    belayd-proof-generator agent_browser=true
    ```
 
-   Source inspection equivalent: `src/agent-registry.ts` lines ~536, ~562, and
-   ~578 each end their `tools` array with `"agent_browser"`.
+   Source inspection equivalent: `src/agent-registry.ts` line 560
+   (`belayd-implementer`) and line 604 (`belayd-proof-generator`) each end their
+   `tools` array with `"agent_browser"`; `belayd-tester` (`src/agent-registry.ts`
+   line 588) does not.
 
 7. **Automated regression guard.**
 
@@ -162,12 +172,60 @@ devShell (`direnv exec . bash`, or `nix develop -c bash -c '<cmd>'`).
    pnpm vitest run src/__tests__/flake-agent-browser.test.ts src/__tests__/agent-registry.test.ts
    ```
 
-   Expected: `2 passed (2)` files / `50 passed (50)` tests. The flake test asserts
+   Expected: `2 passed (2)` files / `56 passed (56)` tests. The flake test asserts
    the npm dependency, the `devShellTools` entry, all three wiring points
    (`devShellTools` → `devShells.default` and `pi-web-runtime-env`), the explicit
    store-path `--extension` in the configured binary, the exported
    `pi-agent-browser-extension` artifact, and the `-e
    npm:pi-agent-browser-native@0.9.2` line in `bin/pi`.
+
+## Managed instruction-group gate
+
+Full runbook (verification, configuration, log lines, troubleshooting):
+[Managed instruction groups](instruction-groups.md).
+
+The browser extension ships ~35k chars (~8.7k tokens) of prompt instructions.
+It tries to gate them on tool availability through pi's `pi:instruction-groups`
+event channel, but pi 1.0.2 emits nothing on that channel, so the extension's
+unconditional fallback (`event.systemPromptOptions.sections.agent_browser =
+fullInstructions(ctx)`) always wins — even in sessions whose `--tools`
+allowlist has no browser tool.
+
+The harness closes that gap:
+
+- `src/instruction-groups.ts` implements the collector contract. It emits
+  `pi:instruction-groups` from `before_agent_start` until a group registers,
+  registers a collector, and applies the registered groups to
+  `systemPromptOptions.sections`.
+- A group's instructions are written under the **group name** (`browser`), not
+  the legacy fallback key (`agent_browser`). When the collector owns any group
+  the harness deletes `agent_browser` so a load order that lets the fallback
+  run cannot append a duplicate section. Browser-enabled sessions therefore
+  change their section tag from `<agent_browser>…</agent_browser>` to
+  `<browser>…</browser>` — a one-time prompt-cache invalidation, not a
+  regression.
+- A group is active only when at least one of its tools is in the session's
+  `selectedTools`. A session whose allowlist excludes every browser tool gets
+  no `<browser>` section; a session with `agent_browser` in `--tools` keeps it.
+
+The gate is bypassed (and unmanaged fallback behaviour preserved exactly) when
+`selectedTools` is missing/empty or no extension registered a group.
+
+**Verify the gate:**
+
+```bash
+pnpm vitest run src/__tests__/instruction-groups.test.ts
+```
+
+To prove it against the real agent allowlists, run the pure function with each
+`DEFAULT_AGENTS` entry's `tools`: scout/reviewer produce no `browser` section;
+implementer/proof-generator do. For a live check, spawn the scout sub-agent and
+confirm its session JSONL's `message.sections` contains no `browser` /
+`agent_browser` key, then spawn the implementer and confirm `browser` is
+present. Use `jq` on `.message.sections` rather than grepping the raw JSONL —
+the transcript legitimately contains those tag strings in `project_context` and
+in tool output. The exact `node -e`, `jq`, and session-path commands are in
+[instruction-groups.md](instruction-groups.md#how-to-verify).
 
 ## How to Use
 
@@ -259,6 +317,9 @@ Related: the extension declares Node `>= 24.21.0` while the devShell provides
 
 ## Related documentation
 
+- [Managed instruction groups](instruction-groups.md) — bd-114: how the
+  browser prompt section is gated on the session tool allowlist, and how to
+  verify it.
 - [`agent_browser` in pi-web orchestrator sessions](pi-web-agent-browser.md) —
   the bd-83 verification runbook: pre-rebuild checks, blocked-state proof, and
   post-rebuild live checks.

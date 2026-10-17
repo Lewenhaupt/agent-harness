@@ -111,6 +111,25 @@ export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export * from "./honcho-memory/index.js";
 export type {
+  ApplyInstructionGroupSectionsInput,
+  InstructionGroup,
+  InstructionGroupCollector,
+  ManageInstructionGroupsFailureReason,
+  ManageInstructionGroupsInput,
+  ManageInstructionGroupsResult,
+  RegisterInstructionGroupResult,
+} from "./instruction-groups.js";
+export {
+  applyInstructionGroupSections,
+  createInstructionGroupCollector,
+  INSTRUCTION_GROUPS_CHANNEL,
+  LEGACY_SUPERSEDED_SECTION_KEYS,
+  manageInstructionGroups,
+  manageInstructionGroupsWarning,
+  NO_GROUP_REGISTERED_WARNING,
+  selectActiveGroups,
+} from "./instruction-groups.js";
+export type {
   GatewayModelEntry,
   LlmGatewayApiResponse,
   LlmGatewayModel,

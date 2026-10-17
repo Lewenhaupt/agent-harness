@@ -482,6 +482,8 @@ describe("belayd-direnv-setup (unit)", () => {
   // Regression net for the whole direnv.toml parser class: every shape either
   // merges (preserving prior content) or is left byte-identical with a warning,
   // and every modified result must be accepted by the real direnv binary.
+  // The matrix spawns the real direnv binary many times; under parallel test
+  // load it can exceed the 5s default, so give it explicit headroom.
   it("sweeps a matrix of direnv.toml shapes and validates each with real direnv", () => {
     const repo = join(harness.root, "whitelisted-repo");
     mkdirSync(repo, { recursive: true });

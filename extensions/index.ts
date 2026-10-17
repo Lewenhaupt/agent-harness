@@ -69,6 +69,7 @@ import {
   buildVerifierPrompt,
   checkToolAllowed,
   collectChangeContext,
+  createInstructionGroupCollector,
   currentBranch,
   DEFAULT_AGENTS,
   DEFAULT_BASE_BRANCH,
@@ -83,6 +84,7 @@ import {
   getNextPhase,
   getPhasesForType,
   getPhaseToolName,
+  INSTRUCTION_GROUPS_CHANNEL,
   ignoredArchifyParams,
   isArchifyDiagramType,
   isArchifyQuality,
@@ -95,7 +97,10 @@ import {
   listArchifyExamples,
   listPendingUserCompletions,
   listRuns,
+  manageInstructionGroups,
+  manageInstructionGroupsWarning,
   markPhaseCompleted,
+  NO_GROUP_REGISTERED_WARNING,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_MODE_TOOLS,
   PROOF_VERIFIER_AGENT,
@@ -2585,6 +2590,42 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // a pending user completion is still recovered on the next turn.
     if (state.gateActive) reconcileUserCompletions({ state, cwd: ctx.cwd });
     return planningContextMessage(state) ?? gateContextMessage(state);
+  });
+
+  // Managed instruction groups. Agent extensions (e.g. pi-agent-browser) ship
+  // a large prompt section and register an eager fallback that writes it every
+  // turn regardless of whether their tools are callable. Nothing in pi 1.0.2
+  // emits `pi:instruction-groups`, so the harness emits it itself and owns the
+  // gate. A dedicated handler (separate from the process-gate handler above)
+  // keeps the gate's early returns from skipping it. The body lives in
+  // `src/instruction-groups.ts` so the wiring is unit-testable without pi.
+  const instructionCollector = createInstructionGroupCollector();
+  // A pi with no instruction-group extension at all legitimately leaves the
+  // collector empty forever, so the same "no group registered" line would
+  // repeat every turn. Warn once per session; every other message can signal a
+  // state change and keeps logging every turn.
+  let noGroupWarningEmitted = false;
+  const warnInstructionGroups = (message: string): void => {
+    if (message === NO_GROUP_REGISTERED_WARNING) {
+      if (noGroupWarningEmitted) return;
+      noGroupWarningEmitted = true;
+    }
+    console.warn(`[belayd-harness] ${message}`);
+  };
+  pi.on("before_agent_start", async (event, ctx) => {
+    try {
+      const result = manageInstructionGroups({
+        collector: instructionCollector,
+        emitInstructionGroups: (collector) => pi.events.emit(INSTRUCTION_GROUPS_CHANNEL, collector),
+        systemPromptOptions: event.systemPromptOptions,
+        ctx,
+        warn: warnInstructionGroups,
+      });
+      const warning = manageInstructionGroupsWarning(result);
+      if (warning !== undefined) console.warn(`[belayd-harness] ${warning}`);
+    } catch (error) {
+      console.warn(`[belayd-harness] instruction-group prompt gate failed: ${String(error)}`);
+    }
   });
 
   // ── Map agent tool names to phase names ────────────────────────────
