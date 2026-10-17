@@ -19,9 +19,12 @@
  */
 
 import type { SpawnDetails, SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js";
+import type { CapacityCache, CapacityWindow } from "./capacity-cache.js";
+import { orderCandidatesByCapacity } from "./capacity-cache.js";
 import type { ModelClass } from "./model-classes.js";
 import { candidatesForModel, providerOf } from "./model-classes.js";
 import { createModelCooldownStore, type ModelCooldownStore } from "./model-cooldown.js";
+import type { ModelTelemetryStore } from "./model-telemetry.js";
 import type { FailureClassification } from "./quota-failure.js";
 import { classifySpawnFailure } from "./quota-failure.js";
 import { spawnAgentProcess } from "./spawn.js";
@@ -33,6 +36,14 @@ export interface SpawnAttempt {
   skippedCooldown?: boolean;
   /** Provider skipped because an earlier candidate on it hit a quota failure. */
   skippedProvider?: string;
+  /** Provider skipped because the pre-dispatch capacity signal marks it exhausted. */
+  skippedCapacity?: string;
+  /** True when the attempt ran at fallback index > 0. */
+  fallback?: boolean;
+  /** Tool calls this attempt executed (0 marks a no-op candidate). */
+  toolCalls?: number;
+  /** Cost in USD attributed to this attempt. */
+  cost?: number;
 }
 
 export interface SpawnWithFallbackResult {
@@ -53,6 +64,15 @@ export interface SpawnWithFallbackOptions extends SpawnOptions {
   enabled?: boolean;
   /** Cap on the number of candidates to attempt (default: all candidates). */
   maxAttempts?: number;
+  /** Phase name for telemetry grouping (e.g. "plan", "implement"). */
+  phase?: string;
+  /** Shared telemetry store; records attempt/fallback/429/no-op counts as it runs. */
+  telemetry?: ModelTelemetryStore;
+  /**
+   * Pre-dispatch capacity cache. When provided, candidates whose provider is
+   * known-exhausted are moved behind the healthy ones before the first attempt.
+   */
+  capacity?: CapacityCache;
 }
 
 function zeroUsage(): SpawnUsage {
@@ -94,6 +114,36 @@ function exhaustedResult(models: string[]): SpawnResult {
   };
 }
 
+/** Per-candidate skip row for a provider the pre-dispatch capacity signal blocks. */
+function capacitySkipAttempt(candidate: string): SpawnAttempt {
+  const provider = providerOf(candidate);
+  return {
+    model: candidate,
+    classification: skippedCapacityClassification(provider),
+    skippedCapacity: provider,
+  };
+}
+
+/** Fast-fail result for the all-providers-exhausted capacity case. */
+function capacityExhaustedResult(
+  models: string[],
+  windows: readonly CapacityWindow[],
+): SpawnResult {
+  const providers = [...new Set(windows.map((window) => window.provider))];
+  const providerText = providers.length > 0 ? ` (${providers.join(", ")})` : "";
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text:
+          `All candidate models are on capacity-exhausted providers${providerText}; ` +
+          `retry after reset. Candidates: ${models.join(", ")}.`,
+      },
+    ],
+    details: { messages: [], usage: zeroUsage(), exitCode: 1 },
+  };
+}
+
 function skippedClassification(model: string): FailureClassification {
   return { kind: "other", reason: `Model ${model} is cooling down after a quota failure.` };
 }
@@ -105,15 +155,27 @@ function skippedProviderClassification(provider: string): FailureClassification 
   };
 }
 
-/** A fresh session id per attempt, unless resume mode shares the base session. */
+function skippedCapacityClassification(provider: string): FailureClassification {
+  return {
+    kind: "other",
+    reason: `Provider ${provider} is inside its capacity reset window; skipping remaining models on it.`,
+  };
+}
+
+/**
+ * A fresh session id per *spawned* attempt, unless resume mode shares the base
+ * session. `attemptOrdinal` is the spawned-attempt count, not the candidate
+ * loop index: a skipped (cooling) candidate must not burn a `-fallback-N`
+ * ordinal, or the headline fallback metric counts phantom sessions.
+ */
 function sessionNameFor(
   base: string | undefined,
-  index: number,
+  attemptOrdinal: number,
   resumeSession: boolean,
 ): string | undefined {
   if (resumeSession) return base;
-  if (index === 0 || base === undefined) return base;
-  return `${base}-fallback-${index}`;
+  if (attemptOrdinal === 0 || base === undefined) return base;
+  return `${base}-fallback-${attemptOrdinal}`;
 }
 
 type CandidateOutcome =
@@ -123,14 +185,14 @@ type CandidateOutcome =
 /** Spawn one candidate and decide whether the loop should stop or retry. */
 async function runCandidate(
   candidate: string,
-  index: number,
+  attemptOrdinal: number,
   spawnOptions: SpawnOptions,
   classifyFn: (details: SpawnDetails) => FailureClassification,
   suppressResumeWarning: boolean,
 ): Promise<CandidateOutcome> {
   const sessionName = sessionNameFor(
     spawnOptions.sessionName,
-    index,
+    attemptOrdinal,
     spawnOptions.resumeSession === true,
   );
   const result = await spawnAgentProcess({
@@ -150,6 +212,37 @@ interface LoopDeps {
   classifyFn: (details: SpawnDetails) => FailureClassification;
   store: ModelCooldownStore;
   signal?: AbortSignal;
+  phase: string;
+  telemetry?: ModelTelemetryStore;
+  capacity?: CapacityCache;
+}
+
+/** Record one spawned attempt's outcome in the telemetry store. */
+function recordAttemptTelemetry(
+  deps: LoopDeps,
+  candidate: string,
+  fallback: boolean,
+  outcome: CandidateOutcome,
+): void {
+  if (deps.telemetry === undefined) return;
+  deps.telemetry.record({
+    phase: deps.phase,
+    model: candidate,
+    fallback,
+    classification: outcome.classification.kind,
+    cost: outcome.result.details.usage.cost,
+    toolCalls: outcome.result.details.usage.toolCalls,
+  });
+}
+
+/**
+ * True when a candidate's provider is known-exhausted from the cached capacity
+ * signal. The cooldown store is deliberately not consulted here: its reactive
+ * skips keep their original slot in `attempts` (skippedCooldown/skippedProvider),
+ * while the capacity cache is what pre-empts the *first* attempt.
+ */
+function isCapacityExhausted(candidate: string, capacity: CapacityCache | undefined): boolean {
+  return capacity?.isModelExhausted(candidate) ?? false;
 }
 
 /** A candidate to record in `attempts` without spawning, or undefined to spawn it. */
@@ -190,6 +283,30 @@ function recordCooldown(
   }
 }
 
+/**
+ * Feed an observed quota window back into the pre-dispatch capacity cache so a
+ * mid-workflow 429 is reflected immediately instead of waiting out the TTL.
+ * Provider-scoped only: a transient failure is endpoint-specific and must not
+ * reorder the provider's other models.
+ */
+function recordCapacityFromFailure(
+  capacity: CapacityCache | undefined,
+  provider: string,
+  classification: FailureClassification,
+): void {
+  if (capacity === undefined) return;
+  if (classification.kind !== "quota" || provider === "") return;
+  const seconds = classification.cooldownSeconds;
+  if (seconds === undefined) return;
+  // Use the cache's own clock so a test/alternate clock stays consistent with
+  // the windows the cache reads back.
+  capacity.record({
+    provider,
+    resetAt: capacity.nowMs() + seconds * 1000,
+    reason: classification.reason ?? classification.kind,
+  });
+}
+
 /** Try candidates in order, cooling down quota/transient failures as it goes. */
 async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult> {
   const attempts: SpawnAttempt[] = [];
@@ -198,9 +315,14 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
   // The resume-unavailable warning is per-spawn, not per-candidate: a missing
   // base session would otherwise warn once for every fallback candidate. Only
   // the first candidate that actually spawns emits it.
-  let hasSpawned = false;
+  //
+  // `spawnedAttempts` (not the candidate index) also defines the telemetry
+  // `fallback` flag and the `-fallback-N` session ordinal: a skipped/cooling
+  // candidate consumes an index but never spawns, so index > 0 would report a
+  // 100% fallback rate with zero fallbacks and mint a phantom session.
+  let spawnedAttempts = 0;
 
-  for (const [index, candidate] of deps.candidates.entries()) {
+  for (const candidate of deps.candidates) {
     if (deps.signal?.aborted) break;
 
     deps.store.prune();
@@ -211,15 +333,23 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
     }
 
     const provider = providerOf(candidate);
+    const fallback = spawnedAttempts > 0;
     const outcome = await runCandidate(
       candidate,
-      index,
+      spawnedAttempts,
       deps.spawnOptions,
       deps.classifyFn,
-      hasSpawned,
+      fallback,
     );
-    hasSpawned = true;
-    attempts.push({ model: candidate, classification: outcome.classification });
+    spawnedAttempts += 1;
+    attempts.push({
+      model: candidate,
+      classification: outcome.classification,
+      fallback,
+      toolCalls: outcome.result.details.usage.toolCalls,
+      cost: outcome.result.details.usage.cost,
+    });
+    recordAttemptTelemetry(deps, candidate, fallback, outcome);
     lastResult = outcome.result;
     totalUsage = sumUsage(totalUsage, outcome.result.details.usage);
 
@@ -237,6 +367,7 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
     }
 
     recordCooldown(deps.store, candidate, provider, outcome.classification);
+    recordCapacityFromFailure(deps.capacity, provider, outcome.classification);
   }
 
   return {
@@ -252,8 +383,18 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
 export async function spawnAgentWithFallback(
   options: SpawnWithFallbackOptions,
 ): Promise<SpawnWithFallbackResult> {
-  const { candidates, modelClass, cooldownStore, classify, enabled, maxAttempts, ...spawnOptions } =
-    options;
+  const {
+    candidates,
+    modelClass,
+    cooldownStore,
+    classify,
+    enabled,
+    maxAttempts,
+    phase,
+    telemetry,
+    capacity,
+    ...spawnOptions
+  } = options;
   const classifyFn = classify ?? classifySpawnFailure;
   const store = cooldownStore ?? createModelCooldownStore();
   const resolved = candidates ?? candidatesForModel(options.model, modelClass);
@@ -273,11 +414,40 @@ export async function spawnAgentWithFallback(
     };
   }
 
+  // Pre-flight capacity check: refresh the cached signal once per TTL, then
+  // move candidates on known-exhausted providers behind the healthy ones.
+  if (capacity !== undefined) await capacity.refreshIfStale();
+  const orderedCandidates = orderCandidatesByCapacity(modelCandidates, (candidate) =>
+    isCapacityExhausted(candidate, capacity),
+  );
+
+  // All-exhausted fast-fail, mirroring the reactive cooldown path: spawning
+  // against a provider known to be inside its reset window only burns an
+  // attempt and a `-fallback-N` session, violating the bd-116 acceptance rule.
+  if (
+    capacity !== undefined &&
+    orderedCandidates.length > 0 &&
+    orderedCandidates.every((candidate) => isCapacityExhausted(candidate, capacity))
+  ) {
+    // List only the candidates' own providers, not every cached window.
+    const candidateProviders = new Set(orderedCandidates.map(providerOf));
+    const relevantWindows = capacity
+      .windows()
+      .filter((window) => candidateProviders.has(window.provider));
+    return {
+      result: capacityExhaustedResult(orderedCandidates, relevantWindows),
+      attempts: orderedCandidates.map(capacitySkipAttempt),
+    };
+  }
+
   return runCandidateLoop({
-    candidates: modelCandidates,
+    candidates: orderedCandidates,
     spawnOptions,
     classifyFn,
     store,
     signal: options.signal,
+    phase: phase ?? "unknown",
+    telemetry,
+    capacity,
   });
 }

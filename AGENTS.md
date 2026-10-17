@@ -24,6 +24,7 @@ belayd-agent-harness/
 │   ├── archify.ts          # Archify diagram wrapper (args, receipts, formatting, run)
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
 │   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
+│   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)
 │   ├── plannotator/
 │   │   ├── signal-protocol.ts  # Signal file contract (SYNC WARNING: duplicated in pi-web-plugins)
@@ -202,7 +203,7 @@ keywords and plain labels are ignored and default to `feature`.
 ### Functional programming
 
 - **Pure functions preferred.** Business logic should be pure functions. Side effects (shelling out to git, spawning processes, filesystem I/O) are confined to well-documented functions.
-- **No global mutable state.** Pass state through function arguments. The only module-level state is in `stale-file-guard.ts` (file hash map) and `spawn.ts` (cached pi binary path), both reset on extension lifecycle.
+- **No global mutable state.** Pass state through function arguments. The only module-level state is in `stale-file-guard.ts` (file hash map), `spawn.ts` (cached pi binary path), and `model-session-state.ts` (session-scoped capacity cache, per-workflow telemetry store, and per-cwd flush cursors), all reset on extension lifecycle.
 - **No class mutation patterns.** Prefer standalone functions and plain objects.
 - **Immutable data.** Use `const`, spread operators, `structuredClone`.
 - **Discriminated unions for multi-outcome functions.** Use `{ allowed: boolean; reason?: string }` rather than boolean returns with optional error strings.

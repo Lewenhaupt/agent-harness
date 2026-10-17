@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SpawnResult, SpawnUsage } from "../agent-registry.js";
+import { createCapacityCache } from "../capacity-cache.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
+import { createModelTelemetryStore } from "../model-telemetry.js";
 import type { classifySpawnFailure, FailureClassification } from "../quota-failure.js";
 import { spawnAgentWithFallback } from "../spawn-with-fallback.js";
 
@@ -423,6 +425,29 @@ describe("spawnAgentWithFallback", () => {
     );
   });
 
+  it("does not burn a -fallback-N session for a skipped candidate", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 2 }));
+    const store = createModelCooldownStore(() => 0);
+    store.markCooldown("a", 900, "quota");
+
+    await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["a", "b"],
+      sessionName: "belayd-x",
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    // The only spawn is the first *spawned* attempt, so it keeps the base name.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(mockSpawnAgentProcess).toHaveBeenCalledWith(
+      expect.objectContaining({ model: "b", sessionName: "belayd-x" }),
+    );
+  });
+
   it("shares the base session id across candidates in resume mode", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("a"))
@@ -515,5 +540,211 @@ describe("spawnAgentWithFallback", () => {
 
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
     expect(attempts).toHaveLength(1);
+  });
+
+  it("orders candidates away from a capacity-exhausted provider before the first attempt", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+
+    const capacity = createCapacityCache({ now: () => 0 });
+    capacity.record({ provider: "opencode-go", resetAt: 9_999_999, reason: "weekly limit" });
+
+    const { attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: createModelCooldownStore(() => 0),
+      capacity,
+      classify: seqClassifier("success"),
+    });
+
+    // The first (and only) spawn must leave the known-exhausted provider alone.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(mockSpawnAgentProcess.mock.calls[0]?.[0]).toHaveProperty(
+      "model",
+      "llmgateway/mimo-v2.5",
+    );
+    expect(attempts[0]).toHaveProperty("model", "llmgateway/mimo-v2.5");
+  });
+
+  it("records per-(phase, model) telemetry including zero-tool-call no-ops", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("a", 0, { toolCalls: 0, cost: 0.01 }))
+      .mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 0, cost: 0.02 }));
+
+    const telemetry = createModelTelemetryStore();
+    await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["a", "b"],
+      phase: "implement",
+      telemetry,
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(telemetry.stats()).toEqual([
+      {
+        phase: "implement",
+        model: "a",
+        attempts: 1,
+        fallbacks: 0,
+        quotaFailures: 1,
+        noOps: 0,
+        cost: 0.01,
+      },
+      {
+        phase: "implement",
+        model: "b",
+        attempts: 1,
+        fallbacks: 1,
+        quotaFailures: 0,
+        noOps: 1,
+        cost: 0.02,
+      },
+    ]);
+  });
+
+  it("fast-fails without spawning when every candidate's provider is capacity-exhausted", async () => {
+    const capacity = createCapacityCache({ now: () => 0 });
+    capacity.record({ provider: "opencode-go", resetAt: 9_999_999, reason: "weekly limit" });
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["opencode-go/a", "opencode-go/b"],
+      capacity,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    // Skip rows mirror the all-cooldown path, one per blocked candidate.
+    expect(attempts.map((a) => a.model)).toEqual(["opencode-go/a", "opencode-go/b"]);
+    expect(attempts.every((a) => a.skippedCapacity === "opencode-go")).toBe(true);
+    expect(result.content[0]?.text).toContain("capacity-exhausted");
+  });
+
+  it("keys the telemetry fallback flag off the spawned-attempt ordinal, not the candidate index", async () => {
+    // The first candidate is skipped (cooling), so the first actual spawn is at
+    // index 1. It must still be attempt 1 with zero fallbacks.
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 2 }));
+
+    const store = createModelCooldownStore(() => 0);
+    store.markCooldown("a", 900, "quota");
+    const telemetry = createModelTelemetryStore();
+
+    await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["a", "b"],
+      cooldownStore: store,
+      telemetry,
+      phase: "plan",
+      classify: seqClassifier("success"),
+    });
+
+    expect(telemetry.stats()).toEqual([
+      {
+        phase: "plan",
+        model: "b",
+        attempts: 1,
+        fallbacks: 0,
+        quotaFailures: 0,
+        noOps: 0,
+        cost: 0,
+      },
+    ]);
+  });
+
+  it("still spawns when the pre-dispatch capacity probe rejects", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(
+      makeResult("opencode-go/mimo-v2.5", 0, { toolCalls: 1 }),
+    );
+    const capacity = createCapacityCache({
+      probe: () => {
+        throw new Error("capacity endpoint down");
+      },
+    });
+
+    const { result } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      capacity,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.5");
+  });
+
+  it("re-probes the capacity signal once the TTL expires between spawns", async () => {
+    let nowMs = 0;
+    const probe = vi.fn(() => ({ windows: [] }));
+    const capacity = createCapacityCache({ probe, now: () => nowMs, ttlInMs: 1_000 });
+    mockSpawnAgentProcess.mockResolvedValue(
+      makeResult("opencode-go/mimo-v2.5", 0, { toolCalls: 1 }),
+    );
+
+    const options = {
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      capacity,
+      classify: seqClassifier("success"),
+    };
+    await spawnAgentWithFallback(options);
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    nowMs = 1_000;
+    await spawnAgentWithFallback(options);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("records an observed quota failure back into the capacity cache", async () => {
+    const capacity = createCapacityCache({ now: () => 0 });
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("opencode-go/a", 0, { toolCalls: 0 }))
+      .mockResolvedValueOnce(makeResult("llmgateway/a", 0, { toolCalls: 1 }));
+
+    await spawnAgentWithFallback({
+      model: "unknown/x",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["opencode-go/a", "llmgateway/a"],
+      cooldownStore: createModelCooldownStore(() => 0),
+      capacity,
+      classify: seqClassifier("quota", "success"),
+    });
+
+    expect(capacity.isModelExhausted("opencode-go/anything")).toBe(true);
+    expect(capacity.isModelExhausted("llmgateway/anything")).toBe(false);
+    // Stamped with the cache's own clock (now: 0), not Date.now().
+    expect(capacity.windows(0)).toEqual([
+      { provider: "opencode-go", resetAt: 900_000, reason: "quota" },
+    ]);
+  });
+
+  it("returns an empty exhausted result for maxAttempts: 0 without spawning", async () => {
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      maxAttempts: 0,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts).toEqual([]);
+    expect(result.details.exitCode).toBe(1);
   });
 });

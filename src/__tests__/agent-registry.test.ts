@@ -259,8 +259,8 @@ describe("PROOF_VERIFIER_AGENT", () => {
     expect(DEFAULT_AGENTS.some((a) => a.name === "belayd-proof-verifier")).toBe(false);
   });
 
-  it("declares the standard class and read-only tools", () => {
-    expect(PROOF_VERIFIER_AGENT.modelClass).toBe("standard");
+  it("declares the fast class and read-only tools", () => {
+    expect(PROOF_VERIFIER_AGENT.modelClass).toBe("fast");
     expect(PROOF_VERIFIER_AGENT.tools).toContain("read");
     expect(PROOF_VERIFIER_AGENT.tools).toContain("describe_image");
     expect(PROOF_VERIFIER_AGENT.tools).not.toContain("edit");

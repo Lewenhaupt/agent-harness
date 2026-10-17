@@ -11,6 +11,7 @@ import * as nodeFs from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
+import { ModelTelemetryTotalsSchema } from "./model-telemetry.js";
 import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
 export enum RunStatus {
@@ -21,6 +22,16 @@ export enum RunStatus {
 }
 
 const SCHEMA_VERSION = 1;
+
+/**
+ * Rolled-up model telemetry attached to a run. The per-(phase, model)
+ * breakdown lives in `.belayd/telemetry.json`; the manifest carries the totals
+ * so a single run file answers "how much fallback did this phase cost?".
+ *
+ * The schema is shared with `model-telemetry.ts` so a field added there cannot
+ * silently fail this re-read validation.
+ */
+export type RunTelemetryTotals = z.infer<typeof ModelTelemetryTotalsSchema>;
 
 const RunManifestSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
@@ -41,6 +52,8 @@ const RunManifestSchema = z.object({
   completedBy: z.literal("user").optional(),
   /** Orchestrator delivery-once marker; set after the report is delivered. */
   deliveredAt: z.number().finite().optional(),
+  /** Model telemetry for this run (delta since the run started). */
+  telemetry: ModelTelemetryTotalsSchema.optional(),
 });
 
 export type RunManifest = z.infer<typeof RunManifestSchema>;
@@ -101,6 +114,13 @@ export interface ScanForInterruptedRunsOptions {
   cwd: string;
   fs?: RunManifestFs;
   now?: () => number;
+}
+
+export interface SetRunTelemetryOptions {
+  cwd: string;
+  runId: string;
+  telemetry: RunTelemetryTotals;
+  fs?: RunManifestFs;
 }
 
 const nodeFsSeam: RunManifestFs = {
@@ -235,6 +255,22 @@ export function completeRunByUser(
     failureReason: undefined,
   };
   return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
+}
+
+/** Attach the current model-telemetry totals to a run manifest. */
+export function setRunTelemetry(
+  options: SetRunTelemetryOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
+  if (existing === undefined) {
+    return { ok: false, error: `No run manifest found for ${options.runId}` };
+  }
+  return writeRunManifest({
+    cwd: options.cwd,
+    manifest: { ...existing, telemetry: options.telemetry },
+    fs,
+  });
 }
 
 /** Record that a user-completed run's report has been delivered exactly once. */
