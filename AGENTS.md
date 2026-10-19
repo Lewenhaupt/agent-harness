@@ -28,6 +28,7 @@ belayd-agent-harness/
 │   ├── outline-extract.ts  # ctags+ast-grep orchestration (merge, line counts)
 │   ├── outline-binary.ts   # BELAYD_CTAGS_BIN / BELAYD_AST_GREP_BIN resolution
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
+│   ├── owned-worktree.ts   # Bead ↔ branch ↔ worktree preflight (bd-119; docs/owned-worktree.md)
 │   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
 │   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)
@@ -146,6 +147,13 @@ it). It mutates `event.input.timeout` in place for the `bash`/`Bash` tool rather
 than blocking, so it applies to orchestrator and sub-agent sessions alike.
 Commands that legitimately need more than 30 minutes must be restructured
 (background/detached).
+
+### Worktree ownership preflight (`owned-worktree.ts`)
+
+Phase tools, `belayd_proof_verifier`, and `belayd_commit` refuse to run when the
+directory's `.belayd/workflow.json` task or checked-out branch is not the
+session's own; no `process.cwd()` fallback remains on the phase, commit, proof,
+or planning paths (bd-119). Runbook: `docs/owned-worktree.md`.
 
 ### Managed instruction groups (`instruction-groups.ts`)
 

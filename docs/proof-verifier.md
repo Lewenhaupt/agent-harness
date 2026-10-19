@@ -153,17 +153,21 @@ re-running the proof phase and never blocks commit.
 
 ### Tool parameters
 
-`belayd_proof_verifier` accepts three **optional** string parameters
+`belayd_proof_verifier` accepts two **optional** string parameters
 (`extensions/index.ts`):
 
 | Param   | Purpose                                                        |
 |---------|----------------------------------------------------------------|
 | `task`  | Override the task text (defaults to the active task ID)        |
 | `proof` | Override the captured proof output (defaults to the last proof phase output) |
-| `cwd`   | Working directory (defaults to the session cwd)               |
+
+The verifier always reads the session's own worktree (`ctx.cwd`); the `cwd`
+parameter was removed in bd-119. The same ownership preflight as the phase tools
+applies, so a session pointed at another bead's worktree is refused with an
+actionable error before any prompt is assembled (see `docs/owned-worktree.md`).
 
 ```text
-belayd_proof_verifier with task "bd-48", proof "proof-of-work/bd-48/demo.cast", cwd "/repo"
+belayd_proof_verifier with task "bd-48", proof "proof-of-work/bd-48/demo.cast"
 ```
 
 ### What the judge sees

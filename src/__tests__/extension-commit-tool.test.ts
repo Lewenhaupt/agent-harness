@@ -7,7 +7,7 @@
  * explicit argv array, and the message reaches git through a `-F` temp file.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -257,11 +257,14 @@ function createMockPi(): {
   return { api, tools, messages };
 }
 
-function createMockCtx(cwd: string): {
+function createMockCtx(
+  cwd: string,
+  sessionId: string = "commit-test-session",
+): {
   sessionManager: { getSessionId: () => string };
   cwd: string;
 } {
-  return { sessionManager: { getSessionId: () => "commit-test-session" }, cwd };
+  return { sessionManager: { getSessionId: () => sessionId }, cwd };
 }
 
 async function loadTools(): Promise<{
@@ -306,10 +309,13 @@ describe("belayd_commit shell safety (bd-70)", () => {
     rmSync(cwd, { recursive: true, force: true });
   });
 
-  async function commit(params: Record<string, unknown>): Promise<CommitResult> {
+  async function commit(
+    params: Record<string, unknown>,
+    sessionId?: string,
+  ): Promise<CommitResult> {
     const tool = tools.get("belayd_commit");
     if (tool === undefined) throw new Error("belayd_commit was not registered");
-    return tool.execute("call-commit", params, undefined, undefined, createMockCtx(cwd));
+    return tool.execute("call-commit", params, undefined, undefined, createMockCtx(cwd, sessionId));
   }
 
   it("writes a hostile body verbatim to the -F temp file", async () => {
@@ -603,6 +609,120 @@ describe("belayd_commit shell safety (bd-70)", () => {
     mockExec.mockClear();
     await commit({ message: "feat: no exec", taskId: "bd-42" });
     expect(mockExec).not.toHaveBeenCalled();
+  });
+
+  it("refuses to stage a tree whose branch is not the workflow branch", async () => {
+    const startTask = tools.get("belayd_start_task");
+    await startTask?.execute(
+      "start",
+      { taskId: "bd-42", workflowType: "feature" },
+      undefined,
+      undefined,
+      createMockCtx(cwd),
+    );
+
+    // Pin the workflow to a branch, then make the tree report a different one.
+    const statePath = join(cwd, ".belayd", "workflow.json");
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { branch: string };
+    writeFileSync(statePath, JSON.stringify({ ...persisted, branch: "feat/owned" }));
+    mockSync.setResponder((file, args) => {
+      if (file === "git" && args[0] === "branch") return "feat/other\n";
+      if (file === "git" && args[0] === "config") throw new Error("no such key");
+      if (file === "git" && args[0] === "rev-parse") return "sha\n";
+      return "";
+    });
+
+    const result = await commit({ message: "feat: wrong tree" });
+
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("feat/owned");
+    expect(result.content[0]?.text).toContain("feat/other");
+    expect(callsFor("git").some((call) => call.args[0] === "add")).toBe(false);
+    expect(callsFor("git").some((call) => call.args[0] === "commit")).toBe(false);
+  });
+
+  it("allows a sub-bead taskId from the parent session", async () => {
+    const startTask = tools.get("belayd_start_task");
+    await startTask?.execute(
+      "start",
+      { taskId: "bd-42", workflowType: "feature" },
+      undefined,
+      undefined,
+      createMockCtx(cwd),
+    );
+
+    const result = await commit({ message: "feat: sub-bead", taskId: "bd-42.1" });
+
+    expect(result.details.exitCode).toBe(0);
+    expect(callsFor("git").some((call) => call.args[0] === "add")).toBe(true);
+    expect(callsFor("git").some((call) => call.args[0] === "commit")).toBe(true);
+  });
+
+  it("refuses to commit another task's id from a pinned session", async () => {
+    const startTask = tools.get("belayd_start_task");
+    await startTask?.execute(
+      "start",
+      { taskId: "bd-42", workflowType: "feature" },
+      undefined,
+      undefined,
+      createMockCtx(cwd),
+    );
+
+    // The cwd itself owns bd-99, but this session is pinned to bd-42.
+    const statePath = join(cwd, ".belayd", "workflow.json");
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { branch: string };
+    writeFileSync(
+      statePath,
+      JSON.stringify({ ...persisted, taskId: "bd-99", branch: "feat/owned" }),
+    );
+    mockSync.setResponder((file, args) => {
+      if (file === "git" && args[0] === "branch") return "feat/owned\n";
+      if (file === "git" && args[0] === "config") throw new Error("no such key");
+      if (file === "git" && args[0] === "rev-parse") return "sha\n";
+      return "";
+    });
+
+    const result = await commit({ message: "feat: borrow another tree", taskId: "bd-99" });
+
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("this session owns bd-42");
+    expect(result.content[0]?.text).toContain("refusing to commit bd-99");
+    expect(callsFor("git").some((call) => call.args[0] === "add")).toBe(false);
+  });
+
+  it("refuses a stale workflow branch even when no task id is supplied", async () => {
+    const stopTask = tools.get("belayd_stop_task");
+    await stopTask?.execute("stop", {}, undefined, undefined, createMockCtx(cwd));
+
+    const statePath = join(cwd, ".belayd", "workflow.json");
+    mkdirSync(join(cwd, ".belayd"), { recursive: true });
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        schemaVersion: 1,
+        taskId: "bd-99",
+        workflowType: "feature",
+        branch: "feat/owned",
+        originalCwd: cwd,
+        phaseOrder: ["plan", "implement", "review", "test", "commit"],
+        completedPhaseNames: [],
+        startedAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    mockSync.setResponder((file, args) => {
+      if (file === "git" && args[0] === "branch") return "feat/other\n";
+      if (file === "git" && args[0] === "config") throw new Error("no such key");
+      if (file === "git" && args[0] === "rev-parse") return "sha\n";
+      return "";
+    });
+
+    const result = await commit({ message: "feat: stale workflow" }, "commit-no-task-session");
+
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("feat/owned");
+    expect(result.content[0]?.text).toContain("feat/other");
+    expect(callsFor("git").some((call) => call.args[0] === "add")).toBe(false);
   });
 
   it("does not inspect a non-stacked branch", async () => {
