@@ -148,12 +148,23 @@ const mockExecFile = vi.hoisted(() => {
   };
 });
 
+// The ownership preflight shells out to `git branch --show-current`. These
+// resume tests use temp directories outside git with a seeded workflow.json, so
+// report the branch that fixture records.
+const mockExecFileSync = vi.hoisted(() =>
+  vi.fn((file: string, args: readonly string[]) => {
+    if (file === "git" && args[0] === "branch") return "feat/bd-42\n";
+    return "";
+  }),
+);
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return {
     ...actual,
     exec: mockExec,
     execFile: mockExecFile.fn,
+    execFileSync: mockExecFileSync,
   };
 });
 
@@ -2406,6 +2417,7 @@ describe("session_start resume from disk (bd-40)", () => {
     await runPhase("implement", "first pass");
     const first = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(first.resumeSession).toBe(false);
+    expect(first.task).toContain("Your worktree is");
     const base = first.sessionName as string;
 
     await runPhase("implement", "fix the findings");
@@ -2413,8 +2425,11 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(second.sessionName).toBe(base);
     expect(second.resumeSession).toBe(true);
     // A cross-run resume must not re-prepend the bead plan; the orchestrator
-    // supplies the review findings in the task instead.
-    expect(second.task).toBe("fix the findings");
+    // supplies the review findings in the task instead. The worktree preamble
+    // is still pinned to every spawn.
+    expect(second.task).toContain("fix the findings");
+    expect(second.task).not.toContain("## Bead plan");
+    expect(second.task).toContain("Your worktree is");
 
     await runPhase("implement", "third pass");
     const third = mockSpawnAgentProcess.mock.calls[2]?.[0] as Record<string, unknown>;
@@ -2555,16 +2570,16 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(persisted?.invocations).toBeGreaterThan(3);
   });
 
-  it("ignores a foreign workflow.json (taskId mismatch) and writes no ledger entry (W1)", async () => {
+  it("refuses a phase whose workflow.json belongs to another task (W1)", async () => {
     setExecToSucceed();
     mockResolveProjectSessionExists.mockReturnValue(true);
     const cwd = freshWorktree();
-    const { tools, messages } = await bootWithCwd(cwd);
+    const { tools } = await bootWithCwd(cwd);
     const ctx = createResumeCtx({ cwd });
 
     // Start bd-42 so the gate is active and currentTaskId is set, then swap the
-    // workflow.json for another task's state. A phase tool must treat the
-    // foreign ledger as absent: fresh session, and no write into it.
+    // workflow.json for another task's state. The phase tool must refuse rather
+    // than run in that worktree and corrupt the foreign ledger.
     await tools
       .get("belayd_start_task")
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
@@ -2579,17 +2594,17 @@ describe("session_start resume from disk (bd-40)", () => {
       }),
     });
 
-    const before = runCompletionCount(messages);
-    await tools
+    const result = (await tools
       .get("belayd_implement")
-      ?.execute("call-implement", { task: "implement" }, undefined, undefined, ctx);
-    await vi.waitFor(() => {
-      expect(runCompletionCount(messages)).toBe(before + 1);
-    });
+      ?.execute("call-implement", { task: "implement" }, undefined, undefined, ctx)) as {
+      content: Array<{ text: string }>;
+      details: { exitCode: number };
+    };
 
-    const opts = mockSpawnAgentProcess.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(opts.sessionName).toMatch(/^belayd-bd-42-sub-implement-/);
-    expect(opts.resumeSession).toBe(false);
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("bd-99 lives in");
+    expect(result.content[0]?.text).toContain("bd-42");
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
 
     // The foreign task's ledger entry is untouched and no bd-42 entry was added.
     const persisted = readWorkflowStateFromDisk({ cwd });
@@ -2949,7 +2964,7 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(undefined);
   });
 
-  it("ignores a foreign task's reviewed sha when scoping a review (bd-113)", async () => {
+  it("refuses to review when workflow.json belongs to another task (bd-113)", async () => {
     setExecToSucceed();
     const cwd = freshWorktree();
     const { tools, messages } = await bootWithCwd(cwd);
@@ -2971,7 +2986,7 @@ describe("session_start resume from disk (bd-40)", () => {
     await runPhase("implement", "implement");
 
     // A stale workflow.json from another task must not narrow (or widen) this
-    // task's review scope.
+    // task's review scope; the phase tool refuses before a review can run.
     writeWorkflowState({
       cwd,
       state: featureState({
@@ -2981,12 +2996,18 @@ describe("session_start resume from disk (bd-40)", () => {
       }),
     });
 
-    await runPhase("review", "review");
+    const spawnsBefore = mockSpawnAgentProcess.mock.calls.length;
+    const result = (await tools
+      .get("belayd_review")
+      ?.execute("call-review", { task: "review" }, undefined, undefined, ctx)) as {
+      content: Array<{ text: string }>;
+      details: { exitCode: number };
+    };
 
-    const reviewTask = lastReviewTask();
-    expect(reviewTask).toContain("mode: first review");
-    expect(reviewTask).not.toContain("mode: re-review of fixes");
-    expect(reviewTask).not.toContain("deadbee");
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("bd-99 lives in");
+    expect(mockSpawnAgentProcess.mock.calls).toHaveLength(spawnsBefore);
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("deadbee");
   });
 
   it("records the reviewed sha only for the current task's workflow state (bd-113)", async () => {
@@ -3010,22 +3031,29 @@ describe("session_start resume from disk (bd-40)", () => {
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
     await runPhase("implement", "implement");
 
-    // Swap in another task's state, then review. The read side ignores the
-    // foreign sha; the write side must ignore the foreign file too and warn so
-    // the mis-scoped state incident is observable.
+    // Swap in another task's state, then review. The phase tool refuses the
+    // foreign worktree before the review can read or write that state.
     writeWorkflowState({
       cwd,
       state: featureState({ taskId: "bd-99", completedPhaseNames: ["implement"] }),
     });
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      await runPhase("review", "review the foreign state");
-      expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("workflow state belongs to bd-99, not bd-42"),
-      );
-    } finally {
-      warnSpy.mockRestore();
-    }
+
+    const spawnsBefore = mockSpawnAgentProcess.mock.calls.length;
+    const refused = (await tools
+      .get("belayd_review")
+      ?.execute(
+        "call-review",
+        { task: "review the foreign state" },
+        undefined,
+        undefined,
+        ctx,
+      )) as {
+      content: Array<{ text: string }>;
+      details: { exitCode: number };
+    };
+    expect(refused.details.exitCode).toBe(1);
+    expect(refused.content[0]?.text).toContain("bd-99 lives in");
+    expect(mockSpawnAgentProcess.mock.calls).toHaveLength(spawnsBefore);
 
     const foreignState = readWorkflowStateFromDisk({ cwd });
     expect(foreignState).toHaveProperty("taskId", "bd-99");
@@ -3216,7 +3244,9 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(opts.sessionName).toBe(base);
     expect(opts.resumeSession).toBe(true);
     // Resumed runs must not re-prepend the plan (it is already in the transcript).
-    expect(opts.task).toBe("fix findings");
+    expect(opts.task).toContain("fix findings");
+    expect(opts.task).not.toContain("## Bead plan");
+    expect(opts.task).toContain("Your worktree is");
   });
 
   it("derives the armed loop from disk when the persisted flag is absent (pre-bd-81 state)", async () => {

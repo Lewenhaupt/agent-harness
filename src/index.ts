@@ -270,7 +270,22 @@ export type {
   OutlineExtractionResult,
 } from "./outline-extract.js";
 export { extractOutlineSymbols } from "./outline-extract.js";
-
+export type {
+  AssertOwnedWorktreeOptions,
+  MatchOwnedWorktreeOptions,
+  OwnedWorktreeResult,
+  ReadWorkflowStateAtCwd,
+  SessionOwnedWorktreeOptions,
+  WorktreeBranch,
+} from "./owned-worktree.js";
+export {
+  assertOwnedWorktree,
+  formatWorktreePreamble,
+  isSameOrDescendantTask,
+  matchOwnedWorktree,
+  matchSessionOwnedWorktree,
+  readWorktreeBranch,
+} from "./owned-worktree.js";
 export type { Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,

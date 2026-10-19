@@ -42,6 +42,7 @@ import type {
   ModelClass,
   OutlineFilesOptions,
   OutlineKind,
+  OwnedWorktreeResult,
   Phase,
   QualityGate,
   RunDelivery,
@@ -63,6 +64,7 @@ import {
   ARCHIFY_QUALITY_PROFILES,
   ARCHIFY_TOOL_COMMANDS,
   acceptedProofRefsFromScan,
+  assertOwnedWorktree,
   awaitWorktreeReady,
   bdCommandReadsStdin,
   boundReviewOutput,
@@ -87,6 +89,7 @@ import {
   formatOutline,
   formatProcessState,
   formatReviewTask,
+  formatWorktreePreamble,
   getAgentByShortName,
   getNextPhase,
   getPhasesForType,
@@ -98,6 +101,7 @@ import {
   isArchifyToolCommand,
   isInsideWorktreeForBranch,
   isOutlineKind,
+  isSameOrDescendantTask,
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
@@ -108,6 +112,7 @@ import {
   manageInstructionGroups,
   manageInstructionGroupsWarning,
   markPhaseCompleted,
+  matchSessionOwnedWorktree,
   NO_GROUP_REGISTERED_WARNING,
   OUTLINE_FILE_EXTENSIONS,
   OUTLINE_KINDS,
@@ -122,6 +127,7 @@ import {
   RESEARCHER_TOOLS,
   RunStatus,
   readStackNode,
+  readWorktreeBranch,
   resolveArchifyHome,
   resolveAutoRebaseEnabled,
   resolveBashTimeout,
@@ -1561,6 +1567,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     };
   }
 
+  /** Shared no-cwd refusal for every tool that must stay pinned to a worktree. */
+  function missingWorkingDirectoryError(label: string): string {
+    return `${label} has no working directory: this session cannot be pinned to a worktree.`;
+  }
+
   /** Shape a read-only guidance result (exit 1 on transport/parse failure). */
   function textResultFromRun(result: ArchifyTextResult, note: string) {
     const base = result.ok ? result.text : result.error;
@@ -2851,14 +2862,18 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd-committer": "commit",
   };
 
-  interface PhaseToolContext {
-    sessionManager: { getSessionId: () => string };
-    cwd?: string;
-  }
-
   interface PhaseToolParams {
     task: string;
-    cwd?: string;
+  }
+
+  interface StartPhaseRunOptions {
+    agent: AgentDefinition;
+    phaseName: string;
+    params: PhaseToolParams;
+    state: SessionState;
+    cwd: string;
+    worktreeBranch: string | undefined;
+    runId: string;
   }
 
   /** Persist the "running" manifest so a mid-phase crash is resumable. */
@@ -3026,26 +3041,39 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /**
+   * Preflight for workflow-scoped runs: the session's task must own `cwd` and
+   * its branch. A post-completion rework call (gate off, workflow state gone)
+   * legitimately runs outside a workflow, so it stays allowed; any workflow
+   * state present in cwd still pins that tree to its owner.
+   */
+  function activeWorkflowOwnership(state: SessionState, cwd: string): OwnedWorktreeResult {
+    return matchSessionOwnedWorktree({
+      cwd,
+      currentTaskId: state.currentTaskId,
+      gateActive: state.gateActive,
+      branch: readWorktreeBranch(cwd),
+      persisted: readWorkflowState({ cwd }),
+    });
+  }
+
+  /**
    * Start a phase run in the background and return its handle immediately.
    *
    * The run owns its abort signal — the tool-call signal belongs to the
    * (now non-blocking) tool response and must not cancel the background run.
    */
-  function startPhaseRun(
-    agent: AgentDefinition,
-    phaseName: string,
-    params: PhaseToolParams,
-    state: SessionState,
-    effectiveCwd: string | undefined,
-    runId: string,
-  ): { handle: RunHandle; sessionName: string; ledgerWarning?: string } {
+  function startPhaseRun(options: StartPhaseRunOptions): {
+    handle: RunHandle;
+    sessionName: string;
+    ledgerWarning?: string;
+  } {
+    const { agent, phaseName, params, state, cwd, worktreeBranch, runId } = options;
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
     const resolvedModel = resolveModelSpec(agent);
     const effectiveModel = overrides?.model ?? resolvedModel.model;
     const effectiveModelClass = resolveEffectiveModelClass(resolvedModel.modelClass, overrides);
     const effectiveTools = overrides?.tools ?? agent.tools;
     const effectiveSystemPrompt = overrides?.systemPrompt ?? agent.systemPrompt;
-    const cwd = effectiveCwd ?? process.cwd();
     const freshSessionName = computeSubagentSessionName(state.currentTaskId, phaseName, runId);
     // Resolve the proof base before the session ledger so the same env (which
     // may later carry session-dir overrides) feeds both existence checks.
@@ -3158,13 +3186,17 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     const spawnAgent = (): Promise<SpawnResult> => {
       const buildTask = async (): Promise<string> => {
-        fullTask = await buildFullPhaseTask({
+        const preamble = formatWorktreePreamble({
+          cwd,
+          branch: worktreeBranch,
+        });
+        fullTask = `${preamble}\n\n${await buildFullPhaseTask({
           phaseName,
           taskId: state.currentTaskId,
           paramsTask: params.task,
           cwd,
           userGuideContent: state.userGuideContent,
-        });
+        })}`;
         // On a cross-run resume the transcript already contains the bead plan,
         // so sending the full task would duplicate context; the orchestrator
         // supplies the review findings it wants fixed in params.task instead.
@@ -3173,7 +3205,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         // re-review) and fresh change context, respectively. Returning
         // params.task there would hand a resumed re-review no diff at all.
         const needsFullTask = !resumeSession || phaseName === "proof" || phaseName === REVIEW_PHASE;
-        return needsFullTask ? fullTask : params.task;
+        return needsFullTask ? fullTask : `${preamble}\n\n${params.task}`;
       };
       return buildTask().then((task) =>
         spawnAgentWithFallback({
@@ -3184,7 +3216,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           task,
           sessionName: subagentSessionName,
           resumeSession,
-          cwd: effectiveCwd,
+          cwd,
           signal: abortController.signal,
           // Background runs use detached:true so a terminal Ctrl-C in the
           // orchestrator does not kill the sub-agent; explicit cancellation goes
@@ -3212,7 +3244,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         agent,
         result,
         task: fullTask,
-        cwd: effectiveCwd,
+        cwd,
         proofDir,
         proofRunStartMs,
         env: spawnEnv,
@@ -3303,7 +3335,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     phaseName: "scout" | "research",
     params: { task: string },
     state: SessionState,
-    effectiveCwd: string | undefined,
+    effectiveCwd: string,
     runId: string,
   ): { handle: RunHandle; sessionName: string } {
     const sessionName = computePlanningSubagentSessionName(phaseName, runId);
@@ -3364,7 +3396,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           },
           { deliverAs: "followUp", triggerTurn: true },
         );
-        persistModelTelemetry(effectiveCwd ?? process.cwd());
+        persistModelTelemetry(effectiveCwd);
       },
       isDelivered: (id) => state.deliveredRunIds.has(id),
       markDelivered: (id) => {
@@ -3542,21 +3574,25 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       description: agent.description,
       parameters: Type.Object({
         task: Type.String({ description: "Task to delegate to this agent" }),
-        cwd: Type.Optional(Type.String({ description: "Working directory" })),
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const state = getSessionState(ctx);
-        const ctxWithCwd = ctx as PhaseToolContext;
-        const effectiveCwd = params.cwd ?? ctxWithCwd.cwd;
+        const cwd = ctx.cwd;
+        if (cwd === undefined || cwd === "") {
+          return textToolResult(missingWorkingDirectoryError("Belayd phase run"), 1);
+        }
+        const ownership = activeWorkflowOwnership(state, cwd);
+        if (!ownership.ok) return textToolResult(ownership.error, 1);
         const runId = generateShortRunId();
-        const { sessionName, ledgerWarning } = startPhaseRun(
+        const { sessionName, ledgerWarning } = startPhaseRun({
           agent,
           phaseName,
           params,
           state,
-          effectiveCwd,
+          cwd,
+          worktreeBranch: ownership.branch,
           runId,
-        );
+        });
         const ledgerNotice = ledgerWarning === undefined ? "" : `\n\n⚠️ ${ledgerWarning}`;
         return {
           content: [
@@ -3595,6 +3631,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           details: { messages: [], usage: emptyUsage(), exitCode: 1 },
         };
       }
+      const cwd = ctx.cwd;
+      if (cwd === undefined || cwd === "") {
+        return textToolResult(missingWorkingDirectoryError("belayd_plan_scout"), 1);
+      }
       const runId = generateShortRunId();
       const { sessionName } = startPlanningRun(
         {
@@ -3606,7 +3646,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         "scout",
         params,
         state,
-        (ctx as { cwd?: string }).cwd,
+        cwd,
         runId,
       );
       return {
@@ -3633,6 +3673,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
+      const cwd = ctx.cwd;
+      if (cwd === undefined || cwd === "") {
+        return textToolResult(missingWorkingDirectoryError("belayd_plan_research"), 1);
+      }
       const runId = generateShortRunId();
       const { sessionName } = startPlanningRun(
         {
@@ -3647,7 +3691,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         "research",
         params,
         state,
-        (ctx as { cwd?: string }).cwd,
+        cwd,
         runId,
       );
       return {
@@ -3731,12 +3775,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     params: {
       task?: string;
       proof?: string;
-      cwd?: string;
     },
     state: SessionState,
-    ctx: unknown,
+    cwd: string,
   ): Promise<{ prompt: string; cwd: string; skipped: boolean }> {
-    const cwd = params.cwd ?? (ctx as { cwd?: string }).cwd ?? process.cwd();
     const taskText = params.task ?? state.currentTaskId;
     const proofOutput = params.proof ?? state.proofOutput ?? "";
     const changeContext = await collectChangeContext(cwd, state.userGuideContent);
@@ -3822,11 +3864,16 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     parameters: Type.Object({
       task: Type.Optional(Type.String({ description: "The task the proof should demonstrate" })),
       proof: Type.Optional(Type.String({ description: "Optional proof output override" })),
-      cwd: Type.Optional(Type.String({ description: "Working directory" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
-      const built = await buildProofVerifierPrompt(params, state, ctx);
+      const cwd = ctx.cwd;
+      if (cwd === undefined || cwd === "") {
+        return textToolResult(missingWorkingDirectoryError("Proof verifier"), 1);
+      }
+      const ownership = activeWorkflowOwnership(state, cwd);
+      if (!ownership.ok) return textToolResult(ownership.error, 1);
+      const built = await buildProofVerifierPrompt(params, state, cwd);
       if (built.skipped) {
         return {
           content: [
@@ -4842,16 +4889,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Tool failure result for an invalid commit task id. */
-  function invalidCommitTaskIdResult(taskId: string) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Invalid task id: ${taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`,
-        },
-      ],
-      details: { messages: [], usage: emptyUsage(), exitCode: 1 },
-    };
+  function invalidCommitTaskIdText(taskId: string): string {
+    return `Invalid task id: ${taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`;
   }
 
   /** Flag a task for human review and append its notes, when a task id was given. */
@@ -4863,6 +4902,64 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (taskId === undefined) return;
     await flagForHumanReview(taskId, cwd);
     await appendTaskNotes(taskId, state, cwd);
+  }
+
+  /**
+   * Error text when this cwd does not own the commit's task/branch. A repo with
+   * no workflow state has no identity contract to violate, so standalone
+   * commits still stage normally there.
+   */
+  function commitOwnershipError(options: {
+    cwd: string;
+    state: SessionState;
+    taskId: string | undefined;
+  }): string | undefined {
+    const persisted = readWorkflowState({ cwd: options.cwd });
+    if (persisted === undefined) return undefined;
+
+    const sessionTaskId = options.state.currentTaskId;
+    const taskId = options.taskId ?? sessionTaskId;
+    // A session may commit its own task or a sub-bead of it (bd-42.1), never an
+    // unrelated bead or a parent from a sub-bead session.
+    if (sessionTaskId !== "" && !isSameOrDescendantTask(taskId, sessionTaskId)) {
+      return (
+        `this session owns ${sessionTaskId}; refusing to commit ${taskId} in ${options.cwd} — ` +
+        `use the orchestrator that owns ${taskId}'s worktree.`
+      );
+    }
+
+    // Anchor the cwd preflight on workflow.json's task. A supplied sub-bead
+    // resolves to its owning parent; an unrelated id still fails the matcher.
+    const ownershipTaskId =
+      taskId === "" || isSameOrDescendantTask(taskId, persisted.taskId) ? persisted.taskId : taskId;
+    const owned = assertOwnedWorktree({
+      cwd: options.cwd,
+      taskId: ownershipTaskId,
+      branch: readWorktreeBranch(options.cwd),
+      readState: () => persisted,
+    });
+    return owned.ok ? undefined : owned.error;
+  }
+
+  /** Validate the commit invocation before any run manifest or staging starts. */
+  function commitPreflight(options: {
+    cwd: string | undefined;
+    taskId: string | undefined;
+    state: SessionState;
+  }): { ok: true; cwd: string } | { ok: false; error: string } {
+    if (options.taskId !== undefined && !isValidTaskId(options.taskId)) {
+      return { ok: false, error: invalidCommitTaskIdText(options.taskId) };
+    }
+    const cwd = options.cwd;
+    if (cwd === undefined || cwd === "") {
+      return { ok: false, error: missingWorkingDirectoryError("belayd_commit") };
+    }
+    const ownershipError = commitOwnershipError({
+      cwd,
+      state: options.state,
+      taskId: options.taskId,
+    });
+    return ownershipError === undefined ? { ok: true, cwd } : { ok: false, error: ownershipError };
   }
 
   // ── Register commit tool ────────────────────────────────────────────
@@ -4897,12 +4994,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (params.taskId !== undefined && !isValidTaskId(params.taskId)) {
-        return invalidCommitTaskIdResult(params.taskId);
-      }
-
-      const cwd = ctx?.cwd ?? process.cwd();
       const state = getSessionState(ctx);
+      const preflight = commitPreflight({ cwd: ctx?.cwd, taskId: params.taskId, state });
+      if (!preflight.ok) return commitFailure(preflight.error);
+      const cwd = preflight.cwd;
       const runId = generateShortRunId();
       const gateCommit = startCommitRunManifest({ state, cwd, runId });
 
