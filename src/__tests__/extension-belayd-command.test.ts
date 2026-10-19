@@ -155,10 +155,15 @@ async function loadExtension() {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 describe("/belayd command daemon delegation", () => {
+  let projectRoot: string;
   let worktreeDir: string;
 
   beforeEach(() => {
-    worktreeDir = mkdtempSync(join(tmpdir(), "belayd-cmd-test-"));
+    // The caller runs from its own worktree; the launch creates a sibling
+    // worktree for the target branch (a same-directory launch is refused).
+    projectRoot = mkdtempSync(join(tmpdir(), "belayd-cmd-test-"));
+    worktreeDir = `${projectRoot}.feat-bd-42`;
+    mkdirSync(worktreeDir);
     state.worktreeDir = worktreeDir;
     // Simulate a completed dependency install so awaitWorktreeReady resolves
     // immediately instead of polling until the test times out.
@@ -167,6 +172,7 @@ describe("/belayd command daemon delegation", () => {
   });
 
   afterEach(() => {
+    rmSync(projectRoot, { recursive: true, force: true });
     rmSync(worktreeDir, { recursive: true, force: true });
     mockExecFile.mockClear();
     mockExecSync.mockClear();
@@ -185,7 +191,7 @@ describe("/belayd command daemon delegation", () => {
 
     const notify = vi.fn();
     const ctx = {
-      cwd: worktreeDir,
+      cwd: projectRoot,
       ui: { notify },
       sessionManager: { getSessionId: () => "test-session" },
     };
@@ -218,7 +224,7 @@ describe("/belayd command daemon delegation", () => {
 
     const notify = vi.fn();
     const ctx = {
-      cwd: worktreeDir,
+      cwd: projectRoot,
       ui: { notify },
       sessionManager: { getSessionId: () => "test-session" },
     };
@@ -226,8 +232,9 @@ describe("/belayd command daemon delegation", () => {
     await commands.get("belayd")?.handler("bd-42", ctx);
 
     // pi-web session processes run with cwd `/`; persisting process.cwd()
-    // made belayd_stop_task chdir to the filesystem root.
-    expect(readWorkflowState({ cwd: worktreeDir })?.originalCwd).toBe(worktreeDir);
+    // made belayd_stop_task chdir to the filesystem root. The child's state
+    // file lives in its own worktree, so that is where originalCwd is read.
+    expect(readWorkflowState({ cwd: worktreeDir })?.originalCwd).toBe(projectRoot);
   });
 
   it("persists the handoff packet in the child worktree before the session starts", async () => {
@@ -236,7 +243,7 @@ describe("/belayd command daemon delegation", () => {
     factory(api);
 
     const ctx = {
-      cwd: worktreeDir,
+      cwd: projectRoot,
       ui: { notify: vi.fn() },
       sessionManager: { getSessionId: () => "test-session" },
     };
@@ -262,11 +269,11 @@ describe("/belayd command daemon delegation", () => {
     const factory = await loadExtension();
     factory(api);
 
-    const handoffFile = join(worktreeDir, "plan.md");
+    const handoffFile = join(projectRoot, "plan.md");
     writeFileSync(handoffFile, "Parent plan: split bd-42 into two phases.");
 
     const ctx = {
-      cwd: worktreeDir,
+      cwd: projectRoot,
       ui: { notify: vi.fn() },
       sessionManager: { getSessionId: () => "test-session" },
     };
@@ -284,7 +291,7 @@ describe("/belayd command daemon delegation", () => {
     factory(api);
 
     const ctx = {
-      cwd: worktreeDir,
+      cwd: projectRoot,
       ui: { notify: vi.fn() },
       sessionManager: { getSessionId: () => "test-session" },
     };

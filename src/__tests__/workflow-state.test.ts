@@ -1,15 +1,23 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  callerHandoffFilePath,
+  clearCallerHandoff,
+  clearHandedOffMarker,
   clearWorkflowState,
+  parseHandedOffMarker,
   parseWorkflowState,
+  readCallerHandoff,
   readWorkflowState,
   saveCompletedPhases,
+  saveHandedOffMarker,
   savePhaseSession,
   saveReviewedSha,
   type WorkflowFs,
   type WorkflowState,
   workflowStateFilePath,
+  writeCallerHandoff,
   writeWorkflowState,
 } from "../workflow-state.js";
 
@@ -424,5 +432,140 @@ describe("workflow state", () => {
         phaseSessions: { implement: { base: "impl", invocations: 0 } },
       }),
     ).toBe(undefined);
+  });
+});
+
+describe("handoff marker", () => {
+  const marker = { taskId: "bd-101", branch: "feat/bd-101", sessionId: "sess-child" };
+
+  it("parses state without a marker (backwards compatible)", () => {
+    const parsed = parseWorkflowState(sampleState());
+    expect(parsed?.handedOffTo).toBe(undefined);
+  });
+
+  it("records the marker while preserving the workflow identity", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), fs });
+
+    const saved = saveHandedOffMarker({ cwd, marker, fs });
+
+    expect(saved.ok).toBe(true);
+    const persisted = readWorkflowState({ cwd, fs });
+    expect(persisted).toHaveProperty("taskId", "bd-42");
+    expect(persisted).toHaveProperty("completedPhaseNames", ["implement"]);
+    expect(persisted).toHaveProperty("handedOffTo", marker);
+  });
+
+  it("saveHandedOffMarker reports a missing state instead of creating one", () => {
+    const fs = createFakeFs();
+
+    const saved = saveHandedOffMarker({ cwd, marker, fs });
+
+    expect(saved.ok).toBe(false);
+    expect(fs.files.size).toBe(0);
+  });
+
+  it("clears only the marker and keeps the workflow state", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), fs });
+    saveHandedOffMarker({ cwd, marker, fs });
+
+    const cleared = clearHandedOffMarker({ cwd, fs });
+
+    expect(cleared.ok).toBe(true);
+    const persisted = readWorkflowState({ cwd, fs });
+    expect(persisted).toHaveProperty("taskId", "bd-42");
+    expect(persisted).toHaveProperty("completedPhaseNames", ["implement"]);
+    expect(persisted?.handedOffTo).toBe(undefined);
+  });
+
+  it("clearing a missing state is a no-op success", () => {
+    const fs = createFakeFs();
+
+    expect(clearHandedOffMarker({ cwd, fs }).ok).toBe(true);
+    expect(fs.files.size).toBe(0);
+  });
+
+  it("rejects a partially malformed marker", () => {
+    expect(parseWorkflowState({ ...sampleState(), handedOffTo: { taskId: "bd-101" } })).toBe(
+      undefined,
+    );
+  });
+});
+
+describe("caller-scoped handoff marker", () => {
+  const marker = { taskId: "bd-101", branch: "feat/bd-101", sessionId: "sess-child" };
+  const sessionKey = "caller-session-1";
+
+  it("uses a sanitized, caller-keyed path", () => {
+    expect(callerHandoffFilePath(cwd, "a/b:c d")).toBe(
+      join(cwd, ".belayd", "handoff-a_b_c_d.json"),
+    );
+    expect(callerHandoffFilePath(cwd, sessionKey)).toBe(
+      join(cwd, ".belayd", `handoff-${sessionKey}.json`),
+    );
+  });
+
+  it("round-trips a marker and survives unrelated workflow.json rewrites", () => {
+    const fs = createFakeFs();
+    const written = writeCallerHandoff({ cwd, sessionKey, marker, fs });
+    // A same-directory child writes its own workflow.json over the caller's.
+    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-101" }), fs });
+
+    expect(written.ok).toBe(true);
+    expect(readCallerHandoff({ cwd, sessionKey, fs })).toEqual(marker);
+    expect(readWorkflowState({ cwd, fs })?.handedOffTo).toBe(undefined);
+  });
+
+  it("returns undefined for another session or a corrupt file", () => {
+    const fs = createFakeFs();
+    writeCallerHandoff({ cwd, sessionKey, marker, fs });
+
+    expect(readCallerHandoff({ cwd, sessionKey: "other-session", fs })).toBe(undefined);
+
+    const corruptFs = createFakeFs({
+      [callerHandoffFilePath(cwd, sessionKey)]: JSON.stringify({ taskId: "bd-101" }),
+    });
+    expect(readCallerHandoff({ cwd, sessionKey, fs: corruptFs })).toBe(undefined);
+  });
+
+  it("clears only the caller's marker", () => {
+    const fs = createFakeFs();
+    writeCallerHandoff({ cwd, sessionKey, marker, fs });
+    writeCallerHandoff({ cwd, sessionKey: "other-session", marker, fs });
+
+    expect(clearCallerHandoff({ cwd, sessionKey, fs }).ok).toBe(true);
+    expect(readCallerHandoff({ cwd, sessionKey, fs })).toBe(undefined);
+    expect(readCallerHandoff({ cwd, sessionKey: "other-session", fs })).toEqual(marker);
+  });
+
+  it("clearing a missing marker is a no-op success and reports a real unlink failure", () => {
+    const fs = createFakeFs();
+    expect(clearCallerHandoff({ cwd, sessionKey, fs }).ok).toBe(true);
+
+    writeCallerHandoff({ cwd, sessionKey, marker, fs });
+    fs.unlinkSync = () => {
+      throw new Error("EACCES");
+    };
+    const failed = clearCallerHandoff({ cwd, sessionKey, fs });
+    expect(failed.ok).toBe(false);
+    if (!failed.ok) expect(failed.error).toBe("EACCES");
+  });
+
+  it("writeCallerHandoff reports a write failure instead of throwing", () => {
+    const fs = createFakeFs();
+    fs.renameSync = () => {
+      throw new Error("disk full");
+    };
+
+    const written = writeCallerHandoff({ cwd, sessionKey, marker, fs });
+    expect(written.ok).toBe(false);
+    if (!written.ok) expect(written.error).toBe("disk full");
+  });
+
+  it("parses a marker only when every field is present", () => {
+    expect(parseHandedOffMarker(marker)).toEqual(marker);
+    expect(parseHandedOffMarker({ taskId: marker.taskId })).toBe(undefined);
+    expect(parseHandedOffMarker(null)).toBe(undefined);
   });
 });

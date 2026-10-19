@@ -19,6 +19,17 @@ const PhaseSessionRecordSchema = z.object({
   invocations: z.number().int().positive(),
 });
 
+/**
+ * Marker written into the *caller's* workflow state when it hands a workflow
+ * off to an orchestrator session in another worktree. Its presence means the
+ * caller no longer drives a workflow, so a restart must not re-arm its gate.
+ */
+const HandedOffMarkerSchema = z.object({
+  taskId: z.string(),
+  branch: z.string(),
+  sessionId: z.string(),
+});
+
 const WorkflowStateSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   taskId: z.string(),
@@ -42,11 +53,17 @@ const WorkflowStateSchema = z.object({
   // diffs from here, so it sees only the fix round. Optional so a workflow.json
   // written before bd-113 still parses.
   reviewedSha: z.string().optional(),
+  // Set when this session handed its workflow off to a child orchestrator
+  // (see launchWorktreeWorkflow). Optional so every workflow.json written
+  // before bd-120 still parses.
+  handedOffTo: HandedOffMarkerSchema.optional(),
   startedAt: z.number().finite(),
   updatedAt: z.number().finite(),
 });
 
 export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
+
+export type HandedOffMarker = z.infer<typeof HandedOffMarkerSchema>;
 
 /**
  * Subset of node:fs sync operations workflow state persistence needs. Tests
@@ -106,6 +123,31 @@ export interface ClearWorkflowStateOptions {
   fs?: WorkflowFs;
 }
 
+export interface SaveHandedOffMarkerOptions {
+  cwd: string;
+  marker: HandedOffMarker;
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+export interface ClearHandedOffMarkerOptions {
+  cwd: string;
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+export interface CallerHandoffOptions {
+  cwd: string;
+  /** The caller's own pi session id (the owner of the marker file). */
+  sessionKey: string;
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+export interface WriteCallerHandoffOptions extends CallerHandoffOptions {
+  marker: HandedOffMarker;
+}
+
 export interface SaveReviewedShaOptions {
   cwd: string;
   sha: string;
@@ -153,6 +195,21 @@ export function workflowStateDir(cwd: string): string {
 
 export function workflowStateFilePath(cwd: string): string {
   return join(cwd, ".belayd", "workflow.json");
+}
+
+/**
+ * Caller-scoped handoff marker path.
+ *
+ * `.belayd/workflow.json` cannot carry the marker when the child orchestrator
+ * runs in the caller's own directory: the child writes that file for its own
+ * workflow and would clobber the marker. A file keyed by the *caller's* session
+ * id is not owned by the child, so a resumed caller still learns that it no
+ * longer drives a workflow (bd-120). The id is sanitized because external
+ * session ids are not guaranteed to be filesystem-safe.
+ */
+export function callerHandoffFilePath(cwd: string, sessionKey: string): string {
+  const safeKey = sessionKey.replace(/[^A-Za-z0-9._-]/g, "_");
+  return join(cwd, ".belayd", `handoff-${safeKey}.json`);
 }
 
 /**
@@ -311,6 +368,106 @@ export function saveReviewedSha(options: SaveReviewedShaOptions): SaveReviewedSh
     return { ok: false, reason: "write-failed", error: writeResult.error };
   }
   return { ok: true };
+}
+
+/**
+ * Read-modify-write: record the handoff marker on the caller's own state,
+ * preserving its identity fields and phase ledger. A missing state file is an
+ * error: the caller was not driving a workflow, so there is nothing to mark
+ * and the caller can rely on `clearWorkflowState` semantics instead.
+ */
+export function saveHandedOffMarker(
+  options: SaveHandedOffMarkerOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
+  if (existing === undefined) {
+    return { ok: false, error: `No Belayd workflow state found in ${options.cwd}` };
+  }
+  const updated: WorkflowState = {
+    ...existing,
+    handedOffTo: { ...options.marker },
+    updatedAt: nowMs(options.now),
+  };
+  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+}
+
+/**
+ * Read-modify-write: drop the handoff marker, keeping the workflow identity so
+ * a session that starts a new task over the same state is not blocked by a
+ * stale marker. A missing state file is a no-op success.
+ */
+export function clearHandedOffMarker(
+  options: ClearHandedOffMarkerOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
+  if (existing === undefined) return { ok: true };
+  const updated: WorkflowState = { ...existing, updatedAt: nowMs(options.now) };
+  delete updated.handedOffTo;
+  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+}
+
+/** Parse a caller-scoped handoff marker file's contents. */
+export function parseHandedOffMarker(raw: unknown): HandedOffMarker | undefined {
+  const result = HandedOffMarkerSchema.safeParse(raw);
+  return result.success ? result.data : undefined;
+}
+
+function readCallerHandoffFile(
+  fs: WorkflowFs,
+  cwd: string,
+  sessionKey: string,
+): HandedOffMarker | undefined {
+  const filePath = callerHandoffFilePath(cwd, sessionKey);
+  if (!fs.existsSync(filePath)) return undefined;
+  try {
+    return parseHandedOffMarker(JSON.parse(fs.readFileSync(filePath)));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read the caller-scoped marker. Returns undefined when this session never
+ * handed anything off (or the file is unreadable/corrupt).
+ */
+export function readCallerHandoff(options: CallerHandoffOptions): HandedOffMarker | undefined {
+  const fs = options.fs ?? nodeFsSeam;
+  return readCallerHandoffFile(fs, options.cwd, options.sessionKey);
+}
+
+/**
+ * Persist the handoff marker for one caller session. This is the authoritative
+ * record when the child shares the caller's directory; callers must treat a
+ * failure as a precondition failure and stay armed (a missing marker resurrects
+ * the workflow on the next restart).
+ */
+export function writeCallerHandoff(
+  options: WriteCallerHandoffOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  return atomicWriteJson(
+    callerHandoffFilePath(options.cwd, options.sessionKey),
+    { ...options.marker },
+    fs,
+  );
+}
+
+/** Remove this caller's marker, tolerating a missing file; reports real errors. */
+export function clearCallerHandoff(
+  options: CallerHandoffOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const filePath = callerHandoffFilePath(options.cwd, options.sessionKey);
+  try {
+    fs.unlinkSync(filePath);
+    return { ok: true };
+  } catch (error) {
+    // A missing marker is the expected success case; only surface real errors.
+    if (!fs.existsSync(filePath)) return { ok: true };
+    return { ok: false, error: errorMessage(error) };
+  }
 }
 
 /** Remove the current workflow state file, tolerating a missing file. */

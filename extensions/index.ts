@@ -40,6 +40,7 @@ import type {
   ArchifyQuality,
   ArchifyTextResult,
   BelaydCommandArgs,
+  HandedOffMarker,
   HandoffPacket,
   ModelClass,
   OutlineFilesOptions,
@@ -108,8 +109,8 @@ import {
   isArchifyToolCommand,
   isInsideWorktreeForBranch,
   isOutlineKind,
-  isSameOrDescendantTask,
   isSafeChdirTarget,
+  isSameOrDescendantTask,
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
@@ -205,11 +206,16 @@ import {
 } from "../src/session-naming.js";
 import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
 import {
+  clearCallerHandoff,
+  clearHandedOffMarker,
   clearWorkflowState,
+  readCallerHandoff,
   readWorkflowState,
   saveCompletedPhases,
+  saveHandedOffMarker,
   savePhaseSession,
   saveReviewedSha,
+  writeCallerHandoff,
   writeWorkflowState,
 } from "../src/workflow-state.js";
 
@@ -266,6 +272,18 @@ type SessionState = {
    * compaction re-injects the parent's context instead of losing it.
    */
   handoff?: HandoffPacket;
+  /**
+   * Set when this session handed its workflow to a child orchestrator in
+   * another worktree. While present the session drives nothing: the gate stays
+   * disarmed and `belayd_status` reports the handoff instead of a workflow.
+   */
+  handedOffTo?: HandedOffMarker;
+  /**
+   * Summary of caller-side leftovers found when resuming a handed-off session
+   * (interrupted runs, pending user completions). Surfaced by `belayd_status`
+   * instead of being silently dropped (bd-120).
+   */
+  handoffPendingNotice?: string;
   /**
    * Monotonic teardown counter, bumped whenever the active workflow is torn
    * down (start/stop task, /plan entry, workflow completion, session restart).
@@ -373,11 +391,12 @@ function resolveHandoffArg(
 /** Usage text for `/belayd`; shared by every rejection path. */
 function belaydUsageText(): string {
   return [
-    "Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>]",
+    "Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>] [--force]",
     "  taskId: beads issue or subtask ID (e.g. bd-42, bd-42.1)",
     "  type: optional; omit to use the bead's wf:<type> label. Valid: feature (default), bugfix, research, chore, documentation, refactor, hotfix",
     "  --no-worktree: activate gate in the current directory, no worktree or daemon",
     "  --handoff <text|@path>: context for the spawned orchestrator. Everything after the flag is its value (quote multi-word text); `@path` reads a file relative to the current directory",
+    "  --force: hand off even while this session has phase runs in flight or is already inside the target worktree (the live runs are abandoned)",
   ].join("\n");
 }
 
@@ -512,6 +531,96 @@ function evaluateToolCallGate(
   }
 
   return {};
+}
+
+/** Normalize an unknown thrown/rejected value for an error message. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Status line for a session that handed its workflow to a child orchestrator.
+ * It must never read like a live workflow: the caller has no gate and no phase
+ * tools, and the bead is owned by the child session (bd-120).
+ */
+function formatHandedOffStatus(marker: HandedOffMarker): string {
+  return (
+    `**Handed off** — ${marker.taskId} is owned by session \`${marker.sessionId}\` ` +
+    `in worktree \`${marker.branch}\`; this session no longer drives a workflow.`
+  );
+}
+
+/**
+ * First status section: a handoff wins over a live workflow, because a
+ * handed-off session keeps no gate but must still explain where the bead went.
+ */
+function formatWorkflowStatusSection(state: SessionState): string {
+  if (state.handedOffTo !== undefined) return formatHandedOffStatus(state.handedOffTo);
+  if (!state.gateActive) return "Belayd process is inactive.";
+  return formatProcessState(state.completedPhaseNames, state.currentTaskId, state.phaseOrder);
+}
+
+/** Active-run list for `belayd_status` (always printed, even when empty). */
+function formatActiveRunsSection(
+  activeRuns: ReadonlyMap<string, { handle: { phaseName: string; status: string } }>,
+): string {
+  const lines = ["**Active runs**"];
+  if (activeRuns.size === 0) {
+    lines.push("(none)");
+    return lines.join("\n");
+  }
+  for (const [runId, { handle }] of activeRuns) {
+    lines.push(`- \`${runId}\` — ${handle.phaseName} (${handle.status})`);
+  }
+  return lines.join("\n");
+}
+
+/** Mark every pending user completion delivered; returns per-run outcome labels. */
+function markPendingCompletionsDelivered(options: {
+  cwd: string;
+  /** Runs for this task belong to the child orchestrator; leave them alone. */
+  skipTaskId: string;
+}): { delivered: string[]; undeliverable: string[] } {
+  const delivered: string[] = [];
+  const undeliverable: string[] = [];
+  for (const run of listPendingUserCompletions({ cwd: options.cwd })) {
+    if (run.taskId === options.skipTaskId) continue;
+    const result = markRunDelivered({ cwd: options.cwd, runId: run.runId });
+    if (result.ok) {
+      delivered.push(`${run.runId} (${run.phase})`);
+    } else {
+      undeliverable.push(`${run.runId} (${run.phase}: ${result.error})`);
+    }
+  }
+  return { delivered, undeliverable };
+}
+
+/** Compose the handed-off pending-items summary, or undefined when nothing was found. */
+function formatHandoffPendingNotice(options: {
+  taskId: string;
+  interrupted: RunManifest[];
+  delivered: string[];
+  undeliverable: string[];
+}): string | undefined {
+  const parts: string[] = [];
+  if (options.interrupted.length > 0) {
+    const runs = options.interrupted.map((run) => `${run.runId} (${run.phase})`).join(", ");
+    parts.push(`${options.interrupted.length} interrupted phase run(s): ${runs}`);
+  }
+  if (options.delivered.length > 0) {
+    parts.push(
+      `${options.delivered.length} pending user completion(s) marked delivered without applying them ` +
+        `(this session no longer drives ${options.taskId}): ${options.delivered.join(", ")}`,
+    );
+  }
+  if (options.undeliverable.length > 0) {
+    parts.push(
+      `could not mark ${options.undeliverable.length} pending user completion(s) delivered: ` +
+        options.undeliverable.join(", "),
+    );
+  }
+  if (parts.length === 0) return undefined;
+  return `Handed off to ${options.taskId}: ${parts.join("; ")}.`;
 }
 
 /** Abort every active background run, then drop their handles. */
@@ -1238,6 +1347,31 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.planningTarget = undefined;
     state.completedPhaseNames = [];
     state.currentTaskId = taskId;
+    // A new task supersedes an earlier handoff; keeping the marker would make a
+    // later restart refuse to resume this workflow (bd-120).
+    state.handedOffTo = undefined;
+    state.handoffPendingNotice = undefined;
+    const clearedMarker = clearHandedOffMarker({ cwd });
+    if (!clearedMarker.ok) {
+      // A stale marker wins over the phase ledger on resume, so a silent failure
+      // would make the restarted session refuse to drive the NEW task.
+      reportHandoffProblem(
+        `Belayd could not clear the handoff marker in ${cwd}/.belayd/workflow.json ` +
+          `(${clearedMarker.error}); a restart may refuse to resume ${taskId} until it is removed.`,
+      );
+    }
+    // The caller-scoped marker is authoritative on resume, so it must be gone
+    // too or the new workflow would look handed off after a restart.
+    const clearedCallerMarker = clearCallerHandoff({
+      cwd,
+      sessionKey: ctx.sessionManager.getSessionId(),
+    });
+    if (!clearedCallerMarker.ok) {
+      reportHandoffProblem(
+        `Belayd could not clear this session's handoff marker (${clearedCallerMarker.error}); ` +
+          `a restart may refuse to resume ${taskId} until ${cwd}/.belayd/handoff-<session>.json is removed.`,
+      );
+    }
     state.proofBase = undefined;
     state.workflowType = workflowType ?? "feature";
     applyWorkflowConfig(state);
@@ -1259,6 +1393,53 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.phaseOrder = getPhasesForType(state.workflowType);
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
     state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
+  }
+
+  /**
+   * Surface a handoff-persistence problem in the UI as well as the log. These
+   * failures are rare but correctness-relevant: the marker is what stops a
+   * restarted session from driving a workflow it no longer owns.
+   */
+  function reportHandoffProblem(message: string): void {
+    const text = `[belayd-harness] ${message}`;
+    console.warn(text);
+    pi.sendMessage({ customType: "belayd-error", content: message, display: true });
+  }
+
+  /**
+   * Stop the caller from driving a workflow it just handed to a child
+   * orchestrator (bd-120). Two live orchestrators on one bead produced
+   * duplicate phase runs, interleaved writes, and apparent reverts, so the
+   * caller drops every phase/proof field, aborts its in-flight runs, and
+   * restores the full tool set.
+   */
+  function disarmForHandoff(options: {
+    state: SessionState;
+    cwd: string;
+    marker: HandedOffMarker;
+  }): void {
+    const { state } = options;
+    // The delegated workflow is this session's only telemetry producer from
+    // here on; flush its rows instead of losing them with the dropped run state.
+    resetModelTelemetry(options.cwd);
+    abortAndResetRunTracking(state);
+    state.planningActive = false;
+    state.planningTarget = undefined;
+    state.gateActive = false;
+    state.currentTaskId = "";
+    // Neutral phase configuration: no phase-order check can trip on a workflow
+    // the session no longer owns (the gate itself is off).
+    state.workflowType = "feature";
+    applyWorkflowConfig(state);
+    state.completedPhaseNames = [];
+    state.awaitingReviewResponse = false;
+    state.proofBase = undefined;
+    state.proofOutput = undefined;
+    state.userGuideContent = undefined;
+    state.proofVerifierVerdict = undefined;
+    state.handedOffTo = { ...options.marker };
+    state.handoffPendingNotice = undefined;
+    applyToolGate(state);
   }
 
   /** Build the workflow.json identity payload for a freshly-activated gate. */
@@ -2078,6 +2259,56 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Write the child worktree's workflow state and (when present) the handoff
+   * packet, before its session exists. Split out of `createOrchestratorSession`
+   * to keep that function's branch count readable.
+   */
+  function persistChildWorkflowState(options: {
+    taskId: string;
+    workflowType: WorkflowSubType;
+    branch: string;
+    worktreePath: string;
+    originalCwd: string;
+    phaseOrder: string[];
+    resolutionSource?: WorkflowResolutionSource;
+    matchedLabel?: string;
+    handoff?: HandoffPacket;
+  }): { ok: true } | { ok: false; error: string } {
+    const now = Date.now();
+    const writeResult = writeWorkflowState({
+      cwd: options.worktreePath,
+      state: {
+        schemaVersion: 1,
+        taskId: options.taskId,
+        workflowType: options.workflowType,
+        resolutionSource: options.resolutionSource ?? "default",
+        ...(options.matchedLabel !== undefined ? { matchedLabel: options.matchedLabel } : {}),
+        branch: options.branch,
+        originalCwd: options.originalCwd,
+        phaseOrder: options.phaseOrder,
+        completedPhaseNames: [],
+        startedAt: now,
+        updatedAt: now,
+      },
+    });
+    if (!writeResult.ok) {
+      return { ok: false, error: `Failed to persist Belayd workflow state: ${writeResult.error}` };
+    }
+
+    // Persist the handoff beside the workflow state so a child restart (which
+    // only reads disk) can recover it; written before the session exists.
+    if (options.handoff !== undefined) {
+      const handoffResult = writeHandoff({ cwd: options.worktreePath, packet: options.handoff });
+      if (!handoffResult.ok) {
+        // A missing packet degrades the child's first turn, it does not block
+        // the launch: the workflow state and prompt are already complete.
+        console.warn(`[belayd-harness] failed to persist handoff packet: ${handoffResult.error}`);
+      }
+    }
+    return { ok: true };
+  }
+
   /** Delegate a worktree workflow to the pi-web session daemon. */
   async function createOrchestratorSession(options: {
     ctx: ExtensionContext;
@@ -2090,7 +2321,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     resolutionSource?: WorkflowResolutionSource;
     matchedLabel?: string;
     handoff?: HandoffPacket;
-  }): Promise<void> {
+  }): Promise<{ ok: true; sessionId: string; sessionName: string } | { ok: false; error: string }> {
     const { ctx, taskId, workflowType, branch, worktreePath } = options;
     // ctx.cwd is the calling session's directory; process.cwd() is `/` in
     // pi-web session processes, and belayd_stop_task chdirs back to this value.
@@ -2109,61 +2340,165 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
     // Persist workflow state so the new session's session_start handler can
     // activate (and later resume) the gate.
-    const now = Date.now();
-    const writeResult = writeWorkflowState({
-      cwd: worktreePath,
-      state: {
-        schemaVersion: 1,
-        taskId,
-        workflowType,
-        resolutionSource: options.resolutionSource ?? "default",
-        ...(options.matchedLabel !== undefined ? { matchedLabel: options.matchedLabel } : {}),
-        branch,
-        originalCwd,
-        phaseOrder,
-        completedPhaseNames: [],
-        startedAt: now,
-        updatedAt: now,
-      },
+    const persisted = persistChildWorkflowState({
+      taskId,
+      workflowType,
+      branch,
+      worktreePath,
+      originalCwd,
+      phaseOrder,
+      resolutionSource: options.resolutionSource,
+      matchedLabel: options.matchedLabel,
+      handoff: options.handoff,
     });
-    if (!writeResult.ok) {
-      ctx.ui.notify(`Failed to persist Belayd workflow state: ${writeResult.error}`, "error");
-      return;
-    }
-
-    // Persist the handoff beside the workflow state so a child restart (which
-    // only reads disk) can recover it; written before the session exists.
-    if (options.handoff !== undefined) {
-      const handoffResult = writeHandoff({ cwd: worktreePath, packet: options.handoff });
-      if (!handoffResult.ok) {
-        // A missing packet degrades the child's first turn, it does not block
-        // the launch: the workflow state and prompt are already complete.
-        console.warn(`[belayd-harness] failed to persist handoff packet: ${handoffResult.error}`);
-      }
-    }
+    if (!persisted.ok) return { ok: false, error: persisted.error };
 
     // Delegate to pi-web session daemon for persistent session management.
     const orchestrationName = computeOrchestratorSessionName(taskId);
 
-    // Try setting name at creation time
-    const created = (await daemonRequest("POST", "/sessions", {
-      cwd: worktreePath,
-      name: orchestrationName,
-    })) as { id?: string };
+    // Errors-as-values: daemonRequest rejects on socket errors and non-2xx
+    // responses. Letting that escape would leave an unprompted child session
+    // and an armed caller, so a retry would create a second zombie
+    // orchestrator (bd-120).
+    let created: { id?: string };
+    try {
+      // Try setting name at creation time
+      created = (await daemonRequest("POST", "/sessions", {
+        cwd: worktreePath,
+        name: orchestrationName,
+      })) as { id?: string };
+    } catch (error) {
+      return {
+        ok: false,
+        error: `Session daemon rejected the orchestrator request: ${errorText(error)}. No child session was created.`,
+      };
+    }
 
     if (!created.id) {
-      ctx.ui.notify("Session daemon returned no session id.", "error");
-      return;
+      return { ok: false, error: "Session daemon returned no session id." };
     }
 
     // The session daemon's per-session routes scope every request by cwd, so
     // the prompt body must carry the worktree path alongside the prompt text.
-    await daemonRequest("POST", `/sessions/${created.id}/prompt`, {
-      cwd: worktreePath,
-      text: prompt,
-    });
+    try {
+      await daemonRequest("POST", `/sessions/${created.id}/prompt`, {
+        cwd: worktreePath,
+        text: prompt,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        error:
+          `Created session ${created.id} for ${taskId} but could not send it the workflow prompt ` +
+          `(${errorText(error)}). The child has no work queued; stop/delete session ${created.id} ` +
+          "before retrying, so a retry does not leave two orchestrators behind.",
+      };
+    }
 
     ctx.ui.notify(`Belayd ${workflowType} workflow started for ${taskId} (${branch}).`, "info");
+    return { ok: true, sessionId: created.id, sessionName: orchestrationName };
+  }
+
+  /**
+   * Refusal text for a launch attempted while this session still has phase
+   * runs in flight: naming each live run is what lets the model decide between
+   * waiting and forcing (bd-120).
+   */
+  function describeInFlightLaunchRefusal(state: SessionState): string {
+    const live = [...state.activeRuns.entries()].map(([runId, { handle }]) => {
+      const owner = state.currentTaskId === "" ? "" : ` for ${state.currentTaskId}`;
+      return `\`${runId}\` (${handle.phaseName}${owner})`;
+    });
+    return (
+      `Cannot launch a child workflow while this session has phase runs in flight: ${live.join(", ")}. ` +
+      "Wait for their follow-up results, or pass force: true (--force for /belayd) to abandon them and hand off anyway."
+    );
+  }
+
+  /**
+   * Refusal text for a launch from inside the target worktree.
+   *
+   * The child orchestrator would share this directory's `.belayd/workflow.json`
+   * and overwrite it with its own workflow, and no marker can be stored there
+   * because the child owns that file. Two sessions then race on one branch
+   * (bd-120), so the same-directory launch is refused unless forced.
+   */
+  function describeSameWorktreeRefusal(branch: string): string {
+    return (
+      `Refusing to launch a workflow for \`${branch}\`: this session is already inside that ` +
+      "worktree, and the workflow state file would be shared, so a second orchestrator would " +
+      "fight this one over the same branch. One session per worktree: launch from the parent " +
+      "worktree (or main), or pass force: true (--force for /belayd) to hand off here anyway " +
+      "— a forced same-directory handoff replaces this session's workflow.json and records the " +
+      "handoff in .belayd/handoff-<sessionId>.json instead."
+    );
+  }
+
+  /**
+   * Blockers that must be cleared before a child launch has any side effect.
+   * Shared by `launchWorktreeWorkflow` and the follow-up tool (which writes bead
+   * labels before launching and must not mutate them for a refused launch).
+   */
+  function launchBlocker(options: {
+    state: SessionState;
+    cwd: string;
+    branch: string;
+    force: boolean;
+  }): string | undefined {
+    if (options.force) return undefined;
+    if (options.state.activeRuns.size > 0) {
+      return describeInFlightLaunchRefusal(options.state);
+    }
+    // Already inside the target worktree: the child would share this cwd's
+    // state file (see describeSameWorktreeRefusal).
+    if (isInsideWorktreeForBranch(options.cwd, options.branch)) {
+      return describeSameWorktreeRefusal(options.branch);
+    }
+    return undefined;
+  }
+
+  /**
+   * Persist the two handoff records after the child session exists.
+   *
+   * The caller-scoped marker is required: it is the one record the child cannot
+   * clobber (a same-directory child owns the shared `workflow.json`), and
+   * `resumeWorkflowFromDisk` consults it first. The `workflow.json` marker is a
+   * best-effort secondary record for a *new* session in this directory; a
+   * failure there is loud but leaves this session's restart guarded.
+   */
+  function persistHandoffMarkers(options: {
+    ctx: ExtensionContext;
+    marker: HandedOffMarker;
+    sameDirectory: boolean;
+  }): { ok: true } | { ok: false; error: string } {
+    const callerMarker = writeCallerHandoff({
+      cwd: options.ctx.cwd,
+      sessionKey: options.ctx.sessionManager.getSessionId(),
+      marker: options.marker,
+    });
+    if (!callerMarker.ok) {
+      return {
+        ok: false,
+        error:
+          `Created orchestrator session ${options.marker.sessionId} for ${options.marker.taskId} ` +
+          `but could not persist the handoff marker (${callerMarker.error}); the caller stays ` +
+          `armed. Stop session ${options.marker.sessionId} and retry, or check write access to ` +
+          `${options.ctx.cwd}/.belayd.`,
+      };
+    }
+
+    if (options.sameDirectory) return { ok: true };
+    if (readWorkflowState({ cwd: options.ctx.cwd }) === undefined) return { ok: true };
+
+    const saved = saveHandedOffMarker({ cwd: options.ctx.cwd, marker: options.marker });
+    if (!saved.ok) {
+      reportHandoffProblem(
+        `the handoff marker in ${options.ctx.cwd}/.belayd/workflow.json could not be written ` +
+          `(${saved.error}); this session's restart is still guarded by ` +
+          `.belayd/handoff-<sessionId>.json, but a new session in this directory will not see the handoff.`,
+      );
+    }
+    return { ok: true };
   }
 
   /**
@@ -2230,7 +2565,22 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     handoff?: string;
     resolutionSource?: WorkflowResolutionSource;
     matchedLabel?: string;
-  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    /** Explicit override: hand off even with phase runs in flight or in-place. */
+    force?: boolean;
+  }): Promise<{ ok: true; handoff: HandedOffMarker } | { ok: false; error: string }> {
+    // Guard before any side effect: creating a worktree/session while a phase
+    // run is still writing (or from inside the target worktree) would leave two
+    // orchestrators on one bead (bd-120).
+    const state = getSessionState(options.ctx);
+    const force = options.force === true;
+    const blocker = launchBlocker({
+      state,
+      cwd: options.ctx.cwd,
+      branch: options.branch,
+      force,
+    });
+    if (blocker !== undefined) return { ok: false, error: blocker };
+
     const worktreePath = ensureWorktree(options.ctx.cwd, options.branch, options.base);
     if (!worktreePath) {
       return {
@@ -2238,6 +2588,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         error:
           "Worktree creation failed. Use --no-worktree to skip isolation, or check that wt is installed.",
       };
+    }
+
+    // `ensureWorktree` returns the caller's own directory when it already sits
+    // in the target worktree; re-check after resolution so a mismatch between
+    // the git probe and the worktree resolver cannot bypass the refusal.
+    const sameDirectory = worktreePath === options.ctx.cwd;
+    if (sameDirectory && !force) {
+      return { ok: false, error: describeSameWorktreeRefusal(options.branch) };
     }
 
     // Hardening: `wt switch` can return before background post-start hooks
@@ -2271,7 +2629,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       deps: { showTask: (taskId) => readTaskPlan(taskId, options.ctx.cwd) },
     });
 
-    await createOrchestratorSession({
+    const created = await createOrchestratorSession({
       ctx: options.ctx,
       taskId: options.taskId,
       workflowType: options.workflowType,
@@ -2283,7 +2641,37 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       matchedLabel: options.matchedLabel,
       handoff,
     });
-    return { ok: true };
+    if (!created.ok) return { ok: false, error: created.error };
+
+    const marker: HandedOffMarker = {
+      taskId: options.taskId,
+      branch: options.branch,
+      sessionId: created.sessionId,
+    };
+
+    // Persistence is a precondition for disarming, not a best-effort side
+    // effect: without the marker the next restart resurrects this workflow next
+    // to the running child.
+    const persisted = persistHandoffMarkers({
+      ctx: options.ctx,
+      marker,
+      sameDirectory,
+    });
+    if (!persisted.ok) return { ok: false, error: persisted.error };
+
+    disarmForHandoff({ state, cwd: options.ctx.cwd, marker });
+    pi.sendMessage(
+      {
+        customType: "belayd-handoff",
+        content:
+          `Handed off ${options.taskId} to session ${created.sessionName} in \`${options.branch}\`; ` +
+          "you no longer drive a workflow. The new orchestrator owns this bead — do not start " +
+          "phase runs for it here.",
+        display: true,
+      },
+      { triggerTurn: true },
+    );
+    return { ok: true, handoff: marker };
   }
 
   // ── Slash command: /plan <description> | /plan bd-x ───────────────
@@ -2473,6 +2861,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       handoff: handoffArg.text,
       resolutionSource: resolution.source,
       matchedLabel: resolution.matchedLabel,
+      force: args.force,
     });
     if (!outcome.ok) ctx.ui.notify(outcome.error, "error");
   }
@@ -2480,7 +2869,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   // ── Slash command: /belayd bd-42 [type] ────────────────────────────
   pi.registerCommand("belayd", {
     description:
-      "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>]. " +
+      "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>] [--force]. " +
       "Omit type to use the bead's wf:<type> label (confirmed before launch).",
     handler: async (args, ctx) => {
       const parsedArgs = parseBelaydCommandArgs(args);
@@ -2739,26 +3128,52 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   });
 
   /**
-   * Resume the gate from the persisted workflow state written by /belayd.
-   * A completed workflow is cleared instead of resurrected; a sub-agent never
-   * reaches this helper because its session has no workflow state file.
+   * Record a handed-off resume and settle the caller's leftovers rather than
+   * dropping them (bd-120). A handed-off session cannot apply a phase
+   * completion to a workflow it no longer drives, and it can no longer deliver
+   * a follow-up for it, so interrupted runs are flipped to `interrupted` and
+   * pending user completions are marked delivered with a summary that
+   * `belayd_status` surfaces.
    */
-  function resumeWorkflowFromDisk(state: SessionState, cwd: string): void {
-    const persisted = readWorkflowState({ cwd });
-    if (persisted === undefined) return;
+  function settleHandoffPendingItems(options: {
+    state: SessionState;
+    cwd: string;
+    marker: HandedOffMarker;
+  }): void {
+    const { state, cwd, marker } = options;
+    state.gateActive = false;
+    state.handedOffTo = { ...marker };
 
-    if (!isValidTaskId(persisted.taskId)) {
-      // A crafted/corrupt workflow.json must not reach the `bd show ${taskId}` shell sink.
-      clearWorkflowState({ cwd });
-      return;
-    }
+    // In a same-directory handoff the child orchestrator owns this cwd's state
+    // and run manifests. Settling them here would flip a live child run to
+    // interrupted and swallow its pending user completions, so the caller only
+    // settles leftovers in a directory it still owns.
+    const persistedHere = readWorkflowState({ cwd });
+    if (persistedHere !== undefined && persistedHere.taskId === marker.taskId) return;
 
-    // A stale workflow.json that already finished must not resurrect the gate.
-    if (isWorkflowComplete(persisted.completedPhaseNames, persisted.phaseOrder)) {
-      clearWorkflowState({ cwd });
-      return;
-    }
+    const interrupted = scanForInterruptedRuns({ cwd });
+    const { delivered, undeliverable } = markPendingCompletionsDelivered({
+      cwd,
+      skipTaskId: marker.taskId,
+    });
+    const notice = formatHandoffPendingNotice({
+      taskId: marker.taskId,
+      interrupted,
+      delivered,
+      undeliverable,
+    });
+    if (notice === undefined) return;
 
+    state.handoffPendingNotice = notice;
+    console.warn(`[belayd-harness] ${notice}`);
+  }
+
+  /** Arm the gate from a validated persisted workflow and surface dead runs. */
+  function armFromPersistedWorkflow(
+    state: SessionState,
+    cwd: string,
+    persisted: WorkflowState,
+  ): void {
     state.gateActive = true;
     state.currentTaskId = persisted.taskId;
     state.workflowType = isValidWorkflowType(persisted.workflowType)
@@ -2788,6 +3203,47 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
+  /**
+   * Resume the gate from the persisted workflow state written by /belayd.
+   * A completed workflow is cleared instead of resurrected; a sub-agent never
+   * reaches this helper because its session has no workflow state file.
+   */
+  function resumeWorkflowFromDisk(state: SessionState, cwd: string, sessionKey: string): void {
+    // The caller-scoped marker wins over any workflow.json: a same-directory
+    // handoff cannot store the marker in the shared state file (the child owns
+    // it), so this file is the only reliable record for THIS session.
+    const callerMarker = readCallerHandoff({ cwd, sessionKey });
+    if (callerMarker !== undefined) {
+      settleHandoffPendingItems({ state, cwd, marker: callerMarker });
+      return;
+    }
+
+    const persisted = readWorkflowState({ cwd });
+    if (persisted === undefined) return;
+
+    // A handed-off workflow belongs to the child orchestrator. Re-arming this
+    // session's gate would put two orchestrators on the same bead again — the
+    // exact failure bd-120 fixes — so the marker wins over the phase ledger.
+    if (persisted.handedOffTo !== undefined) {
+      settleHandoffPendingItems({ state, cwd, marker: persisted.handedOffTo });
+      return;
+    }
+
+    if (!isValidTaskId(persisted.taskId)) {
+      // A crafted/corrupt workflow.json must not reach the `bd show ${taskId}` shell sink.
+      clearWorkflowState({ cwd });
+      return;
+    }
+
+    // A stale workflow.json that already finished must not resurrect the gate.
+    if (isWorkflowComplete(persisted.completedPhaseNames, persisted.phaseOrder)) {
+      clearWorkflowState({ cwd });
+      return;
+    }
+
+    armFromPersistedWorkflow(state, cwd, persisted);
+  }
+
   pi.on("session_start", (_event, ctx) => {
     // A session can restart mid-workflow (compaction/resume). Flush pending
     // rows before dropping the store, otherwise telemetry recorded since the
@@ -2806,6 +3262,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.proofVerifierVerdict = undefined;
     state.handoff = undefined;
     state.awaitingReviewResponse = false;
+    state.handedOffTo = undefined;
+    state.handoffPendingNotice = undefined;
     state.runEpoch = 0;
     resetRunTracking(state);
     applyToolGate(state);
@@ -2816,7 +3274,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const sessionName = ctx.sessionManager.getSessionName();
     const isSubAgent = sessionName?.includes("-sub-");
     if (!ctx.sessionManager.getSessionFile() || isSubAgent) return;
-    resumeWorkflowFromDisk(state, ctx.cwd);
+    resumeWorkflowFromDisk(state, ctx.cwd, ctx.sessionManager.getSessionId());
     // A user completion persisted before an orchestrator restart is recovered
     // from disk; the in-memory delivery marker was lost with the process.
     reconcileUserCompletions({ state, cwd: ctx.cwd });
@@ -4122,23 +4580,15 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
       const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
-      const sections: string[] = [];
+      const sections: string[] = [formatWorkflowStatusSection(state)];
 
-      sections.push(
-        state.gateActive
-          ? formatProcessState(state.completedPhaseNames, state.currentTaskId, state.phaseOrder)
-          : "Belayd process is inactive.",
-      );
-
-      const activeLines = ["**Active runs**"];
-      if (state.activeRuns.size > 0) {
-        for (const [runId, { handle }] of state.activeRuns) {
-          activeLines.push(`- \`${runId}\` — ${handle.phaseName} (${handle.status})`);
-        }
-      } else {
-        activeLines.push("(none)");
+      // Leftovers from the caller's own directory are reported instead of lost
+      // when a handed-off session resumes (bd-120).
+      if (state.handoffPendingNotice !== undefined) {
+        sections.push(`**Pending items from the handoff** — ${state.handoffPendingNotice}`);
       }
-      sections.push(activeLines.join("\n"));
+
+      sections.push(formatActiveRunsSection(state.activeRuns));
 
       const runs = listRuns({ cwd });
       if (runs.length > 0) {
@@ -4480,13 +4930,63 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     return `Stacked on ${base}.`;
   }
 
+  /**
+   * Resolve the branch a follow-up is stacked on, rejecting the detached-HEAD
+   * and self-stacking cases. Extracted so the tool handler stays under the
+   * complexity budget.
+   */
+  function resolveFollowupBase(options: {
+    branch: string;
+    requested?: string;
+    cwd: string;
+  }): { ok: true; base: string } | { ok: false; error: string } {
+    const base = options.requested ?? currentBranch(options.cwd);
+    if (base === undefined) {
+      return {
+        ok: false,
+        error:
+          "Cannot determine the base branch: the repository is in a detached HEAD state. Pass `base` explicitly.",
+      };
+    }
+    if (base === options.branch) {
+      return {
+        ok: false,
+        error: `The follow-up branch ${options.branch} cannot be stacked on itself.`,
+      };
+    }
+    return { ok: true, base };
+  }
+
+  /**
+   * Write back an explicit `workflowType` as a `wf:<type>` label. Called only
+   * after the launch guards pass, so a refused launch never mutates the bead.
+   */
+  async function persistExplicitWorkflowLabel(options: {
+    taskId: string;
+    cwd: string;
+    resolution: WorkflowResolution;
+    /** True when a confirmation flow already wrote the label. */
+    alreadyPersisted: boolean;
+    existingLabels?: string[];
+  }): Promise<void> {
+    if (options.resolution.source !== "arg" || options.alreadyPersisted) return;
+    await writeWorkflowTypeLabel({
+      taskId: options.taskId,
+      type: options.resolution.type,
+      cwd: options.cwd,
+      existingLabels: options.existingLabels,
+    });
+  }
+
   pi.registerTool({
     name: "belayd_start_followup",
     label: "Start stacked follow-up workflow",
     description:
       "Start a new Belayd workflow for a follow-up bead, stacked on the current branch " +
       "instead of main. Records the base branch and fork point so it can later be rebased " +
-      "onto main with belayd_stack_rebase.",
+      "onto main with belayd_stack_rebase. Hands the workflow off to a new orchestrator " +
+      "session and disarms this one. Set force: true to hand off even while this session " +
+      "has phase runs in flight (they are abandoned).",
     parameters: Type.Object({
       taskId: Type.String({ description: "Beads issue ID for the follow-up, e.g. bd-43" }),
       workflowType: Type.Optional(
@@ -4506,6 +5006,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
             "Free-text context for the spawned orchestrator. Overrides only the parent-summary line; task ids, branch/base/fork point and the completed phase list are always collected from the parent session.",
         }),
       ),
+      force: Type.Optional(
+        Type.Boolean({
+          description:
+            "Hand off even while this session has phase runs in flight; the live runs are abandoned.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (!isValidTaskId(params.taskId)) {
@@ -4517,16 +5023,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const cwd = ctx.cwd ?? process.cwd();
       const branch = `feat/${params.taskId}`;
-      const base = params.base ?? currentBranch(cwd);
-      if (base === undefined) {
-        return textToolResult(
-          "Cannot determine the base branch: the repository is in a detached HEAD state. Pass `base` explicitly.",
-          1,
-        );
-      }
-      if (base === branch) {
-        return textToolResult(`The follow-up branch ${branch} cannot be stacked on itself.`, 1);
-      }
+      const baseResult = resolveFollowupBase({ branch, requested: params.base, cwd });
+      if (!baseResult.ok) return textToolResult(baseResult.error, 1);
+      const base = baseResult.base;
 
       const metadata = await readTaskMetadata(params.taskId, cwd);
       const toolResolution = await resolveToolWorkflowResolution({
@@ -4539,16 +5038,26 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       const resolution = toolResolution.resolution;
       const workflowType = resolution.type;
-      // A choose-another-type confirmation already persisted the label; only an
-      // explicit arg needs the write-back here.
-      if (resolution.source === "arg" && !toolResolution.persisted) {
-        await writeWorkflowTypeLabel({
-          taskId: params.taskId,
-          type: workflowType,
-          cwd,
-          existingLabels: metadata?.labels,
-        });
-      }
+
+      // Refuse a launch that would duplicate this session's own work *before*
+      // writing the wf:<type> label, so a refused launch leaves the bead
+      // untouched (bd-120). The same guards run again inside
+      // launchWorktreeWorkflow for callers that do not pre-check.
+      const blocker = launchBlocker({
+        state: getSessionState(ctx),
+        cwd,
+        branch,
+        force: params.force === true,
+      });
+      if (blocker !== undefined) return textToolResult(blocker, 1);
+
+      await persistExplicitWorkflowLabel({
+        taskId: params.taskId,
+        cwd,
+        resolution,
+        alreadyPersisted: toolResolution.persisted,
+        existingLabels: metadata?.labels,
+      });
 
       const outcome = await launchWorktreeWorkflow({
         ctx,
@@ -4559,6 +5068,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         handoff: params.handoff,
         resolutionSource: resolution.source,
         matchedLabel: resolution.matchedLabel,
+        force: params.force === true,
       });
       if (!outcome.ok) return textToolResult(outcome.error, 1);
 
@@ -4705,6 +5215,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       state.gateActive = false;
       state.completedPhaseNames = [];
+      // A stopped session no longer hands anything off; leaving the marker in
+      // memory would keep `belayd_status` reporting "Handed off" until restart.
+      state.handedOffTo = undefined;
+      state.handoffPendingNotice = undefined;
+      const clearedCallerMarker = clearCallerHandoff({
+        cwd: ctx.cwd,
+        sessionKey: ctx.sessionManager.getSessionId(),
+      });
+      if (!clearedCallerMarker.ok) {
+        reportHandoffProblem(
+          `Belayd could not clear this session's handoff marker (${clearedCallerMarker.error}); ` +
+            "a restart may still report a handoff that was stopped here.",
+        );
+      }
       state.workflowType = "feature";
       state.phaseOrder = getPhasesForType("feature");
       state.optionalPhases = WORKFLOW_REGISTRY.feature.optionalPhases ?? [];
