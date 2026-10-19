@@ -19,6 +19,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Narrow an untrusted value (e.g. `SessionManager.getBranch()`) to the minimal
+ * structural entry shape this module reads.
+ *
+ * Entries that are not records are dropped rather than rejected wholesale: a
+ * runtime that adds a new entry kind must not break transcript recovery. No
+ * property is trusted beyond `type`/`message` being present on a record, and
+ * both stay `unknown` so consumers still narrow before use.
+ */
+export function narrowTranscriptEntries(entries: unknown): TranscriptEntry[] {
+  if (!Array.isArray(entries)) return [];
+  const narrowed: TranscriptEntry[] = [];
+  for (const entry of entries) {
+    // Arrays are objects too; an entry must be a plain record.
+    if (!isRecord(entry) || Array.isArray(entry)) continue;
+    narrowed.push({ type: entry.type, message: entry.message });
+  }
+  return narrowed;
+}
+
+/**
  * Extract the text of an assistant message's content.
  *
  * Assistant content is normally an array of blocks; only `text` blocks count.

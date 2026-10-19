@@ -14,10 +14,10 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type {
   BashToolCallEvent,
   ExtensionAPI,
@@ -39,6 +39,8 @@ import type {
   ArchifyDiagramType,
   ArchifyQuality,
   ArchifyTextResult,
+  BelaydCommandArgs,
+  HandoffPacket,
   ModelClass,
   OutlineFilesOptions,
   OutlineKind,
@@ -51,6 +53,7 @@ import type {
   SpawnResult,
   StackNode,
   SubagentSessionRef,
+  TranscriptEntry,
   WorkflowResolution,
   WorkflowResolutionSource,
   WorkflowState,
@@ -72,9 +75,12 @@ import {
   buildArchifyCheckArgs,
   buildArchifyGuideArgs,
   buildArchifyInspectArgs,
+  buildOrchestratorPrompt,
   buildVerifierPrompt,
   checkToolAllowed,
+  clearHandoff,
   collectChangeContext,
+  collectHandoffDefault,
   collectReviewDiff,
   createInstructionGroupCollector,
   currentBranch,
@@ -86,6 +92,7 @@ import {
   findWorkspaceRoot,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
+  formatHandoffBlock,
   formatOutline,
   formatProcessState,
   formatReviewTask,
@@ -102,6 +109,7 @@ import {
   isInsideWorktreeForBranch,
   isOutlineKind,
   isSameOrDescendantTask,
+  isSafeChdirTarget,
   isValidTaskId,
   isValidWorkflowType,
   isWorkflowComplete,
@@ -114,6 +122,7 @@ import {
   markPhaseCompleted,
   matchSessionOwnedWorktree,
   NO_GROUP_REGISTERED_WARNING,
+  narrowTranscriptEntries,
   OUTLINE_FILE_EXTENSIONS,
   OUTLINE_KINDS,
   outlineFiles,
@@ -121,11 +130,14 @@ import {
   PLANNING_MODE_TOOLS,
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
+  parseBelaydCommandArgs,
   parseSubagentSessionName,
   parseWorkflowLabel,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
+  readHandoff,
+  readHandoffFileArg,
   readStackNode,
   readWorktreeBranch,
   resolveArchifyHome,
@@ -143,11 +155,13 @@ import {
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
+  taskIdFromBranch,
   validateBdCommand,
   WF_LABEL_PREFIX,
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
   watchRunCompletion,
+  writeHandoff,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
 import {
@@ -247,6 +261,12 @@ type SessionState = {
   /** True after a review run completes and before a later phase runs again. */
   awaitingReviewResponse: boolean;
   /**
+   * Handoff packet received from the parent session that launched this
+   * orchestrator (`.belayd/handoff.json`). Re-read on resume so a restart or
+   * compaction re-injects the parent's context instead of losing it.
+   */
+  handoff?: HandoffPacket;
+  /**
    * Monotonic teardown counter, bumped whenever the active workflow is torn
    * down (start/stop task, /plan entry, workflow completion, session restart).
    * A run captures it at launch so runs started before a teardown can be told
@@ -331,8 +351,48 @@ function runGitCommand(
 ): Promise<{ stdout: string; stderr: string }> {
   return runFileCommand("git", argv, { ...options, stdin: undefined });
 }
+/**
+ * Resolve a `--handoff` value into text. `@path` reads the file relative to the
+ * calling session's cwd — pi-web processes run with cwd `/`, so resolving
+ * against `process.cwd()` would silently miss the file. The read itself is
+ * bounded and regular-file-only (see `readHandoffFileArg`).
+ */
+function resolveHandoffArg(
+  handoff: string | undefined,
+  cwd: string,
+): { ok: true; text: string | undefined } | { ok: false; error: string } {
+  if (handoff === undefined || !handoff.startsWith("@")) {
+    return { ok: true, text: handoff };
+  }
+  const handoffPath = handoff.slice(1);
+  const resolvedPath = isAbsolute(handoffPath) ? handoffPath : join(cwd, handoffPath);
+  const read = readHandoffFileArg({ path: resolvedPath });
+  return read.ok ? { ok: true, text: read.text } : read;
+}
 
-// Shared per-orchestrator model cooldown store: when a model hits a quota/rate
+/** Usage text for `/belayd`; shared by every rejection path. */
+function belaydUsageText(): string {
+  return [
+    "Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>]",
+    "  taskId: beads issue or subtask ID (e.g. bd-42, bd-42.1)",
+    "  type: optional; omit to use the bead's wf:<type> label. Valid: feature (default), bugfix, research, chore, documentation, refactor, hotfix",
+    "  --no-worktree: activate gate in the current directory, no worktree or daemon",
+    "  --handoff <text|@path>: context for the spawned orchestrator. Everything after the flag is its value (quote multi-word text); `@path` reads a file relative to the current directory",
+  ].join("\n");
+}
+
+/**
+ * Whether the parsed arguments can start a workflow. A bare `--handoff` is a
+ * usage error rather than "no handoff": silently dropping it would launch a
+ * child with no context while looking successful.
+ */
+function isUsableBelaydInvocation(args: BelaydCommandArgs): boolean {
+  return (
+    args.taskId !== "" &&
+    isValidTaskId(args.taskId) &&
+    (!args.handoffFlagPresent || args.handoff !== undefined)
+  );
+}
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
 // Persisted to disk so cooldowns survive orchestrator restarts.
 // Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
@@ -1184,6 +1244,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.userGuideContent = undefined;
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
+    // A fresh gate carries no parent packet; only the worktree launch writes
+    // one, and only resume-from-disk reads it back.
+    state.handoff = undefined;
     state.awaitingReviewResponse = false;
     abortAndResetRunTracking(state);
     applyToolGate(state);
@@ -2016,26 +2079,33 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /** Delegate a worktree workflow to the pi-web session daemon. */
-  async function createOrchestratorSession(
-    ctx: ExtensionContext,
-    taskId: string,
-    workflowType: WorkflowSubType,
-    branch: string,
-    worktreePath: string,
-    base?: string,
-    resolutionSource?: WorkflowResolutionSource,
-    matchedLabel?: string,
-  ): Promise<void> {
-    const originalCwd = process.cwd();
+  async function createOrchestratorSession(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    workflowType: WorkflowSubType;
+    branch: string;
+    worktreePath: string;
+    base?: string;
+    forkPoint?: string;
+    resolutionSource?: WorkflowResolutionSource;
+    matchedLabel?: string;
+    handoff?: HandoffPacket;
+  }): Promise<void> {
+    const { ctx, taskId, workflowType, branch, worktreePath } = options;
+    // ctx.cwd is the calling session's directory; process.cwd() is `/` in
+    // pi-web session processes, and belayd_stop_task chdirs back to this value.
+    const originalCwd = ctx.cwd;
     const phaseOrder = getPhasesForType(workflowType);
-    const prompt = [
-      `Start the Belayd ${workflowType} workflow for ${taskId}.`,
-      `The worktree is \`${branch}\`.`,
-      ...(base !== undefined ? [`Stacked on \`${base}\`.`] : []),
-      "",
-      `Follow the enforced phase order: ${phaseOrder.join(" → ")}.`,
-      `Begin by calling \`belayd_${phaseOrder[0] ?? "commit"}\` to start.`,
-    ].join("\n");
+    const prompt = buildOrchestratorPrompt({
+      taskId,
+      workflowType,
+      worktreePath,
+      branch,
+      phaseOrder,
+      base: options.base,
+      forkPoint: options.forkPoint,
+      handoff: options.handoff,
+    });
 
     // Persist workflow state so the new session's session_start handler can
     // activate (and later resume) the gate.
@@ -2046,8 +2116,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         schemaVersion: 1,
         taskId,
         workflowType,
-        resolutionSource: resolutionSource ?? "default",
-        ...(matchedLabel !== undefined ? { matchedLabel } : {}),
+        resolutionSource: options.resolutionSource ?? "default",
+        ...(options.matchedLabel !== undefined ? { matchedLabel: options.matchedLabel } : {}),
         branch,
         originalCwd,
         phaseOrder,
@@ -2059,6 +2129,17 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     if (!writeResult.ok) {
       ctx.ui.notify(`Failed to persist Belayd workflow state: ${writeResult.error}`, "error");
       return;
+    }
+
+    // Persist the handoff beside the workflow state so a child restart (which
+    // only reads disk) can recover it; written before the session exists.
+    if (options.handoff !== undefined) {
+      const handoffResult = writeHandoff({ cwd: worktreePath, packet: options.handoff });
+      if (!handoffResult.ok) {
+        // A missing packet degrades the child's first turn, it does not block
+        // the launch: the workflow state and prompt are already complete.
+        console.warn(`[belayd-harness] failed to persist handoff packet: ${handoffResult.error}`);
+      }
     }
 
     // Delegate to pi-web session daemon for persistent session management.
@@ -2086,6 +2167,54 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   }
 
   /**
+   * The calling session's branch entries, narrowed for the transcript helper.
+   * Older/other runtimes may not expose `getBranch`; the handoff then simply
+   * has no transcript-derived summary instead of failing the launch.
+   */
+  function readSessionBranch(ctx: ExtensionContext): TranscriptEntry[] {
+    const manager: { getBranch?: () => unknown } = ctx.sessionManager;
+    if (typeof manager.getBranch !== "function") return [];
+    try {
+      // pi hands back its own SessionEntry[]; narrow it at the boundary instead
+      // of casting, so a runtime change degrades to "no transcript" rather
+      // than undefined shape failures downstream.
+      return narrowTranscriptEntries(manager.getBranch());
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Identity of the session launching a workflow, recorded in the child's
+   * handoff packet so the child can tell its parent from an unrelated run.
+   */
+  function resolveParentIdentity(
+    ctx: ExtensionContext,
+    base: string | undefined,
+  ): {
+    parentTaskId?: string;
+    parentBranch?: string;
+    parentSessionId?: string;
+    parentWorktreePath?: string;
+  } {
+    const state = getSessionState(ctx);
+    const parentBranch = base ?? currentBranch(ctx.cwd);
+    const activeTaskId =
+      state.gateActive && state.currentTaskId !== "" ? state.currentTaskId : undefined;
+    // A `/belayd` branch is cut from the caller's branch, so the branch name is
+    // the only record of which bead the parent workflow belonged to.
+    const parentTaskId =
+      activeTaskId ?? (parentBranch !== undefined ? taskIdFromBranch(parentBranch) : undefined);
+    const sessionId = ctx.sessionManager.getSessionId();
+    return {
+      ...(parentTaskId !== undefined ? { parentTaskId } : {}),
+      ...(parentBranch !== undefined ? { parentBranch } : {}),
+      ...(sessionId !== "" ? { parentSessionId: sessionId } : {}),
+      parentWorktreePath: ctx.cwd,
+    };
+  }
+
+  /**
    * Shared tail of the `/belayd` command and `belayd_start_followup`: ensure the
    * worktree (stacking on `base` when given), wait for its dependencies, then
    * delegate the orchestrator session. Returns an error result instead of
@@ -2097,6 +2226,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     workflowType: WorkflowSubType;
     branch: string;
     base?: string;
+    /** Explicit caller handoff text; overrides only the transcript summary. */
+    handoff?: string;
     resolutionSource?: WorkflowResolutionSource;
     matchedLabel?: string;
   }): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -2115,16 +2246,43 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     const ready = await awaitWorktreeReady(worktreePath);
     if (!ready.ok) return { ok: false, error: `Worktree not ready: ${ready.error}` };
 
-    await createOrchestratorSession(
-      options.ctx,
-      options.taskId,
-      options.workflowType,
-      options.branch,
+    // The worktree create path records the effective base + fork point, so the
+    // packet's stack identity comes from git rather than from a re-derivation.
+    const stack = readStackNode(options.ctx.cwd, options.branch);
+    const base = options.base ?? stack?.base;
+    const parent = resolveParentIdentity(options.ctx, base);
+    const handoff = await collectHandoffDefault({
+      cwd: options.ctx.cwd,
+      taskId: options.taskId,
+      workflowType: options.workflowType,
+      branch: options.branch,
       worktreePath,
-      options.base,
-      options.resolutionSource,
-      options.matchedLabel,
-    );
+      base,
+      forkPoint: stack?.forkPoint,
+      parentTaskId: parent.parentTaskId,
+      parentBranch: parent.parentBranch,
+      parentSessionId: parent.parentSessionId,
+      parentWorktreePath: parent.parentWorktreePath,
+      // Merge semantics: an explicit handoff replaces only the free-text
+      // summary; task ids, branch/base/fork point, phase list and dirty files
+      // are always collected mechanically so they cannot drift from git/bd.
+      parentSummary: options.handoff,
+      transcript: readSessionBranch(options.ctx),
+      deps: { showTask: (taskId) => readTaskPlan(taskId, options.ctx.cwd) },
+    });
+
+    await createOrchestratorSession({
+      ctx: options.ctx,
+      taskId: options.taskId,
+      workflowType: options.workflowType,
+      branch: options.branch,
+      worktreePath,
+      base,
+      forkPoint: stack?.forkPoint,
+      resolutionSource: options.resolutionSource,
+      matchedLabel: options.matchedLabel,
+      handoff,
+    });
     return { ok: true };
   }
 
@@ -2171,6 +2329,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       abortAndResetRunTracking(state);
       state.gateActive = false;
       clearWorkflowState({ cwd: ctx.cwd });
+      clearHandoff({ cwd: ctx.cwd });
 
       state.planningActive = true;
       state.planningTarget = planningTarget;
@@ -2200,92 +2359,141 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * `/belayd --no-worktree`: activate the gate in this session. Extracted from
+   * the command handler so the handler stays a readable sequence of guards.
+   */
+  function startInSessionWorkflow(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    workflowType: WorkflowSubType;
+    resolution: WorkflowResolution;
+  }): void {
+    const { ctx, taskId, workflowType, resolution } = options;
+    activateGate({
+      ctx,
+      taskId,
+      workflowType,
+      cwd: ctx.cwd,
+      originalCwd: ctx.cwd,
+      resolutionSource: resolution.source,
+      matchedLabel: resolution.matchedLabel,
+    });
+    ctx.ui.notify(
+      `Belayd ${workflowType} workflow started for ${taskId} (no worktree). ${describeResolutionSource(
+        resolution,
+      )}.`,
+      "info",
+    );
+    sendWorkflowMessage(pi, taskId, null, workflowType, undefined, resolution);
+  }
+
+  /**
+   * Resolve `--handoff` for a `/belayd` launch. In `--no-worktree` mode there is
+   * no child to hand off to, so the flag is reported as ignored (and the file
+   * is not read) rather than accepted and silently discarded.
+   */
+  function resolveBelaydHandoff(options: {
+    ctx: ExtensionContext;
+    args: BelaydCommandArgs;
+  }): { ok: true; text: string | undefined } | { ok: false; error: string } {
+    if (!options.args.noWorktree) {
+      return resolveHandoffArg(options.args.handoff, options.ctx.cwd);
+    }
+    if (options.args.handoffFlagPresent) {
+      options.ctx.ui.notify(
+        "`--handoff` is ignored with `--no-worktree`: the gate runs in this session, so no child orchestrator is spawned.",
+        "warning",
+      );
+    }
+    return { ok: true, text: undefined };
+  }
+
+  /**
+   * Resolve the workflow type (including the wf: label confirmation) and start
+   * the workflow — in-session for `--no-worktree`, otherwise in a delegated
+   * worktree session. Split out of the command handler so the handler stays a
+   * short sequence of guards.
+   */
+  async function runBelaydLaunch(options: {
+    ctx: ExtensionContext;
+    args: BelaydCommandArgs;
+  }): Promise<void> {
+    const { ctx, args } = options;
+
+    // Resolve the explicit handoff before any side effect, so an unreadable
+    // file aborts the command untouched rather than half-launching a child.
+    const handoffArg = resolveBelaydHandoff({ ctx, args });
+    if (!handoffArg.ok) {
+      ctx.ui.notify(handoffArg.error, "error");
+      return;
+    }
+
+    // Explicit signals only: a CLI arg or a namespaced wf:<type> label. Title
+    // keywords and plain labels never drive the choice (bd-106).
+    const metadata = await readTaskMetadata(args.taskId, ctx.cwd);
+    let resolution = resolveWorkflowSelection(args.typeArg, metadata?.labels);
+
+    if (args.typeArg !== undefined && !isValidWorkflowType(args.typeArg)) {
+      ctx.ui.notify(
+        `Unknown workflow type: "${args.typeArg}".\nValid types: feature, bugfix, research, chore, documentation, refactor, hotfix\nFalling back to "${resolution.type}".`,
+        "warning",
+      );
+    }
+
+    // A wf: label drives the type -> confirm before any side effects. A
+    // cancelled (or unavailable) dialog aborts the run untouched.
+    const confirmed = await confirmAndPersistResolution({
+      ctx,
+      taskId: args.taskId,
+      resolution,
+      existingLabels: metadata?.labels,
+    });
+    if (confirmed.kind === "cancelled") {
+      ctx.ui.notify("Belayd workflow cancelled — no changes made.", "info");
+      return;
+    }
+    resolution = confirmed.resolution;
+
+    if (args.noWorktree) {
+      startInSessionWorkflow({
+        ctx,
+        taskId: args.taskId,
+        workflowType: resolution.type,
+        resolution,
+      });
+      return;
+    }
+
+    const outcome = await launchWorktreeWorkflow({
+      ctx,
+      taskId: args.taskId,
+      workflowType: resolution.type,
+      branch: `feat/${args.taskId}`,
+      handoff: handoffArg.text,
+      resolutionSource: resolution.source,
+      matchedLabel: resolution.matchedLabel,
+    });
+    if (!outcome.ok) ctx.ui.notify(outcome.error, "error");
+  }
+
   // ── Slash command: /belayd bd-42 [type] ────────────────────────────
   pi.registerCommand("belayd", {
     description:
-      "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree]. " +
+      "Start enforced Belayd workflow. Usage: /belayd bd-42 [type] [--no-worktree] [--handoff <text|@path>]. " +
       "Omit type to use the bead's wf:<type> label (confirmed before launch).",
     handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/);
-      const taskId = parts[0] ?? "";
-
-      // Filter out flags from type arg
-      const noWorktree = parts.includes("--no-worktree");
-      const typeArg = parts.slice(1).find((p) => p !== "--no-worktree");
-
-      if (!taskId || !isValidTaskId(taskId)) {
-        ctx.ui.notify(
-          "Usage: /belayd bd-42 [type] [--no-worktree]\n" +
-            "  taskId: beads issue or subtask ID (e.g. bd-42, bd-42.1)\n" +
-            "  type: optional; omit to use the bead's wf:<type> label. Valid: feature (default), bugfix, research, chore, documentation, refactor, hotfix\n" +
-            "  --no-worktree: activate gate in the current directory, no worktree or daemon",
-          "error",
-        );
+      const parsedArgs = parseBelaydCommandArgs(args);
+      if (!parsedArgs.ok) {
+        ctx.ui.notify(parsedArgs.error, "error");
         return;
       }
-
-      // Explicit signals only: a CLI arg or a namespaced wf:<type> label. Title
-      // keywords and plain labels never drive the choice (bd-106).
-      const metadata = await readTaskMetadata(taskId, ctx.cwd);
-      let resolution = resolveWorkflowSelection(typeArg, metadata?.labels);
-
-      if (typeArg && !isValidWorkflowType(typeArg)) {
-        ctx.ui.notify(
-          `Unknown workflow type: "${typeArg}".\nValid types: feature, bugfix, research, chore, documentation, refactor, hotfix\nFalling back to "${resolution.type}".`,
-          "warning",
-        );
-      }
-
-      // A wf: label drives the type -> confirm before any side effects. A
-      // cancelled (or unavailable) dialog aborts the run untouched.
-      const confirmed = await confirmAndPersistResolution({
-        ctx,
-        taskId,
-        resolution,
-        existingLabels: metadata?.labels,
-      });
-      if (confirmed.kind === "cancelled") {
-        ctx.ui.notify("Belayd workflow cancelled — no changes made.", "info");
+      const parsed = parsedArgs.args;
+      if (!isUsableBelaydInvocation(parsed)) {
+        ctx.ui.notify(belaydUsageText(), "error");
         return;
       }
-      resolution = confirmed.resolution;
-
-      const workflowType = resolution.type;
-
-      // --no-worktree mode: activate gate in-place, no isolation
-      if (noWorktree) {
-        activateGate({
-          ctx,
-          taskId,
-          workflowType,
-          cwd: ctx.cwd,
-          originalCwd: process.cwd(),
-          resolutionSource: resolution.source,
-          matchedLabel: resolution.matchedLabel,
-        });
-        ctx.ui.notify(
-          `Belayd ${workflowType} workflow started for ${taskId} (no worktree). ${describeResolutionSource(
-            resolution,
-          )}.`,
-          "info",
-        );
-        sendWorkflowMessage(pi, taskId, null, workflowType, undefined, resolution);
-        return;
-      }
-
-      const branch = `feat/${taskId}`;
-      const outcome = await launchWorktreeWorkflow({
-        ctx,
-        taskId,
-        workflowType,
-        branch,
-        resolutionSource: resolution.source,
-        matchedLabel: resolution.matchedLabel,
-      });
-      if (!outcome.ok) {
-        ctx.ui.notify(outcome.error, "error");
-        return;
-      }
+      await runBelaydLaunch({ ctx, args: parsed });
     },
   });
 
@@ -2560,6 +2768,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.optionalPhases = WORKFLOW_REGISTRY[state.workflowType].optionalPhases ?? [];
     state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
     state.completedPhaseNames = [...persisted.completedPhaseNames];
+    // Re-read the parent's handoff so a restart/compaction re-injects it; the
+    // packet lives beside workflow.json rather than inside it (bd-121). A
+    // packet for a different task is stale (worktree reused) and must not be
+    // injected into this workflow.
+    const handoff = readHandoff({ cwd });
+    state.handoff = handoff?.taskId === persisted.taskId ? handoff : undefined;
     state.awaitingReviewResponse =
       persisted.awaitingReviewResponse ??
       isAwaitingReviewResponse(persisted.completedPhaseNames, persisted.phaseOrder);
@@ -2590,6 +2804,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     state.userGuideContent = undefined;
     state.proofOutput = undefined;
     state.proofVerifierVerdict = undefined;
+    state.handoff = undefined;
     state.awaitingReviewResponse = false;
     state.runEpoch = 0;
     resetRunTracking(state);
@@ -2779,6 +2994,10 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       remainingPhase: remaining,
     });
 
+    // The handoff section is additive: an absent packet (older workflow, or a
+    // launch that never had a parent session) leaves the gate text unchanged.
+    const handoffLines = state.handoff !== undefined ? ["", formatHandoffBlock(state.handoff)] : [];
+
     return {
       message: {
         customType: "belayd-gate-context",
@@ -2796,6 +3015,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           ...proofVerifierGuidanceLines(phaseOrder),
           ...proofModalityGuidanceLines(phaseOrder),
           ...worktreeSyncGuidanceLines(),
+          ...handoffLines,
           ...activeRunLines,
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
@@ -4280,6 +4500,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
           description: "Base branch to stack on (defaults to the current branch)",
         }),
       ),
+      handoff: Type.Optional(
+        Type.String({
+          description:
+            "Free-text context for the spawned orchestrator. Overrides only the parent-summary line; task ids, branch/base/fork point and the completed phase list are always collected from the parent session.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (!isValidTaskId(params.taskId)) {
@@ -4330,6 +4556,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         workflowType,
         branch,
         base,
+        handoff: params.handoff,
         resolutionSource: resolution.source,
         matchedLabel: resolution.matchedLabel,
       });
@@ -4444,12 +4671,37 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       // In-flight background runs must not survive task teardown.
       abortAndResetRunTracking(state);
 
-      // Restore original cwd if we're in a worktree
+      // Restore original cwd if we're in a worktree. The recorded path comes
+      // from another process (and older workflows recorded `/`), so it is
+      // validated before chdir instead of trusted blindly.
+      let chdirNote = "";
       const persisted = readWorkflowState({ cwd: ctx.cwd });
       if (persisted) {
-        process.chdir(persisted.originalCwd);
+        const target = isSafeChdirTarget({
+          path: persisted.originalCwd,
+          existsSync: (path) => existsSync(path),
+          // statSync can race a concurrent delete; a probe failure means "not a
+          // directory" and must not throw out of the tool handler.
+          isDirectory: (path) => {
+            try {
+              return statSync(path).isDirectory();
+            } catch {
+              return false;
+            }
+          },
+        });
+        if (target.allowed) {
+          process.chdir(target.path);
+        } else {
+          chdirNote = `\nWorking directory unchanged: ${target.reason}.`;
+        }
         clearWorkflowState({ cwd: ctx.cwd });
       }
+
+      // Teardown always drops the packet, even when workflow.json is missing: a
+      // stale handoff must never be re-injected by the next workflow that runs
+      // in this worktree.
+      clearHandoff({ cwd: ctx.cwd });
 
       state.gateActive = false;
       state.completedPhaseNames = [];
@@ -4468,7 +4720,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         content: [
           {
             type: "text" as const,
-            text: "Belayd process deactivated.",
+            text: `Belayd process deactivated.${chdirNote}`,
           },
         ],
         details: {
@@ -5106,6 +5358,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
       // Workflow complete: the persisted state file is no longer needed.
       clearWorkflowState({ cwd: ctx.cwd });
+      clearHandoff({ cwd: ctx.cwd });
       // Log the workflow's telemetry summary exactly once here, then start a
       // fresh store so a later phase-run settle cannot re-log it.
       resetModelTelemetry(ctx.cwd, { log: true });

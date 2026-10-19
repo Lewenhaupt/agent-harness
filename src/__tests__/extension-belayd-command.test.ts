@@ -7,11 +7,13 @@
  *   Extension "command:belayd" error: cwd field must be a string
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readHandoff } from "../handoff.js";
+import { readWorkflowState } from "../workflow-state.js";
 
 // Isolate the extension's persistent cooldown store from the real user file.
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
@@ -198,5 +200,149 @@ describe("/belayd command daemon delegation", () => {
     const body = JSON.parse(promptCall?.body ?? "{}") as { cwd?: string; text?: string };
     expect(body.cwd).toBe(worktreeDir);
     expect(body.text).toContain("Belayd feature workflow");
+    // bd-121: the child's first turn carries identity + ownership + handoff
+    // instead of a bare task/worktree line.
+    expect(body.text).toContain("## Identity");
+    expect(body.text).toContain(`- Worktree (absolute): ${worktreeDir}`);
+    expect(body.text).toContain("- Branch: feat/bd-42");
+    expect(body.text).toContain("## Ownership");
+    expect(body.text).toContain(`You own this worktree only (${worktreeDir}).`);
+    expect(body.text).toContain("you cannot drive another workflow");
+    expect(body.text).toContain("## Handoff");
+  });
+
+  it("records the calling session's cwd as originalCwd (never /)", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const notify = vi.fn();
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42", ctx);
+
+    // pi-web session processes run with cwd `/`; persisting process.cwd()
+    // made belayd_stop_task chdir to the filesystem root.
+    expect(readWorkflowState({ cwd: worktreeDir })?.originalCwd).toBe(worktreeDir);
+  });
+
+  it("persists the handoff packet in the child worktree before the session starts", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify: vi.fn() },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42", ctx);
+
+    const packet = readHandoff({ cwd: worktreeDir });
+    expect(packet).toBeDefined();
+    expect(packet).toHaveProperty("taskId", "bd-42");
+    expect(packet).toHaveProperty("branch", "feat/bd-42");
+    // Written before POST /sessions, so it is on disk for the child's restart.
+    expect(existsSync(join(worktreeDir, ".belayd", "handoff.json"))).toBe(true);
+    const promptCall = httpCalls.calls.find((call) => call.path === "/sessions/sess-123/prompt");
+    const body = JSON.parse(promptCall?.body ?? "{}") as { text?: string };
+    expect(body.text).toContain("- Task: bd-42 (feature workflow)");
+    expect(readFileSync(join(worktreeDir, ".belayd", "handoff.json"), "utf8")).toContain(
+      '"taskId": "bd-42"',
+    );
+  });
+
+  it("reads --handoff @path and puts the text in the child prompt", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const handoffFile = join(worktreeDir, "plan.md");
+    writeFileSync(handoffFile, "Parent plan: split bd-42 into two phases.");
+
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify: vi.fn() },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42 feature --handoff @plan.md", ctx);
+
+    expect(readHandoff({ cwd: worktreeDir })?.parentSummary).toBe(
+      "Parent plan: split bd-42 into two phases.",
+    );
+  });
+
+  it("joins unquoted multi-word --handoff text instead of truncating it", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify: vi.fn() },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42 --handoff Follow the retry plan closely", ctx);
+
+    expect(readHandoff({ cwd: worktreeDir })?.parentSummary).toBe("Follow the retry plan closely");
+    // The swallowed value used to be re-read as the workflow type, producing a
+    // spurious "Unknown workflow type" warning.
+    expect(readWorkflowState({ cwd: worktreeDir })?.workflowType).toBe("feature");
+  });
+
+  it("warns that --handoff is ignored with --no-worktree", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const notify = vi.fn();
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42 --no-worktree --handoff the plan", ctx);
+
+    expect(
+      notify.mock.calls.some(
+        ([text, level]) =>
+          String(text).includes("--handoff") &&
+          String(text).includes("ignored") &&
+          level === "warning",
+      ),
+    ).toBe(true);
+    // No child session is spawned in --no-worktree mode.
+    expect(httpCalls.calls.some((call) => call.path === "/sessions")).toBe(false);
+    expect(readHandoff({ cwd: worktreeDir })).toBeUndefined();
+  });
+
+  it("aborts without side effects when --handoff @path is unreadable", async () => {
+    const { api, commands } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const notify = vi.fn();
+    const ctx = {
+      cwd: worktreeDir,
+      ui: { notify },
+      sessionManager: { getSessionId: () => "test-session" },
+    };
+
+    await commands.get("belayd")?.handler("bd-42 --handoff @missing.md", ctx);
+
+    expect(notify.mock.calls.some(([, level]) => level === "error")).toBe(true);
+    // Nothing was launched: no worktree command, no session, no `.belayd/`.
+    expect(mockExecFileSync).not.toHaveBeenCalled();
+    expect(httpCalls.calls.some((call) => call.path === "/sessions")).toBe(false);
+    expect(existsSync(join(worktreeDir, ".belayd"))).toBe(false);
+    expect(existsSync(join(worktreeDir, ".belayd", "handoff.json"))).toBe(false);
   });
 });

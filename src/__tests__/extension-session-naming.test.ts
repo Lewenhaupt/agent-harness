@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { buildHandoff, handoffFilePath, writeHandoff } from "../handoff.js";
 import { REVIEW_SECTION_LIMITS } from "../review-context.js";
 import {
   listRuns,
@@ -2195,6 +2196,159 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(message).toContain("Mid-rebase conflicts are expected");
     expect(message).toContain("**Stacked follow-up worktree?**");
     expect(message).toContain("belayd_stack_rebase");
+  });
+
+  it("re-injects the handoff packet from disk after a simulated restart", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout"] }),
+    });
+    // The packet lives beside workflow.json (not inside it), so the restart
+    // path must read it separately.
+    writeHandoff({
+      cwd,
+      packet: buildHandoff({
+        taskId: "bd-42",
+        workflowType: "feature",
+        branch: "feat/bd-42",
+        worktreePath: cwd,
+        base: "feat/bd-40",
+        forkPoint: "fork-40",
+        parentTaskId: "bd-40",
+        parentBranch: "feat/bd-40",
+        parentSessionId: "parent-session",
+        parentWorktreePath: "/repo/.feat-bd-40",
+        parentSummary: "Parent plan: keep the review gate on.",
+        completedPhases: ["scout"],
+        now: 1,
+      }),
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    expect(message).toContain("## Handoff");
+    expect(message).toContain("Parent plan: keep the review gate on.");
+    expect(message).toContain("- Parent: bd-40");
+    expect(message).toContain("- Base: feat/bd-40 (fork point fork-40)");
+    expect(message).toContain("Next required step: call `belayd_implement`");
+  });
+
+  it("ignores a handoff packet recorded for a different task", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout"] }),
+    });
+    // A previous workflow in this worktree left its packet behind; injecting it
+    // would feed bd-43's plan into bd-42 every turn.
+    writeHandoff({
+      cwd,
+      packet: buildHandoff({
+        taskId: "bd-43",
+        workflowType: "feature",
+        branch: "feat/bd-43",
+        worktreePath: cwd,
+        parentSummary: "Stale plan from another task.",
+        now: 1,
+      }),
+    });
+
+    const { eventHandlers } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await fireSessionStart(eventHandlers, ctx);
+    const message = await gateContextMessage(eventHandlers, ctx);
+
+    expect(message).toContain("BELAYD WORKFLOW ACTIVE");
+    expect(message).not.toContain("## Handoff");
+    expect(message).not.toContain("Stale plan from another task.");
+  });
+
+  it("refuses to chdir to the filesystem root on belayd_stop_task", async () => {
+    const cwd = freshWorktree();
+    // Older pi-web workflows persisted originalCwd "/" (session processes start
+    // with cwd `/`); restoring it would chdir the session into the root.
+    writeWorkflowState({ cwd, state: featureState({ originalCwd: "/" }) });
+
+    const { tools } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    // Spy rather than read process.cwd(): an earlier test may have chdir'd the
+    // runner into a since-deleted temp worktree, which makes process.cwd throw.
+    const chdir = vi.spyOn(process, "chdir").mockImplementation(() => {});
+
+    try {
+      const result = (await tools
+        .get("belayd_stop_task")
+        ?.execute("stop", {}, undefined, undefined, ctx)) as
+        | { content: Array<{ text: string }> }
+        | undefined;
+
+      expect(result?.content[0]?.text).toContain("Belayd process deactivated.");
+      expect(result?.content[0]?.text).toContain(
+        "Working directory unchanged: / is the filesystem root.",
+      );
+      expect(chdir).not.toHaveBeenCalled();
+    } finally {
+      chdir.mockRestore();
+    }
+  });
+
+  it("refuses to chdir to a directory that no longer exists on belayd_stop_task", async () => {
+    const cwd = freshWorktree();
+    const gone = join(cwd, "deleted-worktree");
+    writeWorkflowState({ cwd, state: featureState({ originalCwd: gone }) });
+
+    const { tools } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    const chdir = vi.spyOn(process, "chdir").mockImplementation(() => {});
+
+    try {
+      const result = (await tools
+        .get("belayd_stop_task")
+        ?.execute("stop", {}, undefined, undefined, ctx)) as
+        | { content: Array<{ text: string }> }
+        | undefined;
+
+      expect(result?.content[0]?.text).toContain(
+        `Working directory unchanged: ${gone} does not exist.`,
+      );
+      expect(chdir).not.toHaveBeenCalled();
+    } finally {
+      chdir.mockRestore();
+    }
+  });
+
+  it("drops the handoff packet on belayd_stop_task", async () => {
+    const cwd = freshWorktree();
+    writeWorkflowState({
+      cwd,
+      state: featureState({ completedPhaseNames: ["scout"] }),
+    });
+    writeHandoff({
+      cwd,
+      packet: buildHandoff({
+        taskId: "bd-42",
+        workflowType: "feature",
+        branch: "feat/bd-42",
+        worktreePath: cwd,
+        parentSummary: "Parent plan.",
+        now: 1,
+      }),
+    });
+    expect(existsSync(handoffFilePath(cwd))).toBe(true);
+
+    const { tools } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    await tools.get("belayd_stop_task")?.execute("stop", {}, undefined, undefined, ctx);
+
+    // A packet that outlives its workflow is re-injected by the next one.
+    expect(existsSync(handoffFilePath(cwd))).toBe(false);
   });
 
   it("clears a fully-complete workflow and leaves the gate inactive", async () => {

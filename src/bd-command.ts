@@ -13,6 +13,8 @@
  * newline inside a quoted argument stays a newline.
  */
 
+import { parseArgv } from "./argv.js";
+
 /** Read-only `bd` subcommands that never mutate the beads database. */
 const BD_READ_SUBCOMMANDS: readonly string[] = [
   "blocked",
@@ -73,122 +75,22 @@ export type BdCommandValidation =
   | { ok: true; subcommand: string; argv: readonly string[] }
   | { ok: false; error: string };
 
-function isBdWhitespace(char: string): boolean {
-  return char === " " || char === "\t" || char === "\n" || char === "\r";
-}
-
-function isBdQuote(char: string): char is "'" | '"' {
-  return char === "'" || char === '"';
-}
-
-/**
- * A run of characters read at one parser position: its decoded value, the
- * index to resume at, and — for quoted runs — the quote that never closed.
- */
-type BdSegment = { value: string; nextIndex: number; unclosedQuote: "'" | '"' | null };
-
-/**
- * Read a single- or double-quoted run starting at `start` (the opening quote).
- *
- * Single quotes are fully literal. In double quotes a backslash only escapes
- * `"` and `\`; anything else (including `\n`) stays literal, matching shell
- * semantics and keeping written markdown intact.
- */
-function readBdQuoted(command: string, start: number, quote: "'" | '"'): BdSegment {
-  let value = "";
-  let i = start + 1;
-
-  while (i < command.length) {
-    const char = command[i] ?? "";
-    if (char === quote) return { value, nextIndex: i + 1, unclosedQuote: null };
-
-    if (quote === '"' && char === "\\") {
-      const next = command[i + 1];
-      if (next === '"' || next === "\\") {
-        value += next;
-        i += 2;
-        continue;
-      }
-    }
-
-    value += char;
-    i += 1;
-  }
-
-  return { value, nextIndex: i, unclosedQuote: quote };
-}
-
-/** Read an unquoted run until whitespace or a quote, honoring backslash escapes. */
-function readBdUnquoted(command: string, start: number): BdSegment {
-  let value = "";
-  let i = start;
-
-  while (i < command.length) {
-    const char = command[i] ?? "";
-    if (isBdWhitespace(char) || isBdQuote(char)) break;
-
-    if (char === "\\") {
-      const next = command[i + 1];
-      if (next === undefined) {
-        value += char;
-        i += 1;
-        continue;
-      }
-      value += next;
-      i += 2;
-      continue;
-    }
-
-    value += char;
-    i += 1;
-  }
-
-  return { value, nextIndex: i, unclosedQuote: null };
-}
-
-/** Read the segment starting at `start`, dispatching on quote vs. bare text. */
-function readBdSegment(command: string, start: number): BdSegment {
-  const char = command[start] ?? "";
-  return isBdQuote(char) ? readBdQuoted(command, start, char) : readBdUnquoted(command, start);
-}
-
-function unterminatedQuoteError(kind: "'" | '"'): BdCommandParse {
-  const name = kind === "'" ? "single" : "double";
-  return { ok: false, error: `Unterminated ${name} quote in bd command.` };
-}
-
 /**
  * Split a command string into argv without invoking a shell.
  *
- * POSIX quoting is honored (`'...'`, `"..."`, backslash escapes) but no
- * expansion happens: `$`, backticks, and other metacharacters are plain
- * characters. Whitespace inside quotes — including newlines — is preserved.
- * An unterminated quote is reported instead of silently swallowed.
+ * The tokenizer lives in `argv.ts` because `/belayd` needs exactly the same
+ * quoting rules; this wrapper only maps the parse failure onto the bd error
+ * shape. POSIX quoting is honored but no expansion happens: `$`, backticks,
+ * and other metacharacters are plain characters, and whitespace inside quotes
+ * (including newlines) is preserved.
  */
 export function parseBdCommand(command: string): BdCommandParse {
-  const argv: string[] = [];
-  let current: string | null = null;
-  let i = 0;
-
-  while (i < command.length) {
-    const char = command[i] ?? "";
-
-    if (isBdWhitespace(char)) {
-      if (current !== null) argv.push(current);
-      current = null;
-      i += 1;
-      continue;
-    }
-
-    const segment = readBdSegment(command, i);
-    if (segment.unclosedQuote !== null) return unterminatedQuoteError(segment.unclosedQuote);
-
-    current = (current ?? "") + segment.value;
-    i = segment.nextIndex;
+  const parsed = parseArgv(command);
+  if (!parsed.ok) {
+    const name = parsed.quote === "'" ? "single" : "double";
+    return { ok: false, error: `Unterminated ${name} quote in bd command.` };
   }
-
-  if (current !== null) argv.push(current);
-  return { ok: true, argv };
+  return { ok: true, argv: parsed.argv };
 }
 
 /**

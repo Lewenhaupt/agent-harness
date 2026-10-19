@@ -283,7 +283,7 @@ describe("setupWorktree", () => {
     });
   });
 
-  it("skips capturing stack metadata when the base is main", () => {
+  it("records stack metadata for a main-based branch too (bd-121)", () => {
     mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
     mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
@@ -291,7 +291,39 @@ describe("setupWorktree", () => {
 
     setupWorktree("/repo", { branch: "feat/bd-42", base: "main" }, deps);
 
-    expect(deps.captureStack).not.toHaveBeenCalled();
+    // `/belayd` passes no explicit base, so the branch must carry
+    // belaydBase=main + a fork point; otherwise resolveStackChain cannot tell
+    // a genuinely main-based branch from a metadata-less stacked one.
+    expect(deps.captureStack).toHaveBeenCalledWith({
+      cwd: "/repo",
+      branch: "feat/bd-42",
+      base: "main",
+    });
+  });
+
+  it("records belaydBase + fork point for a base-less branch with the real capture helper", () => {
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
+    mockedExecFileSync.mockImplementation((file: string, args?: readonly string[]) => {
+      if (file !== "git") return "";
+      if (args?.[0] === "rev-parse" && args[1] === "--abbrev-ref") return "main\n";
+      if (args?.[0] === "rev-parse") return "fork-sha\n";
+      return "";
+    });
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
+    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
+
+    // No explicit base and no deps: the default capture path resolves the
+    // caller's branch (main) and records it, so resolveStackChain can report a
+    // real chain instead of stopping at a metadata-less ancestor.
+    setupWorktree("/repo", { branch: "feat/bd-42" });
+
+    const gitCalls: string[][] = [];
+    for (const [file, args] of mockedExecFileSync.mock.calls) {
+      if (file === "git" && args !== undefined) gitCalls.push([...args]);
+    }
+    expect(gitCalls).toContainEqual(["config", "branch.feat/bd-42.belaydBase", "main"]);
+    expect(gitCalls).toContainEqual(["config", "branch.feat/bd-42.belaydForkPoint", "fork-sha"]);
+    expect(gitCalls).toContainEqual(["branch", "--set-upstream-to=main", "feat/bd-42"]);
   });
 
   it("does not fail when stack capture fails", () => {

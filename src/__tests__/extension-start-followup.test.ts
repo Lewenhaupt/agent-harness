@@ -4,11 +4,12 @@
  * delegated session what it is stacked on.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseHandoff } from "../handoff.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -18,6 +19,10 @@ const state = vi.hoisted(() => ({
   worktreeDir: "",
   worktreeCreated: false,
   head: "feat/bd-102" as string | undefined,
+  // Simulates an unwritable child `.belayd/` (read-only worktree, disk error)
+  // so the handoff-persistence failure path can be exercised with real fs
+  // behaviour for everything else.
+  failHandoffWrite: false,
   // Recorded stack metadata the tool reads back through `git config`.
   stack: {
     bases: {} as Record<string, string>,
@@ -139,7 +144,18 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: vi.fn(() => false) };
+  return {
+    ...actual,
+    existsSync: vi.fn(() => false),
+    // Only the handoff temp file fails: workflow.json must still be written,
+    // so the failure is the packet write and nothing earlier.
+    writeFileSync: vi.fn((path: Parameters<typeof actual.writeFileSync>[0], data: string) => {
+      if (state.failHandoffWrite && String(path).includes("handoff.json")) {
+        throw new Error("EACCES: permission denied, open 'handoff.json'");
+      }
+      return actual.writeFileSync(path, data);
+    }),
+  };
 });
 
 const httpCalls = vi.hoisted(() => {
@@ -239,6 +255,7 @@ describe("belayd_start_followup", () => {
     state.worktreeDir = `${cwd}.feat-bd-103`;
     state.worktreeCreated = false;
     state.head = "feat/bd-102";
+    state.failHandoffWrite = false;
     state.stack = { bases: {}, forkPoints: {}, branches: {}, mergeBases: {} };
     execFileSyncCalls.length = 0;
     httpCalls.clear();
@@ -317,7 +334,95 @@ describe("belayd_start_followup", () => {
     expect(promptCall).toBeDefined();
     const body = JSON.parse(promptCall?.body ?? "{}") as { cwd?: string; text?: string };
     expect(body.cwd).toBe(state.worktreeDir);
-    expect(body.text).toContain("Stacked on `feat/bd-102`");
+    // bd-121: identity + ownership + handoff replace the old one-line
+    // "Stacked on ..." hint.
+    expect(body.text).toContain("- Base branch: feat/bd-102");
+    expect(body.text).toContain("- Parent: bd-102");
+    expect(body.text).toContain(`You own this worktree only (${state.worktreeDir}).`);
+    expect(body.text).toContain("## Handoff");
+  });
+
+  it("accepts explicit handoff text and persists it in the child worktree", async () => {
+    const tools = await loadTools();
+    const tool = tools.get("belayd_start_followup");
+
+    const result = await tool?.execute(
+      "call-followup",
+      { taskId: "bd-103", handoff: "Parent plan: reuse the bd-102 retry helper." },
+      undefined,
+      undefined,
+      createMockCtx(cwd),
+    );
+
+    expect(result?.details.exitCode).toBe(0);
+    // node:fs.existsSync is stubbed to false in this suite, so read the file
+    // directly instead of going through readHandoff's existence probe.
+    const raw = readFileSync(join(state.worktreeDir, ".belayd", "handoff.json"), "utf8");
+    const packet = parseHandoff(JSON.parse(raw));
+    expect(packet?.parentSummary).toBe("Parent plan: reuse the bd-102 retry helper.");
+    // The mechanical facts are still collected alongside the override.
+    expect(packet).toHaveProperty("branch", "feat/bd-103");
+    expect(packet).toHaveProperty("base", "feat/bd-102");
+    expect(packet).toHaveProperty("parentTaskId", "bd-102");
+  });
+
+  it("warns and still launches when the handoff packet cannot be written", async () => {
+    state.failHandoffWrite = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    try {
+      const tools = await loadTools();
+      const tool = tools.get("belayd_start_followup");
+
+      const result = await tool?.execute(
+        "call-followup",
+        { taskId: "bd-103", handoff: "Parent plan: keep the review gate on." },
+        undefined,
+        undefined,
+        createMockCtx(cwd),
+      );
+
+      // A missing packet degrades the child's first turn; it must not abort a
+      // launch whose workflow state is already persisted.
+      expect(result?.details.exitCode).toBe(0);
+      expect(warn.mock.calls.some(([text]) => String(text).includes("handoff"))).toBe(true);
+      // existsSync is stubbed false in this suite, so inspect the directory.
+      const belaydEntries = readdirSync(join(state.worktreeDir, ".belayd"));
+      expect(belaydEntries).toContain("workflow.json");
+      expect(belaydEntries).not.toContain("handoff.json");
+
+      const promptCall = httpCalls.calls.find((call) => call.path === "/sessions/sess-999/prompt");
+      expect(promptCall).toBeDefined();
+      const body = JSON.parse(promptCall?.body ?? "{}") as { text?: string };
+      // The in-memory packet still reaches the prompt, so the child gets the
+      // handoff even though a later restart cannot re-read it from disk.
+      expect(body.text).toContain("Parent plan: keep the review gate on.");
+      expect(body.text).toContain("## Handoff");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("records the caller's cwd as the child's originalCwd, not the child worktree", async () => {
+    const tools = await loadTools();
+    const tool = tools.get("belayd_start_followup");
+
+    await tool?.execute(
+      "call-followup",
+      { taskId: "bd-103" },
+      undefined,
+      undefined,
+      createMockCtx(cwd),
+    );
+
+    // pi-web session processes start with cwd `/`; the persisted value is what
+    // belayd_stop_task later chdirs back to, so it must be the caller's path.
+    // existsSync is stubbed false in this suite, so read the file directly.
+    const persisted = JSON.parse(
+      readFileSync(join(state.worktreeDir, ".belayd", "workflow.json"), "utf8"),
+    ) as { originalCwd?: string };
+    expect(persisted.originalCwd).toBe(cwd);
+    expect(persisted.originalCwd).not.toBe(state.worktreeDir);
   });
 
   it("rejects an invalid task id before touching git", async () => {
