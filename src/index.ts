@@ -74,6 +74,8 @@ export {
   runArchify,
   runArchifyText,
 } from "./archify.js";
+export type { ArgvParse } from "./argv.js";
+export { parseArgv } from "./argv.js";
 export {
   BASH_DEFAULT_TIMEOUT_SECONDS,
   BASH_MAX_TIMEOUT_SECONDS,
@@ -86,6 +88,8 @@ export {
   parseBdCommand,
   validateBdCommand,
 } from "./bd-command.js";
+export type { BelaydCommandArgs, BelaydCommandArgsParse } from "./belayd-command-args.js";
+export { parseBelaydCommandArgs } from "./belayd-command-args.js";
 export type {
   CapacityCache,
   CapacityCacheOptions,
@@ -109,6 +113,36 @@ export {
 } from "./capacity-cache.js";
 export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
+export type { ChdirTargetInput, ChdirTargetResult } from "./chdir-guard.js";
+export { isSafeChdirTarget } from "./chdir-guard.js";
+// Handoff packets carried into a spawned orchestrator
+export type {
+  BuildHandoffInput,
+  CollectHandoffDefaultInput,
+  HandoffDefaultDeps,
+  HandoffPacket,
+  OrchestratorPromptInput,
+} from "./handoff.js";
+export {
+  buildHandoff,
+  buildOrchestratorPrompt,
+  clearHandoff,
+  collectHandoffDefault,
+  formatHandoffBlock,
+  HANDOFF_ARG_FILE_MAX_BYTES,
+  HANDOFF_DIRTY_FILES_MAX,
+  HANDOFF_FIELD_MAX_CHARS,
+  HANDOFF_FILE_NAME,
+  HANDOFF_IDENTITY_FIELD_MAX_CHARS,
+  HANDOFF_SCHEMA_VERSION,
+  HANDOFF_TOTAL_MAX_CHARS,
+  handoffFilePath,
+  parseHandoff,
+  readHandoff,
+  readHandoffFileArg,
+  taskIdFromBranch,
+  writeHandoff,
+} from "./handoff.js";
 export * from "./honcho-memory/index.js";
 export type {
   ApplyInstructionGroupSectionsInput,
@@ -402,7 +436,7 @@ export {
   resolveProjectSessionExists,
 } from "./session-naming.js";
 export type { TranscriptEntry } from "./session-transcript.js";
-export { lastAssistantText } from "./session-transcript.js";
+export { lastAssistantText, narrowTranscriptEntries } from "./session-transcript.js";
 export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
 export {
   buildSpawnArgs,

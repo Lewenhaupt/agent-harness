@@ -126,14 +126,20 @@ function planWtArgs(
 
 /**
  * Record stack metadata for a branch this call created, best-effort. Reusing an
- * existing branch must not overwrite the config it already carries, and a
- * main-based branch has nothing to stack on.
+ * existing branch must not overwrite the config it already carries.
+ *
+ * A `main`-based branch is recorded too (bd-121): `/belayd` passes no explicit
+ * base, so its branch is cut from whatever the caller is on. Without the
+ * recorded base `resolveStackChain` stops at the first metadata-less ancestor
+ * and reports the branch as rooted at `main` even when it sits on an unmerged
+ * parent. A single-level `main` record stays a no-op for `belayd_stack_rebase`
+ * (see `isStackAlreadyOnMain`).
  */
 function captureStackForNewBranch(
   options: { cwd: string; branch: string; base: string; branchExists: boolean },
   captureStack: (input: { cwd: string; branch: string; base: string }) => void,
 ): void {
-  if (options.branchExists || options.base === DEFAULT_BASE_BRANCH) return;
+  if (options.branchExists) return;
   try {
     captureStack({ cwd: options.cwd, branch: options.branch, base: options.base });
   } catch (error) {

@@ -1,10 +1,36 @@
 import { describe, expect, it } from "vitest";
 
-import { lastAssistantText } from "../session-transcript.js";
+import { lastAssistantText, narrowTranscriptEntries } from "../session-transcript.js";
 
 function assistantMessage(content: unknown): { type: string; message: unknown } {
   return { type: "message", message: { role: "assistant", content } };
 }
+
+describe("narrowTranscriptEntries", () => {
+  it("keeps record entries and drops everything else", () => {
+    const entry = { type: "message", message: { role: "assistant" }, extra: 1 };
+    const narrowed = narrowTranscriptEntries([entry, "plain string", 42, null, undefined, []]);
+
+    expect(narrowed).toHaveLength(1);
+    expect(narrowed[0]).toHaveProperty("type", "message");
+    expect(narrowed[0]).toHaveProperty("message");
+  });
+
+  it("returns an empty list for a non-array input", () => {
+    expect(narrowTranscriptEntries(undefined)).toEqual([]);
+    expect(narrowTranscriptEntries({})).toEqual([]);
+    expect(narrowTranscriptEntries("message")).toEqual([]);
+  });
+
+  it("preserves the last-assistant lookup over a narrowed branch", () => {
+    const narrowed = narrowTranscriptEntries([
+      "garbage",
+      assistantMessage([{ type: "text", text: "narrowed answer" }]),
+    ]);
+
+    expect(lastAssistantText(narrowed)).toBe("narrowed answer");
+  });
+});
 
 describe("lastAssistantText", () => {
   it("returns the text of the last assistant message", () => {
