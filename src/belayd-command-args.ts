@@ -5,7 +5,7 @@
  * handoff text, a flag-looking handoff value, a bare `--handoff`) are unit
  * testable without loading pi.
  *
- * Grammar: `/belayd <taskId> [type] [--no-worktree] [--handoff <text|@path>]`.
+ * Grammar: `/belayd <taskId> [type] [--no-worktree] [--handoff <text|@path>] [--force]`.
  * `--handoff` is terminal: everything after it is its value. That choice is
  * deliberate — the handoff is free text (a plan summary can be several words),
  * and consuming the remainder means a value that looks like a flag
@@ -23,6 +23,8 @@ export interface BelaydCommandArgs {
   handoff: string | undefined;
   /** True when `--handoff` was given, even with no value (a usage error). */
   handoffFlagPresent: boolean;
+  /** Explicit override for the in-flight / same-worktree launch guards (bd-120). */
+  force: boolean;
 }
 
 export type BelaydCommandArgsParse =
@@ -32,6 +34,7 @@ export type BelaydCommandArgsParse =
 const BELAYD_HANDOFF_FLAG = "--handoff";
 const BELAYD_HANDOFF_PREFIX = `${BELAYD_HANDOFF_FLAG}=`;
 const BELAYD_NO_WORKTREE_FLAG = "--no-worktree";
+const BELAYD_FORCE_FLAG = "--force";
 
 function joinHandoff(value: string, rest: readonly string[]): string | undefined {
   const joined = [value, ...rest].join(" ").trim();
@@ -48,6 +51,7 @@ export function parseBelaydCommandArgs(raw: string): BelaydCommandArgsParse {
   const parts = parsed.argv;
   const positional: string[] = [];
   let noWorktree = false;
+  let force = false;
   let handoff: string | undefined;
   let handoffFlagPresent = false;
 
@@ -58,6 +62,10 @@ export function parseBelaydCommandArgs(raw: string): BelaydCommandArgsParse {
     if (part === undefined) continue;
     if (part === BELAYD_NO_WORKTREE_FLAG) {
       noWorktree = true;
+      continue;
+    }
+    if (part === BELAYD_FORCE_FLAG) {
+      force = true;
       continue;
     }
     if (part === BELAYD_HANDOFF_FLAG) {
@@ -83,6 +91,7 @@ export function parseBelaydCommandArgs(raw: string): BelaydCommandArgsParse {
       typeArg: positional[1],
       handoff,
       handoffFlagPresent,
+      force,
     },
   };
 }

@@ -497,20 +497,31 @@ export {
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";
 export type {
+  CallerHandoffOptions,
+  HandedOffMarker,
+  SaveHandedOffMarkerOptions,
   SavePhaseSessionOptions,
   SaveReviewedShaOptions,
   SaveReviewedShaResult,
   WorkflowFs,
   WorkflowState,
+  WriteCallerHandoffOptions,
 } from "./workflow-state.js";
 export {
+  callerHandoffFilePath,
+  clearCallerHandoff,
+  clearHandedOffMarker,
   clearWorkflowState,
+  parseHandedOffMarker,
+  readCallerHandoff,
   readWorkflowState,
   saveCompletedPhases,
+  saveHandedOffMarker,
   savePhaseSession,
   saveReviewedSha,
   workflowStateDir,
   workflowStateFilePath,
+  writeCallerHandoff,
   writeWorkflowState,
 } from "./workflow-state.js";
 export type { RepoKeyExec, RepoKeyResult, WorktreeDeps, WorktreeOptions } from "./worktree.js";

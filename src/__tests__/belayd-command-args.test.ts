@@ -11,6 +11,7 @@ describe("parseBelaydCommandArgs", () => {
         typeArg: undefined,
         handoff: undefined,
         handoffFlagPresent: false,
+        force: false,
       },
     });
   });
@@ -76,6 +77,32 @@ describe("parseBelaydCommandArgs", () => {
     expect(textResult.ok).toBe(true);
     if (!textResult.ok) return;
     expect(textResult.args.handoff).toBe("the plan continues");
+  });
+
+  it("parses --force as a boolean override, in any position", () => {
+    const leading = parseBelaydCommandArgs("--force bd-42 bugfix");
+    expect(leading.ok).toBe(true);
+    if (!leading.ok) return;
+    expect(leading.args.force).toBe(true);
+    expect(leading.args.taskId).toBe("bd-42");
+    expect(leading.args.typeArg).toBe("bugfix");
+
+    const trailing = parseBelaydCommandArgs("bd-42 --no-worktree --force");
+    expect(trailing.ok).toBe(true);
+    if (!trailing.ok) return;
+    expect(trailing.args.force).toBe(true);
+    expect(trailing.args.noWorktree).toBe(true);
+    expect(trailing.args.typeArg).toBeUndefined();
+  });
+
+  it("treats --force after --handoff as handoff text, not a flag", () => {
+    // `--handoff` is documented as terminal, so the value wins over flag-ness.
+    const result = parseBelaydCommandArgs("bd-42 --handoff stop --force now");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.args.handoff).toBe("stop --force now");
+    expect(result.args.force).toBe(false);
   });
 
   it("flags a bare --handoff as present with no value", () => {
