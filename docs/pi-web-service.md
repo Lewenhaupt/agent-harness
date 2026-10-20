@@ -450,10 +450,15 @@ wrapper is unaffected — it reloads extensions on every launch.)
 ### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
-pi-web is now pinned to upstream tag v1.202610.1, whose embedded
-`@earendil-works/pi-coding-agent` resolves to 1.0.0 — meeting the
+pi-web is now pinned to upstream tag v1.202610.4, whose embedded
+`@earendil-works/pi-coding-agent` resolves to 1.2.0 — meeting the
 `agent_browser` extension's declared Pi `>= 1.0.0` floor, so registering it is
-supported. The nix-tmp `belayd-pi-web` home-manager module adds the symlink
+supported. The 1.202610.1 → 1.202610.4 bump (bd-123) also carries upstream's
+browser-tab fixes: the Terminal panel request storm (pi-web #302/#316),
+repeated history auto-loading, reconnect recovery after backgrounding, and
+transcript image handling (pi-web #301).
+
+The nix-tmp `belayd-pi-web` home-manager module adds the symlink
 (patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):
 
 ```nix

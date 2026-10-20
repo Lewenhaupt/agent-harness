@@ -7,3 +7,5 @@ allowBuilds:
   node-pty: true
   protobufjs: true
   ssh2: true
+minimumReleaseAgeExclude:
+  - '@jmfederico/pi-web@1.202610.4'

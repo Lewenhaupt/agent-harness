@@ -114,71 +114,29 @@ describe("bd-68: agent-browser extension wiring", () => {
 });
 
 describe("bd-83: pi-web embeds pi-coding-agent >= 1.0 for agent-browser", () => {
-  it("pins the pi-web upstream tag whose lockfile resolves pi-coding-agent 1.0.0", () => {
+  it("pins the pi-web upstream tag whose lockfile resolves pi-coding-agent 1.2.0", () => {
     if (flakeContents === null) {
       throw new Error(`could not read flake.nix at ${flakePath}`);
     }
-    // The tag and rev must move together; a rev that still points at a
-    // pi-coding-agent ^0.84.x/^0.87.x release would defeat the bump. These
-    // literals are intentionally version-pinned: a future pi-web bump must
-    // update flake.nix's tag+rev and this test in lockstep, so a half-updated
-    // bump (new tag, stale rev) fails here.
-    expect(flakeContents).toContain('version = "1.202610.1";');
-    expect(flakeContents).toContain('rev = "3f5f39eb988810b468f486e4334f10adcdb96b21"');
+    // The tag and rev must move together; a rev that still points at an older
+    // pi-coding-agent release would defeat the bump. These literals are
+    // intentionally version-pinned: a future pi-web bump must update flake.nix's
+    // tag+rev and this test in lockstep, so a half-updated bump (new tag, stale
+    // rev) fails here.
+    expect(flakeContents).toContain('version = "1.202610.4";');
+    expect(flakeContents).toContain('rev = "e93d7a4e8fd763b25ee052c980f8fe295466ee5a"');
   });
 
-  it("fills in integrity for the nested @earendil-works 1.0.0 deps", () => {
-    if (integrityPatchContents === null) {
-      throw new Error(`could not read pi-web integrity patch at ${integrityPatchPath}`);
+  it("no longer patches the lockfile because 1.202610.4 ships SDK 1.2.0 with integrity", () => {
+    if (flakeContents === null) {
+      throw new Error(`could not read flake.nix at ${flakePath}`);
     }
-    // prefetch-npm-deps refuses non-git deps without integrity; the upstream
-    // lockfile omits it for pi-coding-agent's nested @earendil-works deps. Keep
-    // the explicit known set so a wholesale hunk deletion (not just a dropped
-    // integrity line) still fails.
-    for (const dep of [
-      "chord",
-      "pi-agent-core",
-      "pi-ai",
-      "pi-codemode",
-      "pi-mcp",
-      "pi-telemetry",
-      "pi-tui",
-    ]) {
-      expect(integrityPatchContents).toContain(
-        `pi-coding-agent/node_modules/@earendil-works/${dep}`,
-      );
-    }
-
-    // Parse the patch so a future nested @earendil-works dep added without an
-    // integrity line fails here instead of at prefetch-npm-deps time: every
-    // nested key hunk in the patch must carry exactly one added integrity line.
-    const nestedKeyPattern =
-      /^[ +-]\s*"node_modules\/@earendil-works\/pi-coding-agent\/node_modules\/@earendil-works\/([a-z-]+)": \{/;
-    const nestedKeys: string[] = [];
-    const integrityKeys: string[] = [];
-    let currentDep: string | null = null;
-    let currentHasIntegrity = false;
-    const flushCurrentDep = () => {
-      if (currentDep === null) return;
-      nestedKeys.push(currentDep);
-      if (currentHasIntegrity) integrityKeys.push(currentDep);
-      currentDep = null;
-      currentHasIntegrity = false;
-    };
-    for (const line of integrityPatchContents.split("\n")) {
-      const keyMatch = line.match(nestedKeyPattern);
-      if (keyMatch) {
-        flushCurrentDep();
-        currentDep = keyMatch[1] ?? null;
-        continue;
-      }
-      if (currentDep !== null && /^\+.*"integrity": "sha512-/.test(line)) {
-        currentHasIntegrity = true;
-      }
-    }
-    flushCurrentDep();
-    expect(nestedKeys.length).toBeGreaterThan(0);
-    expect(integrityKeys).toEqual(nestedKeys);
+    // pi-web 1.202610.4 resolves pi-coding-agent 1.2.0, whose nested
+    // @earendil-works deps all carry registry integrity values, so the patch
+    // that 1.202610.1 needed must not be applied (a stale reference would fail
+    // the build at patch time) and the file itself should be gone.
+    expect(flakeContents).not.toContain("patches = [ ./nix/pi-web-integrity.patch ]");
+    expect(integrityPatchContents).toBeNull();
   });
 
   it("records the nix-tmp home-manager symlink for the pi-web orchestrator", () => {

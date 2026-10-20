@@ -243,25 +243,23 @@
         # those paths via a common environment.
         pi-web = pkgs.buildNpmPackage {
           pname = "pi-web";
-          version = "1.202610.1";
+          version = "1.202610.4";
           src = pkgs.fetchFromGitHub {
             owner = "jmfederico";
             repo = "pi-web";
-            # Upstream tag v1.202610.1. Its package-lock.json resolves
-            # @earendil-works/pi-coding-agent to 1.0.0 (and pi-agent-core/pi-ai
-            # to 1.0.0), which satisfies pi-agent-browser-native's declared Pi
+            # Upstream tag v1.202610.4. Its package-lock.json resolves
+            # @earendil-works/pi-coding-agent to 1.2.0 (with pi-agent-core/pi-ai
+            # at 1.2.0), which satisfies pi-agent-browser-native's declared Pi
             # >= 1.0.0 floor so its defaultActive/namespace/outputSchema
             # features are supported (should work) in pi-web orchestrator
             # sessions; runtime behavior is not yet verified (bd-83).
-            rev = "3f5f39eb988810b468f486e4334f10adcdb96b21";
-            hash = "sha256-YU4eKjHPu7dmRELIyEyZY4c2MM3gQLRj6iKYq0pkhks=";
+            # The nested @earendil-works entries that needed integrity values
+            # patched in at 1.202610.1 no longer exist, so
+            # nix/pi-web-integrity.patch is no longer applied.
+            rev = "e93d7a4e8fd763b25ee052c980f8fe295466ee5a";
+            hash = "sha256-vais01tSik8UfF31nYnDSdhMbYnjMphT2oz3S+giaP4=";
           };
-          # Upstream's package-lock.json omits `integrity` for a few nested
-          # @earendil-works deps of pi-coding-agent; prefetch-npm-deps refuses
-          # non-git deps without integrity. Fill in the registry-published
-          # dist.integrity values (see nix/pi-web-integrity.patch).
-          patches = [ ./nix/pi-web-integrity.patch ];
-          npmDepsHash = "sha256-aqeDeZhdr30vc+65WlHCvixSUkvc4ZsIYCDJ76gl33k=";
+          npmDepsHash = "sha256-D81YfrSik6wNOC7srN5XyedwukQs7DHZm/71v/HelMw=";
           npmFlags = [
             "--no-audit"
             "--no-fund"
