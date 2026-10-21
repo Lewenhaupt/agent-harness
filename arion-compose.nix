@@ -39,6 +39,20 @@ let
   # non-container scotty/pi-web already wrote instead of empty named volumes.
   scottyConfigDir = fromEnv "BELAYD_SCOTTY_CONFIG_DIR" "${home}/.config/bead-me-up-scotty";
 
+  # Scotty 0.3.1+ answers only browsers that address it as localhost/*.localhost
+  # or an IP literal; a Host header carrying any other name (a LAN or tailscale
+  # hostname) is refused with a 403 before routing. This container publishes on
+  # the host network under whatever name the browser used, so the check has to
+  # be told which names to accept. `*` relaxes the hostname check only — writes
+  # from another website (Origin mismatch) stay refused.
+  scottyAllowedHosts = fromEnv "BELAYD_SCOTTY_ALLOWED_HOSTS" "*";
+
+  # Scotty 0.2+ reports one PostHog `app_active` event per active day and ships a
+  # public ingestion token as its default. A Nix-managed service should not phone
+  # home on its own, so the token is emptied here (upstream's operator-level
+  # opt-out). BELAYD_SCOTTY_POSTHOG_KEY sets a project token to opt back in.
+  scottyPosthogKey = fromEnv "BELAYD_SCOTTY_POSTHOG_KEY" "";
+
   # Single dolt sql-server for all Beads projects (shared-server mode). State
   # lives here on the host; host bd and scotty dial it over 127.0.0.1.
   beadsSharedServerDir = fromEnv "BELAYD_BEADS_SHARED_SERVER_DIR" "${home}/.beads/shared-server";
@@ -91,6 +105,8 @@ in
       # as host-run bd (no /repos vs /home/<user> flip-flop).
       BEADS_FS_ROOT = reposDir;
       BEADS_DOLT_AUTO_START = "false";
+      SCOTTY_ALLOWED_HOSTS = scottyAllowedHosts;
+      POSTHOG_KEY = scottyPosthogKey;
     } // (if actor == "" then { } else { BEADS_ACTOR = actor; });
     service.volumes = [
       # Host git repos at their host path, so scotty and host bd share one

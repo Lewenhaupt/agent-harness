@@ -126,6 +126,23 @@ is rooted at the host repos path (`BEADS_FS_ROOT` = `reposDir`, e.g.
 contain a `.beads` directory; projects use the same host paths as host-run
 `bd`, so scotty and host `bd` see one set of `.beads`.
 
+### Opening scotty by a hostname
+
+Since 0.3.1 scotty refuses requests whose `Host` header is not `localhost`,
+`*.localhost` or an IP literal (DNS-rebinding defence), and refuses writes sent
+from another website (CSRF defence). The container publishes on the host
+network, where browsers may address it as `http://<hostname>:7687`, so
+`arion-compose.nix` sets `SCOTTY_ALLOWED_HOSTS=*`: only the hostname check is
+relaxed, cross-site writes stay refused. Set `BELAYD_SCOTTY_ALLOWED_HOSTS` to a
+comma-separated list (e.g. `desktop,desktop.local`) to narrow it.
+
+### Usage statistics
+
+Scotty 0.2+ reports one PostHog `app_active` event per active day and enables it
+by default. The container empties `POSTHOG_KEY` (upstream's operator-level
+opt-out), so a Nix-managed service does not phone home; set
+`BELAYD_SCOTTY_POSTHOG_KEY` to a PostHog project token to opt back in.
+
 ### Sharing the dolt server with host `bd`
 
 scotty runs with `network_mode: host` so its `bd` reaches the host's dolt
@@ -164,6 +181,8 @@ the latest tag (schema v69 exists on `main` while v1.3.1 stops at v66).
 | `BELAYD_ACTOR` | `$USER` | Human actor scotty falls back to (`BEADS_ACTOR`) |
 | `BELAYD_REPOS_DIR` | `$HOME/git` | Host repos dir (scotty mounts it at its host path) |
 | `BELAYD_SCOTTY_CONFIG_DIR` | `$HOME/.config/bead-me-up-scotty` | Host scotty config dir |
+| `BELAYD_SCOTTY_ALLOWED_HOSTS` | `*` | Hostnames scotty accepts in the `Host` header (`*` = any; writes still checked) |
+| `BELAYD_SCOTTY_POSTHOG_KEY` | empty | PostHog project token; empty disables usage reporting |
 | `SCOTTY_HOST_PORT` | `7687` | Host port scotty binds directly (host networking) |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | Container-engine socket Portainer manages |
 | `PORTAINER_HOST_PORT` | `9443` | Host HTTPS port for Portainer |

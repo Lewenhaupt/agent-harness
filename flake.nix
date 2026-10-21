@@ -166,17 +166,18 @@
         };
 
         # Bead Me Up, Scotty — multi-repo web UI for beads (bd).
-        # `__noChroot` allows next/font/google to download fonts during `next build`.
+        # `postPatch` owns app/layout.tsx (see below) so `next build` never reaches
+        # next/font/google, which would need network access in the sandbox.
         bead-me-up-scotty = pkgs.buildNpmPackage {
           pname = "bead-me-up-scotty";
-          version = "0.1.0";
+          version = "0.3.2";
           src = pkgs.fetchFromGitHub {
             owner = "brendan-appstart";
             repo = "bead-me-up-scotty";
-            rev = "e26e446cba697a522ecceabdeeb11dc99239a071";
-            hash = "sha256-NZDins8ZZdbFdTk8MBXbD83Q89INz/ZXWDFc6jKkfNo=";
+            rev = "6a64785270449caf86fa01798d7a9599e0d384ee";
+            hash = "sha256-hXzGUr7Qhdkj6AqO9WW7Pi93b71Kc2GdYaxBB4cUfVs=";
           };
-          npmDepsHash = "sha256-Yr3l6WD1B1sTD3UxiHW5yZUiSNAfyrZpL0nFvBBUZcU=";
+          npmDepsHash = "sha256-Wx18/6mhKGhCAjRzAPKpyVIBNE1uR/P/LiNaZkeN9cY=";
           npmFlags = [
             "--no-audit"
             "--no-fund"
@@ -184,13 +185,23 @@
           NEXT_TELEMETRY_DISABLED = "1";
 
           # Drop next/font/google so the build works in the Nix sandbox (no
-          # network to download Geist during `next build`).
+          # network to download Geist during `next build`). The replacement keeps
+          # the two Geist CSS variables app/globals.css derives --font-sans and
+          # --font-mono from, pointing them at the system stacks — without them
+          # every font-family declaration is invalid and pages render in serif.
           postPatch = ''
             cat > app/layout.tsx <<'LAYOUT'
             import type { Metadata } from "next";
             import "./globals.css";
             import { Providers } from "@/components/providers";
             import { APP_TITLE } from "@/lib/app-title";
+
+            const fontVariables = {
+              "--font-geist-sans":
+                'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+              "--font-geist-mono":
+                'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+            } as React.CSSProperties;
 
             export const metadata: Metadata = {
               title: APP_TITLE,
@@ -201,7 +212,12 @@
               children,
             }: Readonly<{ children: React.ReactNode }>) {
               return (
-                <html lang="en" suppressHydrationWarning className="h-full antialiased">
+                <html
+                  lang="en"
+                  suppressHydrationWarning
+                  className="h-full antialiased"
+                  style={fontVariables}
+                >
                   <body className="h-full">
                     <Providers>{children}</Providers>
                   </body>
@@ -225,7 +241,7 @@
             cp -r node_modules "$outDir/node_modules"
             cp -r public "$outDir/public"
             cp -r bin "$outDir/bin"
-            cp next.config.ts package.json instrumentation.ts instrumentation-node.ts "$outDir/" 2>/dev/null || true
+            cp next.config.ts proxy.ts package.json instrumentation.ts instrumentation-node.ts "$outDir/" 2>/dev/null || true
             mkdir -p "$out/bin"
             cat > "$out/bin/scotty" <<WRAPPER
             #!${pkgs.bash}/bin/bash
@@ -761,6 +777,17 @@
               "PATH=/bin"
               "HOME=/config"
               "XDG_CONFIG_HOME=/config"
+              # Node and git inside an image with no /etc/ssl setup need an explicit
+              # trust store; without it scotty's release check fails with
+              # "unable to get local issuer certificate".
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+              # Reached under an arbitrary LAN/host hostname (host networking);
+              # scotty 0.3.1+ otherwise refuses those Host headers. `*` relaxes
+              # the hostname check only — cross-site writes stay refused.
+              "SCOTTY_ALLOWED_HOSTS=*"
+              # Empty token = upstream's operator-level opt-out of PostHog
+              # `app_active` reporting (see arion-compose.nix).
+              "POSTHOG_KEY="
             ];
             Cmd = [
               "scotty"
