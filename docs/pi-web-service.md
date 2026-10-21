@@ -52,6 +52,40 @@ Both units run as `user` with an explicit environment:
 - `PI_CODING_AGENT_DIR=~/.pi/agent` (the pi SDK default).
 - `SHELL=belayd-shell` (the wrapper below), `LD_LIBRARY_PATH`, `SSL_CERT_FILE`,
   `NIX_SSL_CERT_FILE` mirror the devShell.
+- `XDG_RUNTIME_DIR=/run/user/<uid>` — set **when the uid is known** (systemd
+  only sets it for *user* units); a `user` that is not declared under
+  `users.users` degrades to a `warnings` entry instead of an eval error.
+- `BELAYD_AWS_RUNTIME_BASE_DIR=/run/belayd/aws` — the broker's socket base,
+  created by the broker unit's `RuntimeDirectory` (no logind dependency).
+- `BELAYD_AWS_BIN` / `BELAYD_AWS_CREDENTIAL_PROCESS_BIN` point at the harness's
+  broker CLI and shim wrappers (bd-125).
+
+### AWS credential isolation (bd-125)
+
+`pi-web-sessiond` runs inside a bubblewrap *mask*
+(`bwrap --unshare-user --die-with-parent --ro-bind / / --dev-bind /dev /dev
+--proc /proc --tmpfs <home>/.aws --tmpfs <home>/.config/aws -- …`), so every
+agent session it spawns has no SSO cache and cannot run `aws sso login`. The
+`ExecStartPre` helper pre-creates both mask destinations (bubblewrap cannot
+create a mount point under a read-only `/`). Only the user namespace is
+unshared: `ps`, the host `/tmp`, and the host network stay available.
+
+The per-repo sandbox (`src/spawn.ts`, `belayd-shell.sh`) additionally masks the
+broker runtime base, so a sandboxed agent can reach neither the control socket
+nor a sibling repo's scope socket. The session daemon's own argv deliberately
+leaves the runtime base visible, because the orchestrator inside it must run
+`ensure-scope` for the agents it spawns — a single-uid limit documented in
+`docs/aws-credential-isolation.md`.
+
+A third unit, `pi-web-aws-broker`, serves one scoped credential socket per
+repo. It is deliberately **not** sandboxed — it is the one process that must
+read `~/.aws` (through `aws configure export-credentials`) — and must never be
+started from inside a sandboxed session daemon. Its `RuntimeDirectory` owns
+`/run/belayd/aws`, so it cannot crash-loop on a missing `/run/user/<uid>`.
+Rollback is one line in the module (`ExecStart` back to
+`${pi-web}/bin/pi-web-sessiond`), a rebuild, and a restart of both units. Full
+threat model, operator workflow (`## How to Use`), and acceptance checklist
+(`## How to Verify`): `docs/aws-credential-isolation.md`.
 
 ### devShell routing (`SHELL` + `shellPath`)
 
@@ -538,10 +572,11 @@ public half is `~/.ssh/git-signing.pub`). Signing works because `ssh-keygen`
 ## Manage
 
 ```bash
-systemctl status pi-web pi-web-sessiond
+systemctl status pi-web pi-web-sessiond pi-web-aws-broker
 journalctl -u pi-web -f
 journalctl -u pi-web-sessiond -f
-sudo systemctl restart pi-web pi-web-sessiond
+journalctl -u pi-web-aws-broker -f
+sudo systemctl restart pi-web pi-web-sessiond pi-web-aws-broker
 ```
 
 ## Remove

@@ -1,7 +1,7 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Create the mock spawn function before the vi.mock hoisting.
 // Stores handler arrays so tests can simulate process events (a real
@@ -33,10 +33,16 @@ const mockSpawn = vi.hoisted(() => {
   return mock;
 });
 
-// Mock child_process at module level (hoisted by vitest)
-vi.mock("node:child_process", () => ({
-  spawn: mockSpawn,
-}));
+// Mock child_process at module level (hoisted by vitest). `execFileSync` is
+// kept real because the AWS sandbox plan (src/aws-broker/plan.ts) resolves the
+// git toplevel with it; only `spawn` is faked.
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...actual,
+    spawn: mockSpawn,
+  };
+});
 
 // Partially mock node:fs so the buildSpawnArgs throw-path test can make
 // writeFileSync fail while every other fs call stays real. The hoisted holder
@@ -908,6 +914,214 @@ describe("buildSpawnArgs resumeSession (bd-74)", () => {
       }
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+describe("launchAgentProcess AWS sandbox (bd-125)", () => {
+  let sandboxRoot: string;
+
+  beforeEach(() => {
+    sandboxRoot = mkdtempSync(join(tmpdir(), "belayd-spawn-aws-"));
+  });
+
+  afterEach(() => {
+    mockSpawn.mockClear();
+    rmSync(sandboxRoot, { recursive: true, force: true });
+  });
+
+  /**
+   * Hermetic AWS fixture: a fake `git` that reports the worktree root, a fake
+   * `bwrap` so the plan resolves, an operator allowlist under XDG_CONFIG_HOME,
+   * and the repo's own `.belayd/aws.yaml`.
+   */
+  function writeAwsFixture(): { repo: string; home: string; env: Record<string, string> } {
+    const repo = join(sandboxRoot, "repo");
+    const bin = join(sandboxRoot, "bin");
+    const configHome = join(sandboxRoot, "config");
+    const runtimeDir = join(sandboxRoot, "runtime");
+    const home = join(sandboxRoot, "home");
+    mkdirSync(join(repo, ".belayd"), { recursive: true });
+    mkdirSync(join(configHome, "belayd"), { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(runtimeDir, { recursive: true });
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(repo, ".belayd", "aws.yaml"), "profile: agent-readonly\n");
+    writeFileSync(
+      join(configHome, "belayd", "aws.yaml"),
+      `region: eu-north-1\nscopes:\n  - worktree: ${repo}\n    profiles: [agent-readonly]\n`,
+    );
+    writeFileSync(join(bin, "bwrap"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' '${repo}'\n`, { mode: 0o755 });
+    // The broker CLI the plan resolver calls to start the scope socket; a
+    // fixed path keeps the spawn tests independent of a live daemon.
+    const brokerCli = join(bin, "belayd-aws");
+    writeFileSync(brokerCli, `#!/bin/sh\nprintf '%s\\n' '${runtimeDir}/scope.sock'\n`, {
+      mode: 0o755,
+    });
+    return {
+      repo,
+      home,
+      env: {
+        HOME: home,
+        XDG_CONFIG_HOME: configHome,
+        XDG_RUNTIME_DIR: runtimeDir,
+        BELAYD_AWS_BIN: brokerCli,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+      },
+    };
+  }
+
+  it("scrubs every AWS credential key from the child environment", async () => {
+    const restore = applyProcessEnv({
+      XDG_CONFIG_HOME: join(sandboxRoot, "empty-config"),
+      AWS_ACCESS_KEY_ID: "AKIA",
+      AWS_SECRET_ACCESS_KEY: "secret",
+      AWS_SESSION_TOKEN: "token",
+      AWS_SECURITY_TOKEN: "token",
+      AWS_PROFILE: "operator",
+      AWS_DEFAULT_PROFILE: "operator",
+      AWS_CONFIG_FILE: "/home/hugo/.aws/config",
+      AWS_SHARED_CREDENTIALS_FILE: "/home/hugo/.aws/credentials",
+      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: "/v2/credentials",
+    });
+    try {
+      const mod = await import("../spawn.js");
+      const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      for (const key of [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+      ]) {
+        expect(spawnOptions.env).not.toHaveProperty(key);
+      }
+      expect(spawnOptions.env).not.toHaveProperty("BELAYD_SANDBOX_ACTIVE");
+      handle.cleanup();
+    } finally {
+      restore();
+    }
+  });
+
+  it("spawns the raw binary when the worktree has no AWS plan", async () => {
+    const restore = applyProcessEnv({ XDG_CONFIG_HOME: join(sandboxRoot, "empty-config") });
+    try {
+      const mod = await import("../spawn.js");
+      const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      expect(callArgs[0]).toBe(built.piBinary);
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      expect(spawnOptions.env).not.toHaveProperty("BELAYD_SANDBOX_ACTIVE");
+      handle.cleanup();
+    } finally {
+      restore();
+    }
+  });
+
+  it("spawns through bwrap with the plan argv and marks the child as sandboxed", async () => {
+    const fixture = writeAwsFixture();
+    const restore = applyProcessEnv(fixture.env);
+    try {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        cwd: fixture.repo,
+      };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      expect(String(callArgs[0])).toBe(join(sandboxRoot, "bin", "bwrap"));
+      const argv = callArgs[1] as string[];
+      expect(argv).toContain("--unshare-user");
+      expect(argv).toContain("--tmpfs");
+      expect(argv).toContain(join(fixture.home, ".aws"));
+      expect(argv).toContain("AWS_PROFILE");
+      expect(argv).toContain("AWS_REGION");
+      expect(argv).toContain("eu-north-1");
+      // The pi binary and its args follow the sandbox separator.
+      const separator = argv.indexOf("--");
+      expect(separator).toBeGreaterThan(0);
+      expect(argv.slice(separator + 1)).toEqual([built.piBinary, ...built.args]);
+
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv; cwd: string };
+      expect(spawnOptions.env.BELAYD_SANDBOX_ACTIVE).toBe("1");
+      expect(spawnOptions.cwd).toBe(fixture.repo);
+      handle.cleanup();
+    } finally {
+      restore();
+    }
+  });
+
+  it("runs unwrapped when a plan is refused (fail closed, never a default profile)", async () => {
+    const fixture = writeAwsFixture();
+    writeFileSync(join(fixture.repo, ".belayd", "aws.yaml"), "profile: agent-deploy\n");
+    const restore = applyProcessEnv(fixture.env);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        cwd: fixture.repo,
+      };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      expect(callArgs[0]).toBe(built.piBinary);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("AWS sandbox refused"));
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      expect(spawnOptions.env).not.toHaveProperty("BELAYD_SANDBOX_ACTIVE");
+      handle.cleanup();
+    } finally {
+      warn.mockRestore();
+      restore();
+    }
+  });
+
+  it("still sandboxes (and warns) when the broker CLI is unavailable", async () => {
+    const fixture = writeAwsFixture();
+    const restore = applyProcessEnv({ ...fixture.env, BELAYD_AWS_BIN: "" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        cwd: fixture.repo,
+      };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      // The mask is the security property: a down broker must never un-sandbox.
+      expect(String(callArgs[0])).toBe(join(sandboxRoot, "bin", "bwrap"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("AWS broker unavailable"));
+      handle.cleanup();
+    } finally {
+      warn.mockRestore();
+      restore();
     }
   });
 });

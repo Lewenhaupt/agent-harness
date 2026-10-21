@@ -17,6 +17,9 @@ import { existsSync, mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js";
+import { ensureScopeSync } from "./aws-broker/ensure.ts";
+import { planCommandArgv, resolveSandboxPlan } from "./aws-broker/plan.ts";
+import { scrubAwsEnv } from "./aws-broker/scope.ts";
 import { resolveProjectSessionExists } from "./session-naming.js";
 import { setupWorktree } from "./worktree.js";
 
@@ -227,15 +230,50 @@ export function launchAgentProcess(
   // the sub-agent's shell; stripping it additionally stops a sub-agent from
   // inheriting the parent repo's devShell. HOME/PATH stay intact so harness
   // tools (bd/dolt/wt/pnpm/node) remain available at lower priority.
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
-  delete childEnv.BELAYD_SHELL_ACTIVE;
-  for (const key of DIRENV_STATE_ENV_KEYS) delete childEnv[key];
+  const baseChildEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
+  delete baseChildEnv.BELAYD_SHELL_ACTIVE;
+  for (const key of DIRENV_STATE_ENV_KEYS) delete baseChildEnv[key];
+
+  // Drop every AWS credential source (bd-125): an agent must never inherit the
+  // operator's env-var credentials, only the per-repo scoped broker inside the
+  // sandbox. The scrub happens before the sandbox plan is resolved so the plan
+  // (and the shim) sees the same sanitized environment.
+  const { env: childEnv } = scrubAwsEnv(baseChildEnv);
+
+  const runCwd = built.worktreePath ?? options.cwd ?? process.cwd();
+  const sandbox = resolveSandboxPlan({ worktree: runCwd, env: childEnv });
+  if (sandbox.ok) {
+    childEnv.BELAYD_SANDBOX_ACTIVE = "1";
+    // The scope socket is served by the broker daemon and the control socket is
+    // masked inside the sandbox, so the daemon must be asked from here. A down
+    // broker is reported but never un-sandboxes the child: the mask is the
+    // security property, AWS access is not.
+    const ensured = ensureScopeSync({ worktree: sandbox.plan.worktree, env: childEnv });
+    if (!ensured.ok) {
+      console.warn(
+        `[belayd-harness] AWS broker unavailable for ${sandbox.plan.worktree}: ${ensured.error}`,
+      );
+    }
+  } else if (sandbox.kind === "refused") {
+    // A repo that asked for AWS and was denied must be visible; a repo with no
+    // AWS config is the normal case and stays quiet.
+    console.warn(`[belayd-harness] AWS sandbox refused for ${runCwd}: ${sandbox.reason}`);
+  } else if (sandbox.kind === "unavailable") {
+    // The repo is configured but the sandbox could not be built (bwrap missing,
+    // runtime base not writable, …). The child still runs with AWS_* scrubbed,
+    // but it is not masked, so this must be loud rather than silent.
+    console.warn(`[belayd-harness] AWS sandbox unavailable for ${runCwd}: ${sandbox.reason}`);
+  }
+  const command = sandbox.ok
+    ? planCommandArgv(sandbox.plan, [built.piBinary, ...built.args])
+    : [built.piBinary, ...built.args];
+  const [commandBinary, ...commandArgs] = command;
 
   // We intentionally do NOT call proc.unref(): a background phase run must keep
   // the parent pi process alive until it completes, otherwise the run would be
   // killed when the tool-call turn finishes.
-  const proc = spawn(built.piBinary, built.args, {
-    cwd: built.worktreePath ?? options.cwd ?? process.cwd(),
+  const proc = spawn(commandBinary ?? built.piBinary, commandArgs, {
+    cwd: runCwd,
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
     detached: options.detached === true,

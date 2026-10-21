@@ -38,10 +38,23 @@
           pi-web = self.packages.${system}.pi-web;
           pi-web-runtime-env = self.packages.${system}.pi-web-runtime-env;
           belayd-shell = self.packages.${system}.belayd-shell;
+          belayd-harness = self.packages.${system}.belayd-harness;
           gccLib = belaydPkgs.stdenv.cc.cc.lib;
           cacert = belaydPkgs.cacert.out;
 
           userHome = config.users.users.${cfg.user}.home or "/home/${cfg.user}";
+          # `or null`: the operator may point `user` at a pre-existing system
+          # account that is not declared under `users.users` (a service user
+          # owned by another module, for example). A raw `.uid` selection throws
+          # at evaluation time and takes the whole rebuild down with it; the only
+          # consumer is XDG_RUNTIME_DIR, and the AWS broker deliberately no
+          # longer depends on that path (it uses RuntimeDirectory +
+          # BELAYD_AWS_RUNTIME_BASE_DIR, both uid-independent).
+          userUid = config.users.users.${cfg.user}.uid or null;
+          # systemd-created runtime base for the broker. Unlike /run/user/<uid>,
+          # it exists for a session-less system-service user and survives the
+          # crash-restarts of Restart=on-failure.
+          awsRuntimeBaseDir = "/run/belayd/aws";
           dataDir = if cfg.dataDir != null then cfg.dataDir else "${userHome}/.pi-web";
 
           environment = [
@@ -57,6 +70,18 @@
             "PI_WEB_SESSIOND_SOCKET=${dataDir}/sessiond.sock"
             "PI_CODING_AGENT_DIR=${userHome}/.pi/agent"
             "PATH=${pi-web-runtime-env}/bin:/run/current-system/sw/bin:${userHome}/.nix-profile/bin"
+            # The AWS broker (and the sandbox plans it serves) keep their unix
+            # sockets under a runtime base the broker unit owns via systemd
+            # `RuntimeDirectory`. Both units must agree on it; it is set here so
+            # a sandboxed session and the broker resolve the same sockets
+            # without depending on logind creating /run/user/<uid>.
+            "BELAYD_AWS_RUNTIME_BASE_DIR=${awsRuntimeBaseDir}"
+            # The generated credential_process shim execs this wrapper instead
+            # of a hardcoded node path, so the sandbox never depends on how the
+            # harness happens to be built. BELAYD_AWS_BIN is the CLI the plan
+            # resolver calls to start a scope socket on demand.
+            "BELAYD_AWS_CREDENTIAL_PROCESS_BIN=${belayd-harness}/bin/belayd-aws-credential-process"
+            "BELAYD_AWS_BIN=${belayd-harness}/bin/belayd-aws"
             "LD_LIBRARY_PATH=${gccLib}/lib"
             "SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
             "NIX_SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt"
@@ -65,14 +90,26 @@
             # Spawned agent sessions see this; the archify wrapper exports it
             # too, but the runtime env is what reaches the agent's shell.
             "ARCHIFY_HOME=${archify}/libexec/archify"
-          ];
+          ]
+          # XDG_RUNTIME_DIR is still useful for tools inside sessions (dbus,
+          # ssh-agent), but it is only set when the uid is known: systemd only
+          # sets it for *user* units, and a service user may not be declared in
+          # users.users at all.
+          ++ lib.optional (userUid != null) "XDG_RUNTIME_DIR=/run/user/${toString userUid}";
 
           # Runs before the session daemon: provision the direnv whitelist and
           # merge the global settings.json shellPath. Both helpers are
           # non-strict by default, so a corrupt direnv.toml/settings.json warns
           # and exits 0 — a broken user config must not block the unit.
+          #
+          # It also pre-creates the two AWS mask destinations (bd-125):
+          # bubblewrap cannot create a `--tmpfs` mount point under a read-only
+          # `/`, so both directories must exist on the host before the sandbox
+          # starts, even when the operator has never run `aws sso login`.
           piWebSessiondSetup = pkgs.writeShellScriptBin "pi-web-sessiond-setup" ''
             set -euo pipefail
+            install -d -m 0700 ${lib.escapeShellArg "${userHome}/.aws"}
+            install -d -m 0700 ${lib.escapeShellArg "${userHome}/.config/aws"}
             ${belayd-shell}/bin/belayd-direnv-setup \
               --toml ${lib.escapeShellArg "${userHome}/.config/direnv/direnv.toml"} \
               ${lib.concatMapStringsSep " " (
@@ -118,8 +155,84 @@
           };
 
           config = lib.mkIf cfg.enable {
+            # Only reachable when `user` is not declared under users.users, so
+            # XDG_RUNTIME_DIR cannot be derived. The AWS broker is unaffected
+            # (RuntimeDirectory + BELAYD_AWS_RUNTIME_BASE_DIR are uid-free); this
+            # warns instead of failing the rebuild.
+            warnings = lib.optional (userUid == null) ''
+              services.belayd-pi-web: user "${cfg.user}" is not declared in users.users, so XDG_RUNTIME_DIR is not set for pi-web-sessiond/pi-web-aws-broker. The AWS broker still works (it uses RuntimeDirectory + BELAYD_AWS_RUNTIME_BASE_DIR); tools inside sessions that rely on XDG_RUNTIME_DIR (dbus, ssh-agent) may not find it.
+            '';
+
+            # The session daemon runs inside a bubblewrap *mask* (bd-125): every
+            # agent session it spawns inherits a mount namespace where the
+            # operator's AWS credential material does not exist. Only the user
+            # namespace is unshared on purpose — bd's dolt liveness check shells
+            # out to `ps -axo`, and terminals plus `nix build` need the host
+            # /tmp and host network, so pid/ipc/net stay shared. `--tmpfs` is
+            # used (not `--ro-bind /dev/null`) because the SSO cache is a
+            # directory; both mount points are pre-created by ExecStartPre.
+            #
+            # Rollback is one line: replace ExecStart with the plain
+            # `${pi-web}/bin/pi-web-sessiond`, `nixos-rebuild switch`, then
+            # restart pi-web-sessiond and pi-web-aws-broker.
+            #
+            # This sandbox deliberately does NOT set BELAYD_SANDBOX_ACTIVE: an
+            # agent spawned inside it must still resolve its own per-repo scope
+            # (a nested, stricter sandbox). See docs/aws-credential-isolation.md.
             systemd.services.pi-web-sessiond = {
               description = "PI WEB session daemon";
+              after = [
+                "network-online.target"
+                "pi-web-aws-broker.service"
+              ];
+              wants = [
+                "network-online.target"
+                "pi-web-aws-broker.service"
+              ];
+              wantedBy = [ "multi-user.target" ];
+              serviceConfig = {
+                Type = "simple";
+                User = cfg.user;
+                Environment = environment;
+                ExecStartPre = "${piWebSessiondSetup}/bin/pi-web-sessiond-setup";
+                ExecStart = lib.concatStringsSep " " [
+                  "${pkgs.bubblewrap}/bin/bwrap"
+                  "--unshare-user"
+                  "--die-with-parent"
+                  "--ro-bind"
+                  "/"
+                  "/"
+                  "--dev-bind"
+                  "/dev"
+                  "/dev"
+                  "--proc"
+                  "/proc"
+                  "--tmpfs"
+                  "${userHome}/.aws"
+                  "--tmpfs"
+                  "${userHome}/.config/aws"
+                  "--"
+                  "${pi-web}/bin/pi-web-sessiond"
+                ];
+                Restart = "on-failure";
+                RestartSec = 2;
+              };
+            };
+
+            # The AWS credential broker (bd-125). Deliberately NOT sandboxed:
+            # it is the one process that must read the operator's ~/.aws (via
+            # the AWS CLI) to resolve scoped credentials for the repos the
+            # allowlist covers. It serves one 0600 unix socket per repo scope.
+            #
+            # RuntimeDirectory gives the daemon a systemd-owned runtime base
+            # (/run/belayd/aws, 0700, owned by `user`) before ExecStart, so the
+            # broker does not crash-loop on a missing /run/user/<uid> — a system
+            # service user has no logind session, and XDG_RUNTIME_DIR is only a
+            # convenience for tools inside sessions. Preserve=restart keeps the
+            # directory across the Restart=on-failure crash-restarts, which is
+            # what lets the scope sockets come back on their own.
+            systemd.services.pi-web-aws-broker = {
+              description = "belayd AWS credential broker";
               after = [ "network-online.target" ];
               wants = [ "network-online.target" ];
               wantedBy = [ "multi-user.target" ];
@@ -127,8 +240,15 @@
                 Type = "simple";
                 User = cfg.user;
                 Environment = environment;
-                ExecStartPre = "${piWebSessiondSetup}/bin/pi-web-sessiond-setup";
-                ExecStart = "${pi-web}/bin/pi-web-sessiond";
+                RuntimeDirectory = "belayd/aws";
+                RuntimeDirectoryMode = "0700";
+                RuntimeDirectoryPreserve = "restart";
+                # Non-fatal (`-`): the audit writer creates this lazily and
+                # reports a failure through the daemon's stderr (journal), so a
+                # read-only home must not crash-loop the broker before it can
+                # serve a single scope. `install` still logs its own error here.
+                ExecStartPre = "-${pkgs.coreutils}/bin/install -d -m 0700 ${lib.escapeShellArg "${userHome}/.local/state/belayd"}";
+                ExecStart = "${belayd-harness}/bin/belayd-aws-broker";
                 Restart = "on-failure";
                 RestartSec = 2;
               };
@@ -149,6 +269,9 @@
                 Type = "simple";
                 User = cfg.user;
                 Environment = environment;
+                # Intentionally NOT sandboxed (bd-125): the browser UI and its
+                # plugin `runCommand` path are the operator's own session, not
+                # an agent. Only the session daemon gets the AWS mask.
                 ExecStart = "${pi-web}/bin/pi-web-server";
                 Restart = "on-failure";
                 RestartSec = 2;
@@ -444,6 +567,15 @@
           pkgs.ast-grep
           pkgs.playwright-test # `playwright` test runner + show-trace viewer
           pkgs.playwright-driver.browsers
+          # bd-125: the agent AWS sandbox (bwrap) and the credential broker's
+          # resolver (aws configure export-credentials). Both also flow into
+          # pi-web-runtime-env through this list, so the broker unit and the
+          # sandboxed session daemon see them without a separate PATH entry.
+          # bubblewrap comes from nixpkgs-unstable (0.11.x/0.12.x line) and has
+          # no setuid mode, so `--unshare-user` is the only privilege path — no
+          # setuid-root helper to attack. Do not switch this to a setuid build.
+          pkgs.bubblewrap
+          pkgs.awscli2
         ];
 
         # Native runtime environment for the pi-web system service: a buildEnv
@@ -488,6 +620,7 @@
               -e 's|^#!/usr/bin/env bash$|#!${pkgs.bash}/bin/bash|' \
               -e 's|@realShell@|${pkgs.bash}/bin/bash|g' \
               -e 's|@jq@|${pkgs.jq}/bin/jq|g' \
+              -e 's|@awsSandbox@|${belayd-harness}/bin/belayd-aws|g' \
               "${./scripts}/$script.sh" > "$out/bin/$script"
             chmod +x "$out/bin/$script"
           done
@@ -590,7 +723,7 @@
             mv package.json.stripped package.json
             pnpm install --offline --ignore-scripts --prod --frozen-lockfile --config.node-linker=hoisted
 
-            mkdir -p "$out/extensions" "$out/src" "$out/templates" "$out/node_modules"
+            mkdir -p "$out/extensions" "$out/src" "$out/templates" "$out/node_modules" "$out/bin"
             cp -r extensions/. "$out/extensions/"
             cp -r src/. "$out/src/"
             # templates/ must stay a sibling of extensions/ so the bootstrap
@@ -603,6 +736,33 @@
             rm -f "$out/node_modules/.modules.yaml" \
                   "$out/node_modules/.package-map.json" \
                   "$out/node_modules/.pnpm-workspace-state-v1.json"
+
+            # AWS credential broker entry points (bd-125). Node 24 strips the
+            # TypeScript types at load time, so these run straight from src/ and
+            # the derivation needs no tsc step (dist/ stays a library-consumer
+            # artifact only). `belayd-aws` is the CLI the shell wrapper and the
+            # systemd broker unit call; `belayd-aws-credential-process` is the
+            # shim botocore execs, generated into each scope dir.
+            for entry in "belayd-aws:src/aws-broker/main.ts" \
+                         "belayd-aws-broker:src/aws-broker/main.ts" \
+                         "belayd-aws-credential-process:src/aws-broker/main.ts"; do
+              name="''${entry%%:*}"
+              file="''${entry#*:}"
+              subcommand=""
+              case "$name" in
+                belayd-aws-broker) subcommand="daemon" ;;
+                belayd-aws-credential-process) subcommand="credential-process" ;;
+              esac
+              {
+                printf '#!%s\n' "${pkgs.bash}/bin/bash"
+                if [ -n "$subcommand" ]; then
+                  printf 'exec %s %s %s "$@"\n' "${pkgs.nodejs_24}/bin/node" "$out/$file" "$subcommand"
+                else
+                  printf 'exec %s %s "$@"\n' "${pkgs.nodejs_24}/bin/node" "$out/$file"
+                fi
+              } > "$out/bin/$name"
+              chmod +x "$out/bin/$name"
+            done
 
             runHook postInstall
           '';

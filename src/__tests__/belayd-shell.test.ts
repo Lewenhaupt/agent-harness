@@ -8,6 +8,7 @@ import {
   renderScript,
   runScript,
   type ShellHarness,
+  writeExecutableStub,
 } from "./helpers/belayd-script-harness.js";
 
 function writeFile(path: string, contents: string): void {
@@ -408,5 +409,273 @@ describe("belayd-shell wrapper (unit)", () => {
       // The status noise is still filtered from the failure diagnostics.
       expect(result.stderr).not.toContain("direnv: loading");
     });
+  });
+});
+
+describe("belayd-shell AWS sandbox re-exec (bd-125)", () => {
+  let harness: ShellHarness;
+
+  beforeEach(() => {
+    harness = createShellHarness();
+  });
+
+  afterEach(() => {
+    harness.cleanup();
+    cleanupRenderedScripts();
+  });
+
+  /**
+   * A planner stub that emits the NUL-separated bwrap argv the real
+   * `belayd-aws plan --print0` produces, with the harness's real-shell stub as
+   * argv[0] so the wrapper's `exec` actually lands somewhere observable.
+   */
+  function writePlannerStub(): { planner: string; plannerLog: string } {
+    const plannerLog = join(harness.root, "planner.log");
+    const planner = writeExecutableStub(
+      harness.stubDir,
+      "belayd-aws",
+      [
+        "#!/bin/sh",
+        'printf \'%s\\n\' "$@" > "$BELAYD_TEST_PLANNER_LOG"',
+        'printf \'%s\\0\' "$BELAYD_TEST_REAL_SHELL" "--unshare-user" "--tmpfs" "/home/x/.aws"',
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    return { planner, plannerLog };
+  }
+
+  function writeGitStub(repo: string): void {
+    writeExecutableStub(
+      harness.stubDir,
+      "git",
+      ["#!/bin/sh", `printf '%s\\n' '${repo}'`, "exit 0", ""].join("\n"),
+    );
+  }
+
+  it("re-execs through the plan argv for a repo with .belayd/aws.yaml", () => {
+    const repo = join(harness.root, "aws-repo");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-readonly\n");
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(plannerLog)).toEqual(["plan", "--worktree", repo, "--print0"]);
+    expect(readArgvLog(harness.argvLog)).toEqual([
+      "argc=7",
+      "--unshare-user",
+      "--tmpfs",
+      "/home/x/.aws",
+      "--",
+      harness.realShell,
+      "-c",
+      "echo hi",
+    ]);
+  });
+
+  it("does not re-exec when BELAYD_SANDBOX_ACTIVE is already set", () => {
+    const repo = join(harness.root, "aws-repo-nested");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-readonly\n");
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_SANDBOX_ACTIVE: "1",
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(plannerLog)).toEqual([]);
+    expect(readArgvLog(harness.argvLog)).toEqual(["argc=2", "-c", "echo hi"]);
+  });
+
+  it("forwards a refusal reason and still runs the command unwrapped", () => {
+    const repo = join(harness.root, "aws-repo-refused");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-deploy\n");
+    writeGitStub(repo);
+    const planner = writeExecutableStub(
+      harness.stubDir,
+      "belayd-aws",
+      [
+        "#!/bin/sh",
+        "printf 'belayd-aws: profile \"agent-deploy\" is not permitted\\n' >&2",
+        "exit 1",
+        "",
+      ].join("\n"),
+    );
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: { ...harness.env, BELAYD_TEST_REAL_SHELL: harness.realShell },
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('belayd-shell: belayd-aws: profile "agent-deploy"');
+    expect(readArgvLog(harness.argvLog)).toEqual(["argc=2", "-c", "echo hi"]);
+  });
+
+  it("skips the planner entirely when the repo has no .belayd/aws.yaml", () => {
+    const repo = join(harness.root, "plain-repo");
+    mkdirSync(repo, { recursive: true });
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(plannerLog)).toEqual([]);
+    expect(readArgvLog(harness.argvLog)).toEqual(["argc=2", "-c", "echo hi"]);
+  });
+  it("still routes a flake repo through nix develop inside the sandbox", () => {
+    // Regression: the AWS block used to exec REAL_SHELL directly, silently
+    // skipping the devShell for a repo with both .belayd/aws.yaml and flake.nix.
+    const repo = join(harness.root, "aws-flake-repo");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-readonly\n");
+    writeFile(join(repo, "flake.nix"), "{}\n");
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(plannerLog)).toEqual(["plan", "--worktree", repo, "--print0"]);
+    // The sandbox wrap comes first, and the nix develop command is the one
+    // inside it, so the devShell still applies under the mask.
+    expect(readArgvLog(harness.argvLog)).toEqual([
+      "argc=11",
+      "--unshare-user",
+      "--tmpfs",
+      "/home/x/.aws",
+      "--",
+      "nix",
+      "develop",
+      repo,
+      "-c",
+      harness.realShell,
+      "-c",
+      "echo hi",
+    ]);
+  });
+
+  it("still evaluates .envrc through direnv inside the sandbox", () => {
+    const repo = join(harness.root, "aws-direnv-repo");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-readonly\n");
+    writeFile(join(repo, ".envrc"), "export FOO=1\n");
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(harness.direnvLog)).toContain("export");
+    expect(readArgvLog(harness.argvLog)).toEqual([
+      "argc=7",
+      "--unshare-user",
+      "--tmpfs",
+      "/home/x/.aws",
+      "--",
+      harness.realShell,
+      "-c",
+      "echo hi",
+    ]);
+  });
+
+  it("honours .pi/no-devshell while still sandboxing", () => {
+    const repo = join(harness.root, "aws-nodevshell-repo");
+    writeFile(join(repo, ".belayd/aws.yaml"), "profile: agent-readonly\n");
+    writeFile(join(repo, ".pi/no-devshell"), "");
+    writeGitStub(repo);
+    const { planner, plannerLog } = writePlannerStub();
+    const wrapper = renderScript("belayd-shell", {
+      realShell: harness.realShell,
+      jqPath: harness.jqPath,
+      awsSandboxPath: planner,
+    }).path;
+
+    const result = runScript(wrapper, ["-c", "echo hi"], {
+      cwd: repo,
+      env: {
+        ...harness.env,
+        BELAYD_TEST_PLANNER_LOG: plannerLog,
+        BELAYD_TEST_REAL_SHELL: harness.realShell,
+      },
+    });
+
+    expect(result.status).toBe(0);
+    expect(readArgvLog(harness.argvLog)).toEqual([
+      "argc=7",
+      "--unshare-user",
+      "--tmpfs",
+      "/home/x/.aws",
+      "--",
+      harness.realShell,
+      "-c",
+      "echo hi",
+    ]);
   });
 });

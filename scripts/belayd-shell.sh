@@ -12,6 +12,10 @@ set -u
 # overrides exist so tests can point at stubs.
 REAL_SHELL="${BELAYD_REAL_SHELL:-@realShell@}"
 JQ="${BELAYD_JQ:-@jq@}"
+# belayd-aws (src/aws-broker) — resolves the per-repo AWS sandbox plan. Absent
+# (or not executable) means this wrapper never wraps, which is the dev-machine
+# and test default.
+AWS_SANDBOX="${BELAYD_AWS_SANDBOX:-@awsSandbox@}"
 
 belayd_warn() { printf 'belayd-shell: %s\n' "$1" >&2; }
 belayd_fail() { printf 'belayd-shell: %s\n' "$1" >&2; exit 1; }
@@ -63,13 +67,80 @@ belayd_filter_direnv_stderr() {
   done
 }
 
+# Prefix a captured stderr file line by line, so a planner warning or refusal
+# reads as this wrapper's own diagnostic.
+belayd_prefix_stderr() {
+  local line
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then printf 'belayd-shell: %s\n' "$line" >&2; fi
+  done < "$1"
+}
+
+# Filled by the AWS block below when a per-repo sandbox plan resolves; an empty
+# array means "run unwrapped" (no AWS config, or the planner refused). Declared
+# before `belayd_exec` is defined so the helper always expands it under `set -u`.
+sandbox_argv=()
+
+# Exec the final command, wrapped in the per-repo AWS sandbox when a plan
+# resolved. Every routing branch below goes through this helper, so routing
+# still runs first and only the *final* command is wrapped: direnv's
+# status/allow check and `direnv export bash` run in this process (outside the
+# mask) and the environment they export is inherited by the sandboxed command,
+# while `nix develop`/`nix-shell` are themselves the wrapped command (inside the
+# mask). Exec'ing REAL_SHELL straight from the AWS block instead would silently
+# skip the devShell for a repo carrying both `.belayd/aws.yaml` and
+# `.envrc`/`flake.nix`.
+belayd_exec() {
+  if [ "${#sandbox_argv[@]}" -gt 0 ]; then
+    exec "${sandbox_argv[@]}" -- "$@"
+  fi
+  exec "$@"
+}
+
+# Re-enter through the per-repo AWS sandbox when the current git toplevel
+# carries a `.belayd/aws.yaml` (bd-125). This is what turns "agent with the
+# operator's ~/.aws" into "agent with one scoped profile": bubblewrap masks
+# ~/.aws, ~/.config/aws and every other repo's scope socket, then re-exposes
+# only this worktree's generated credential_process profile.
+#
+# The plan is resolved *before* the devShell routing below because `belayd_exec`
+# needs its argv, but the routing itself still happens first (see `belayd_exec`):
+# this block only decides whether the final command is wrapped. Every step is
+# best-effort and silent for the common case: a missing planner, a non-git cwd,
+# or a repo without the marker leaves the rest of this wrapper byte-identical.
+# Recursion is stopped by BELAYD_SANDBOX_ACTIVE, which the plan exports via bwrap
+# --setenv. The plan is asked for a NUL-separated argv (never eval'd) so paths
+# with spaces and quoted arguments survive.
+if [ -z "${BELAYD_SANDBOX_ACTIVE:-}" ] && [ -x "$AWS_SANDBOX" ]; then
+  sandbox_toplevel="$(git rev-parse --show-toplevel 2>/dev/null)"
+  if [ -n "$sandbox_toplevel" ] && [ -f "$sandbox_toplevel/.belayd/aws.yaml" ]; then
+    sandbox_plan_file="$(mktemp 2>/dev/null)"
+    sandbox_plan_err="$(mktemp 2>/dev/null)"
+    if [ -n "$sandbox_plan_file" ] && [ -n "$sandbox_plan_err" ]; then
+      if "$AWS_SANDBOX" plan --worktree "$sandbox_toplevel" --print0 \
+        >"$sandbox_plan_file" 2>"$sandbox_plan_err"; then
+        mapfile -d '' sandbox_argv < "$sandbox_plan_file"
+        # The planner warns here when the broker is unreachable (it still
+        # prints the plan, because the mask is the security property).
+        if [ -s "$sandbox_plan_err" ]; then belayd_prefix_stderr "$sandbox_plan_err"; fi
+      else
+        # A repo that opted into AWS but was refused (bad profile, malformed
+        # allowlist) must be visible: the command still runs, unwrapped and
+        # without AWS, and the reason goes to stderr.
+        belayd_prefix_stderr "$sandbox_plan_err"
+      fi
+      rm -f "$sandbox_plan_file" "$sandbox_plan_err"
+    fi
+  fi
+fi
+
 # No recursion: a process already inside a devShell must not re-enter one (that
 # would deadlock nix/direnv). A consequence: a process already inside one repo's
 # devShell will NOT switch to another repo's devShell — it gets the ambient
 # shell. Nested shells inside one project inherit the enclosing devShell, which
 # is the desired behavior.
 if [ -n "${BELAYD_SHELL_ACTIVE:-}" ]; then
-  exec "$REAL_SHELL" "$@"
+  belayd_exec "$REAL_SHELL" "$@"
 fi
 
 # Walk up from $PWD to the first devShell marker. `.pi/no-devshell` stops the
@@ -80,7 +151,7 @@ mode=""
 dir="${PWD:-$(pwd)}"
 while [ -n "$dir" ]; do
   if [ -e "$dir/.pi/no-devshell" ]; then
-    exec "$REAL_SHELL" "$@"
+    belayd_exec "$REAL_SHELL" "$@"
   fi
   if [ -e "$dir/.envrc" ]; then
     root="$dir"
@@ -109,7 +180,7 @@ done
 # exists precisely to keep this branch's inherited PATH from being clobbered by
 # an interactive shell's startup files.)
 if [ -z "$mode" ]; then
-  exec "$REAL_SHELL" "$@"
+  belayd_exec "$REAL_SHELL" "$@"
 fi
 
 if [ "$mode" = "direnv" ]; then
@@ -172,7 +243,7 @@ if [ "$mode" = "direnv" ]; then
   [ -z "$err_file" ] || rm -f "$err_file"
   eval "$env_out"
   export BELAYD_SHELL_ACTIVE=1
-  exec "$REAL_SHELL" "$@"
+  belayd_exec "$REAL_SHELL" "$@"
 fi
 
 if [ "$mode" = "flake" ]; then
@@ -183,7 +254,7 @@ if [ "$mode" = "flake" ]; then
   # ambient-PATH merge). `nix develop <root> -c` preserves the caller's cwd,
   # verified from a subdirectory of the root.
   export BELAYD_SHELL_ACTIVE=1
-  exec nix develop "$root" -c "$REAL_SHELL" "$@"
+  belayd_exec nix develop "$root" -c "$REAL_SHELL" "$@"
 fi
 
 # shell.nix-only repos cannot use `nix develop`. nix-shell has no argv form, so
@@ -197,4 +268,4 @@ cmd="exec $(printf '%q' "$REAL_SHELL")"
 for arg in "$@"; do
   cmd="$cmd $(printf '%q' "$arg")"
 done
-exec nix-shell "$root" --command "$cmd"
+belayd_exec nix-shell "$root" --command "$cmd"

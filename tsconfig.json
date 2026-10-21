@@ -17,7 +17,15 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
     "outDir": "dist",
-    "rootDir": "."
+    "rootDir": ".",
+    // The aws-broker entry points (src/aws-broker/main.ts, client.ts) are run
+    // directly by Node 24's native type stripping from the Nix wrappers, which
+    // resolves only the literal specifier. Those files therefore import
+    // `./x.ts`; tsc rewrites the extension to `.js` on emit so `dist/` stays
+    // valid for library consumers. Everything else keeps the usual `.js`
+    // specifiers.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src", "extensions", "pi-web-plugins"],
   "exclude": []
