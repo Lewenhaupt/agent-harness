@@ -33,18 +33,31 @@ const renderedDirs: string[] = [];
  */
 export function renderScript(
   name: string,
-  placeholders: { realShell: string; jqPath: string },
+  placeholders: { realShell: string; jqPath: string; awsSandboxPath?: string },
 ): RenderedScript {
   const source = readFileSync(join(REPO_ROOT, "scripts", `${name}.sh`), "utf-8");
   const rendered = source
     .replaceAll("@realShell@", placeholders.realShell)
-    .replaceAll("@jq@", placeholders.jqPath);
+    .replaceAll("@jq@", placeholders.jqPath)
+    // The AWS sandbox planner is only ever invoked when a repo opts in with
+    // `.belayd/aws.yaml`; a non-existent default keeps every existing fixture
+    // byte-identical to the pre-bd-125 wrapper.
+    .replaceAll("@awsSandbox@", placeholders.awsSandboxPath ?? "/nonexistent/belayd-aws");
   const dir = mkdtempSync(join(tmpdir(), `belayd-render-${name}-`));
   const path = join(dir, name);
   writeFileSync(path, rendered);
   chmodSync(path, 0o755);
   renderedDirs.push(dir);
   return { path, dir };
+}
+
+/** Write an executable stub into a directory (used by the wrapper tests). */
+export function writeExecutableStub(dir: string, name: string, body: string): string {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+  return path;
 }
 
 export function cleanupRenderedScripts(): void {

@@ -229,6 +229,60 @@ Restart (sudo):
 sudo systemctl restart pi-web pi-web-sessiond
 ```
 
+### AWS credential isolation (bd-125)
+
+Agents must not see the operator's AWS credentials. Two mechanisms enforce
+that, both described in `docs/aws-credential-isolation.md`:
+
+- **bubblewrap masking** at three choke points: every process spawned by
+  `src/spawn.ts`, `scripts/belayd-shell.sh` (terminals, plugin `runCommand`),
+  and the `pi-web-sessiond` unit itself. Each wraps the command with
+  `bwrap --unshare-user --ro-bind / / … --tmpfs <home>/.aws --tmpfs
+  <home>/.config/aws`, so a session sees no SSO cache and cannot run
+  `aws sso login`.
+- **per-repo credential broker** (`src/aws-broker/`), a long-running daemon
+  (`pi-web-aws-broker`, deliberately *not* sandboxed) that serves one 0600 unix
+  socket per repo scope and resolves credentials through `aws configure
+  export-credentials` (never by parsing the SSO cache). A repo opts in with a
+  committed `.belayd/aws.yaml` naming a literal profile, validated against the
+  operator allowlist `~/.config/belayd/aws.yaml`; the sandbox gets a synthetic
+  `~/.aws/config` whose single `[profile agent]` uses a generated
+  `credential_process` shim.
+
+Dependency chain: `pkgs.bubblewrap` + `pkgs.awscli2` are in `devShellTools`, so
+both `devShells.default` and `pi-web-runtime-env` (hence every spawned agent's
+`PATH`) carry them. `belayd-harness` also exposes `bin/belayd-aws`,
+`bin/belayd-aws-broker`, and `bin/belayd-aws-credential-process`, which run the
+TypeScript entry points directly under Node 24's native type stripping (no
+tsc step; `dist/` stays a library-consumer artifact).
+
+`pi-web-sessiond` now runs in a mount namespace, so **anything that assumes an
+unmasked `~/.aws` inside a session is broken by design** — that is the point.
+Same-uid processes outside a sandbox (the interactive pi CLI, a human shell,
+pi-web server, the broker) can still read `~/.aws`; a dedicated broker uid is
+the documented, out-of-scope upgrade path.
+
+**Orchestrator vs sandboxed child (single uid).** The per-repo bwrap masks the
+broker runtime base, so a sandboxed agent cannot reach the control socket or a
+sibling repo's scope socket. The orchestrator (the session pi process in the
+`pi-web-sessiond` namespace, an agent tool that bypasses `belayd-shell`, or a
+repo with no `.belayd/aws.yaml`) is *not* masked from the runtime base — it
+needs `ensure-scope` for the agents it spawns — and can therefore ask the
+broker for any scope the allowlist configures. That is a single-uid limit, not
+a bug: do not read this as a per-uid boundary. See the actor table in
+`docs/aws-credential-isolation.md`.
+
+Fail-closed rules: no repo file, no matching allowlist scope, or a profile the
+scope does not grant ⇒ no AWS inside the sandbox. A repo that opts in and is
+refused logs one line per spawn; a repo with no AWS config is silent. An expired
+portal session or 90-day PKCE registration can only be fixed by an interactive
+`aws sso login` on the host — the broker surfaces AWS's own error text plus that
+instruction and never retries silently.
+
+Operator workflow (allowlist + repo file + host activation + refresh + diagnostics)
+and the ~5-minute acceptance checklist are the `## How to Use` and
+`## How to Verify` sections of `docs/aws-credential-isolation.md`.
+
 ### scotty / portainer / beads-shared-server (arion containers)
 
 ```bash
