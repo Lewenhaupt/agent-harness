@@ -14,10 +14,10 @@
 
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type {
   BashToolCallEvent,
   ExtensionAPI,
@@ -157,6 +157,7 @@ import {
   spawnAgentWithFallback,
   spawnDetachedRun,
   taskIdFromBranch,
+  userGuideDocPath,
   validateBdCommand,
   WF_LABEL_PREFIX,
   WORKFLOW_REGISTRY,
@@ -232,6 +233,11 @@ export interface RunQualityGateOptions {
   proofDir?: string;
   /** Epoch ms when this phase run's spawn started (proof-gate freshness floor). */
   proofRunStartMs?: number;
+  /**
+   * Worktree-relative userguide deliverable, set for the userguide phase so the
+   * gate validates the file the phase was told to write.
+   */
+  userGuidePath?: string;
   env?: Record<string, string>;
   signal?: AbortSignal;
   model?: string;
@@ -756,8 +762,16 @@ function reviewLoopDirective(nextPhaseTool: string): string {
 /**
  * Compose the body of the `belayd-run-complete` follow-up. Extracted from the
  * `deliver` callback so the callback stays under the complexity budget.
+ *
+ * `artifactLine` names the phase's on-disk deliverable when it produced one
+ * (the userguide markdown), so the operator sees the record without opening
+ * beads or the worktree.
  */
-function buildRunCompleteContent(delivery: RunDelivery, reviewLoopHint: string): string {
+function buildRunCompleteContent(
+  delivery: RunDelivery,
+  reviewLoopHint: string,
+  artifactLine: string,
+): string {
   const text = delivery.result.content?.[0]?.text ?? "";
   const header = delivery.success
     ? `✅ **${delivery.phaseName} phase completed** (run \`${delivery.runId}\`)`
@@ -769,7 +783,22 @@ function buildRunCompleteContent(delivery: RunDelivery, reviewLoopHint: string):
   const failureGuidance = delivery.success
     ? ""
     : `\n\nInspect the output and re-run \`belayd_${delivery.phaseName}\` if needed.`;
-  return `${header}${reasonNote}\n\n${text}${failureGuidance}${reviewLoopHint}`;
+  return `${header}${reasonNote}\n\n${artifactLine}${text}${failureGuidance}${reviewLoopHint}`;
+}
+
+/**
+ * Deliverable pointer for a completed userguide run, or "" when the phase left
+ * no artifact. Gated on the file actually existing: the follow-up must never
+ * claim a record that a failed run did not write.
+ */
+function userGuideArtifactLine(
+  delivery: RunDelivery,
+  options: { cwd: string; taskId: string },
+): string {
+  if (!delivery.success || delivery.phaseName !== "userguide" || options.taskId === "") return "";
+  const docPath = userGuideDocPath(options.taskId);
+  if (!existsSync(resolve(options.cwd, docPath))) return "";
+  return `📄 **User guide written to \`${docPath}\`** — How to Verify + How to Use.\n\n`;
 }
 
 /**
@@ -2022,6 +2051,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     proofDir?: string;
     proofRequired?: boolean;
     proofRunStartMs?: number;
+    userGuidePath?: string;
   }
 
   /** Run a quality gate over a result, normalizing the feedback text. */
@@ -2030,13 +2060,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     result: SpawnResult,
     context: GateRunContext,
   ): Promise<{ passed: boolean; feedback: string }> {
-    const { cwd, proofDir, proofRequired, proofRunStartMs } = context;
+    const { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath } = context;
     const options =
       cwd !== undefined ||
       proofDir !== undefined ||
       proofRequired !== undefined ||
-      proofRunStartMs !== undefined
-        ? { cwd, proofDir, proofRequired, proofRunStartMs }
+      proofRunStartMs !== undefined ||
+      userGuidePath !== undefined
+        ? { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath }
         : undefined;
     const text = result.content?.[0]?.text ?? "";
     const outcome = await gate(text, result.details, options);
@@ -2069,6 +2100,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         proofDir: options.proofDir,
         proofRequired: WORKFLOW_REGISTRY[workflowType].proofRequired,
         proofRunStartMs: options.proofRunStartMs,
+        userGuidePath: options.userGuidePath,
       });
 
       if (verdict.passed) {
@@ -3666,9 +3698,9 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
 
   /**
    * Build the full phase prompt: the bead plan for implement, the inlined diff
-   * for review, the change context for proof, or the raw task otherwise. Used
-   * for the initial spawn and to re-supply a fresh-epoch gate retry that has no
-   * transcript.
+   * for review, the change context for proof, the deliverable path for
+   * userguide, or the raw task otherwise. Used for the initial spawn and to
+   * re-supply a fresh-epoch gate retry that has no transcript.
    */
   async function buildFullPhaseTask(options: {
     phaseName: string;
@@ -3691,11 +3723,62 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         cwd: options.cwd,
       });
     }
+    if (options.phaseName === "userguide") {
+      return buildUserGuideTask(options);
+    }
     if (options.phaseName === "proof") {
-      const proofContext = await collectChangeContext(options.cwd, options.userGuideContent);
+      const proofContext = await collectChangeContext(
+        options.cwd,
+        readUserGuideForContext({
+          cwd: options.cwd,
+          taskId: options.taskId,
+          captured: options.userGuideContent,
+        }),
+      );
       return `${options.paramsTask}${proofContext}`;
     }
     return options.paramsTask;
+  }
+
+  /**
+   * Userguide prompt: name the exact deliverable path and state that the file,
+   * not the chat answer, is what the gate and the human read. The path is
+   * derived here (not left to the agent) so the gate, the commit note, and the
+   * agent cannot disagree about where the guide lives.
+   */
+  function buildUserGuideTask(options: { taskId: string; paramsTask: string }): string {
+    const docPath = userGuideDocPath(options.taskId);
+    return `${options.paramsTask}
+
+## Deliverable
+
+Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`write\` tool. The file is the record: a quality gate reads it back from the worktree, so pasting the guide into your final message instead of writing the file fails this phase.`;
+  }
+
+  /**
+   * User-guide markdown used as functional context for the proof verifier.
+   *
+   * The phase deliverable lives on disk, so read it there; a session recovered
+   * from an older capture (or a run whose file was never written) falls back to
+   * the in-session text.
+   */
+  function readUserGuideForContext(options: {
+    cwd: string;
+    taskId: string;
+    captured: string | undefined;
+  }): string | undefined {
+    if (options.taskId !== "") {
+      try {
+        const content = readFileSync(
+          resolve(options.cwd, userGuideDocPath(options.taskId)),
+          "utf8",
+        );
+        if (content.trim() !== "") return content;
+      } catch {
+        // No deliverable on disk — fall through to the captured text.
+      }
+    }
+    return options.captured;
   }
 
   /**
@@ -3837,7 +3920,11 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
-            content: buildRunCompleteContent(delivered, reviewLoopHintFor(delivered, state)),
+            content: buildRunCompleteContent(
+              delivered,
+              reviewLoopHintFor(delivered, state),
+              userGuideArtifactLine(delivered, { cwd, taskId: state.currentTaskId }),
+            ),
             display: true,
             details: {
               runId: delivery.runId,
@@ -3925,6 +4012,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
         cwd,
         proofDir,
         proofRunStartMs,
+        // Only the userguide phase has a file deliverable; the path is derived
+        // from the bead id so the gate reads exactly what the prompt named.
+        userGuidePath:
+          phaseName === "userguide" && state.currentTaskId !== ""
+            ? userGuideDocPath(state.currentTaskId)
+            : undefined,
         env: spawnEnv,
         workflowType: state.workflowType,
         phaseName,
@@ -4459,7 +4552,14 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   ): Promise<{ prompt: string; cwd: string; skipped: boolean }> {
     const taskText = params.task ?? state.currentTaskId;
     const proofOutput = params.proof ?? state.proofOutput ?? "";
-    const changeContext = await collectChangeContext(cwd, state.userGuideContent);
+    const changeContext = await collectChangeContext(
+      cwd,
+      readUserGuideForContext({
+        cwd,
+        taskId: state.currentTaskId,
+        captured: state.userGuideContent,
+      }),
+    );
     // A single scan classifies canonical refs without the proof base, so the
     // early return below skips before any git-backed base derivation. Raw
     // absolute candidates are carried forward and normalized once the base is
@@ -5532,8 +5632,8 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     }
   }
 
-  /** Append user-guide content to a task's notes; best-effort and non-blocking. */
-  async function appendUserGuideNote(taskId: string, content: string, cwd: string): Promise<void> {
+  /** Append a note to a task's notes field; best-effort and non-blocking. */
+  async function appendTaskNote(taskId: string, content: string, cwd: string): Promise<void> {
     try {
       // Piping via `--stdin` keeps the body out of argv and avoids a temp file
       // that could leak if the process dies mid-append.
@@ -5657,11 +5757,30 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
   /** Append userguide + proof-verifier verdict notes (best-effort). */
   async function appendTaskNotes(taskId: string, state: SessionState, cwd: string): Promise<void> {
     if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
-      await appendUserGuideNote(taskId, state.userGuideContent, cwd);
+      await appendTaskNote(
+        taskId,
+        userGuideNoteBody({ cwd, taskId: state.currentTaskId, report: state.userGuideContent }),
+        cwd,
+      );
     }
     if (state.proofVerifierVerdict) {
-      await appendUserGuideNote(taskId, state.proofVerifierVerdict, cwd);
+      await appendTaskNote(taskId, state.proofVerifierVerdict, cwd);
     }
+  }
+
+  /**
+   * Bead note for the userguide phase: a stable pointer to the committed guide
+   * plus the agent's own report. The pointer is emitted on its own line so
+   * `bd show` names the record even when the report is only a summary, and it
+   * is omitted when no file was written rather than claiming one that is absent.
+   */
+  function userGuideNoteBody(options: { cwd: string; taskId: string; report: string }): string {
+    const docPath = userGuideDocPath(options.taskId);
+    const wroteFile = existsSync(resolve(options.cwd, docPath));
+    const pointer = wroteFile
+      ? `## User guide\n\n\`${docPath}\` — How to Verify and How to Use.\n\n`
+      : "## User guide\n\n(no guide file found in the worktree — see the report below)\n\n";
+    return `${pointer}${options.report}`;
   }
 
   /** Tool failure result for an invalid commit task id. */

@@ -374,6 +374,7 @@ export {
   gateTests,
   gateTypecheck,
   gateUserGuide,
+  userGuideDocPath,
 } from "./quality-gates.js";
 export type { FailureClassification, FailureKind } from "./quota-failure.js";
 export {

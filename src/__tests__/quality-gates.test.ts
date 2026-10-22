@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   readlinkSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -25,6 +26,7 @@ import {
   gateTests,
   gateTypecheck,
   gateUserGuide,
+  userGuideDocPath,
   validateCastRecording,
 } from "../quality-gates.js";
 
@@ -1110,6 +1112,18 @@ describe("gateProofContent fallback", () => {
   });
 });
 
+describe("userGuideDocPath", () => {
+  it("derives the deliverable path from the bead id", () => {
+    expect(userGuideDocPath("bd-42")).toBe("docs/bd-42-userguide.md");
+    expect(userGuideDocPath("bd-42.1")).toBe("docs/bd-42.1-userguide.md");
+  });
+
+  it("falls back to a generic name when no task id is known", () => {
+    expect(userGuideDocPath("")).toBe("docs/userguide.md");
+    expect(userGuideDocPath("   ")).toBe("docs/userguide.md");
+  });
+});
+
 describe("gateUserGuide", () => {
   it("passes when both How to Verify and How to Use sections are present with sufficient length", async () => {
     const output = [
@@ -1291,6 +1305,103 @@ describe("gateUserGuide", () => {
     const result = await gateUserGuide(output, MOCK_DETAILS);
     expect(result).toHaveProperty("passed", false);
     expect(result.feedback).toContain("too short");
+  });
+});
+
+// The workflow path passes `userGuidePath`, so the phase passes only when the
+// guide exists as a file in the worktree — a chat-only answer must fail.
+describe("gateUserGuide (file deliverable)", () => {
+  const validGuide = [
+    "# Bash timeout enforcement (bd-42)",
+    "",
+    "## How to Verify",
+    "1. Run `pnpm typecheck`",
+    "2. Expect no output and exit code 0",
+    "",
+    "## How to Use",
+    "```typescript",
+    'import { resolveBashTimeout } from "../src/bash-timeout.js";',
+    "resolveBashTimeout(undefined);",
+    "```",
+  ].join("\n");
+
+  let cwd = "";
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "belayd-userguide-gate-"));
+  });
+
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  /** Write the deliverable the phase was told to produce. */
+  function writeGuide(relativePath: string, content: string): void {
+    const absolute = resolve(cwd, relativePath);
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, content, "utf8");
+  }
+
+  it("passes when the deliverable exists with both sections", async () => {
+    writeGuide("docs/bd-42-userguide.md", validGuide);
+
+    const result = await gateUserGuide("done", MOCK_DETAILS, {
+      cwd,
+      userGuidePath: "docs/bd-42-userguide.md",
+    });
+
+    expect(result).toHaveProperty("passed", true);
+  });
+
+  it("fails when the agent only answered in chat", async () => {
+    const result = await gateUserGuide(validGuide, MOCK_DETAILS, {
+      cwd,
+      userGuidePath: "docs/bd-42-userguide.md",
+    });
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Missing user guide file");
+    expect(result.feedback).toContain("docs/bd-42-userguide.md");
+  });
+
+  it("fails when the file exists without a How to Use section", async () => {
+    writeGuide(
+      "docs/bd-42-userguide.md",
+      ["# Feature", "", "## How to Verify", `1. Run it\n${"x".repeat(200)}`].join("\n"),
+    );
+
+    const result = await gateUserGuide("done", MOCK_DETAILS, {
+      cwd,
+      userGuidePath: "docs/bd-42-userguide.md",
+    });
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("How to Use");
+    expect(result.feedback).toContain("docs/bd-42-userguide.md");
+  });
+
+  it("fails when the file is too short", async () => {
+    writeGuide("docs/bd-42-userguide.md", "## How to Verify\nx\n## How to Use\ny\n");
+
+    const result = await gateUserGuide("done", MOCK_DETAILS, {
+      cwd,
+      userGuidePath: "docs/bd-42-userguide.md",
+    });
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("too short");
+  });
+
+  it("fails closed on a path that escapes the worktree", async () => {
+    writeGuide("../outside-userguide.md", validGuide);
+
+    const result = await gateUserGuide(validGuide, MOCK_DETAILS, {
+      cwd,
+      userGuidePath: "../outside-userguide.md",
+    });
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("escapes the worktree");
   });
 });
 
