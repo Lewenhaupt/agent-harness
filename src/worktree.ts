@@ -332,13 +332,233 @@ export async function awaitWorktreeReady(
 export type RepoKeyResult = { ok: true; key: string } | { ok: false; error: string };
 
 /**
- * Exec seam for {@link resolveRepoKey}. Production runs `git rev-parse`;
- * tests inject a function returning a fixed common-dir or throwing.
+ * Exec seam for the read-only git probes in this module (`rev-parse`,
+ * `worktree list`). Production runs git; tests inject fixed stdout/throwers.
  */
 export type RepoKeyExec = (cwd: string) => string;
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** One entry of `git worktree list --porcelain` (bd-126 fleet status). */
+export interface WorktreeListEntry {
+  path: string;
+  /** Branch checked out here; undefined on detached HEAD. */
+  branch: string | undefined;
+  /**
+   * git lists the main worktree first. Only the main worktree can check out the
+   * base branch (`main`), which is why fleet merges happen in the operator's
+   * own checkout (docs/fleet-orchestrator.md).
+   */
+  isMainWorktree: boolean;
+}
+
+/** Parsed worktree list plus the records the parser had to skip. */
+export interface ParsedWorktreeList {
+  entries: WorktreeListEntry[];
+  /** Human-readable warnings for records that could not be represented. */
+  warnings: string[];
+}
+
+/** Discriminated result of enumerating registered worktrees. */
+export type WorktreeListResult =
+  | { ok: true; entries: WorktreeListEntry[]; warnings: string[] }
+  | { ok: false; error: string };
+
+/**
+ * Parse `git worktree list --porcelain -z` (NUL-separated, git >= 2.36).
+ *
+ * This is the primary form because a worktree path may contain a newline (legal
+ * on Linux): with NUL separators the newline is just a byte inside the
+ * `worktree` value, whereas the line-oriented form splits the record and
+ * silently truncates the path. git does not C-quote these values, so there is
+ * nothing to unquote here.
+ */
+export function parseWorktreeListPorcelainZ(output: string): ParsedWorktreeList {
+  const entries: WorktreeListEntry[] = [];
+  let recordIndex = 0;
+  let path: string | undefined;
+  let branch: string | undefined;
+
+  const flush = (): void => {
+    if (path === undefined) return;
+    entries.push({ path, branch, isMainWorktree: recordIndex === 0 });
+    recordIndex += 1;
+    path = undefined;
+    branch = undefined;
+  };
+
+  // `-z` NUL-terminates every field and closes a record with an empty field.
+  for (const field of output.split("\0")) {
+    if (field === "") {
+      flush();
+      continue;
+    }
+    if (field.startsWith("worktree ")) {
+      path = field.slice("worktree ".length);
+      continue;
+    }
+    if (field.startsWith("branch refs/heads/")) {
+      branch = field.slice("branch refs/heads/".length);
+    }
+    // HEAD/detached/bare/locked/prunable carry no path information.
+  }
+  flush();
+
+  return { entries, warnings: [] };
+}
+
+/** Recognized non-path keys in the line-oriented porcelain form. */
+function isPorcelainKeyLine(line: string): boolean {
+  return (
+    line === "bare" ||
+    line === "detached" ||
+    line.startsWith("HEAD ") ||
+    line.startsWith("branch ") ||
+    line.startsWith("locked") ||
+    line.startsWith("prunable")
+  );
+}
+
+/**
+ * Parse line-oriented `git worktree list --porcelain` (fallback for git < 2.36).
+ *
+ * A path containing a newline spans two lines here and cannot be recovered. Such
+ * a record is skipped with a warning rather than accepted truncated: a truncated
+ * path would read as `missing-workflow-state` for a worktree that exists, which
+ * is worse than an explicit warning. Prefer {@link parseWorktreeListPorcelainZ}.
+ */
+export function parseWorktreeListPorcelain(porcelain: string): ParsedWorktreeList {
+  const entries: WorktreeListEntry[] = [];
+  const warnings: string[] = [];
+  let recordIndex = 0;
+
+  for (const block of porcelain.split("\n\n")) {
+    const lines = block.split("\n").filter((line) => line !== "");
+    if (lines.length === 0) continue;
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (pathLine === undefined) continue;
+
+    const path = pathLine.slice("worktree ".length);
+    const isFirstRecord = recordIndex === 0;
+    recordIndex += 1;
+
+    const unexpected = lines.filter((line) => line !== pathLine && !isPorcelainKeyLine(line));
+    if (unexpected.length > 0) {
+      warnings.push(
+        `git worktree list entry ${JSON.stringify(path)} was skipped: non-key line(s) ` +
+          `${JSON.stringify(unexpected.join("; "))} mean the path does not round-trip ` +
+          "through line-oriented porcelain (likely a newline in the path; git >= 2.36 `-z` " +
+          "is required)",
+      );
+      continue;
+    }
+
+    const branchLine = lines.find((line) => line.startsWith("branch refs/heads/"));
+    entries.push({
+      path,
+      branch: branchLine === undefined ? undefined : branchLine.slice("branch refs/heads/".length),
+      isMainWorktree: isFirstRecord,
+    });
+  }
+
+  return { entries, warnings };
+}
+
+function runGitWorktreeList(cwd: string, args: readonly string[]): string {
+  return execFileSync("git", ["worktree", "list", ...args], {
+    cwd,
+    env: gitContextFreeEnv(),
+    timeout: 10_000,
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+}
+
+/** NUL-separated probe (git >= 2.36): the primary, newline-safe form. */
+function execGitWorktreeListZ(cwd: string): string {
+  return runGitWorktreeList(cwd, ["--porcelain", "-z"]);
+}
+
+/** Line-oriented fallback for hosts whose git predates `-z` (2.36). */
+function execGitWorktreeListLines(cwd: string): string {
+  return runGitWorktreeList(cwd, ["--porcelain"]);
+}
+
+/** Injectable git probes for {@link listWorktrees} (tests avoid shelling out). */
+export interface ListWorktreesDeps {
+  /** NUL-separated probe seam (git >= 2.36). */
+  execNul?: RepoKeyExec;
+  /** Line-oriented fallback seam for older git. */
+  execLines?: RepoKeyExec;
+}
+
+/**
+ * Enumerate every worktree registered for `projectRoot`'s repository.
+ *
+ * Read-only: one `git worktree list --porcelain -z` probe, falling back to the
+ * line-oriented form only when `-z` is unavailable (git < 2.36). No mutation.
+ * Returns an error value (not a throw) so callers can surface a refusal.
+ */
+export function listWorktrees(
+  projectRoot: string,
+  deps: ListWorktreesDeps = {},
+): WorktreeListResult {
+  const execNul = deps.execNul ?? execGitWorktreeListZ;
+  const execLines = deps.execLines ?? execGitWorktreeListLines;
+
+  try {
+    const parsed = parseWorktreeListPorcelainZ(execNul(projectRoot));
+    return { ok: true, entries: parsed.entries, warnings: parsed.warnings };
+  } catch {
+    // `-z` does not exist before git 2.36. Only the fallback's failure is
+    // reported: the -z error is usually just "unknown switch `z'" and would
+    // mask the real reason the repository could not be listed.
+    try {
+      const parsed = parseWorktreeListPorcelain(execLines(projectRoot));
+      return { ok: true, entries: parsed.entries, warnings: parsed.warnings };
+    } catch (error) {
+      return {
+        ok: false,
+        error: `git worktree list failed in ${projectRoot}: ${errorMessage(error)}`,
+      };
+    }
+  }
+}
+
+/** Discriminated result of resolving the shared git common dir. */
+export type GitCommonDirResult = { ok: true; commonDir: string } | { ok: false; error: string };
+
+/**
+ * Resolve the absolute shared git common dir for `cwd`.
+ *
+ * Every linked worktree of one repository reports the same directory, so
+ * `<git-common-dir>/belayd/...` is the one place cross-worktree fleet state can
+ * live (docs/fleet-orchestrator.md). `resolveRepoKey` is derived from this same
+ * probe so there is exactly one git-common-dir resolver.
+ *
+ * Side effect: shells out to git with a 10s timeout.
+ */
+export function resolveGitCommonDir(
+  cwd: string,
+  exec: RepoKeyExec = execGitCommonDir,
+): GitCommonDirResult {
+  let commonDirRaw: string;
+  try {
+    commonDirRaw = exec(cwd).trim();
+  } catch (error) {
+    return {
+      ok: false,
+      error: `git rev-parse --git-common-dir failed in ${cwd}: ${errorMessage(error)}`,
+    };
+  }
+
+  if (commonDirRaw === "") {
+    return { ok: false, error: `git rev-parse returned an empty common dir for ${cwd}` };
+  }
+
+  return { ok: true, commonDir: resolve(cwd, commonDirRaw) };
 }
 
 /**
@@ -355,24 +575,14 @@ function errorMessage(error: unknown): string {
  * Side effect: shells out to git with a 10s timeout.
  */
 export function resolveRepoKey(cwd: string, exec: RepoKeyExec = execGitCommonDir): RepoKeyResult {
-  let commonDirRaw: string;
-  try {
-    commonDirRaw = exec(cwd).trim();
-  } catch (error) {
-    return {
-      ok: false,
-      error: `git rev-parse --git-common-dir failed in ${cwd}: ${errorMessage(error)}`,
-    };
-  }
-
-  if (commonDirRaw === "") {
-    return { ok: false, error: `git rev-parse returned an empty common dir for ${cwd}` };
+  const commonDirResult = resolveGitCommonDir(cwd, exec);
+  if (!commonDirResult.ok) {
+    return { ok: false, error: commonDirResult.error };
   }
 
   // For non-bare repos, git-common-dir is the `.git` directory itself and its
   // parent is the repo root (bare repos resolve to their parent; see above).
-  const commonDir = resolve(cwd, commonDirRaw);
-  const repoRoot = dirname(commonDir);
+  const repoRoot = dirname(commonDirResult.commonDir);
   try {
     return { ok: true, key: projectKeyFromRepoRoot(repoRoot) };
   } catch (error) {

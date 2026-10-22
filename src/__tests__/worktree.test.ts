@@ -4,7 +4,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   awaitWorktreeReady,
+  gitContextFreeEnv,
   isInsideWorktreeForBranch,
+  listWorktrees,
+  parseWorktreeListPorcelain,
+  parseWorktreeListPorcelainZ,
   resolveWorktreePath,
   setupWorktree,
 } from "../worktree.js";
@@ -403,5 +407,271 @@ describe("awaitWorktreeReady", () => {
 
     expect(result).toEqual({ ok: true });
     expect(sleep).not.toHaveBeenCalled();
+  });
+});
+
+/** Build `-z` output: NUL-terminated fields, empty field between records. */
+function porcelainZ(records: Array<{ path: string; branch?: string }>): string {
+  return records
+    .map((record) => {
+      const fields = [`worktree ${record.path}`, "HEAD 1111111"];
+      if (record.branch !== undefined) fields.push(`branch refs/heads/${record.branch}`);
+      return `${fields.join("\0")}\0\0`;
+    })
+    .join("");
+}
+
+describe("parseWorktreeListPorcelainZ", () => {
+  it("parses NUL-separated records and marks the first as main", () => {
+    const parsed = parseWorktreeListPorcelainZ(
+      porcelainZ([
+        { path: "/repo", branch: "main" },
+        { path: "/repo.feat-bd-42", branch: "feat/bd-42" },
+      ]),
+    );
+
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.entries).toEqual([
+      { path: "/repo", branch: "main", isMainWorktree: true },
+      { path: "/repo.feat-bd-42", branch: "feat/bd-42", isMainWorktree: false },
+    ]);
+  });
+
+  it("keeps a path containing a newline intact", () => {
+    // git does not C-quote porcelain values, so only -z can carry this path.
+    const parsed = parseWorktreeListPorcelainZ(
+      porcelainZ([{ path: "/tmp/repo.feat-bd-42\nline2", branch: "feat/bd-42" }]),
+    );
+
+    expect(parsed.entries[0]).toHaveProperty("path", "/tmp/repo.feat-bd-42\nline2");
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("keeps a path containing a space, a quote, and a non-ASCII character", () => {
+    const parsed = parseWorktreeListPorcelainZ(
+      porcelainZ([{ path: '/tmp/repo.feat-bd-42"aä b', branch: "feat/bd-42" }]),
+    );
+
+    expect(parsed.entries[0]).toHaveProperty("path", '/tmp/repo.feat-bd-42"aä b');
+  });
+
+  it("keeps a detached record with no branch", () => {
+    const parsed = parseWorktreeListPorcelainZ(porcelainZ([{ path: "/tmp/det" }]));
+
+    expect(parsed.entries).toEqual([{ path: "/tmp/det", branch: undefined, isMainWorktree: true }]);
+  });
+
+  it("returns no entries for empty output", () => {
+    expect(parseWorktreeListPorcelainZ("")).toEqual({ entries: [], warnings: [] });
+  });
+
+  it("stays total for adversarial streams and never truncates a path", () => {
+    const cases: Array<{ name: string; output: string; expectedPaths: string[] }> = [
+      {
+        // git always NUL-terminates, so a missing terminator means the caller
+        // captured a partial stream; the last record must still parse whole.
+        name: "no trailing NUL",
+        output: "worktree /repo\u0000HEAD 1111111\u0000branch refs/heads/main",
+        expectedPaths: ["/repo"],
+      },
+      {
+        name: "tripled NUL between records",
+        output: "worktree /repo\u0000\u0000\u0000worktree /repo.feat\u0000\u0000",
+        expectedPaths: ["/repo", "/repo.feat"],
+      },
+      {
+        name: "bare repository record",
+        output: "worktree /srv/repo.git\u0000bare\u0000\u0000",
+        expectedPaths: ["/srv/repo.git"],
+      },
+      {
+        name: "spaces inside the path are preserved verbatim",
+        output: "worktree /repo.feat bd-42 \u0000HEAD 1111111\u0000\u0000",
+        expectedPaths: ["/repo.feat bd-42 "],
+      },
+      { name: "only newlines", output: "\n\n", expectedPaths: [] },
+      { name: "truncated key with no value", output: "worktree", expectedPaths: [] },
+    ];
+
+    for (const testCase of cases) {
+      const parsed = parseWorktreeListPorcelainZ(testCase.output);
+      expect(parsed.warnings, testCase.name).toEqual([]);
+      expect(
+        parsed.entries.map((entry) => entry.path),
+        testCase.name,
+      ).toEqual(testCase.expectedPaths);
+    }
+  });
+
+  it("keeps an empty worktree value from swallowing the following record", () => {
+    // git never emits an empty worktree value, but a malformed stream must not
+    // merge it into the next path or drop the record that follows.
+    const parsed = parseWorktreeListPorcelainZ(
+      "worktree \u0000\u0000worktree /repo.feat\u0000branch refs/heads/feat/bd-42\u0000\u0000",
+    );
+
+    expect(parsed.entries.map((entry) => entry.path)).toEqual(["", "/repo.feat"]);
+    expect(parsed.entries[1]).toHaveProperty("branch", "feat/bd-42");
+  });
+});
+
+describe("parseWorktreeListPorcelain (line-oriented fallback)", () => {
+  it("parses normal output with no warnings", () => {
+    const parsed = parseWorktreeListPorcelain(PORCELAIN_MULTI);
+
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.entries.map((entry) => entry.path)).toEqual([
+      "/repo/main",
+      "/repo/feat",
+      "/repo/fix",
+    ]);
+  });
+
+  it("skips a record whose path contains a newline instead of truncating it", () => {
+    const porcelain = [
+      "worktree /tmp/repo.feat-bd-42",
+      "HEAD 1111111",
+      "branch refs/heads/feat/bd-42",
+      "",
+      "worktree /tmp/repo.feat-bd-19",
+      "line2",
+      "HEAD 2222222",
+      "branch refs/heads/feat/bd-19",
+      "",
+    ].join("\n");
+
+    const parsed = parseWorktreeListPorcelain(porcelain);
+
+    expect(parsed.entries.map((entry) => entry.path)).toEqual(["/tmp/repo.feat-bd-42"]);
+    expect(parsed.warnings).toHaveLength(1);
+    expect(parsed.warnings[0]).toContain("/tmp/repo.feat-bd-19");
+    expect(parsed.warnings[0]).toContain("line2");
+    expect(parsed.warnings[0]).toContain("-z");
+  });
+
+  it("accepts locked/prunable records without inventing a warning", () => {
+    const porcelain = [
+      "worktree /repo/main",
+      "HEAD 1111111",
+      "branch refs/heads/main",
+      "locked reason with spaces",
+      "",
+      "worktree /repo/feat",
+      "HEAD 2222222",
+      "branch refs/heads/feat/bd-42",
+      "prunable gitdir file points to non-existent location",
+      "",
+    ].join("\n");
+
+    const parsed = parseWorktreeListPorcelain(porcelain);
+
+    expect(parsed.warnings).toEqual([]);
+    expect(parsed.entries.map((entry) => entry.path)).toEqual(["/repo/main", "/repo/feat"]);
+  });
+
+  it("stays total for an empty or newline-only stream", () => {
+    expect(parseWorktreeListPorcelain("")).toEqual({ entries: [], warnings: [] });
+    expect(parseWorktreeListPorcelain("\n\n\n")).toEqual({ entries: [], warnings: [] });
+  });
+});
+
+describe("listWorktrees", () => {
+  it("pins the -z argv, timeout, and git-context-free env", () => {
+    mockedExecFileSync.mockReturnValueOnce(
+      porcelainZ([
+        { path: "/repo", branch: "main" },
+        { path: "/repo/feat", branch: "feat/bd-42" },
+        { path: "/repo/fix", branch: "fix/bd-18" },
+      ]),
+    );
+
+    const result = listWorktrees("/repo");
+
+    expect(result).toHaveProperty("ok", true);
+    expect(result).toHaveProperty("warnings", []);
+    const call = mockedExecFileSync.mock.calls[0];
+    expect(call?.[0]).toBe("git");
+    expect(call?.[1]).toEqual(["worktree", "list", "--porcelain", "-z"]);
+    const options = call?.[2] as
+      | {
+          cwd?: string;
+          env?: NodeJS.ProcessEnv;
+          timeout?: number;
+          encoding?: string;
+          stdio?: string;
+        }
+      | undefined;
+    expect(options?.cwd).toBe("/repo");
+    expect(options?.timeout).toBe(10_000);
+    expect(options?.encoding).toBe("utf8");
+    expect(options?.stdio).toBe("pipe");
+    expect(options?.env).toEqual(gitContextFreeEnv());
+    expect(options?.env).not.toHaveProperty("GIT_DIR");
+    expect(options?.env).not.toHaveProperty("GIT_WORK_TREE");
+  });
+
+  it("strips an inherited GIT_DIR from the probe environment", () => {
+    const originalGitDir = process.env.GIT_DIR;
+    const originalWorkTree = process.env.GIT_WORK_TREE;
+    process.env.GIT_DIR = "/poison/.git";
+    process.env.GIT_WORK_TREE = "/poison";
+    mockedExecFileSync.mockReturnValueOnce(porcelainZ([{ path: "/repo/main", branch: "main" }]));
+
+    try {
+      listWorktrees("/repo");
+    } finally {
+      if (originalGitDir === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = originalGitDir;
+      if (originalWorkTree === undefined) delete process.env.GIT_WORK_TREE;
+      else process.env.GIT_WORK_TREE = originalWorkTree;
+    }
+
+    const call = mockedExecFileSync.mock.calls[0];
+    const options = call?.[2] as { env?: NodeJS.ProcessEnv } | undefined;
+    expect(options?.env).not.toHaveProperty("GIT_DIR");
+    expect(options?.env).not.toHaveProperty("GIT_WORK_TREE");
+  });
+
+  it("falls back to line-oriented porcelain when -z is unsupported", () => {
+    mockedExecFileSync
+      .mockImplementationOnce(() => {
+        throw new Error("error: unknown switch 'z'");
+      })
+      .mockReturnValueOnce(PORCELAIN_SINGLE);
+
+    const result = listWorktrees("/repo");
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.entries).toHaveLength(2);
+    expect(mockedExecFileSync.mock.calls[1]?.[1]).toEqual(["worktree", "list", "--porcelain"]);
+  });
+
+  it("surfaces a fallback truncation warning through the seam", () => {
+    const result = listWorktrees("/repo", {
+      execNul: () => {
+        throw new Error("error: unknown switch 'z'");
+      },
+      execLines: () => "worktree /tmp/repo.feat-bd-19\nline2\nbranch refs/heads/feat/bd-19\n",
+    });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.entries).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("line2");
+  });
+
+  it("converts a thrown git failure into an error value", () => {
+    mockedExecFileSync.mockImplementation(() => {
+      throw new Error("Command failed: git worktree list");
+    });
+
+    const result = listWorktrees("/repo");
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.error).toContain("git worktree list failed in /repo");
+    expect(result.error).toContain("Command failed");
   });
 });

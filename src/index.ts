@@ -115,6 +115,41 @@ export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export type { ChdirTargetInput, ChdirTargetResult } from "./chdir-guard.js";
 export { isSafeChdirTarget } from "./chdir-guard.js";
+export type {
+  BuildFleetStatusOptions,
+  DeriveFleetMemberStateInput,
+  FleetIntent,
+  FleetMemberSnapshot,
+  FleetMemberState,
+  FleetMemberView,
+  FleetPhaseRunView,
+  FleetStateCounts,
+  FleetStatus,
+  FleetStatusFs,
+  FleetWarning,
+  FleetWarningKind,
+  FleetWorkflowFile,
+  FleetWorkflowSnapshot,
+  ReadFleetStatusOptions,
+  ReadFleetStatusResult,
+} from "./fleet-status.js";
+export {
+  buildFleetStatus,
+  DEFAULT_FLEET_ID,
+  deriveFleetMemberState,
+  FLEET_MEMBER_STATES,
+  FLEET_WARNING_KINDS,
+  fleetAuditLogPath,
+  fleetEventsDir,
+  fleetInboxDir,
+  fleetIntentFilePath,
+  fleetMergeQueueFilePath,
+  fleetStateDir,
+  formatFleetStatus,
+  parseFleetIntent,
+  readFleetStatus,
+  sanitizeFleetId,
+} from "./fleet-status.js";
 // Handoff packets carried into a spawned orchestrator
 export type {
   BuildHandoffInput,
@@ -416,6 +451,7 @@ export {
   markRunDelivered,
   RunStatus,
   readRunManifest,
+  runManifestFs,
   runManifestPath,
   runsDir,
   scanForInterruptedRuns,
@@ -525,11 +561,25 @@ export {
   writeCallerHandoff,
   writeWorkflowState,
 } from "./workflow-state.js";
-export type { RepoKeyExec, RepoKeyResult, WorktreeDeps, WorktreeOptions } from "./worktree.js";
+export type {
+  GitCommonDirResult,
+  ListWorktreesDeps,
+  ParsedWorktreeList,
+  RepoKeyExec,
+  RepoKeyResult,
+  WorktreeDeps,
+  WorktreeListEntry,
+  WorktreeListResult,
+  WorktreeOptions,
+} from "./worktree.js";
 export {
   awaitWorktreeReady,
   isInsideWorktreeForBranch,
+  listWorktrees,
+  parseWorktreeListPorcelain,
+  parseWorktreeListPorcelainZ,
   projectKeyFromRepoRoot,
+  resolveGitCommonDir,
   resolveRepoKey,
   resolveWorktreePath,
   setupWorktree,

@@ -10,13 +10,14 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resolveProjectProofBase } from "../proof-dir.js";
 import {
   GIT_CONTEXT_ENV_KEYS,
   gitContextFreeEnv,
   projectKeyFromRepoRoot,
+  resolveGitCommonDir,
   resolveRepoKey,
 } from "../worktree.js";
 
@@ -194,6 +195,90 @@ describe("resolveRepoKey", () => {
     if (result.ok) {
       expect(result.key).toBe(projectKeyFromRepoRoot(parent));
     }
+  });
+});
+
+describe("resolveGitCommonDir", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "git-common-dir-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns an absolute common dir for absolute git output", () => {
+    const repoRoot = join(tmpDir, "repo");
+    mkdirSync(repoRoot);
+    const commonDir = join(repoRoot, ".git");
+
+    expect(resolveGitCommonDir(repoRoot, () => `${commonDir}\n`)).toEqual({
+      ok: true,
+      commonDir,
+    });
+  });
+
+  it("resolves a relative common dir against the cwd", () => {
+    const repoRoot = join(tmpDir, "repo");
+    mkdirSync(repoRoot);
+
+    const result = resolveGitCommonDir(repoRoot, () => ".git\n");
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.commonDir).toBe(join(repoRoot, ".git"));
+  });
+
+  it("returns an error when git fails", () => {
+    const result = resolveGitCommonDir(tmpDir, () => {
+      throw new Error("not a git repository");
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.error).toContain("git rev-parse --git-common-dir failed");
+    expect(result.error).toContain("not a git repository");
+  });
+
+  it("returns an error when git reports an empty common dir", () => {
+    const result = resolveGitCommonDir(tmpDir, () => "\n");
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.error).toContain("empty common dir");
+  });
+
+  it("is the single probe resolveRepoKey derives its key from", () => {
+    // Guards the bd-126 refactor: the key must stay `projectKeyFromRepoRoot` of
+    // the common dir's parent, so one resolver cannot drift from the other.
+    const repoRoot = join(tmpDir, "repo");
+    mkdirSync(repoRoot);
+    const exec = (): string => ".git\n";
+
+    const commonDir = resolveGitCommonDir(repoRoot, exec);
+    const repoKey = resolveRepoKey(repoRoot, exec);
+
+    expect(commonDir).toHaveProperty("ok", true);
+    expect(repoKey).toHaveProperty("ok", true);
+    if (!commonDir.ok || !repoKey.ok) return;
+    expect(repoKey.key).toBe(projectKeyFromRepoRoot(dirname(commonDir.commonDir)));
+    expect(repoKey.key).toBe(projectKeyFromRepoRoot(repoRoot));
+  });
+
+  it("surfaces the same error text through resolveRepoKey", () => {
+    const fail = (): string => {
+      throw new Error("fatal: not a git repository");
+    };
+
+    const commonDir = resolveGitCommonDir(tmpDir, fail);
+    const repoKey = resolveRepoKey(tmpDir, fail);
+
+    expect(commonDir).toHaveProperty("ok", false);
+    expect(repoKey).toHaveProperty("ok", false);
+    if (commonDir.ok || repoKey.ok) return;
+    expect(repoKey.error).toBe(commonDir.error);
   });
 });
 
