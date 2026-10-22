@@ -8,15 +8,15 @@ A workspace panel for pi-web that renders verifiable-proof artifacts from `proof
 
 Follow these steps to confirm the plugin is correctly installed and functioning.
 
-### 1. Verify the plugin matches the installed pi-web browser apiVersion
+### 1. Verify the plugin matches an installed pi-web browser apiVersion
 
-The pi-web host hard-rejects any browser plugin whose `apiVersion` does not match
-its own, so check this first after any pi-web upgrade. The plugin is plain
+The pi-web host rejects any browser plugin whose `apiVersion` it does not
+accept, so check this first after any pi-web upgrade. The plugin is plain
 JavaScript with no build step — these checks read it directly from source.
 
 ```bash
-# Regression guard: derives the browser apiVersion from the installed host
-# artifact (not a hardcoded number) and asserts the plugin declares the same one.
+# Regression guard: derives the accepted browser apiVersions from the installed
+# host artifact (not a hardcoded number) and asserts the plugin declares one.
 pnpm vitest run pi-web-plugins/proof-of-work/pi-web-plugin.test.js
 # Expected: Test Files  1 passed (1); Tests  2 passed (2)
 
@@ -26,15 +26,21 @@ grep -n apiVersion pi-web-plugins/proof-of-work/pi-web-plugin.js
 
 # What the installed host accepts (the PiWebPlugin contract):
 grep -n "apiVersion" node_modules/@jmfederico/pi-web/dist/plugin-api.d.ts
-# Expected: "apiVersion: 4;" in interface PiWebPlugin, and
-#           "readonly apiVersion: 4;" in interface PluginActivationContext
+# Since pi-web 1.202610.5 that contract is a union:
+#   export type PiWebPlugin = LegacyPiWebPlugin | PiWebPluginV5;
+#   interface PiWebPluginV5 { apiVersion: 5; ... }      (current)
+#   interface LegacyPiWebPlugin { apiVersion: 4; ... }   (@deprecated, still accepted)
+# plus "readonly apiVersion: 4;" in the legacy PluginActivationContext.
 ```
 
-`pi-web-plugin.test.js` parses the expected value out of the host contract, so a
-future pi-web bump (for example 4 → 5) makes the guard **fail** until the plugin
-is migrated too — it never silently passes. To migrate, set `apiVersion` in
-`pi-web-plugins/proof-of-work/pi-web-plugin.js` to the version the installed host
-reports, then re-run the command above. If the bump also changes the pinned
+`pi-web-plugin.test.js` parses the accepted values out of the host contract and
+asserts membership, so a pi-web bump that drops a legacy apiVersion makes the
+guard **fail** until the plugin is migrated too — it never silently passes. The
+plugin still declares v4: pi-web 1.202610.5 documents v4 as deprecated but
+supported, and the host logs a once-per-plugin deprecation diagnostic for it.
+Migrating to v5 is tracked as bd-129. To migrate, set `apiVersion` in
+`pi-web-plugins/proof-of-work/pi-web-plugin.js` to a version the installed host
+accepts, then re-run the command above. If the bump also changes the pinned
 `@jmfederico/pi-web` devDependency, see
 [Regenerating `pnpm-lock.yaml` after a pi-web bump](#regenerating-pnpm-lockyaml-after-a-pi-web-bump)
 below.
@@ -391,6 +397,8 @@ pnpm install
 #    lockfile, so flake.nix (belayd-harness.pnpmDeps.hash) no longer matches:
 nix build .#belayd-harness
 # Fails with: hash mismatch ... got: sha256-...
+# If it succeeds, Nix may have reused the existing fixed-output store path: use
+# pkgs.lib.fakeHash in flake.nix once to force the real `got:` hash.
 
 # 3. Copy the reported `got:` hash into belayd-harness.pnpmDeps.hash in flake.nix,
 #    then re-run until it succeeds:
@@ -745,16 +753,21 @@ The plugin is a plain JavaScript ES module with no build step. It consists of fo
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
 
-The plugin targets browser plugin `apiVersion: 4`. Server plugin `apiVersion: 3`
+The plugin targets browser plugin `apiVersion: 4`, which pi-web 1.202610.5 and
+later still accept but mark deprecated (upstream renamed the contract
+`LegacyPiWebPlugin` and logs a once-per-plugin deprecation diagnostic); the
+migration to v5 is bd-129. Server plugin `apiVersion: 3`
 is N/A here: this package's `piWeb.plugins` entry declares only a browser entry
 (`browserRoot`/`module`) with no `server`, so there is no server plugin to
 migrate. The `@jmfederico/pi-web` dependency used for API/type parity lives in
 the repository root `package.json`; `pi-web-plugins/proof-of-work/package.json`
 intentionally declares no devDependencies because the plugin is a plain-JS,
 no-build package served directly from source by pi-web and is not an npm
-workspace member. `pi-web-plugin.test.js` derives the browser `apiVersion` from
-this repository's installed `@jmfederico/pi-web` and fails if the two drift. A
-future host bump therefore fails this guard — rather than silently passing —
+workspace member. `pi-web-plugin.test.js` derives the accepted browser
+`apiVersion` values from
+this repository's installed `@jmfederico/pi-web` and fails if the plugin's value
+is not among them. A future host bump that drops v4 therefore fails this guard —
+rather than silently passing —
 until `apiVersion` in `pi-web-plugin.js` is updated to match.
 
 Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step).

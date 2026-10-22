@@ -11,12 +11,12 @@ extension.
 bd-83 closes that gap in two halves:
 
 1. **pi-web SDK floor** — `flake.nix` pins pi-web to upstream tag
-   `v1.202610.4` (`rev e93d7a4e8fd763b25ee052c980f8fe295466ee5a`), whose
-   `package-lock.json` resolves `@earendil-works/pi-coding-agent` to **1.2.0**.
+   `v1.202610.6` (`rev 5b30d2ede183cfee4fd66ae9d22dab318b066c09`), whose
+   `package-lock.json` resolves `@earendil-works/pi-coding-agent` to **1.3.0**.
    That meets `pi-agent-browser-native`'s declared Pi `>= 1.0.0` floor (its
    devDependency pins `@earendil-works/pi-coding-agent@1.0.0`), so the
    extension's `defaultActive`/`namespace`/`outputSchema` features are
-   supported. The 1.2.0 lockfile carries `integrity` for every `@earendil-works`
+   supported. The 1.3.0 lockfile carries `integrity` for every `@earendil-works`
    entry, so the `nix/pi-web-integrity.patch` that the 1.0.0 lockfile needed is
    gone.
 2. **Extension discovery** — pi-web's orchestrator discovers extensions from
@@ -40,7 +40,7 @@ has been made in an orchestrator session:
 
 | Piece | Where | State |
 |-------|-------|-------|
-| pi-web v1.202610.4 + embedded SDK 1.2.0 | `flake.nix` | builds and verifiable now |
+| pi-web v1.202610.6 + embedded SDK 1.3.0 | `flake.nix` | builds and verifiable now |
 | `packages.${system}.pi-agent-browser-extension` export | `flake.nix` (bd-68) | builds now |
 | `~/.pi/agent/extensions/pi-agent-browser` symlink | nix-tmp `modules/core/belayd-pi-web.nix`, recorded in `nix/nix-tmp-belayd-pi-web.patch` | in the working tree only |
 | belayd flake pushed to GitHub | `github:Lewenhaupt/agent-harness` | **not pushed** |
@@ -67,15 +67,15 @@ and they require the push + lock bump + rebuild + restart chain above.
 ### A. Runnable now (pre-rebuild)
 
 1. **Confirm the pi-web pin and that upstream really resolves the SDK to
-   1.2.0.** The cheap, no-build check reads the pinned tag's lockfile directly:
+   1.3.0.** The cheap, no-build check reads the pinned tag's lockfile directly:
 
    ```bash
    nix eval --raw .#pi-web.version
-   # 1.202610.4
+   # 1.202610.6
 
-   curl -sL https://raw.githubusercontent.com/jmfederico/pi-web/e93d7a4e8fd763b25ee052c980f8fe295466ee5a/package-lock.json \
+   curl -sL https://raw.githubusercontent.com/jmfederico/pi-web/5b30d2ede183cfee4fd66ae9d22dab318b066c09/package-lock.json \
      | jq -r '.packages["node_modules/@earendil-works/pi-coding-agent"].version'
-   # 1.2.0
+   # 1.3.0
    ```
 
    If the second command needs to compile anything you are offline — skip to
@@ -88,13 +88,13 @@ and they require the push + lock bump + rebuild + restart chain above.
    ```bash
    piweb=$(nix build .#pi-web --no-link --print-out-paths)
    echo "$piweb"
-   # /nix/store/<hash>-pi-web-1.202610.4
+   # /nix/store/<hash>-pi-web-1.202610.6
 
    jq -r .version "$piweb/lib/node_modules/pi-web/node_modules/@earendil-works/pi-coding-agent/package.json"
-   # 1.2.0
+   # 1.3.0
    ```
 
-   Expected: `1.202610.4` in the store path name and `1.2.0` from `jq`. A
+   Expected: `1.202610.6` in the store path name and `1.3.0` from `jq`. A
    missing-integrity failure from `prefetch-npm-deps` means upstream dropped the
    `integrity` field for a nested `@earendil-works` dep and the patch has to
    come back; a `hash mismatch` on `npmDepsHash` means the lockfile changed.
@@ -215,15 +215,15 @@ and they require the push + lock bump + rebuild + restart chain above.
 
    piweb=$(systemctl show --value -p ExecStart pi-web \
      | grep -oE '/nix/store/[a-z0-9]+-pi-web-[^/ ]+' | head -1)
-   echo "$piweb"   # /nix/store/<hash>-pi-web-1.202610.4
+   echo "$piweb"   # /nix/store/<hash>-pi-web-1.202610.6
    jq -r .version "$piweb/lib/node_modules/pi-web/node_modules/@earendil-works/pi-coding-agent/package.json"
-   # 1.2.0
+   # 1.3.0
    ```
 
    Expected: four symlinks under `~/.pi/agent/extensions/` (`belayd-*` plus
    `pi-agent-browser`), `readlink -f` resolving into a
    `…-pi-agent-browser-extension` store path, `entry-ok`, and the running unit's
-   store path ending in `-pi-web-1.202610.4` with SDK version `1.2.0`. If the
+   store path ending in `-pi-web-1.202610.6` with SDK version `1.3.0`. If the
    symlink is missing, home-manager did not switch or the rebuild came from a
    stale generation; if the version is still `0.84.1`, the daemon is running a
    pre-rebuild closure.

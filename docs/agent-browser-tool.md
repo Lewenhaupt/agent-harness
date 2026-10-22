@@ -28,8 +28,8 @@ directory artifact of the whole package, for the pi-web orchestrator symlink.
 
 **Wired in the flake.nix + nix-tmp working tree; blocked on the belayd push +
 nix-tmp flake.lock bump before a rebuild will evaluate.** pi-web is pinned to
-upstream tag v1.202610.4 (`flake.nix`), whose embedded
-`@earendil-works/pi-coding-agent` resolves to 1.2.0 — meeting the extension's
+upstream tag v1.202610.6 (`flake.nix`), whose embedded
+`@earendil-works/pi-coding-agent` resolves to 1.3.0 — meeting the extension's
 declared Pi `>= 1.0.0` floor, so its `defaultActive`/`namespace`/`outputSchema`
 features are supported. The nix-tmp `belayd-pi-web` home-manager module now
 creates `~/.pi/agent/extensions/pi-agent-browser` pointing at that artifact
@@ -286,8 +286,8 @@ Common operations:
 The `agent_browser` tool is wired for pi-web orchestrator sessions in the
 flake.nix + nix-tmp working tree, but it is **not** active yet and the wiring is
 blocked before a rebuild will evaluate. pi-web discovers extensions from
-`~/.pi/agent/extensions/` and is now pinned to upstream tag v1.202610.4, whose
-embedded `@earendil-works/pi-coding-agent` resolves to 1.2.0 (satisfying the
+`~/.pi/agent/extensions/` and is now pinned to upstream tag v1.202610.6, whose
+embedded `@earendil-works/pi-coding-agent` resolves to 1.3.0 (satisfying the
 extension's Pi `>= 1.0.0` floor). The NixOS side adds:
 
 ```nix
