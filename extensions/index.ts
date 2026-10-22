@@ -87,12 +87,14 @@ import {
   currentBranch,
   DEFAULT_AGENTS,
   DEFAULT_BASE_BRANCH,
+  DEFAULT_FLEET_ID,
   defaultGitExec,
   extractOutlineSymbols,
   extractProofArtifacts,
   findWorkspaceRoot,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
+  formatFleetStatus,
   formatHandoffBlock,
   formatOutline,
   formatProcessState,
@@ -137,6 +139,7 @@ import {
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
+  readFleetStatus,
   readHandoff,
   readHandoffFileArg,
   readStackNode,
@@ -1317,6 +1320,7 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd_proof_verifier",
     "belayd_archify",
     "belayd_outline",
+    "belayd_fleet_status",
     "bd",
     "read",
     "grep",
@@ -4928,6 +4932,42 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
       const built = await buildOutlineText(cwd, validation.value);
       return built.ok ? textToolResult(built.text, 0) : textToolResult(built.error, 1);
+    },
+  });
+
+  // ── Register fleet status (read-only fleet aggregation) tool ─────────
+  // Milestone P0 of the multi-bead fleet supervisor (docs/fleet-orchestrator.md):
+  // a scheduler's observation view, never a phase worker. It reads every
+  // worktree's `.belayd/workflow.json` + run manifests plus the optional fleet
+  // intent file, writes nothing, spawns nothing, merges nothing, and arms no
+  // gate. Listed in GATED_TOOLS only to survive the process gate — never a
+  // required workflow step, and never in PLANNING_GATED_TOOLS.
+  pi.registerTool({
+    name: "belayd_fleet_status",
+    label: "Belayd fleet status",
+    description:
+      "Read-only fleet status: aggregates every git worktree's Belayd workflow into one " +
+      "view (task id, branch, workflow type, completed/pending phases, latest run per phase " +
+      "with its status, interrupted-run count, last update, derived state) and warns about " +
+      "duplicate task ids, workflow task ids that disagree with the branch or directory, " +
+      "and worktrees without workflow state. Reads only: no writes, no merges, no spawns, no " +
+      "phase runs. fleetId selects <git-common-dir>/belayd/fleet/<fleetId>/fleet.json " +
+      `(default: ${DEFAULT_FLEET_ID}); P0 never creates that file.`,
+    parameters: Type.Object({
+      fleetId: Type.Optional(
+        Type.String({
+          description: `Fleet intent directory name under <git-common-dir>/belayd/fleet/ (default: ${DEFAULT_FLEET_ID})`,
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
+      const requested = params.fleetId;
+      const fleetId =
+        requested === undefined || requested.trim() === "" ? DEFAULT_FLEET_ID : requested.trim();
+      const result = readFleetStatus({ cwd, fleetId });
+      if (!result.ok) return textToolResult(result.error, 1);
+      return textToolResult(formatFleetStatus(result.value), 0);
     },
   });
 

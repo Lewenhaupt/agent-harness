@@ -29,6 +29,7 @@ belayd-agent-harness/
 │   ├── outline-binary.ts   # BELAYD_CTAGS_BIN / BELAYD_AST_GREP_BIN resolution
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
 │   ├── owned-worktree.ts   # Bead ↔ branch ↔ worktree preflight (bd-119; docs/owned-worktree.md)
+│   ├── fleet-status.ts     # belayd_fleet_status read-only aggregation (bd-126 P0; docs/fleet-status.md)
 │   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
 │   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)

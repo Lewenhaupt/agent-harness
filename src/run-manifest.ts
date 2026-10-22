@@ -123,7 +123,11 @@ export interface SetRunTelemetryOptions {
   fs?: RunManifestFs;
 }
 
-const nodeFsSeam: RunManifestFs = {
+/**
+ * Production fs seam. Exported so other read-only aggregators (fleet status)
+ * reuse one implementation instead of keeping a second copy that can drift.
+ */
+export const runManifestFs: RunManifestFs = {
   existsSync: (path) => nodeFs.existsSync(path),
   readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
   writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
@@ -150,7 +154,7 @@ export function parseRunManifest(raw: unknown): RunManifest | undefined {
 export function writeRunManifest(
   options: WriteRunManifestOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   return atomicWriteJson(
     runManifestPath(options.cwd, options.manifest.runId),
     options.manifest,
@@ -159,7 +163,7 @@ export function writeRunManifest(
 }
 
 export function readRunManifest(options: ReadRunManifestOptions): RunManifest | undefined {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const filePath = runManifestPath(options.cwd, options.runId);
   if (!fs.existsSync(filePath)) return undefined;
   let text: string;
@@ -190,7 +194,7 @@ function terminalStatus(status: RunStatus): boolean {
 export function setRunStatus(
   options: SetRunStatusOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
   if (existing === undefined) {
     return { ok: false, error: `No run manifest found for ${options.runId}` };
@@ -213,7 +217,7 @@ export function setRunStatus(
 
 /** List persisted runs sorted by start time; malformed files and non-.json entries are skipped. */
 export function listRuns(options: ListRunsOptions): RunManifest[] {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const dir = runsDir(options.cwd);
   let entries: string[];
   try {
@@ -241,7 +245,7 @@ export function listRuns(options: ListRunsOptions): RunManifest[] {
 export function completeRunByUser(
   options: CompleteRunByUserOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
   if (existing === undefined) {
     return { ok: false, error: `No run manifest found for ${options.runId}` };
@@ -261,7 +265,7 @@ export function completeRunByUser(
 export function setRunTelemetry(
   options: SetRunTelemetryOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
   if (existing === undefined) {
     return { ok: false, error: `No run manifest found for ${options.runId}` };
@@ -277,7 +281,7 @@ export function setRunTelemetry(
 export function markRunDelivered(
   options: MarkRunDeliveredOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
   if (existing === undefined) {
     return { ok: false, error: `No run manifest found for ${options.runId}` };
@@ -311,7 +315,7 @@ export function listPendingUserCompletions(
  * previous orchestrator process.
  */
 export function scanForInterruptedRuns(options: ScanForInterruptedRunsOptions): RunManifest[] {
-  const fs = options.fs ?? nodeFsSeam;
+  const fs = options.fs ?? runManifestFs;
   const now = options.now ?? Date.now;
   const interrupted: RunManifest[] = [];
   for (const run of listRuns({ cwd: options.cwd, fs })) {
