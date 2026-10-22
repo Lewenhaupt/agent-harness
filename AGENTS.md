@@ -80,6 +80,15 @@ The `pre-push` lefthook job "flake package build (belayd-harness)" runs step 2
 whenever `flake.nix`, `flake.lock`, `package.json`, or `pnpm-lock.yaml` changes,
 so a stale hash fails the push instead of landing on `main`.
 
+A stale hash does **not** always fail locally: Nix skips rebuilding a
+fixed-output derivation whose output path is already valid in the store, so
+`nix build .#belayd-harness` can succeed from cache even though a fresh fetch of
+the new lockfile would hash differently (seen when a dependency bump only
+*removed* packages, e.g. the pi-web 1.202610.6 bump, which shrank the store but
+left the old store path able to satisfy the install). To force the real hash
+before pushing, temporarily set the value to `pkgs.lib.fakeHash`, build once,
+copy the reported `got:` hash, and restore.
+
 ### Archify diagram generation (`archify`)
 
 [archify](https://github.com/tt-a1i/archify) compiles a typed JSON IR into a

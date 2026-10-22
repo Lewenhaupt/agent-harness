@@ -259,23 +259,23 @@
         # those paths via a common environment.
         pi-web = pkgs.buildNpmPackage {
           pname = "pi-web";
-          version = "1.202610.4";
+          version = "1.202610.6";
           src = pkgs.fetchFromGitHub {
             owner = "jmfederico";
             repo = "pi-web";
-            # Upstream tag v1.202610.4. Its package-lock.json resolves
-            # @earendil-works/pi-coding-agent to 1.2.0 (with pi-agent-core/pi-ai
-            # at 1.2.0), which satisfies pi-agent-browser-native's declared Pi
+            # Upstream tag v1.202610.6. Its package-lock.json resolves
+            # @earendil-works/pi-coding-agent to 1.3.0 (with pi-agent-core/pi-ai
+            # at 1.3.0), which satisfies pi-agent-browser-native's declared Pi
             # >= 1.0.0 floor so its defaultActive/namespace/outputSchema
             # features are supported (should work) in pi-web orchestrator
             # sessions; runtime behavior is not yet verified (bd-83).
             # The nested @earendil-works entries that needed integrity values
             # patched in at 1.202610.1 no longer exist, so
             # nix/pi-web-integrity.patch is no longer applied.
-            rev = "e93d7a4e8fd763b25ee052c980f8fe295466ee5a";
-            hash = "sha256-vais01tSik8UfF31nYnDSdhMbYnjMphT2oz3S+giaP4=";
+            rev = "5b30d2ede183cfee4fd66ae9d22dab318b066c09";
+            hash = "sha256-WWjsirNju/9phxkeiQZTL/ERZl3ARANqCTCdwKvof/U=";
           };
-          npmDepsHash = "sha256-D81YfrSik6wNOC7srN5XyedwukQs7DHZm/71v/HelMw=";
+          npmDepsHash = "sha256-3QkqOGTwQgY/byenRG5eXTTdrn6Uq3GSXkTTVp16mFw=";
           npmFlags = [
             "--no-audit"
             "--no-fund"
@@ -546,7 +546,7 @@
             src = ./.;
             pnpm = pkgs.pnpm;
             fetcherVersion = 4;
-            hash = "sha256-daPL7YuRbkvHSNEoyyUOX/DuvZ53/e8qhG6V8jrB8qQ=";
+            hash = "sha256-gxdGqSNzSWzWFFGW9jI7/x/zZit0oi9m3sL85DLDx7k=";
           };
           dontBuild = true;
           installPhase = ''

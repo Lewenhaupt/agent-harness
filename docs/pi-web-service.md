@@ -450,13 +450,22 @@ wrapper is unaffected — it reloads extensions on every launch.)
 ### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
-pi-web is now pinned to upstream tag v1.202610.4, whose embedded
-`@earendil-works/pi-coding-agent` resolves to 1.2.0 — meeting the
+pi-web is now pinned to upstream tag v1.202610.6, whose embedded
+`@earendil-works/pi-coding-agent` resolves to 1.3.0 — meeting the
 `agent_browser` extension's declared Pi `>= 1.0.0` floor, so registering it is
-supported. The 1.202610.1 → 1.202610.4 bump (bd-123) also carries upstream's
+supported. The 1.202610.1 → 1.202610.4 bump (bd-123) carried upstream's
 browser-tab fixes: the Terminal panel request storm (pi-web #302/#316),
 repeated history auto-loading, reconnect recovery after backgrounding, and
-transcript image handling (pi-web #301).
+transcript image handling (pi-web #301). The 1.202610.4 → 1.202610.6 bump
+carries the 2026-10-20/21 release train: a built-in base theme plus shared UI
+styles v1, a reworked full-width chat composer and navigation, Settings with
+explicit machine/browser scope and saved-versus-running plugin status, session
+naming controls, a configurable session-archive directory
+(`sessionArchive.directory` / `PI_WEB_SESSION_ARCHIVE_DIR`), and plugin catalog
+v5 with scoped backends. Browser plugin API v4 and server v3 stay supported
+with a once-per-plugin deprecation diagnostic, so the in-repo `proof-of-work`
+plugin (browser `apiVersion: 4`, no server entry) needs no change; migrating it
+to v5 is follow-up work.
 
 The nix-tmp `belayd-pi-web` home-manager module adds the symlink
 (patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):
