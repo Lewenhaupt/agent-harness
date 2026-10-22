@@ -576,6 +576,11 @@
           # setuid-root helper to attack. Do not switch this to a setuid build.
           pkgs.bubblewrap
           pkgs.awscli2
+          # aws_signing_helper: needed by the *broker* (never the sandbox) when
+          # an allowlisted profile is an IAM RolesAnywhere `credential_process`
+          # profile — `aws configure export-credentials` shells out to it, so
+          # without this the profile resolves to "command not found".
+          pkgs.aws-signing-helper
         ];
 
         # Native runtime environment for the pi-web system service: a buildEnv

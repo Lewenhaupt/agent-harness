@@ -247,12 +247,20 @@ that, both described in `docs/aws-credential-isolation.md`:
   committed `.belayd/aws.yaml` naming a literal profile, validated against the
   operator allowlist `~/.config/belayd/aws.yaml`; the sandbox gets a synthetic
   `~/.aws/config` whose single `[profile agent]` uses a generated
-  `credential_process` shim.
+  `credential_process` shim. The operator allowlist may also list extra paths
+  under `mask:` (top level and/or per scope) that are hidden inside that scope's
+  sandbox — reference: the `Mask entries` section of
+  `docs/aws-credential-isolation.md`. The repo file carries only `profile`, so a
+  repo cannot widen its own sandbox.
 
-Dependency chain: `pkgs.bubblewrap` + `pkgs.awscli2` are in `devShellTools`, so
-both `devShells.default` and `pi-web-runtime-env` (hence every spawned agent's
-`PATH`) carry them. `belayd-harness` also exposes `bin/belayd-aws`,
-`bin/belayd-aws-broker`, and `bin/belayd-aws-credential-process`, which run the
+Dependency chain: `pkgs.bubblewrap` + `pkgs.awscli2` + `pkgs.aws-signing-helper`
+are in `devShellTools`, so all three flow into `devShells.default` and
+`pi-web-runtime-env` (hence every spawned agent's `PATH`). `bubblewrap` is the
+mask, `awscli2` resolves credentials, and `aws_signing_helper` is only needed
+when an allowlisted profile is an IAM RolesAnywhere `credential_process`
+profile: the *broker* (deliberately unsandboxed) runs it, never the sandbox.
+`belayd-harness` also exposes `bin/belayd-aws`, `bin/belayd-aws-broker`, and
+`bin/belayd-aws-credential-process`, which run the
 TypeScript entry points directly under Node 24's native type stripping (no
 tsc step; `dist/` stays a library-consumer artifact).
 
@@ -276,8 +284,9 @@ Fail-closed rules: no repo file, no matching allowlist scope, or a profile the
 scope does not grant ⇒ no AWS inside the sandbox. A repo that opts in and is
 refused logs one line per spawn; a repo with no AWS config is silent. An expired
 portal session or 90-day PKCE registration can only be fixed by an interactive
-`aws sso login` on the host — the broker surfaces AWS's own error text plus that
-instruction and never retries silently.
+`aws sso login` on the host; for a non-SSO profile (IAM RolesAnywhere) the broker
+names the `credential_process` helper and x509 material instead and never
+prescribes an SSO login. It never retries silently.
 
 Operator workflow (allowlist + repo file + host activation + refresh + diagnostics)
 and the ~5-minute acceptance checklist are the `## How to Use` and

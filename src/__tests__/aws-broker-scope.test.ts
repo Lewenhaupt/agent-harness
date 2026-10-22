@@ -30,7 +30,10 @@ function buildArgv(overrides: Partial<Parameters<typeof buildSandboxArgv>[0]> = 
     homeDir: "/home/hugo",
     runtimeBaseDir: RUNTIME_BASE,
     scopeDir: SCOPE_DIR,
-    maskDirs: ["/home/hugo/.aws", "/home/hugo/.config/aws"],
+    masks: [
+      { kind: "tmpfs", path: "/home/hugo/.aws" },
+      { kind: "tmpfs", path: "/home/hugo/.config/aws" },
+    ],
     region: "eu-north-1",
     ...overrides,
   });
@@ -153,6 +156,38 @@ describe("aws-broker scope: sandbox argv", () => {
     expect(argv).not.toContain(
       scopeDirFor({ runtimeBaseDir: RUNTIME_BASE, scopeId: "deadbeefcafe" }),
     );
+  });
+
+  it("masks a regular file with a /dev/null bind, after the base bind", () => {
+    // Verified on bubblewrap 0.11.2: `--tmpfs <file>` fails ("Not a
+    // directory"), while `--ro-bind /dev/null <file>` reads EACCES — a masked
+    // file still exists but cannot be opened.
+    const argv = buildArgv({
+      masks: [
+        { kind: "tmpfs", path: "/home/hugo/.aws" },
+        { kind: "null-bind", path: "/run/secrets.d/2/aws-pi-agent-cert" },
+        { kind: "null-bind", path: "/run/secrets.d/2/aws-pi-agent-key" },
+      ],
+    });
+    const baseBind = indexOfSequence(argv, ["--ro-bind", "/", "/"]);
+    const certMask = indexOfSequence(argv, [
+      "--ro-bind",
+      "/dev/null",
+      "/run/secrets.d/2/aws-pi-agent-cert",
+    ]);
+    const keyMask = indexOfSequence(argv, [
+      "--ro-bind",
+      "/dev/null",
+      "/run/secrets.d/2/aws-pi-agent-key",
+    ]);
+    const runtimeMask = indexOfSequence(argv, ["--tmpfs", RUNTIME_BASE]);
+    expect(certMask).toBeGreaterThan(baseBind);
+    expect(keyMask).toBeGreaterThan(certMask);
+    // Every mask stays before the runtime-base mask and the scope re-bind.
+    expect(runtimeMask).toBeGreaterThan(keyMask);
+    expect(indexOfSequence(argv, ["--ro-bind", SCOPE_DIR, SCOPE_DIR])).toBeGreaterThan(runtimeMask);
+    // A file cannot be masked with --tmpfs: bwrap cannot mkdir it.
+    expect(indexOfSequence(argv, ["--tmpfs", "/run/secrets.d/2/aws-pi-agent-cert"])).toBe(-1);
   });
 
   it("exports the sandbox profile, region, and the recursion guard", () => {

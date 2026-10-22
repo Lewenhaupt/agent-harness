@@ -51,10 +51,15 @@ function sliceBetween(start: string, end: string): string {
  * `nixos-rebuild` time.
  */
 describe("bd-125: flake AWS isolation wiring", () => {
-  it("puts bubblewrap and awscli2 in devShellTools (so both PATHs get them)", () => {
+  it("puts bubblewrap, awscli2 and aws-signing-helper in devShellTools (so both PATHs get them)", () => {
     const tools = sliceBetween("devShellTools = [", "];");
     expect(tools).toContain("pkgs.bubblewrap");
     expect(tools).toContain("pkgs.awscli2");
+    // `aws configure export-credentials` shells out to a RolesAnywhere
+    // profile's credential_process helper, so the *broker* needs it on PATH
+    // (the sandbox never runs it). Without this every request fails with
+    // "command not found".
+    expect(tools).toContain("pkgs.aws-signing-helper");
   });
 
   it("routes devShellTools into the devShell and the pi-web runtime env", () => {
@@ -62,6 +67,21 @@ describe("bd-125: flake AWS isolation wiring", () => {
     // list; the AWS tools must ride that one list rather than a second PATH entry.
     expect(flake()).toContain("paths = devShellTools ++ [");
     expect(flake()).toContain("packages = devShellTools ++ [");
+  });
+
+  it("reaches the broker's PATH through pi-web-runtime-env (devShellTools → broker unit)", () => {
+    // devShellTools membership alone proves nothing: `aws configure
+    // export-credentials` finds `aws_signing_helper` only because the broker
+    // unit's own environment puts pi-web-runtime-env/bin (built from
+    // devShellTools) on PATH. Pin both links so a PATH edit that drops the
+    // runtime env fails here instead of at the first RolesAnywhere request.
+    const environment = sliceBetween("environment = [", "piWebSessiondSetup = pkgs");
+    expect(environment).toContain(`"PATH=\${pi-web-runtime-env}/bin:`);
+    const broker = sliceBetween(
+      "systemd.services.pi-web-aws-broker = {",
+      "systemd.services.pi-web = {",
+    );
+    expect(broker).toContain("Environment = environment;");
   });
 
   it("runs pi-web-sessiond under a minimal bwrap mask", () => {

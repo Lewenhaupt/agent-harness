@@ -60,11 +60,13 @@ export function buildExportCredentialsArgv(options: {
 /**
  * Validate a `--format process` document.
  *
- * Only *temporary* credentials are accepted: the broker exists to hand a repo a
- * scoped SSO/assumed-role identity, and `aws configure export-credentials
- * --format process` omits `SessionToken`/`Expiration` for long-lived IAM-user
- * keys. A static-credential profile is refused with a message that names the
- * real fix (use an SSO profile) instead of failing forever on a missing field.
+ * Only *temporary / role* credentials are accepted: the broker exists to hand a
+ * repo a scoped identity, and `aws configure export-credentials --format
+ * process` omits `SessionToken`/`Expiration` for long-lived IAM-user keys. An
+ * SSO profile and an IAM RolesAnywhere `credential_process` profile both
+ * qualify (both emit a session token with an expiry); a static-access-key
+ * profile is refused with a message that names the real fix instead of failing
+ * forever on a missing field.
  *
  * Failure messages deliberately never echo the payload: stdout can contain
  * live credentials, and the broker's errors are surfaced in tool output and
@@ -100,7 +102,7 @@ export function parseCredentialDocument(stdout: string): AwsResult<AwsCredential
   }
   if (typeof sessionToken !== "string" || sessionToken === "") {
     return fail(
-      "aws returned long-lived credentials (no `SessionToken`); the belayd broker only serves temporary SSO credentials — point this repo's `.belayd/aws.yaml` at an SSO/assumed-role profile",
+      "aws returned long-lived credentials (no `SessionToken`); the belayd broker only serves temporary/role credentials — a `credential_process` profile (including IAM RolesAnywhere) or an SSO/assumed-role profile is fine, long-lived IAM-user keys are not: point this repo's `.belayd/aws.yaml` at a temporary-credential profile",
     );
   }
   if (typeof expiration !== "string" || expiration === "") {
@@ -128,6 +130,23 @@ const EXPIRY_PATTERNS: readonly RegExp[] = [
   /refresh failed/i,
 ];
 
+/**
+ * Hint appended to AWS's own error text.
+ *
+ * The expiry hint is only correct for IAM Identity Center profiles. A
+ * `credential_process` profile (IAM RolesAnywhere, a broken helper, a missing
+ * certificate) produces stderr that matches none of
+ * {@link EXPIRY_PATTERNS}, and telling the operator to run `aws sso login` for
+ * it would send them chasing a fix that cannot work, so that branch names the
+ * real alternatives instead.
+ */
+function failureHint(options: { profile: string; matchedExpiry: boolean }): string {
+  if (options.matchedExpiry) {
+    return `\nThe IAM Identity Center session is no longer valid. Refresh it on the host, outside every sandbox: aws sso login --profile ${options.profile}`;
+  }
+  return `\nNo expired SSO session was reported, so an SSO login will not fix this. Check that the profile's credential_process helper is installed and executable on the broker's PATH and that the material it reads exists and is valid (for IAM RolesAnywhere: the x509 certificate and private key, re-issued if expired), and re-check the trust anchor / profile / role ARNs; if this is an IAM Identity Center profile after all, refresh its portal session on the host.`;
+}
+
 /** Turn a failed AWS CLI invocation into an actionable message. */
 export function describeAwsFailure(options: {
   profile: string;
@@ -135,14 +154,16 @@ export function describeAwsFailure(options: {
   exitCode: number | null;
 }): string {
   // Surface AWS's own text verbatim: it is the only place the real cause
-  // (expired portal session, missing registration, wrong role) is named.
+  // (expired portal session, missing registration, wrong role, a signing helper
+  // that is not on PATH) is named.
   const verbatim = options.stderr.trim();
   const detail = verbatim === "" ? "(aws wrote no error text)" : verbatim;
   const exit = options.exitCode === null ? "killed" : `exit ${options.exitCode}`;
-  const expiryHint = EXPIRY_PATTERNS.some((pattern) => pattern.test(verbatim))
-    ? "\nThe IAM Identity Center session is no longer valid. Refresh it on the host, outside every sandbox: aws sso login --profile "
-    : "\nIf the profile's SSO session or client registration expired, refresh it on the host, outside every sandbox: aws sso login --profile ";
-  return `aws failed for profile "${options.profile}" (${exit}): ${detail}${expiryHint}${options.profile}`;
+  const hint = failureHint({
+    profile: options.profile,
+    matchedExpiry: EXPIRY_PATTERNS.some((pattern) => pattern.test(verbatim)),
+  });
+  return `aws failed for profile "${options.profile}" (${exit}): ${detail}${hint}`;
 }
 
 /** Default spawner: `execFile`, argv only, no shell. */

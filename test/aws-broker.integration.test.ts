@@ -14,7 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { startDaemon } from "../src/aws-broker/daemon.js";
-import { defaultClientEntryPath, resolveSandboxPlan } from "../src/aws-broker/plan.js";
+import { defaultClientEntryPath, resolveSandboxPlan, shellQuote } from "../src/aws-broker/plan.js";
 
 const execFileAsync = promisify(execFile);
 const BWRAP = which("bwrap");
@@ -214,6 +214,70 @@ describe("aws broker end to end (integration, real bwrap)", () => {
       expect(direct.ok).toBe(true);
       if (!direct.ok) return;
       expect(direct.plan.socketPath).toBe(socketPath);
+    },
+  );
+
+  it.skipIf(BWRAP === null)(
+    "serves the profile while masking RolesAnywhere material inside the sandbox",
+    async () => {
+      // The broker resolves the profile by reading these files as the
+      // operator; the sandbox must not see them, or an agent could call
+      // aws_signing_helper itself and skip the allowlist.
+      const secrets = join(root, "secrets");
+      mkdirSync(secrets, { recursive: true });
+      const certPath = join(secrets, "agent-cert.pem");
+      const keyPath = join(secrets, "agent-key.pem");
+      writeFileSync(certPath, "CERT-CANARY\n");
+      writeFileSync(keyPath, "KEY-CANARY\n");
+      writeFileSync(
+        join(configHome, "belayd", "aws.yaml"),
+        [
+          "region: eu-north-1",
+          "scopes:",
+          `  - worktree: ${repo}`,
+          "    profiles: [agent-readonly]",
+          `    mask: [${certPath}, ${keyPath}]`,
+        ].join("\n"),
+      );
+      await startBroker();
+
+      const plan = await runCli(["plan", "--worktree", repo, "--print0"]);
+      expect(plan.status).toBe(0);
+      const argvPrefix = plan.stdout.split("\0").filter((token) => token !== "");
+      const certIndex = argvPrefix.indexOf(certPath);
+      expect(certIndex).toBeGreaterThan(0);
+      expect(argvPrefix[certIndex - 1]).toBe("/dev/null");
+      expect(argvPrefix[certIndex - 2]).toBe("--ro-bind");
+      expect(argvPrefix).toContain(keyPath);
+
+      const ensure = await runCli(["ensure-scope", "--worktree", repo]);
+      expect(ensure.status).toBe(0);
+      const socketPath = ensure.stdout.trim();
+      const shim = join(dirname(socketPath), "credential-process");
+      const binary = argvPrefix[0];
+      if (binary === undefined) throw new Error("empty plan argv");
+      const sandboxPrefix = [...argvPrefix.slice(1), "--"];
+
+      const readAttempt = await runProcess(
+        binary,
+        [...sandboxPrefix, "sh", "-c", `cat ${shellQuote(certPath)}`],
+        env,
+      );
+      expect(readAttempt.status).not.toBe(0);
+      expect(readAttempt.stdout).toBe("");
+      expect(readAttempt.stderr).toContain("Permission denied");
+
+      // …and the scoped profile still resolves through the scope socket.
+      const document = await runProcess(
+        binary,
+        [...sandboxPrefix, shim, "--socket", socketPath],
+        env,
+      );
+      expect(document.status).toBe(0);
+      expect(document.stderr).toBe("");
+      const parsed = JSON.parse(document.stdout.trim()) as Record<string, unknown>;
+      expect(parsed.Version).toBe(1);
+      expect(parsed.AccessKeyId).toBe("AKIAFIXTURE");
     },
   );
 
