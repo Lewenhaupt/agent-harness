@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,9 +9,15 @@ import {
   renderScript,
   runScript,
 } from "../src/__tests__/helpers/belayd-script-harness.js";
-import { prepareScopeFiles, shellQuote } from "../src/aws-broker/plan.js";
+import {
+  prepareScopeFiles,
+  resolveMaskEntries,
+  shellQuote,
+  toSandboxMask,
+} from "../src/aws-broker/plan.js";
 import {
   buildSandboxArgv,
+  type SandboxMask,
   scopeDirFor,
   scopeIdFor,
   socketPathFor,
@@ -89,24 +95,30 @@ describe("aws sandbox masking (integration, real bwrap)", () => {
     cleanupRenderedScripts();
   });
 
-  function sandboxArgv(command: string[]): string[] {
+  function sandboxArgv(command: string[], masks?: readonly SandboxMask[]): string[] {
     return buildSandboxArgv({
       bwrapPath: requireBwrap(),
       homeDir: home,
       runtimeBaseDir,
       scopeDir,
-      maskDirs: [join(home, ".aws"), join(home, ".config", "aws")],
+      masks: masks ?? [
+        { kind: "tmpfs", path: join(home, ".aws") },
+        { kind: "tmpfs", path: join(home, ".config", "aws") },
+      ],
       region: "eu-north-1",
       command,
     });
   }
 
-  function runSandboxed(command: string[]): {
+  function runSandboxed(
+    command: string[],
+    masks?: readonly SandboxMask[],
+  ): {
     status: number | null;
     stdout: string;
     stderr: string;
   } {
-    const argv = sandboxArgv(command);
+    const argv = sandboxArgv(command, masks);
     const binary = argv[0];
     if (binary === undefined) throw new Error("empty sandbox argv");
     const result = spawnSync(binary, argv.slice(1), {
@@ -258,6 +270,145 @@ describe("aws sandbox masking (integration, real bwrap)", () => {
     const result = runSandboxed(["sh", "-c", `cat ${shellQuote(marker)}`]);
     expect(result.stdout).toContain("reachable");
   });
+
+  it.skipIf(BWRAP === null)(
+    "masks allowlisted files (EACCES) and directories (empty), through a symlinked path",
+    () => {
+      // The IAM RolesAnywhere hole this closes: the broker must read the cert
+      // and key, so they live outside ~/.aws and were previously readable from
+      // inside the sandbox (an agent could call aws_signing_helper directly and
+      // bypass the allowlist entirely).
+      const secrets = join(root, "secrets");
+      mkdirSync(secrets, { recursive: true });
+      const certPath = join(secrets, "agent-cert.pem");
+      const keyPath = join(secrets, "agent-key.pem");
+      const siblingPath = join(secrets, "unlisted.pem");
+      writeFileSync(certPath, "CERT-CANARY\n");
+      writeFileSync(keyPath, "KEY-CANARY\n");
+      writeFileSync(siblingPath, "UNLISTED-VISIBLE\n");
+      const cacheDir = join(root, "agent-cache");
+      mkdirSync(cacheDir, { recursive: true });
+      writeFileSync(join(cacheDir, "token"), "CACHE-CANARY\n");
+      // `/run/secrets` on the real host is a symlink, so resolution matters:
+      // bwrap refuses an unresolved path through a symlinked directory.
+      const secretsLink = join(root, "secrets-link");
+      symlinkSync(secrets, secretsLink);
+
+      const resolved = resolveMaskEntries({
+        entries: [join(secretsLink, "agent-cert.pem"), keyPath, cacheDir],
+        context: {
+          worktreeRoot: join(root, "repo"),
+          homeDir: home,
+          runtimeBaseDir,
+          scopeDir,
+          allowlistPath: join(root, "config", "belayd", "aws.yaml"),
+        },
+      });
+      expect(resolved.ok).toBe(true);
+      if (!resolved.ok) return;
+      expect(resolved.value.map((mask) => mask.kind)).toEqual(["null-bind", "null-bind", "tmpfs"]);
+      const masks: SandboxMask[] = [
+        { kind: "tmpfs", path: join(home, ".aws") },
+        { kind: "tmpfs", path: join(home, ".config", "aws") },
+        ...resolved.value.map(toSandboxMask),
+      ];
+
+      // Control: the material is readable outside the sandbox.
+      expect(readFileSync(certPath, "utf-8")).toContain("CERT-CANARY");
+
+      const script = [
+        `cat ${shellQuote(certPath)} 2>&1 || true`,
+        `cat ${shellQuote(keyPath)} 2>&1 || true`,
+        `cat ${shellQuote(`${secretsLink}/agent-cert.pem`)} 2>&1 || true`,
+        `cat /proc/self/root${certPath} 2>&1 || true`,
+        `if [ -e ${shellQuote(join(cacheDir, "token"))} ]; then echo CACHE-VISIBLE; else echo CACHE-HIDDEN; fi`,
+        `cat ${shellQuote(siblingPath)}`,
+      ].join("\n");
+      const result = runSandboxed(["sh", "-c", script], masks);
+
+      expect(result.status).toBe(0);
+      // File masks read EACCES (a `/dev/null` bind is a regular file that
+      // cannot be opened), never the canary.
+      expect(result.stdout.match(/Permission denied/g) ?? []).toHaveLength(4);
+      expect(result.stdout).not.toContain("CERT-CANARY");
+      expect(result.stdout).not.toContain("KEY-CANARY");
+      // Directory mask: an empty tmpfs, so the token inside is gone.
+      expect(result.stdout).toContain("CACHE-HIDDEN");
+      expect(result.stdout).not.toContain("CACHE-VISIBLE");
+      expect(result.stdout).not.toContain("CACHE-CANARY");
+      // Unlisted sibling stays readable: the mask is per-entry, not per-dir.
+      expect(result.stdout).toContain("UNLISTED-VISIBLE");
+    },
+  );
+
+  it.skipIf(BWRAP === null || GIT === null || JQ === null)(
+    "propagates a mask refusal: runs unwrapped, without AWS, and says why",
+    () => {
+      // Fail-closed through the real wrapper, not just the planner: a scope
+      // whose `mask:` entry does not exist must NOT fall back to a sandbox
+      // without that mask (the certificate would stay readable), and must not
+      // fall back to an AWS profile either. The command still runs — the
+      // operator's shell keeps working — with the reason on stderr.
+      const repo = join(root, "aws-mask-refusal-repo");
+      const configHome = join(root, "refusal-config");
+      const refusalRuntime = join(root, "refusal-runtime");
+      mkdirSync(join(repo, ".belayd"), { recursive: true });
+      mkdirSync(join(configHome, "belayd"), { recursive: true });
+      mkdirSync(refusalRuntime, { recursive: true });
+      writeFileSync(join(repo, ".belayd", "aws.yaml"), "profile: agent-readonly\n");
+      const missingMask = join(root, "missing-cert.pem");
+      writeFileSync(
+        join(configHome, "belayd", "aws.yaml"),
+        [
+          "region: eu-north-1",
+          "scopes:",
+          `  - worktree: ${repo}`,
+          "    profiles: [agent-readonly]",
+          `    mask: [${missingMask}]`,
+        ].join("\n"),
+      );
+
+      const env = cleanEnv({
+        HOME: home,
+        XDG_CONFIG_HOME: configHome,
+        XDG_RUNTIME_DIR: refusalRuntime,
+        BELAYD_AWS_RUNTIME_BASE_DIR: refusalRuntime,
+        BELAYD_BWRAP_BIN: requireBwrap(),
+        BELAYD_AWS_BIN: join(root, "missing-belayd-aws"),
+      });
+
+      // A wrapper whose planner is the real CLI (node + main.ts), so the
+      // refusal comes from the production code path.
+      const planner = join(root, "belayd-aws-refusal-stub");
+      writeFileSync(
+        planner,
+        `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(join(REPO_ROOT, "src", "aws-broker", "main.ts"))} "$@"\n`,
+        { mode: 0o755 },
+      );
+      const wrapper = renderScript("belayd-shell", {
+        realShell: which("bash") ?? "/bin/sh",
+        jqPath: requireJq(),
+        awsSandboxPath: planner,
+      }).path;
+
+      const initialized = spawnSync("git", ["init", "-q", repo], { env, encoding: "utf-8" });
+      expect(initialized.status).toBe(0);
+
+      const result = runScript(
+        wrapper,
+        ["-c", `printf "active=%s\\n" "\${BELAYD_SANDBOX_ACTIVE:-none}"`],
+        { cwd: repo, env },
+      );
+
+      expect(result.status).toBe(0);
+      // Unwrapped: no sandbox marker, so no scoped profile was handed out.
+      expect(result.stdout.trim()).toBe("active=none");
+      // …and loud: the wrapper relays the planner's refusal, naming the entry.
+      expect(result.stderr).toContain("belayd-shell:");
+      expect(result.stderr).toContain(missingMask);
+      expect(result.stderr).toContain("does not exist or cannot be resolved");
+    },
+  );
 
   it.skipIf(BWRAP === null || DIRENV === null || GIT === null || JQ === null)(
     "still resolves the repo devShell (direnv) inside the sandbox",

@@ -9,6 +9,10 @@
  *   scope ⇒ `not-configured`/`refused`, and the caller runs the command
  *   *unwrapped* with no AWS (never a default profile);
  * - bubblewrap or a runtime dir missing ⇒ `unavailable`;
+ * - an allowlist `mask:` entry that is relative, names the home directory, the
+ *   worktree, the scope dir or the broker runtime base, does not exist, or is
+ *   not a regular file/directory ⇒ `refused`. Masking is fail-closed on
+ *   purpose: a typo in `mask:` must never leave a certificate readable;
  * - everything present ⇒ the scope dir is (re)created with the synthetic
  *   `~/.aws/config` and the `credential_process` shim, and the bwrap argv is
  *   returned.
@@ -19,11 +23,31 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  type Stats,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type AwsAllowlist, parseAllowlist, parseRepoConfig, resolveScope } from "./config.ts";
+import {
+  type AwsAllowlist,
+  type ConfigResult,
+  type MaskPathStat,
+  type MaskValidationContext,
+  mergeMaskEntries,
+  parseAllowlist,
+  parseRepoConfig,
+  type ResolvedMaskEntry,
+  resolveScope,
+  validateMaskEntry,
+} from "./config.ts";
 import {
   BROKER_DIR_MODE,
   type BuildSandboxArgvOptions,
@@ -31,6 +55,7 @@ import {
   isSandboxActive,
   resolveBrokerRuntimeBaseDir,
   SANDBOX_PROFILE_NAME,
+  type SandboxMask,
   scopeDirFor,
   scopeIdFor,
   shimPathFor,
@@ -51,6 +76,13 @@ export interface AwsSandboxPlan {
   /** Profile the sandbox sees (`agent`). */
   sandboxProfile: string;
   region: string;
+  /**
+   * Every mask the sandbox applies, in argv order: the two fixed AWS config
+   * locations first, then the allowlist's `mask:` entries (already resolved
+   * and validated). Exposed so callers and tests can see exactly what is
+   * hidden without re-deriving it from the argv.
+   */
+  masks: readonly SandboxMask[];
   /** bwrap argv without a command; append `-- <cmd>` via {@link withSandboxCommand}. */
   argvPrefix: readonly string[];
 }
@@ -252,6 +284,9 @@ interface ConfiguredScope {
   worktreeRoot: string;
   profile: string;
   region: string;
+  /** Allowlist `mask:` entries (top level then per scope), unvalidated. */
+  maskEntries: readonly string[];
+  allowlistPath: string;
 }
 
 /**
@@ -302,7 +337,90 @@ function resolveConfiguredScope(options: {
       `scope for ${worktreeRoot} sets no region; add \`region\` to its allowlist scope (the repo file only carries \`profile\`) or export AWS_REGION for the broker`,
     );
   }
-  return { ok: true, value: { worktreeRoot, profile: resolved.value.profile, region } };
+  return {
+    ok: true,
+    value: {
+      worktreeRoot,
+      profile: resolved.value.profile,
+      region,
+      // Top-level masks apply to every scope, so they come first; the per-scope
+      // list then narrows further. Deduplication is by entry text so an entry
+      // repeated at both levels is mounted once.
+      maskEntries: mergeMaskEntries(allowlist.mask, resolved.value.rule.mask),
+      allowlistPath,
+    },
+  };
+}
+
+/** Map a `stats` object onto the pure validator's vocabulary. */
+function describeSpecialFile(stats: Stats): string {
+  if (stats.isSocket()) return "socket";
+  if (stats.isFIFO()) return "fifo";
+  if (stats.isCharacterDevice()) return "character device";
+  if (stats.isBlockDevice()) return "block device";
+  return "special file";
+}
+
+/** Filesystem kind of an already-resolved mask path. */
+function maskStatFor(path: string): MaskPathStat {
+  try {
+    const stats = statSync(path);
+    if (stats.isDirectory()) return { kind: "directory" };
+    if (stats.isFile()) return { kind: "file" };
+    return { kind: "other", description: describeSpecialFile(stats) };
+  } catch {
+    return { kind: "missing" };
+  }
+}
+
+/**
+ * Resolve every allowlist `mask:` entry, fail-closed.
+ *
+ * `realpath()` is not a nicety: bwrap cannot create the mount point for a path
+ * that traverses a symlinked directory (`Can't create file at …`), so the argv
+ * must carry the resolved path. A resolution failure is reported as `missing`
+ * and refuses the scope — a typo in `mask:` must never leave a private key
+ * readable.
+ *
+ * Duplicates are dropped on the *resolved* path, first entry wins: a symlink
+ * and its target (or `/srv/cert` at the top level plus `/srv/cert/` per scope)
+ * are the same mount, and stacking two mounts of one target is at best wasted
+ * argv and at worst a second mount that unmasks the first.
+ */
+export function resolveMaskEntries(options: {
+  entries: readonly string[];
+  context: MaskValidationContext;
+}): ConfigResult<readonly ResolvedMaskEntry[]> {
+  const resolvedMasks: ResolvedMaskEntry[] = [];
+  const seenPaths = new Set<string>();
+  for (const entry of options.entries) {
+    let resolvedPath = entry;
+    let stat: MaskPathStat = { kind: "missing" };
+    try {
+      resolvedPath = realpathSync(entry);
+      stat = maskStatFor(resolvedPath);
+    } catch {
+      // Keep the entry as written so the refusal names the operator's own text.
+    }
+    const validated = validateMaskEntry({
+      entry,
+      resolvedPath,
+      stat,
+      context: options.context,
+    });
+    if (!validated.ok) return validated;
+    if (seenPaths.has(validated.value.path)) continue;
+    seenPaths.add(validated.value.path);
+    resolvedMasks.push(validated.value);
+  }
+  return { ok: true, value: resolvedMasks };
+}
+
+/** Narrow a resolved mask entry into the argv-shaped form. */
+export function toSandboxMask(mask: ResolvedMaskEntry): SandboxMask {
+  return mask.kind === "tmpfs"
+    ? { kind: "tmpfs", path: mask.path }
+    : { kind: "null-bind", path: mask.path };
 }
 
 /**
@@ -343,6 +461,22 @@ export function resolveSandboxPlan(options: ResolveSandboxPlanOptions): SandboxP
   const scopeDir = scopeDirFor({ runtimeBaseDir, scopeId });
   const socketPath = socketPathFor(scopeDir);
 
+  // Validate the operator's `mask:` entries here, before anything is created:
+  // a bad entry must refuse the whole scope rather than run with a readable
+  // secret. Entries that resolve did so against the real filesystem, so no
+  // mount destination needs creating for them.
+  const masksResult = resolveMaskEntries({
+    entries: configured.value.maskEntries,
+    context: {
+      worktreeRoot,
+      homeDir,
+      runtimeBaseDir,
+      scopeDir,
+      allowlistPath: configured.value.allowlistPath,
+    },
+  });
+  if (!masksResult.ok) return skip("refused", masksResult.reason);
+
   // `--tmpfs` destinations must exist on the host (bubblewrap cannot create
   // them under a read-only `/`), and the scope dir has to exist before the
   // shim/config are written into it. The NixOS broker unit declares
@@ -377,12 +511,20 @@ export function resolveSandboxPlan(options: ResolveSandboxPlanOptions): SandboxP
     );
   }
 
+  const masks: SandboxMask[] = [
+    // The two fixed AWS config locations come first: they are never optional.
+    { kind: "tmpfs", path: awsDir },
+    { kind: "tmpfs", path: awsConfigDir },
+    // …then the operator's extra masks (IAM RolesAnywhere x509 material and
+    // anything else that must not be reachable from inside the sandbox).
+    ...masksResult.value.map(toSandboxMask),
+  ];
   const argvOptions: BuildSandboxArgvOptions = {
     bwrapPath,
     homeDir,
     runtimeBaseDir,
     scopeDir,
-    maskDirs: [awsDir, awsConfigDir],
+    masks,
     region,
   };
 
@@ -396,6 +538,7 @@ export function resolveSandboxPlan(options: ResolveSandboxPlanOptions): SandboxP
       profile,
       sandboxProfile: SANDBOX_PROFILE_NAME,
       region,
+      masks,
       argvPrefix: buildSandboxArgv(argvOptions),
     },
   };

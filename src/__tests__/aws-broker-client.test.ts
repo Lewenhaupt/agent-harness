@@ -162,7 +162,8 @@ describe("aws-broker aws-cli", () => {
     expect(staticOnly).toHaveProperty("ok", false);
     if (staticOnly.ok) return;
     expect(staticOnly.error).toContain("long-lived credentials");
-    expect(staticOnly.error).toContain("temporary SSO credentials");
+    expect(staticOnly.error).toContain("temporary/role credentials");
+    expect(staticOnly.error).toContain("IAM RolesAnywhere");
     expect(staticOnly.error).toContain(".belayd/aws.yaml");
 
     const missingExpiration = parseCredentialDocument(
@@ -183,6 +184,23 @@ describe("aws-broker aws-cli", () => {
     expect(message).toContain("exit 255");
     expect(message).toContain("aws sso login --profile agent-readonly");
     expect(message).toContain("on the host");
+  });
+
+  it("does not prescribe an SSO login for a non-SSO failure", () => {
+    // An IAM RolesAnywhere profile fails for reasons `aws sso login` cannot
+    // fix (missing helper, expired x509 material, wrong ARN). AWS's own text
+    // stays verbatim and the hint points at those, not at the SSO command.
+    const message = describeAwsFailure({
+      profile: "dev-agent",
+      stderr:
+        "An error occurred (InvalidSignatureException) when calling the CreateSession operation: Signature expired\n",
+      exitCode: 255,
+    });
+    expect(message).toContain("InvalidSignatureException");
+    expect(message).not.toContain("aws sso login");
+    expect(message).toContain("credential_process");
+    expect(message).toContain("IAM RolesAnywhere");
+    expect(message).toContain("trust anchor / profile / role ARNs");
   });
 
   it("resolves credentials through the injected spawner and fails loud", async () => {

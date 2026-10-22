@@ -33,6 +33,8 @@ bwrap
   --ro-bind / / --dev-bind /dev /dev --proc /proc
   --tmpfs $HOME/.aws
   --tmpfs $HOME/.config/aws
+  --tmpfs <allowlist dir mask>                # only when the allowlist says so
+  --ro-bind /dev/null <allowlist file mask>   # only when the allowlist says so
   --tmpfs <runtimeBase>
   --ro-bind <scopeDir> <scopeDir>
   --ro-bind <scopeDir>/aws/config $HOME/.aws/config
@@ -51,6 +53,7 @@ bwrap
 | `--dev-bind /dev /dev`, `--proc /proc` | `/dev/null`, `/dev/tty`, and `/proc/self` keep working; `ps`/`git`/`nix` need them. |
 | `--tmpfs $HOME/.aws` | The SSO cache is a *directory*, so `--tmpfs` is correct. (`--ro-bind /dev/null <dir>` is not, and `--ro-bind /dev/null <file>` reads `EACCES`, not EOF.) |
 | `--tmpfs $HOME/.config/aws` | Any second AWS config location is masked too. |
+| `--tmpfs <dir>` / `--ro-bind /dev/null <file>` per allowlist `mask:` entry | Operator-chosen extra masks, chiefly the x509 certificate and private key of an IAM RolesAnywhere `credential_process` profile: the broker must read them, so they cannot live under `~/.aws`, and an agent that can read them can call `aws_signing_helper` itself and bypass the allowlist. Directories become a tmpfs; a regular file becomes a `/dev/null` bind, which reads `EACCES` on open (never EOF and never an empty file that looks like an empty key). Paths are `realpath()`-resolved, and any unusable entry refuses the whole scope. Shapes, resolution, and the full refusal list: [Mask entries](#mask-entries). |
 | `--tmpfs <runtimeBase>` | `<runtimeBase>` is where the broker keeps the control socket and every scope dir (`BELAYD_AWS_RUNTIME_BASE_DIR`, else `<XDG_RUNTIME_DIR>/belayd/aws`). Masking it removes the control socket ("ensure any scope") and every *other* repo's scope socket, then the next line re-exposes only this one. This mask — not socket mode 0600, which is meaningless between same-uid processes — is what makes per-repo scoping real. |
 | `--ro-bind <scopeDir> <scopeDir>` | Re-exposes this worktree's scope dir (shim, synthetic config, socket). The destination lives inside the tmpfs, so bubblewrap can create it even though `/` is read-only. |
 | `--ro-bind <scopeDir>/aws/config $HOME/.aws/config` | The only profile the agent can see: `[profile agent]` with a `credential_process`. |
@@ -84,16 +87,32 @@ mount point under a read-only `/`). The plan resolver creates `<runtimeBase>`,
 
 ```yaml
 region: eu-north-1                 # optional default region
+mask:                              # optional: hidden in EVERY scope
+  - /srv/belayd/agent-keyring
 scopes:
   - worktree: /home/hugo/git/acme-*   # glob on the git toplevel
     profiles: [agent-readonly, agent-deploy]
     default: agent-readonly
     region: us-east-1              # optional per-scope override
+    mask:                          # optional: hidden in THIS scope only
+      - /srv/belayd/acme-agent-cert
+      - /srv/belayd/acme-agent-key
 ```
 
 - `worktree` is a glob (`*` does not cross `/`, `**` does, `?` is one char).
   The first matching scope wins.
 - A worktree matched by **no** scope gets no AWS.
+- `mask` entries are absolute host paths hidden inside that scope's sandbox
+  (top-level list first, then the per-scope list, de-duplicated — by entry text,
+  then again by `realpath()`-resolved path, so a symlink and its target are
+  mounted once). They are resolved with `realpath()` at plan time, and a
+  directory is masked with a tmpfs while a regular file is masked with a
+  `--ro-bind /dev/null` (opening it reads `EACCES`). Any entry that cannot be
+  applied **refuses the scope** rather than being ignored. Accepted shapes,
+  indentation, resolution, and the full refusal list:
+  [Mask entries](#mask-entries).
+- The repo file deliberately has no `mask:` key: a repo cannot widen or shrink
+  its own sandbox.
 - Only this small schema is parsed; unknown keys, tabs, or anything outside it
   are refused with a line number (`src/aws-broker/config.ts` is a hand-rolled
   subset parser, deliberately not a new dependency).
@@ -134,12 +153,14 @@ profile: agent-deploy
 - One socket serves exactly one source profile; the SDKs never cache a
   `credential_process`, so the broker caches (single-flight, 5-minute refresh
   skew, small LRU).
-- Only **temporary** credentials are served. `aws configure export-credentials
+- Only **temporary / role** credentials are served. `aws configure export-credentials
   --format process` omits `SessionToken`/`Expiration` for long-lived IAM-user
   keys, and the broker refuses that document with an actionable message
-  (`long-lived credentials (no SessionToken); … point this repo's
-  .belayd/aws.yaml at an SSO/assumed-role profile`) instead of failing forever
-  on a missing field. Static-credential profiles are out of scope for this bead.
+  (`long-lived credentials (no SessionToken); … a credential_process profile
+  (including IAM RolesAnywhere) or an SSO/assumed-role profile is fine,
+  long-lived IAM-user keys are not …`) instead of failing forever on a missing
+  field. An SSO profile and an IAM RolesAnywhere `credential_process` profile
+  both qualify; static IAM-user keys do not.
 - The shim (`src/aws-broker/client.ts`) prints exactly one document on stdout
   and **nothing** on stderr on success; on failure it prints the broker's
   message on stderr and exits non-zero, never partial JSON.
@@ -174,7 +195,7 @@ The answer depends on **which process** you are. Read each row as its actor.
 
 | Actor | Cannot | Can |
 |-------|--------|-----|
-| **Sandboxed agent** (per-repo bwrap: `src/spawn.ts`, `belayd-shell.sh`) | Read `~/.aws` or `~/.config/aws`; run `aws sso login`; read or connect to the broker control socket; read or connect to any sibling repo's scope socket; see inherited `AWS_*` credentials | Use its repo's one scoped profile until `Expiration`; call any API that profile's IAM permission set allows; use the host `/tmp`, host network, `/dev`, `nix develop`, `git`, `bd` |
+| **Sandboxed agent** (per-repo bwrap: `src/spawn.ts`, `belayd-shell.sh`) | Read `~/.aws` or `~/.config/aws`; read any path the operator listed under `mask:` (e.g. an IAM RolesAnywhere certificate/private key); run `aws sso login`; read or connect to the broker control socket; read or connect to any sibling repo's scope socket; see inherited `AWS_*` credentials | Use its repo's one scoped profile (SSO or RolesAnywhere `credential_process`, temporary credentials only) until `Expiration`; call any API that profile's IAM permission set / role allows; use the host `/tmp`, host network, `/dev`, `nix develop`, `git`, `bd` |
 | **Orchestrator / agent session in the `pi-web-sessiond` namespace** (not itself under a per-repo wrap: the session pi process, an agent tool that bypasses `belayd-shell`, a repo with no `.belayd/aws.yaml`) | Read `~/.aws` or `~/.config/aws` (the sessiond mask); run `aws sso login` | Reach the control socket and therefore ask the broker for **any scope the allowlist configures**; reach every scope socket |
 | **Same-uid process outside every sandbox** (interactive pi CLI, human shell, pi-web server, the broker) | Nothing enforced | Read `~/.aws`, run `aws sso login`, use the full IAM Identity Center permission set |
 
@@ -191,6 +212,14 @@ PKCE client registration expires after 90 days. When either lapses, **only an
 interactive `aws sso login` on the host** (outside every sandbox, as the
 operator) restores access. The broker never retries silently: it surfaces AWS's
 own error text verbatim plus `aws sso login --profile <profile>`.
+
+A repo scoped to an IAM RolesAnywhere `credential_process` profile is different:
+there is no portal session and no PKCE registration. Role credentials are
+refreshed by the broker, and the human boundary is the **x509 certificate's
+expiry** — re-issue the certificate/key on the host when it lapses. For those
+failures the broker does **not** prescribe `aws sso login`; it names the
+credential_process helper, the x509 material, and the trust anchor / profile /
+role ARNs instead.
 
 ## Residual risks (honest list)
 
@@ -216,6 +245,15 @@ own error text verbatim plus `aws sso login --profile <profile>`.
   exfiltrate within its role's permissions. Least privilege lives in the IAM
   permission set chosen per repo, plus the allowlist.
 - **Audit is per scope, not per agent.**
+- **`mask:` covers what the operator lists.** The fixed masks are `~/.aws`,
+  `~/.config/aws`, and the broker runtime base; anything else (an IAM
+  RolesAnywhere certificate and key, a second keyring) is readable inside the
+  sandbox until the operator adds it to the scope's `mask:` list. A mask typo
+  refuses the scope rather than being ignored, a mask entry inside the
+  worktree / scope dir / runtime base is refused (the repo cannot widen or
+  break its own sandbox), and so is an entry that *contains* the home dir,
+  worktree, scope dir or runtime base — an ancestor mask would hide the spawn
+  cwd or the broker/sessiond sockets instead of hiding one secret.
 - **The SSO cache format is a botocore internal.** We never parse it: credential
   resolution is delegated to `aws configure export-credentials --format
   process`. A direct `CreateToken` + `GetRoleCredentials` path is a later
@@ -260,10 +298,13 @@ own error text verbatim plus `aws sso login --profile <profile>`.
 - The sessiond argv does **not** mask `/run/belayd/aws` on purpose: the
   orchestrator inside it needs the control socket (see the actor table above).
   The per-repo argv does mask it.
-- `pkgs.bubblewrap` and `pkgs.awscli2` are in `devShellTools`, so they reach
-  both `devShells.default` and `pi-web-runtime-env` (and therefore every spawned
-  agent's `PATH`). bubblewrap comes from nixpkgs-unstable (0.11.x/0.12.x line)
-  and has no setuid mode, so `--unshare-user` is the only privilege path.
+- `pkgs.bubblewrap`, `pkgs.awscli2`, and `pkgs.aws-signing-helper` are in
+  `devShellTools`, so they reach both `devShells.default` and
+  `pi-web-runtime-env` (and therefore every spawned agent's `PATH`). bubblewrap
+  comes from nixpkgs-unstable (0.11.x/0.12.x line) and has no setuid mode, so
+  `--unshare-user` is the only privilege path. `aws_signing_helper` matters only
+  on the **broker's** `PATH`: it is the helper an IAM RolesAnywhere
+  `credential_process` profile shells out to, and the sandbox never runs it.
 
 ### Scope sockets start on demand
 
@@ -322,6 +363,10 @@ chmod 600 ~/.config/belayd/aws.yaml      # holds no secrets, but keep it private
 # Default region for every scope that does not set its own.
 region: eu-north-1
 
+# Optional: hidden inside EVERY scope's sandbox (absolute host paths).
+mask:
+  - /srv/belayd/agent-keyring
+
 scopes:
   # `worktree` is a glob on the worktree's absolute git toplevel.
   - worktree: /home/hugo/git/acme-*
@@ -332,6 +377,11 @@ scopes:
     region: us-east-1              # optional per-scope override
   - worktree: /home/hugo/git/infra/**
     profiles: [agent-deploy]
+    # Optional: hidden inside THIS scope's sandbox. The broker still reads
+    # them; the sandboxed agent cannot.
+    mask:
+      - /run/secrets/aws-pi-agent-cert
+      - /run/secrets/aws-pi-agent-key
 ```
 
 Schema — this is the entire language (subset parser, see
@@ -340,11 +390,39 @@ Schema — this is the entire language (subset parser, see
 | Key | Level | Required | Meaning |
 |-----|-------|----------|---------|
 | `region` | top | no | fallback region for scopes without one |
+| `mask` | top | no | absolute paths hidden in every scope; flow `[p, p]` or a block list |
 | `scopes` | top | **yes** | block sequence of scope entries |
 | `worktree` | scope | **yes** | glob matched against the absolute git toplevel |
 | `profiles` | scope | **yes** | literal profile names; flow `[a, b]` or a block list |
 | `default` | scope | no | must be one of `profiles`; documentation only |
 | `region` | scope | no | overrides the top-level region |
+| `mask` | scope | no | absolute paths hidden in this scope; merged after the top-level list, de-duplicated |
+
+Indentation is pinned by the parser (it is a line-oriented subset, not a full
+YAML parser):
+
+- top-level keys (`region`, `mask`, `scopes`) at **indent 0**; any indent-0 line
+  also closes an open top-level `mask:` block;
+- items of a top-level `mask:` block list at indent **2 or deeper** — indent 2
+  is accepted even though indent 2 also starts a `scopes:` entry, because the
+  open block disambiguates them, and any deeper indent is accepted so a
+  four-space habit is not mistaken for a broken scope entry;
+- `scopes:` sequence entries at **exactly indent 2** (`  - worktree: …`); indent
+  1 or 3 is refused, not guessed;
+- scope keys (`worktree`, `profiles`, `default`, `region`, `mask`) at **exactly
+  indent 4**;
+- items of a per-scope `mask:` / `profiles:` block list at indent **≥ 3**
+  (deeper than the scope entry's indent 2, which is what keeps them from being
+  read as another scope entry); deeper is fine, so both `   - /srv/cert` and
+  `      - /srv/cert` work.
+
+Indent 1 is always refused, and the message says which rule you broke: a
+`- item` under a `profiles:` / `mask:` header gives ``line 4: block-list items
+under `profiles` / `mask` must be indented at least 3 spaces``, a stray list
+item with no block-list header gives ``line 3: unexpected list item; only
+`profiles` and `mask` support a block list``, and then
+`line 4: unsupported indentation; scope keys must be at indent 4` or
+``line 3: expected a `- ` scope entry at indent 2``.
 
 Glob semantics (`worktreeMatchesGlob`): `*` matches inside one path segment
 (`[^/]*`), `**` crosses `/` (`.*`), `?` is one non-`/` character. The pattern
@@ -359,6 +437,111 @@ Fail-closed behaviour of this file:
 | missing | not-configured — silent, no AWS anywhere |
 | parses, but `scopes` is empty | refusal: `allowlist defines no scopes; AWS access stays disabled` |
 | tabs, unknown keys, bad indentation | refusal naming the line: `invalid allowlist /…/belayd/aws.yaml: line 4: unknown scope key "profile"` |
+| an unusable `mask:` entry | refusal naming the entry and this allowlist, and the scope gets **no** sandbox at all — every case is in [Mask entries](#mask-entries) |
+
+#### Mask entries
+
+`mask:` lists **absolute host paths that must not be reachable from inside this
+scope's sandbox**. The motivating case is an IAM RolesAnywhere certificate and
+private key ([Using an IAM RolesAnywhere
+profile](#4a-using-an-iam-rolesanywhere-profile)): the broker must read them, an
+agent must not — an agent that can read them can run `aws_signing_helper` itself
+with the (non-secret) trust-anchor / profile / role ARNs and get the same
+credentials without touching the allowlist. The repo file has no `mask:` key, so
+only you can add one.
+
+A top-level `mask:` applies to every scope; a scope-level one applies to that
+scope only. Both accept two shapes:
+
+```yaml
+mask: [/srv/aws/pki]                 # flow form
+```
+
+```yaml
+mask:                                # block form
+  - /srv/aws/pki/agent.pem
+  - '/srv/aws/pki/agent key.pem'
+```
+
+- The flow form is split on **plain commas** with no escaping, and the split
+  happens before quotes are stripped, so a path containing a comma cannot be
+  written there at all (quoting does not help) — use the block form for it.
+- A bare scalar (`mask: /srv/aws/pki`) is refused with a line number
+  (`… must be a flow list ([path, path])`). At the top level, do not follow a
+  flow value with `- item` lines: with no open block they are read as `scopes:`
+  entries and refused (``line N: expected `key: value` ``).
+- While a top-level `mask:` block is open, every `- item` at indent ≥ 2 belongs
+  to it, so put `scopes:` at indent 0 after the block. An `- worktree: …` line
+  indented under `mask:` is read as a mask entry and refused as a relative path
+  — it does not quietly become a scope.
+
+An entry must resolve to exactly one of two filesystem kinds:
+
+| Resolves to | Argv form the plan emits | What the sandbox sees |
+|-------------|--------------------------|-----------------------|
+| a directory | `--tmpfs <resolved path>` | the directory exists and is **empty** |
+| a regular file | `--ro-bind /dev/null <resolved path>` | the file exists and `open()` reads `EACCES` (`cat: …: Permission denied`) — never `EOF`, and never an empty file that would look like an empty key |
+| anything else (socket, fifo, character or block device) | — | refused |
+
+Entries are `realpath()`-resolved at plan time and the **resolved** path is what
+the argv carries, because bubblewrap cannot create a `/dev/null` bind mount
+point through a symlinked directory (`bwrap: Can't create file at …`) — an
+unresolved entry fails the whole sandbox. Duplicates are collapsed twice: first
+by the text as written (top level + scope), then by resolved path, with the
+first occurrence winning and order otherwise preserved, so `/run/secrets/cert`
+and the file it points at are mounted once, not twice.
+
+Every refusal the plan can emit, in the order it checks them (the first
+applicable rule wins). The `line N:` ones are parse-time and surface as
+`invalid allowlist <file>: line N: …`; every other message gets
+` (in <allowlist path>)` appended so the typo is findable.
+
+| Bad entry | Operator-facing message |
+|-----------|-------------------------|
+| empty (`mask: [, /a]`) | `line N: mask entries must not be empty` |
+| relative, `~`, or `$VAR` (nothing is expanded) | `line N: mask entry "~/cert" must be an absolute path` |
+| `/` | `line N: mask entry "/" would hide the entire filesystem` |
+| missing path, or a dangling symlink (reported as missing, **not** as containment) | `mask entry "/srv/typo" does not exist or cannot be resolved; a mask typo would leave it readable, so the scope is refused — fix or remove the entry` |
+| a symlink that resolves to `/` | `mask entry "…" resolves to the filesystem root` |
+| `$HOME` itself | `mask entry "…" is the home directory itself` |
+| equal to or inside the scope dir | `mask entry "…" is inside this scope's runtime dir <runtimeBase>/<scopeId>, which holds the generated shim, config and socket; masking it would break the sandbox` |
+| equal to or inside the broker runtime base | `mask entry "…" is inside the broker runtime base <runtimeBase>; masking it would hide this scope's own socket` |
+| equal to or inside the worktree | `mask entry "…" is inside the worktree <worktree>; the operator allowlist, not the repo, decides what is hidden` |
+| an **ancestor** of the broker runtime base | `mask entry "…" hides the broker runtime base <runtimeBase>; masking it would disable the control socket and every scope socket, including this one` |
+| an **ancestor** of the scope dir | `mask entry "…" hides this scope's runtime dir <…>, which holds the generated shim, config and socket; masking it would break the sandbox` |
+| an **ancestor** of the worktree | `mask entry "…" hides the worktree <worktree>; a sandboxed spawn would start in a hidden working directory` |
+| an **ancestor** of `$HOME` | `mask entry "…" hides the home directory <home>; mask a specific path inside it instead` |
+| a socket / fifo / character device / block device | `mask entry "…" is a socket, which cannot be masked cleanly` (the word is the actual kind) |
+
+The ancestor rules are what stop a "just mask the parent directory" habit: a
+tmpfs over the worktree's parent hides the sandboxed spawn's own working
+directory (every spawn then fails with a useless bwrap error), and one over
+`/run/belayd` or `/run/user/<uid>` takes out the control socket, the sibling
+scope sockets, or the sessiond's dbus/ssh-agent sockets. Which ancestor message
+you actually see depends on the entry, because the runtime base is checked first
+and `$HOME` usually contains the worktree (the scope-dir ancestor rule is
+there for completeness: the scope dir lives inside the runtime base, so the
+runtime-base rule fires first). All of them are refusals; none of them is a
+partial mask.
+
+**One bad entry voids the whole scope**: the plan returns `refused`, so that repo
+gets no sandbox and no AWS at all — never a sandbox with the good entries applied
+and the bad one skipped, because a still-readable certificate is exactly what
+`mask:` exists to prevent. The refusal is loud, in each place an operator looks:
+
+- `belayd-aws plan --worktree "$PWD"` exits 1 with the reason on stderr and
+  nothing on stdout;
+- every `belayd-shell` invocation in that repo relays it, prefixed:
+  `belayd-shell: mask entry "…" …`;
+- every sub-agent spawn warns once:
+  `[belayd-harness] AWS sandbox refused for <dir>: mask entry "…" …`;
+- the broker's audit log records the attempt as
+  `"action":"ensure-scope","outcome":"error:refused"` (see
+  [Diagnostics](#6-diagnostics)).
+
+The fix is an allowlist edit and needs no restart — the same rule as a profile
+refusal, in [step 7 of How to
+Verify](#7-refusal-names-the-allowed-profiles-and-the-allowlist-fix-needs-no-restart).
 
 An empty or missing allowlist therefore means **no AWS in any sandbox**, not a
 permissive default. If a repo has no `.belayd/aws.yaml` there is no broker
@@ -472,6 +655,86 @@ broker control socket. That is the documented single-uid limit: read the actor
 table in [Cannot escape / can still do](#cannot-escape--can-still-do) before
 drawing conclusions about "the agent".
 
+### 4a. Using an IAM RolesAnywhere profile
+
+A repo can be scoped to an **IAM RolesAnywhere** identity instead of an IAM
+Identity Center profile. The broker does not care which kind it is: `aws
+configure export-credentials --profile <name> --format process` resolves a
+`credential_process` profile by running that profile's helper and re-emits the
+result as a `Version: 1` document with `SessionToken`/`Expiration` (verified on
+this host), so the same socket, cache, shim, and audit path all apply.
+
+Host `~/.aws/config` (unchanged, operator-owned):
+
+```ini
+[profile dev-agent]
+credential_process = aws_signing_helper credential-process --certificate /run/secrets/aws-pi-agent-cert --private-key /run/secrets/aws-pi-agent-key --trust-anchor-arn arn:aws:rolesanywhere:eu-north-1:… --profile-arn arn:aws:rolesanywhere:eu-north-1:… --role-arn arn:aws:iam::…:role/…
+```
+
+Operator allowlist:
+
+```yaml
+scopes:
+  - worktree: /home/hugo/git/proof-of-work-reviewing-platform
+    profiles: [dev-agent]
+    default: dev-agent
+    region: eu-north-1
+    mask:
+      - /run/secrets/aws-pi-agent-cert
+      - /run/secrets/aws-pi-agent-key
+```
+
+Repo file (`/home/hugo/git/proof-of-work-reviewing-platform/.belayd/aws.yaml`):
+
+```yaml
+profile: dev-agent
+```
+
+How it differs from the SSO flow, and what you must get right:
+
+- **The broker runs the helper, not the sandbox.** `aws configure
+  export-credentials` shells out to `aws_signing_helper`, so the helper must be
+  on the **broker's** `PATH`. `pkgs.aws-signing-helper` is in `devShellTools`,
+  which is exactly what `pi-web-runtime-env` links, and the broker unit prepends
+  `pi-web-runtime-env/bin` to `PATH` — so the helper arrives with the rebuild,
+  not with anything you install by hand. The certificate and private key must be
+  readable by the broker's user outside every sandbox. Without the helper the
+  profile resolves to `command not found`, the agent's AWS call fails with that
+  text, and the audit line is
+  `"action":"credential_process","outcome":"error:unavailable"`.
+  [How to Verify](#how-to-verify) check 6c checks both links.
+- **List the certificate and key under `mask:`.** They live outside `~/.aws`, so
+  masking `~/.aws` does not cover them; an agent that can read them can run
+  `aws_signing_helper` itself with the (non-secret, committed) trust-anchor /
+  profile / role ARNs and get the same credentials **without going through the
+  allowlist**. That is the hole `mask:` closes. A mask typo refuses the scope
+  rather than leaving them readable.
+- **`~/.aws` is masked inside the sandbox**, so the profile name (`dev-agent`)
+  only ever matters to the broker; the sandbox always sees `[profile agent]`
+  and `AWS_PROFILE=agent`. A sandboxed `aws` call therefore cannot address the
+  source profile by name.
+- **Region must come from the allowlist** (`region:` on the scope or top level,
+  else the broker unit's `AWS_REGION`/`AWS_DEFAULT_REGION`); the repo file
+  carries only `profile`, and a scope with no region anywhere is refused rather
+  than guessed.
+- **Refreshing is automatic.** The role credentials are short-lived
+  (minutes-to-hours, set by the RolesAnywhere profile's session duration) and
+  the broker refreshes them on demand, so there is no 8-hour portal session and
+  no 90-day PKCE registration to renew. The human-in-the-loop boundary becomes
+  the **x509 certificate's own expiry**: when it lapses, the broker surfaces the
+  helper's error text and someone must re-issue the certificate and key on the
+  host.
+- **Troubleshooting**: check the trust-anchor ARN, profile ARN, and role ARN in
+  the `credential_process` line, that the helper is installed on the broker's
+  `PATH` (6c), and that the certificate/key are readable outside the sandbox
+  (and *unreadable* inside — that is the point). **Do not run `aws sso login`
+  for a RolesAnywhere failure**: there is no portal session to refresh. The
+  broker recognises the non-SSO case and appends the hint quoted in [Refresh
+  expired credentials](#5-refresh-expired-credentials) — helper on `PATH`, x509
+  material present and valid, ARNs re-checked — which never prescribes an SSO
+  login. The broker never retries silently and never substitutes a different
+  profile.
+
 ### 5. Refresh expired credentials
 
 Two independent clocks can lapse:
@@ -479,6 +742,12 @@ Two independent clocks can lapse:
 - the **IAM Identity Center portal session** (default 8 h, maximum 90 days per
   your IdP configuration);
 - the **PKCE client registration** (90 days), refreshed by an interactive login.
+
+A repo scoped to an IAM RolesAnywhere `credential_process` profile has neither
+clock: role credentials simply expire and the broker re-runs the helper ([Using
+an IAM RolesAnywhere profile](#4a-using-an-iam-rolesanywhere-profile)). Its human
+boundary is the x509 certificate's expiry, and its failures take the non-SSO
+branch below.
 
 The broker never retries silently. An agent AWS call fails with AWS's own
 stderr verbatim plus one instruction line (text and exit code vary by failure;
@@ -490,12 +759,16 @@ An error occurred (UnauthorizedException) when calling the GetRoleCredentials op
 The IAM Identity Center session is no longer valid. Refresh it on the host, outside every sandbox: aws sso login --profile agent-deploy
 ```
 
-For a failure AWS does not label as expiry you get the softer variant
-(`If the profile's SSO session or client registration expired, refresh it on the
-host, outside every sandbox: aws sso login --profile agent-deploy`).
+For a failure AWS does not label as expiry you get the non-SSO variant, which
+does **not** prescribe `aws sso login` (it cannot fix a broken
+`credential_process`, an expired x509 certificate, or a wrong RolesAnywhere ARN):
 
-The only fix is interactive, on the host, outside every sandbox, as the
-operator:
+```
+No expired SSO session was reported, so an SSO login will not fix this. Check that the profile's credential_process helper is installed and executable on the broker's PATH and that the material it reads exists and is valid (for IAM RolesAnywhere: the x509 certificate and private key, re-issued if expired), and re-check the trust anchor / profile / role ARNs; if this is an IAM Identity Center profile after all, refresh its portal session on the host.
+```
+
+The only fix for an expired **IAM Identity Center** session is interactive, on
+the host, outside every sandbox, as the operator:
 
 ```bash
 aws sso login --profile <source-profile-named-in-the-allowlist>
@@ -590,13 +863,14 @@ units — full sequence in [Rollback](#rollback).
 
 | Not available | Detail |
 |---------------|--------|
-| Static / long-lived credentials | `aws configure export-credentials` omits `SessionToken`/`Expiration` for IAM-user keys; the broker refuses with a message naming the real fix: `aws returned long-lived credentials (no SessionToken); … point this repo's .belayd/aws.yaml at an SSO/assumed-role profile`. Only temporary credentials are served. |
+| Static / long-lived credentials | `aws configure export-credentials` omits `SessionToken`/`Expiration` for long-lived IAM-user keys; the broker refuses with a message naming the real fix: `aws returned long-lived credentials (no SessionToken); … a credential_process profile (including IAM RolesAnywhere) or an SSO/assumed-role profile is fine, long-lived IAM-user keys are not …`. Only temporary/role credentials are served. |
 | MFA prompts | MFA happens in your interactive `aws sso login` on the host. The broker never prompts and never blocks waiting for a human. |
 | `AssumeRole` / session policies / role chaining from inside the sandbox | The scope socket serves `credential_process` and `whoami` only; anything else is `unsupported action …; this socket only serves "credential_process" and "whoami"` with no credential lookup. The profile's IAM permission set is the entire grant. |
 | Per-agent attribution | The audit log is per scope (`worktree` + `profile` + time), never "which session". |
 | Network egress control | An agent holding scoped credentials can use them within the role's permissions. Least privilege lives in the IAM permission set chosen per repo, plus the allowlist. |
 | `aws sso login` inside a session | Impossible by construction (masked `~/.aws`); the human-in-the-loop boundary is the point. |
-| Operator-allowlist secrecy | `~/.config/belayd/aws.yaml` is **not** masked (it holds profile *names*, not secrets). A sandboxed agent can read it, but it cannot use it: the control socket is masked, and its own scope socket serves exactly one profile. |
+| Operator-allowlist secrecy | `~/.config/belayd/aws.yaml` is **not** masked (it holds profile *names* and mask *paths*, not secrets). A sandboxed agent can read it, but it cannot use it: the control socket is masked, its own scope socket serves exactly one profile, and every path listed under `mask:` is hidden from it. What is masked is therefore operator-controlled, never repo-controlled. |
+| Masking arbitrary credential locations automatically | Only `~/.aws`, `~/.config/aws`, the broker runtime base, and the allowlist's `mask:` entries are masked. Any other credential store (a second keyring, a tool-specific cache) is readable unless the operator adds it to `mask:`. |
 
 The honest limits (same-uid siblings, orchestrator vs child, `bwrap` not being a
 hostile-code boundary) are listed once in [Residual risks](#residual-risks) —
@@ -619,8 +893,8 @@ fallback path), and the unit's `RuntimeDirectory` is removed when it stops.
 ## How to Verify
 
 An acceptance checklist an operator can run end to end in ~5 minutes after
-`nixos-rebuild switch` + restarting both units. Checks 1–7 are the fast pass;
-8–10 are the pre-delivery gates. Each check states the command, the expected
+`nixos-rebuild switch` + restarting both units. Checks 1–8 are the fast pass;
+9–11 are the pre-delivery gates. Each check states the command, the expected
 result, and what a failure means.
 
 ### 1. Units are active and the session daemon is wrapped
@@ -676,7 +950,8 @@ Failure meanings:
   Check `env | grep BELAYD_SANDBOX_ACTIVE` (must be `1`), look for
   `belayd-shell: belayd-aws:` on stderr, and run `belayd-aws plan --worktree "$PWD"`.
 - `aws sso login` succeeds ⇒ the `~/.aws` mask is missing (check 1).
-- STS fails with the expiry sentence ⇒ credentials need a host login (check 10).
+- STS fails with the expiry sentence ⇒ credentials need a host login (check 11).
+  A RolesAnywhere scope instead gets the non-SSO hint (check 6a).
 
 ### 4. Unit-level masking, from the orchestrator namespace
 
@@ -726,7 +1001,127 @@ mask is missing and that agent can request **any** allowlisted scope. If the
 sibling socket connects, the same. This check is the security property, not a
 nicety.
 
-### 6. Refusal names the allowed profiles, and the allowlist fix needs no restart
+### 6. Allowlisted masks hide RolesAnywhere material, the broker still resolves the profile, and the helper is on its PATH
+
+This is the IAM RolesAnywhere set
+([Using an IAM RolesAnywhere profile](#4a-using-an-iam-rolesanywhere-profile)). All
+of it happens in one repo whose scope grants `dev-agent`, sets
+`region: eu-north-1`, and lists the x509 material under `mask:`
+([Mask entries](#mask-entries)):
+
+```yaml
+# ~/.config/belayd/aws.yaml (excerpt)
+scopes:
+  - worktree: /home/hugo/git/proof-of-work-reviewing-platform
+    profiles: [dev-agent]
+    region: eu-north-1
+    mask:
+      - /run/secrets/aws-pi-agent-cert
+      - /run/secrets/aws-pi-agent-key
+```
+
+#### 6a. Inside the sandbox the cert and key are `EACCES` and AWS still works
+
+From the **sandboxed** agent in that repo:
+
+```bash
+cat /run/secrets/aws-pi-agent-cert; echo "exit=$?"     # Permission denied, exit 1
+cat /run/secrets/aws-pi-agent-key;  echo "exit=$?"     # Permission denied, exit 1
+ls -l /run/secrets                                     # both entries exist, they just cannot be opened
+cat /run/secrets/<some-unlisted-file>                  # unlisted siblings stay readable
+aws sts get-caller-identity                            # still succeeds, via the broker
+```
+
+Expected: exit 1 with `cat: …: Permission denied` for both listed files,
+`ls -l` lists them, an unlisted sibling is readable (the mask is per entry, not
+per directory), and STS returns the repo's RolesAnywhere role.
+
+Failure meanings:
+- the certificate is readable ⇒ `mask:` does not list it, the entry does not
+  resolve (`realpath`), or the plan was not applied at all. Run
+  `belayd-aws plan --worktree "$PWD"` and look for
+  `--ro-bind /dev/null /run/secrets/aws-pi-agent-cert` (a directory mask would
+  be `--tmpfs`), and check `env | grep BELAYD_SANDBOX_ACTIVE` is `1`.
+- STS fails ⇒ read the failure text in the agent's tool output (it carries the
+  broker's message, the broker journal does not log per-request failures):
+  `command not found` means the helper is missing from the broker's `PATH`
+  (6c); an x509 or ARN error means fix the `credential_process` line. Either way
+  the audit line is
+  `"action":"credential_process","outcome":"error:unavailable"`.
+
+#### 6b. The broker still resolves the profile, from outside the sandbox
+
+```bash
+aws configure export-credentials --profile dev-agent --format process \
+  | jq -r '.Version, (.SessionToken != null)'
+belayd-aws ensure-scope --worktree ~/git/proof-of-work-reviewing-platform
+```
+
+Expected: `1` then `true` (a `Version`-1 document with a session token, which is
+what the broker requires), and `ensure-scope` prints the scope socket path.
+
+Failure: exit 1 on the first command ⇒ the host cannot resolve `dev-agent`
+either, and the helper's own stderr names the cause (missing certificate,
+expired x509, wrong ARN). `false` for `SessionToken` ⇒ a static-IAM-key profile,
+which the broker refuses by design
+([Not available by design](#8-not-available-by-design)) — issue a role
+credential instead.
+
+#### 6c. `aws_signing_helper` is on the **broker's** `PATH`
+
+```bash
+systemctl show pi-web-aws-broker -p Environment | tr ' ' '\n' | grep 'PATH='
+env=$(nix build .#pi-web-runtime-env --print-out-paths --no-link)
+ls -l "$env/bin/aws_signing_helper"
+```
+
+Expected: one `PATH=<…>-pi-web-runtime-env/bin:/run/current-system/sw/bin:…`
+line (the property prints as a single `Environment=…` string, split on spaces
+here), and `ls` prints `aws_signing_helper` as executable.
+
+Failure meanings:
+- `PATH` without `pi-web-runtime-env/bin` ⇒ the unit's `environment` list
+  regressed, so `aws configure export-credentials` cannot find the helper and
+  *every* RolesAnywhere request fails with `command not found`.
+- the helper is missing from that `bin` ⇒ `pkgs.aws-signing-helper` left
+  `devShellTools`; `nix build .#pi-web-runtime-env` is the direct check for that,
+  and a fixed flake needs `nixos-rebuild switch` plus
+  `sudo systemctl restart pi-web-aws-broker`.
+- the helper is absent from a **session's** own `PATH` but present here: not a
+  failure — the broker runs it, never the sandbox.
+
+#### 6d. A deliberately bad `mask:` entry voids the scope, with the documented message
+
+Add a typo'd entry to that scope's `mask:` block (or, if the scope uses the flow
+form, append it inside the brackets), then replan — and restore the real entry
+afterwards:
+
+```bash
+belayd-aws plan --worktree ~/git/proof-of-work-reviewing-platform; echo "exit=$?"
+```
+
+Expected: exit 1, **stdout empty**, and stderr
+
+```
+belayd-aws: mask entry "/run/secrets/does-not-exist.pem" does not exist or cannot be resolved; a mask typo would leave it readable, so the scope is refused — fix or remove the entry (in /home/<user>/.config/belayd/aws.yaml)
+```
+
+In a shell inside that repo the command still runs — unwrapped, with no AWS:
+`belayd-shell` prints `belayd-shell: mask entry …`, the sub-agent warning reads
+`[belayd-harness] AWS sandbox refused for <dir>: …`, `env | grep
+BELAYD_SANDBOX_ACTIVE` is empty, and the audit line is
+`"action":"ensure-scope","outcome":"error:refused"`.
+
+Failure meanings:
+- the plan exits 0 ⇒ the entry was accepted: treat it as a security bug, not a
+  docs bug.
+- the scope still runs sandboxed with the remaining entries ⇒ the refusal was
+  downgraded to a partial mask, which is the same bug.
+- the message names a *different* rule (relative path, `$HOME`, a parent of the
+  worktree, …) ⇒ that is still a correct refusal; the full list with each
+  message is in [Mask entries](#mask-entries).
+
+### 7. Refusal names the allowed profiles, and the allowlist fix needs no restart
 
 Do this in an opted-in repo (check 5 uses one); it rewrites that repo’s
 committed `.belayd/aws.yaml`, so restore the real profile afterwards.
@@ -758,7 +1153,7 @@ restart. Failure: still refused ⇒ the allowlist edit went to the wrong scope
 (first matching glob wins) or the file failed to parse
 (`invalid allowlist …: line N: …`).
 
-### 7. Audit log: one line per request, 0600, no credential material
+### 8. Audit log: one line per request, 0600, no credential material
 
 ```bash
 stat -c '%a %n' ~/.local/state/belayd/aws-audit.jsonl
@@ -768,14 +1163,14 @@ grep -cE 'SecretAccessKey|SessionToken|AccessKeyId' ~/.local/state/belayd/aws-au
 
 Expected: mode `600`; each line has exactly
 `{ts, scope, worktree, profile, action, outcome}`; the grep prints `0`. The
-refusal from check 6 appears as `"action":"ensure-scope","outcome":"error:refused"`
+refusal from check 7 appears as `"action":"ensure-scope","outcome":"error:refused"`
 with `"profile":""`.
 
 Failure: any credential field ⇒ stop and treat it as a leak. Missing lines ⇒
 the state dir is not writable (`journalctl -u pi-web-aws-broker` reports
 `could not write audit log`), which is non-fatal by design but blind.
 
-### 8. Regression: the host still works
+### 9. Regression: the host still works
 
 ```bash
 nix develop -c true
@@ -794,7 +1189,7 @@ Failure: `ps`/dolt liveness failing or `/tmp` empty ⇒ pid/ipc/net were unshare
 or `/tmp` was masked; `git push` failing on signing ⇒ `~/.ssh` or
 `SSH_AUTH_SOCK` was masked (it must not be).
 
-### 9. Automated gates
+### 10. Automated gates
 
 ```bash
 pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build \
@@ -806,7 +1201,7 @@ Expected: all pass. `test/aws-sandbox.integration.test.ts` and
 `Skipping integration test:` when `bwrap`, `git`, `direnv`, or `jq` are absent —
 **a skip is not a pass**; re-run inside `nix develop`.
 
-### 10. Expiry behaviour (needs a live SSO session)
+### 11. Expiry behaviour (needs a live SSO session)
 
 On the host:
 
@@ -836,20 +1231,27 @@ the token (`systemctl show pi-web-aws-broker -p User`).
 ## Tests
 
 - Unit (`src/__tests__/`): `aws-broker-config` (allowlist/repo parsing, globs,
-  refusals), `aws-broker-scope` (scope ids, paths, argv order and the
-  runtime-base mask, env scrub, `BELAYD_AWS_RUNTIME_BASE_DIR` resolution),
+  `mask:` parsing and every mask refusal), `aws-broker-scope` (scope ids, paths,
+  argv order and the runtime-base mask, file masks as `--ro-bind /dev/null`,
+  env scrub, `BELAYD_AWS_RUNTIME_BASE_DIR` resolution),
   `aws-broker-plan` (generated-file quoting, `unavailable` on a missing
   bwrap/runtime base, `already-sandboxed`, region refusal message),
   `aws-broker-cache` (single-flight, skew, LRU, failure propagation),
-  `aws-broker-client` (document shape, static-credential refusal, error
-  mapping), `aws-broker-server` (request handling, socket modes,
-  concurrent-bind serialization and umask restore, audit warnings), and the
-  `spawn.test.ts` AWS-env/argv/broker-unavailable cases.
+  `aws-broker-client` (document shape, static-credential refusal, the expiry vs
+  non-SSO failure hints), `aws-broker-server` (request handling, socket modes,
+  concurrent-bind serialization and umask restore, audit warnings),
+  `flake-aws-isolation` (bubblewrap/awscli2/aws-signing-helper in
+  `devShellTools`, `pi-web-runtime-env/bin` on the broker's `PATH`, the
+  sessiond/broker unit wiring), and the `spawn.test.ts`
+  AWS-env/argv/broker-unavailable cases.
 - Integration (`test/`): `aws-sandbox.integration.test.ts` (SSO-cache masking,
-  control-socket and sibling-scope unreachability with a live own-scope
-  connection, inherited-env scrub, host `/tmp` + shared pid namespace, and
-  devShell resolution through direnv inside the sandbox) and
-  `aws-broker.integration.test.ts` (plan/ensure-scope on demand, concurrent
-  ensure-scope serialization, shim round trip through bwrap, refusal paths,
-  and audit lines for allowed and refused requests). Both use `it.skipIf` for
-  missing prerequisites — a skip is **not** a pass.
+  allowlisted file masks reading `EACCES` and directory masks reading empty
+  through a symlinked path, a mask refusal relayed through the real wrapper as
+  an unwrapped run with the reason on stderr, control-socket and sibling-scope
+  unreachability with a live own-scope connection, inherited-env scrub, host
+  `/tmp` + shared pid namespace, and devShell resolution through direnv inside
+  the sandbox) and `aws-broker.integration.test.ts` (plan/ensure-scope on
+  demand, concurrent ensure-scope serialization, shim round trip through bwrap
+  with a *masked* RolesAnywhere cert, refusal paths, and audit lines for allowed
+  and refused requests). Both use `it.skipIf` for missing prerequisites — a skip
+  is **not** a pass.

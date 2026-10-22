@@ -21,6 +21,25 @@
  *    profile: agent-deploy
  *    ```
  *
+ * Either level may also carry `mask:` — extra host paths the operator wants
+ * hidden *inside* that scope's sandbox (an IAM RolesAnywhere certificate and
+ * private key are the motivating case: the broker must read them, the agent
+ * must not, or an agent can call the signing helper directly and bypass this
+ * whole allowlist):
+ *
+ *    ```yaml
+ *    mask: [/srv/aws/agent-cert]          # top level: applied to every scope
+ *    scopes:
+ *      - worktree: /home/hugo/git/acme-*
+ *        profiles: [dev-agent]
+ *        mask:
+ *          - /srv/aws/acme-cert
+ *          - /srv/aws/acme-key
+ *    ```
+ *
+ * The repo file deliberately has no `mask:` key: a repo must not be able to
+ * widen (or shrink) its own sandbox, so masks are operator-only.
+ *
  * Everything here is pure: text in, discriminated union out. The repo file is
  * mandatory and must name a profile the allowlist grants that worktree — this
  * is the fail-closed rule. No repo file means no AWS inside the sandbox, not a
@@ -43,12 +62,16 @@ export interface AwsScopeRule {
   defaultProfile?: string;
   /** Per-scope region override. */
   region?: string;
+  /** Extra paths to mask inside this scope's sandbox, as written. */
+  mask: readonly string[];
 }
 
 /** Parsed operator allowlist. */
 export interface AwsAllowlist {
   scopes: readonly AwsScopeRule[];
   region?: string;
+  /** Extra paths masked inside every scope's sandbox, as written. */
+  mask: readonly string[];
 }
 
 /** Parsed repo file. */
@@ -180,20 +203,36 @@ interface PendingScope {
   profiles: string[];
   defaultProfile?: string;
   region?: string;
+  mask: string[];
 }
+
+/** Scope keys whose value may be a block list (`- item` at indent 6). */
+type BlockListKey = "profiles" | "mask";
 
 /** Mutable parse state, threaded through the line handlers below. */
 interface AllowlistParseState {
   scopes: AwsScopeRule[];
   region: string | undefined;
+  mask: string[];
   current: PendingScope | undefined;
-  expectingProfilesBlock: boolean;
+  /** Scope key the next indent-6 `- item` lines belong to. */
+  blockListKey: BlockListKey | undefined;
+  /**
+   * True while `- item` lines are a top-level `mask` block instead of scope
+   * entries. `mask:` is the only top-level key that takes a block list, so its
+   * items would otherwise read as `scopes` entries — the state is what
+   * disambiguates them, and any indent-0 line ends it. Items are accepted at
+   * any indent ≥2 so a four-space habit is not mistaken for a broken scope
+   * entry; a scope entry only ever starts at the pinned indent 2.
+   */
+  topLevelMaskBlock: boolean;
 }
 
 type AllowlistLineKind =
   | { kind: "top-level"; entry: KeyValue }
   | { kind: "scope-item"; rest: string }
-  | { kind: "profiles-list-item"; value: string }
+  | { kind: "top-level-mask-item"; value: string }
+  | { kind: "block-list-item"; key: BlockListKey; value: string }
   | { kind: "scope-key"; entry: KeyValue }
   | { kind: "invalid"; reason: string };
 
@@ -204,39 +243,66 @@ function invalidLine(line: ConfigLine, reason: string): AllowlistLineKind {
 /**
  * Classify one line from its indentation plus the current state. Keeping this
  * in one place is what makes the parser's shape (indent 0 keys, indent 2 scope
- * items, indent 4 scope keys, indent 6 profile list items) explicit.
+ * items, indent 4 scope keys, deeper block-list items) explicit.
  */
 function classifyAllowlistLine(line: ConfigLine, state: AllowlistParseState): AllowlistLineKind {
-  const isSequenceItem = line.text === "-" || line.text.startsWith("- ");
-  const entry = isSequenceItem ? undefined : splitKeyValue(line.text);
-
   if (line.indent === 0) {
+    const entry = splitKeyValue(line.text);
     if (entry === undefined) return invalidLine(line, "expected `key: value`");
     return { kind: "top-level", entry };
   }
-  if (isSequenceItem && line.indent === 2) {
-    return { kind: "scope-item", rest: line.text.slice(1).trim() };
-  }
+  const sequenceItem = classifySequenceItem(line, state);
+  if (sequenceItem !== undefined) return sequenceItem;
   if (state.current === undefined) {
     return invalidLine(line, "expected a `- ` scope entry at indent 2");
   }
-  if (isSequenceItem) {
-    if (!state.expectingProfilesBlock) {
-      return invalidLine(line, "unexpected list item; only `profiles` supports a block list");
-    }
-    return { kind: "profiles-list-item", value: parseScalar(line.text.slice(1)) };
-  }
+  const entry = splitKeyValue(line.text);
   if (line.indent !== 4 || entry === undefined) {
     return invalidLine(line, "unsupported indentation; scope keys must be at indent 4");
   }
   return { kind: "scope-key", entry };
 }
 
+/** Classify a `- item` line; undefined when the line is not a list item. */
+function classifySequenceItem(
+  line: ConfigLine,
+  state: AllowlistParseState,
+): AllowlistLineKind | undefined {
+  if (line.text !== "-" && !line.text.startsWith("- ")) return undefined;
+  const value = parseScalar(line.text.slice(1));
+  // `topLevelMaskBlock` is only set between `mask:` and the next indent-0 key,
+  // and no scope can be open in that window, so accepting any indent ≥2 here
+  // cannot reattribute a scope item.
+  if (state.topLevelMaskBlock && line.indent >= 2) {
+    return { kind: "top-level-mask-item", value };
+  }
+  if (line.indent === 2) return { kind: "scope-item", rest: line.text.slice(1).trim() };
+  if (state.current === undefined) {
+    return invalidLine(line, "expected a `- ` scope entry at indent 2");
+  }
+  if (state.blockListKey === undefined) {
+    return invalidLine(
+      line,
+      "unexpected list item; only `profiles` and `mask` support a block list",
+    );
+  }
+  // A per-scope block item must sit deeper than its scope entry (indent 2); an
+  // indent-1 item is a typo, not a shorter indent, and accepting it would make
+  // the documented indent contract a lie.
+  if (line.indent < 3) {
+    return invalidLine(
+      line,
+      "block-list items under `profiles` / `mask` must be indented at least 3 spaces",
+    );
+  }
+  return { kind: "block-list-item", key: state.blockListKey, value };
+}
+
 /** Validate and push the pending scope; a no-op when there is none. */
 function flushPendingScope(state: AllowlistParseState): ConfigResult<null> {
   const pending = state.current;
   state.current = undefined;
-  state.expectingProfilesBlock = false;
+  state.blockListKey = undefined;
   if (pending === undefined) return ok(null);
   if (pending.worktree === undefined) return fail("scope entry is missing `worktree`");
   if (pending.profiles.length === 0) {
@@ -252,11 +318,12 @@ function flushPendingScope(state: AllowlistParseState): ConfigResult<null> {
     profiles: pending.profiles,
     defaultProfile: pending.defaultProfile,
     region: pending.region,
+    mask: pending.mask,
   });
   return ok(null);
 }
 
-/** Apply a top-level \`key: value\` line (\`scopes\` / \`region\`). */
+/** Apply a top-level \`key: value\` line (\`scopes\` / \`region\` / \`mask\`). */
 function applyTopLevelEntry(
   state: AllowlistParseState,
   entry: KeyValue,
@@ -264,6 +331,9 @@ function applyTopLevelEntry(
 ): ConfigResult<null> {
   const flushed = flushPendingScope(state);
   if (!flushed.ok) return flushed;
+  // Any indent-0 line ends a top-level `mask` block, so a later `scopes:`
+  // sequence cannot be mistaken for more mask entries.
+  state.topLevelMaskBlock = false;
   switch (entry.key) {
     case "scopes":
       if (entry.value !== "") {
@@ -273,6 +343,12 @@ function applyTopLevelEntry(
     case "region":
       state.region = parseScalar(entry.value);
       return ok(null);
+    case "mask":
+      if (entry.value === "") {
+        state.topLevelMaskBlock = true;
+        return ok(null);
+      }
+      return applyMaskFlow(state.mask, entry.value, line, "`mask`");
     default:
       return fail(`line ${line.lineNumber}: unknown top-level key "${entry.key}"`);
   }
@@ -290,7 +366,7 @@ function applyScopeEntry(
   }
   const entry = splitKeyValue(text);
   if (entry === undefined) return fail(`line ${line.lineNumber}: expected \`key: value\``);
-  state.expectingProfilesBlock = entry.key === "profiles";
+  state.blockListKey = entry.key === "profiles" || entry.key === "mask" ? entry.key : undefined;
   switch (entry.key) {
     case "worktree": {
       const value = parseScalar(entry.value);
@@ -300,6 +376,8 @@ function applyScopeEntry(
     }
     case "profiles":
       return applyProfilesEntry(current, entry.value, line);
+    case "mask":
+      return applyScopeMaskEntry(current, entry.value, line);
     case "default": {
       const name = validateProfileName(parseScalar(entry.value));
       if (!name.ok) return fail(`line ${line.lineNumber}: ${name.reason}`);
@@ -315,6 +393,18 @@ function applyScopeEntry(
     default:
       return fail(`line ${line.lineNumber}: unknown scope key "${entry.key}"`);
   }
+}
+
+/** Apply a scope \`mask\` value: flow list, or a header for a block list. */
+function applyScopeMaskEntry(
+  current: PendingScope,
+  raw: string,
+  line: ConfigLine,
+): ConfigResult<null> {
+  // An empty value is a block-list header; the items arrive through
+  // `state.blockListKey` and `appendBlockListItem`.
+  if (raw === "") return ok(null);
+  return applyMaskFlow(current.mask, raw, line, "`mask`");
 }
 
 /** Apply a \`profiles\` value: flow list, or a header for a block list. */
@@ -351,31 +441,76 @@ function applyAllowlistLine(state: AllowlistParseState, line: ConfigLine): Confi
     case "scope-item": {
       const flushed = flushPendingScope(state);
       if (!flushed.ok) return flushed;
-      state.current = { worktree: undefined, profiles: [] };
+      state.current = { worktree: undefined, profiles: [], mask: [] };
       if (classified.rest === "") return ok(null);
       return applyScopeEntry(state, classified.rest, line);
     }
-    case "profiles-list-item":
-      return appendProfile(state, classified.value, line);
+    case "top-level-mask-item":
+      return appendMaskEntry(state.mask, classified.value, line);
+    case "block-list-item":
+      return appendBlockListItem(state, classified.key, classified.value, line);
     default:
       return applyScopeEntry(state, line.text, line);
   }
 }
 
-/** Push one validated profile onto the scope under construction. */
-function appendProfile(
+/** Push one validated block-list item onto the scope under construction. */
+function appendBlockListItem(
   state: AllowlistParseState,
+  key: BlockListKey,
   value: string,
   line: ConfigLine,
 ): ConfigResult<null> {
+  const current = state.current;
+  if (current === undefined) return fail(`line ${line.lineNumber}: no scope to add \`${key}\` to`);
+  if (key === "mask") return appendMaskEntry(current.mask, value, line);
   const name = validateProfileName(value);
   if (!name.ok) return fail(`line ${line.lineNumber}: ${name.reason}`);
-  const current = state.current;
-  if (current === undefined) {
-    return fail(`line ${line.lineNumber}: no scope to add a profile to`);
-  }
   current.profiles.push(name.value);
   return ok(null);
+}
+
+/**
+ * Push one mask entry after checking only its *syntax*.
+ *
+ * Path-relationship and existence checks need the worktree, home, runtime
+ * base, and a `realpath()`/`stat()`, so they live in {@link validateMaskEntry}
+ * and run at plan time. Anything absolute is accepted here; anything that is
+ * not absolute cannot be a mount target and is refused with the line number.
+ */
+function appendMaskEntry(target: string[], value: string, line: ConfigLine): ConfigResult<null> {
+  const validated = validateMaskEntrySyntax(value);
+  if (!validated.ok) return fail(`line ${line.lineNumber}: ${validated.reason}`);
+  target.push(validated.value);
+  return ok(null);
+}
+
+/** Apply a \`mask\` flow sequence to a target list. */
+function applyMaskFlow(
+  target: string[],
+  raw: string,
+  line: ConfigLine,
+  label: string,
+): ConfigResult<null> {
+  const flow = parseFlowSequence(raw);
+  if (flow === undefined) {
+    return fail(`line ${line.lineNumber}: ${label} must be a flow list ([path, path])`);
+  }
+  for (const entry of flow) {
+    const appended = appendMaskEntry(target, entry, line);
+    if (!appended.ok) return appended;
+  }
+  return ok(null);
+}
+
+/** Absolute-path check for one `mask:` entry (context-free part). */
+export function validateMaskEntrySyntax(entry: string): ConfigResult<string> {
+  if (entry === "") return fail("mask entries must not be empty");
+  if (!entry.startsWith("/")) {
+    return fail(`mask entry "${entry}" must be an absolute path`);
+  }
+  if (entry === "/") return fail('mask entry "/" would hide the entire filesystem');
+  return ok(entry);
 }
 
 /** Parse the operator allowlist. */
@@ -386,8 +521,10 @@ export function parseAllowlist(text: string): ConfigResult<AwsAllowlist> {
   const state: AllowlistParseState = {
     scopes: [],
     region: undefined,
+    mask: [],
     current: undefined,
-    expectingProfilesBlock: false,
+    blockListKey: undefined,
+    topLevelMaskBlock: false,
   };
 
   for (const line of linesResult.value) {
@@ -400,7 +537,7 @@ export function parseAllowlist(text: string): ConfigResult<AwsAllowlist> {
   if (state.scopes.length === 0) {
     return fail("allowlist defines no scopes; AWS access stays disabled");
   }
-  return ok({ scopes: state.scopes, region: state.region });
+  return ok({ scopes: state.scopes, region: state.region, mask: state.mask });
 }
 
 /** Parse `<worktree>/.belayd/aws.yaml`. */
@@ -504,4 +641,160 @@ export function resolveScope(options: {
     profile: options.repo.profile,
     region: rule.value.region ?? options.allowlist.region,
   });
+}
+
+/**
+ * Merge mask lists in precedence order (top-level first, then per-scope),
+ * dropping duplicates by the entry text as written.
+ */
+export function mergeMaskEntries(...lists: readonly (readonly string[])[]): string[] {
+  const merged: string[] = [];
+  for (const list of lists) {
+    for (const entry of list) {
+      if (!merged.includes(entry)) merged.push(entry);
+    }
+  }
+  return merged;
+}
+
+/**
+ * What the filesystem says about one mask entry at plan time.
+ *
+ * `other` covers everything bwrap cannot mask cleanly: sockets, fifos, and
+ * device nodes. `missing` is what a `realpath()` failure becomes, so a typo in
+ * `mask:` refuses the whole scope instead of silently leaving the path
+ * readable.
+ */
+export type MaskPathStat =
+  | { kind: "directory" }
+  | { kind: "file" }
+  | { kind: "other"; description: string }
+  | { kind: "missing" };
+
+/** A mask entry resolved into the exact argv form it takes. */
+export interface ResolvedMaskEntry {
+  /** Entry exactly as the allowlist wrote it (for messages). */
+  entry: string;
+  /** `realpath()`-resolved path — what bwrap must be given (see below). */
+  path: string;
+  /** Directories become a tmpfs mount; regular files a `/dev/null` bind. */
+  kind: "tmpfs" | "null-bind";
+}
+
+/** Context a mask entry is validated against. */
+export interface MaskValidationContext {
+  worktreeRoot: string;
+  homeDir: string;
+  runtimeBaseDir: string;
+  scopeDir: string;
+  /** Allowlist file, named in every refusal so a typo is findable. */
+  allowlistPath: string;
+}
+
+/** Drop trailing slashes so path comparisons are stable. */
+function normalizeMaskPath(value: string): string {
+  const trimmed = value.replace(/\/+$/, "");
+  return trimmed === "" ? "/" : trimmed;
+}
+
+/** True when `candidate` is `base` itself or lives underneath it. */
+export function isPathWithin(candidate: string, base: string): boolean {
+  const normalizedCandidate = normalizeMaskPath(candidate);
+  const normalizedBase = normalizeMaskPath(base);
+  if (normalizedBase === "/") return true;
+  if (normalizedCandidate === normalizedBase) return true;
+  return normalizedCandidate.startsWith(`${normalizedBase}/`);
+}
+
+/**
+ * Validate one resolved mask entry and decide its argv form.
+ *
+ * Pure: the caller supplies the `realpath()` result and the filesystem kind,
+ * so every refusal below is unit-testable without touching the disk. `path`
+ * must already be resolved because bwrap cannot create a mount point through a
+ * symlinked directory (`bwrap: Can't create file at …: No such file or
+ * directory`, verified on bubblewrap 0.11.2).
+ *
+ * Refusing instead of ignoring is the whole point: a mask entry that does not
+ * apply (bad path, wrong type) must never leave a certificate readable.
+ */
+export function validateMaskEntry(options: {
+  entry: string;
+  resolvedPath: string;
+  stat: MaskPathStat;
+  context: MaskValidationContext;
+}): ConfigResult<ResolvedMaskEntry> {
+  const { context } = options;
+  const syntax = validateMaskEntrySyntax(options.entry);
+  if (!syntax.ok) return fail(`${syntax.reason} (in ${context.allowlistPath})`);
+
+  const resolvedPath = normalizeMaskPath(options.resolvedPath);
+  const refuse = (detail: string): ConfigResult<ResolvedMaskEntry> =>
+    fail(`mask entry "${options.entry}" ${detail} (in ${context.allowlistPath})`);
+
+  // A path that failed `realpath()` cannot be masked, and this check must come
+  // before the containment rules: with an unresolved entry the text as written
+  // is all we have, so a dangling symlink whose literal path sits inside the
+  // worktree would be blamed on the worktree instead of being reported as
+  // missing. Only resolvable entries reach the rules below.
+  const stat = options.stat;
+  if (stat.kind === "missing") {
+    return refuse(
+      "does not exist or cannot be resolved; a mask typo would leave it readable, so the scope is refused — fix or remove the entry",
+    );
+  }
+
+  if (resolvedPath === "/") return refuse("resolves to the filesystem root");
+  if (resolvedPath === normalizeMaskPath(context.homeDir)) {
+    return refuse("is the home directory itself");
+  }
+  if (isPathWithin(resolvedPath, context.scopeDir)) {
+    return refuse(
+      `is inside this scope's runtime dir ${context.scopeDir}, which holds the generated shim, config and socket; masking it would break the sandbox`,
+    );
+  }
+  if (isPathWithin(resolvedPath, context.runtimeBaseDir)) {
+    return refuse(
+      `is inside the broker runtime base ${context.runtimeBaseDir}; masking it would hide this scope's own socket`,
+    );
+  }
+  if (isPathWithin(resolvedPath, context.worktreeRoot)) {
+    return refuse(
+      `is inside the worktree ${context.worktreeRoot}; the operator allowlist, not the repo, decides what is hidden`,
+    );
+  }
+  // The inverse direction matters just as much: a mask that *contains* a
+  // protected path hides it wholesale. Masking the runtime base's parent would
+  // take out the control socket and every scope socket; masking the worktree's
+  // parent would hide the sandboxed spawn's own cwd. Both must fail at plan
+  // time, not as a bwrap error (or a mysteriously broken session) later.
+  if (isPathWithin(context.runtimeBaseDir, resolvedPath)) {
+    return refuse(
+      `hides the broker runtime base ${context.runtimeBaseDir}; masking it would disable the control socket and every scope socket, including this one`,
+    );
+  }
+  if (isPathWithin(context.scopeDir, resolvedPath)) {
+    return refuse(
+      `hides this scope's runtime dir ${context.scopeDir}, which holds the generated shim, config and socket; masking it would break the sandbox`,
+    );
+  }
+  if (isPathWithin(context.worktreeRoot, resolvedPath)) {
+    return refuse(
+      `hides the worktree ${context.worktreeRoot}; a sandboxed spawn would start in a hidden working directory`,
+    );
+  }
+  if (isPathWithin(context.homeDir, resolvedPath)) {
+    return refuse(
+      `hides the home directory ${context.homeDir}; mask a specific path inside it instead`,
+    );
+  }
+
+  switch (stat.kind) {
+    case "other":
+      return refuse(`is a ${stat.description}, which cannot be masked cleanly`);
+    case "directory":
+      return ok({ entry: options.entry, path: resolvedPath, kind: "tmpfs" });
+    case "file":
+      return ok({ entry: options.entry, path: resolvedPath, kind: "null-bind" });
+  }
 }

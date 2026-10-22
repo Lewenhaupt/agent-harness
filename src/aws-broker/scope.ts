@@ -8,6 +8,19 @@
  * - Masks must come *after* the base `--ro-bind / /`: bubblewrap applies
  *   mounts in argv order, so a later base bind would silently unmask
  *   `~/.aws` again (unit-tested below).
+ * - A mask is a `--tmpfs <dir>` for a directory and a
+ *   `--ro-bind /dev/null <file>` for a regular file. The two are not
+ *   interchangeable, and neither alternative works (verified on bubblewrap
+ *   0.11.2 on this host): `--tmpfs <file>` fails with `Can't mkdir <file>:
+ *   Not a directory`, while `--ro-bind /dev/null <file>` reads `EACCES`
+ *   (`cat: … Permission denied`) — not EOF. `EACCES` is the correct outcome:
+ *   the path still exists inside the sandbox, it just cannot be opened, which
+ *   is exactly what "masked" means for a file (an empty file would silently
+ *   look like an empty certificate instead).
+ * - Mask paths must be `realpath()`-resolved: masking a path that goes through
+ *   a symlinked directory fails with `bwrap: Can't create file at …: No such
+ *   file or directory` (verified), because bwrap creates the mount point in the
+ *   *resolved* parent but is handed the unresolved path.
  * - `--tmpfs` only works on directories that already exist, and bubblewrap
  *   cannot create the path itself because the base bind makes `/` read-only
  *   ("Can't create file …: Read-only file system"). So `~/.aws`,
@@ -192,6 +205,16 @@ export const BROKER_DIR_MODE = 0o700;
 /** Socket mode for the broker's unix sockets. */
 export const BROKER_SOCKET_MODE = 0o600;
 
+/**
+ * One mask entry in the argv form it takes.
+ *
+ * Discriminated rather than a bare path list so a caller cannot accidentally
+ * `--tmpfs` a file (`Not a directory`) or `--ro-bind /dev/null` a directory
+ * (silently useless): the kind is decided from the filesystem by
+ * `config.ts#validateMaskEntry`, not guessed here.
+ */
+export type SandboxMask = { kind: "tmpfs"; path: string } | { kind: "null-bind"; path: string };
+
 /** Options for {@link buildSandboxArgv}. */
 export interface BuildSandboxArgvOptions {
   /** bubblewrap binary to exec. */
@@ -206,8 +229,11 @@ export interface BuildSandboxArgvOptions {
   runtimeBaseDir: string;
   /** Scope dir holding the shim, synthetic config, and socket. */
   scopeDir: string;
-  /** Extra directories to mask with tmpfs, in order; they must already exist. */
-  maskDirs: readonly string[];
+  /**
+   * Masks applied in order, after the base bind and before the runtime-base
+   * mask. Directory entries must already exist on the host.
+   */
+  masks: readonly SandboxMask[];
   /** Region to export inside the sandbox. */
   region: string;
   /** Sandbox profile name; defaults to {@link SANDBOX_PROFILE_NAME}. */
@@ -240,7 +266,15 @@ export function buildSandboxArgv(options: BuildSandboxArgvOptions): string[] {
   ];
 
   // Masks strictly after the base bind: a later `--ro-bind / /` unmasks.
-  for (const maskDir of options.maskDirs) argv.push("--tmpfs", maskDir);
+  for (const mask of options.masks) {
+    if (mask.kind === "tmpfs") {
+      argv.push("--tmpfs", mask.path);
+      continue;
+    }
+    // A file mask is a `/dev/null` bind, which reads EACCES inside the
+    // sandbox (see the module comment): `--tmpfs` on a file is a hard error.
+    argv.push("--ro-bind", "/dev/null", mask.path);
+  }
 
   // Hide the broker runtime base: the control socket ("ensure any scope") and
   // every sibling scope socket live there, and socket mode 0600 does not

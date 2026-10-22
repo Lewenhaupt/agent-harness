@@ -23,6 +23,7 @@ import type { AwsCredentials } from "../aws-broker/aws-cli.js";
 import { createCredentialCache } from "../aws-broker/cache.js";
 import { parseControlRequest, startDaemon } from "../aws-broker/daemon.js";
 import { formatPlanOutput, isEntrypoint, parseControlResponse } from "../aws-broker/main.js";
+import type { AwsSandboxPlan } from "../aws-broker/plan.js";
 import { scopeIdFor } from "../aws-broker/scope.js";
 import {
   closeServer,
@@ -433,7 +434,7 @@ describe("aws-broker daemon and CLI plumbing", () => {
   });
 
   it("formats plan output as NUL-separated argv for the shell wrapper", () => {
-    const plan = {
+    const plan: AwsSandboxPlan = {
       worktree: "/repo",
       scopeId: scopeIdFor("/repo"),
       scopeDir: "/run/x/scope",
@@ -441,6 +442,7 @@ describe("aws-broker daemon and CLI plumbing", () => {
       profile: "agent-readonly",
       sandboxProfile: "agent",
       region: "eu-north-1",
+      masks: [{ kind: "tmpfs", path: "/home/hugo/.aws" }],
       argvPrefix: ["bwrap", "--unshare-user"],
     };
     expect(formatPlanOutput(plan, true)).toBe("bwrap\0--unshare-user\0");
