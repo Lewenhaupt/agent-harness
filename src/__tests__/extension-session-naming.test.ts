@@ -7,7 +7,7 @@
  * - runQualityGate multi-retry naming (via phase with quality gate)
  */
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -423,6 +423,42 @@ async function runPhaseToolAndWait(
   await tool?.execute(`call-${toolName}`, { task: `do ${toolName}` }, undefined, undefined, ctx);
   await vi.waitFor(() => {
     expect(runCompletionCount(messages)).toBe(before + 1);
+  });
+}
+
+/**
+ * Mock a userguide spawn that honours the file contract: it writes the
+ * deliverable the gate reads back (`docs/<taskId>-userguide.md`) and returns
+ * the guide as the run's chat report, so the gate passes on the first attempt.
+ * A chat-only mock would trip the gate and burn retry epochs.
+ */
+function mockUserGuideSpawn(options: {
+  cwd: () => string;
+  taskId: string;
+  guide: string;
+  sessionName: string;
+}): void {
+  mockSpawnAgentProcess.mockImplementation(async () => {
+    const docsDir = join(options.cwd(), "docs");
+    mkdirSync(docsDir, { recursive: true });
+    writeFileSync(join(docsDir, `${options.taskId}-userguide.md`), options.guide, "utf8");
+    return {
+      content: [{ type: "text" as const, text: options.guide }],
+      details: {
+        messages: [],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 1,
+        },
+        exitCode: 0,
+      },
+      sessionName: options.sessionName,
+    };
   });
 }
 
@@ -855,21 +891,10 @@ describe("extension session naming (bd-10)", () => {
         "x".repeat(200),
       ].join("\n");
 
-      mockSpawnAgentProcess.mockResolvedValue({
-        content: [{ type: "text" as const, text: validUserGuide }],
-        details: {
-          messages: [],
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: 0,
-            turns: 0,
-            toolCalls: 1,
-          },
-          exitCode: 0,
-        },
+      mockUserGuideSpawn({
+        cwd: () => mockCwd,
+        taskId: "bd-77",
+        guide: validUserGuide,
         sessionName: "mocked-userguide",
       });
 
@@ -916,6 +941,12 @@ describe("extension session naming (bd-10)", () => {
 
       expect(updateCalls.length).toBeGreaterThanOrEqual(1);
       expect(noteCalls.length).toBeGreaterThanOrEqual(1);
+
+      // The guide is a repo record now: the bead note and the run follow-up both
+      // name the file the phase wrote, not a wall of pasted markdown.
+      expect(noteCalls[0]?.stdin).toContain("docs/bd-77-userguide.md");
+      const runComplete = messages.filter((m) => m.customType === "belayd-run-complete");
+      expect(runComplete.at(-1)?.content).toContain("docs/bd-77-userguide.md");
     });
 
     it("clears userGuideContent on gate activation (belayd_start_task)", async () => {
@@ -928,21 +959,10 @@ describe("extension session naming (bd-10)", () => {
         "x".repeat(200),
       ].join("\n");
 
-      mockSpawnAgentProcess.mockResolvedValue({
-        content: [{ type: "text" as const, text: validUserGuide }],
-        details: {
-          messages: [],
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: 0,
-            turns: 0,
-            toolCalls: 1,
-          },
-          exitCode: 0,
-        },
+      mockUserGuideSpawn({
+        cwd: () => mockCwd,
+        taskId: "bd-77",
+        guide: validUserGuide,
         sessionName: "mocked-userguide",
       });
 
@@ -993,21 +1013,10 @@ describe("extension session naming (bd-10)", () => {
         "x".repeat(200),
       ].join("\n");
 
-      mockSpawnAgentProcess.mockResolvedValue({
-        content: [{ type: "text" as const, text: validUserGuide }],
-        details: {
-          messages: [],
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: 0,
-            turns: 0,
-            toolCalls: 1,
-          },
-          exitCode: 0,
-        },
+      mockUserGuideSpawn({
+        cwd: () => mockCwd,
+        taskId: "bd-77",
+        guide: validUserGuide,
         sessionName: "mocked-userguide",
       });
 
@@ -1070,10 +1079,16 @@ describe("extension session naming (bd-10)", () => {
         "x".repeat(200),
       ].join("\n");
 
-      // First call returns firstGuide, second call returns secondGuide
-      mockSpawnAgentProcess
-        .mockResolvedValueOnce({
-          content: [{ type: "text" as const, text: firstGuide }],
+      // First call writes/returns firstGuide, every later call secondGuide.
+      let userguideSpawns = 0;
+      mockSpawnAgentProcess.mockImplementation(async () => {
+        userguideSpawns += 1;
+        const guide = userguideSpawns === 1 ? firstGuide : secondGuide;
+        const docsDir = join(mockCwd, "docs");
+        mkdirSync(docsDir, { recursive: true });
+        writeFileSync(join(docsDir, "bd-77-userguide.md"), guide, "utf8");
+        return {
+          content: [{ type: "text" as const, text: guide }],
           details: {
             messages: [],
             usage: {
@@ -1087,25 +1102,9 @@ describe("extension session naming (bd-10)", () => {
             },
             exitCode: 0,
           },
-          sessionName: "mocked-ug-1",
-        })
-        .mockResolvedValueOnce({
-          content: [{ type: "text" as const, text: secondGuide }],
-          details: {
-            messages: [],
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              cost: 0,
-              turns: 0,
-              toolCalls: 1,
-            },
-            exitCode: 0,
-          },
-          sessionName: "mocked-ug-2",
-        });
+          sessionName: `mocked-ug-${userguideSpawns}`,
+        };
+      });
 
       const { api, tools, messages } = createMockPi();
       const factory = await loadExtension();
@@ -1151,21 +1150,10 @@ describe("extension session naming (bd-10)", () => {
         "x".repeat(200),
       ].join("\n");
 
-      mockSpawnAgentProcess.mockResolvedValue({
-        content: [{ type: "text" as const, text: validUserGuide }],
-        details: {
-          messages: [],
-          usage: {
-            input: 0,
-            output: 0,
-            cacheRead: 0,
-            cacheWrite: 0,
-            cost: 0,
-            turns: 0,
-            toolCalls: 1,
-          },
-          exitCode: 0,
-        },
+      mockUserGuideSpawn({
+        cwd: () => mockCwd,
+        taskId: "bd-77",
+        guide: validUserGuide,
         sessionName: "mocked-userguide",
       });
 

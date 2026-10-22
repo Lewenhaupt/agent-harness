@@ -100,6 +100,10 @@ setup.) Confirm:
   → proof → commit` (6 phases for `feature`; `bugfix`/`refactor` = 5,
   `documentation` = 3). `scout`/`plan` are **not** numbered required-step
   bullets.
+- The `userguide` phase's deliverable is a file, not a report: the spawned task
+  ends with a `## Deliverable` block naming `docs/<task-id>-userguide.md`, and
+  `gateUserGuide` reads that file back from the worktree (see
+  [docs/userguide-phase.md](userguide-phase.md)).
 - The message says the bead's description/design/notes are the plan source, and
   that `belayd_scout` / `belayd_plan` are "available as consultation (NOT
   required steps)".

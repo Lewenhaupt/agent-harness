@@ -173,15 +173,24 @@ describe("DEFAULT_AGENTS", () => {
     expect(committer?.tools).toEqual(["bash", "ls", "find", "ast_grep", "belayd_outline"]);
   });
 
-  it("userguide has read-only tools (no edit/write) and a quality gate", () => {
+  // The guide is a committed record, so the agent must be able to write it:
+  // the phase deliverable is docs/<task-id>-userguide.md, not a chat answer.
+  it("userguide can write its doc file and has a quality gate", () => {
     const userguide = DEFAULT_AGENTS.find((a) => a.name === "belayd-userguide");
     expect(userguide).toBeDefined();
     expect(userguide?.tools).toContain("read");
     expect(userguide?.tools).toContain("grep");
     expect(userguide?.tools).toContain("bash");
-    expect(userguide?.tools).not.toContain("edit");
-    expect(userguide?.tools).not.toContain("write");
+    expect(userguide?.tools).toContain("write");
+    expect(userguide?.tools).toContain("edit");
     expect(userguide?.qualityGate).toBeDefined();
+  });
+
+  it("userguide prompt names the file deliverable, not a chat answer", () => {
+    const userguide = DEFAULT_AGENTS.find((a) => a.name === "belayd-userguide");
+    expect(userguide?.systemPrompt).toContain("deliverable is a markdown file");
+    expect(userguide?.systemPrompt).toContain("## How to Verify");
+    expect(userguide?.systemPrompt).toContain("## How to Use");
   });
 
   it("implementer, tester, userguide, and proof-generator have quality gates wired", () => {

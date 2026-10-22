@@ -7,7 +7,7 @@
 
 import { exec } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GateOptions, GateResult, SpawnDetails } from "./agent-registry.js";
 import { cleanTerminalOutput, parseCast } from "./cast-utils.js";
@@ -401,38 +401,90 @@ export async function gateTests(
 const MIN_USER_GUIDE_LENGTH = 200;
 
 /**
- * Quality gate for user guide content.
+ * Worktree-relative path of the userguide phase deliverable.
  *
- * Checks that the output contains both "How to Verify" and "How to Use"
- * sections, and that the combined content exceeds the minimum length.
+ * Derived from the bead id so an orchestrator, a gate retry, and the commit
+ * note all agree on one path without passing it around: `docs/bd-42-userguide.md`.
+ */
+export function userGuideDocPath(taskId: string): string {
+  const trimmed = taskId.trim();
+  return trimmed === "" ? "docs/userguide.md" : `docs/${trimmed}-userguide.md`;
+}
+
+/** Section and length problems in a guide body, shared by both gate contracts. */
+function userGuideContentFailures(content: string): string[] {
+  const failures: string[] = [];
+  if (!/##\s+How\s+to\s+Verify/i.test(content)) {
+    failures.push('Missing "## How to Verify" section');
+  }
+  if (!/##\s+How\s+to\s+Use/i.test(content)) {
+    failures.push('Missing "## How to Use" section');
+  }
+  if (content.length < MIN_USER_GUIDE_LENGTH) {
+    failures.push(
+      `User guide too short (${content.length} chars, minimum ${MIN_USER_GUIDE_LENGTH})`,
+    );
+  }
+  return failures;
+}
+
+/**
+ * Read the deliverable, refusing any path that escapes the worktree. The path
+ * reaches the gate from the phase run, and a retry agent can edit the guide, so
+ * a traversal-shaped value must fail closed rather than be probed.
+ */
+async function readUserGuideFile(options: {
+  path: string;
+  cwd: string;
+}): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
+  const root = resolve(options.cwd);
+  const absolute = resolve(root, options.path);
+  if (absolute !== root && !absolute.startsWith(`${root}${sep}`)) {
+    return { ok: false, error: `User guide path escapes the worktree: ${options.path}` };
+  }
+  try {
+    return { ok: true, content: await readFile(absolute, "utf8") };
+  } catch {
+    return {
+      ok: false,
+      error: `Missing user guide file: ${options.path} — write the guide there (the file is the deliverable, not your chat output)`,
+    };
+  }
+}
+
+/**
+ * Quality gate for the userguide phase.
+ *
+ * With a `userGuidePath` (the normal workflow path) the gate validates the file
+ * on disk: it is the record a reviewer or operator opens later, so a chat-only
+ * answer must not pass. Without a path the gate keeps the legacy text contract.
  */
 export async function gateUserGuide(
   output: string,
   _details: SpawnDetails,
-  _options?: GateOptions,
+  options?: GateOptions,
 ): Promise<GateResult> {
-  const failures: string[] = [];
-
-  const hasHowToVerify = /##\s+How\s+to\s+Verify/i.test(output);
-  if (!hasHowToVerify) {
-    failures.push('Missing "## How to Verify" section');
+  if (options?.userGuidePath === undefined) {
+    return userGuideVerdict(userGuideContentFailures(output));
   }
 
-  const hasHowToUse = /##\s+How\s+to\s+Use/i.test(output);
-  if (!hasHowToUse) {
-    failures.push('Missing "## How to Use" section');
-  }
+  const read = await readUserGuideFile({
+    path: options.userGuidePath,
+    cwd: options.cwd ?? process.cwd(),
+  });
+  if (!read.ok) return { passed: false, feedback: `User guide quality issues:\n${read.error}` };
 
-  if (output.length < MIN_USER_GUIDE_LENGTH) {
-    failures.push(
-      `User guide too short (${output.length} chars, minimum ${MIN_USER_GUIDE_LENGTH})`,
-    );
-  }
+  const failures = userGuideContentFailures(read.content).map(
+    (failure) => `${failure} in ${options.userGuidePath}`,
+  );
+  return userGuideVerdict(failures);
+}
 
+/** Shape a userguide verdict from its collected failures. */
+function userGuideVerdict(failures: readonly string[]): GateResult {
   if (failures.length > 0) {
     return { passed: false, feedback: `User guide quality issues:\n${failures.join("\n")}` };
   }
-
   return { passed: true };
 }
 

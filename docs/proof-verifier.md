@@ -113,7 +113,10 @@ bd show <task-id>
 ```
 
 and confirm the note contains the `## Verdict` / `reasonable:` / `reason:` /
-`evidence:` block alongside the userguide `How to Verify` / `How to Use` note.
+`evidence:` block alongside the userguide note. The userguide note is a pointer
+plus the agent's report: it names the committed record
+(`docs/<task-id>-userguide.md`) instead of inlining the whole guide. See
+[userguide-phase.md](userguide-phase.md).
 
 ### 6. Confirm path-traversal safety
 
@@ -177,7 +180,9 @@ The verifier assembles a prompt (`buildProofVerifierPrompt` →
 
 - **Task text** — `task` override or the active task ID.
 - **Change context** — `git diff --stat HEAD`, `git status --short`, and the
-  userguide's `## How to Verify` section (`collectChangeContext`).
+  userguide's `## How to Verify` section (`collectChangeContext`), read from
+  `docs/<task-id>-userguide.md` on disk (`readUserGuideForContext`) with the
+  in-session report as fallback.
 - **Extracted proof content** per modality (`extractProofArtifacts`):
   - `.cast` → asciicast parsed to plain text (`readCastToText`).
   - `.png` / `.jpg` / `.jpeg` → marker for `describe_image` visual inspection.

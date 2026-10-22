@@ -47,6 +47,12 @@ export interface GateOptions {
    * so a retry cannot pass on a previous attempt's leftovers.
    */
   proofRunStartMs?: number;
+  /**
+   * Worktree-relative path of the userguide phase's deliverable. When set, the
+   * userguide gate validates that file on disk instead of trusting the agent's
+   * chat text, because the guide is a committed record, not a transient report.
+   */
+  userGuidePath?: string;
 }
 
 /** Deterministic quality gate: takes the agent's output and returns pass/fail. */
@@ -487,16 +493,17 @@ Output format:
 ## Summary of Changes
 Brief overview of documentation updates.${SHARED_AGENT_GUIDANCE}`;
 
-const USER_GUIDE_SYSTEM_PROMPT = `You are a user-guide writer. Produce structured user-facing documentation that a QA engineer or developer can follow.
+const USER_GUIDE_SYSTEM_PROMPT = `You are a user-guide writer. Your deliverable is a markdown file committed in the repository, not a chat answer that disappears with the session.
 
-Your output will be appended to the task's Final Summary (via the bd note command).
+Write the guide to the exact path named under "## Deliverable" in your task (by convention \`docs/<task-id>-userguide.md\`). Create the \`docs/\` directory when it is missing. Use the \`write\` tool, and re-read the file afterwards to confirm it landed.
 
 Process:
 1. Read the implementation files (git diff or changed files) to understand what changed
 2. Read the test files to understand verification scenarios
 3. Understand how external APIs, CLIs, UIs, or library interfaces are affected
+4. Write the document, then fix it in place if anything is wrong
 
-Output format:
+Required structure — both headings, in this order, as level-2 headings:
 
 ## How to Verify
 Step-by-step manual verification instructions:
@@ -510,7 +517,12 @@ Code examples or CLI commands showing how to use the new/changed functionality:
 // Example usage
 \`\`\`
 
-Be specific — use real file paths, function names, and CLI commands from the codebase. The reader has NOT seen the implementation.${SHARED_AGENT_GUIDANCE}`;
+Be specific — use real file paths, function names, and CLI commands from the codebase. The reader has NOT seen the implementation. Start the file with a single level-1 title naming the feature and its bead id.
+
+Rules:
+- The file on disk is the deliverable. A deterministic quality gate reads that path back from the worktree, so a chat-only answer fails the phase and costs a retry.
+- Do not modify unrelated documentation files, and do not touch source or test code.
+- Your final message is a short report: the file path, plus one line per section you wrote. Never paste the whole guide into the response — the file is the record.${SHARED_AGENT_GUIDANCE}`;
 
 const COMMITTER_SYSTEM_PROMPT = `You are a committer. Commit the completed work with a conventional commit message.
 
@@ -623,10 +635,15 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   },
   {
     name: "belayd-userguide",
-    description: "Generates user-facing How to Verify and How to Use documentation",
+    description: "Writes user-facing How to Verify and How to Use docs into docs/",
     modelClass: "frontier",
+    // write/edit are load-bearing: the phase deliverable is a markdown file in
+    // the worktree (docs/<task-id>-userguide.md), not a chat answer captured in
+    // session memory. gateUserGuide reads that file back from disk.
     tools: [
       "read",
+      "write",
+      "edit",
       "grep",
       "find",
       "ls",
