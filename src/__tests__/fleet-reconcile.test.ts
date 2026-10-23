@@ -45,6 +45,7 @@ import {
   writeFleetMergeQueue,
 } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
 
@@ -929,9 +930,12 @@ describe("runFleetReconcile: supervision", () => {
 // ── Engine: a real fixture repository (stash restore contract) ────────
 
 describe("runFleetReconcile: real git fixture", () => {
+  // Inherited git-context variables would point these fixtures at the real
+  // checkout (see gitContextFreeEnv).
   function git(cwd: string, argv: readonly string[]): string {
     return execFileSync("git", [...argv], {
       cwd,
+      env: gitContextFreeEnv(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
@@ -982,6 +986,7 @@ describe("runFleetReconcile: real git fixture", () => {
         try {
           const stdout = execFileSync("git", [...argv], {
             cwd: options.cwd,
+            env: gitContextFreeEnv(),
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
           });
@@ -1063,6 +1068,7 @@ describe("runFleetReconcile: real git fixture", () => {
       try {
         const stdout = execFileSync("git", [...argv], {
           cwd: options.cwd,
+          env: gitContextFreeEnv(),
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
         });

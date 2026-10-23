@@ -55,6 +55,7 @@ import {
   updateFleetIntent,
   updateFleetMergeQueue,
 } from "../fleet-state.js";
+import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
 
@@ -686,9 +687,16 @@ interface FixtureRepo {
   siblingPath: string;
 }
 
+/**
+ * Fixture git always runs with inherited git-context variables stripped: under
+ * `wt merge` / a git hook, `GIT_DIR` is exported, and an inherited value makes
+ * `git init` on a temp fixture reinitialize the real checkout instead (bare
+ * rewrite, refs moved, worktrees registered). See `gitContextFreeEnv`.
+ */
 function git(cwd: string, argv: readonly string[]): string {
   return execFileSync("git", [...argv], {
     cwd,
+    env: gitContextFreeEnv(),
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
@@ -748,13 +756,19 @@ function createFixtureRepo(options: { secondMember?: boolean } = {}): FixtureRep
   writeFileSync(join(root, "base.txt"), "base\n");
   commit(root, "base");
 
+  // The linked worktrees live next to the root, so `cleanup` has to hold each
+  // path explicitly: registering only the root leaves two directories behind on
+  // every run, and under an inherited GIT_DIR those stale registrations used to
+  // point at the real checkout.
   const memberPath = `${root}.feat-bd-12`;
+  cleanup.push(memberPath);
   git(root, ["worktree", "add", "-q", "-b", "feat/bd-12", memberPath]);
   writeFileSync(join(memberPath, "member.txt"), "member work\n");
   commit(memberPath, "member bd-12");
 
   const siblingPath = `${root}.feat-bd-15`;
   if (options.secondMember !== false) {
+    cleanup.push(siblingPath);
     git(root, ["worktree", "add", "-q", "-b", "feat/bd-15", siblingPath]);
   }
 
@@ -1009,6 +1023,7 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     const fixture = createFixtureRepo();
     enqueue(fixture);
     const escaped = `${fixture.root}.not-the-root`;
+    cleanup.push(escaped);
     git(fixture.root, ["worktree", "add", "-q", "-b", "not-main", escaped]);
 
     const result = await drainFleetMerge({
@@ -1533,12 +1548,14 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     commit(root, "base");
 
     const memberPath = `${root}.feat-bd-12`;
+    cleanup.push(memberPath);
     git(root, ["worktree", "add", "-q", "-b", "feat/bd-12", memberPath]);
     writeFileSync(join(memberPath, "member.txt"), "member work\n");
     commit(memberPath, "member bd-12");
 
     // The sibling is on a branch that does not follow `feat/<id>` at all.
     const siblingPath = `${root}.work-bd-15`;
+    cleanup.push(siblingPath);
     git(root, ["worktree", "add", "-q", "-b", "work/bd-15", siblingPath, "feat/bd-12"]);
     mkdirSync(join(siblingPath, ".belayd"), { recursive: true });
     writeFileSync(
