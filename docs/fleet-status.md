@@ -2,13 +2,18 @@
 
 One read-only tool that answers: **what is every Belayd workflow in this
 repository doing right now?** It walks every git worktree, reads each one's
-`.belayd/workflow.json` and `.belayd/runs/` manifests, and renders a single
+`.belayd/workflow.json` and `.belayd/runs/` manifests, adds the bead title and
+status from one batched read-only `bd show <ids> --json`, and renders a single
 plain-text view with a derived state per worktree plus fleet-level warnings.
 
-This is milestone **P0** of `docs/fleet-orchestrator.md`. It is observation only:
-it never launches a workflow, never merges, never writes, never changes a bead's
-status, and never touches another worktree's files. P1–P4 (launch, mailbox,
-merge queue, ordering, pause/reconcile) do **not** exist yet.
+This is milestone **P0** of `docs/fleet-orchestrator.md`, and the read-only half of
+the fleet surface whose operator entry point is **`docs/fleet.md`**. It is
+observation only: it never launches a workflow, never merges, never writes, never
+changes a bead's status, and never touches another worktree's files. P1 (launch +
+mailbox, `docs/fleet-launch.md`), P2 (single-flight merge queue,
+`docs/fleet-merge.md`), P3 (ordering + capacity-aware launch) and P4 (pause,
+explicit advance, crash reconcile — `docs/fleet-reconcile.md`) are the writing
+surfaces and are implemented too.
 
 - [How to Use](#how-to-use)
   - [When to reach for it](#when-to-reach-for-it)
@@ -74,12 +79,14 @@ list with a different header. With a real intent file the first lines read:
 ```text
 Fleet night-shift
   intent: bd-42, bd-43, max 2 concurrent
+  deferred: bd-44 (capacity), bd-45 (dependency)
   members: 2
   states: active=2 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0
 ```
 
 (`paused` and `no task ids` can also appear in that `intent:` line; P0 only
-reports those fields.)
+reports those fields. A parked fleet adds a `parked:` line naming the reason, the
+recorded stash ref, and the way out — see below.)
 
 Outside a pi session, call the library functions `readFleetStatus({ cwd, fleetId })`
 and `formatFleetStatus(status)` — both are exported from `src/index.ts`
@@ -87,7 +94,14 @@ and `formatFleetStatus(status)` — both are exported from `src/index.ts`
 
 ### Worked example
 
-Real output, run in this repository while bd-126 was in its `userguide` phase:
+Real output, captured in this repository while bd-126 was in its `userguide`
+phase (before bead enrichment landed: on a beads-backed repo every member block
+now also carries a `bead: <title> (<status>)` line under its `worktree:` line).
+It is kept as a capture, not a reproduction: on `feat/bd-126` as it stands both
+worktrees have finished their workflow, so the live view today is the
+all-`missing-state` one in [How to Verify](#how-to-verify). It is worth reading
+because it is the only shape here that shows a member with readable workflow
+state:
 
 ```text
 Fleet default
@@ -128,6 +142,10 @@ That run is worth reading closely:
 - `3/6` counts phases completed **in phase order**; `latest runs` always shows
   the newest manifest per phase, so `userguide=running` is why the member is
   `active` rather than `idle`.
+- That transcript has no `bead:` lines because it predates bead enrichment. A
+  member with readable workflow state in a beads repository shows
+  `bead: <title> (<status>)`; a fleet whose members hold no workflow state
+  (like the current branch) makes **no** `bd` call at all.
 
 ### Reading the output
 
@@ -137,7 +155,9 @@ Header lines:
 |------|---------|
 | `Fleet <id>` | Sanitized fleet id whose directory was read; `(requested "<raw>")` is appended only when sanitizing changed the input |
 | `intent:` | Contents of `fleet.json`, or `none recorded` |
-| `members:` | Number of worktrees in the view (the main checkout counts only when it holds workflow state) |
+| `deferred:` | Members a launch deferred, with the reason each waits (`capacity`, `dependency`, `external-blocker`), bounded to 8 entries plus `...and N more`. Omitted when nothing is deferred |
+| `parked:` | Present only for a paused/parked fleet: `parked: <reason> (stash <sha>) — belayd_fleet_reconcile then belayd_fleet_resume`. This is the read-only pointer to the operator's stashed root work |
+| `members:` | Number of worktrees in the view (the main checkout counts only when it holds workflow state). Deferred members are *not* counted here: they have no worktree yet |
 | `states:` | Count per derived state, printed in the fixed order `active blocked awaiting-human interrupted idle missing-state` |
 
 Per member (blocks are separated by a blank line and sorted by task id, code
@@ -147,6 +167,7 @@ unit order):
 |------|---------|
 | `Member <taskId> — <state>` | Task id recorded in `workflow.json`, or `(no task id)` when there is no readable state |
 | `worktree: <path> (branch <branch>)` | Path from `git worktree list`, and the checked-out branch (`detached HEAD` when there is none) |
+| `bead: <title> (<status>)` | Bead title and status from one batched read-only `bd show <ids> --json`. Omitted when bd is unavailable or has no record for that task id; `(no title)` / `(status unknown)` when bd returns the record without those fields |
 | `workflow: <type> <n>/<m> phases complete` | Workflow sub-type and completed-in-order phase count |
 | `pending: <phases>` | Phase order minus completed, or `none` |
 | `awaiting review response: yes\|no` | The workflow is parked waiting for the operator |
@@ -175,6 +196,7 @@ Warnings (absent when there are none):
 | `<path> records <a>, but its branch or directory names <b>` | `workflow.json` `taskId` disagrees with the branch (or the worktree directory name) | The worktree holds another bead's state, or was re-branched. bd-119 phase/commit/proof tools refuse in that state, so sort out the identity before running a phase. |
 | `<taskId> is claimed by <n> worktrees: <paths>` | Two worktrees record the same `taskId` | Exactly one is real. Do not run phases in either until you know which; `bd show <taskId>` plus the branches tell you which tree owns the bead. |
 | `git worktree list entry "<path>" was skipped: non-key line(s) "…" mean the path does not round-trip through line-oriented porcelain (…git >= 2.36 `-z` is required)` | `git worktree list --porcelain -z` failed (git < 2.36 has no `-z`), so the line-oriented fallback ran and a path containing a newline cannot round-trip; the NUL form never produces this warning | Upgrade git. A skipped entry is *not reported at all*, so never read its absence as "that worktree is clean". |
+| `bead metadata unavailable (bd read failed): …` | The single batched `bd show <ids> --json` could not be read: no beads database, `bd` not on `PATH`, a timeout, or non-JSON output | Nothing about the workflow view is affected — states, phases, and runs are still derived correctly. Fix beads access only if you need titles/statuses. The warning appears **once per fleet**, never once per member, and never appears when no member has a task id (bd is not called at all then). |
 
 The tool exits `0` on a successful read and `1` on a reader failure (not a git
 repository, git missing). A failure prints the git error instead of a view:
@@ -193,17 +215,25 @@ fatal: not a git repository (or any of the parent directories): .git
 - It does **not** write anything: no `fleet.json`, no `audit.log`, no run
   manifest, no `.belayd` state. It does not even create
   `<git-common-dir>/belayd/fleet/`.
-- It does **not** change bead status, and makes no `bd` calls at all.
+- It does **not** change bead status. It runs exactly one read-only
+  `bd show <ids> --json` for bead titles/statuses — never `bd update`, `close`,
+  `label`, `comment`, or `sync` — and skips that call entirely when no member
+  has a task id. If bd is missing or fails, the view still renders (with one
+  `bead metadata unavailable` warning).
 - It does **not** touch another worktree's files: every read is a plain fs read
   of that worktree's own `.belayd/` records.
 - It has **no** cross-tree authority. The bd-119 preflight still governs phase,
   proof, and commit tools; being able to *see* another member does not let you
   act on it.
 
-If you want the tool to *do* something with what it reports, that is P1–P4, and
-none of it is available yet — see the milestone table in
-`docs/fleet-orchestrator.md`. For now: read the view, then act through the bead's
-own orchestrator/worktree, `bd`, or `wt merge` as usual.
+If you want the tool to *do* something with what it reports, the other fleet
+surfaces are separate: P1 launches and messages members (`docs/fleet-launch.md`),
+P2 merges an explicitly queued member (`docs/fleet-merge.md`), and P3 orders
+launches by bd dependencies inside the capacity ceiling
+(`docs/fleet-launch.md`). P4 pauses/resumes and repairs through its own tools
+(`docs/fleet-reconcile.md`). Status itself stays read-only:
+read the view, then act through the bead's own orchestrator/worktree, `bd`,
+`wt merge`, or an explicit fleet merge.
 
 ### Common situations
 
@@ -250,27 +280,34 @@ Run every command from the repository root. The driver below loads
 ### 1. Gates
 
 ```bash
-pnpm test              # Test Files 82 passed (82); Tests 1906 passed (1906)
-pnpm test:integration  # Test Files  8 passed (8);  Tests   69 passed (69)
+pnpm test              # Test Files 93 passed (93); Tests 2280 passed (2280)
+pnpm test:integration  # Test Files  9 passed (9);  Tests   72 passed (72)
 pnpm typecheck         # tsc --noEmit, no output
-pnpm lint              # Checked 154 files … No fixes applied.
-pnpm build             # tsc to dist/
+pnpm lint              # Checked 177 files in ~340ms. No fixes applied.
+pnpm build             # tsc to dist/ (no output)
 ```
 
 The fleet-specific suites are `src/__tests__/fleet-status.test.ts` (pure view
-builder, formatter, derivation, warnings), `src/__tests__/extension-fleet-status-tool.test.ts`
-(registration, fleet-id defaulting/sanitizing, error exit code, gate membership)
+builder, formatter, derivation, warnings, bead enrichment), `src/__tests__/fleet-state.test.ts`
+(shared-state paths, intent, audit log, mailbox, merge-queue schema),
+`src/__tests__/fleet-beads.test.ts` (the batched read-only bead lookup and its
+non-read-argv refusal), `src/__tests__/bd-command.test.ts` (the read-only bd
+argv),
+`src/__tests__/extension-fleet-status-tool.test.ts` (registration, fleet-id
+defaulting/sanitizing, bd enrichment/degrades, error exit code, gate membership)
 and `test/fleet-status.integration.test.ts` (real git). Run just those:
 
 ```bash
 pnpm vitest run src/__tests__/fleet-status.test.ts \
+  src/__tests__/fleet-state.test.ts \
+  src/__tests__/fleet-beads.test.ts \
+  src/__tests__/bd-command.test.ts \
   src/__tests__/extension-fleet-status-tool.test.ts
 pnpm vitest run --config vitest.integration.config.ts test/fleet-status.integration.test.ts
 ```
 
-Expected: `Test Files 2 passed (2)`, `Tests 65 passed (65)` for the unit pair
-(59 in `fleet-status.test.ts`, 6 in `extension-fleet-status-tool.test.ts`), and
-`Test Files 1 passed (1)`, `Tests 5 passed (5)` for the integration file.
+Expected: `Test Files 5 passed (5)`, `Tests 179 passed (179)` for the unit set,
+and `Test Files 1 passed (1)`, `Tests 5 passed (5)` for the integration file.
 
 ### 2. Install the driver
 
@@ -332,12 +369,21 @@ nix develop -c bash -lc "$J $T '{}'" 2>/dev/null \
   | grep -E '^(Fleet |  states:|Member )'
 ```
 
+Produced on `feat/bd-126`:
+
 ```text
 Fleet default
-  states: active=1 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=1
-Member bd-126 — active
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=2
+Member (no task id) — missing-state
 Member (no task id) — missing-state
 ```
+
+Both members are `missing-state` because both worktrees have **finished** their
+workflow: completion clears `.belayd/workflow.json` and keeps the run manifests
+(`extensions/index.ts`, the workflow-complete path), so there is no task id to
+report. That is also why no `bd show` call happens at all here and every member
+prints `(no task id)`. A fleet with live workflows looks like the worked example
+above and like the scratch view in `docs/fleet.md`.
 
 The fleet id is the driver's first argument (a JSON params object); a
 sanitized id is visible in the header:
@@ -398,7 +444,10 @@ ls: cannot access '/home/hugo/git/belayd-agent-harness/.git/belayd/fleet': No su
 
 That last line is the point: P0 does not create the fleet directory at all, not
 even the default one. (`<git-common-dir>` resolves to the main checkout's
-`.git`, so the path names that repository, not the worktree you ran from.)
+`.git`, so the path names that repository, not the worktree you ran from.) The
+single `bd show <ids> --json` read is read-only too — never `bd update`, `close`,
+`label`, `comment`, or `sync` — and it does not run at all when no member holds
+workflow state, so `bd` cannot be the source of a change here.
 
 ### 5. Prove determinism
 
@@ -436,8 +485,16 @@ way the driver does.
 
 ## Related documentation
 
+- `docs/fleet.md` — operator entry point for the whole bd-126 surface (P0–P4):
+  the end-to-end run, the decision and failure-recovery tables, and the shared
+  verification steps.
 - `docs/fleet-orchestrator.md` — the design record: scheduler architecture,
   shared fleet state layout, locked decisions, and the P0–P4 milestones.
+- `docs/fleet-launch.md` — the P1 operator guide: `/fleet`,
+  `belayd_fleet_launch`, the mailbox tools, and the fleet-mode refusal. Launch is
+  what writes the intent this view reads; P2's park and P4's
+  pause/resume/reconcile additionally write its `paused`, `park`, and `taskIds`
+  fields.
 - `docs/owned-worktree.md` — the bd-119 bead ↔ branch ↔ worktree preflight that
   keeps one gate, one bead, one worktree intact (and that the
   `task-id-mismatch` warning predicts).

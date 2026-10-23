@@ -14,18 +14,49 @@
 import { basename, join } from "node:path";
 import { z } from "zod";
 
+import { FLEET_SCHEDULE_DEFERRAL_REASONS } from "./fleet-schedule.js";
 import { taskIdFromBranch } from "./handoff.js";
 import type { RunManifest, RunManifestFs } from "./run-manifest.js";
 import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
+import { isValidTaskId } from "./session-naming.js";
 import type { WorkflowState } from "./workflow-state.js";
 import { parseWorkflowState, workflowStateFilePath } from "./workflow-state.js";
 import type { GitCommonDirResult, WorktreeListEntry } from "./worktree.js";
 import { listWorktrees as defaultListWorktrees, resolveGitCommonDir } from "./worktree.js";
 
-const FLEET_SCHEMA_VERSION = 1;
+/**
+ * `schemaVersion` of the `fleet.json` intent record. The merge queue and the
+ * mailbox notes keep their own versions (`fleet-state.ts`) so bumping the
+ * intent schema cannot invalidate every note already in a mailbox.
+ */
+export const FLEET_SCHEMA_VERSION = 1;
 
 /** Fleet id used when the caller does not name one. */
 export const DEFAULT_FLEET_ID = "default";
+
+/**
+ * Upper bound on the intent's `taskIds` list.
+ *
+ * The intent is untrusted input to the P0 reader, so its lists are bounded like
+ * every other trust-boundary list. The bound is deliberately far above any real
+ * fleet (the concurrency ceiling is 3; three leaves of planning headroom is
+ * already extreme) and `belayd_fleet_launch` refuses a launch whose membership
+ * would exceed it, so a launch can never write a record its own reader rejects.
+ */
+export const FLEET_INTENT_MEMBERS_MAX = 256;
+
+/**
+ * Upper bound on the intent's `deferred` list.
+ *
+ * Larger than the membership cap because a relaunch may restate part of the plan
+ * while preserving entries it did not schedule (they are unioned, not replaced).
+ * The launch refuses a request whose waiting members would exceed it, so the
+ * bound is a guard against hostile/hand-edited records, not a practical limit.
+ */
+export const FLEET_INTENT_DEFERRED_MAX = 1000;
+
+/** Members rendered in the one-line intent summary before it is elided. */
+export const FLEET_INTENT_SUMMARY_MAX = 8;
 
 // ── Fleet intent (fleet.json) ─────────────────────────────────────────
 
@@ -38,17 +69,73 @@ export const DEFAULT_FLEET_ID = "default";
 const FleetIntentSchema = z.object({
   schemaVersion: z.literal(FLEET_SCHEMA_VERSION),
   fleetId: z.string(),
-  taskIds: z.array(z.string()),
+  taskIds: z.array(z.string()).max(FLEET_INTENT_MEMBERS_MAX),
   createdAt: z.number().finite(),
   updatedAt: z.number().finite(),
   /** Requested concurrency ceiling (P3); absent means "use the default". */
   maxConcurrent: z.number().int().positive().optional(),
-  /** Set while the operator has paused the fleet (P4). P0 only reports it. */
+  /**
+   * Members P3 deferred to a later launch (P3 ordering/capacity).
+   *
+   * A deferred member is **not** launched, so it is deliberately absent from
+   * `taskIds`: the intent's member list stays "what is actually running". Each
+   * entry says why it waits. A launch that adds members unions its new plan with
+   * the entries it did not schedule, and a supervisor re-arm leaves the whole
+   * list untouched. P4's explicit advance step (`belayd_fleet_advance`) uses this
+   * list as its worklist.
+   */
+  deferred: z
+    .array(
+      z.object({
+        taskId: z.string(),
+        reason: z.enum(FLEET_SCHEDULE_DEFERRAL_REASONS),
+        detail: z.string(),
+      }),
+    )
+    .max(FLEET_INTENT_DEFERRED_MAX)
+    .optional(),
+  /** Set while the operator has paused the fleet (P4). */
   paused: z.boolean().optional(),
+  /**
+   * Why the fleet is paused, when a repair path wrote a reason (P2/P4).
+   *
+   * `stashRef` is what makes unparking mechanical instead of archaeological: the
+   * merge parked the fleet because the recorded root stash could not be restored,
+   * and reconcile needs the exact sha to retry. `note` keeps the human wording (and
+   * older records carry only that), so P0 renders both.
+   */
+  park: z
+    .object({
+      reason: z.string(),
+      stashRef: z.string().optional(),
+      recordedAt: z.number().finite(),
+    })
+    .optional(),
   note: z.string().optional(),
+  /** Branch merges land on (P2). Absent means the repository's default branch. */
+  baseBranch: z.string().optional(),
+  /**
+   * The supervisor session that owns this fleet (P4 crash reconcile): a later
+   * session needs to tell "my fleet" from one abandoned by a dead process.
+   *
+   * `pidStartTime` (`/proc/<pid>/stat` field 22) and `armToken` are the two
+   * anti-impersonation anchors: the pid alone is reusable by an unrelated live
+   * process, and a session id is public. Both are optional so a hand-written
+   * intent still parses; a record missing them simply never matches a live
+   * session (see `matchesFleetSupervisor`).
+   */
+  supervisor: z
+    .object({
+      sessionId: z.string(),
+      pid: z.number().int().positive(),
+      pidStartTime: z.string().optional(),
+      armToken: z.string().optional(),
+    })
+    .optional(),
 });
 
 export type FleetIntent = z.infer<typeof FleetIntentSchema>;
+export type FleetSupervisor = NonNullable<FleetIntent["supervisor"]>;
 
 /** Parse a fleet intent file; absent/corrupt/wrong-version all yield undefined. */
 export function parseFleetIntent(raw: unknown): FleetIntent | undefined {
@@ -171,6 +258,8 @@ export interface FleetMemberView {
   interruptedRunCount: number;
   /** workflow.json `updatedAt`, raised to the newest run timestamp when that is later. */
   updatedAt: number | undefined;
+  /** Read-only `bd show` metadata, when a lookup succeeded for this task id. */
+  bead?: FleetBead;
   state: FleetMemberState;
 }
 
@@ -180,6 +269,8 @@ export const FLEET_WARNING_KINDS = [
   "unparsed-worktree-path",
   "duplicate-task-id",
   "task-id-mismatch",
+  "bead-metadata-unavailable",
+  "bead-metadata-missing",
 ] as const;
 
 export type FleetWarningKind = (typeof FLEET_WARNING_KINDS)[number];
@@ -511,6 +602,151 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
   };
 }
 
+// ── Bead metadata (read-only bd enrichment) ─────────────────────────
+
+/** Narrowed bead metadata; every field except `id` may be absent in bd's output. */
+export interface FleetBead {
+  id: string;
+  title: string | undefined;
+  status: string | undefined;
+  priority: number | undefined;
+  labels: readonly string[];
+}
+
+/**
+ * One bead record as `bd show --json` prints it.
+ *
+ * Unknown keys are stripped and each optional field `.catch`es to `undefined`
+ * instead of failing the record: bd renames and re-types fields between minor
+ * versions, and losing a title must never cost the whole fleet its bead view.
+ */
+const BeadRecordSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().optional().catch(undefined),
+  status: z.string().optional().catch(undefined),
+  priority: z.number().finite().optional().catch(undefined),
+  labels: z.array(z.string()).optional().catch(undefined),
+});
+
+/** Parse one bead record; anything without a usable `id` yields undefined. */
+export function parseBeadView(raw: unknown): FleetBead | undefined {
+  const result = BeadRecordSchema.safeParse(raw);
+  if (!result.success) return undefined;
+  return {
+    id: result.data.id,
+    title: result.data.title,
+    status: result.data.status,
+    priority: result.data.priority,
+    labels: result.data.labels ?? [],
+  };
+}
+
+/**
+ * Parse a batched `bd show <ids> --json` payload. bd answers with an array for
+ * a found set (and tolerates unknown ids inside that set), so a single record
+ * is accepted too; an error object carries no `id` and therefore yields no
+ * beads rather than an exception.
+ */
+export function parseBeadViews(raw: unknown): FleetBead[] {
+  const records = Array.isArray(raw) ? raw : [raw];
+  const beads: FleetBead[] = [];
+  for (const record of records) {
+    const bead = parseBeadView(record);
+    if (bead !== undefined) beads.push(bead);
+  }
+  return beads;
+}
+
+/**
+ * Task ids worth one batched bead lookup: readable state only, syntactically
+ * valid ids (so no recorded value can be read as a `bd` flag), de-duplicated
+ * and code-unit sorted so the argv — and therefore the audit trail — is
+ * deterministic. Empty means "do not invoke bd at all".
+ */
+export function fleetBeadTaskIds(status: FleetStatus): string[] {
+  const ids = new Set<string>();
+  for (const member of status.members) {
+    const taskId = member.taskId;
+    if (taskId !== undefined && isValidTaskId(taskId)) ids.add(taskId);
+  }
+  return [...ids].sort(compareCodeUnits);
+}
+
+/** Outcome of the batched bead read, as handed back to the pure layer. */
+export type FleetBeadLookup =
+  | { ok: true; beads: readonly FleetBead[] }
+  | { ok: false; error: string };
+
+/** Bound on the bd failure text kept in one warning (bd prints long hints). */
+const BEAD_LOOKUP_ERROR_MAX_LENGTH = 300;
+
+function boundLookupError(error: string): string {
+  const singleLine = error.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= BEAD_LOOKUP_ERROR_MAX_LENGTH) return singleLine;
+  return `${singleLine.slice(0, BEAD_LOOKUP_ERROR_MAX_LENGTH - 1)}…`;
+}
+
+/** Missing ids named in one warning before the count alone carries the rest. */
+const BEAD_MISSING_IDS_MAX = 5;
+
+/**
+ * Attach bead metadata to the derived view.
+ *
+ * Best-effort by design: `bd` may be absent, slow, or pointed at no database,
+ * and none of that may break observation of the workflows. A failed lookup
+ * leaves every member without `bead` and records exactly **one** fleet-level
+ * warning — a missing bd is one fleet-wide fact, not one fact per member, so
+ * this can never become a warning storm.
+ *
+ * A *successful* lookup that answers none of the expected ids is the other
+ * silent failure: bd changing its payload shape (e.g. wrapping records in
+ * `{issues: [...]}`, which `parseBeadViews` flattens to `[]`) would otherwise
+ * drop every bead line with no diagnostic at all. That case emits one bounded
+ * warning naming the missing count and at most {@link BEAD_MISSING_IDS_MAX} ids.
+ */
+export function applyFleetBeadLookup(status: FleetStatus, lookup: FleetBeadLookup): FleetStatus {
+  if (!lookup.ok) {
+    return {
+      ...status,
+      warnings: [
+        ...status.warnings,
+        {
+          kind: "bead-metadata-unavailable",
+          message: `bead metadata unavailable (bd read failed): ${boundLookupError(lookup.error)}`,
+        },
+      ],
+    };
+  }
+
+  const byId = new Map<string, FleetBead>();
+  for (const bead of lookup.beads) byId.set(bead.id.toLowerCase(), bead);
+
+  const expected = fleetBeadTaskIds(status);
+  const missing = expected.filter((taskId) => !byId.has(taskId.toLowerCase()));
+  const warnings = [...status.warnings];
+  if (missing.length > 0) {
+    const shown = missing.slice(0, BEAD_MISSING_IDS_MAX);
+    const remainder = missing.length - shown.length;
+    const suffix = remainder > 0 ? `, +${remainder} more` : "";
+    warnings.push({
+      kind: "bead-metadata-missing",
+      message: boundLookupError(
+        `bd returned no record for ${missing.length} of ${expected.length} fleet task id(s): ${shown.join(", ")}${suffix}`,
+      ),
+    });
+  }
+
+  return {
+    ...status,
+    members: status.members.map((member) => {
+      if (member.taskId === undefined) return member;
+      const bead = byId.get(member.taskId.toLowerCase());
+      return bead === undefined ? member : { ...member, bead };
+    }),
+    warnings,
+  };
+}
+
 // ── Plain-text formatter ──────────────────────────────────────────────
 
 function formatIntent(intent: FleetIntent | undefined): string {
@@ -522,6 +758,30 @@ function formatIntent(intent: FleetIntent | undefined): string {
   return `${tasks}${concurrency}${paused}`;
 }
 
+/**
+ * Persisted deferrals, one bounded line: what is waiting and why.
+ *
+ * The intent is the only read-only observation surface a supervisor has for a
+ * member that never started, so "deferred and forgotten" must be visible here
+ * rather than only in `audit.log`.
+ */
+function formatDeferred(deferred: NonNullable<FleetIntent["deferred"]>): string | undefined {
+  if (deferred.length === 0) return undefined;
+  const shown = deferred
+    .slice(0, FLEET_INTENT_SUMMARY_MAX)
+    .map((entry) => `${entry.taskId} (${entry.reason})`);
+  const hidden = deferred.length - shown.length;
+  const suffix = hidden > 0 ? `, ...and ${hidden} more` : "";
+  return `deferred: ${shown.join(", ")}${suffix}`;
+}
+
+/** The park reason for a paused fleet, or undefined when it is not parked. */
+function formatPark(intent: FleetIntent): string | undefined {
+  if (intent.park === undefined) return undefined;
+  const stash = intent.park.stashRef === undefined ? "" : ` (stash ${intent.park.stashRef})`;
+  return `parked: ${intent.park.reason}${stash} — belayd_fleet_reconcile then belayd_fleet_resume`;
+}
+
 function formatCounts(counts: FleetStateCounts): string {
   return FLEET_MEMBER_STATES.map((state) => `${state}=${counts[state]}`).join(" ");
 }
@@ -531,12 +791,20 @@ function formatFleetId(status: FleetStatus): string {
   return `${status.fleetId} (requested "${status.requestedFleetId}")`;
 }
 
+function formatBeadLine(bead: FleetBead): string {
+  const title = bead.title === undefined ? "(no title)" : bead.title;
+  const status = bead.status === undefined ? "status unknown" : bead.status;
+  return `  bead: ${title} (${status})`;
+}
+
 function formatMember(member: FleetMemberView): string[] {
   const branch = member.branch === undefined ? "detached HEAD" : member.branch;
   const lines = [
     `Member ${member.taskId ?? "(no task id)"} — ${member.state}`,
     `  worktree: ${member.worktreePath} (branch ${branch})`,
   ];
+
+  if (member.bead !== undefined) lines.push(formatBeadLine(member.bead));
 
   if (member.workflowFile === "ok") {
     const completedInOrder = member.phaseOrder.filter((phase) =>
@@ -572,11 +840,16 @@ function formatMember(member: FleetMemberView): string[] {
  * sorted by task id; warnings keep that order with duplicate-task warnings last.
  */
 export function formatFleetStatus(status: FleetStatus): string {
+  const deferred =
+    status.intent === undefined ? undefined : formatDeferred(status.intent.deferred ?? []);
+  const park = status.intent === undefined ? undefined : formatPark(status.intent);
   const lines = [
     // Name only the id that actually located the files; a sanitized id keeps
     // traversal input from printing as if it were a real directory.
     `Fleet ${formatFleetId(status)}`,
     `  intent: ${formatIntent(status.intent)}`,
+    ...(deferred === undefined ? [] : [`  ${deferred}`]),
+    ...(park === undefined ? [] : [`  ${park}`]),
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
   ];
