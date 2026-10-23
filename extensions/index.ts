@@ -34,14 +34,25 @@ import {
 } from "../src/capacity-cache.js";
 import { claimRegistrationOnce } from "../src/claim-registry.js";
 import type {
+  AckNotesResult,
   AgentDefinition,
   ArchifyCommand,
   ArchifyDiagramType,
   ArchifyQuality,
   ArchifyTextResult,
   BelaydCommandArgs,
+  FleetBeadLookup,
+  FleetEventBatch,
+  FleetMemberLaunchOutcome,
+  FleetMode,
+  FleetNoteDelivery,
+  FleetNoteKind,
+  FleetPidProbe,
+  FleetProcessScan,
+  FleetStatus,
   HandedOffMarker,
   HandoffPacket,
+  MemberPidOutcome,
   ModelClass,
   OutlineFilesOptions,
   OutlineKind,
@@ -68,6 +79,9 @@ import {
   ARCHIFY_QUALITY_PROFILES,
   ARCHIFY_TOOL_COMMANDS,
   acceptedProofRefsFromScan,
+  ackNotes,
+  appendFleetAuditEntry,
+  applyFleetBeadLookup,
   assertOwnedWorktree,
   awaitWorktreeReady,
   bdCommandReadsStdin,
@@ -76,6 +90,7 @@ import {
   buildArchifyCheckArgs,
   buildArchifyGuideArgs,
   buildArchifyInspectArgs,
+  buildFleetNote,
   buildOrchestratorPrompt,
   buildVerifierPrompt,
   checkToolAllowed,
@@ -88,12 +103,25 @@ import {
   DEFAULT_AGENTS,
   DEFAULT_BASE_BRANCH,
   DEFAULT_FLEET_ID,
+  defaultFleetMergeGitRunner,
   defaultGitExec,
+  drainFleetMerge,
+  drainNotes,
+  enqueueFleetMerge,
+  enqueueNoteFanout,
   extractOutlineSymbols,
   extractProofArtifacts,
+  FLEET_NOTE_BROADCAST,
+  FLEET_NOTE_KINDS,
+  FLEET_NOTE_SUPERVISOR,
   findWorkspaceRoot,
+  fleetBeadTaskIds,
+  fleetMemberTaskIds,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
+  formatFleetInbox,
+  formatFleetMergeQueue,
+  formatFleetRefusal,
   formatFleetStatus,
   formatHandoffBlock,
   formatOutline,
@@ -109,8 +137,11 @@ import {
   isArchifyDiagramType,
   isArchifyQuality,
   isArchifyToolCommand,
+  isFleetNoteKind,
+  isFleetRefusedTool,
   isInsideWorktreeForBranch,
   isOutlineKind,
+  isProcessAlive,
   isSafeChdirTarget,
   isSameOrDescendantTask,
   isValidTaskId,
@@ -120,10 +151,14 @@ import {
   listArchifyExamples,
   listPendingUserCompletions,
   listRuns,
+  lookupFleetBeads,
+  lookupFleetDependencies,
   manageInstructionGroups,
   manageInstructionGroupsWarning,
   markPhaseCompleted,
+  matchOwnedWorktree,
   matchSessionOwnedWorktree,
+  memberSessionToken,
   NO_GROUP_REGISTERED_WARNING,
   narrowTranscriptEntries,
   OUTLINE_FILE_EXTENSIONS,
@@ -134,31 +169,50 @@ import {
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
   parseBelaydCommandArgs,
+  parseFleetCommandArgs,
+  parseFleetTaskIds,
   parseSubagentSessionName,
   parseWorkflowLabel,
+  pauseFleet,
+  planFleetAdvance,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
+  readFleetIntent,
+  readFleetMergeQueue,
   readFleetStatus,
   readHandoff,
   readHandoffFileArg,
+  readProcessStartTime,
   readStackNode,
   readWorktreeBranch,
   resolveArchifyHome,
   resolveAutoRebaseEnabled,
   resolveBashTimeout,
+  resolveFleetMode,
+  resolveFleetNoteRecipients,
+  resolveGitCommonDir,
+  resolveMemberFleet,
   resolveModelSpec,
   resolveOutlineTargets,
   resolveQualityGate,
   resolveStackChain,
   resolveWorkflowSelection,
+  resolveWorktreePath,
+  resumeFleet,
   runArchify,
   runArchifyText,
+  runFleetLaunch as runFleetLaunchEngine,
+  runFleetReconcile,
   runStackRebase,
+  sanitizeFleetId,
+  scanProcesses,
   scanProofRefs,
+  selectFleetEvents,
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
+  stopMemberSession,
   taskIdFromBranch,
   userGuideDocPath,
   validateBdCommand,
@@ -305,6 +359,26 @@ type SessionState = {
   runEpoch: number;
   deliveredRunIds: Set<string>;
   activeRuns: Map<string, { handle: RunHandle; abortController: AbortController }>;
+  /**
+   * The arm token this session minted for a fleet it supervises (W6). It exists
+   * only here — never written anywhere but the fleet intent — so a `fleet.json`
+   * planted by another writer cannot match it.
+   */
+  fleetArm?: { fleetId: string; token: string };
+  /**
+   * Events injected into the current turn and not yet acknowledged (W4).
+   *
+   * The ack happens in `agent_end`, *after* the model has read the injected
+   * message, so a crash between injection and ack replays the note instead of
+   * losing it (at-least-once). Acking inside `before_agent_start` would make the
+   * delivery at-most-once, which is what the docstring used to claim.
+   */
+  pendingFleetEventAcks?: {
+    fleetId: string;
+    gitCommonDir: string;
+    dir: string;
+    deliveries: FleetNoteDelivery[];
+  };
 };
 
 const sessionStates = new Map<string, SessionState>();
@@ -1305,8 +1379,40 @@ function isBashToolCallEvent(event: ToolCallEvent): event is BashToolCallEvent {
   return event.toolName === "bash" || event.toolName === "Bash";
 }
 
-export default function belaydAgentHarness(pi: ExtensionAPI): void {
+export interface FleetForceStopSeams {
+  /**
+   * Process-table snapshot; defaults to this host's `/proc` scan.
+   *
+   * Injected because the forceful pause is the only code path in the product that
+   * sends a signal: a test must be able to drive a *verified* member pid through a
+   * fake table without touching a real process, and the real table is not a
+   * fixture.
+   */
+  scan?: () => FleetProcessScan;
+  /** Identity probes used to re-verify a matched pid; defaults to `/proc`. */
+  probe?: FleetPidProbe;
+  /** Start-time capture at match time; defaults to the probe's own reader. */
+  startTime?: (pid: number) => string | undefined;
+  /** Signal delivery; defaults to `process.kill`. */
+  signal?: (pid: number, signalName: NodeJS.Signals) => void;
+}
+
+export default function belaydAgentHarness(
+  pi: ExtensionAPI,
+  seamOverrides: FleetForceStopSeams = {},
+): void {
   if (harnessAlreadyLoaded(pi)) return;
+
+  const seams: Required<Pick<FleetForceStopSeams, "scan" | "signal">> &
+    Omit<FleetForceStopSeams, "scan" | "signal"> = {
+    ...seamOverrides,
+    scan: seamOverrides.scan ?? (() => scanProcesses()),
+    signal:
+      seamOverrides.signal ??
+      ((pid, signalName) => {
+        process.kill(pid, signalName);
+      }),
+  };
 
   console.warn(`[belayd-harness] registering tools/commands from ${HARNESS_MODULE_PATH}`);
 
@@ -1321,6 +1427,12 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     "belayd_archify",
     "belayd_outline",
     "belayd_fleet_status",
+    "belayd_fleet_note",
+    "belayd_fleet_merge",
+    "belayd_fleet_pause",
+    "belayd_fleet_resume",
+    "belayd_fleet_advance",
+    "belayd_fleet_reconcile",
     "bd",
     "read",
     "grep",
@@ -2603,6 +2715,13 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     matchedLabel?: string;
     /** Explicit override: hand off even with phase runs in flight or in-place. */
     force?: boolean;
+    /**
+     * `handoff` (default) is the `/belayd` contract: this session stops driving
+     * the bead, records a handoff marker, and announces it. `fleet-member` is the
+     * fleet supervisor's contract: the supervisor keeps scheduling the fleet, so
+     * launching one member must neither disarm it nor claim it handed off.
+     */
+    role?: "handoff" | "fleet-member";
   }): Promise<{ ok: true; handoff: HandedOffMarker } | { ok: false; error: string }> {
     // Guard before any side effect: creating a worktree/session while a phase
     // run is still writing (or from inside the target worktree) would leave two
@@ -2684,23 +2803,52 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
       branch: options.branch,
       sessionId: created.sessionId,
     };
+    return completeWorktreeLaunch({
+      ctx: options.ctx,
+      state,
+      marker,
+      sameDirectory,
+      sessionName: created.sessionName,
+      role: options.role,
+    });
+  }
+
+  /**
+   * Finish a worktree launch once the orchestrator session exists.
+   *
+   * Two contracts share this tail. A `/belayd` handoff records the handoff
+   * markers and disarms the caller, because that session stops driving the bead.
+   * A fleet member launch does neither: the supervisor keeps scheduling the
+   * fleet, so a handoff marker would make its own restart refuse to resume
+   * supervision, and it never had a gate to disarm.
+   */
+  function completeWorktreeLaunch(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    marker: HandedOffMarker;
+    sameDirectory: boolean;
+    sessionName: string;
+    role: "handoff" | "fleet-member" | undefined;
+  }): { ok: true; handoff: HandedOffMarker } | { ok: false; error: string } {
+    const { ctx, marker } = options;
+    if (options.role === "fleet-member") return { ok: true, handoff: marker };
 
     // Persistence is a precondition for disarming, not a best-effort side
     // effect: without the marker the next restart resurrects this workflow next
     // to the running child.
     const persisted = persistHandoffMarkers({
-      ctx: options.ctx,
+      ctx,
       marker,
-      sameDirectory,
+      sameDirectory: options.sameDirectory,
     });
     if (!persisted.ok) return { ok: false, error: persisted.error };
 
-    disarmForHandoff({ state, cwd: options.ctx.cwd, marker });
+    disarmForHandoff({ state: options.state, cwd: ctx.cwd, marker });
     pi.sendMessage(
       {
         customType: "belayd-handoff",
         content:
-          `Handed off ${options.taskId} to session ${created.sessionName} in \`${options.branch}\`; ` +
+          `Handed off ${marker.taskId} to session ${options.sessionName} in \`${marker.branch}\`; ` +
           "you no longer drive a workflow. The new orchestrator owns this bead — do not start " +
           "phase runs for it here.",
         display: true,
@@ -3527,6 +3675,20 @@ export default function belaydAgentHarness(pi: ExtensionAPI): void {
     // a pending user completion is still recovered on the next turn.
     if (state.gateActive) reconcileUserCompletions({ state, cwd: ctx.cwd });
     return planningContextMessage(state) ?? gateContextMessage(state);
+  });
+
+  // Fleet member delivery. Separate handler for the same reason as the
+  // instruction-group handler below: the gate handler's early returns must not
+  // be able to skip it. A supervisor → member note is a file in `events/`, so it
+  // is drained here, at the start of the turn, bounded, acked once, and silent
+  // when nothing is addressed to this member.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    try {
+      return drainFleetEventsMessage(ctx);
+    } catch (error) {
+      console.warn(`[belayd-harness] fleet events delivery failed: ${errorText(error)}`);
+      return undefined;
+    }
   });
 
   // Managed instruction groups. Agent extensions (e.g. pi-agent-browser) ship
@@ -4942,17 +5104,33 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   // intent file, writes nothing, spawns nothing, merges nothing, and arms no
   // gate. Listed in GATED_TOOLS only to survive the process gate — never a
   // required workflow step, and never in PLANNING_GATED_TOOLS.
+  //
+  // Bead metadata comes from one batched read-only `bd show <ids> --json`.
+  // bd is an optional, frequently-absent dependency (no beads database, version
+  // drift, slow server) and the workflow view is derived from workflow state,
+  // so every failure degrades to "no bead metadata" plus exactly one
+  // fleet-level warning instead of failing the call.
+  async function readFleetBeads(status: FleetStatus, cwd: string): Promise<FleetBeadLookup> {
+    return lookupFleetBeads({
+      taskIds: fleetBeadTaskIds(status),
+      cwd,
+      runBd: (argv, options) => runBdCommand(argv, options),
+    });
+  }
+
   pi.registerTool({
     name: "belayd_fleet_status",
     label: "Belayd fleet status",
     description:
       "Read-only fleet status: aggregates every git worktree's Belayd workflow into one " +
-      "view (task id, branch, workflow type, completed/pending phases, latest run per phase " +
-      "with its status, interrupted-run count, last update, derived state) and warns about " +
-      "duplicate task ids, workflow task ids that disagree with the branch or directory, " +
-      "and worktrees without workflow state. Reads only: no writes, no merges, no spawns, no " +
-      "phase runs. fleetId selects <git-common-dir>/belayd/fleet/<fleetId>/fleet.json " +
-      `(default: ${DEFAULT_FLEET_ID}); P0 never creates that file.`,
+      "view (task id, bead title/status, branch, workflow type, completed/pending phases, " +
+      "latest run per phase with its status, interrupted-run count, last update, derived " +
+      "state) and warns about duplicate task ids, workflow task ids that disagree with the " +
+      "branch or directory, and worktrees without workflow state. Reads only: no writes, no " +
+      "merges, no spawns, no phase runs. Bead metadata is one best-effort `bd show --json` " +
+      "read; without bd the view still renders. fleetId selects " +
+      `<git-common-dir>/belayd/fleet/<fleetId>/fleet.json (default: ${DEFAULT_FLEET_ID}); ` +
+      "P0 never creates that file.",
     parameters: Type.Object({
       fleetId: Type.Optional(
         Type.String({
@@ -4967,7 +5145,1440 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         requested === undefined || requested.trim() === "" ? DEFAULT_FLEET_ID : requested.trim();
       const result = readFleetStatus({ cwd, fleetId });
       if (!result.ok) return textToolResult(result.error, 1);
-      return textToolResult(formatFleetStatus(result.value), 0);
+      const lookup = await readFleetBeads(result.value, cwd);
+      return textToolResult(formatFleetStatus(applyFleetBeadLookup(result.value, lookup)), 0);
+    },
+  });
+
+  // ── Fleet supervisor (bd-126 P1–P4): launch, mailbox, merge, pause, reconcile ──
+  //
+  // The supervisor is a scheduler: it arms no gate, runs no phase, and owns no
+  // worktree. Its only authority is the fleet family below, and every action it
+  // takes across worktrees is appended to `<fleet>/audit.log`. Nothing here merges,
+  // advances a wave, pauses, or mutates a bead on its own: each of those is an
+  // explicit, audited call.
+
+  /** `<git-common-dir>` for a session's directory, or an error value. */
+  function gitCommonDirFor(
+    cwd: string,
+  ): { ok: true; gitCommonDir: string } | { ok: false; error: string } {
+    const resolved = resolveGitCommonDir(cwd);
+    return resolved.ok ? { ok: true, gitCommonDir: resolved.commonDir } : resolved;
+  }
+
+  /**
+   * The fleet this session supervises, or undefined.
+   *
+   * Derived from `fleet.json` on every call (session id + live, unchanged
+   * supervisor process + the arm token this session minted), so no in-memory flag
+   * can survive a lifecycle reset and a record left or planted by another writer
+   * cannot put this session into fleet mode. The token is the only piece that is
+   * not on disk: a corrupt or malicious `fleet.json` cannot guess it.
+   */
+  function fleetModeFor(ctx: ExtensionContext): FleetMode | undefined {
+    const common = gitCommonDirFor(ctx.cwd);
+    if (!common.ok) return undefined;
+    const state = getSessionState(ctx);
+    return resolveFleetMode({
+      gitCommonDir: common.gitCommonDir,
+      sessionId: ctx.sessionManager.getSessionId(),
+      isPidAlive: isProcessAlive,
+      pidStartTime: readProcessStartTime,
+      ...(state.fleetArm === undefined ? {} : { armToken: state.fleetArm }),
+    });
+  }
+
+  /** The fleet a member task belongs to (member → fleet lookup by task id). */
+  function memberFleetFor(ctx: ExtensionContext, taskId: string): FleetMode | undefined {
+    const common = gitCommonDirFor(ctx.cwd);
+    if (!common.ok) return undefined;
+    return resolveMemberFleet({ gitCommonDir: common.gitCommonDir, taskId });
+  }
+
+  /** Append one cross-tree audit entry; a failure is reported, never swallowed. */
+  function auditFleetAction(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    fleetId: string;
+    action: string;
+    taskIds: readonly string[];
+    detail: string;
+  }): void {
+    const appended = appendFleetAuditEntry({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      entry: {
+        timestamp: Date.now(),
+        fleetId: options.fleetId,
+        actor: options.ctx.sessionManager.getSessionId(),
+        action: options.action,
+        taskIds: [...options.taskIds],
+        detail: options.detail,
+      },
+    });
+    if (appended.ok) return;
+    // Cross-tree authority must be auditable; an unlogged action is a bug the
+    // operator has to see, not a detail.
+    options.ctx.ui.notify(
+      `Fleet ${options.fleetId}: could not append to audit.log (${appended.error}).`,
+      "warning",
+    );
+    console.warn(`[belayd-harness] failed to append fleet audit entry: ${appended.error}`);
+  }
+
+  /**
+   * bd-119 conflict check for a member whose worktree already exists.
+   *
+   * Reuses `matchOwnedWorktree` instead of re-deriving bead ↔ branch ↔ worktree
+   * identity, so the fleet cannot disagree with the phase/commit/proof preflight
+   * about who owns a tree. A worktree with no workflow state belongs to nobody
+   * yet and is reusable; anything else is refused with the bd-119 wording.
+   */
+  function fleetMemberOwnershipError(root: string, taskId: string): string | undefined {
+    const worktreePath = resolveWorktreePath(root, `feat/${taskId}`);
+    if (worktreePath === undefined) return undefined;
+    const persisted = readWorkflowState({ cwd: worktreePath });
+    if (persisted === undefined) return undefined;
+
+    // bd-119 only answers "does another bead own this tree": a worktree whose
+    // state is for *this* bead resolves `ok`, yet a standalone `/belayd`
+    // orchestrator is already driving it. A fleet launch there would spawn a
+    // second detached orchestrator on one bead — the exact invariant bd-119
+    // exists to protect — so the fleet adds the missing precondition. Any
+    // recorded workflow state for the task means the tree is already driven; a
+    // dead orchestrator is recovered by re-arming the fleet (a re-arm preserves
+    // members instead of relaunching), or by using that session.
+    if (persisted.taskId === taskId) {
+      return (
+        `${taskId} is already driven by a standalone orchestrator in ${worktreePath} ` +
+        `(workflow state for ${taskId} on branch ` +
+        `${persisted.branch === "" ? "an unpinned branch" : persisted.branch}). Use that ` +
+        "orchestrator's session, or re-arm the fleet (`/fleet <id> --fleet <fleetId>`) instead of " +
+        "launching a second orchestrator on the same worktree."
+      );
+    }
+
+    const owned = matchOwnedWorktree({
+      cwd: worktreePath,
+      taskId,
+      branch: readWorktreeBranch(worktreePath),
+      persisted,
+    });
+    return owned.ok ? undefined : owned.error;
+  }
+
+  /**
+   * Launch one member through the existing single-bead path.
+   *
+   * There is deliberately no second spawner: `launchWorktreeWorkflow` owns the
+   * worktree, handoff packet, workflow state, and daemon session. The fleet only
+   * decides *which* members to launch and records the outcome.
+   */
+  async function launchFleetMember(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    base?: string;
+  }): Promise<FleetMemberLaunchOutcome> {
+    const { ctx, taskId } = options;
+    try {
+      // Explicit signals only for the workflow type: `/fleet` has no type
+      // argument, so a namespaced wf:<type> label decides and anything else is
+      // `feature`. No interactive confirmation here: a fleet launch cannot
+      // prompt once per member, and the operator's id list is the authority.
+      const metadata = await readTaskMetadata(taskId, ctx.cwd);
+      const resolution = resolveWorkflowSelection(undefined, metadata?.labels);
+      const launched = await launchWorktreeWorkflow({
+        ctx,
+        taskId,
+        workflowType: resolution.type,
+        branch: `feat/${taskId}`,
+        ...(options.base === undefined ? {} : { base: options.base }),
+        resolutionSource: resolution.source,
+        ...(resolution.matchedLabel === undefined ? {} : { matchedLabel: resolution.matchedLabel }),
+        role: "fleet-member",
+      });
+      if (!launched.ok) return { taskId, ok: false, detail: launched.error };
+      return {
+        taskId,
+        ok: true,
+        detail: `worktree \`feat/${taskId}\`, orchestrator session ${launched.handoff.sessionId}`,
+        workflowType: resolution.type,
+      };
+    } catch (error) {
+      return { taskId, ok: false, detail: errorText(error) };
+    }
+  }
+
+  interface FleetLaunchResult {
+    ok: boolean;
+    text: string;
+  }
+
+  /**
+   * `/fleet` and `belayd_fleet_launch` share this wrapper: the launch engine
+   * itself is `runFleetLaunch` in src/fleet-launch.ts (validation, intent write,
+   * per-member launch, prune), with the two side-effecting halves injected — the
+   * bd-119 ownership probe and the existing single-bead launch path.
+   *
+   * Order is validate -> schedule -> write intent -> launch -> prune: the intent
+   * must exist before a member starts (a member finds its mailbox by task id), a
+   * member that fails is removed from the intent afterwards so the failure is
+   * visible, audited, and retryable, and the P3 schedule decides which members
+   * start now (waves + capacity) before anything is written.
+   */
+  /** Refuse a launch from a session that is already driving a workflow or plan. */
+  function fleetLaunchBlockedText(state: SessionState): string | undefined {
+    if (!state.gateActive && !state.planningActive) return undefined;
+    return (
+      "A fleet supervisor arms no process gate, so this session cannot launch a fleet while it " +
+      "is driving a workflow or a planning session. Finish or stop that work first, then launch " +
+      "the fleet from a session with no gate (normally the repository root)."
+    );
+  }
+
+  /**
+   * Apply a launch result to the session: surface warnings, then arm only when
+   * the launch wrote and verified its supervisor record.
+   *
+   * `armed` is separate from `ok` on purpose: a failed member launch still
+   * rewrote the record with this call's token, so clearing the arm would leave a
+   * fleet whose record names this session while the session refuses its own
+   * inbox. A refused or unread-back launch armed nothing and must not clear an
+   * existing arm.
+   */
+  function applyFleetLaunchResult(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    result: {
+      ok: boolean;
+      text: string;
+      warnings: readonly string[];
+      armed: boolean;
+      fleetId: string;
+    };
+    armToken: string;
+  }): FleetLaunchResult {
+    for (const warning of options.result.warnings) {
+      options.ctx.ui.notify(warning, "warning");
+      console.warn(`[belayd-harness] ${warning}`);
+    }
+    if (options.result.armed) {
+      options.state.fleetArm = { fleetId: options.result.fleetId, token: options.armToken };
+    }
+    return { ok: options.result.ok, text: options.result.text };
+  }
+
+  async function runFleetLaunch(options: {
+    ctx: ExtensionContext;
+    taskIds: readonly string[];
+    fleetId: string;
+    requestedConcurrency?: number;
+    /** `advance` when the worklist came from the persisted deferred plan (P4). */
+    origin?: "launch" | "advance";
+  }): Promise<FleetLaunchResult> {
+    const { ctx } = options;
+    const state = getSessionState(ctx);
+    const blocked = fleetLaunchBlockedText(state);
+    if (blocked !== undefined) return { ok: false, text: blocked };
+
+    const common = gitCommonDirFor(ctx.cwd);
+    if (!common.ok) {
+      return { ok: false, text: `Fleet launch needs a git repository: ${common.error}` };
+    }
+    const baseBranch = currentBranch(ctx.cwd);
+
+    // Minted per arming and kept only in this session's memory: the intent carries
+    // it, so the on-disk record alone is not enough to become the supervisor.
+    const armToken = randomUUID();
+    const pidStartTime = readProcessStartTime(process.pid);
+    // A session supervises one fleet. Pass the fleet it actually holds (derived
+    // from its arm token, not from a record alone) so validation can refuse a
+    // second fleet before any write.
+    const supervised = fleetModeFor(ctx);
+
+    const result = await runFleetLaunchEngine({
+      gitCommonDir: common.gitCommonDir,
+      fleetId: options.fleetId,
+      taskIds: options.taskIds,
+      sessionId: ctx.sessionManager.getSessionId(),
+      ...(supervised === undefined ? {} : { sessionFleetId: supervised.fleetId }),
+      pid: process.pid,
+      ...(pidStartTime === undefined ? {} : { pidStartTime }),
+      armToken,
+      liveness: { isPidAlive: isProcessAlive, pidStartTime: readProcessStartTime },
+      now: Date.now(),
+      ...(baseBranch === undefined ? {} : { baseBranch }),
+      ...(options.requestedConcurrency === undefined
+        ? {}
+        : { requestedConcurrency: options.requestedConcurrency }),
+      ...(options.origin === undefined ? {} : { origin: options.origin }),
+      probeOwnership: (taskId) => fleetMemberOwnershipError(ctx.cwd, taskId),
+      launchMember: (taskId) => launchFleetMember({ ctx, taskId, base: baseBranch }),
+      // P3 ordering: one batched, read-only `bd show --brief-deps`. Any failure
+      // degrades to "no known edges" inside the seam, never to a crashed launch.
+      lookupDependencies: (taskIds) =>
+        lookupFleetDependencies({
+          taskIds,
+          cwd: ctx.cwd,
+          runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+        }),
+    });
+
+    return applyFleetLaunchResult({ ctx, state, result, armToken });
+  }
+
+  /** Normalize the optional fleet-id tool parameter. */
+  function fleetIdParam(raw: string | undefined): string {
+    return raw === undefined || raw.trim() === "" ? DEFAULT_FLEET_ID : raw.trim();
+  }
+
+  pi.registerTool({
+    name: "belayd_fleet_launch",
+    label: "Belayd fleet launch",
+    description:
+      "Explicitly launch several beads as concurrent Belayd workflows, each in its own worktree " +
+      "and detached orchestrator session, and record them in the fleet intent " +
+      "(<git-common-dir>/belayd/fleet/<fleetId>/fleet.json). Validates every task id first: an " +
+      "invalid, duplicated, already-member, or worktree-conflicting id refuses the whole launch " +
+      "with no side effects. Orders members by bd's blocking dependencies (blocked-by edges; a " +
+      "dependency cycle refuses the launch and names the cycle) and launches only the free " +
+      "capacity: at most 3 orchestrators in flight, counting the ones already running. Members " +
+      "beyond that, or in a later wave, are deferred — reported per member and recorded in " +
+      "fleet.json — never silently dropped. Later waves are advanced explicitly with " +
+      "belayd_fleet_advance (there is no background poller). This session becomes the fleet " +
+      "supervisor: it runs no phases and owns no worktree — observe with belayd_fleet_status, " +
+      "message members with belayd_fleet_note, read reports with belayd_fleet_inbox, pause with " +
+      "belayd_fleet_pause, repair crashes with belayd_fleet_reconcile. No merges " +
+      "(belayd_fleet_merge is explicit).",
+    parameters: Type.Object({
+      tasks: Type.Union([
+        Type.String({ description: "One task id or a whitespace/comma separated list" }),
+        Type.Array(Type.String(), { description: 'Task ids, e.g. ["bd-12", "bd-15"]' }),
+      ]),
+      fleetId: Type.Optional(
+        Type.String({
+          description: `Fleet directory name under <git-common-dir>/belayd/fleet/ (default: ${DEFAULT_FLEET_ID})`,
+        }),
+      ),
+      concurrency: Type.Optional(
+        Type.Number({ description: "Concurrent orchestrators (capped at 3)" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const parsed = parseFleetTaskIds(params.tasks);
+      if (!parsed.ok) return textToolResult(`belayd_fleet_launch: ${parsed.error}.`, 1);
+      const result = await runFleetLaunch({
+        ctx: extensionCtx,
+        taskIds: parsed.taskIds,
+        fleetId: fleetIdParam(params.fleetId),
+        ...(params.concurrency === undefined ? {} : { requestedConcurrency: params.concurrency }),
+      });
+      return textToolResult(result.text, result.ok ? 0 : 1);
+    },
+  });
+
+  pi.registerTool({
+    name: "belayd_fleet_note",
+    label: "Belayd fleet note",
+    description:
+      "Write fleet mailbox notes. The supervisor writes into events/ for one member or `all` " +
+      "(a broadcast is materialized as one file per member, so every member receives its own " +
+      "copy); a member writes into inbox/ and may only address `supervisor`. The target is " +
+      "validated against live fleet membership, so a typo is refused instead of becoming mail " +
+      "nobody ever reads. Kinds: note, rebase-hint, base-moved, sibling-landed, pause, resume. " +
+      "Delivery is files-first: a member sees queued events at the start of its next turn; the " +
+      "supervisor reads inbox/ with belayd_fleet_inbox. Body is bounded and every note is " +
+      "audited in audit.log.",
+    parameters: Type.Object({
+      to: Type.String({
+        description: "Target task id, `supervisor` (inbox only), or `all` (every member)",
+      }),
+      body: Type.String({ description: "Note body (truncated to 2000 characters)" }),
+      kind: Type.Optional(
+        Type.String({ description: `One of: ${FLEET_NOTE_KINDS.join(", ")} (default: note)` }),
+      ),
+      channel: Type.Optional(
+        Type.String({ description: "inbox (member → supervisor) or events (supervisor → member)" }),
+      ),
+      fleetId: Type.Optional(
+        Type.String({ description: "Fleet id (default: this session's fleet)" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const kind = normalizeFleetNoteKind(params.kind);
+      if (kind === undefined) {
+        return textToolResult(
+          `Unknown note kind \`${params.kind ?? ""}\`. Valid kinds: ${FLEET_NOTE_KINDS.join(", ")}.`,
+          1,
+        );
+      }
+      const resolved = resolveFleetNoteTarget({
+        ctx: extensionCtx,
+        fleetId: params.fleetId,
+        channel: params.channel,
+      });
+      if (!resolved.ok) return textToolResult(resolved.error, 1);
+
+      const written = writeFleetNote({
+        ctx: extensionCtx,
+        resolved,
+        kind,
+        to: params.to,
+        body: params.body,
+      });
+      return written.ok ? textToolResult(written.text, 0) : textToolResult(written.error, 1);
+    },
+  });
+
+  /**
+   * Validate the address, fan the note out, and audit the outcome.
+   *
+   * Split out of the tool handler so the handler stays a short orchestration of
+   * "narrow the parameter → resolve the mailbox → write → report".
+   */
+  function writeFleetNote(options: {
+    ctx: ExtensionContext;
+    resolved: FleetNoteTarget;
+    kind: FleetNoteKind;
+    to: string;
+    body: string;
+  }): { ok: true; text: string } | { ok: false; error: string } {
+    const { ctx, resolved, kind } = options;
+    const recipients = resolveFleetNoteRecipients({
+      direction: resolved.channel === "events" ? "supervisor-to-member" : "member-to-supervisor",
+      to: options.to,
+      members: resolved.members,
+    });
+    if (!recipients.ok) return { ok: false, error: `Fleet note refused: ${recipients.error}` };
+
+    const enqueued = enqueueNoteFanout({
+      dir: resolved.dir,
+      note: buildFleetNote({
+        kind,
+        from: resolved.from,
+        // Replaced per recipient by the fan-out; kept as the caller asked so a
+        // single-recipient note is byte-identical to the old behaviour.
+        to: options.to,
+        body: options.body,
+        now: Date.now(),
+      }),
+      recipients: recipients.recipients,
+    });
+    if (!enqueued.ok) {
+      // A partial fan-out means some members already have the note. The audit
+      // records exactly the recipients whose file was written — not the request
+      // — so a broadcast that reached two of three members never claims three.
+      auditFleetAction({
+        ctx,
+        gitCommonDir: resolved.gitCommonDir,
+        fleetId: resolved.fleetId,
+        action: "note-partial",
+        taskIds: enqueued.writtenRecipients,
+        detail: `${resolved.channel} ${kind}: ${enqueued.error}`,
+      });
+      return { ok: false, error: `Fleet note refused: ${enqueued.error}` };
+    }
+
+    auditFleetAction({
+      ctx,
+      gitCommonDir: resolved.gitCommonDir,
+      fleetId: resolved.fleetId,
+      action: "note",
+      taskIds: recipients.recipients,
+      detail: `${resolved.channel} ${kind} to ${recipients.recipients.length} recipient(s)`,
+    });
+    const audience =
+      recipients.recipients.length === 1
+        ? `to ${recipients.recipients[0] ?? ""}`
+        : `to ${recipients.recipients.length} members (${recipients.recipients.join(", ")})`;
+    return {
+      ok: true,
+      text:
+        `Fleet \`${resolved.fleetId}\`: ${kind} from ${resolved.from} ${audience} queued in ` +
+        `${resolved.channel} (${enqueued.paths.length} file(s)).`,
+    };
+  }
+
+  /** Audit detail for an inbox drain; a partial ack is stated, never hidden. */
+  function inboxDrainDetail(drainedCount: number, acked: AckNotesResult): string {
+    if (acked.ok) return `${drainedCount} note(s) drained and acknowledged`;
+    return (
+      `${drainedCount} note(s) drained; ${acked.removed.length} acknowledged, ` +
+      `${acked.remaining.length} still queued (${acked.error})`
+    );
+  }
+
+  /** Render a drain plus its ack outcome, with the ack failure as an explicit field. */
+  function formatFleetInboxResult(options: {
+    mode: FleetMode;
+    drained: { deliveries: readonly FleetNoteDelivery[]; warnings: readonly string[] };
+    acked: AckNotesResult;
+  }): string {
+    const ackFailure = options.acked.ok
+      ? {}
+      : {
+          ackFailure: {
+            error: options.acked.error,
+            removedCount: options.acked.removed.length,
+            remaining: options.acked.remaining,
+          },
+        };
+    return formatFleetInbox({
+      fleetId: options.mode.fleetId,
+      deliveries: options.drained.deliveries,
+      warnings: options.drained.warnings,
+      ...ackFailure,
+    });
+  }
+
+  pi.registerTool({
+    name: "belayd_fleet_inbox",
+    label: "Belayd fleet inbox",
+    description:
+      "Drain the fleet supervisor's inbox/ (member → supervisor notes), acknowledge each note, and " +
+      "return them. At-least-once: a note is removed only after this call consumed it. Supervisor " +
+      "sessions only — events/ is delivered to members automatically at turn start.",
+    parameters: Type.Object({
+      fleetId: Type.Optional(
+        Type.String({ description: `Fleet id (default: ${DEFAULT_FLEET_ID})` }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) {
+        return textToolResult(
+          "belayd_fleet_inbox is supervisor-only: this session is not the live supervisor of a " +
+            "fleet (a stale supervisor record from a dead process does not count). Start one with " +
+            "/fleet or belayd_fleet_launch.",
+          1,
+        );
+      }
+      const requested = params.fleetId;
+      if (requested !== undefined && requested.trim() !== "" && requested.trim() !== mode.fleetId) {
+        return textToolResult(
+          `This session supervises fleet \`${mode.fleetId}\`, not \`${requested.trim()}\`.`,
+          1,
+        );
+      }
+
+      const drained = drainNotes({ dir: mode.inboxDir });
+      if (!drained.ok) return textToolResult(`Fleet inbox unavailable: ${drained.error}`, 1);
+
+      // Render first, ack second. If an unlink fails, the note bodies this call
+      // consumed are already in the result, and the rendered text states exactly
+      // what remains queued — nothing vanishes off the record.
+      const acked = ackNotes({ dir: mode.inboxDir, deliveries: drained.deliveries });
+
+      if (drained.deliveries.length > 0) {
+        auditFleetAction({
+          ctx: extensionCtx,
+          gitCommonDir: mode.gitCommonDir,
+          fleetId: mode.fleetId,
+          action: "inbox-drain",
+          taskIds: drained.deliveries.map((delivery) => delivery.note.from),
+          detail: inboxDrainDetail(drained.deliveries.length, acked),
+        });
+      }
+
+      return textToolResult(formatFleetInboxResult({ mode, drained, acked }), acked.ok ? 0 : 1);
+    },
+  });
+
+  /**
+   * The branch a member worktree currently has checked out, or an error value.
+   *
+   * The queue stores the branch it will merge, so it must be the branch the
+   * worktree actually holds — a queue entry is not the place to guess
+   * `feat/<id>` when the operator renamed the branch.
+   */
+  function memberMergeBranch(
+    rootCwd: string,
+    taskId: string,
+  ): { ok: true; branch: string; worktreePath: string } | { ok: false; error: string } {
+    const worktreePath = resolveWorktreePath(rootCwd, `feat/${taskId}`);
+    if (worktreePath === undefined) {
+      return {
+        ok: false,
+        error:
+          `no worktree is checked out for feat/${taskId}; launch the member first ` +
+          `(belayd_fleet_launch) or name the branch it actually has`,
+      };
+    }
+    const branch = readWorktreeBranch(worktreePath);
+    if (!branch.ok) {
+      return { ok: false, error: `could not read the branch in ${worktreePath}` };
+    }
+    return { ok: true, branch: branch.branch, worktreePath };
+  }
+
+  /** `action: list` — render the queue without touching it. */
+  function fleetMergeListAction(mode: FleetMode, now: number) {
+    const loaded = readFleetMergeQueue({
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+    });
+    if (!loaded.ok) return textToolResult(`Merge queue unavailable: ${loaded.error}`, 1);
+    return textToolResult(
+      formatFleetMergeQueue({ fleetId: mode.fleetId, queue: loaded.queue, now }),
+      0,
+    );
+  }
+
+  /** `action: enqueue` — queue exactly one member branch. */
+  function fleetMergeEnqueueAction(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    task: string | undefined;
+    now: number;
+  }) {
+    const parsed = options.task === undefined ? undefined : parseFleetTaskIds(options.task);
+    if (parsed === undefined || !parsed.ok) {
+      return textToolResult("belayd_fleet_merge enqueue needs a member task id (`task`).", 1);
+    }
+    if (parsed.taskIds.length !== 1) {
+      return textToolResult(
+        "belayd_fleet_merge enqueue takes exactly one task id; one merge at a time.",
+        1,
+      );
+    }
+    const taskId = parsed.taskIds[0] ?? "";
+    const branch = memberMergeBranch(options.ctx.cwd, taskId);
+    if (!branch.ok) return textToolResult(branch.error, 1);
+    const queued = enqueueFleetMerge({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      sessionId: options.ctx.sessionManager.getSessionId(),
+      taskId,
+      branch: branch.branch,
+      now: options.now,
+    });
+    if (!queued.ok) {
+      return textToolResult(`Merge enqueue refused: ${queued.error}`, 1);
+    }
+    // An unlogged cross-tree write is a bug the operator has to see.
+    for (const warning of queued.warnings) {
+      options.ctx.ui.notify(warning, "warning");
+      console.warn(`[belayd-harness] ${warning}`);
+    }
+    return textToolResult(queued.text, 0);
+  }
+
+  /** `action: drain` — one explicit merge attempt, with every warning surfaced. */
+  async function fleetMergeDrainAction(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    task: string | undefined;
+    now: number;
+  }) {
+    const parsed = options.task === undefined ? undefined : parseFleetTaskIds(options.task);
+    const taskId =
+      parsed === undefined || !parsed.ok || parsed.taskIds.length === 0
+        ? undefined
+        : parsed.taskIds[0];
+    const drained = await drainFleetMerge({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      sessionId: options.ctx.sessionManager.getSessionId(),
+      pid: process.pid,
+      rootCwd: options.ctx.cwd,
+      now: options.now,
+      ...(taskId === undefined ? {} : { taskId }),
+    });
+    for (const warning of drained.warnings) {
+      options.ctx.ui.notify(warning, "warning");
+      console.warn(`[belayd-harness] ${warning}`);
+    }
+    // An empty queue is not a failure: the operator asked for the next merge and
+    // there is none, which exits 0 with an explanatory result.
+    const exitCode = drained.ok || drained.reason === "no-queued-entry" ? 0 : 1;
+    return textToolResult(drained.text, exitCode);
+  }
+
+  pi.registerTool({
+    name: "belayd_fleet_merge",
+    label: "Belayd fleet merge",
+    description:
+      "Explicit single-flight merge queue for a fleet supervisor. action=enqueue queues one " +
+      "member's branch; action=drain merges one queued member into the fleet base branch in the " +
+      "operator's root checkout (rebase → project gates → fast-forward merge → base-moved " +
+      "notifications), and action=list renders the queue. A dirty root is auto-stashed and " +
+      "restored; a conflicting restore parks the fleet with the stash ref in fleet.json (repair " +
+      "with belayd_fleet_reconcile, then belayd_fleet_resume). " +
+      "Merging is not closing: the bead stays in_progress + human. Supervisor sessions only.",
+    parameters: Type.Object({
+      action: Type.Union([Type.Literal("enqueue"), Type.Literal("drain"), Type.Literal("list")], {
+        description: "enqueue one member, drain one queued member, or list the queue",
+      }),
+      task: Type.Optional(
+        Type.String({
+          description:
+            "Member task id. Required for enqueue; optional for drain (default: the oldest queued entry)",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) {
+        return textToolResult(
+          "belayd_fleet_merge is supervisor-only: this session is not the live supervisor of a " +
+            "fleet (a stale supervisor record from a dead process does not count). Start one with " +
+            "/fleet or belayd_fleet_launch.",
+          1,
+        );
+      }
+      const now = Date.now();
+      switch (params.action) {
+        case "list":
+          return fleetMergeListAction(mode, now);
+        case "enqueue":
+          return fleetMergeEnqueueAction({
+            ctx: extensionCtx,
+            mode,
+            task: params.task,
+            now,
+          });
+        case "drain":
+          return fleetMergeDrainAction({ ctx: extensionCtx, mode, task: params.task, now });
+      }
+    },
+  });
+
+  /**
+   * The uniform refusal for fleet tools that need live supervision authority.
+   *
+   * A stale record from a dead process does not count: `fleetModeFor` re-derives
+   * mode from the record, the process identity, and this session's arm token on
+   * every call, so these tools can never be driven by a planted `fleet.json`.
+   */
+  function fleetSupervisorOnly(toolName: string): string {
+    return (
+      `${toolName} is supervisor-only: this session is not the live supervisor of a fleet ` +
+      "(a stale supervisor record from a dead process does not count). Start one with /fleet or " +
+      "belayd_fleet_launch."
+    );
+  }
+
+  /**
+   * Send one supervisor → member note through the validated fan-out, auditing it.
+   *
+   * Best effort on purpose: a pause that failed to *queue* its advisory note still
+   * wrote the intent flag, which is the enforceable half, so the report says which
+   * members were reached instead of failing the pause.
+   */
+  function announceToMembers(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    kind: FleetNoteKind;
+    body: string;
+  }): readonly string[] {
+    const recipients = resolveFleetNoteRecipients({
+      direction: "supervisor-to-member",
+      to: FLEET_NOTE_BROADCAST,
+      members: fleetMemberTaskIds(options.mode.intent),
+    });
+    if (!recipients.ok) return [];
+    const enqueued = enqueueNoteFanout({
+      dir: options.mode.eventsDir,
+      note: buildFleetNote({
+        kind: options.kind,
+        from: FLEET_NOTE_SUPERVISOR,
+        to: FLEET_NOTE_BROADCAST,
+        body: options.body,
+        now: Date.now(),
+      }),
+      recipients: recipients.recipients,
+    });
+    if (!enqueued.ok) {
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "note-partial",
+        taskIds: enqueued.writtenRecipients,
+        detail: `${options.kind}: ${enqueued.error}`,
+      });
+      return enqueued.writtenRecipients;
+    }
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      action: "note",
+      taskIds: enqueued.recipients,
+      detail: `events ${options.kind} to ${enqueued.recipients.length} recipient(s)`,
+    });
+    return enqueued.recipients;
+  }
+
+  pi.registerTool({
+    name: "belayd_fleet_pause",
+    label: "Belayd fleet pause",
+    description:
+      "Pause a fleet so it starts no new work: the intent's `paused` flag is written through the " +
+      "compare-and-replace path and audited (fleet-paused), launches refuse and merges refuse " +
+      "until belayd_fleet_resume. Every member also gets a `pause` note in events/ (delivered at " +
+      "its next turn start). This is cooperative: a running phase is NOT interrupted and a member " +
+      "that ignores the note keeps working. force=true additionally sends SIGTERM to each " +
+      "member's orchestrator process, identified only by the exact `belayd-<taskId>` session " +
+      "token in its argv and re-verified (argv token + process start time) immediately before " +
+      "each signal, so a recycled pid is skipped and audited instead of signalled (audited per " +
+      "pid); it does not guarantee the process exited, does not " +
+      "stop that member's phase sub-agents, and refuses outright when the process table cannot be " +
+      "read or a member's process cannot be identified. Supervisor sessions only.",
+    parameters: Type.Object({
+      reason: Type.Optional(Type.String({ description: "Operator-visible pause reason" })),
+      force: Type.Optional(
+        Type.Boolean({ description: "Also signal each member orchestrator (SIGTERM)" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) return textToolResult(fleetSupervisorOnly("belayd_fleet_pause"), 1);
+
+      const paused = pauseFleet({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        sessionId: extensionCtx.sessionManager.getSessionId(),
+        now: Date.now(),
+        ...(params.reason === undefined ? {} : { reason: params.reason }),
+      });
+      for (const warning of paused.warnings) {
+        extensionCtx.ui.notify(warning, "warning");
+        console.warn(`[belayd-harness] ${warning}`);
+      }
+      if (!paused.ok) return textToolResult(`Fleet pause refused: ${paused.error}`, 1);
+
+      const notified = announceToMembers({
+        ctx: extensionCtx,
+        mode,
+        kind: "pause",
+        body:
+          `Fleet \`${mode.fleetId}\` is paused` +
+          (params.reason === undefined ? "" : `: ${params.reason}`) +
+          ". Start no new phase; finish or park your current work and wait for a `resume` event.",
+      });
+
+      const lines = [paused.text];
+      lines.push(
+        notified.length === 0
+          ? "- pause note: no member to notify (no members recorded)"
+          : `- pause note queued for ${notified.join(", ")} (delivered at their next turn start)`,
+      );
+      if (params.force === true) {
+        lines.push(...forceStopMembers({ ctx: extensionCtx, mode }));
+      }
+      return textToolResult(lines.join("\n"), 0);
+    },
+  });
+
+  /**
+   * Forceful pause: SIGTERM every member orchestrator we can positively identify.
+   *
+   * One process-table snapshot for all members, so two members cannot be matched
+   * against two different tables. Everything that could not be proven is reported
+   * as such — this path exists to stop a member that will not cooperate, not to
+   * pretend a kill succeeded.
+   */
+  function forceStopMembers(options: { ctx: ExtensionContext; mode: FleetMode }): string[] {
+    const { ctx, mode } = options;
+    const scan = seams.scan();
+    if (!scan.ok) {
+      const warning =
+        `forceful pause could not identify member sessions (${scan.reason}); nothing was ` +
+        "signalled. The fleet is still paused (cooperative), so no new work starts.";
+      auditFleetAction({
+        ctx,
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        action: "member-stop-unavailable",
+        taskIds: [...mode.intent.taskIds],
+        detail: scan.reason,
+      });
+      return [`- forceful pause: ${warning}`];
+    }
+
+    return mode.intent.taskIds.flatMap((taskId) => stopOneMember({ ctx, mode, scan, taskId }));
+  }
+
+  /**
+   * Stop one member and report every matched pid separately.
+   *
+   * One process-table snapshot is shared by all members (two members must not be
+   * matched against two different tables), but each pid is re-verified and
+   * signalled on its own: a pid that was recycled is skipped while its sibling is
+   * still signalled, and one failing kill does not abort the rest.
+   */
+  function stopOneMember(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    scan: ReturnType<typeof scanProcesses>;
+    taskId: string;
+  }): string[] {
+    const { ctx, mode, scan, taskId } = options;
+    const token = memberSessionToken(taskId);
+    let outcome: ReturnType<typeof stopMemberSession>;
+    try {
+      outcome = stopMemberSession({
+        taskId,
+        scan,
+        selfPid: process.pid,
+        signal: seams.signal,
+        ...(seams.probe === undefined ? {} : { probe: seams.probe }),
+        ...(seams.startTime === undefined ? {} : { startTime: seams.startTime }),
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      auditFleetAction({
+        ctx,
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        action: "member-stop-failed",
+        taskIds: [taskId],
+        detail: `${detail} (session token ${token})`,
+      });
+      return [`- forceful pause: ${taskId} could not be signalled (${detail})`];
+    }
+    if (!outcome.ok) {
+      auditFleetAction({
+        ctx,
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        action: "member-stop-skipped",
+        taskIds: [taskId],
+        detail: `${outcome.reason}: ${outcome.error}`,
+      });
+      return [`- forceful pause: ${taskId} not signalled — ${outcome.error}`];
+    }
+
+    const lines = outcome.outcomes.flatMap((pidOutcome) =>
+      reportMemberPidOutcome({ ctx, mode, taskId, token, pidOutcome }),
+    );
+    if (outcome.pids.length === 0 && outcome.outcomes.length > 0) {
+      lines.push(
+        `- forceful pause: ${taskId} had matched orchestrator pids but none was signalled; ` +
+          "the cooperative pause is the only stop that applied",
+      );
+    }
+    return lines;
+  }
+
+  /**
+   * Report and audit one matched pid's outcome.
+   *
+   * Every line and audit detail names the matched `belayd-<taskId>` token, so the
+   * pid can be tied back to the identity it was signalled as after the process is
+   * gone.
+   */
+  function reportMemberPidOutcome(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    token: string;
+    pidOutcome: MemberPidOutcome;
+  }): string[] {
+    const { ctx, mode, taskId, token, pidOutcome } = options;
+    const audit = (action: string, detail: string): void => {
+      auditFleetAction({
+        ctx,
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        action,
+        taskIds: [taskId],
+        detail,
+      });
+    };
+    switch (pidOutcome.kind) {
+      case "signalled":
+        audit("member-stopped", `SIGTERM sent to pid ${pidOutcome.pid} (session token ${token})`);
+        return [
+          `- forceful pause: SIGTERM sent to ${taskId}'s orchestrator pid ${pidOutcome.pid} ` +
+            "(delivery only: verify the session stopped and the worktree is clean before relaunching)",
+        ];
+      case "skipped":
+        audit(
+          "member-stop-skipped",
+          `pid ${pidOutcome.pid} (session token ${token}): ${pidOutcome.reason}: ${pidOutcome.detail}`,
+        );
+        return [
+          `- forceful pause: ${taskId} pid ${pidOutcome.pid} was NOT signalled — ` +
+            `${pidOutcome.reason}: ${pidOutcome.detail}`,
+        ];
+      case "failed":
+        audit(
+          "member-stop-failed",
+          `pid ${pidOutcome.pid} (session token ${token}): ${pidOutcome.error}`,
+        );
+        return [
+          `- forceful pause: ${taskId} pid ${pidOutcome.pid} could not be signalled ` +
+            `(${pidOutcome.error}); the other matched pids were signalled`,
+        ];
+    }
+  }
+  pi.registerTool({
+    name: "belayd_fleet_resume",
+    label: "Belayd fleet resume",
+    description:
+      "Resume a paused or parked fleet: clears the intent's `paused` flag, the park record and its " +
+      "note through the compare-and-replace path, audited (fleet-resumed, fleet-unparked). A park " +
+      "that records a stash ref is refused unless force=true: run belayd_fleet_reconcile first so " +
+      "the operator's stashed root work is restored (reconcile verifies the root is this " +
+      "repository's own checkout on the base branch, applies the recorded sha, and unparks); " +
+      "force clears the pause and leaves the stash untouched, naming the ref. Resuming a fleet " +
+      "that is already running is a successful no-op. Members get a `resume` note in events/. " +
+      "Supervisor sessions only.",
+    parameters: Type.Object({
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Clear a park whose stash was not verified as restored (the stash is kept)",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) return textToolResult(fleetSupervisorOnly("belayd_fleet_resume"), 1);
+
+      const resumed = resumeFleet({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        sessionId: extensionCtx.sessionManager.getSessionId(),
+        now: Date.now(),
+        ...(params.force === true ? { force: true } : {}),
+      });
+      for (const warning of resumed.warnings) {
+        extensionCtx.ui.notify(warning, "warning");
+        console.warn(`[belayd-harness] ${warning}`);
+      }
+      if (!resumed.ok) return textToolResult(`Fleet resume refused: ${resumed.error}`, 1);
+      // An already-running fleet is a no-op: no member is told a pause ended that
+      // never started, and nothing is fanned out.
+      if (resumed.alreadyResumed) return textToolResult(resumed.text, 0);
+
+      const notified = announceToMembers({
+        ctx: extensionCtx,
+        mode,
+        kind: "resume",
+        body:
+          `Fleet \`${mode.fleetId}\` resumed. You may start new work again; re-read ` +
+          "belayd_fleet_status before assuming a sibling's premises still hold.",
+      });
+      const lines = [resumed.text];
+      if (notified.length > 0) {
+        lines.push(`- resume note queued for ${notified.join(", ")}`);
+      }
+      return textToolResult(lines.join("\n"), 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "belayd_fleet_advance",
+    label: "Belayd fleet advance",
+    description:
+      "Explicitly advance the fleet's next wave. The worklist is the intent's persisted `deferred` " +
+      "list (members a previous launch could not start); the ordinary launch engine re-reads bd's " +
+      "blocking edges, refuses a cycle, re-applies the ceiling of 3 orchestrators and launches only " +
+      "what fits, recording the rest as deferred again. Every decision is audited (`advance`, " +
+      "`schedule-planned`, per-member deferrals). There is no background poller: a wave advances " +
+      "only when this tool (or another explicit launch) is called. A dependency wave advances only " +
+      "once bd stops reporting the blocking edge — merging a sibling is not closing its bead. " +
+      "Refused while the fleet is paused. Supervisor sessions only.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) return textToolResult(fleetSupervisorOnly("belayd_fleet_advance"), 1);
+
+      const loaded = readFleetIntent({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+      });
+      if (!loaded.ok) {
+        return textToolResult(`Could not read the fleet intent: ${loaded.error}`, 1);
+      }
+      const planned = planFleetAdvance({ fleetId: mode.fleetId, intent: loaded.intent });
+      if (!planned.ok) return textToolResult(planned.text, 1);
+
+      const result = await runFleetLaunch({
+        ctx: extensionCtx,
+        taskIds: planned.worklist,
+        fleetId: mode.fleetId,
+        origin: "advance",
+      });
+      const header =
+        `Advancing fleet \`${mode.fleetId}\`: ${planned.worklist.length} deferred member(s) ` +
+        `(${planned.worklist.join(", ")}) re-scheduled; ${planned.members.length} already ` +
+        "launched.";
+      return textToolResult(`${header}\n${result.text}`, result.ok ? 0 : 1);
+    },
+  });
+
+  pi.registerTool({
+    name: "belayd_fleet_reconcile",
+    label: "Belayd fleet reconcile",
+    description:
+      "Repair a fleet after a crash, audited and idempotent. Merge queue: takes over an expired " +
+      "lease, clears a lock record whose merge.lock.d is gone, reclaims an orphaned lock " +
+      "directory past its grace window, and re-queues (or marks merged when git proves it landed) " +
+      "an entry frozen mid-flight — all under the existing single-flight merge lock, so it never " +
+      "interleaves with a merge. Parked fleet: restores the recorded stash ref when the root is " +
+      "this repository's own checkout on the base branch and unparks, or reports exactly what " +
+      "blocks it (the stash is never discarded); a recorded sha that is no longer in `git stash " +
+      "list` is reported as already restored or dropped and never applied again. Supervision: " +
+      "reports the supervisor's liveness and each member's orchestrator " +
+      "liveness from the process table; prune-dead-members=true removes members whose orchestrator " +
+      "is provably gone (positive `absent` evidence from a completed scan — `unknown` is never " +
+      "pruned, and a live supervisor may prune); worktrees, transcripts, and beads stay. A second " +
+      "run finds nothing to do. Supervisor sessions only; acts in this session's root checkout.",
+    parameters: Type.Object({
+      pruneDeadMembers: Type.Optional(
+        Type.Boolean({
+          description:
+            "Remove members whose orchestrator process is provably gone (a completed scan found " +
+            "no `belayd-<taskId>` process); unknown liveness is never pruned and worktrees stay",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const mode = fleetModeFor(extensionCtx);
+      if (mode === undefined) {
+        return textToolResult(fleetSupervisorOnly("belayd_fleet_reconcile"), 1);
+      }
+
+      const result = await runFleetReconcile({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        sessionId: extensionCtx.sessionManager.getSessionId(),
+        pid: process.pid,
+        rootCwd: extensionCtx.cwd,
+        now: Date.now(),
+        scan: scanProcesses(),
+        git: defaultFleetMergeGitRunner,
+        isPidAlive: isProcessAlive,
+        pidStartTime: readProcessStartTime,
+        selfPid: process.pid,
+        ...(params.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
+      });
+      for (const warning of result.warnings) {
+        extensionCtx.ui.notify(warning, "warning");
+        console.warn(`[belayd-harness] ${warning}`);
+      }
+      return textToolResult(result.text, result.ok ? 0 : 1);
+    },
+  });
+
+  /** Narrow a note kind parameter; undefined means "not a known kind". */
+  function normalizeFleetNoteKind(raw: string | undefined): FleetNoteKind | undefined {
+    if (raw === undefined || raw.trim() === "") return "note";
+    const candidate = raw.trim();
+    return isFleetNoteKind(candidate) ? candidate : undefined;
+  }
+
+  interface FleetNoteTarget {
+    ok: true;
+    gitCommonDir: string;
+    fleetId: string;
+    dir: string;
+    channel: "inbox" | "events";
+    from: string;
+    /** Fleet members from the intent: the audience a note's `to` is checked against. */
+    members: readonly string[];
+  }
+
+  /**
+   * Resolve where a note goes, who it is from, and which mailbox it lands in.
+   *
+   * Defaults follow the direction of travel: a supervisor writes to `events/`
+   * (its messages are for members), a member writes to `inbox/` (its messages
+   * are for the supervisor). The channel can be overridden explicitly, but the
+   * fleet itself cannot: a session may only write into a fleet it supervises or
+   * is a member of.
+   */
+  function resolveFleetNoteTarget(options: {
+    ctx: ExtensionContext;
+    fleetId: string | undefined;
+    channel: string | undefined;
+  }): FleetNoteTarget | { ok: false; error: string } {
+    const { ctx } = options;
+    const common = gitCommonDirFor(ctx.cwd);
+    if (!common.ok)
+      return { ok: false, error: `Fleet mail needs a git repository: ${common.error}` };
+
+    const requestedFleetId =
+      options.fleetId === undefined || options.fleetId.trim() === ""
+        ? undefined
+        : sanitizeFleetId(options.fleetId.trim());
+    const channel = normalizeFleetChannel(options.channel);
+    if (!channel.ok) return channel;
+
+    // A supervisor's own fleet wins; otherwise the session writes as a member.
+    const supervised = fleetModeFor(ctx);
+    if (supervised !== undefined) {
+      if (requestedFleetId !== undefined && requestedFleetId !== supervised.fleetId) {
+        return {
+          ok: false,
+          error: `This session supervises fleet \`${supervised.fleetId}\`, not \`${requestedFleetId}\`.`,
+        };
+      }
+      return supervisorNoteTarget(supervised, channel.channel);
+    }
+    return memberNoteTarget({
+      ctx,
+      gitCommonDir: common.gitCommonDir,
+      requestedFleetId,
+      channel: channel.channel,
+    });
+  }
+
+  /** Narrow the optional `channel` parameter to the two mailboxes. */
+  function normalizeFleetChannel(
+    raw: string | undefined,
+  ): { ok: true; channel: "inbox" | "events" | undefined } | { ok: false; error: string } {
+    if (raw === undefined) return { ok: true, channel: undefined };
+    if (raw === "inbox" || raw === "events") return { ok: true, channel: raw };
+    return { ok: false, error: "channel must be `inbox` or `events`" };
+  }
+
+  /** A supervisor addresses members: default mailbox `events/`. */
+  function supervisorNoteTarget(
+    mode: FleetMode,
+    channel: "inbox" | "events" | undefined,
+  ): FleetNoteTarget {
+    const resolved = channel ?? "events";
+    return {
+      ok: true,
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+      dir: resolved === "inbox" ? mode.inboxDir : mode.eventsDir,
+      channel: resolved,
+      from: FLEET_NOTE_SUPERVISOR,
+      // Deferred members are addressable too: mail queued for a member that has not
+      // started yet is delivered at that session's first turn, and the P0 member
+      // *count* stays `taskIds`-only (a deferred member has no worktree to observe).
+      members: fleetMemberTaskIds(mode.intent),
+    };
+  }
+
+  /** A member addresses the supervisor: default mailbox `inbox/`. */
+  function memberNoteTarget(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    requestedFleetId: string | undefined;
+    channel: "inbox" | "events" | undefined;
+  }): FleetNoteTarget | { ok: false; error: string } {
+    const { ctx } = options;
+    const state = getSessionState(ctx);
+    const memberTaskId =
+      state.currentTaskId !== ""
+        ? state.currentTaskId
+        : (readWorkflowState({ cwd: ctx.cwd })?.taskId ?? "");
+    const member = memberTaskId === "" ? undefined : memberFleetFor(ctx, memberTaskId);
+    if (member === undefined) {
+      return {
+        ok: false,
+        error:
+          "This session is neither a fleet supervisor nor a member of a fleet, so it has no mailbox. " +
+          "Start one with /fleet or belayd_fleet_launch.",
+      };
+    }
+    if (options.requestedFleetId !== undefined && options.requestedFleetId !== member.fleetId) {
+      return {
+        ok: false,
+        error: `This session is a member of fleet \`${member.fleetId}\`, not \`${options.requestedFleetId}\`.`,
+      };
+    }
+    // events/ is supervisor → member only. Letting a member write it would be
+    // cross-worktree prompt injection: it could hand a sibling a fake `pause`,
+    // `base-moved`, or `rebase-hint` that the sibling renders as supervisor
+    // instructions. The member's own surface is inbox/ → supervisor.
+    if (options.channel === "events") {
+      return {
+        ok: false,
+        error:
+          "events/ is supervisor-only: a fleet member writes to the supervisor via inbox/, so it " +
+          "cannot inject a turn-start event into a sibling's session. Use channel inbox (the " +
+          "default) and address `supervisor`.",
+      };
+    }
+    return {
+      ok: true,
+      gitCommonDir: member.gitCommonDir,
+      fleetId: member.fleetId,
+      dir: member.inboxDir,
+      channel: "inbox",
+      from: memberTaskId,
+      members: [...member.intent.taskIds],
+    };
+  }
+
+  /**
+   * Member-side delivery: drain this member's `events/` at turn start.
+   *
+   * Files-first by design (members are detached sessions, so there is no
+   * in-memory channel). Bounded by note count and character budget, silent when
+   * nothing is addressed to this member.
+   *
+   * **The ack is deferred (W4).** Selection only records the deliveries on the
+   * session state; `ackFleetEventsAfterTurn` removes them in `agent_end`, after
+   * the model has actually read the injected message. Acking here — before the
+   * message reaches the model — would be at-most-once: a crash between ack and
+   * read would lose the note silently while the docstring promised replay.
+   */
+  function drainFleetEventsMessage(
+    ctx: ExtensionContext,
+  ): { message: { customType: string; content: string; display: boolean } } | undefined {
+    // A phase sub-agent shares its orchestrator's worktree and workflow state, so
+    // draining here would consume the orchestrator's events in a session the
+    // supervisor never addressed (and that cannot act on them).
+    if (ctx.sessionManager.getSessionName()?.includes("-sub-") === true) return undefined;
+    // Delivery keys on the worktree's task id, so the fleet assumes one member
+    // orchestrator per worktree (docs/fleet-launch.md "One session per
+    // worktree"). A second session opened in the same worktree would drain and
+    // ack that member's mail alongside its owner; bd-119 keeps a worktree pinned
+    // to one bead, and the fleet launch refuses a worktree already driven, but
+    // this handler deliberately does not try to tell two same-cwd sessions apart
+    // (pi exposes no ownership relation between them).
+    const taskId = inferredTaskId(ctx);
+    if (taskId === "") return undefined;
+    const fleet = memberFleetFor(ctx, taskId);
+    if (fleet === undefined) return undefined;
+
+    const batch = selectMemberEvents(fleet, taskId);
+    if (batch === undefined) return undefined;
+
+    queueFleetEventAcks(getSessionState(ctx), fleet, batch.delivered);
+    return {
+      message: { customType: "belayd-fleet-events", content: batch.content, display: true },
+    };
+  }
+
+  /** Drain and select this member's events; undefined when nothing is addressed. */
+  function selectMemberEvents(member: FleetMode, taskId: string): FleetEventBatch | undefined {
+    const drained = drainNotes({ dir: member.eventsDir });
+    if (!drained.ok) {
+      console.warn(`[belayd-harness] fleet events drain failed: ${drained.error}`);
+      return undefined;
+    }
+    return selectFleetEvents({
+      fleetId: member.fleetId,
+      taskId,
+      deliveries: drained.deliveries,
+    });
+  }
+
+  /**
+   * Remember the events this turn injected, for the `agent_end` ack.
+   *
+   * Accumulates, never overwrites: a turn that drains twice before `agent_end`
+   * must ack the union, not just the last batch.
+   */
+  function queueFleetEventAcks(
+    state: SessionState,
+    member: FleetMode,
+    deliveries: readonly FleetNoteDelivery[],
+  ): void {
+    const pending = state.pendingFleetEventAcks ?? {
+      fleetId: member.fleetId,
+      gitCommonDir: member.gitCommonDir,
+      dir: member.eventsDir,
+      deliveries: [],
+    };
+    for (const delivery of deliveries) {
+      if (!pending.deliveries.some((existing) => existing.path === delivery.path)) {
+        pending.deliveries.push(delivery);
+      }
+    }
+    state.pendingFleetEventAcks = pending;
+  }
+
+  /**
+   * Ack the events injected into the turn that just ended (W4).
+   *
+   * Runs in `agent_end`, i.e. after the model has read the message. A crash before
+   * this point leaves the files on disk and the next turn replays them: the
+   * delivery guarantee for events is at-least-once, and repeats must be treated
+   * as the same event. The delete is a cross-tree mutation, so it is audited.
+   */
+  function ackFleetEventsAfterTurn(ctx: ExtensionContext): void {
+    const state = getSessionState(ctx);
+    const pending = state.pendingFleetEventAcks;
+    if (pending === undefined) return;
+    // Clear first: a throwing ack must not make the next turn re-ack the set.
+    state.pendingFleetEventAcks = undefined;
+    if (pending.deliveries.length === 0) return;
+
+    const acked = ackNotes({ dir: pending.dir, deliveries: pending.deliveries });
+    const taskId = inferredTaskId(ctx);
+    if (acked.ok) {
+      auditFleetAction({
+        ctx,
+        gitCommonDir: pending.gitCommonDir,
+        fleetId: pending.fleetId,
+        action: "events-acked",
+        taskIds: [taskId],
+        detail: `${acked.removed.length} event(s) acknowledged after the turn that read them`,
+      });
+      return;
+    }
+    console.warn(`[belayd-harness] fleet events could not be acknowledged: ${acked.error}`);
+    auditFleetAction({
+      ctx,
+      gitCommonDir: pending.gitCommonDir,
+      fleetId: pending.fleetId,
+      action: "events-ack-failed",
+      taskIds: [taskId],
+      detail: `${acked.error}; ${acked.remaining.length} event(s) remain and will be re-delivered`,
+    });
+  }
+
+  /** Task id this session is working on, from memory or the worktree state. */
+  function inferredTaskId(ctx: ExtensionContext): string {
+    const state = getSessionState(ctx);
+    return state.currentTaskId !== ""
+      ? state.currentTaskId
+      : (readWorkflowState({ cwd: ctx.cwd })?.taskId ?? "");
+  }
+
+  pi.on("agent_end", async (_event, ctx) => {
+    try {
+      ackFleetEventsAfterTurn(ctx);
+    } catch (error) {
+      console.warn(`[belayd-harness] fleet events ack failed: ${errorText(error)}`);
+    }
+  });
+
+  // ── Slash command: /fleet bd-12 bd-15 ──────────────────────────────
+  //
+  // The operator-facing entry point. It launches the members and records this
+  // session as the fleet supervisor; it arms no gate, and afterwards every
+  // phase/proof/commit tool is refused with the fleet message (see the
+  // tool_call handler).
+  pi.registerCommand("fleet", {
+    description:
+      "Start a fleet supervisor session for several beads, each as its own worktree workflow. " +
+      "Members are ordered by bd dependencies and only the free capacity starts now (max 3 " +
+      "orchestrators); deferred members are reported and recorded. " +
+      "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>].",
+    handler: async (args, ctx) => {
+      const parsed = parseFleetCommandArgs(args);
+      if (!parsed.ok) {
+        ctx.ui.notify(parsed.error, "error");
+        return;
+      }
+      const result = await runFleetLaunch({
+        ctx,
+        taskIds: parsed.args.taskIds,
+        fleetId: fleetIdParam(parsed.args.fleetId),
+        ...(parsed.args.concurrency === undefined
+          ? {}
+          : { requestedConcurrency: parsed.args.concurrency }),
+      });
+      ctx.ui.notify(result.text, result.ok ? "info" : "error");
     },
   });
 
@@ -5997,8 +7608,35 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   });
 
   // ── Process gate: block out-of-sequence tool calls ──────────────────
+  /**
+   * Fleet-mode refusal for one tool call, or undefined when the call is fine.
+   *
+   * A gated or planning session is never a supervisor (fleet mode arms no gate),
+   * so this can never pre-empt the process gate or the bd-119 ownership
+   * preflight with a fleet message — a member keeps its own refusal.
+   */
+  function fleetRefusalFor(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    toolName: string;
+  }): string | undefined {
+    if (options.state.gateActive || options.state.planningActive) return undefined;
+    if (!isFleetRefusedTool(options.toolName)) return undefined;
+    const fleet = fleetModeFor(options.ctx);
+    if (fleet === undefined) return undefined;
+    return formatFleetRefusal({ toolName: options.toolName, fleetId: fleet.fleetId });
+  }
+
   pi.on("tool_call", (event, ctx) => {
     const state = getSessionState(ctx);
+    // Fleet mode is an additional, earlier refusal with its own wording: a fleet
+    // supervisor owns no worktree, so a phase tool is wrong here for a different
+    // reason than bd-119.
+    const fleetReason = fleetRefusalFor({ ctx, state, toolName: event.toolName });
+    if (fleetReason !== undefined) {
+      abortToolCall(event, "fleet-supervisor", fleetReason);
+      return { block: true, reason: fleetReason };
+    }
     if (state.planningActive) {
       const toolName = event.toolName;
       const isPlanningSubagent =

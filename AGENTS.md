@@ -30,6 +30,16 @@ belayd-agent-harness/
 │   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
 │   ├── owned-worktree.ts   # Bead ↔ branch ↔ worktree preflight (bd-119; docs/owned-worktree.md)
 │   ├── fleet-status.ts     # belayd_fleet_status read-only aggregation (bd-126 P0; docs/fleet-status.md)
+│   ├── fleet-state.ts      # Shared fleet state substrate: paths, fleet.json intent, audit.log, mailbox notes, merge-queue schema (bd-126 P1–P4)
+│   ├── fleet-mode.ts       # Fleet supervisor mode: supervisor session+pid matching, refusal wording, member→fleet lookup (bd-126 P1)
+│   ├── fleet-launch.ts     # Fleet launch engine: concurrency ceiling, validation, /fleet parsing, intent merge, P3 schedule wiring, per-member launch + prune (bd-126 P1/P3)
+│   ├── fleet-schedule.ts   # P3 pure scheduler: bd blocking edges → waves, cycle refusal, capacity deferrals + bd dependency-graph parser (bd-126 P3)
+│   ├── fleet-mailbox.ts    # Fleet mailbox rendering: note construction, inbox view, bounded turn-start event block (bd-126 P1)
+│   ├── fleet-merge.ts      # P2 single-flight merge queue: mkdir lock + lease, rebase/gates/merge, recorded-sha root stash/restore, base-moved fan-out (bd-126 P2; docs/fleet-merge.md)
+│   ├── fleet-beads.ts      # Batched read-only bd seam: bead metadata + blocking dependency graph, injected argv builder + runner, read-only argv guard (bd-126 P0/P3)
+│   ├── fleet-pause.ts      # P4 cooperative pause/resume: CAS intent writes, audited `fleet-paused`/`fleet-resumed`/`fleet-unparked`, park-stash refusal with an exact way out (bd-126 P4)
+│   ├── fleet-reconcile.ts  # P4 crash reconcile: merge-queue repair table under the existing merge lock, parked-root restore from the recorded stash sha (already-dropped shas are never re-applied), supervisor+member liveness report/prune (bd-126 P4; docs/fleet-reconcile.md)
+│   ├── fleet-sessions.ts   # P4 member-session liveness: `/proc` argv scan, exact `belayd-<taskId>` token matching, per-pid start-time re-verification before each signal, injected signalling, `unknown` never folded into `absent` (bd-126 P4)
 │   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
 │   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
 │   ├── stale-file-guard.ts # Stale file detection (hash tracking)
@@ -164,6 +174,20 @@ Phase tools, `belayd_proof_verifier`, and `belayd_commit` refuse to run when the
 directory's `.belayd/workflow.json` task or checked-out branch is not the
 session's own; no `process.cwd()` fallback remains on the phase, commit, proof,
 or planning paths (bd-119). Runbook: `docs/owned-worktree.md`.
+
+### Fleet supervisor (`fleet-*.ts`, bd-126)
+
+`/fleet bd-12 bd-15 …` runs several beads at once, each as a normal single-bead
+workflow in its own worktree, ordered by bd's blocking edges inside a ceiling of
+3 concurrent orchestrators, with a files-first mailbox, an explicit single-flight
+merge queue, and explicit pause/advance/reconcile tools. The supervisor session
+arms no process gate and refuses the phase, proof, and commit tools.
+**Operator entry point: `docs/fleet.md`**; per-area detail in
+`docs/fleet-status.md` (P0), `docs/fleet-launch.md` (P1/P3),
+`docs/fleet-merge.md` (P2), `docs/fleet-reconcile.md` (P4), and the design record
+`docs/fleet-orchestrator.md`. Cross-tree state lives under
+`<git-common-dir>/belayd/fleet/<fleetId>/` (`fleet.json`, `audit.log`, `inbox/`,
+`events/`, `merge-queue.json`, `merge.lock.d`) — never in a worktree's `.belayd/`.
 
 ### Managed instruction groups (`instruction-groups.ts`)
 

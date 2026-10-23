@@ -15,8 +15,13 @@
 
 import { parseArgv } from "./argv.js";
 
-/** Read-only `bd` subcommands that never mutate the beads database. */
-const BD_READ_SUBCOMMANDS: readonly string[] = [
+/**
+ * Read-only `bd` subcommands that never mutate the beads database.
+ *
+ * Exported so read-only consumers (fleet status bead enrichment) and their
+ * tests can assert that they only ever issue a read.
+ */
+export const BD_READ_SUBCOMMANDS: readonly string[] = [
   "blocked",
   "children",
   "comments",
@@ -60,6 +65,24 @@ export const BD_ALLOWED_SUBCOMMANDS: readonly string[] = [
   ...BD_READ_SUBCOMMANDS,
   ...BD_WRITE_SUBCOMMANDS,
 ].sort();
+
+/** Whether `bd <subcommand>` is on the read-only list. */
+export function isBdReadSubcommand(subcommand: string): boolean {
+  return BD_READ_SUBCOMMANDS.includes(subcommand);
+}
+
+/**
+ * argv for one batched read-only bead lookup: `bd show <id>... --json`.
+ *
+ * `show` is on {@link BD_READ_SUBCOMMANDS}; batching keeps a whole fleet view to
+ * a single subprocess, and `show` tolerates ids it cannot find (it returns the
+ * records it did find), so one purged bead does not hide its siblings. Callers
+ * must filter the ids first (`fleetBeadTaskIds` does): a value starting with `-`
+ * would otherwise be read by bd as a flag.
+ */
+export function buildBeadShowArgv(taskIds: readonly string[]): readonly string[] {
+  return ["show", ...taskIds, "--json"];
+}
 
 /** `bd` flags that make the process read a note/description/body from stdin. */
 const BD_STDIN_FLAGS: readonly string[] = ["--stdin"];

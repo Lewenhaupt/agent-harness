@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   BD_ALLOWED_SUBCOMMANDS,
+  BD_READ_SUBCOMMANDS,
   bdCommandReadsStdin,
+  buildBeadShowArgv,
+  isBdReadSubcommand,
   parseBdCommand,
   validateBdCommand,
 } from "../bd-command.js";
@@ -212,5 +215,24 @@ describe("bdCommandReadsStdin", () => {
   it("is false without a stdin-reading flag", () => {
     expect(bdCommandReadsStdin(["note", "bd-1", "text"])).toBe(false);
     expect(bdCommandReadsStdin(["note", "bd-1", "--file", "notes.txt"])).toBe(false);
+  });
+});
+
+describe("buildBeadShowArgv (fleet bead enrichment)", () => {
+  it("batches every id into one show and asks for JSON", () => {
+    expect(buildBeadShowArgv(["bd-12", "bd-15"])).toEqual(["show", "bd-12", "bd-15", "--json"]);
+    expect(buildBeadShowArgv([])).toEqual(["show", "--json"]);
+  });
+
+  it("only ever issues a read-only subcommand", () => {
+    const argv = buildBeadShowArgv(["bd-12"]);
+    const subcommand = argv[0] ?? "";
+    expect(BD_READ_SUBCOMMANDS).toContain(subcommand);
+    expect(isBdReadSubcommand(subcommand)).toBe(true);
+    // Sanity: the read set excludes the mutations a fleet must never perform.
+    for (const forbidden of ["update", "close", "label", "comment", "sync", "delete"]) {
+      expect(BD_READ_SUBCOMMANDS).not.toContain(forbidden);
+      expect(isBdReadSubcommand(forbidden)).toBe(false);
+    }
   });
 });

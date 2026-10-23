@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  applyFleetBeadLookup,
   buildFleetStatus,
   DEFAULT_FLEET_ID,
   deriveFleetMemberState,
@@ -20,18 +21,22 @@ import {
   type FleetStatusFs,
   type FleetWorkflowSnapshot,
   fleetAuditLogPath,
+  fleetBeadTaskIds,
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
   fleetMergeQueueFilePath,
   fleetStateDir,
   formatFleetStatus,
+  parseBeadView,
+  parseBeadViews,
   parseFleetIntent,
   readFleetStatus,
   sanitizeFleetId,
 } from "../fleet-status.js";
 import type { RunManifest } from "../run-manifest.js";
 import { RunStatus, runManifestPath } from "../run-manifest.js";
+import { isValidTaskId } from "../session-naming.js";
 import type { WorkflowState } from "../workflow-state.js";
 import { workflowStateFilePath } from "../workflow-state.js";
 import {
@@ -404,6 +409,58 @@ describe("buildFleetStatus", () => {
       members: [sampleMember({ worktreePath: "/repo", isMainWorktree: true, branch: "main" })],
     });
     expect(inPlace.members).toHaveLength(1);
+  });
+
+  it("renders persisted deferrals so a waiting member is never invisible (W3)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        deferred: [
+          { taskId: "bd-19", reason: "capacity", detail: "all 3 slots taken" },
+          { taskId: "bd-22", reason: "dependency", detail: "wave 1: waits for bd-19" },
+        ],
+      }),
+      members: [sampleMember()],
+    });
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain("deferred: bd-19 (capacity), bd-22 (dependency)");
+  });
+
+  it("bounds the deferred summary instead of printing an unbounded list", () => {
+    const deferred = Array.from({ length: 12 }, (_unused, index) => ({
+      taskId: `bd-${100 + index}`,
+      reason: "capacity" as const,
+      detail: "no slot",
+    }));
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ deferred }),
+      members: [],
+    });
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain("bd-100 (capacity)");
+    expect(text).toContain("and 4 more");
+    expect(text).not.toContain("bd-111");
+  });
+
+  it("renders a parked fleet with its stash and the way out", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        paused: true,
+        note: "root restore conflicted",
+        park: { reason: "root restore conflicted", stashRef: "abc123", recordedAt: 5 },
+      }),
+      members: [],
+    });
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain("paused");
+    expect(text).toContain("parked: root restore conflicted (stash abc123)");
+    expect(text).toContain("belayd_fleet_reconcile");
+    expect(text).toContain("belayd_fleet_resume");
   });
 
   it("derives a healthy member mid-workflow", () => {
@@ -965,6 +1022,192 @@ describe("formatFleetStatus", () => {
     expect(first).not.toContain("\u001b");
     expect(first).toContain("bd-12, bd-15, paused");
     expect(first).toContain("  - skipped entry");
+  });
+});
+
+describe("bead metadata (read-only bd enrichment)", () => {
+  function statusOf(members: readonly FleetMemberSnapshot[]) {
+    return buildFleetStatus({ fleetId: "fleet-1", intent: undefined, members });
+  }
+
+  it("parses a bead record and tolerates absent or renamed fields", () => {
+    expect(
+      parseBeadView({
+        id: "bd-12",
+        title: "Fix login",
+        status: "open",
+        priority: 1,
+        labels: ["fleet"],
+        description: "ignored, stripped by the schema",
+      }),
+    ).toEqual({
+      id: "bd-12",
+      title: "Fix login",
+      status: "open",
+      priority: 1,
+      labels: ["fleet"],
+    });
+
+    const bare = parseBeadView({ id: "bd-12" });
+    expect(bare).toHaveProperty("title", undefined);
+    expect(bare).toHaveProperty("status", undefined);
+    expect(bare).toHaveProperty("priority", undefined);
+    expect(bare).toHaveProperty("labels", []);
+
+    // A renamed or re-typed field costs that field, never the whole record.
+    const renamed = parseBeadView({
+      id: "bd-12",
+      name: "renamed title",
+      status: 7,
+      priority: "high",
+      labels: "fleet",
+    });
+    expect(renamed).toHaveProperty("id", "bd-12");
+    expect(renamed).toHaveProperty("title", undefined);
+    expect(renamed).toHaveProperty("status", undefined);
+    expect(renamed).toHaveProperty("priority", undefined);
+    expect(renamed).toHaveProperty("labels", []);
+
+    expect(parseBeadView({ title: "no id" })).toBe(undefined);
+    expect(parseBeadView({ id: "" })).toBe(undefined);
+    expect(parseBeadView("not an object")).toBe(undefined);
+    expect(parseBeadView(null)).toBe(undefined);
+  });
+
+  it("parses the batched show payload and survives garbage", () => {
+    const records = [
+      { id: "bd-12", title: "Fix login", status: "open", priority: 1, labels: [] },
+      { id: "bd-15", title: "Add fleet", status: "in_progress", priority: 2, labels: ["fleet"] },
+    ];
+    expect(parseBeadViews(records).map((bead) => bead.id)).toEqual(["bd-12", "bd-15"]);
+    // Older bd versions answer one id with a bare object.
+    expect(parseBeadViews(records[0]).map((bead) => bead.id)).toEqual(["bd-12"]);
+    // bd's "no issues found" error object carries no id ⇒ no beads, no throw.
+    expect(parseBeadViews({ error: "no issues found", schema_version: 1 })).toEqual([]);
+    expect(parseBeadViews([null, 7, "x", { id: "bd-12" }]).map((bead) => bead.id)).toEqual([
+      "bd-12",
+    ]);
+    expect(parseBeadViews(undefined)).toEqual([]);
+  });
+
+  it("requests one lookup for valid, unique task ids only", () => {
+    const status = statusOf([
+      sampleMember({ worktreePath: "/repo.feat-bd-15", workflow: okWorkflow({ taskId: "bd-15" }) }),
+      sampleMember(),
+      sampleMember({ worktreePath: "/repo.dup", workflow: okWorkflow({ taskId: "bd-12" }) }),
+      // Not a task id shape: it must never reach bd argv (a leading `-` would be a flag).
+      sampleMember({ worktreePath: "/repo.flag", workflow: okWorkflow({ taskId: "--json" }) }),
+      sampleMember({ worktreePath: "/repo.none", workflow: { kind: "missing" } }),
+    ]);
+
+    expect(fleetBeadTaskIds(status)).toEqual(["bd-12", "bd-15"]);
+    for (const taskId of fleetBeadTaskIds(status)) expect(isValidTaskId(taskId)).toBe(true);
+    expect(fleetBeadTaskIds(statusOf([]))).toEqual([]);
+  });
+
+  it("attaches metadata by task id, case-insensitively, without reordering members", () => {
+    const status = statusOf([
+      sampleMember(),
+      sampleMember({ worktreePath: "/repo.feat-bd-15", workflow: okWorkflow({ taskId: "bd-15" }) }),
+    ]);
+
+    const enriched = applyFleetBeadLookup(status, {
+      ok: true,
+      beads: [{ id: "BD-12", title: "Fix login", status: "open", priority: 1, labels: [] }],
+    });
+
+    expect(enriched.members.map((member) => member.taskId)).toEqual(["bd-12", "bd-15"]);
+    expect(enriched.members[0]?.bead).toHaveProperty("title", "Fix login");
+    expect(enriched.members[1]?.bead).toBe(undefined);
+    // bd answered one of the two ids: exactly one bounded warning names the gap.
+    expect(enriched.warnings).toHaveLength(status.warnings.length + 1);
+    expect(enriched.warnings.at(-1)).toHaveProperty("kind", "bead-metadata-missing");
+    expect(enriched.warnings.at(-1)?.message).toContain("bd-15");
+    expect(enriched.warnings.at(-1)?.message).toContain("1 of 2");
+    expect(formatFleetStatus(enriched)).toContain("  bead: Fix login (open)");
+  });
+
+  it("renders an unknown bead status and title without crashing", () => {
+    const enriched = applyFleetBeadLookup(statusOf([sampleMember()]), {
+      ok: true,
+      beads: [
+        { id: "bd-12", title: undefined, status: undefined, priority: undefined, labels: [] },
+      ],
+    });
+
+    expect(formatFleetStatus(enriched)).toContain("  bead: (no title) (status unknown)");
+  });
+
+  it("degrades to no bead metadata with exactly one fleet-level warning", () => {
+    const status = statusOf([
+      sampleMember(),
+      sampleMember({
+        worktreePath: "/repo.feat-bd-15",
+        branch: "feat/bd-15",
+        workflow: okWorkflow({ taskId: "bd-15", branch: "feat/bd-15" }),
+      }),
+    ]);
+
+    const degraded = applyFleetBeadLookup(status, { ok: false, error: "no beads database found" });
+
+    expect(degraded.members.map((member) => member.bead)).toEqual([undefined, undefined]);
+    expect(degraded.warnings).toHaveLength(1);
+    expect(degraded.warnings[0]).toHaveProperty("kind", "bead-metadata-unavailable");
+    expect(degraded.warnings[0]?.message).toContain("no beads database found");
+    // one warning for the fleet, never one per member
+    expect(formatFleetStatus(degraded)).toContain("Warnings (1):");
+  });
+
+  it("bounds a runaway bd error message into one line", () => {
+    const degraded = applyFleetBeadLookup(statusOf([sampleMember()]), {
+      ok: false,
+      error: `${"x".repeat(10_000)}\nsecond line`,
+    });
+
+    const message = degraded.warnings[0]?.message ?? "";
+    expect(message.length).toBeLessThan(400);
+    expect(message).not.toContain("\n");
+    expect(message).toContain("…");
+  });
+
+  it("warns once when a successful lookup matches none of the expected ids", () => {
+    const status = statusOf([sampleMember()]);
+    // bd wrapping its records in an envelope flattens to no beads; silence here
+    // would make that shape drift invisible in the fleet view.
+    const unchanged = applyFleetBeadLookup(status, { ok: true, beads: [] });
+
+    expect(unchanged.members[0]?.bead).toBe(undefined);
+    expect(unchanged.warnings).toHaveLength(1);
+    expect(unchanged.warnings[0]).toHaveProperty("kind", "bead-metadata-missing");
+    expect(unchanged.warnings[0]?.message).toContain("1 of 1");
+    expect(formatFleetStatus(unchanged)).not.toContain("  bead: ");
+    expect(formatFleetStatus(unchanged)).toContain("bd returned no record");
+  });
+
+  it("bounds the missing-id warning and stays quiet when every id matched", () => {
+    const status = statusOf([
+      sampleMember(),
+      ...Array.from({ length: 12 }, (_, index) =>
+        sampleMember({
+          worktreePath: `/repo.feat-bd-${100 + index}`,
+          workflow: okWorkflow({ taskId: `bd-${100 + index}`, branch: `feat/bd-${100 + index}` }),
+        }),
+      ),
+    ]);
+
+    const missing = applyFleetBeadLookup(status, { ok: true, beads: [] });
+    const message = missing.warnings.at(-1)?.message ?? "";
+    expect(message).toContain("13 of 13");
+    expect(message).toContain("+8 more");
+    expect(message.length).toBeLessThan(400);
+
+    const allMatched = applyFleetBeadLookup(statusOf([sampleMember()]), {
+      ok: true,
+      beads: [
+        { id: "bd-12", title: undefined, status: undefined, priority: undefined, labels: [] },
+      ],
+    });
+    expect(allMatched.warnings).toEqual([]);
   });
 });
 
