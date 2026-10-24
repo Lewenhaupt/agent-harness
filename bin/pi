@@ -15,6 +15,15 @@
 # local: edits to extensions/ take effect on the next pi start, with no push
 # + OS rebuild.
 #
+# The -e list is DERIVED, never hand-maintained:
+# - harness entry points come from package.json `pi.extensions`;
+# - third-party entry points come from nix/pi-extensions/package.json
+#   `piExtensions`, resolved against $BELAYD_PI_EXTENSIONS_DIR (the Nix-built
+#   node_modules tree the devShell exports).
+# When that tree is absent (running outside the devShell) the third-party set
+# falls back to npm specs with a warning, because pi can only resolve those
+# from the registry.
+#
 # `.envrc` captures the real pi path in PI_WRAPPER_REAL_PI before prepending
 # bin/ to PATH, so this script never re-executes itself.
 set -euo pipefail
@@ -37,26 +46,58 @@ case "${1:-}" in
     ;;
 esac
 
-# Run mode: -ne disables extension discovery and built-in extensions, then the
-# repo-local extensions are re-added explicitly with -e.
-# Third-party npm extensions need a matching -e npm:<pkg> line here; note
-# that -ne does NOT affect models.json custom providers (e.g. LLM Gateway via
-# ~/.pi/agent/models.json) — those load regardless of extension discovery.
-#
-# The npm: source resolves at runtime: pi fetches the package once from the
-# registry into ~/.pi/agent/npm and caches it afterwards. It is pinned to the
-# same 0.9.2 the Nix pi-extensions tree ships. With PI_OFFLINE=1 (or no
-# registry access) the fetch cannot happen and the extension is silently
-# absent — accepted for this dev wrapper, because the configured belayd-pi
-# binary and pi-web runtime get the extension from the Nix store instead.
-# The run-mode flags are all placed BEFORE the user args on purpose: pi treats
-# the first positional as the prompt, so the user's prompt/args must stay last.
-exec "$real_pi" -ne \
-  -e "$repo_dir/extensions/index.ts" \
-  -e "$repo_dir/extensions/bootstrap.ts" \
-  -e "$repo_dir/extensions/honcho-memory.ts" \
-  -e "$repo_dir/extensions/llmgateway-refresh.ts" \
-  -e "$repo_dir/extensions/stale-file-guard.ts" \
-  -e "$repo_dir/extensions/worktree-guard.ts" \
-  -e npm:pi-agent-browser-native@0.9.2 \
-  "$@"
+# Resolve extension entry points from the two manifests. Node is always present
+# (pi itself is a node program), so this needs no jq.
+extension_args="$(
+  node - "$repo_dir" "${BELAYD_PI_EXTENSIONS_DIR:-}" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const [repoDir, thirdPartyDir] = process.argv.slice(2);
+
+const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+const harnessManifest = readJson(path.join(repoDir, "package.json"));
+const thirdPartyManifest = readJson(path.join(repoDir, "nix/pi-extensions/package.json"));
+
+const args = [];
+const missing = [];
+
+for (const entry of harnessManifest.pi?.extensions ?? []) {
+  const rel = entry.replace(/^\.\//, "");
+  const abs = path.join(repoDir, rel);
+  if (!fs.existsSync(abs)) missing.push(abs);
+  args.push("-e", abs);
+}
+
+const entries = thirdPartyManifest.piExtensions ?? {};
+const deps = thirdPartyManifest.dependencies ?? {};
+const thirdPartyRoot =
+  thirdPartyDir !== "" && fs.existsSync(thirdPartyDir) ? thirdPartyDir : undefined;
+
+for (const [name, entryPath] of Object.entries(entries)) {
+  if (thirdPartyRoot !== undefined) {
+    const abs = path.join(thirdPartyRoot, name, entryPath);
+    if (!fs.existsSync(abs)) missing.push(abs);
+    args.push("-e", abs);
+    continue;
+  }
+  // No Nix-built tree: fall back to the registry spec from the manifest.
+  const spec = deps[name] ?? "latest";
+  process.stderr.write(
+    `pi: BELAYD_PI_EXTENSIONS_DIR is unset or missing; loading ${name}@${spec} from npm ` +
+      "(start pi inside the devShell for the pinned, offline tree)\n",
+  );
+  args.push("-e", `npm:${name}@${spec}`);
+}
+
+if (missing.length > 0) {
+  process.stderr.write(`pi: manifest names missing extension paths:\n  ${missing.join("\n  ")}\n`);
+  process.exit(1);
+}
+process.stdout.write(args.join("\n"));
+NODE
+)"
+
+# mapfile keeps paths with spaces intact (word splitting would break them).
+mapfile -t ext_args <<<"$extension_args"
+
+exec "$real_pi" -ne "${ext_args[@]}" "$@"

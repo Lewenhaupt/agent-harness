@@ -69,6 +69,17 @@ belayd-agent-harness/
 - Extensions in `extensions/` are loaded directly by pi via `pi install -l`, which transpiles TypeScript on load (jiti); they import from `../src/*.js` source, not `dist/`. `dist/` exists only for library consumers.
 - `@earendil-works/pi-coding-agent` and `typebox` are listed as `peerDependencies` (pi provides them at runtime). The `pi-coding-agent` range (`^1.0.0`) must stay compatible with the flake's `pi-bare` version; it only needs to move on a major bump or when a newly adopted API has a higher minor floor.
 
+### pi packaging (`docs/packaging.md`)
+
+Which extensions a session loads is defined in exactly two manifests: `package.json`
+`pi.extensions`/`pi.skills` (the harness's own entry points) and
+`nix/pi-extensions/package.json` `piExtensions` (third-party entry paths, beside
+their dependency specs). `bin/pi`, the flake's `belayd-pi` wrapper and the
+manifest tests all derive from those two files — never add a third list. The
+spawned-agent binary resolves through `BELAYD_PI_BINARY` → `PI_BINARY_PATH` →
+system pi and logs when it falls back, because the binary decides the tool set;
+`belayd_doctor` prints the effective surface for the current session.
+
 ### Nix dependency bundling (`belayd-harness`)
 
 The flake's `belayd-harness` derivation bundles every `dependencies` entry from

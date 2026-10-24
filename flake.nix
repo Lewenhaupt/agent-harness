@@ -39,6 +39,7 @@
           pi-web-runtime-env = self.packages.${system}.pi-web-runtime-env;
           belayd-shell = self.packages.${system}.belayd-shell;
           belayd-harness = self.packages.${system}.belayd-harness;
+          pi-extensions = self.packages.${system}.pi-extensions;
           gccLib = belaydPkgs.stdenv.cc.cc.lib;
           cacert = belaydPkgs.cacert.out;
 
@@ -90,6 +91,12 @@
             # Spawned agent sessions see this; the archify wrapper exports it
             # too, but the runtime env is what reaches the agent's shell.
             "ARCHIFY_HOME=${archify}/libexec/archify"
+            # Node_modules tree for the third-party pi extensions. bin/pi builds
+            # its -e list from ./package.json pi.extensions plus the
+            # nix/pi-extensions manifest, resolved against this directory, so
+            # the dev loop loads the same extension set as the baked binary
+            # without a runtime `npm install`.
+            "BELAYD_PI_EXTENSIONS_DIR=${pi-extensions}/lib/node_modules/pi-extensions/node_modules"
           ]
           # XDG_RUNTIME_DIR is still useful for tools inside sessions (dbus,
           # ssh-agent), but it is only set when the uid is known: systemd only
@@ -788,6 +795,25 @@
           dontNpmBuild = true;
         };
 
+        # Single source of truth for which pi extensions this repo loads, for
+        # both consumers (this flake's `pi` wrapper and bin/pi). The lists used
+        # to be hand-maintained in four places, which is how the repo dev loop
+        # ended up with a different tool set than the baked binary.
+        #
+        # - harness entry points come from package.json `pi.extensions`;
+        # - third-party entry points come from nix/pi-extensions/package.json
+        #   `piExtensions` (package name -> entry path inside that package).
+        piExtensionManifest = pkgs.lib.importJSON ./nix/pi-extensions/package.json;
+        harnessPiManifest = pkgs.lib.importJSON ./package.json;
+        thirdPartyExtensionsDir =
+          "${pi-extensions}/lib/node_modules/pi-extensions/node_modules";
+        harnessExtensionPaths = map (
+          entry: "${belayd-harness}/${pkgs.lib.removePrefix "./" entry}"
+        ) (harnessPiManifest.pi.extensions or [ ]);
+        thirdPartyExtensionPaths = pkgs.lib.mapAttrsToList (
+          name: entryPath: "${thirdPartyExtensionsDir}/${name}/${entryPath}"
+        ) (piExtensionManifest.piExtensions or { });
+
         # Directory artifact for the pi-web orchestrator, which discovers
         # extensions from ~/.pi/agent/extensions/ instead of taking explicit
         # --extension flags. pi's discovery reads package.json `pi.extensions`
@@ -825,20 +851,9 @@
                 # Keep the llm-agents pi build as the base binary; pi.nix only
                 # supplies the wrapper-generation logic here (no pi.cachix.org).
                 package = pi-bare;
-                extensions = [
-                  "${belayd-harness}/extensions/index.ts"
-                  "${belayd-harness}/extensions/bootstrap.ts"
-                  "${belayd-harness}/extensions/honcho-memory.ts"
-                  "${belayd-harness}/extensions/llmgateway-refresh.ts"
-                  "${belayd-harness}/extensions/stale-file-guard.ts"
-                  "${belayd-harness}/extensions/worktree-guard.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-exa/src/index.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-ast-grep/src/index.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-vision-tool/extensions/vision-tool.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@plannotator/pi-extension/index.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/@robhowley/pi-openrouter/extensions/openrouter/index.ts"
-                  "${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native/dist/extensions/agent-browser/index.js"
-                ];
+                extensions =
+                  harnessExtensionPaths
+                  ++ thirdPartyExtensionPaths;
                 skills = [ belayd-skills ];
                 models = ./models.json;
                 settings = {
@@ -1024,6 +1039,9 @@
             # binary via this var (src/spawn.ts) and would otherwise pick the
             # global /run/current-system/sw/bin/pi and dual-load extensions.
             export PI_BINARY_PATH="''${PWD}/bin/pi"
+            # Third-party pi extensions resolve from the Nix-built tree, so
+            # bin/pi never fetches from the npm registry at startup.
+            export BELAYD_PI_EXTENSIONS_DIR="${thirdPartyExtensionsDir}"
           '';
         };
       }

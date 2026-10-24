@@ -75,14 +75,18 @@ describe("bd-68: agent-browser extension wiring", () => {
     expect(flakeContents).toContain("packages = devShellTools ++ [");
   });
 
-  it("loads the extension explicitly in the configured belayd-pi binary", () => {
-    if (flakeContents === null) {
-      throw new Error(`could not read flake.nix at ${flakePath}`);
+  it("loads the extension through the derived manifest list in belayd-pi", () => {
+    if (flakeContents === null || packageJsonContents === null) {
+      throw new Error("could not read flake.nix or nix/pi-extensions/package.json");
     }
-    // -ne disables discovery, so the store-path entry must be in the explicit list.
-    expect(flakeContents).toContain(
-      "pi-agent-browser-native/dist/extensions/agent-browser/index.js",
+    // bd-131: the entry path lives in the manifest next to its dependency, and
+    // flake.nix derives the -e list from it. -ne still disables discovery, so
+    // the derived list is the only thing that loads extensions.
+    expect(packageJsonContents).toContain(
+      '"pi-agent-browser-native": "dist/extensions/agent-browser/index.js"',
     );
+    expect(flakeContents).toContain("piExtensionManifest.piExtensions");
+    expect(flakeContents).toContain("thirdPartyExtensionPaths");
   });
 
   it("exports pi-agent-browser-extension for the pi-web orchestrator symlink", () => {
@@ -105,11 +109,16 @@ describe("bd-68: agent-browser extension wiring", () => {
     );
   });
 
-  it("loads the npm package in the isolated repo-dev wrapper", () => {
+  it("resolves the package from the Nix tree in the isolated repo-dev wrapper", () => {
     if (binPiContents === null) {
       throw new Error(`could not read bin/pi at ${binPiPath}`);
     }
-    expect(binPiContents).toContain("-e npm:pi-agent-browser-native@0.9.2");
+    // bd-131: bin/pi no longer pins an npm spec at runtime (that fetch silently
+    // produced a smaller tool set under PI_OFFLINE=1); it reads the manifest and
+    // resolves against the store tree the devShell exports.
+    expect(binPiContents).toContain("BELAYD_PI_EXTENSIONS_DIR");
+    expect(binPiContents).toContain("nix/pi-extensions/package.json");
+    expect(binPiContents).not.toContain("-e npm:pi-agent-browser-native@0.9.2");
   });
 });
 
