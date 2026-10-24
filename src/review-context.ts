@@ -606,3 +606,39 @@ export function formatReviewTask(options: FormatReviewTaskOptions): string {
   lines.push(...outputContractLines(), "", "## Task", options.paramsTask);
   return lines.join("\n");
 }
+
+/** Findings per severity in one review delivery. */
+export interface ReviewFindingCounts {
+  critical: number;
+  warnings: number;
+  suggestions: number;
+}
+
+/**
+ * Count the findings bullets a review reported, per severity section.
+ *
+ * Used by the metrics log (bd-140): "did this review find anything, and how
+ * serious was it" is the signal that tells us whether the review phase earns its
+ * keep. A `None` body counts as zero, and the bounding markers this module
+ * appends are not findings.
+ */
+export function countReviewFindings(text: string): ReviewFindingCounts {
+  const counts: ReviewFindingCounts = { critical: 0, warnings: 0, suggestions: 0 };
+  let current: ReviewSeverity | undefined;
+  for (const line of text.split("\n")) {
+    const severity = severityOfHeading(line);
+    if (severity !== undefined) {
+      current = severity;
+      continue;
+    }
+    if (current === undefined) continue;
+    if (isHeading(line)) {
+      current = undefined;
+      continue;
+    }
+    if (!isBullet(line)) continue;
+    if (isBoundMarkerNote(line)) continue;
+    counts[current] += 1;
+  }
+  return counts;
+}
