@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { gateStaticValidation } from "../quality-gates.js";
 import {
   getPhasesForType,
   isValidWorkflowType,
@@ -75,9 +76,40 @@ describe("WORKFLOW_REGISTRY", () => {
     expect(WORKFLOW_REGISTRY.feature.consultPhases).toEqual(["scout", "plan"]);
   });
 
-  it("chore has 4 phases with no proof", () => {
-    expect(WORKFLOW_REGISTRY.chore.phases).toEqual(["plan", "implement", "test", "commit"]);
+  it("chore is implement/test/commit with planning consultable (bd-139)", () => {
+    expect(WORKFLOW_REGISTRY.chore.phases).toEqual(["implement", "test", "commit"]);
+    expect(WORKFLOW_REGISTRY.chore.consultPhases).toEqual(["scout", "plan"]);
     expect(WORKFLOW_REGISTRY.chore.proofRequired).toBe(false);
+  });
+
+  it("refactor no longer writes a user guide (bd-139)", () => {
+    expect(WORKFLOW_REGISTRY.refactor.phases).toEqual([
+      "implement",
+      "review",
+      "test",
+      "proof",
+      "commit",
+    ]);
+    expect(WORKFLOW_REGISTRY.refactor.phases).not.toContain("userguide");
+  });
+
+  it("documentation is implement/commit with no proof phase (bd-139)", () => {
+    expect(WORKFLOW_REGISTRY.documentation.phases).toEqual(["implement", "commit"]);
+    expect(WORKFLOW_REGISTRY.documentation.proofRequired).toBe(false);
+  });
+
+  it("runs the test suite once: a test phase means the implement gate is static", () => {
+    // bd-139: the suite used to run in the implement gate AND again in the test
+    // gate. Every workflow with a test phase must delegate the run to it; a
+    // workflow without one keeps the full validation on implement.
+    for (const type of Object.keys(WORKFLOW_REGISTRY) as Array<keyof typeof WORKFLOW_REGISTRY>) {
+      const config = WORKFLOW_REGISTRY[type];
+      if (!config.phases.includes("test")) continue;
+      expect(resolveQualityGate("implement", type), `${type} still runs tests twice`).toBe(
+        gateStaticValidation,
+      );
+    }
+    expect(resolveQualityGate("implement", "documentation")).toBeUndefined();
   });
 
   it("hotfix skips scout and plan", () => {
@@ -293,7 +325,7 @@ describe("getPhasesForType", () => {
   });
 
   it("returns correct phases for chore", () => {
-    expect(getPhasesForType("chore")).toEqual(["plan", "implement", "test", "commit"]);
+    expect(getPhasesForType("chore")).toEqual(["implement", "test", "commit"]);
   });
 
   it("returns correct phases for hotfix", () => {
@@ -301,7 +333,7 @@ describe("getPhasesForType", () => {
   });
 
   it("returns correct phases for documentation", () => {
-    expect(getPhasesForType("documentation")).toEqual(["implement", "proof", "commit"]);
+    expect(getPhasesForType("documentation")).toEqual(["implement", "commit"]);
   });
 
   it("returns correct phases for bugfix", () => {
@@ -379,10 +411,8 @@ describe("resolveQualityGate", () => {
   });
 
   it("resolves gate for a phase with gateOverrides", () => {
-    // Use hotfix which has agentOverrides for implement but not gateOverrides
-    // hotfix implement has model override but no qualityGate in agentOverrides
-    // result should be undefined since there's no gate
-    const result = resolveQualityGate("implement", "hotfix");
-    expect(result).toBeUndefined();
+    // hotfix overrides the implement gate (bd-139) and still carries a model
+    // override, so the gate must come from gateOverrides, not the agent default.
+    expect(resolveQualityGate("implement", "hotfix")).toBe(gateStaticValidation);
   });
 });

@@ -9,7 +9,7 @@ import { exec } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import type { GateOptions, GateResult, SpawnDetails } from "./agent-registry.js";
+import type { GateOptions, GateResult, QualityGate, SpawnDetails } from "./agent-registry.js";
 import { cleanTerminalOutput, parseCast } from "./cast-utils.js";
 import {
   checkPathTraversal,
@@ -798,33 +798,67 @@ export async function gateProofContent(
 }
 
 /**
- * Combined quality gate: typecheck + lint + test.
+ * Run gates in order, collecting every failure.
+ *
+ * Both combined gates share this so a failure message names each check the same
+ * way, and so adding a check is a one-line change in the caller.
  */
+async function runGateSequence(options: {
+  output: string;
+  details: SpawnDetails;
+  gateOptions?: GateOptions;
+  gates: ReadonlyArray<{ name: string; gate: QualityGate }>;
+}): Promise<GateResult> {
+  const failures: string[] = [];
+  for (const { name, gate } of options.gates) {
+    const result = await gate(options.output, options.details, options.gateOptions);
+    if (!result.passed) failures.push(`### ${name}\n${result.feedback ?? "Failed"}`);
+  }
+  if (failures.length === 0) return { passed: true };
+  return {
+    passed: false,
+    feedback: `**Quality gates failed:**\n\n${failures.join("\n\n")}`,
+  };
+}
+
+/**
+ * Static validation: typecheck + lint, no test run.
+ *
+ * The implement phase uses this when the workflow has a later `test` phase
+ * (bd-139): the suite used to run twice per workflow — once in the implement
+ * gate and again in the test gate — for no extra signal. Workflows with no test
+ * phase keep gateFullValidation, which is then the only chance to run it.
+ */
+export async function gateStaticValidation(
+  output: string,
+  details: SpawnDetails,
+  options?: GateOptions,
+): Promise<GateResult> {
+  return runGateSequence({
+    output,
+    details,
+    gateOptions: options,
+    gates: [
+      { name: "typecheck", gate: gateTypecheck },
+      { name: "lint", gate: gateLint },
+    ],
+  });
+}
+
+/** Combined quality gate: typecheck + lint + test. */
 export async function gateFullValidation(
   output: string,
   details: SpawnDetails,
   options?: GateOptions,
 ): Promise<GateResult> {
-  const gates = [
-    { name: "typecheck", gate: gateTypecheck },
-    { name: "lint", gate: gateLint },
-    { name: "tests", gate: gateTests },
-  ];
-
-  const failures: string[] = [];
-  for (const { name, gate } of gates) {
-    const result = await gate(output, details, options);
-    if (!result.passed) {
-      failures.push(`### ${name}\n${result.feedback ?? "Failed"}`);
-    }
-  }
-
-  if (failures.length === 0) {
-    return { passed: true };
-  }
-
-  return {
-    passed: false,
-    feedback: `**Quality gates failed:**\n\n${failures.join("\n\n")}`,
-  };
+  return runGateSequence({
+    output,
+    details,
+    gateOptions: options,
+    gates: [
+      { name: "typecheck", gate: gateTypecheck },
+      { name: "lint", gate: gateLint },
+      { name: "tests", gate: gateTests },
+    ],
+  });
 }
