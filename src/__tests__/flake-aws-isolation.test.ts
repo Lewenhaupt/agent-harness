@@ -92,7 +92,11 @@ describe("bd-125: flake AWS isolation wiring", () => {
     expect(sessiond).toContain(`"${nixInterp("pkgs.bubblewrap")}/bin/bwrap"`);
     expect(sessiond).toContain('"--unshare-user"');
     expect(sessiond).toContain('"--die-with-parent"');
-    expect(sessiond).toContain('"--ro-bind"');
+    // A writable base, not `--ro-bind / /`: the daemon writes its ownership
+    // marker and socket into the data dir, and sessions must write their
+    // worktrees and /tmp. The AWS mask is the security boundary.
+    expect(sessiond).toContain('"--bind"');
+    expect(sessiond).not.toContain('"--ro-bind"');
     expect(sessiond).toContain('"--tmpfs"');
     expect(sessiond).toContain(`"${nixInterp("userHome")}/.aws"`);
     expect(sessiond).toContain(`"${nixInterp("userHome")}/.config/aws"`);
@@ -126,11 +130,13 @@ describe("bd-125: flake AWS isolation wiring", () => {
     expect(broker).not.toContain("--tmpfs");
   });
 
-  it("pre-creates both mask destinations before the session daemon starts", () => {
+  it("pre-creates the mask and data destinations before the session daemon starts", () => {
     const setup = sliceBetween("piWebSessiondSetup = pkgs.writeShellScriptBin", "'';");
     expect(setup).toContain("install -d -m 0700");
     expect(setup).toContain(`${nixInterp("userHome")}/.aws`);
     expect(setup).toContain(`${nixInterp("userHome")}/.config/aws`);
+    // The writable state dir must exist before the daemon claims ownership.
+    expect(setup).toContain(`install -d -m 0700 ${nixInterp("lib.escapeShellArg dataDir")}`);
   });
 
   it("exports XDG_RUNTIME_DIR and the shim wrapper to both units", () => {
@@ -148,11 +154,14 @@ describe("bd-125: flake AWS isolation wiring", () => {
     expect(flake()).toContain('awsRuntimeBaseDir = "/run/belayd/aws";');
   });
 
-  it("derives the uid without throwing for an undeclared service user", () => {
+  it("derives the uid without throwing and only warns for an undeclared user", () => {
     // A raw `.uid` selection throws at eval time and takes the whole rebuild
-    // down; `or null` plus a warning degrades to "no XDG_RUNTIME_DIR".
+    // down; `or null` plus a warning degrades to "no XDG_RUNTIME_DIR". A null
+    // uid is also the normal `isNormalUser` shape, so the warning keys off the
+    // declared attribute, not the uid.
     expect(flake()).toContain(`userUid = config.users.users.${nixInterp("cfg.user")}.uid or null;`);
-    expect(flake()).toContain("warnings = lib.optional (userUid == null)");
+    expect(flake()).toContain("userDeclared = builtins.hasAttr cfg.user config.users.users;");
+    expect(flake()).toContain("warnings = lib.optional (!userDeclared)");
     expect(flake()).toContain('lib.optional (userUid != null) "XDG_RUNTIME_DIR=/run/user/');
   });
 

@@ -30,7 +30,7 @@ Per-repo (agent) sandbox, built by `src/aws-broker/scope.ts`
 ```
 bwrap
   --unshare-user --die-with-parent --new-session
-  --ro-bind / / --dev-bind /dev /dev --proc /proc
+  --bind / / --dev-bind /dev /dev --proc /proc
   --tmpfs $HOME/.aws
   --tmpfs $HOME/.config/aws
   --tmpfs <allowlist dir mask>                # only when the allowlist says so
@@ -49,13 +49,13 @@ bwrap
 | `--unshare-user` | The only namespace we unshare. It makes a same-uid `/proc/<pid>/environ` read from a sibling process outside the sandbox fail, which is what protects credentials from another agent process. |
 | `--die-with-parent` | A killed session must not leave an orphan holding the scope socket. |
 | `--new-session` | New session (no controlling tty) so a sandboxed process cannot inject input into the parent's terminal. |
-| `--ro-bind / /` | Base view. **Must come first**: bubblewrap applies mounts in argv order, so a later `--ro-bind / /` would silently unmask everything above it. Unit-tested. |
+| `--bind / /` | Writable base view. **Must come first**: bubblewrap applies mounts in argv order, so a later base bind would silently unmask everything above it. Writable on purpose: a coding agent must write its worktree and `/tmp`, so a read-only base would make every `git`/`bd`/`nix` command fail with `EROFS` (and crash the session daemon before it can create its socket). The mask, not a read-only root, is the AWS security boundary. Unit-tested. |
 | `--dev-bind /dev /dev`, `--proc /proc` | `/dev/null`, `/dev/tty`, and `/proc/self` keep working; `ps`/`git`/`nix` need them. |
 | `--tmpfs $HOME/.aws` | The SSO cache is a *directory*, so `--tmpfs` is correct. (`--ro-bind /dev/null <dir>` is not, and `--ro-bind /dev/null <file>` reads `EACCES`, not EOF.) |
 | `--tmpfs $HOME/.config/aws` | Any second AWS config location is masked too. |
 | `--tmpfs <dir>` / `--ro-bind /dev/null <file>` per allowlist `mask:` entry | Operator-chosen extra masks, chiefly the x509 certificate and private key of an IAM RolesAnywhere `credential_process` profile: the broker must read them, so they cannot live under `~/.aws`, and an agent that can read them can call `aws_signing_helper` itself and bypass the allowlist. Directories become a tmpfs; a regular file becomes a `/dev/null` bind, which reads `EACCES` on open (never EOF and never an empty file that looks like an empty key). Paths are `realpath()`-resolved, and any unusable entry refuses the whole scope. Shapes, resolution, and the full refusal list: [Mask entries](#mask-entries). |
 | `--tmpfs <runtimeBase>` | `<runtimeBase>` is where the broker keeps the control socket and every scope dir (`BELAYD_AWS_RUNTIME_BASE_DIR`, else `<XDG_RUNTIME_DIR>/belayd/aws`). Masking it removes the control socket ("ensure any scope") and every *other* repo's scope socket, then the next line re-exposes only this one. This mask — not socket mode 0600, which is meaningless between same-uid processes — is what makes per-repo scoping real. |
-| `--ro-bind <scopeDir> <scopeDir>` | Re-exposes this worktree's scope dir (shim, synthetic config, socket). The destination lives inside the tmpfs, so bubblewrap can create it even though `/` is read-only. |
+| `--ro-bind <scopeDir> <scopeDir>` | Re-exposes this worktree's scope dir (shim, synthetic config, socket). The destination lives inside the tmpfs, so bubblewrap can create it without relying on a writable host destination. |
 | `--ro-bind <scopeDir>/aws/config $HOME/.aws/config` | The only profile the agent can see: `[profile agent]` with a `credential_process`. |
 | `--setenv BELAYD_SANDBOX_ACTIVE 1` | Makes nested wraps no-ops (`spawn.ts` and `belayd-shell.sh` both check it). |
 | `--unsetenv AWS_ACCESS_KEY_ID …` | Drops every inherited credential source (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_SECURITY_TOKEN`, `AWS_DEFAULT_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, the two `AWS_CONTAINER_CREDENTIALS_*` keys) *inside* the sandbox, so a launcher that forgot to scrub (or a hand-run argv) still cannot pass env-var credentials through. `AWS_PROFILE` is deliberately not unset — the sandbox sets it to the synthetic profile. |
@@ -68,16 +68,17 @@ Deliberately **not** used:
   for the credential property that matters.
 - `--not-a-security-boundary` (self-defeating) and `--disable-userns` (would
   break nesting).
-- `/run/belayd-aws` as the mount point: bubblewrap cannot create a mount
-  destination under a read-only `/` (`Can't create file …: Read-only file
-  system`), and `/run/belayd-aws` cannot be pre-created by an unprivileged
-  `ExecStartPre`. The scope dir is therefore re-exposed at its own host path,
-  which also means the same absolute socket path is valid inside and outside.
+- `/run/belayd-aws` as the mount point: an unprivileged service user cannot
+  create a directory directly under the root-owned `/run`, and
+  `ExecStartPre` cannot either. The scope dir is therefore re-exposed at its
+  own host path, which also means the same absolute socket path is valid inside
+  and outside.
 
-`--tmpfs` destinations must **exist** on the host (bubblewrap cannot create a
-mount point under a read-only `/`). The plan resolver creates `<runtimeBase>`,
-`~/.aws`, and `~/.config/aws` (0700) and turns any failure into an
-`unavailable` result rather than throwing; the systemd broker unit's
+`--tmpfs` destinations are **pre-created** on the host by the plan resolver
+(`<runtimeBase>`, `~/.aws`, and `~/.config/aws`, mode 0700). A writable base
+would let bubblewrap create a missing destination itself, but pre-creating
+keeps the mask shape independent of who wins the race and turns any failure
+into an `unavailable` result rather than throwing; the systemd broker unit's
 `RuntimeDirectory` creates the runtime base, and the session daemon's
 `ExecStartPre` creates the two `$HOME` masks for its static argv.
 
@@ -264,9 +265,11 @@ role ARNs instead.
 ## NixOS module wiring
 
 - `pi-web-sessiond` runs under
-  `bwrap --unshare-user --die-with-parent --ro-bind / / --dev-bind /dev /dev
+  `bwrap --unshare-user --die-with-parent --bind / / --dev-bind /dev /dev
   --proc /proc --tmpfs <home>/.aws --tmpfs <home>/.config/aws --
-  <pi-web>/bin/pi-web-sessiond`.
+  <pi-web>/bin/pi-web-sessiond`. The base is writable so the daemon can write
+  `sessiond-owner.json` and `sessiond.sock` into its data dir; the AWS mask is
+  what isolates credentials.
   It deliberately does **not** set `BELAYD_SANDBOX_ACTIVE`, so an agent spawned
   inside it still resolves its own (stricter) per-repo scope as a nested
   sandbox. It also has no `--unsetenv`: a systemd system unit does not inherit
@@ -906,7 +909,7 @@ systemctl show pi-web-sessiond -p ExecStart
 
 Expected: three `active` lines; `ExecStart` contains
 `/nix/store/<hash>-bubblewrap-*/bin/bwrap --unshare-user --die-with-parent
---ro-bind / / --dev-bind /dev /dev --proc /proc --tmpfs <home>/.aws
+--bind / / --dev-bind /dev /dev --proc /proc --tmpfs <home>/.aws
 --tmpfs <home>/.config/aws -- /nix/store/<hash>-pi-web-*/bin/pi-web-sessiond`.
 
 Failure: `ExecStart` without `bwrap` ⇒ the mask is off — either the module is

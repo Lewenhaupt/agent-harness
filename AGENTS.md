@@ -248,9 +248,11 @@ that, both described in `docs/aws-credential-isolation.md`:
 - **bubblewrap masking** at three choke points: every process spawned by
   `src/spawn.ts`, `scripts/belayd-shell.sh` (terminals, plugin `runCommand`),
   and the `pi-web-sessiond` unit itself. Each wraps the command with
-  `bwrap --unshare-user --ro-bind / / … --tmpfs <home>/.aws --tmpfs
+  `bwrap --unshare-user --bind / / … --tmpfs <home>/.aws --tmpfs
   <home>/.config/aws`, so a session sees no SSO cache and cannot run
-  `aws sso login`.
+  `aws sso login`. The base is writable (not `--ro-bind`) because agents must
+  write their worktrees and `/tmp`; the AWS mask is the security boundary, and
+  a read-only base breaks `git`/`bd`/`nix` and the session daemon's own state.
 - **per-repo credential broker** (`src/aws-broker/`), a long-running daemon
   (`pi-web-aws-broker`, deliberately *not* sandboxed) that serves one 0600 unix
   socket per repo scope and resolves credentials through `aws configure

@@ -244,7 +244,7 @@ describe("aws-broker plan: resolution", () => {
     ]);
 
     const argv = outcome.plan.argvPrefix;
-    const baseBind = argv.indexOf("--ro-bind");
+    const baseBind = argv.indexOf("--bind");
     const certIndex = argv.indexOf(resolvedCertPath);
     expect(certIndex).toBeGreaterThan(baseBind);
     expect(argv[certIndex - 1]).toBe("/dev/null");

@@ -44,9 +44,16 @@
           cacert = belaydPkgs.cacert.out;
 
           userHome = config.users.users.${cfg.user}.home or "/home/${cfg.user}";
-          # `or null`: the operator may point `user` at a pre-existing system
-          # account that is not declared under `users.users` (a service user
-          # owned by another module, for example). A raw `.uid` selection throws
+          # Declaration is not the same thing as an explicit uid:
+          # `isNormalUser = true` leaves `uid = null` until NixOS assigns one at
+          # build time, so a null uid does NOT mean the account is undeclared.
+          # Check the attribute explicitly so a normal user never trips the
+          # "not declared" warning.
+          userDeclared = builtins.hasAttr cfg.user config.users.users;
+          # `or null`: the operator may also point `user` at a pre-existing
+          # system account that is not declared under `users.users` (a service
+          # user owned by another module, for example), and even a declared
+          # normal user has no explicit uid here. A raw `.uid` selection throws
           # at evaluation time and takes the whole rebuild down with it; the only
           # consumer is XDG_RUNTIME_DIR, and the AWS broker deliberately no
           # longer depends on that path (it uses RuntimeDirectory +
@@ -99,9 +106,10 @@
             "BELAYD_PI_EXTENSIONS_DIR=${pi-extensions}/lib/node_modules/pi-extensions/node_modules"
           ]
           # XDG_RUNTIME_DIR is still useful for tools inside sessions (dbus,
-          # ssh-agent), but it is only set when the uid is known: systemd only
-          # sets it for *user* units, and a service user may not be declared in
-          # users.users at all.
+          # ssh-agent), but it is only set when the uid is explicit at eval time:
+          # systemd only sets it for *user* units, a normal `isNormalUser`
+          # account has `uid = null` here, and a service user may not be
+          # declared in users.users at all.
           ++ lib.optional (userUid != null) "XDG_RUNTIME_DIR=/run/user/${toString userUid}";
 
           # Runs before the session daemon: provision the direnv whitelist and
@@ -109,14 +117,18 @@
           # non-strict by default, so a corrupt direnv.toml/settings.json warns
           # and exits 0 — a broken user config must not block the unit.
           #
-          # It also pre-creates the two AWS mask destinations (bd-125):
-          # bubblewrap cannot create a `--tmpfs` mount point under a read-only
-          # `/`, so both directories must exist on the host before the sandbox
-          # starts, even when the operator has never run `aws sso login`.
+          # It also pre-creates the two AWS mask destinations (bd-125) and the
+          # pi-web data directory, so the sandbox starts even when the operator
+          # has never run `aws sso login` or the web server has not created its
+          # state directory yet.
           piWebSessiondSetup = pkgs.writeShellScriptBin "pi-web-sessiond-setup" ''
             set -euo pipefail
             install -d -m 0700 ${lib.escapeShellArg "${userHome}/.aws"}
             install -d -m 0700 ${lib.escapeShellArg "${userHome}/.config/aws"}
+            # The session daemon writes its ownership marker and unix socket
+            # here before the web server may have created the directory; the
+            # writable bind below needs the destination to exist.
+            install -d -m 0700 ${lib.escapeShellArg dataDir}
             ${belayd-shell}/bin/belayd-direnv-setup \
               --toml ${lib.escapeShellArg "${userHome}/.config/direnv/direnv.toml"} \
               ${lib.concatMapStringsSep " " (
@@ -163,11 +175,14 @@
 
           config = lib.mkIf cfg.enable {
             # Only reachable when `user` is not declared under users.users, so
-            # XDG_RUNTIME_DIR cannot be derived. The AWS broker is unaffected
-            # (RuntimeDirectory + BELAYD_AWS_RUNTIME_BASE_DIR are uid-free); this
-            # warns instead of failing the rebuild.
-            warnings = lib.optional (userUid == null) ''
-              services.belayd-pi-web: user "${cfg.user}" is not declared in users.users, so XDG_RUNTIME_DIR is not set for pi-web-sessiond/pi-web-aws-broker. The AWS broker still works (it uses RuntimeDirectory + BELAYD_AWS_RUNTIME_BASE_DIR); tools inside sessions that rely on XDG_RUNTIME_DIR (dbus, ssh-agent) may not find it.
+            # the service account cannot be resolved and XDG_RUNTIME_DIR cannot
+            # be derived. The AWS broker is unaffected (RuntimeDirectory +
+            # BELAYD_AWS_RUNTIME_BASE_DIR are uid-free); this warns instead of
+            # failing the rebuild. A declared normal user has `uid = null` at
+            # eval time too, but is not warned about: that is the expected
+            # `isNormalUser` shape, not a missing account.
+            warnings = lib.optional (!userDeclared) ''
+              services.belayd-pi-web: user "${cfg.user}" is not declared in users.users, so the service account cannot be resolved and XDG_RUNTIME_DIR is not set for pi-web-sessiond/pi-web-aws-broker. The AWS broker still works (it uses RuntimeDirectory + BELAYD_AWS_RUNTIME_BASE_DIR); tools inside sessions that rely on XDG_RUNTIME_DIR (dbus, ssh-agent) may not find it.
             '';
 
             # The session daemon runs inside a bubblewrap *mask* (bd-125): every
@@ -178,6 +193,13 @@
             # /tmp and host network, so pid/ipc/net stay shared. `--tmpfs` is
             # used (not `--ro-bind /dev/null`) because the SSO cache is a
             # directory; both mount points are pre-created by ExecStartPre.
+            #
+            # The base is `--bind / /`, NOT `--ro-bind / /`: the daemon writes
+            # its ownership marker and unix socket into PI_WEB_DATA_DIR, and
+            # every session it spawns must write its worktree, `/tmp`, `~/.pi`,
+            # and Nix caches. The security boundary is the AWS mask, not a
+            # read-only root; a read-only base makes the daemon crash with
+            # `EROFS ... sessiond-owner.json` before it can bind the socket.
             #
             # Rollback is one line: replace ExecStart with the plain
             # `${pi-web}/bin/pi-web-sessiond`, `nixos-rebuild switch`, then
@@ -206,7 +228,7 @@
                   "${pkgs.bubblewrap}/bin/bwrap"
                   "--unshare-user"
                   "--die-with-parent"
-                  "--ro-bind"
+                  "--bind"
                   "/"
                   "/"
                   "--dev-bind"

@@ -264,6 +264,21 @@ describe("aws sandbox masking (integration, real bwrap)", () => {
     expect(result.stdout).toMatch(/PID\s+1\b/);
   });
 
+  it.skipIf(BWRAP === null)(
+    "keeps the worktree writable (a read-only base breaks git/bd/nix)",
+    () => {
+      // The AWS mask must not cost writability: `--ro-bind / /` makes every
+      // `git`, `bd`, and `nix develop` write fail with EROFS (and crashes the
+      // session daemon before it can create its socket).
+      const probe = join(root, "write-probe");
+      const script = `printf 'written\\n' > ${shellQuote(probe)} && cat ${shellQuote(probe)}`;
+      const result = runSandboxed(["sh", "-c", script]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("written");
+      expect(readFileSync(probe, "utf-8")).toContain("written");
+    },
+  );
+
   it.skipIf(BWRAP === null)("still sees an unrelated host path (the mask is surgical)", () => {
     const marker = join(root, "outside.txt");
     writeFileSync(marker, "reachable\n");
