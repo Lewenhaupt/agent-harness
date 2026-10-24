@@ -83,6 +83,7 @@ describe("validateBdCommand", () => {
       "blocked",
       "prime",
       "memories",
+      "recall",
     ]) {
       const result = validateBdCommand(subcommand);
       expect(result).toHaveProperty("ok", true);
