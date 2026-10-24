@@ -532,6 +532,26 @@ export {
   metricsHostname,
   resolveMetricsDir,
 } from "./metrics.js";
+export type {
+  MetricsQuery,
+  MetricsQueryIo,
+  MetricsQueryResult,
+  MetricsReport,
+  MetricsTable,
+} from "./metrics-query.js";
+export {
+  buildDuckdbArgs,
+  formatMetricsResults,
+  formatMetricsTable,
+  loadMetricsQueries,
+  METRICS_EVENT_NAMES,
+  METRICS_GLOB_TOKEN,
+  parseCsv,
+  parseMetricsQueryFile,
+  parseMetricsTable,
+  renderMetricsSql,
+  runMetricsQueries,
+} from "./metrics-query.js";
 export type { AgentModelSpec, ModelClass } from "./model-classes.js";
 // Model classes & quota-fallback routing
 export {

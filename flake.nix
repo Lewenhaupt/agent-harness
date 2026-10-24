@@ -771,6 +771,10 @@
             # should pass "skills": [] to avoid loading them twice.
             mkdir -p "$out/extensions" "$out/src" "$out/templates" "$out/node_modules" "$out/bin"
             install -m 0644 package.json "$out/package.json"
+            # Metric queries live beside the extension and are read at runtime by
+            # belayd_metrics, so the package output must carry them.
+            mkdir -p "$out/metrics"
+            cp -r metrics/. "$out/metrics/"
             cp -r extensions/. "$out/extensions/"
             cp -r src/. "$out/src/"
             # templates/ must stay a sibling of extensions/ so the bootstrap
