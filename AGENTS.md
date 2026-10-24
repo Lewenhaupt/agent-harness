@@ -406,6 +406,7 @@ The `src/plannotator/signal-protocol.ts` file contains a **SYNC WARNING** block 
 ## Communication
 
 - **Be extremely concise.** When reporting information to me, sacrifice grammar for the sake of concision. Keep responses short but never drop the actual facts — include all relevant facts, omit filler words, pleasantries, and narrative padding.
+- **Match the language of the user's most recent message** — headings and summaries included. Keep code, identifiers, file paths, commands, commit messages and quoted file content exactly as written; never translate them. DeepSeek primaries drift to Chinese output non-deterministically; the static block in `SHARED_AGENT_GUIDANCE` (`src/agent-registry.ts`) is the mitigation — keep it early and never vary it, and never force a reasoning language.
 
 ## Acceptance Criteria
 

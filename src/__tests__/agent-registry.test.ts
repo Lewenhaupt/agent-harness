@@ -481,3 +481,31 @@ describe("RESEARCHER_TOOLS", () => {
     expect(RESEARCHER_TOOLS).not.toContain("write");
   });
 });
+
+describe("language policy (bd-136)", () => {
+  // DeepSeek primaries drift to Chinese output non-deterministically; the
+  // mitigation that holds is a static block present in every prompt. A new agent
+  // that forgets SHARED_AGENT_GUIDANCE would silently lose it.
+  const prompts = [
+    ...DEFAULT_AGENTS.map((agent) => [agent.name, agent.systemPrompt] as const),
+    ["belayd-planning-orchestrator", PLANNING_MODE_SYSTEM_PROMPT] as const,
+    ["belayd-proof-verifier", PROOF_VERIFIER_AGENT.systemPrompt] as const,
+  ];
+
+  it("every agent prompt mirrors the user's language and preserves code verbatim", () => {
+    for (const [name, prompt] of prompts) {
+      expect(prompt, `${name} is missing the language policy`).toContain("## Language");
+      expect(prompt, `${name} does not scope to the user's language`).toContain(
+        "language of the user's most recent message",
+      );
+      expect(prompt, `${name} does not protect verbatim content`).toContain("never translate them");
+    }
+  });
+
+  it("does not force a reasoning language", () => {
+    for (const [, prompt] of prompts) {
+      expect(prompt.toLowerCase()).not.toContain("think in english");
+      expect(prompt.toLowerCase()).not.toContain("think in chinese");
+    }
+  });
+});
