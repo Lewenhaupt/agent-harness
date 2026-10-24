@@ -642,6 +642,20 @@ export {
   matchSessionOwnedWorktree,
   readWorktreeBranch,
 } from "./owned-worktree.js";
+export type {
+  PiBinaryCandidate,
+  PiBinaryEnv,
+  PiBinaryResolution,
+  PiBinarySource,
+} from "./pi-binary.js";
+export {
+  BELAYD_PI_BINARY_ENV,
+  PI_BINARY_PATH_ENV,
+  piBinaryCandidates,
+  piBinaryNotice,
+  resolvePiBinaryPath,
+  SYSTEM_PI_BINARY,
+} from "./pi-binary.js";
 export type { Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,
@@ -766,6 +780,7 @@ export {
   buildSpawnArgs,
   collectSpawnResult,
   launchAgentProcess,
+  resolvePiBinaryResolution,
   spawnAgentProcess,
 } from "./spawn.js";
 export type {
@@ -802,6 +817,24 @@ export {
   recordRead,
   reset,
 } from "./stale-file-guard.js";
+export type {
+  AgentToolSpec,
+  DoctorInput,
+  DoctorTool,
+  ToolAuditRow,
+  ToolSchemaLike,
+  ToolTokenEstimate,
+  ToolTokenReport,
+} from "./tool-audit.js";
+export {
+  auditAgentTools,
+  EXTERNAL_TOOL_NAMES,
+  estimateSchemaTokens,
+  estimateToolTokens,
+  formatDoctorReport,
+  HARNESS_TOOL_NAMES,
+  unknownAllowlistTools,
+} from "./tool-audit.js";
 // Workflow registry
 export type {
   WorkflowResolution,
