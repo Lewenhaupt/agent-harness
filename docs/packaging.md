@@ -20,7 +20,11 @@ rather than hiding it.
 ## The two manifests
 
 1. **`package.json` → `pi.extensions` / `pi.skills`** — the harness's own entry
-   points. `bin/pi` and `flake.nix` both read it; nothing else may list them.
+   points. `bin/pi`, `flake.nix` and the project settings file all read it;
+   nothing else may list them. `.pi/settings.json` loads the repo as one package
+   (`{"packages": [{"source": ".."}]}`) rather than six raw file paths, because
+   raw path arrays are concatenated and never deduped while a package has an
+   identity (its resolved absolute path).
 2. **`nix/pi-extensions/package.json` → `piExtensions`** — third-party
    extensions as `package name → entry path inside that package`. The same file
    already owns the npm dependency specs, so the entry path lives next to the
@@ -104,3 +108,15 @@ under a gate" rule, and a budget bound; `src/__tests__/tool-contract.test.ts`
 fails when an agent allowlist or a role set names a tool that no build registers,
 and when a registered `belayd_*` tool is missing from `HARNESS_TOOL_NAMES` (the
 list `belayd_doctor` audits against).
+
+## Load order caveat
+
+pi loads user-scope extensions before project-scope ones, and the harness
+extension factories self-dedupe on a process-wide marker — so when the NixOS
+config also installs the harness at `~/.pi/agent/extensions/belayd-harness.ts`,
+**that copy wins and the worktree's `extensions/` is not the code that runs**.
+This is why the dev loop goes through `bin/pi` (`-ne` plus explicit `-e` paths to
+the worktree). A pi-web orchestrator session inherits the same rule: it runs
+whatever copy loaded first, which is normally the Nix-built one. Verified with a
+clean `PI_CODING_AGENT_DIR` (no user extensions): the project package alone
+declares all 30 harness tools, so the package form itself is sound.
