@@ -757,7 +757,15 @@
             mv package.json.stripped package.json
             pnpm install --offline --ignore-scripts --prod --frozen-lockfile --config.node-linker=hoisted
 
+            # The manifest makes $out loadable as a pi *package*: consumers can
+            # point a project/global settings entry or an extensions/ symlink at
+            # this directory and pi reads pi.extensions from it, instead of every
+            # consumer hand-listing extension files. Note that pi.skills points at
+            # .agents/skills, which is deliberately NOT installed here — skills
+            # stay owned by belayd-skills (~/.agents/skills), so a packages entry
+            # should pass "skills": [] to avoid loading them twice.
             mkdir -p "$out/extensions" "$out/src" "$out/templates" "$out/node_modules" "$out/bin"
+            install -m 0644 package.json "$out/package.json"
             cp -r extensions/. "$out/extensions/"
             cp -r src/. "$out/src/"
             # templates/ must stay a sibling of extensions/ so the bootstrap
