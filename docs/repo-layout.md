@@ -157,6 +157,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `docs/bash-timeout.md` | per-call bash timeout clamp |
 | `docs/instruction-groups.md` | managed prompt sections (browser instructions) |
 | `docs/model-capacity-and-telemetry.md` | capacity probing, cooldowns, per-phase telemetry |
+| `docs/artifacts.md` | per-phase worktree artifacts and how a phase prompt references them |
 | `docs/metrics.md` | append-only metrics event log (gate first-pass, phase economics) and its DuckDB queries |
 | `docs/diff-scoped-review.md` | review scoping and output bounding |
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
