@@ -34,6 +34,12 @@ export interface MetricsEventBase {
   ts: number;
   /** Hostname, so several machines can share one report without ambiguity. */
   host: string;
+  /**
+   * Where the event came from. Absent means live; `backfill` marks history
+   * reconstructed from recorded sessions (bd-140 phase 3), which has no gate
+   * verdicts and an unknown workflow type.
+   */
+  source?: "live" | "backfill";
 }
 
 /** A phase run started (one spawn, before any gate attempt). */
