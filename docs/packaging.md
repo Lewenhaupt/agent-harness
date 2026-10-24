@@ -75,3 +75,32 @@ pnpm test                      # src/__tests__/pi-manifest.test.ts guards both m
 nix build .#pi --no-link       # wrapper carries exactly the manifest's extensions
 ./bin/pi --version 2>&1 | head # dev loop resolves the same set from the store tree
 ```
+
+## Per-role tool surfaces (bd-133)
+
+Every declared tool is sent on every request, and a bigger catalog measurably
+hurts tool choice — DeepSeek's own scaffold benchmark on identical weights puts
+a ~12-tool minimal scaffold above a full-featured one, and Anthropic's
+tool-search guidance puts the deferral threshold near 10 tools / 10k tokens of
+definitions. `src/role-tools.ts` therefore computes each role's surface instead
+of declaring one flat list:
+
+| Set | Contents |
+|---|---|
+| `WORKFLOW_CONTROL_TOOLS` | start-followup, stack-rebase, stop-task, status, doctor, proof-verifier, `bd`, read/grep/find/ls |
+| `MEMBER_FLEET_TOOLS` | `fleet_status`, `fleet_inbox`, `fleet_note` — a gated member must be able to see a pause and answer it |
+| `SUPERVISOR_FLEET_TOOLS` | launch, merge, pause, resume, advance, reconcile — **not** declared under a gate; the supervisor session arms no gate |
+| `CONSULT_TOOLS` | `belayd_outline`, `belayd_archify` — callable, never a required step |
+| `PLANNING_TOOL_SET` | read-only investigation + `bd` + planning sub-agents; no edit/write/bash/browser |
+
+A gated session declares its own workflow's phase tools (required + consult) plus
+the control, member-fleet, and consult sets. That drops the surface from 35 tools
+to at most 24, and removes phase tools the workflow never runs (a bugfix session
+is not offered `belayd_userguide`) plus `belayd_documenter`, which no phase order
+contains.
+
+`src/__tests__/role-tools.test.ts` pins the contents, the "no edit/write/bash
+under a gate" rule, and a budget bound; `src/__tests__/tool-contract.test.ts`
+fails when an agent allowlist or a role set names a tool that no build registers,
+and when a registered `belayd_*` tool is missing from `HARNESS_TOOL_NAMES` (the
+list `belayd_doctor` audits against).
