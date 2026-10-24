@@ -20,11 +20,18 @@ import type { SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js"
 import { ensureScopeSync } from "./aws-broker/ensure.ts";
 import { planCommandArgv, resolveSandboxPlan } from "./aws-broker/plan.ts";
 import { scrubAwsEnv } from "./aws-broker/scope.ts";
+import { type PiBinaryResolution, piBinaryNotice, resolvePiBinaryPath } from "./pi-binary.js";
 import { resolveProjectSessionExists } from "./session-naming.js";
 import { setupWorktree } from "./worktree.js";
 
 /** Cached path to the pi binary, resolved once. */
 let cachedPiBinary: string | undefined;
+
+/** Cached resolution with provenance, for logging and diagnostics. */
+let cachedPiResolution: PiBinaryResolution | undefined;
+
+/** The fallback notice is worth exactly one line per process, not one per spawn. */
+let loggedPiResolution = false;
 
 /**
  * direnv per-directory STATE variables, stripped from every child so a
@@ -585,39 +592,54 @@ function extractFinalMessages(messages: unknown[]): string | undefined {
   return undefined;
 }
 
-/** Resolve the pi binary path. */
+/**
+ * Resolve the pi binary used for spawned agents, with provenance.
+ *
+ * The resolution is cached because a phase run resolves it once per process,
+ * but the *notice* is emitted only once too: a fallback that logs on every
+ * spawn would be noise, while logging it zero times is how the harness ended up
+ * with three different tool sets. See `src/pi-binary.ts` for the precedence.
+ */
+export function resolvePiBinaryResolution(): PiBinaryResolution {
+  if (cachedPiResolution !== undefined) return cachedPiResolution;
+  cachedPiResolution = resolvePiBinaryPath({
+    env: process.env,
+    exists: existsSync,
+    pathLookup: legacyPiLookup,
+  });
+  if (!loggedPiResolution) {
+    loggedPiResolution = true;
+    const notice = piBinaryNotice(cachedPiResolution);
+    if (notice !== undefined) console.warn(`[belayd-harness] ${notice}`);
+  }
+  return cachedPiResolution;
+}
+
+/** Resolve the pi binary path (last-resort `"pi"` keeps the pre-doctor behavior). */
 function resolvePiBinary(): string {
-  if (cachedPiBinary) return cachedPiBinary;
+  if (cachedPiBinary !== undefined) return cachedPiBinary;
+  cachedPiBinary = resolvePiBinaryResolution().binary ?? "pi";
+  return cachedPiBinary;
+}
 
-  // Try PATH first
-  const piPath = process.env.PI_BINARY_PATH;
-  if (piPath && existsSync(piPath)) {
-    cachedPiBinary = piPath;
-    return piPath;
-  }
-
-  // Try nix store
-  const nixPi = "/run/current-system/sw/bin/pi";
-  if (existsSync(nixPi)) {
-    cachedPiBinary = nixPi;
-    return nixPi;
-  }
-
-  // Try common install locations
+/**
+ * Non-Nix install locations, tried after the system pi.
+ *
+ * Kept as a separate lookup instead of a general PATH search so a stray `pi` on
+ * PATH cannot silently win over the configured system binary: these are the
+ * exact paths the harness resolved before `src/pi-binary.ts` existed.
+ */
+function legacyPiLookup(name: string): string | undefined {
+  const home = process.env.HOME ?? "/home";
   const candidates = [
-    join(process.env.HOME ?? "/home", ".npm-global/bin/pi"),
-    join(process.env.HOME ?? "/home", ".local/bin/pi"),
-    join(process.env.HOME ?? "/home", "node_modules/.bin/pi"),
-    "/usr/local/bin/pi",
-    "/usr/bin/pi",
+    join(home, ".npm-global/bin", name),
+    join(home, ".local/bin", name),
+    join(home, "node_modules/.bin", name),
+    `/usr/local/bin/${name}`,
+    `/usr/bin/${name}`,
   ];
   for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      cachedPiBinary = candidate;
-      return candidate;
-    }
+    if (existsSync(candidate)) return candidate;
   }
-
-  cachedPiBinary = "pi";
-  return "pi";
+  return undefined;
 }
