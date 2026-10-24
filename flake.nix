@@ -440,6 +440,19 @@
           # adds nodejs-slim.python; an explicit python3 keeps it unambiguous.
           nativeBuildInputs = [ pkgs.python3 ];
 
+          # Upstream polls GET /sessions/<id>/transcript-snapshot every 5s for the
+          # selected session. That response is the whole transcript (1.4 MB for a
+          # 270-message session) and carries no ETag/Last-Modified, so every tick
+          # re-transfers and re-parses it even when nothing changed -- continuous
+          # CPU and allocation churn on the tab that is left open all day (bd-123).
+          # 20s cuts that 4x; the session socket, not this poll, carries live
+          # updates. Drop this patch once upstream honours conditional requests.
+          postPatch = ''
+            substituteInPlace src/client/src/components/PiWebApp.ts \
+              --replace-fail "const SELECTED_SESSION_REFRESH_MS = 5_000;" \
+              "const SELECTED_SESSION_REFRESH_MS = 20_000;"
+          '';
+
           buildPhase = ''
             runHook preBuild
             npm run build

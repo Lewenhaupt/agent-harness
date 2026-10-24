@@ -484,6 +484,34 @@ sudo systemctl restart pi-web pi-web-sessiond
 before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
 wrapper is unaffected — it reloads extensions on every launch.)
 
+### Transcript poll interval (local patch, bd-123)
+
+`flake.nix` patches one upstream client constant before `npm run build`:
+
+```
+const SELECTED_SESSION_REFRESH_MS = 5_000;   ->  20_000
+```
+
+Why: the selected session is refreshed by polling
+`GET /api/machines/local/sessions/<id>/transcript-snapshot`, which returns the
+**whole transcript** (1.4 MB for a 270-message session) and carries no
+`ETag`/`Last-Modified`, so every tick re-transfers and re-parses it even when
+nothing changed. On a tab left open all day that is continuous CPU and
+allocation churn that grows with transcript size. Live updates arrive on the
+session socket; this poll is only a backstop. Measured on this host, one idle
+tab on the 270-message session: 11 snapshot polls / 3.5 MB per minute before,
+3 polls / 0.95 MB after (the `notifications` poll rides the same cycle, 11 -> 3).
+
+`substituteInPlace` uses `--replace-fail`, so an upstream rename breaks the
+build loudly instead of silently reverting to 5 s. Remove the patch once
+upstream honours conditional requests or exposes the interval as config.
+
+```bash
+nix build .#pi-web --no-link --print-out-paths
+# then inspect the bundle: the constant compiles to `2e4`
+grep -o 'mK=2e4' $(nix build .#pi-web --no-link --print-out-paths)/lib/node_modules/pi-web/dist/client/assets/index-*.js
+```
+
 ### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
