@@ -503,6 +503,35 @@ export {
   parseLlmGatewayApiKeyFromAuthJson,
   serializeModelsJsonDoc,
 } from "./llmgateway-models.js";
+export type {
+  GateResultEvent,
+  GateResultInput,
+  MetricsAppendResult,
+  MetricsEnv,
+  MetricsEvent,
+  MetricsEventBase,
+  PhaseAdvanceEvent,
+  PhaseAdvanceInput,
+  ReviewFindingsEvent,
+  ReviewFindingsInput,
+  RunEndEvent,
+  RunEndInput,
+  RunStartEvent,
+  RunStartInput,
+} from "./metrics.js";
+export {
+  appendMetricsEvent,
+  buildGateResultEvent,
+  buildPhaseAdvanceEvent,
+  buildReviewFindingsEvent,
+  buildRunEndEvent,
+  buildRunStartEvent,
+  METRICS_DIR_ENV,
+  METRICS_ENABLED_ENV,
+  metricsFilePath,
+  metricsHostname,
+  resolveMetricsDir,
+} from "./metrics.js";
 export type { AgentModelSpec, ModelClass } from "./model-classes.js";
 // Model classes & quota-fallback routing
 export {
@@ -725,12 +754,14 @@ export type {
   DiffScope,
   FormatReviewTaskOptions,
   ReviewDiff,
+  ReviewFindingCounts,
   ReviewSeverity,
 } from "./review-context.js";
 export {
   boundReviewOutput,
   classifyDiffScope,
   collectReviewDiff,
+  countReviewFindings,
   formatReviewTask,
   REVIEW_OUTPUT_CONTRACT,
   REVIEW_SCOPE_INSTRUCTION,

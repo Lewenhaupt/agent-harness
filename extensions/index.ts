@@ -80,6 +80,7 @@ import {
   acceptedProofRefsFromScan,
   ackNotes,
   appendFleetAuditEntry,
+  appendMetricsEvent,
   applyFleetBeadLookup,
   assertOwnedWorktree,
   awaitWorktreeReady,
@@ -90,13 +91,19 @@ import {
   buildArchifyGuideArgs,
   buildArchifyInspectArgs,
   buildFleetNote,
+  buildGateResultEvent,
   buildOrchestratorPrompt,
+  buildPhaseAdvanceEvent,
+  buildReviewFindingsEvent,
+  buildRunEndEvent,
+  buildRunStartEvent,
   buildVerifierPrompt,
   checkToolAllowed,
   clearHandoff,
   collectChangeContext,
   collectHandoffDefault,
   collectReviewDiff,
+  countReviewFindings,
   createInstructionGroupCollector,
   currentBranch,
   DEFAULT_AGENTS,
@@ -153,12 +160,14 @@ import {
   listRuns,
   lookupFleetBeads,
   lookupFleetDependencies,
+  type MetricsEvent,
   manageInstructionGroups,
   manageInstructionGroupsWarning,
   markPhaseCompleted,
   matchOwnedWorktree,
   matchSessionOwnedWorktree,
   memberSessionToken,
+  metricsHostname,
   NO_GROUP_REGISTERED_WARNING,
   narrowTranscriptEntries,
   OUTLINE_FILE_EXTENSIONS,
@@ -305,6 +314,113 @@ export interface RunQualityGateOptions {
   sessionName?: string;
   /** Telemetry sink for gate-retry spawns; defaults to the workflow store. */
   telemetry?: ModelTelemetryStore;
+  /** Task id for the metrics log; omitted for gate checks outside a workflow. */
+  taskId?: string;
+}
+
+// ── Metrics log (bd-140) ───────────────────────────────────────────────
+
+/** Hostname stamp for every event; resolved once per process. */
+const METRICS_HOST = metricsHostname();
+
+/** Warn once per process: a failing log must not spam every phase. */
+let metricsWarningEmitted = false;
+
+/**
+ * Append one metrics event.
+ *
+ * Best effort by design: the log answers questions about the workflow, so it
+ * must never be able to fail one. A real error is reported once, then dropped.
+ */
+/**
+ * Classify a gate failure from its feedback text.
+ *
+ * The combined gates emit `### <check>` headings, so the failing check is
+ * recoverable without a new return type. Metrics only needs a short label — the
+ * full feedback stays in the run delivery.
+ */
+function gateFailureKind(feedback: string | undefined): string | undefined {
+  if (feedback === undefined || feedback === "") return undefined;
+  const match = /^###\s+([a-z][a-z0-9_-]*)/im.exec(feedback);
+  return match?.[1];
+}
+
+/** Emit one gate_result event, if this gate is attached to a workflow task. */
+function recordGateAttemptMetric(options: {
+  taskId: string | undefined;
+  phase: string;
+  attempt: number;
+  passed: boolean;
+  durationMs: number;
+  failureKind?: string;
+}): void {
+  if (options.taskId === undefined) return;
+  recordMetric(
+    buildGateResultEvent({
+      now: Date.now(),
+      host: METRICS_HOST,
+      task: options.taskId,
+      phase: options.phase,
+      attempt: options.attempt,
+      passed: options.passed,
+      durationMs: options.durationMs,
+      ...(options.failureKind === undefined ? {} : { failureKind: options.failureKind }),
+    }),
+  );
+}
+
+/**
+ * Emit run_end plus, for a successful review, its per-severity finding counts.
+ *
+ * Kept out of the delivery callback so that callback stays inside the cognitive
+ * complexity budget; recordMetric swallows a metrics failure.
+ */
+function recordRunEndMetrics(options: {
+  taskId: string;
+  delivery: RunDelivery;
+  delivered: RunDelivery;
+  runStartedAt: number;
+}): void {
+  const usage = options.delivery.result.details.usage;
+  recordMetric(
+    buildRunEndEvent({
+      now: Date.now(),
+      host: METRICS_HOST,
+      task: options.taskId,
+      phase: options.delivery.phaseName,
+      runId: options.delivery.runId,
+      status: options.delivery.success ? RunStatus.Completed : RunStatus.Failed,
+      exitCode: options.delivery.result.details.exitCode,
+      toolCalls: usage.toolCalls,
+      cost: usage.cost,
+      tokensIn: usage.input,
+      tokensOut: usage.output,
+      tokensCacheRead: usage.cacheRead,
+      wallMs: Date.now() - options.runStartedAt,
+      ...(options.delivery.result.details.model === undefined
+        ? {}
+        : { model: options.delivery.result.details.model }),
+    }),
+  );
+  if (!options.delivered.success || options.delivered.phaseName !== REVIEW_PHASE) return;
+  const findings = countReviewFindings(options.delivered.result.content?.[0]?.text ?? "");
+  recordMetric(
+    buildReviewFindingsEvent({
+      now: Date.now(),
+      host: METRICS_HOST,
+      task: options.taskId,
+      critical: findings.critical,
+      warnings: findings.warnings,
+      suggestions: findings.suggestions,
+    }),
+  );
+}
+
+function recordMetric(event: MetricsEvent): void {
+  const result = appendMetricsEvent({ env: process.env, event });
+  if (result.ok || result.disabled === true || metricsWarningEmitted) return;
+  metricsWarningEmitted = true;
+  console.warn(`[belayd-harness] metrics append failed: ${result.error}`);
 }
 
 // ── Process gate state ─────────────────────────────────────────────────
@@ -2154,7 +2270,7 @@ export default function belaydAgentHarness(
     gate: QualityGate,
     result: SpawnResult,
     context: GateRunContext,
-  ): Promise<{ passed: boolean; feedback: string }> {
+  ): Promise<{ passed: boolean; failureKind?: string; durationMs: number; feedback: string }> {
     const { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath } = context;
     const options =
       cwd !== undefined ||
@@ -2165,9 +2281,12 @@ export default function belaydAgentHarness(
         ? { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath }
         : undefined;
     const text = result.content?.[0]?.text ?? "";
+    const startedAt = Date.now();
     const outcome = await gate(text, result.details, options);
     return {
       passed: outcome.passed,
+      failureKind: gateFailureKind(outcome.feedback),
+      durationMs: Date.now() - startedAt,
       feedback: outcome.feedback ?? (outcome.passed ? "All quality gates passed." : "Failed"),
     };
   }
@@ -2198,6 +2317,14 @@ export default function belaydAgentHarness(
         userGuidePath: options.userGuidePath,
       });
 
+      recordGateAttemptMetric({
+        taskId: options.taskId,
+        phase: phaseName,
+        attempt,
+        passed: verdict.passed,
+        durationMs: verdict.durationMs,
+        failureKind: verdict.failureKind,
+      });
       if (verdict.passed) {
         return withGateResult(current, "✅ **Quality Gates**", verdict.feedback);
       }
@@ -3973,6 +4100,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     sessionName: string;
     ledgerWarning?: string;
   } {
+    // Wall-clock floor for the run_end event, captured before the spawn so a
+    // gate retry's extra time is attributed to the run that caused it.
+    const runStartedAt = Date.now();
     const { agent, phaseName, params, state, cwd, worktreeBranch, runId } = options;
     const overrides = WORKFLOW_REGISTRY[state.workflowType].agentOverrides?.[phaseName as Phase];
     const resolvedModel = resolveModelSpec(agent);
@@ -4004,6 +4134,19 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       subagentSessionName,
       model: effectiveModel,
     });
+
+    recordMetric(
+      buildRunStartEvent({
+        now: runStartedAt,
+        host: METRICS_HOST,
+        task: state.currentTaskId,
+        phase: phaseName,
+        runId,
+        workflowType: state.workflowType,
+        model: effectiveModel,
+        session: subagentSessionName,
+      }),
+    );
 
     // A private store gives this run an exact per-run manifest delta even when
     // another run overlaps; the fan-out also feeds the shared workflow store
@@ -4062,6 +4205,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           await persistReviewedSha({ cwd, taskId: state.currentTaskId });
         }
         const delivered = boundReviewDelivery(delivery);
+        recordRunEndMetrics({
+          taskId: state.currentTaskId,
+          delivery,
+          delivered,
+          runStartedAt,
+        });
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
@@ -4172,6 +4321,8 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         tools: effectiveTools,
         sessionName: subagentSessionName,
         telemetry: runTelemetrySink,
+        // Emitted as gate_result; undefined outside a gate-owned workflow.
+        taskId: state.currentTaskId === "" ? undefined : state.currentTaskId,
       }).then((gateResult) => gateResult ?? result);
 
     const handle = spawnDetachedRun({
@@ -4224,6 +4375,18 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         if (isRunDelivered(info.runId)) return;
         if (readRunManifest({ cwd, runId: info.runId })?.completedBy === "user") return;
         applyPhaseCompletion(state, info.phaseName, info.result.content?.[0]?.text);
+        const nextPhase = getNextPhase(state.completedPhaseNames, state.phaseOrder);
+        if (nextPhase !== undefined) {
+          recordMetric(
+            buildPhaseAdvanceEvent({
+              now: Date.now(),
+              host: METRICS_HOST,
+              task: state.currentTaskId,
+              phase: info.phaseName,
+              nextPhase,
+            }),
+          );
+        }
       },
       deliver: deliverRunCompletion,
       isDelivered: isRunDelivered,

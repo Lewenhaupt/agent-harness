@@ -584,6 +584,11 @@
           pkgs.stdenv.cc.cc.lib # runtime lib for native node modules (shellHook)
           pkgs.procps # bd's dolt-server liveness check runs `ps -axo`
           pkgs.asciinema
+          # Query engine for the harness metrics log (bd-140): the harness writes
+          # append-only JSONL under ~/.local/state/belayd/metrics and DuckDB reads
+          # it with read_json_auto. Never a write path — fleet members run
+          # concurrently under one uid and DuckDB is single-writer.
+          pkgs.duckdb
           playwright-cli
           archify
           # belayd_outline extraction backends: universal-ctags is the
