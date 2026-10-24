@@ -58,6 +58,14 @@ interface ModelClassSpec {
   models: string[];
 }
 
+/**
+ * Model ids below are GATEWAY ids, not official API ids. `deepseek-v4.1-flash`
+ * is a provider slug (the official DeepSeek id is `deepseek-flash`), and
+ * `deepseek-v4-flash` is retired upstream but still legacy-routed, so it keeps
+ * working through the gateways listed in PROVIDER_PREFERENCE. Both facts, plus
+ * the reasoning_content round-trip invariant that bites any adapter talking to
+ * api.deepseek.com directly, are recorded in docs/deepseek-provider-notes.md.
+ */
 export const MODEL_CLASS_SPECS: Record<ModelClass, ModelClassSpec> = {
   frontier: {
     name: "frontier",
