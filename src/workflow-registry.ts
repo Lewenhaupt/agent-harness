@@ -10,7 +10,7 @@ import type { QualityGate } from "./agent-registry.js";
 import { RESEARCHER_SYSTEM_PROMPT, RESEARCHER_TOOLS } from "./agent-registry.js";
 import type { ModelClass } from "./model-classes.js";
 import type { Phase } from "./process-gate.js";
-import { gateFullValidation } from "./quality-gates.js";
+import { gateStaticValidation } from "./quality-gates.js";
 
 /**
  * Workflow sub-type names.
@@ -83,6 +83,9 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     phases: ["implement", "review", "test", "userguide", "proof", "commit"],
     consultPhases: ["scout", "plan"],
     proofRequired: true,
+    // bd-139: the workflow has a test phase, so the implement gate validates
+    // statically (typecheck + lint) and the suite runs once, in the test gate.
+    gateOverrides: { implement: gateStaticValidation },
   },
 
   bugfix: {
@@ -90,6 +93,7 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     phases: ["implement", "review", "test", "proof", "commit"],
     consultPhases: ["scout", "plan"],
     proofRequired: true,
+    gateOverrides: { implement: gateStaticValidation },
   },
 
   research: {
@@ -108,20 +112,22 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
 
   chore: {
     name: "chore",
-    phases: ["plan", "implement", "test", "commit"],
+    // bd-139: a chore (dependency bump, config tidy) rarely benefits from a
+    // frontier-model plan step, so planning is consultable instead of required.
+    phases: ["implement", "test", "commit"],
+    consultPhases: ["scout", "plan"],
     proofRequired: false,
-    agentOverrides: {
-      implement: {
-        qualityGate: gateFullValidation,
-      },
-    },
+    gateOverrides: { implement: gateStaticValidation },
   },
 
   documentation: {
     name: "documentation",
-    phases: ["implement", "proof", "commit"],
+    // bd-139: a documentation change is a valid proof skip reason on its own
+    // ("doc-only"), so the proof phase could only ever restate that. It has no
+    // test phase either, so the implement gate keeps the full validation run.
+    phases: ["implement", "commit"],
     consultPhases: ["scout", "plan"],
-    proofRequired: true,
+    proofRequired: false,
     agentOverrides: {
       implement: {
         model: "opencode-go/deepseek-v4-flash",
@@ -131,15 +137,19 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
 
   refactor: {
     name: "refactor",
+    // bd-139: a refactor keeps the user-facing contract, so it no longer writes
+    // a user guide (that is feature work).
     phases: ["implement", "review", "test", "proof", "commit"],
     consultPhases: ["scout", "plan"],
     proofRequired: true,
+    gateOverrides: { implement: gateStaticValidation },
   },
 
   hotfix: {
     name: "hotfix",
     phases: ["implement", "review", "test", "proof", "commit"],
     proofRequired: true,
+    gateOverrides: { implement: gateStaticValidation },
     agentOverrides: {
       implement: {
         model: "opencode-go/deepseek-v4-flash",

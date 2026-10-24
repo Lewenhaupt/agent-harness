@@ -98,7 +98,7 @@ setup.) Confirm:
 
 - The workflow message lists phases as `implement → review → test → userguide
   → proof → commit` (6 phases for `feature`; `bugfix`/`refactor` = 5,
-  `documentation` = 3). `scout`/`plan` are **not** numbered required-step
+  `documentation` = 2, `chore` = 3). `scout`/`plan` are **not** numbered required-step
   bullets.
 - The `userguide` phase's deliverable is a file, not a report: the spawned task
   ends with a `## Deliverable` block naming `docs/<task-id>-userguide.md`, and
@@ -506,3 +506,26 @@ needs-confirmation message and starts nothing, rather than silently defaulting.
 `bugfix` / ... label no longer resolve to that type — they now default to
 `feature`. To preserve them, do a one-time relabel, e.g.
 `bd update <id> --add-label wf:chore` (and `--remove-label chore`).
+
+## Phase-model trim (bd-139)
+
+Measured from the session corpus (957 sessions), three phases cost more than the
+signal they returned, so the registry changed. Each change is a registry entry,
+not a gate rewrite: re-enabling one is a one-line edit in
+`src/workflow-registry.ts`.
+
+| Change | Why |
+|---|---|
+| `refactor` no longer runs `userguide` | a refactor keeps the user-facing contract; when it changes, the work is a feature. `feature` still requires the guide. |
+| `documentation` is `implement → commit` | a docs change is already a valid proof skip reason (`doc-only`), so its proof phase could only restate that. `proofRequired` is now `false`. |
+| `chore` is `implement → test → commit` with `plan` consultable | a dependency bump or config tidy rarely benefits from a frontier-model plan step. `plan` stays callable as a consultation phase. |
+| implement gate = `gateStaticValidation` wherever a `test` phase exists | `gateFullValidation` ran `pnpm test` in the implement gate and `gateTests` ran it again in the test gate — the same suite twice per workflow. Static validation (typecheck + lint) fails fast on broken code; the suite runs once, in the test phase. |
+
+Trade-off to know: an implementer that breaks tests is now caught at the test
+phase instead of immediately, so a broken implementation costs one extra agent
+run before it fails. Workflows without a test phase (`documentation`, `research`)
+keep their existing validation, because there it is the only validation.
+
+Verify with `pnpm test` — `src/__tests__/workflow-registry.test.ts` pins each
+phase list and asserts the "test phase ⇒ static implement gate" invariant, so a
+future workflow that reintroduces the double run fails the suite.
