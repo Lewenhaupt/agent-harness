@@ -133,6 +133,7 @@ import {
   fleetMemberTaskIds,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
+  formatArtifactIndex,
   formatDoctorReport,
   formatFleetInbox,
   formatFleetMergeQueue,
@@ -244,6 +245,7 @@ import {
   watchRunCompletion,
   workflowGateToolSet,
   writeHandoff,
+  writePhaseArtifact,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
 import {
@@ -379,6 +381,28 @@ function recordGateAttemptMetric(options: {
       ...(options.failureKind === undefined ? {} : { failureKind: options.failureKind }),
     }),
   );
+}
+
+/**
+ * Persist a delivered phase output as a worktree artifact (bd-141).
+ *
+ * Only a successful delivery becomes an artifact: a failed run's text is error
+ * output, and a later phase reading it as context would be misled.
+ */
+function recordPhaseArtifact(options: {
+  cwd: string;
+  delivery: RunDelivery;
+  taskId: string;
+}): void {
+  if (!options.delivery.success) return;
+  const written = writePhaseArtifact({
+    cwd: options.cwd,
+    phase: options.delivery.phaseName,
+    taskId: options.taskId,
+    text: options.delivery.result.content?.[0]?.text ?? "",
+  });
+  if (written.ok) return;
+  console.warn(`[belayd-harness] phase artifact not written: ${written.error}`);
 }
 
 /**
@@ -4223,6 +4247,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           delivered,
           runStartedAt,
         });
+        recordPhaseArtifact({
+          cwd,
+          delivery,
+          taskId: state.currentTaskId,
+        });
         pi.sendMessage(
           {
             customType: "belayd-run-complete",
@@ -4261,7 +4290,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           cwd,
           branch: worktreeBranch,
         });
-        fullTask = `${preamble}\n\n${await buildFullPhaseTask({
+        // bd-141: name the artifacts earlier phases wrote, so this agent reads a
+        // file instead of re-deriving context the harness already has.
+        const artifactIndex = formatArtifactIndex({ cwd, forPhase: phaseName });
+        const artifactBlock = artifactIndex === "" ? "" : `${artifactIndex}\n\n`;
+        fullTask = `${preamble}\n\n${artifactBlock}${await buildFullPhaseTask({
           phaseName,
           taskId: state.currentTaskId,
           paramsTask: params.task,
@@ -4276,7 +4309,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         // re-review) and fresh change context, respectively. Returning
         // params.task there would hand a resumed re-review no diff at all.
         const needsFullTask = !resumeSession || phaseName === "proof" || phaseName === REVIEW_PHASE;
-        return needsFullTask ? fullTask : `${preamble}\n\n${params.task}`;
+        return needsFullTask ? fullTask : `${preamble}\n\n${artifactBlock}${params.task}`;
       };
       return buildTask().then((task) =>
         spawnAgentWithFallback({

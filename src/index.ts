@@ -76,6 +76,18 @@ export {
 } from "./archify.js";
 export type { ArgvParse } from "./argv.js";
 export { parseArgv } from "./argv.js";
+export type { PhaseArtifact } from "./artifacts.js";
+export {
+  ARTIFACT_DIR,
+  ARTIFACT_PHASES,
+  artifactAbsPath,
+  artifactPath,
+  formatArtifactIndex,
+  listPhaseArtifacts,
+  MAX_ARTIFACT_CHARS,
+  readPhaseArtifact,
+  writePhaseArtifact,
+} from "./artifacts.js";
 export {
   BASH_DEFAULT_TIMEOUT_SECONDS,
   BASH_MAX_TIMEOUT_SECONDS,
