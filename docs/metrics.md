@@ -70,3 +70,38 @@ ORDER BY pct;
 Phase 1 (this page) is the event log plus the DuckDB binary. Phase 2 adds the
 versioned queries and a `belayd_metrics` tool; phase 3 backfills the existing
 session corpus into the same file. See bd-140.
+
+## Backfill (recorded sessions)
+
+The live log starts empty. `scripts/belayd-metrics-backfill.ts` reconstructs
+history from `~/.pi/agent/sessions/**/*.jsonl`:
+
+```bash
+node scripts/belayd-metrics-backfill.ts --dry-run   # counts only
+node scripts/belayd-metrics-backfill.ts             # rewrites events-backfill.jsonl
+```
+
+It writes **one** file, `events-backfill.jsonl`, and rewrites it wholesale on
+every run, so re-running is idempotent. Live events keep their monthly files; the
+query glob picks up both.
+
+| Recoverable | Not recoverable |
+|---|---|
+| `run_start`, `run_end` (model, cost, tokens, tool calls, wall time) | `gate_result` — a transcript records the agent's work, never the gate that judged it |
+| run counts per (task, phase) — the `rework_by_phase` proxy | `phase_advance`, `review_findings` |
+
+Two rules keep the history honest:
+
+- A `-fallback-N` session is the **same run** on another provider (quota/rate-limit
+  failover), so it does not add a run. `-retry-N` and `-run-N` are distinct spawns
+  and do. Getting this wrong made implement read 6.1 runs/task instead of 2.2.
+- Backfilled events carry `"source": "backfill"`, so a query can separate
+  reconstructed history from live events (which also have real workflow types).
+
+## Test isolation
+
+The extension tests drive the real extension code, so the metrics append would
+otherwise write fixture events into the operator's state directory (2940 of them,
+observed). `vitest.config.ts` and `vitest.integration.config.ts` load
+`src/__tests__/setup-env.ts`, which sets `BELAYD_METRICS=0`; a test that asserts on
+metrics sets its own `BELAYD_METRICS_DIR`.
