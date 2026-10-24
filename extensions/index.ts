@@ -73,7 +73,6 @@ import type {
 } from "../src/index.js";
 import {
   ALL_PHASE_NAMES,
-  ALL_PHASE_TOOLS,
   ARCHIFY_DIAGRAM_TYPES,
   ARCHIFY_GUIDANCE_COMMANDS,
   ARCHIFY_QUALITY_PROFILES,
@@ -166,7 +165,7 @@ import {
   OUTLINE_KINDS,
   outlineFiles,
   PLANNING_MODE_SYSTEM_PROMPT,
-  PLANNING_MODE_TOOLS,
+  PLANNING_TOOL_SET,
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
   parseBelaydCommandArgs,
@@ -222,6 +221,7 @@ import {
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
   watchRunCompletion,
+  workflowGateToolSet,
   writeHandoff,
 } from "../src/index.js";
 import { createModelCooldownStore, defaultModelCooldownPath } from "../src/model-cooldown.js";
@@ -1418,38 +1418,10 @@ export default function belaydAgentHarness(
 
   console.warn(`[belayd-harness] registering tools/commands from ${HARNESS_MODULE_PATH}`);
 
-  const GATED_TOOLS = [
-    ...ALL_PHASE_TOOLS,
-    "belayd_start_task",
-    "belayd_start_followup",
-    "belayd_stack_rebase",
-    "belayd_stop_task",
-    "belayd_status",
-    "belayd_doctor",
-    "belayd_proof_verifier",
-    "belayd_archify",
-    "belayd_outline",
-    "belayd_fleet_status",
-    "belayd_fleet_note",
-    "belayd_fleet_merge",
-    "belayd_fleet_pause",
-    "belayd_fleet_resume",
-    "belayd_fleet_advance",
-    "belayd_fleet_reconcile",
-    "bd",
-    "read",
-    "grep",
-    "find",
-    "ls",
-  ];
-
-  const PLANNING_GATED_TOOLS = [
-    ...PLANNING_MODE_TOOLS,
-    "belayd_plan_scout",
-    "belayd_plan_research",
-    "belayd_status",
-    "belayd_stop_planning",
-  ];
+  // Per-role surfaces live in src/role-tools.ts: a workflow session gets its own
+  // phase tools plus the control/consult set, and nothing else. The fleet tools
+  // belong to the supervisor session, which deliberately arms no gate.
+  const PLANNING_GATED_TOOLS = PLANNING_TOOL_SET;
 
   /**
    * Derive the active tool set from session state instead of stashing
@@ -1461,12 +1433,14 @@ export default function belaydAgentHarness(
   function applyToolGate(state: SessionState): void {
     if (state.planningActive) {
       if (state.fullTools === undefined) state.fullTools = pi.getActiveTools();
-      pi.setActiveTools(PLANNING_GATED_TOOLS);
+      pi.setActiveTools([...PLANNING_GATED_TOOLS]);
       return;
     }
     if (state.gateActive) {
       if (state.fullTools === undefined) state.fullTools = pi.getActiveTools();
-      pi.setActiveTools(GATED_TOOLS);
+      const phases =
+        state.phaseOrder.length > 0 ? state.phaseOrder : getPhasesForType(state.workflowType);
+      pi.setActiveTools(workflowGateToolSet({ phases, consultPhases: state.consultPhases }));
       return;
     }
     if (state.fullTools !== undefined) {
@@ -1531,8 +1505,10 @@ export default function belaydAgentHarness(
     state.handoff = undefined;
     state.awaitingReviewResponse = false;
     abortAndResetRunTracking(state);
-    applyToolGate(state);
     reconcileWorkflowState(state, { taskId, cwd, options });
+    // Applied after reconcile: a resume restores the persisted workflow type and
+    // phase order, so the declared set must be derived from the reconciled state.
+    applyToolGate(state);
     return state;
   }
 

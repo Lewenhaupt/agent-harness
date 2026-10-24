@@ -78,7 +78,11 @@ their dependency specs). `bin/pi`, the flake's `belayd-pi` wrapper and the
 manifest tests all derive from those two files — never add a third list. The
 spawned-agent binary resolves through `BELAYD_PI_BINARY` → `PI_BINARY_PATH` →
 system pi and logs when it falls back, because the binary decides the tool set;
-`belayd_doctor` prints the effective surface for the current session.
+`belayd_doctor` prints the effective surface for the current session. Per-role
+surfaces live in `src/role-tools.ts` (a gated workflow declares only its own
+phase tools + control/member-fleet/consult sets; the supervisor fleet tools are
+not declared under a gate), and `src/__tests__/tool-contract.test.ts` guards the
+agent allowlists against tools no build registers.
 
 ### Nix dependency bundling (`belayd-harness`)
 

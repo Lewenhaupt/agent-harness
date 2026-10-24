@@ -736,6 +736,17 @@ export {
   REVIEW_SCOPE_INSTRUCTION,
   REVIEW_SECTION_LIMITS,
 } from "./review-context.js";
+export type { WorkflowToolSetInput } from "./role-tools.js";
+export {
+  CONSULT_TOOLS,
+  FLEET_TOOLS,
+  MEMBER_FLEET_TOOLS,
+  PLANNING_TOOL_SET,
+  SUPERVISOR_FLEET_TOOLS,
+  toolSetSize,
+  WORKFLOW_CONTROL_TOOLS,
+  workflowGateToolSet,
+} from "./role-tools.js";
 export type {
   DetachedRunOptions,
   RunDelivery,
