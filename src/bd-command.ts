@@ -31,6 +31,9 @@ export const BD_READ_SUBCOMMANDS: readonly string[] = [
   "prime",
   "query",
   "ready",
+  // Reading one memory by key. `bd prime` injects the memory bodies but tells an
+  // agent to `bd recall <key>` for the full content, so the proxy must allow it.
+  "recall",
   "search",
   "show",
   "state",
