@@ -174,7 +174,21 @@ const WORKTREE_SYNC_GUIDANCE = `
 - A branch created with \`belayd_start_followup\` records its base in \`branch.<name>.belaydBase\` and fork point in \`branch.<name>.belaydForkPoint\`.
 - When the recorded base lands, replay only this branch with \`belayd_stack_rebase\` (or \`git rebase --onto main <belaydForkPoint> <branch>\`), never a plain \`git rebase <parent>\` — the parent's commits are already in \`main\`.`;
 
-const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}`;
+// DeepSeek models (our frontier/fast class primaries) drift to Chinese output
+// non-deterministically, and the drift is topic-dependent: a prompt in English
+// about a China-based entity can come back entirely in Chinese. Output-level
+// anchoring decays over a long transcript, so the mitigation that holds is a
+// short, static block placed early and never varied — it stays inside the cached
+// prefix instead of being re-stated per phase. Deliberately no "think in X"
+// instruction: forcing the reasoning language costs quality.
+const LANGUAGE_GUIDANCE = `
+
+## Language
+- Reply in the language of the user's most recent message, including headings and summaries.
+- Keep code, identifiers, file paths, commands, commit messages, and quoted file content exactly as written — never translate them.
+- If a reply starts in the wrong language, restate it in the right one instead of continuing.`;
+
+const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}${LANGUAGE_GUIDANCE}`;
 
 // ── Default Belayd agents ──────────────────────────────────────────────
 
