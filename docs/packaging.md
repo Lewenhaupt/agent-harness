@@ -120,3 +120,32 @@ the worktree). A pi-web orchestrator session inherits the same rule: it runs
 whatever copy loaded first, which is normally the Nix-built one. Verified with a
 clean `PI_CODING_AGENT_DIR` (no user extensions): the project package alone
 declares all 30 harness tools, so the package form itself is sound.
+
+## Where a global install belongs (nix-tmp)
+
+The NixOS home-manager module (`nix-tmp/modules/core/belayd-pi-web.nix`) installs
+the harness for pi-web's embedded orchestrator. Point it at the **package
+directory**, not at individual files:
+
+```nix
+home.file.".pi/agent/extensions/belayd-harness".source = "${belaydPkgs.belayd-harness}";
+```
+
+That replaces three loose `.ts` symlinks plus the `~/.pi/agent/src` symlink: the
+store path carries `extensions/`, `src/` and `node_modules/`, so the extensions'
+`../src` imports resolve inside it, and `package.json` supplies the entry list.
+
+**Ordering matters.** pi does not descend into `extensions/<dir>/` looking for
+loose files, so the manifest must already be in the store path when the symlink
+changes: push the harness, bump `agent-harness` in nix-tmp's `flake.lock`, then
+rebuild. Probes that establish this:
+
+| Layout | Result |
+|---|---|
+| `extensions/belayd-harness -> <store>` **without** `package.json` | 0 harness tools |
+| same symlink **with** `package.json` | 30 harness tools, loaded via the symlink |
+| `packages: [{ source = "<store>", skills = [] }]` in settings | 30 harness tools |
+
+Pass `"skills": []` when using the settings form: the copied manifest declares
+`pi.skills`, but the derivation does not install `.agents/`, and skills stay
+owned by the `~/.agents/skills` symlinks that `belayd-skills` provides.

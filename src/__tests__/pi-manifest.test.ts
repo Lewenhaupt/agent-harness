@@ -127,3 +127,21 @@ describe("project extension loading (bd-132)", () => {
     expect(projectSettings.packages?.[0]?.source).toBe("..");
   });
 });
+
+describe("Nix package output (bd-132 follow-up)", () => {
+  it("installs package.json into the belayd-harness output", () => {
+    // Without the manifest the store directory is not a loadable pi package, and
+    // pi also does not descend into extensions/<dir> looking for loose files.
+    // Verified by probe: an extensions/belayd-harness symlink at a manifest-less
+    // store path yields zero harness tools; the same symlink at a store path with
+    // package.json yields all 30.
+    expect(flakeSource).toContain('install -m 0644 package.json "$out/package.json"');
+  });
+
+  it("keeps skills out of the store package so belayd-skills stays the owner", () => {
+    // pi.skills in the copied manifest points at ./.agents/skills, which the
+    // derivation does not install; a consumer loading the package must pass
+    // "skills": [] so ~/.agents/skills is not shadowed or duplicated.
+    expect(flakeSource).toContain('"skills": []');
+  });
+});
