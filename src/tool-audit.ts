@@ -96,6 +96,7 @@ export const HARNESS_TOOL_NAMES: readonly string[] = [
   "belayd_archify",
   "belayd_commit",
   "belayd_doctor",
+  "belayd_metrics",
   "belayd_documenter",
   "belayd_fleet_advance",
   "belayd_fleet_inbox",
