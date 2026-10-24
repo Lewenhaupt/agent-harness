@@ -1,6 +1,11 @@
 # Instructions for AI Agents
 
-## Technology Stack
+Rules that apply before you touch anything, plus a pointer to the doc that owns
+each subsystem. The module map, the full build/release notes and the service
+runbooks live in `docs/repo-layout.md` — read the section you need when you need
+it instead of carrying all of it in every session.
+
+## Technology stack
 
 | Tool | Purpose |
 |------|---------|
@@ -10,405 +15,21 @@
 | Biome | Formatting and linting |
 | pnpm | Package manager |
 
-## Project Structure
-
-```
-belayd-agent-harness/
-├── src/                    # Library source (published as npm package)
-│   ├── index.ts            # Public API re-exports
-│   ├── agent-registry.ts   # Agent definitions, types, DEFAULT_AGENTS
-│   ├── spawn.ts            # Agent process spawner (pi --mode json)
-│   ├── process-gate.ts     # Phase order enforcement
-│   ├── workflow-registry.ts # Workflow sub-types (feature, bugfix, etc.)
-│   ├── quality-gates.ts    # Deterministic quality checks (typecheck, lint, tests, proof)
-│   ├── archify.ts          # Archify diagram wrapper (args, receipts, formatting, run)
-│   ├── outline.ts          # belayd_outline pure layer (kinds, filters, formatter, resolver)
-│   ├── outline-ctags.ts    # universal-ctags argv + pure JSON parser
-│   ├── outline-ast-grep.ts # ast-grep inline rule + pure stream parser (TS family)
-│   ├── outline-extract.ts  # ctags+ast-grep orchestration (merge, line counts)
-│   ├── outline-binary.ts   # BELAYD_CTAGS_BIN / BELAYD_AST_GREP_BIN resolution
-│   ├── worktree.ts         # Git worktree utilities (setup, resolve, isInside)
-│   ├── owned-worktree.ts   # Bead ↔ branch ↔ worktree preflight (bd-119; docs/owned-worktree.md)
-│   ├── fleet-status.ts     # belayd_fleet_status read-only aggregation (bd-126 P0; docs/fleet-status.md)
-│   ├── fleet-state.ts      # Shared fleet state substrate: paths, fleet.json intent, audit.log, mailbox notes, merge-queue schema (bd-126 P1–P4)
-│   ├── fleet-mode.ts       # Fleet supervisor mode: supervisor session+pid matching, refusal wording, member→fleet lookup (bd-126 P1)
-│   ├── fleet-launch.ts     # Fleet launch engine: concurrency ceiling, validation, /fleet parsing, intent merge, P3 schedule wiring, per-member launch + prune (bd-126 P1/P3)
-│   ├── fleet-schedule.ts   # P3 pure scheduler: bd blocking edges → waves, cycle refusal, capacity deferrals + bd dependency-graph parser (bd-126 P3)
-│   ├── fleet-mailbox.ts    # Fleet mailbox rendering: note construction, inbox view, bounded turn-start event block (bd-126 P1)
-│   ├── fleet-merge.ts      # P2 single-flight merge queue: mkdir lock + lease, rebase/gates/merge, recorded-sha root stash/restore, base-moved fan-out (bd-126 P2; docs/fleet-merge.md)
-│   ├── fleet-beads.ts      # Batched read-only bd seam: bead metadata + blocking dependency graph, injected argv builder + runner, read-only argv guard (bd-126 P0/P3)
-│   ├── fleet-pause.ts      # P4 cooperative pause/resume: CAS intent writes, audited `fleet-paused`/`fleet-resumed`/`fleet-unparked`, park-stash refusal with an exact way out (bd-126 P4)
-│   ├── fleet-reconcile.ts  # P4 crash reconcile: merge-queue repair table under the existing merge lock, parked-root restore from the recorded stash sha (already-dropped shas are never re-applied), supervisor+member liveness report/prune (bd-126 P4; docs/fleet-reconcile.md)
-│   ├── fleet-sessions.ts   # P4 member-session liveness: `/proc` argv scan, exact `belayd-<taskId>` token matching, per-pid start-time re-verification before each signal, injected signalling, `unknown` never folded into `absent` (bd-126 P4)
-│   ├── stack-rebase.ts     # Stacked-branch capture/chain/--onto rebase helpers
-│   ├── model-session-state.ts # Session-scoped capacity cache, telemetry store, flush cursors
-│   ├── stale-file-guard.ts # Stale file detection (hash tracking)
-│   ├── plannotator/
-│   │   ├── signal-protocol.ts  # Signal file contract (SYNC WARNING: duplicated in pi-web-plugins)
-│   │   └── signal-writer.ts    # Signal file read/write/poll/cleanup
-│   └── __tests__/          # Unit tests (co-located)
-├── extensions/             # pi extensions (loaded by pi via pi install)
-│   ├── index.ts            # Main belayd-harness extension
-│   └── stale-file-guard.ts # Stale-file guard extension
-├── test/                   # Integration tests
-├── docs/
-│   └── diagrams/           # Committed archify HTML diagrams (see its README.md)
-├── dist/                   # Build output (tsc)
-│   └── *.js, *.d.ts        # Compiled library
-├── package.json
-├── tsconfig.json
-├── vitest.config.ts
-├── vitest.integration.config.ts
-├── biome.json
-└── .gitignore
-```
-
-## Build System
-
-- **`pnpm build`** runs `tsc` — compiles `src/` → `dist/` (library).
-- Extensions in `extensions/` are loaded directly by pi via `pi install -l`, which transpiles TypeScript on load (jiti); they import from `../src/*.js` source, not `dist/`. `dist/` exists only for library consumers.
-- `@earendil-works/pi-coding-agent` and `typebox` are listed as `peerDependencies` (pi provides them at runtime). The `pi-coding-agent` range (`^1.0.0`) must stay compatible with the flake's `pi-bare` version; it only needs to move on a major bump or when a newly adopted API has a higher minor floor.
-
-### pi packaging (`docs/packaging.md`)
-
-Which extensions a session loads is defined in exactly two manifests: `package.json`
-`pi.extensions`/`pi.skills` (the harness's own entry points) and
-`nix/pi-extensions/package.json` `piExtensions` (third-party entry paths, beside
-their dependency specs). `bin/pi`, the flake's `belayd-pi` wrapper and the
-manifest tests all derive from those two files — never add a third list. The
-spawned-agent binary resolves through `BELAYD_PI_BINARY` → `PI_BINARY_PATH` →
-system pi and logs when it falls back, because the binary decides the tool set;
-`belayd_doctor` prints the effective surface for the current session. Per-role
-surfaces live in `src/role-tools.ts` (a gated workflow declares only its own
-phase tools + control/member-fleet/consult sets; the supervisor fleet tools are
-not declared under a gate), and `src/__tests__/tool-contract.test.ts` guards the
-agent allowlists against tools no build registers.
-
-### Nix dependency bundling (`belayd-harness`)
-
-The flake's `belayd-harness` derivation bundles every `dependencies` entry from
-`package.json` into the extension's `node_modules/` (via `fetchPnpmDeps` plus an
-install of the lockfile stripped of `peerDependencies`/`devDependencies`).
-`peerDependencies` and `devDependencies` are **not** bundled.
-
-When the lockfile changes — adding, removing, or changing any
-`dependencies`, `devDependencies`, or `peerDependencies` entry
-(`fetchPnpmDeps` hashes the pnpm store for the *full* lockfile, so a dev-only
-bump such as a `lefthook` upgrade moves it too, even though the install later
-strips dev and peer deps):
-
-1. `pnpm install` — regenerate `pnpm-lock.yaml`.
-2. `nix build .#belayd-harness` — fails with `hash mismatch … got: sha256-…`.
-3. Copy the `got:` hash into `belayd-harness.pnpmDeps.hash` in `flake.nix`.
-4. Re-run `nix build .#belayd-harness`.
-
-The `pre-push` lefthook job "flake package build (belayd-harness)" runs step 2
-whenever `flake.nix`, `flake.lock`, `package.json`, or `pnpm-lock.yaml` changes,
-so a stale hash fails the push instead of landing on `main`.
-
-A stale hash does **not** always fail locally: Nix skips rebuilding a
-fixed-output derivation whose output path is already valid in the store, so
-`nix build .#belayd-harness` can succeed from cache even though a fresh fetch of
-the new lockfile would hash differently (seen when a dependency bump only
-*removed* packages, e.g. the pi-web 1.202610.6 bump, which shrank the store but
-left the old store path able to satisfy the install). To force the real hash
-before pushing, temporarily set the value to `pkgs.lib.fakeHash`, build once,
-copy the reported `got:` hash, and restore.
-
-### Archify diagram generation (`archify`)
-
-[archify](https://github.com/tt-a1i/archify) compiles a typed JSON IR into a
-single self-contained interactive HTML diagram (architecture / workflow /
-sequence / dataflow / lifecycle). It is distributed only as a GitHub release
-zip (the npm name `archify` is an unrelated 2016 package; `@pi-harness/plugin-archify`
-is a different Mermaid-emitting product).
-
-The flake defines an `archify` derivation (pinned to upstream **v3.0.1**) that
-unpacks `releases/download/v<version>/archify.zip` into `$out/libexec/archify`
-(the zip layout `archify/bin/archify.mjs` is unchanged in 3.x) and writes a
-wrapper that pins `ARCHIFY_UPDATE_CHECK_DISABLED=1` (the update checker does a
-fixed-manifest network GET; the `update.noticeRequired` flag it would feed is
-inert while disabled). It is in `devShellTools`, so it flows into
-`devShells.default` and `pi-web-runtime-env` and is therefore on `PATH` for
-every spawned agent session. `nix build .#archify` is directly testable;
-re-pin the version + hash deliberately rather than tracking `releases/latest`
-(2.17.0-dev.1 was only a dev identity, never a tagged release).
-
-The same `$out` also carries the upstream agent assets, so the wrapper,
-the devShell `shellHook`, and the pi-web runtime env all export
-`ARCHIFY_HOME=$out/libexec/archify`. A spawned session can therefore read
-`$ARCHIFY_HOME/SKILL.md` (the upstream authoring contract),
-`$ARCHIFY_HOME/schemas/`, `$ARCHIFY_HOME/examples/`, and
-`$ARCHIFY_HOME/references/` without knowing the store hash. The harness ships a
-thin router skill at `.agents/skills/archify/SKILL.md` (installed by
-`belayd-skills`) that tells the agent to read `$ARCHIFY_HOME/SKILL.md` and
-follow it.
-
-The `belayd_archify` pi tool wraps `render` / `validate` / `deliver` plus the
-read-only guidance subcommands `guide` (with optional `scenario`), `examples`,
-`inspect` (architecture only), and `check`. `guide` returns the recipe list
-without a `scenario` and a type recommendation with one; `inspect` is
-architecture-only; params irrelevant to a guidance command are echoed back as a
-`note: ... ignored for command=y` line instead of being dropped. `examples`
-lists the packaged `*.json` files directly instead of shelling out to
-`archify examples`, which would try to write rendered HTML into the read-only
-Nix store. It requests `--json` for `validate`/`deliver` and parses the path
-`render` prints (3.x rejects `--json` for `render` as an unknown option, exit
-2, so it is never passed). `repoRoot` is forwarded for all five diagram types
-(3.x accepts it for each). The tool is
-opt-in (consult-callable, not a workflow phase). It is listed in
-`GATED_TOOLS` so it stays callable while the process gate is active, but it is
-**not** in `PLANNING_GATED_TOOLS`. Generated diagrams are committed under
-`docs/diagrams/` (see `docs/diagrams/README.md`); `belayd_commit`'s `git add
--A` will include the generated HTML, and the stale-file guard does not track
-files written by the external CLI — both expected.
-
-`finalize`, `compare`, `preview` (opens a loopback HTTP server), `visual-check`
-/ `browser-check` (need Chrome via `$ARCHIFY_CHROME`), and `migrate` are
-intentionally outside the tool surface.
-
-### Bash timeout enforcement (`bash-timeout.ts`)
-
-Every agent bash call is bounded by hardcoded constants in `src/bash-timeout.ts`
-(no env var or settings knob): an omitted or unusable timeout becomes
-`BASH_DEFAULT_TIMEOUT_SECONDS` (600s), and an explicit timeout above
-`BASH_MAX_TIMEOUT_SECONDS` (1800s) is clamped. `resolveBashTimeout` returns a
-positive finite value no greater than the cap — required because pi does not
-re-validate mutated `tool_call` input.
-
-The extension registers a dedicated `tool_call` handler in `extensions/index.ts`
-(separate from the process-gate handler so the gate's early returns cannot skip
-it). It mutates `event.input.timeout` in place for the `bash`/`Bash` tool rather
-than blocking, so it applies to orchestrator and sub-agent sessions alike.
-Commands that legitimately need more than 30 minutes must be restructured
-(background/detached).
-
-### Worktree ownership preflight (`owned-worktree.ts`)
-
-Phase tools, `belayd_proof_verifier`, and `belayd_commit` refuse to run when the
-directory's `.belayd/workflow.json` task or checked-out branch is not the
-session's own; no `process.cwd()` fallback remains on the phase, commit, proof,
-or planning paths (bd-119). Runbook: `docs/owned-worktree.md`.
-
-### Fleet supervisor (`fleet-*.ts`, bd-126)
-
-`/fleet bd-12 bd-15 …` runs several beads at once, each as a normal single-bead
-workflow in its own worktree, ordered by bd's blocking edges inside a ceiling of
-3 concurrent orchestrators, with a files-first mailbox, an explicit single-flight
-merge queue, and explicit pause/advance/reconcile tools. The supervisor session
-arms no process gate and refuses the phase, proof, and commit tools.
-**Operator entry point: `docs/fleet.md`**; per-area detail in
-`docs/fleet-status.md` (P0), `docs/fleet-launch.md` (P1/P3),
-`docs/fleet-merge.md` (P2), `docs/fleet-reconcile.md` (P4), and the design record
-`docs/fleet-orchestrator.md`. Cross-tree state lives under
-`<git-common-dir>/belayd/fleet/<fleetId>/` (`fleet.json`, `audit.log`, `inbox/`,
-`events/`, `merge-queue.json`, `merge.lock.d`) — never in a worktree's `.belayd/`.
-
-### Managed instruction groups (`instruction-groups.ts`)
-
-Some extensions (notably `pi-agent-browser-native`) attach a large prompt
-section and only gate it on tool availability through pi's
-`pi:instruction-groups` event channel — which pi 1.0.2 never emits, so their
-eager fallback writes the section every turn. `src/instruction-groups.ts`
-implements the collector contract; a dedicated `before_agent_start` handler in
-extensions/index.ts emits the channel lazily each turn (until a group
-registers, independent of extension load order) and applies the registered
-groups to `systemPromptOptions.sections`. Sections are keyed by group name (`browser`),
-and a group is included only when at least one of its tools is in the session's
-`selectedTools`; the legacy `agent_browser` key is deleted whenever the
-collector owns any group, so a session whose allowlist excludes every browser
-tool carries no browser prompt section at all (bd-114; runbook:
-`docs/instruction-groups.md`).
-
-## Checking local services
-
-Two runtimes back the harness. Inspect them when diagnosing session,
-task-tracking, or container problems.
-
-### pi-web (systemd system service)
-
-Declared via the flake's `nixosModules.pi-web` and enabled in the NixOS config
-(`services.belayd-pi-web.enable`); installed by `nixos-rebuild`, not an
-imperative installer (this host's `/etc` is read-only).
-
-```bash
-systemctl status pi-web pi-web-sessiond              # health of both units
-journalctl -u pi-web -f                              # web/API logs
-journalctl -u pi-web-sessiond -f                     # session daemon logs
-journalctl -u pi-web -u pi-web-sessiond --since -1h  # recent, both units
-```
-
-Restart (sudo):
-
-```bash
-sudo systemctl restart pi-web pi-web-sessiond
-```
-
-### AWS credential isolation (bd-125)
-
-Agents must not see the operator's AWS credentials. Two mechanisms enforce
-that, both described in `docs/aws-credential-isolation.md`:
-
-- **bubblewrap masking** at three choke points: every process spawned by
-  `src/spawn.ts`, `scripts/belayd-shell.sh` (terminals, plugin `runCommand`),
-  and the `pi-web-sessiond` unit itself. Each wraps the command with
-  `bwrap --unshare-user --bind / / … --tmpfs <home>/.aws --tmpfs
-  <home>/.config/aws`, so a session sees no SSO cache and cannot run
-  `aws sso login`. The base is writable (not `--ro-bind`) because agents must
-  write their worktrees and `/tmp`; the AWS mask is the security boundary, and
-  a read-only base breaks `git`/`bd`/`nix` and the session daemon's own state.
-- **per-repo credential broker** (`src/aws-broker/`), a long-running daemon
-  (`pi-web-aws-broker`, deliberately *not* sandboxed) that serves one 0600 unix
-  socket per repo scope and resolves credentials through `aws configure
-  export-credentials` (never by parsing the SSO cache). A repo opts in with a
-  committed `.belayd/aws.yaml` naming a literal profile, validated against the
-  operator allowlist `~/.config/belayd/aws.yaml`; the sandbox gets a synthetic
-  `~/.aws/config` whose single `[profile agent]` uses a generated
-  `credential_process` shim. The operator allowlist may also list extra paths
-  under `mask:` (top level and/or per scope) that are hidden inside that scope's
-  sandbox — reference: the `Mask entries` section of
-  `docs/aws-credential-isolation.md`. The repo file carries only `profile`, so a
-  repo cannot widen its own sandbox.
-
-Dependency chain: `pkgs.bubblewrap` + `pkgs.awscli2` + `pkgs.aws-signing-helper`
-are in `devShellTools`, so all three flow into `devShells.default` and
-`pi-web-runtime-env` (hence every spawned agent's `PATH`). `bubblewrap` is the
-mask, `awscli2` resolves credentials, and `aws_signing_helper` is only needed
-when an allowlisted profile is an IAM RolesAnywhere `credential_process`
-profile: the *broker* (deliberately unsandboxed) runs it, never the sandbox.
-`belayd-harness` also exposes `bin/belayd-aws`, `bin/belayd-aws-broker`, and
-`bin/belayd-aws-credential-process`, which run the
-TypeScript entry points directly under Node 24's native type stripping (no
-tsc step; `dist/` stays a library-consumer artifact).
-
-`pi-web-sessiond` now runs in a mount namespace, so **anything that assumes an
-unmasked `~/.aws` inside a session is broken by design** — that is the point.
-Same-uid processes outside a sandbox (the interactive pi CLI, a human shell,
-pi-web server, the broker) can still read `~/.aws`; a dedicated broker uid is
-the documented, out-of-scope upgrade path.
-
-**Orchestrator vs sandboxed child (single uid).** The per-repo bwrap masks the
-broker runtime base, so a sandboxed agent cannot reach the control socket or a
-sibling repo's scope socket. The orchestrator (the session pi process in the
-`pi-web-sessiond` namespace, an agent tool that bypasses `belayd-shell`, or a
-repo with no `.belayd/aws.yaml`) is *not* masked from the runtime base — it
-needs `ensure-scope` for the agents it spawns — and can therefore ask the
-broker for any scope the allowlist configures. That is a single-uid limit, not
-a bug: do not read this as a per-uid boundary. See the actor table in
-`docs/aws-credential-isolation.md`.
-
-Fail-closed rules: no repo file, no matching allowlist scope, or a profile the
-scope does not grant ⇒ no AWS inside the sandbox. A repo that opts in and is
-refused logs one line per spawn; a repo with no AWS config is silent. An expired
-portal session or 90-day PKCE registration can only be fixed by an interactive
-`aws sso login` on the host; for a non-SSO profile (IAM RolesAnywhere) the broker
-names the `credential_process` helper and x509 material instead and never
-prescribes an SSO login. It never retries silently.
-
-Operator workflow (allowlist + repo file + host activation + refresh + diagnostics)
-and the ~5-minute acceptance checklist are the `## How to Use` and
-`## How to Verify` sections of `docs/aws-credential-isolation.md`.
-
-### scotty / portainer / beads-shared-server (arion containers)
-
-```bash
-nix develop -c arion ps              # container list + state
-nix develop -c arion logs -f         # follow all container logs
-nix develop -c arion logs -f scotty  # one service only
-```
-
-Raw container engine (this host runs Podman behind a Docker socket):
-
-```bash
-podman ps -a
-podman logs --tail 200 scotty
-```
-
-Portainer UI: `https://localhost:9443`.
-
-## Task tracking
-
-Tasks live in **Beads** (`bd`). Load the **beads** skill for the CLI reference.
-**Never close tasks** — move finished work to `in_progress` with the `human` label
-(`bd update <ID> --status in_progress --add-label human`);
-the human closes via `wt merge`. Workflow type is resolved only from an explicit
-type argument or a namespaced `wf:<type>` label (e.g. `wf:chore`); title
-keywords and plain labels are ignored and default to `feature`.
-
-## Code exploration
-
-- **Prefer `ast_grep` over `grep`/`find` for syntax-aware code searches** — use it when you need to find structural patterns (function definitions, call expressions, imports) or when text grep would produce false positives.
-- `ast_grep` is read-only. Inspect matches with `read`/`edit`/`write` only after deciding on concrete changes.
-- Use `grep`/`find` for plain-text and filename searches.
-- Your working directory is already the worktree root — run commands directly, never prefix `cd <absolute worktree path> &&`.
-- After an edit, do NOT re-read the file to locate the next anchor — use `belayd_outline` for the symbol map or a targeted `grep -n` for text. `belayd_outline` is multi-language (universal-ctags + ast-grep, no hand-rolled lexer); it needs `ctags` and `ast-grep` on PATH (devShell). Note that editing this tool shifts `extensions/index.ts` line anchors, so prefer `belayd_outline`/`ast_grep` over hard-coded line numbers in docs and tests.
-
-## Code Style
-
-### Functional programming
-
-- **Pure functions preferred.** Business logic should be pure functions. Side effects (shelling out to git, spawning processes, filesystem I/O) are confined to well-documented functions.
-- **No global mutable state.** Pass state through function arguments. The only module-level state is in `stale-file-guard.ts` (file hash map), `spawn.ts` (cached pi binary path), and `model-session-state.ts` (session-scoped capacity cache, per-workflow telemetry store, and per-cwd flush cursors), all reset on extension lifecycle.
-- **No class mutation patterns.** Prefer standalone functions and plain objects.
-- **Immutable data.** Use `const`, spread operators, `structuredClone`.
-- **Discriminated unions for multi-outcome functions.** Use `{ allowed: boolean; reason?: string }` rather than boolean returns with optional error strings.
-- **Errors as values, not exceptions.** Return expected failure results via discriminated unions (e.g. `{ ok: true; value: T } | { ok: false; error: string }`). Reserve `throw` for truly unexpected, non-recoverable conditions.
-- **Explicit missing data.** Use discriminated unions or explicit `null` checks to represent optional/missing data. Never rely on `?` optional chaining without guarding first — this is why `!` is banned.
-
-### Function signatures
-
-- **Positional arguments for 3 or fewer.** Beyond 3, use a single object parameter with a defined type.
-- **Object parameters must be unpacked with a defined type**, not inline.
-
-### Control flow
-
-- **Guard clauses first.** Check error conditions early and return/throw. Avoid deep nesting.
-- **Switch statements for multi-branch conditions.** Do not chain `if/else if` for the same variable.
-
-### Type safety
-
-- **Never use `!` non-null assertion.** Use proper checks instead.
-- **Always use `import type` for type-only imports.**
-- **No `any` types.** Use `unknown` and narrow, or define a proper type.
-
-### Naming
-
-- **kebab-case for files and directories.** `agent-registry.ts`, `stale-file-guard.ts`.
-- **PascalCase for exported types and interfaces.** `AgentDefinition`, `SpawnOptions`.
-- **camelCase for exported functions.** `spawnAgentProcess`, `checkToolAllowed`.
-- **Time variables include units.** `timeoutInMs`, `maxAgeInDays`.
-
-### Comments
-
-- **Explain why, not what.** Provide context and rationale.
-- **No commented-out code.** Git history preserves it.
-
-### Plannotator signal protocol
-
-The `src/plannotator/signal-protocol.ts` file contains a **SYNC WARNING** block — its types and functions are duplicated in the pi-web-plugins repository. Any changes to the signal protocol must be mirrored in both places, or the contract must be updated to note the divergence.
-
-## Testing
-
-### Test locations
-
-| Test type | Directory | Vitest pattern | Run command |
-|-----------|-----------|----------------|-------------|
-| Unit | `src/__tests__/` | `src/**/*.test.ts` | `pnpm test` |
-| Integration | `test/` | `test/**/*.integration.test.ts` | `pnpm test:integration` |
-
-### Testing conventions
-
-- **Tests for pure functions use no mocks** — pass all data as arguments, assert on return values.
-- **Tests for side-effect functions mock** `node:child_process` with `vi.fn()`, not entire modules.
-- **Assertions use `expect(...).toHaveProperty()`** instead of direct property access for better failure messages.
-- **Mock timers** with `vi.mock("timers/promises")` when testing retry/polling logic.
-
-## Communication
-
-- **Be extremely concise.** When reporting information to me, sacrifice grammar for the sake of concision. Keep responses short but never drop the actual facts — include all relevant facts, omit filler words, pleasantries, and narrative padding.
-- **Match the language of the user's most recent message** — headings and summaries included. Keep code, identifiers, file paths, commands, commit messages and quoted file content exactly as written; never translate them. DeepSeek primaries drift to Chinese output non-deterministically; the static block in `SHARED_AGENT_GUIDANCE` (`src/agent-registry.ts`) is the mitigation — keep it early and never vary it, and never force a reasoning language.
-
-## Acceptance Criteria
+## Where to look
+
+| Question | Read |
+|---|---|
+| Which extension/tool loads here, and which pi binary runs an agent? | `docs/packaging.md` (start with `belayd_doctor`) |
+| Where does module X live? | `docs/repo-layout.md` |
+| How does a phase agent, retry or resume work? | `docs/subagent-sessions.md`, `docs/planning-implement-workflows.md` |
+| How do I operate pi-web / AWS sandbox / containers? | `docs/pi-web-service.md`, `docs/aws-credential-isolation.md`, `docs/arion.md` |
+| Fleet (`/fleet`), proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
+
+## Build and acceptance
+
+- `pnpm build` runs `tsc` — `src/` → `dist/` (library). Extensions in `extensions/` are loaded from TypeScript source by pi; they import `../src/*.js`, not `dist/`.
+- `@earendil-works/pi-coding-agent` and `typebox` are `peerDependencies` (pi provides them). The pi range must stay compatible with the flake's `pi-bare`.
+- Nix bundles `dependencies` into `belayd-harness`. A lockfile change moves `fetchPnpmDeps`'s hash: `pnpm install`, then `nix build .#belayd-harness` (copy the reported `got:` hash into `flake.nix`), and the pre-push hook re-runs it. Full detail: `docs/packaging.md`.
 
 A change is not done until:
 
@@ -420,6 +41,70 @@ A change is not done until:
 - [ ] Comments explain why, not what
 - [ ] `import type` used for type-only imports
 - [ ] If the signal protocol changed, the SYNC WARNING is updated
+
+## Task tracking
+
+Tasks live in **Beads** (`bd`); the managed blocks at the end of this file carry
+the full protocol. **Never close tasks** — move finished work to `in_progress`
+with the `human` label (`bd update <ID> --status in_progress --add-label human`);
+the human closes via `wt merge`. Workflow type is resolved only from an explicit
+type argument or a namespaced `wf:<type>` label (e.g. `wf:chore`); title keywords
+and plain labels are ignored and default to `feature`.
+
+## Code exploration
+
+- **Prefer `ast_grep` over `grep`/`find`** for syntax-aware searches where the tool is available (spawned sub-agents always have it; a pi-web orchestrator may not — `belayd_doctor` says which). It is read-only.
+- Use `grep`/`find` for plain text and filenames; `belayd_outline` for a symbol map with line ranges. Prefer them over hard-coded line numbers in docs and tests.
+- Your working directory is already the worktree root — run commands directly, never prefix `cd <absolute worktree path> &&`.
+- After an edit, do not re-read the file to find the next anchor: use `belayd_outline` or `grep -n`.
+
+## Code style
+
+### Functional programming
+
+- **Pure functions preferred.** Side effects (git, spawning, filesystem I/O) are confined to documented functions.
+- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary) and `model-session-state.ts`.
+- **Immutable data.** `const`, spread, `structuredClone`. No class mutation patterns.
+- **Discriminated unions for multi-outcome functions**, `{ allowed: boolean; reason?: string }` rather than a boolean with an optional string.
+- **Errors as values.** Return `{ ok: true; value } | { ok: false; error }`. Reserve `throw` for non-recoverable conditions.
+- **Explicit missing data.** Narrow or return `null`; never rely on `?` without guarding (that is why `!` is banned).
+
+### Signatures and control flow
+
+- Positional arguments for 3 or fewer; beyond 3, one object parameter with a defined type, unpacked by name.
+- Guard clauses first; `switch` for multi-branch on one variable.
+
+### Type safety
+
+- Never use `!`. No `any` — use `unknown` and narrow. Always `import type` for type-only imports.
+
+### Naming
+
+- kebab-case files/directories, PascalCase exported types, camelCase functions, units in time variables (`timeoutInMs`).
+
+### Comments
+
+- Explain why, not what. No commented-out code.
+
+### Plannotator signal protocol
+
+`src/plannotator/signal-protocol.ts` carries a **SYNC WARNING**: its types and functions are duplicated in pi-web-plugins. Changes must be mirrored, or the contract must record the divergence.
+
+## Testing
+
+| Type | Directory | Command |
+|---|---|---|
+| Unit | `src/__tests__/` | `pnpm test` |
+| Integration | `test/` | `pnpm test:integration` |
+
+- Pure functions: no mocks, pass data in and assert the return value.
+- Side-effect functions: mock `node:child_process` with `vi.fn()`, not whole modules.
+- Prefer `expect(...).toHaveProperty()` over direct property access; mock timers with `vi.mock("timers/promises")` for retry/polling logic.
+
+## Communication
+
+- **Be extremely concise.** When reporting information, sacrifice grammar for the sake of concision. Keep responses short but never drop the actual facts — include all relevant facts, omit filler words, pleasantries, and narrative padding.
+- **Match the language of the user's most recent message** — headings and summaries included. Keep code, identifiers, file paths, commands, commit messages and quoted file content exactly as written; never translate them. DeepSeek primaries drift to Chinese output non-deterministically; the static block in `SHARED_AGENT_GUIDANCE` (`src/agent-registry.ts`) is the mitigation — keep it early and never vary it, and never force a reasoning language.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
@@ -484,9 +169,7 @@ implied and still require explicit approval under the active profile.
 - Explicit user or orchestrator instructions override this Beads block.
 - Do not commit or push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
-<!-- END BEADS INTEGRATION -->
-
-<!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
+<!-- END BEADS INTEGRATION --><!-- BEGIN BEADS CODEX SETUP: generated by bd setup codex -->
 ## Beads Issue Tracker
 
 Use Beads (`bd`) for durable task tracking in repositories that include it. Use the `beads` skill at `.agents/skills/beads/SKILL.md` (project install) or `~/.agents/skills/beads/SKILL.md` (global install) for Beads workflow guidance, then use the `bd` CLI for issue operations.
