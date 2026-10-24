@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_AGENTS } from "../agent-registry.js";
 import {
@@ -266,5 +269,37 @@ describe("resolveModelSpec", () => {
       model: "vendor/x",
       modelClass: undefined,
     });
+  });
+});
+
+describe("model id documentation (bd-138)", () => {
+  const notesPath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "..",
+    "docs",
+    "deepseek-provider-notes.md",
+  );
+
+  it("documents every model id in the class specs", () => {
+    // DeepSeek's official ids differ from the gateway slugs we ship, and one of
+    // them (deepseek-v4-flash) is retired upstream. Adding a model without
+    // recording which kind of id it is reproduces the silent-400 class of bug.
+    const notes = readFileSync(notesPath, "utf8");
+    for (const spec of Object.values(MODEL_CLASS_SPECS)) {
+      for (const model of spec.models) {
+        // Only DeepSeek ids have an official-vs-slug distinction to document.
+        if (!model.startsWith("deepseek")) continue;
+        expect(notes, `${model} is not documented in docs/deepseek-provider-notes.md`).toContain(
+          model,
+        );
+      }
+    }
+  });
+
+  it("records the reasoning_content round-trip requirement", () => {
+    const notes = readFileSync(notesPath, "utf8");
+    expect(notes).toContain("reasoning_content");
+    expect(notes).toContain("must be passed back");
   });
 });
