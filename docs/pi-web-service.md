@@ -63,12 +63,15 @@ Both units run as `user` with an explicit environment:
 ### AWS credential isolation (bd-125)
 
 `pi-web-sessiond` runs inside a bubblewrap *mask*
-(`bwrap --unshare-user --die-with-parent --ro-bind / / --dev-bind /dev /dev
+(`bwrap --unshare-user --die-with-parent --bind / / --dev-bind /dev /dev
 --proc /proc --tmpfs <home>/.aws --tmpfs <home>/.config/aws -- …`), so every
 agent session it spawns has no SSO cache and cannot run `aws sso login`. The
-`ExecStartPre` helper pre-creates both mask destinations (bubblewrap cannot
-create a mount point under a read-only `/`). Only the user namespace is
-unshared: `ps`, the host `/tmp`, and the host network stay available.
+base is writable (`--bind`, not `--ro-bind`) so the daemon can claim its state
+(`sessiond-owner.json`, `sessiond.sock`) and sessions can write their worktrees
+and `/tmp`; the AWS mask is the security boundary. The `ExecStartPre` helper
+pre-creates the mask destinations and the data directory. Only the user
+namespace is unshared: `ps`, the host `/tmp`, and the host network stay
+available.
 
 The per-repo sandbox (`src/spawn.ts`, `belayd-shell.sh`) additionally masks the
 broker runtime base, so a sandboxed agent can reach neither the control socket

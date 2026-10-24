@@ -117,9 +117,11 @@ describe("aws-broker scope: ids and paths", () => {
 });
 
 describe("aws-broker scope: sandbox argv", () => {
-  it("binds the base root before any mask (a later --ro-bind / / would unmask)", () => {
+  it("binds a writable base root before any mask (a later --bind / / would unmask)", () => {
     const argv = buildArgv();
-    const baseBind = indexOfSequence(argv, ["--ro-bind", "/", "/"]);
+    // `--bind`, not `--ro-bind`: the sandboxed agent must write its worktree
+    // and `/tmp`; a read-only base breaks every `git`/`bd`/`nix` command.
+    const baseBind = indexOfSequence(argv, ["--bind", "/", "/"]);
     const firstMask = indexOfSequence(argv, ["--tmpfs", "/home/hugo/.aws"]);
     const secondMask = indexOfSequence(argv, ["--tmpfs", "/home/hugo/.config/aws"]);
     const runtimeMask = indexOfSequence(argv, ["--tmpfs", RUNTIME_BASE]);
@@ -138,8 +140,9 @@ describe("aws-broker scope: sandbox argv", () => {
     expect(configBind).toBeGreaterThan(scopeBind);
     // Only one base bind exists, so no later one can unmask the tmpfs mounts.
     expect(
-      argv.filter((token, index) => token === "/" && argv[index - 1] === "--ro-bind"),
+      argv.filter((token, index) => token === "/" && argv[index - 1] === "--bind"),
     ).toHaveLength(1);
+    expect(indexOfSequence(argv, ["--ro-bind", "/", "/"])).toBe(-1);
   });
 
   it("masks the broker runtime base, so the control socket and sibling scopes are gone", () => {
@@ -169,7 +172,7 @@ describe("aws-broker scope: sandbox argv", () => {
         { kind: "null-bind", path: "/run/secrets.d/2/aws-pi-agent-key" },
       ],
     });
-    const baseBind = indexOfSequence(argv, ["--ro-bind", "/", "/"]);
+    const baseBind = indexOfSequence(argv, ["--bind", "/", "/"]);
     const certMask = indexOfSequence(argv, [
       "--ro-bind",
       "/dev/null",

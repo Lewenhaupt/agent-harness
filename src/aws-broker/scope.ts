@@ -5,9 +5,11 @@
  * without running bubblewrap. The argv rules encoded here were verified
  * against bubblewrap 0.11.2 and 0.12.0 on this host:
  *
- * - Masks must come *after* the base `--ro-bind / /`: bubblewrap applies
+ * - Masks must come *after* the base `--bind / /`: bubblewrap applies
  *   mounts in argv order, so a later base bind would silently unmask
- *   `~/.aws` again (unit-tested below).
+ *   `~/.aws` again (unit-tested below). The base is writable on purpose: a
+ *   coding agent must write its worktree and `/tmp`, and a read-only base
+ *   makes every `git`, `bd`, and `nix develop` command fail with `EROFS`.
  * - A mask is a `--tmpfs <dir>` for a directory and a
  *   `--ro-bind /dev/null <file>` for a regular file. The two are not
  *   interchangeable, and neither alternative works (verified on bubblewrap
@@ -21,23 +23,20 @@
  *   a symlinked directory fails with `bwrap: Can't create file at …: No such
  *   file or directory` (verified), because bwrap creates the mount point in the
  *   *resolved* parent but is handed the unresolved path.
- * - `--tmpfs` only works on directories that already exist, and bubblewrap
- *   cannot create the path itself because the base bind makes `/` read-only
- *   ("Can't create file …: Read-only file system"). So `~/.aws`,
- *   `~/.config/aws` and the broker runtime base are pre-created by the plan
- *   resolver (which is also why the systemd broker unit declares
- *   `RuntimeDirectory`) before any argv referencing them exists. The plan
- *   resolver treats a failure to create them as `unavailable` rather than
- *   throwing, so a missing base degrades to "no AWS" instead of a broken
- *   shell.
+ * - `--tmpfs` destinations are pre-created by the plan resolver (`~/.aws`,
+ *   `~/.config/aws`, and the broker runtime base; the systemd broker unit
+ *   declares `RuntimeDirectory` for the latter). A writable base would let
+ *   bubblewrap create a missing destination itself, but pre-creating keeps the
+ *   mask shape independent of who wins the race and gives the plan resolver a
+ *   single place to report `unavailable` instead of a broken shell.
  * - The *broker runtime base* (`<base>`, holding the control socket and every
  *   scope dir) is masked with `--tmpfs`, and only this worktree's scope dir is
  *   re-bound inside it. That is the property that keeps one repo's sandbox
  *   away from the control socket and from every sibling scope socket: socket
  *   mode 0600 is meaningless between same-uid processes, so the mask — not the
  *   file mode — is the isolation. A bind destination *inside* a tmpfs is
- *   created by bubblewrap, so the re-expose works even though `/` is
- *   read-only.
+ *   created by bubblewrap, so the re-expose works without relying on a
+ *   writable host destination.
  * - Only the *user* namespace is unshared. `--unshare-pid/--unshare-ipc/
  *   --unshare-net` and `--tmpfs /tmp` are forbidden here: bd's dolt liveness
  *   check shells out to `ps -axo`, and terminals plus `nix build` rely on the
@@ -255,7 +254,7 @@ export function buildSandboxArgv(options: BuildSandboxArgvOptions): string[] {
     "--unshare-user",
     "--die-with-parent",
     "--new-session",
-    "--ro-bind",
+    "--bind",
     "/",
     "/",
     "--dev-bind",
@@ -265,7 +264,7 @@ export function buildSandboxArgv(options: BuildSandboxArgvOptions): string[] {
     "/proc",
   ];
 
-  // Masks strictly after the base bind: a later `--ro-bind / /` unmasks.
+  // Masks strictly after the base bind: a later `--bind / /` unmasks.
   for (const mask of options.masks) {
     if (mask.kind === "tmpfs") {
       argv.push("--tmpfs", mask.path);
@@ -283,7 +282,7 @@ export function buildSandboxArgv(options: BuildSandboxArgvOptions): string[] {
   // credentials.
   argv.push("--tmpfs", options.runtimeBaseDir);
   // … then re-expose only this worktree's scope. The destination lives inside
-  // the tmpfs, so bubblewrap can create it even though `/` is read-only.
+  // the tmpfs, so bubblewrap can create it independently of the host path.
   argv.push("--ro-bind", options.scopeDir, options.scopeDir);
 
   // The synthetic config is the only profile the agent can see, because the
