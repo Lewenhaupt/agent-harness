@@ -69,3 +69,45 @@ describe("pi extension manifests (bd-131)", () => {
     expect(flakeSource).not.toContain("pi-ast-grep/src/index.ts");
   });
 });
+
+describe("project context budget (bd-137)", () => {
+  const agentsMd = readFileSync(join(repoRoot, "AGENTS.md"), "utf8");
+  const repoLayout = readFileSync(join(repoRoot, "docs/repo-layout.md"), "utf8");
+
+  it("keeps AGENTS.md inside the per-session context budget", () => {
+    // pi loads AGENTS.md into the project_context prompt section of every
+    // session, sub-agents included. It was 30.5 KB (~7.6k tokens) and dominated
+    // the sub-agent system prompt; the split moved detail into docs/. The bound
+    // leaves room for the two managed Beads blocks, which are not ours to trim.
+    const bytes = Buffer.byteLength(agentsMd, "utf8");
+    expect(bytes).toBeLessThan(12 * 1024);
+  });
+
+  it("keeps the rules an agent must know before touching anything", () => {
+    for (const rule of [
+      "Be extremely concise",
+      "language of the user's most recent message",
+      "Never close tasks",
+      "No `!` non-null assertions",
+      "pnpm test:integration",
+      "docs/repo-layout.md",
+      "docs/packaging.md",
+    ]) {
+      expect(agentsMd, `AGENTS.md lost: ${rule}`).toContain(rule);
+    }
+  });
+
+  it("keeps the managed Beads blocks intact", () => {
+    expect(agentsMd).toContain("<!-- BEGIN BEADS INTEGRATION");
+    expect(agentsMd).toContain("<!-- END BEADS INTEGRATION -->");
+    expect(agentsMd).toContain("<!-- BEGIN BEADS CODEX SETUP");
+  });
+
+  it("points the moved detail at docs/repo-layout.md instead of duplicating it", () => {
+    // The module map moved; a duplicate table in AGENTS.md would drift and cost
+    // tokens in every session.
+    expect(repoLayout).toContain("## Module map");
+    expect(repoLayout).toContain("## Docs index");
+    expect(agentsMd).not.toContain("├── src/");
+  });
+});
