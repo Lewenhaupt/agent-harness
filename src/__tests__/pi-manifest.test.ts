@@ -111,3 +111,19 @@ describe("project context budget (bd-137)", () => {
     expect(agentsMd).not.toContain("├── src/");
   });
 });
+
+describe("project extension loading (bd-132)", () => {
+  const projectSettings = JSON.parse(readFileSync(join(repoRoot, ".pi/settings.json"), "utf8")) as {
+    packages?: Array<{ source?: string }>;
+    extensions?: string[];
+  };
+
+  it("loads the repo as one package instead of six raw extension paths", () => {
+    // Raw path arrays are concatenated by pi and never deduped; a package has an
+    // identity (its resolved absolute path), so the same harness cannot load
+    // twice through equivalent declarations.
+    expect(projectSettings.extensions ?? []).toEqual([]);
+    expect(projectSettings.packages ?? []).toHaveLength(1);
+    expect(projectSettings.packages?.[0]?.source).toBe("..");
+  });
+});
