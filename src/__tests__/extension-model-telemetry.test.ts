@@ -33,7 +33,7 @@ const mockSpawnAgentProcess = vi.hoisted(() =>
         toolCalls: 1,
       },
       exitCode: 0,
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
     },
     sessionName: "mocked",
   }),

@@ -36,7 +36,7 @@ Run these commands from the repository root. Run each command to completion.
    pnpm test
    ```
 
-   Expected: Vitest exits 0 with **65 test files / 1386 tests passed**. The
+   Expected: Vitest exits 0 with **110 test files / 2562 tests passed**. The
    bd-116 suites alone:
 
    ```bash
@@ -48,8 +48,8 @@ Run these commands from the repository root. Run each command to completion.
      src/__tests__/extension-model-telemetry.test.ts
    ```
 
-   Expected: 6 files / 117 tests passed (30 capacity-cache, 21 model-telemetry,
-   9 model-session-state, 29 spawn-with-fallback, 26 run-manifest, 2
+   Expected: 6 files / 118 tests passed (30 capacity-cache, 21 model-telemetry,
+   9 model-session-state, 30 spawn-with-fallback, 26 run-manifest, 2
    extension-model-telemetry).
 
    > Known flake unrelated to bd-116: `belayd-direnv-setup (unit) > sweeps a
@@ -63,7 +63,7 @@ Run these commands from the repository root. Run each command to completion.
    pnpm test:integration
    ```
 
-   Expected: 5 files / 58 tests passed.
+   Expected: 11 files / 90 tests passed.
 
 3. Static checks and build:
 
@@ -80,7 +80,7 @@ Run these commands from the repository root. Run each command to completion.
 
 - `orders candidates away from a capacity-exhausted provider before the first attempt`
   — with `opencode-go` recorded as exhausted, the single spawn is
-  `llmgateway/mimo-v2.5`, not the first candidate.
+  `llmgateway/mimo-v2.6-flash`, not the first candidate.
 - `fast-fails without spawning when every candidate's provider is capacity-exhausted`
   — `spawnAgentProcess` is never called; one skip row per candidate carries
   `skippedCapacity: "opencode-go"`; the result text contains
@@ -183,7 +183,7 @@ so the variable must be set before `pi` starts.
    ```
 
 3. **Reorder.** With the default fixture body the fast-class scout candidates
-   (`opencode-go/mimo-v2.5` first) are reordered so `llmgateway/mimo-v2.5`
+   (`opencode-go/mimo-v2.6-flash` first) are reordered so `llmgateway/mimo-v2.6-flash`
    runs first. The reorder is deliberately silent — its point is to *not*
    spawn a doomed attempt — so the observable signal is an **absence**:
 
@@ -212,9 +212,9 @@ so the variable must be set before `pi` starts.
    trail:
 
    ```text
-   All candidate models are capacity-exhausted providers (opencode-go, llmgateway, openrouter); retry after reset. Candidates: opencode-go/mimo-v2.5, llmgateway/mimo-v2.5, openrouter/xiaomi/mimo-v2.5, ...
+   All candidate models are capacity-exhausted providers (opencode-go, llmgateway, openrouter); retry after reset. Candidates: opencode-go/mimo-v2.6-flash, llmgateway/mimo-v2.6-flash, openrouter/xiaomi/mimo-v2.6-flash, ...
 
-   [belayd model fallback] opencode-go/mimo-v2.5 (provider opencode-go capacity-exhausted) → llmgateway/mimo-v2.5 (provider llmgateway capacity-exhausted) → openrouter/xiaomi/mimo-v2.5 (provider openrouter capacity-exhausted) → ...
+   [belayd model fallback] opencode-go/mimo-v2.6-flash (provider opencode-go capacity-exhausted) → llmgateway/mimo-v2.6-flash (provider llmgateway capacity-exhausted) → openrouter/xiaomi/mimo-v2.6-flash (provider openrouter capacity-exhausted) → ...
    ```
 
    If a quality gate is configured for the phase it will retry the phase; each
@@ -337,13 +337,65 @@ mechanism that pre-empts the *first* attempt.
 `fast`. Rationale: the verifier's verdict is advisory and non-blocking, so a
 frontier/standard model spends capability on a judge whose failure cannot fail
 the workflow. Its fallback candidates are now the `fast` class
-(`mimo-v2.5`, `deepseek-v4-flash`, `glm-5.3-flash`), primary
-`opencode-go/mimo-v2.5`.
+(`mimo-v2.6-flash`, `deepseek-v4-flash`, `glm-5.3-flash`), primary
+`opencode-go/mimo-v2.6-flash`.
 
 Unchanged: scout was already `fast`, and the tester remains `frontier`
 (bd-102) because generated tests are a correctness artifact. Everything else
 keeps its declared class — see `docs/agent-model-class.md` for the full
 agent → class table and `frontier`/`standard`/`fast` primary models.
+
+### 4. Retirement-aware failure classification (bd-142)
+
+A gateway retiring a model id is a failure mode that neither quota nor transient
+covers, and it used to abort a phase: llmgateway answered
+
+```text
+410: {"message":"Model mimo-v2.5 has been deactivated and is no longer available","type":"invalid_request_error","param":null,"code":null}
+```
+
+for `mimo-v2.5`, `classifySpawnFailure` fell through to `other`, and
+`spawnAgentWithFallback` stopped instead of trying the next candidate — while a
+healthy candidate was one hop away and opencode-go was quota-exhausted. pi exits
+0 on that path, so exit-code handling could not catch it either.
+
+What changed:
+
+- **New `FailureKind`: `unavailable`.** Produced by HTTP 404/410, and by wording
+  that means "this model id is not servable here" on any status —
+  `deactivated`, `no longer available`, `Requested model X not supported`,
+  `X is not a valid model ID`, `model not found`, `has been retired` (all three
+  phrasings observed live from llmgateway/openrouter). It is fallback-worthy and
+  cooled down for `DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS` (6 h),
+  **endpoint-scoped**: `llmgateway/mimo-v2.5` cools, `llmgateway/glm-5.3` does
+  not. The entry expires so a provider rollback recovers without editing
+  `~/.pi/agent/model-cooldowns.json`.
+- **One exhaustive `isFallbackWorthy(kind)` switch** replaces the old negative
+  `kind !== "quota" && kind !== "transient"` stop predicate, so adding a failure
+  kind cannot silently turn into "stop the phase".
+- **Status extraction is defensive:** `errorStatus` (number or numeric string),
+  an `NNN:` prefix, a short human preamble (`Model response failed: 410: ...`),
+  a JSON `code`/`status` field, then any `4xx`/`5xx` code in the body.
+- **Statusless wording** is classified too: quota wording ("usage limit",
+  "quota", "rate limit", "insufficient credits") without a code now yields
+  `quota` instead of `other`.
+- **stderr is classified when no assistant error event exists** (non-zero exit):
+  network signatures → `transient`, retired-model wording → `unavailable`,
+  quota wording → `quota`, everything else stays `other`.
+
+`mimo-v2.5` itself is replaced in the `fast` class by `mimo-v2.6-flash` (the
+direct successor: same price and lineage, verified 200 on llmgateway and
+openrouter and still listed by opencode-go). `deepseek-v4-flash` stays as the
+second rung — llmgateway and openrouter still serve it — and `glm-5.3-flash`
+remains the class ceiling.
+
+Named tests: `src/__tests__/quota-failure.test.ts` →
+`classifies the live 410 deactivated-model error as unavailable`,
+`classifies a 400 rejection of the model id as unavailable, not transient`,
+`reads a status from a prefixed message, a JSON code field, and a string errorStatus`,
+`classifies a non-zero exit on an unknown model as unavailable`; and
+`src/__tests__/spawn-with-fallback.test.ts` →
+`falls back on a deactivated model (410) and cools only that endpoint`.
 
 ### 4. Telemetry artifacts: `.belayd/telemetry.json`
 
@@ -399,7 +451,7 @@ Semantics:
   [belayd model telemetry] attempts=7 fallbacks=2 quotaFailures=2 noOps=1 cost=$0.1840
     implement opencode-go/deepseek-v4.1-flash: attempts=3 fallbacks=1 quota=1 noops=0 cost=$0.1200
     plan opencode-go/deepseek-v4.1-flash: attempts=2 fallbacks=1 quota=1 noops=0 cost=$0.0500
-    scout opencode-go/mimo-v2.5: attempts=2 fallbacks=0 quota=0 noops=1 cost=$0.0140
+    scout opencode-go/mimo-v2.6-flash: attempts=2 fallbacks=0 quota=0 noops=1 cost=$0.0140
   ```
 
   It is emitted on workflow **completion**, `belayd_stop_task`, and
@@ -481,8 +533,10 @@ scout	attempts=2	fallbacks=0	noops=1	cost=$0.0140
 `quotaFailures` says *why* the fallbacks happened: a phase whose `fallbacks`
 are almost all explained by `quotaFailures` is fighting provider limits (the
 pre-dispatch check plus the tuned class are the levers); fallbacks with zero
-`quotaFailures` mean model-level failures (auth, transient, "other") where the
-class routing, not capacity, is the lever.
+`quotaFailures` mean model-level failures (auth, transient, unavailable,
+"other") where the class routing, not capacity, is the lever. A fallback trail
+showing `(unavailable)` means a candidate id is retired at that endpoint — swap
+it in `MODEL_CLASS_SPECS` rather than waiting for the cooldown.
 
 **Which candidate actually absorbs the work?** Group by model to see whether the
 class primary is really the one doing the work:
@@ -582,7 +636,7 @@ const capacity = createCapacityCache({
 
 await capacity.refreshIfStale();               // never rejects
 capacity.record({ provider: "opencode-go", resetAt: Date.now() + 3_600_000, reason: "429" });
-capacity.isModelExhausted("opencode-go/mimo-v2.5"); // true
+capacity.isModelExhausted("opencode-go/mimo-v2.6-flash"); // true
 orderCandidatesByCapacity(["opencode-go/a", "llmgateway/a"], (c) =>
   capacity.isModelExhausted(c),
 );

@@ -262,7 +262,7 @@ describe("extension modelClass threading", () => {
     const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
       | { model: string; modelClass?: string; detached?: boolean }
       | undefined;
-    expect(options?.model).toBe("opencode-go/mimo-v2.5");
+    expect(options?.model).toBe("opencode-go/mimo-v2.6-flash");
     expect(options?.modelClass).toBe("fast");
     expect(options?.detached).toBe(true);
   });

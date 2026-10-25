@@ -41,7 +41,7 @@ const PROVIDER_MODEL_IDS: Readonly<Record<string, Readonly<Record<string, string
     "glm-5.2": "z-ai/glm-5.2",
     "glm-5.3": "z-ai/glm-5.3",
     "glm-5.3-flash": "z-ai/glm-5.3-flash",
-    "mimo-v2.5": "xiaomi/mimo-v2.5",
+    "mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
   },
 };
 
@@ -82,14 +82,14 @@ export const MODEL_CLASS_SPECS: Record<ModelClass, ModelClassSpec> = {
   fast: {
     name: "fast",
     rationale:
-      "mimo-v2.5 is the class primary; deepseek-v4-flash; glm-5.3-flash as the capability ceiling.",
-    models: ["mimo-v2.5", "deepseek-v4-flash", "glm-5.3-flash"],
+      "mimo-v2.6-flash is the class primary (the direct successor of the deactivated mimo-v2.5, same price and lineage); deepseek-v4-flash; glm-5.3-flash as the capability ceiling.",
+    models: ["mimo-v2.6-flash", "deepseek-v4-flash", "glm-5.3-flash"],
   },
 };
 
 /** Primary class for each bare model id used by DEFAULT_AGENTS and workflow overrides. */
 export const MODEL_TO_CLASS: Record<string, ModelClass> = {
-  "mimo-v2.5": "fast",
+  "mimo-v2.6-flash": "fast",
   "deepseek-v4-flash": "fast",
   "glm-5.3-flash": "standard",
   "glm-5.3": "frontier",

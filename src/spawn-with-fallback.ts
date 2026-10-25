@@ -2,10 +2,10 @@
  * Quota-aware spawn loop.
  *
  * Tries an ordered list of candidate models for a single sub-agent task. On a
- * quota/credit/rate-limit (or transient) failure it cools the model down and
- * moves to the next candidate; on auth/config/startup failures it stops
- * immediately — switching models won't fix those and would hide a real
- * misconfiguration.
+ * quota/credit/rate-limit, transient, or model-unavailable failure (`isFallbackWorthy`)
+ * it cools the target down and moves to the next candidate; on
+ * auth/config/startup failures it stops immediately — switching models won't fix
+ * those and would hide a real misconfiguration.
  *
  * Each attempt normally gets a fresh session id (a "-fallback-N" suffix) so
  * pi never resumes a half-failed session. In resume mode (`resumeSession`)
@@ -26,7 +26,7 @@ import { candidatesForModel, providerOf } from "./model-classes.js";
 import { createModelCooldownStore, type ModelCooldownStore } from "./model-cooldown.js";
 import type { ModelTelemetryStore } from "./model-telemetry.js";
 import type { FailureClassification } from "./quota-failure.js";
-import { classifySpawnFailure } from "./quota-failure.js";
+import { classifySpawnFailure, isFallbackWorthy } from "./quota-failure.js";
 import { spawnAgentProcess } from "./spawn.js";
 
 export interface SpawnAttempt {
@@ -202,7 +202,7 @@ async function runCandidate(
     suppressResumeWarning,
   });
   const classification = classifyFn(result.details);
-  const stop = classification.kind !== "quota" && classification.kind !== "transient";
+  const stop = !isFallbackWorthy(classification.kind);
   return { stop, result, classification };
 }
 
@@ -276,6 +276,10 @@ function recordCooldown(
   if (classification.cooldownSeconds === undefined) return;
   const seconds = classification.cooldownSeconds;
   const reason = classification.reason ?? classification.kind;
+  // Only a quota failure exhausts a whole credential bucket. A transient fault or
+  // a retired model id is endpoint-specific: the same bare id is usually still
+  // served by another provider, so cooling the provider instead would discard
+  // healthy candidates.
   if (classification.kind === "quota" && provider !== "") {
     store.markProviderCooldown(provider, seconds, reason);
   } else {
