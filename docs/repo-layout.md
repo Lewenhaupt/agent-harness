@@ -69,7 +69,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/model-session-state.ts` | Session-scoped mutable model-routing state (bd-116) |
 | `src/model-telemetry.ts` | Per-(phase, model) execution telemetry |
 | `src/capacity-cache.ts` | Pre-dispatch provider capacity cache |
-| `src/quota-failure.ts` | Quota/credit/rate-limit failure classification |
+| `src/quota-failure.ts` | Failure classification (quota, transient, model-unavailable, auth) and `isFallbackWorthy` |
 | `src/llmgateway-models.ts` | LLM Gateway models.json mapping — pure functions |
 
 ### worktree

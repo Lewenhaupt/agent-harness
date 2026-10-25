@@ -9,17 +9,17 @@ import {
 describe("model cooldown store", () => {
   it("marks a model endpoint as cooling down for the requested duration", () => {
     const store = createModelCooldownStore(() => 1_000_000);
-    store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
+    store.markCooldown("opencode-go/mimo-v2.6-flash", 300, "transient");
 
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5", 1_299_999)).toBe(true);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash", 1_299_999)).toBe(true);
     // At/after the boundary it is no longer cooling down.
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5", 1_300_000)).toBe(false);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash", 1_300_000)).toBe(false);
   });
 
   it("does not affect other models", () => {
     const store = createModelCooldownStore(() => 1_000_000);
-    store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
+    store.markCooldown("opencode-go/mimo-v2.6-flash", 300, "transient");
     expect(store.isCoolingDown("deepseek-v4.1-flash")).toBe(false);
   });
 
@@ -27,49 +27,52 @@ describe("model cooldown store", () => {
     const store = createModelCooldownStore(() => 1_000_000);
     store.markProviderCooldown("opencode-go", 300, "quota");
 
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
     expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(true);
     // The same bare model id on another provider has its own quota bucket.
-    expect(store.isCoolingDown("llmgateway/mimo-v2.5")).toBe(false);
+    expect(store.isCoolingDown("llmgateway/mimo-v2.6-flash")).toBe(false);
   });
 
   it("reports which scope is blocking a model", () => {
     const store = createModelCooldownStore(() => 1_000_000);
     store.markProviderCooldown("opencode-go", 300, "quota");
-    store.markCooldown("llmgateway/mimo-v2.5", 300, "transient");
+    store.markCooldown("llmgateway/mimo-v2.6-flash", 300, "transient");
 
-    expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("provider");
-    expect(store.cooldownScope("llmgateway/mimo-v2.5")).toBe("model");
+    expect(store.cooldownScope("opencode-go/mimo-v2.6-flash")).toBe("provider");
+    expect(store.cooldownScope("llmgateway/mimo-v2.6-flash")).toBe("model");
     expect(store.cooldownScope("llmgateway/other")).toBe(undefined);
   });
 
   it("prunes expired entries", () => {
     const store = createModelCooldownStore(() => 1_000_000);
-    store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
+    store.markCooldown("opencode-go/mimo-v2.6-flash", 300, "transient");
     store.markProviderCooldown("opencode-go", 300, "quota");
 
     store.prune(2_000_000);
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(false);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(false);
     expect(store.entries().size).toBe(0);
     expect(store.providerEntries().size).toBe(0);
   });
 
   it("keeps non-expired entries on prune", () => {
     const store = createModelCooldownStore(() => 1_000_000);
-    store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
+    store.markCooldown("opencode-go/mimo-v2.6-flash", 300, "transient");
 
     store.prune(1_100_000);
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
     expect(store.entries().size).toBe(1);
   });
 
   it("exposes entry snapshots for both scopes", () => {
     const store = createModelCooldownStore(() => 1_000_000);
-    store.markCooldown("opencode-go/mimo-v2.5", 300, "transient");
+    store.markCooldown("opencode-go/mimo-v2.6-flash", 300, "transient");
     store.markProviderCooldown("opencode-go", 300, "quota");
 
-    expect(store.entries().get("opencode-go/mimo-v2.5")).toHaveProperty("until", 1_300_000);
-    expect(store.entries().get("opencode-go/mimo-v2.5")).toHaveProperty("reason", "transient");
+    expect(store.entries().get("opencode-go/mimo-v2.6-flash")).toHaveProperty("until", 1_300_000);
+    expect(store.entries().get("opencode-go/mimo-v2.6-flash")).toHaveProperty(
+      "reason",
+      "transient",
+    );
     expect(store.providerEntries().get("opencode-go")).toHaveProperty("until", 1_300_000);
     expect(store.providerEntries().get("opencode-go")).toHaveProperty("reason", "quota");
   });
@@ -146,15 +149,15 @@ describe("model cooldown store (file persistence)", () => {
           "expired-provider": { until: 500_000, reason: "quota" },
         },
         models: {
-          "opencode-go/mimo-v2.5": { until: 1_300_000, reason: "transient" },
+          "opencode-go/mimo-v2.6-flash": { until: 1_300_000, reason: "transient" },
           "expired-model": { until: 500_000, reason: "transient" },
         },
       }),
     });
     const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
 
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
-    expect(store.isCoolingDown("expired-provider/mimo-v2.5")).toBe(false);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+    expect(store.isCoolingDown("expired-provider/mimo-v2.6-flash")).toBe(false);
     expect(store.isCoolingDown("expired-model")).toBe(false);
     expect(store.entries().size).toBe(1);
     expect(store.providerEntries().size).toBe(1);
@@ -164,13 +167,13 @@ describe("model cooldown store (file persistence)", () => {
     const fs = createFakeFs();
     const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
     store.markProviderCooldown("opencode-go", 300, "quota");
-    store.markCooldown("llmgateway/mimo-v2.5", 300, "transient");
+    store.markCooldown("llmgateway/mimo-v2.6-flash", 300, "transient");
 
     const state = readState(fs, filePath);
     expect(state.providers).toHaveProperty("opencode-go.until", 1_300_000);
     expect(state.providers).toHaveProperty("opencode-go.reason", "quota");
-    expect(state.models["llmgateway/mimo-v2.5"]).toHaveProperty("until", 1_300_000);
-    expect(state.models["llmgateway/mimo-v2.5"]).toHaveProperty("reason", "transient");
+    expect(state.models["llmgateway/mimo-v2.6-flash"]).toHaveProperty("until", 1_300_000);
+    expect(state.models["llmgateway/mimo-v2.6-flash"]).toHaveProperty("reason", "transient");
     expect([...fs.files.keys()]).toEqual([filePath]);
   });
 
@@ -181,8 +184,8 @@ describe("model cooldown store (file persistence)", () => {
 
     // Simulates an orchestrator restart: a fresh store over the same file.
     const restarted = createModelCooldownStore({ now: () => 1_100_000, filePath, fs });
-    expect(restarted.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
-    expect(restarted.cooldownScope("opencode-go/mimo-v2.5")).toBe("provider");
+    expect(restarted.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+    expect(restarted.cooldownScope("opencode-go/mimo-v2.6-flash")).toBe("provider");
   });
 
   it("treats a corrupt persisted file as empty without throwing", () => {
@@ -201,12 +204,12 @@ describe("model cooldown store (file persistence)", () => {
       }),
     });
     const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
-    store.markCooldown("llmgateway/mimo-v2.5", 300, "transient");
+    store.markCooldown("llmgateway/mimo-v2.6-flash", 300, "transient");
 
     const state = readState(fs, filePath);
     expect(state.providers).toHaveProperty("other-provider.until", 2_000_000);
     expect(state.models["other-provider/x"]).toHaveProperty("until", 2_000_000);
-    expect(state.models["llmgateway/mimo-v2.5"]).toHaveProperty("until", 1_300_000);
+    expect(state.models["llmgateway/mimo-v2.6-flash"]).toHaveProperty("until", 1_300_000);
   });
 
   it("accepts an options object with explicit now and fs seams", () => {
@@ -217,6 +220,6 @@ describe("model cooldown store (file persistence)", () => {
     };
     const store = createModelCooldownStore(options);
     store.markProviderCooldown("opencode-go", 300, "quota");
-    expect(store.isCoolingDown("opencode-go/mimo-v2.5")).toBe(true);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
   });
 });

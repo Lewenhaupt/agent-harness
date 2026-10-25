@@ -776,8 +776,10 @@ export {
 export type { FailureClassification, FailureKind } from "./quota-failure.js";
 export {
   classifySpawnFailure,
+  DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
   DEFAULT_QUOTA_COOLDOWN_SECONDS,
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+  isFallbackWorthy,
   parseQuotaResetSeconds,
 } from "./quota-failure.js";
 export type {

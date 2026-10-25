@@ -47,12 +47,12 @@ function seqClassifier(...kinds: FailureClassification["kind"][]): typeof classi
 describe("spawnAgentWithFallback", () => {
   it("falls back to the next candidate on a quota failure and cools the failed provider", async () => {
     mockSpawnAgentProcess
-      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"))
-      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"))
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
     const store = createModelCooldownStore(() => 0);
     const { result, attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -60,22 +60,70 @@ describe("spawnAgentWithFallback", () => {
       classify: seqClassifier("quota", "success"),
     });
 
-    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
-    expect(attempts.map((a) => a.model)).toEqual(["opencode-go/mimo-v2.5", "llmgateway/mimo-v2.5"]);
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.6-flash");
+    expect(attempts.map((a) => a.model)).toEqual([
+      "opencode-go/mimo-v2.6-flash",
+      "llmgateway/mimo-v2.6-flash",
+    ]);
     // Quota is provider-scoped: the whole provider cools, not just the model.
-    expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("provider");
+    expect(store.cooldownScope("opencode-go/mimo-v2.6-flash")).toBe("provider");
     expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(true);
-    expect(store.isCoolingDown("llmgateway/mimo-v2.5")).toBe(false);
+    expect(store.isCoolingDown("llmgateway/mimo-v2.6-flash")).toBe(false);
+  });
+
+  it("falls back on a deactivated model (410) and cools only that endpoint", async () => {
+    // bd-142: the exact failure that stopped a scout phase used to classify as
+    // "other" and abort the loop, so the next candidate was never tried.
+    const deactivatedDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "llmgateway/mimo-v2.5",
+          stopReason: "error",
+          errorMessage:
+            '410: {"message":"Model mimo-v2.5 has been deactivated and is no longer available","type":"invalid_request_error","param":null,"code":null}',
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("llmgateway/mimo-v2.5"),
+        details: deactivatedDetails,
+      })
+      .mockResolvedValueOnce(makeResult("openrouter/xiaomi/mimo-v2.6-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "llmgateway/mimo-v2.5",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["llmgateway/mimo-v2.5", "openrouter/xiaomi/mimo-v2.6-flash"],
+    });
+
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      "result-from-openrouter/xiaomi/mimo-v2.6-flash",
+    );
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["unavailable", "success"]);
+    // Endpoint-scoped: the gateway still serves its other models.
+    expect(store.cooldownScope("llmgateway/mimo-v2.5")).toBe("model");
+    expect(store.isCoolingDown("llmgateway/glm-5.3")).toBe(false);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(false);
   });
 
   it("cools only the endpoint on a transient failure, leaving the provider usable", async () => {
     mockSpawnAgentProcess
-      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"))
-      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"))
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
     const store = createModelCooldownStore(() => 0);
     const { result } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -83,16 +131,16 @@ describe("spawnAgentWithFallback", () => {
       classify: seqClassifier("transient", "success"),
     });
 
-    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
-    expect(store.cooldownScope("opencode-go/mimo-v2.5")).toBe("model");
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.6-flash");
+    expect(store.cooldownScope("opencode-go/mimo-v2.6-flash")).toBe("model");
     expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(false);
   });
 
   it("stops immediately on an auth/other failure without trying more candidates", async () => {
-    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
 
     const { attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -187,10 +235,10 @@ describe("spawnAgentWithFallback", () => {
   });
 
   it("honors the kill switch by trying only the configured model", async () => {
-    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
 
     const { attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -208,7 +256,7 @@ describe("spawnAgentWithFallback", () => {
         {
           role: "assistant",
           content: [],
-          model: "opencode-go/mimo-v2.5",
+          model: "opencode-go/mimo-v2.6-flash",
           stopReason: "error",
           errorMessage: '429: {"message":"Weekly usage limit reached. Resets in 11hr 6min."}',
         },
@@ -217,17 +265,20 @@ describe("spawnAgentWithFallback", () => {
       exitCode: 0,
     };
     mockSpawnAgentProcess
-      .mockResolvedValueOnce({ ...makeResult("opencode-go/mimo-v2.5"), details: quotaDetails })
-      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+      .mockResolvedValueOnce({
+        ...makeResult("opencode-go/mimo-v2.6-flash"),
+        details: quotaDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
     const { result, attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
     });
 
-    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.5");
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.6-flash");
     expect(attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
   });
 
@@ -329,7 +380,7 @@ describe("spawnAgentWithFallback", () => {
   it("expands an unknown model using the explicit class", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("unknown/x"))
-      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
 
     const { result, attempts } = await spawnAgentWithFallback({
       model: "unknown/x",
@@ -340,16 +391,16 @@ describe("spawnAgentWithFallback", () => {
       classify: seqClassifier("quota", "success"),
     });
 
-    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.5");
-    expect(attempts.map((a) => a.model)).toEqual(["unknown/x", "opencode-go/mimo-v2.5"]);
+    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.6-flash");
+    expect(attempts.map((a) => a.model)).toEqual(["unknown/x", "opencode-go/mimo-v2.6-flash"]);
     expect(attempts.map((a) => a.model)).not.toContain("llmgateway/unknown");
   });
 
   it("does not forward modelClass to spawnAgentProcess", async () => {
-    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.5"));
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
 
     await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       modelClass: "fast",
       tools: [],
       systemPrompt: "t",
@@ -372,7 +423,7 @@ describe("spawnAgentWithFallback", () => {
       "tools",
     ]);
     expect(call).toEqual({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -530,7 +581,7 @@ describe("spawnAgentWithFallback", () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("a"));
 
     const { attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -543,13 +594,13 @@ describe("spawnAgentWithFallback", () => {
   });
 
   it("orders candidates away from a capacity-exhausted provider before the first attempt", async () => {
-    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.5"));
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
     const capacity = createCapacityCache({ now: () => 0 });
     capacity.record({ provider: "opencode-go", resetAt: 9_999_999, reason: "weekly limit" });
 
     const { attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -562,9 +613,9 @@ describe("spawnAgentWithFallback", () => {
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
     expect(mockSpawnAgentProcess.mock.calls[0]?.[0]).toHaveProperty(
       "model",
-      "llmgateway/mimo-v2.5",
+      "llmgateway/mimo-v2.6-flash",
     );
-    expect(attempts[0]).toHaveProperty("model", "llmgateway/mimo-v2.5");
+    expect(attempts[0]).toHaveProperty("model", "llmgateway/mimo-v2.6-flash");
   });
 
   it("records per-(phase, model) telemetry including zero-tool-call no-ops", async () => {
@@ -663,7 +714,7 @@ describe("spawnAgentWithFallback", () => {
 
   it("still spawns when the pre-dispatch capacity probe rejects", async () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(
-      makeResult("opencode-go/mimo-v2.5", 0, { toolCalls: 1 }),
+      makeResult("opencode-go/mimo-v2.6-flash", 0, { toolCalls: 1 }),
     );
     const capacity = createCapacityCache({
       probe: () => {
@@ -672,7 +723,7 @@ describe("spawnAgentWithFallback", () => {
     });
 
     const { result } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -681,7 +732,7 @@ describe("spawnAgentWithFallback", () => {
     });
 
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
-    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.5");
+    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.6-flash");
   });
 
   it("re-probes the capacity signal once the TTL expires between spawns", async () => {
@@ -689,11 +740,11 @@ describe("spawnAgentWithFallback", () => {
     const probe = vi.fn(() => ({ windows: [] }));
     const capacity = createCapacityCache({ probe, now: () => nowMs, ttlInMs: 1_000 });
     mockSpawnAgentProcess.mockResolvedValue(
-      makeResult("opencode-go/mimo-v2.5", 0, { toolCalls: 1 }),
+      makeResult("opencode-go/mimo-v2.6-flash", 0, { toolCalls: 1 }),
     );
 
     const options = {
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",
@@ -735,7 +786,7 @@ describe("spawnAgentWithFallback", () => {
 
   it("returns an empty exhausted result for maxAttempts: 0 without spawning", async () => {
     const { result, attempts } = await spawnAgentWithFallback({
-      model: "opencode-go/mimo-v2.5",
+      model: "opencode-go/mimo-v2.6-flash",
       tools: [],
       systemPrompt: "t",
       task: "t",

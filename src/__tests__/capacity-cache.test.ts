@@ -63,8 +63,8 @@ describe("createCapacityCache", () => {
     expect(cache.isExhausted("opencode-go", 1_999)).toBe(true);
     expect(cache.isExhausted("opencode-go", 2_000)).toBe(false);
     expect(cache.isExhausted("llmgateway")).toBe(false);
-    expect(cache.isModelExhausted("opencode-go/mimo-v2.5")).toBe(true);
-    expect(cache.isModelExhausted("llmgateway/mimo-v2.5")).toBe(false);
+    expect(cache.isModelExhausted("opencode-go/mimo-v2.6-flash")).toBe(true);
+    expect(cache.isModelExhausted("llmgateway/mimo-v2.6-flash")).toBe(false);
   });
 
   it("does not treat a provider-less model id as exhausted", () => {

@@ -12,9 +12,10 @@
  *
  * - **provider** (`opencode-go`): a quota/credit/rate limit (402/429) exhausts
  *   the provider's whole quota bucket, so every model on it is dead until reset.
- * - **model** (`opencode-go/mimo-v2.5`): a transient failure (5xx, network) is
- *   endpoint-specific — the same bare model id may still be healthy on another
- *   provider, so only this exact endpoint is cooled.
+ * - **model** (`opencode-go/mimo-v2.6-flash`): a transient failure (5xx, network),
+ *   or a model id the endpoint retired (404/410), is endpoint-specific — the same
+ *   bare model id may still be healthy on another provider, so only this exact
+ *   endpoint is cooled.
  *
  * `isCoolingDown(model)` reports true when either the model's provider or the
  * model endpoint itself is cooling down.

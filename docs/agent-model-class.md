@@ -23,14 +23,18 @@ Run these commands from the repository root. Run each command to completion:
 1. ```bash
    pnpm test
    ```
-   Expected: 465 unit tests pass; Vitest exits with status 0. This includes
+   Expected: 2562 unit tests in 110 files pass; Vitest exits with status 0.
+   This includes
    the model-class, agent-registry, spawn-fallback, and extension
-   phase-threading tests.
+   phase-threading tests, plus the bd-142 classification cases
+   (`classifies the live 410 deactivated-model error as unavailable`,
+   `falls back on a deactivated model (410) and cools only that endpoint`).
 
 2. ```bash
    pnpm test:integration
    ```
-   Expected: 18 integration tests pass and Vitest exits with status 0.
+   Expected: 90 integration tests in 11 files pass and Vitest exits with
+   status 0.
 
 3. ```bash
    pnpm typecheck
@@ -73,7 +77,7 @@ Expected behavior:
 
   | Agent | Class primary (first-choice model) |
   | --- | --- |
-  | `belayd-scout` | `fast` → `opencode-go/mimo-v2.5` |
+  | `belayd-scout` | `fast` → `opencode-go/mimo-v2.6-flash` |
   | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-reviewer` | `standard` → `opencode-go/glm-5.3-flash` |
@@ -81,7 +85,7 @@ Expected behavior:
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-committer` | `fast` → `opencode-go/mimo-v2.5` |
+  | `belayd-committer` | `fast` → `opencode-go/mimo-v2.6-flash` |
 
 The tier-to-primary mapping used by `primaryModelOf` is:
 
@@ -89,24 +93,41 @@ The tier-to-primary mapping used by `primaryModelOf` is:
 | --- | --- |
 | `frontier` | `opencode-go/deepseek-v4.1-flash` |
 | `standard` | `opencode-go/glm-5.3-flash` |
-| `fast` | `opencode-go/mimo-v2.5` |
+| `fast` | `opencode-go/mimo-v2.6-flash` |
 
-- On a quota or transient failure, the next attempt stays within that class:
-  the same model on each alternate provider (in `PROVIDER_PREFERENCE` order —
-  `opencode-go`, then `llmgateway`, then `openrouter`) is preferred before
-  another model in the class. OpenRouter serves the same models under
-  vendor-qualified ids (`glm-5.3-flash` → `z-ai/glm-5.3-flash`, `mimo-v2.5` →
-  `xiaomi/mimo-v2.5`, `gpt-5.6-luna` → `openai/gpt-5.6-luna`,
-  `deepseek-*` → `deepseek/deepseek-*`), so a candidate looks like
+- On a quota, transient, or model-unavailable failure, the next attempt stays
+  within that class: the same model on each alternate provider (in
+  `PROVIDER_PREFERENCE` order — `opencode-go`, then `llmgateway`, then
+  `openrouter`) is preferred before another model in the class. OpenRouter
+  serves the same models under vendor-qualified ids (`glm-5.3-flash` →
+  `z-ai/glm-5.3-flash`, `mimo-v2.6-flash` → `xiaomi/mimo-v2.6-flash`,
+  `gpt-5.6-luna` → `openai/gpt-5.6-luna`, `deepseek-*` →
+  `deepseek/deepseek-*`), so a candidate looks like
   `openrouter/z-ai/glm-5.3-flash`. A successful result may include a trailing
   `[belayd model fallback] ...` note showing the attempted models. With no
   failure, no fallback note is added.
+- The failure kinds that trigger fallback are exactly `quota`, `transient`, and
+  `unavailable` (`isFallbackWorthy`). `unavailable` covers a model id the
+  endpoint refuses as retired or unknown — HTTP 404/410, or wording such as
+  "has been deactivated and is no longer available", "Requested model X not
+  supported", "X is not a valid model ID" — and is cooled down **per
+  endpoint** (never per provider: the same bare id is usually still served by
+  another gateway) for six hours. It exists because provider catalogs go stale:
+  `mimo-v2.5` stayed in pi's cached `opencode-go` catalog after the gateway
+  retired it, and an unclassified 410 used to abort a whole phase instead of
+  moving to the next candidate. `auth` (bare 401/403) and `other` still stop the
+  fallback immediately.
 - A provider-entitlement 403 — a 403 whose body carries subscription wording
   such as "An active OpenCode Go subscription is required to use Go models" —
   is treated as a provider-scoped quota failure: that provider is cooled down
   and the fallback continues to the alternate provider for the same model. A
   bare 401/403 (a credentials problem) still stops the fallback rather than
   switching models.
+- When the child process fails without an assistant error event, the exit code
+  and stderr are classified by the same signatures: a network error is
+  `transient`, retired-model wording is `unavailable`, quota wording is `quota`,
+  and anything else stays `other` (a genuine startup/config failure, which
+  must not be hidden by switching models).
 - Inspect persistent sub-agent sessions, if needed, with:
 
   ```bash
@@ -176,7 +197,7 @@ primary directly):
 import { candidatesForModel, primaryModelOf, resolveModelSpec } from "belayd-agent-harness";
 
 primaryModelOf("fast");
-// "opencode-go/mimo-v2.5"
+// "opencode-go/mimo-v2.6-flash"
 
 resolveModelSpec({ modelClass: "standard" });
 // { model: "opencode-go/glm-5.3-flash", modelClass: "standard" }
@@ -191,9 +212,9 @@ import { candidatesForModel } from "belayd-agent-harness";
 const candidates = candidatesForModel("opencode-go/glm-5.3", "fast");
 // [
 //   "opencode-go/glm-5.3",        // requested model always comes first
-//   "opencode-go/mimo-v2.5",
-//   "llmgateway/mimo-v2.5",
-//   "openrouter/xiaomi/mimo-v2.5",
+//   "opencode-go/mimo-v2.6-flash",
+//   "llmgateway/mimo-v2.6-flash",
+//   "openrouter/xiaomi/mimo-v2.6-flash",
 //   "opencode-go/deepseek-v4-flash",
 //   "llmgateway/deepseek-v4-flash",
 //   "openrouter/deepseek/deepseek-v4-flash",
