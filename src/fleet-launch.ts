@@ -16,6 +16,8 @@
  *   request would hide the operator's intent.
  */
 
+import type { SupervisorHeartbeat } from "./fleet-heartbeat.js";
+import { effectiveSupervisorState } from "./fleet-heartbeat.js";
 import type {
   FleetSupervisorLiveness,
   FleetSupervisorRecord,
@@ -466,6 +468,14 @@ export interface MergeFleetIntentInput {
    * recorded survives a supervisor restart instead of being silently cleared.
    */
   deferred?: FleetIntent["deferred"];
+  /**
+   * P5 run record for this launch.
+   *
+   * Omitted (as on a re-arm or an advance) so an active run survives a wave
+   * advance; callers that start a run write it after the launch, when the member
+   * session ids are known.
+   */
+  run?: FleetIntent["run"];
 }
 
 /**
@@ -512,6 +522,13 @@ export function mergeFleetIntent(input: MergeFleetIntentInput): FleetIntent {
     ...(current.park === undefined ? {} : { park: current.park }),
     ...(current.note === undefined ? {} : { note: current.note }),
     ...(deferred === undefined ? {} : { deferred }),
+    // An active run survives a launch that does not restate it: dropping it here
+    // would silently stop the loop (`/fleet` advance) or forget what it landed.
+    ...(input.run !== undefined
+      ? { run: input.run }
+      : current.run === undefined
+        ? {}
+        : { run: current.run }),
   };
 }
 
@@ -541,6 +558,21 @@ export interface FleetCommandArgs {
   taskIds: readonly string[];
   fleetId?: string;
   concurrency?: number;
+  /**
+   * False when `--manual` asked for the explicit, tool-driven surface.
+   *
+   * Absent means "run until complete": the default the operator gets from `/fleet`,
+   * because the point of naming several beads at once is to come back to finished
+   * work. `--manual` restores the P1–P4 behaviour (launch/land/advance on call).
+   */
+  untilComplete?: boolean;
+  /**
+   * False when `--no-accept` asked to leave beads for the human.
+   *
+   * Accepting (close the bead, remove the worktree) is the default for a run,
+   * because a bead that stays open keeps blocking its dependents in bd.
+   */
+  accept?: boolean;
 }
 
 export type FleetCommandParse = { ok: true; args: FleetCommandArgs } | { ok: false; error: string };
@@ -548,14 +580,16 @@ export type FleetCommandParse = { ok: true; args: FleetCommandArgs } | { ok: fal
 /** Usage line shown for a bare or malformed `/fleet`. */
 export function fleetUsageText(): string {
   return [
-    "Usage: /fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>]",
+    "Usage: /fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--no-accept]",
     "  task ids: beads to run as members, each in its own worktree (1 or more)",
     `  --fleet <id>: fleet directory name (default: ${DEFAULT_FLEET_ID})`,
     `  --concurrency <n>: concurrent orchestrators, capped at ${FLEET_MAX_CONCURRENT_ORCHESTRATORS}`,
+    "  --manual: launch only; land and advance on explicit calls (no run loop)",
+    "  --no-accept: land without closing beads (leaves them in_progress + human)",
   ].join("\n");
 }
 
-const FLEET_FLAG_NAMES: readonly string[] = ["--fleet", "--concurrency"];
+const FLEET_FLAG_NAMES: readonly string[] = ["--fleet", "--concurrency", "--manual", "--no-accept"];
 
 /**
  * Parse `/fleet` arguments.
@@ -569,6 +603,11 @@ function parseFleetFlagToken(tokens: readonly string[], index: number): FleetFla
   if (!FLEET_FLAG_NAMES.includes(token)) {
     return { ok: false, error: `Unknown flag ${token}.\n${fleetUsageText()}` };
   }
+  // Boolean flags take no value: `--manual --fleet night` must not read "--fleet"
+  // as the manual value.
+  if (token === "--manual") return { ok: true, consumed: 1, untilComplete: false };
+  if (token === "--no-accept") return { ok: true, consumed: 1, accept: false };
+
   const value = tokens[index + 1];
   if (value === undefined || value.startsWith("--")) {
     return { ok: false, error: `${token} needs a value.\n${fleetUsageText()}` };
@@ -583,7 +622,14 @@ function parseFleetFlagToken(tokens: readonly string[], index: number): FleetFla
 }
 
 type FleetFlagParse =
-  | { ok: true; consumed: number; fleetId?: string; concurrency?: number }
+  | {
+      ok: true;
+      consumed: number;
+      fleetId?: string;
+      concurrency?: number;
+      untilComplete?: boolean;
+      accept?: boolean;
+    }
   | { ok: false; error: string };
 
 /**
@@ -600,35 +646,44 @@ export function parseFleetCommandArgs(raw: string): FleetCommandParse {
     .filter((token) => token !== "");
   if (tokens.length === 0) return { ok: false, error: fleetUsageText() };
 
-  const taskIds: string[] = [];
-  let fleetId: string | undefined;
-  let concurrency: number | undefined;
+  const collected: FleetCollectedArgs = { taskIds: [] };
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] ?? "";
     if (!token.startsWith("--")) {
-      taskIds.push(token);
+      collected.taskIds.push(token);
       continue;
     }
     const flag = parseFleetFlagToken(tokens, index);
     if (!flag.ok) return flag;
     index += flag.consumed - 1;
-    if (flag.fleetId !== undefined) fleetId = flag.fleetId;
-    if (flag.concurrency !== undefined) concurrency = flag.concurrency;
+    applyFleetFlag(collected, flag);
   }
 
-  if (taskIds.length === 0) {
+  if (collected.taskIds.length === 0) {
     return { ok: false, error: `No task ids given.\n${fleetUsageText()}` };
   }
+  return { ok: true, args: collected };
+}
 
-  return {
-    ok: true,
-    args: {
-      taskIds,
-      ...(fleetId === undefined ? {} : { fleetId }),
-      ...(concurrency === undefined ? {} : { concurrency }),
-    },
-  };
+/** Accumulator for `parseFleetCommandArgs`; one field per accepted flag. */
+interface FleetCollectedArgs {
+  taskIds: string[];
+  fleetId?: string;
+  concurrency?: number;
+  untilComplete?: boolean;
+  accept?: boolean;
+}
+
+/** Fold one parsed flag into the accumulator (only the flags it carries). */
+function applyFleetFlag(
+  collected: FleetCollectedArgs,
+  flag: Extract<FleetFlagParse, { ok: true }>,
+): void {
+  if (flag.fleetId !== undefined) collected.fleetId = flag.fleetId;
+  if (flag.concurrency !== undefined) collected.concurrency = flag.concurrency;
+  if (flag.untilComplete !== undefined) collected.untilComplete = flag.untilComplete;
+  if (flag.accept !== undefined) collected.accept = flag.accept;
 }
 
 // ── Tool parameter narrowing ──────────────────────────────────────────
@@ -664,6 +719,8 @@ export interface FleetMemberLaunchOutcome {
   detail: string;
   /** Workflow type the member was launched with (successful launches only). */
   workflowType?: string;
+  /** Orchestrator session the launch created, so a run can record and verify it. */
+  sessionId?: string;
 }
 
 export interface FormatFleetLaunchReportInput {
@@ -742,8 +799,9 @@ function formatScheduleLines(schedule: FleetSchedule | undefined): string[] {
   }
   if (schedule.waves.length > 1) {
     lines.push(
-      "Later waves are a plan, not a promise: this call launches only wave 0 up to capacity. " +
-        "Advance a later wave explicitly with belayd_fleet_advance (there is no background poller).",
+      "Later waves are a plan: this call launches only wave 0 up to capacity. A run " +
+        "(untilComplete, the default) starts the rest as members land; with --manual advance " +
+        "explicitly with belayd_fleet_advance.",
     );
   }
   return lines;
@@ -819,6 +877,15 @@ export interface CollectFleetLaunchContextOptions {
   gitCommonDir: string;
   fleetId: string;
   liveness: FleetSupervisorLiveness;
+  /**
+   * Supervisor beat for a fleet, when it has a run record.
+   *
+   * Injected because the beat lives on disk and this module stays a planner; the
+   * caller (the extension) owns the fs seam. Absent means "use the pid rule".
+   */
+  supervisorBeat?: (fleetId: string) => SupervisorHeartbeat | undefined;
+  /** Clock for beat freshness; absent means "no beat evaluation". */
+  now?: number;
   fs?: FleetStateFs;
 }
 
@@ -844,12 +911,18 @@ export function collectFleetLaunchContext(
       continue;
     }
     if (loaded.intent === undefined) continue;
+    const supervisorState = classifyFleetSupervisor({
+      supervisor: loaded.intent.supervisor,
+      liveness: options.liveness,
+    });
     fleets.push({
       fleetId: sanitized,
       members: [...loaded.intent.taskIds],
-      supervisor: classifyFleetSupervisor({
-        supervisor: loaded.intent.supervisor,
-        liveness: options.liveness,
+      supervisor: effectiveSupervisorState({
+        state: supervisorState,
+        runMode: loaded.intent.run !== undefined,
+        beat: options.supervisorBeat?.(sanitized),
+        now: options.now ?? 0,
       }),
     });
     if (sanitized === targetFleetId) targetIntent = loaded.intent;
@@ -887,6 +960,16 @@ export interface RunFleetLaunchOptions {
   armToken: string;
   /** Injected process probes, so tests need no real pids. */
   liveness: FleetSupervisorLiveness;
+  /**
+   * Supervisor beat reader, used only for fleets with a run record.
+   *
+   * A run-mode supervisor is a pi-web session inside a shared daemon, so its
+   * recorded pid stays alive after the session is gone; the beat is what tells a
+   * later session that re-arming is safe.
+   */
+  supervisorBeat?: (fleetId: string) => SupervisorHeartbeat | undefined;
+  /** P5 run record this launch starts (written with the intent). */
+  run?: FleetIntent["run"];
   /** Clock value supplied by the caller: one timestamp per launch, deterministic in tests. */
   now: number;
   /**
@@ -983,6 +1066,8 @@ interface FleetLaunchPlan {
   deferred: FleetIntent["deferred"];
   /** Non-fatal problems from reading the dependency graph / scheduling input. */
   warnings: readonly string[];
+  /** P5 run record this launch starts, when the caller asked to run to completion. */
+  run?: FleetIntent["run"];
 }
 
 /**
@@ -1199,6 +1284,8 @@ function planFleetLaunch(
     gitCommonDir: options.gitCommonDir,
     fleetId: options.fleetId,
     liveness: options.liveness,
+    ...(options.supervisorBeat === undefined ? {} : { supervisorBeat: options.supervisorBeat }),
+    now: options.now,
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
   const validation = validateAgainstContext(options, context);
@@ -1227,33 +1314,47 @@ function planFleetLaunch(
 
   return {
     ok: true,
-    plan: {
-      fleetId: context.targetFleetId,
-      // Only the wave-0 prefix the scheduler allowed is launched now; the rest is
-      // deferred and reported, never silently dropped.
-      taskIds: scheduled.schedule?.launchNow ?? validation.taskIds,
-      rearmedTaskIds: validation.rearmedTaskIds,
-      rearm: validation.rearm,
-      maxConcurrent: validation.maxConcurrent,
-      ...(validation.clampedFrom === undefined ? {} : { clampedFrom: validation.clampedFrom }),
-      ...(validation.flooredFrom === undefined ? {} : { flooredFrom: validation.flooredFrom }),
-      ...(validation.ignoredRequestedConcurrency === undefined
-        ? {}
-        : { ignoredRequestedConcurrency: validation.ignoredRequestedConcurrency }),
-      supervisor: createFleetSupervisorRecord({
-        sessionId: options.sessionId,
-        pid: options.pid,
-        ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
-        armToken: options.armToken,
-      }),
-      ...(scheduled.schedule === undefined ? {} : { schedule: scheduled.schedule }),
-      deferred: scheduled.schedule?.deferred.map((deferral) => ({
-        taskId: deferral.taskId,
-        reason: deferral.reason,
-        detail: deferral.detail,
-      })),
-      warnings: [...dependencyGraph.warnings, ...(scheduled.schedule?.warnings ?? [])],
-    },
+    plan: buildFleetLaunchPlan({ options, context, validation, scheduled, dependencyGraph }),
+  };
+}
+
+/** Assemble the launch plan from the validated request and its schedule. */
+function buildFleetLaunchPlan(input: {
+  options: RunFleetLaunchOptions;
+  context: FleetLaunchContext;
+  validation: Extract<FleetLaunchValidation, { ok: true }>;
+  scheduled: { ok: true; schedule?: FleetSchedule };
+  dependencyGraph: FleetDependencyGraph;
+}): FleetLaunchPlan {
+  const { options, context, validation, scheduled } = input;
+  const schedule = scheduled.schedule;
+  return {
+    fleetId: context.targetFleetId,
+    // Only the wave-0 prefix the scheduler allowed is launched now; the rest is
+    // deferred and reported, never silently dropped.
+    taskIds: schedule?.launchNow ?? validation.taskIds,
+    rearmedTaskIds: validation.rearmedTaskIds,
+    rearm: validation.rearm,
+    maxConcurrent: validation.maxConcurrent,
+    ...(validation.clampedFrom === undefined ? {} : { clampedFrom: validation.clampedFrom }),
+    ...(validation.flooredFrom === undefined ? {} : { flooredFrom: validation.flooredFrom }),
+    ...(validation.ignoredRequestedConcurrency === undefined
+      ? {}
+      : { ignoredRequestedConcurrency: validation.ignoredRequestedConcurrency }),
+    supervisor: createFleetSupervisorRecord({
+      sessionId: options.sessionId,
+      pid: options.pid,
+      ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
+      armToken: options.armToken,
+    }),
+    ...(schedule === undefined ? {} : { schedule }),
+    ...(options.run === undefined ? {} : { run: options.run }),
+    deferred: schedule?.deferred.map((deferral) => ({
+      taskId: deferral.taskId,
+      reason: deferral.reason,
+      detail: deferral.detail,
+    })),
+    warnings: [...input.dependencyGraph.warnings, ...(schedule?.warnings ?? [])],
   };
 }
 
@@ -1275,6 +1376,8 @@ function recountLaunchCapacity(
     gitCommonDir: options.gitCommonDir,
     fleetId: plan.fleetId,
     liveness: options.liveness,
+    ...(options.supervisorBeat === undefined ? {} : { supervisorBeat: options.supervisorBeat }),
+    now: options.now,
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
   if (context.unknownFleets.length > 0) {
@@ -1335,6 +1438,7 @@ function writeLaunchIntent(
         // `deferred` would make waiting members undiscoverable. A re-arm computes
         // no plan at all (`undefined`) and keeps the one it inherited.
         ...(plan.deferred === undefined ? {} : { deferred: plan.deferred }),
+        ...(plan.run === undefined ? {} : { run: plan.run }),
       });
     },
   });

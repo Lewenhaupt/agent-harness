@@ -44,7 +44,11 @@ import {
 } from "./fleet-merge.js";
 import type { FleetSupervisorState } from "./fleet-mode.js";
 import { classifyFleetSupervisor } from "./fleet-mode.js";
-import type { FleetMemberLiveness, FleetProcessScan } from "./fleet-sessions.js";
+import type {
+  FleetMemberLeaseProbe,
+  FleetMemberLiveness,
+  FleetProcessScan,
+} from "./fleet-sessions.js";
 import { classifyMemberLivenessFromScan } from "./fleet-sessions.js";
 import type { FleetMergeQueue, FleetMergeQueueEntry, FleetStateFs } from "./fleet-state.js";
 import {
@@ -344,6 +348,14 @@ export interface RunFleetReconcileOptions {
   pidStartTime?: (pid: number) => string | undefined;
   /** This process, excluded from member matching. */
   selfPid?: number;
+  /**
+   * Worktree lease per member.
+   *
+   * Injected because the lease lives in the member worktree; without it a
+   * pi-web-hosted member (no argv token) always looks absent and gets pruned while
+   * it is running — the bd-37 double-orchestrator failure.
+   */
+  leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
   leaseInMs?: number;
   orphanGraceInMs?: number;
   /**
@@ -698,6 +710,8 @@ export function reportMemberLiveness(options: {
   members: readonly string[];
   scan: FleetProcessScan;
   selfPid?: number;
+  /** Worktree lease per member, when the caller can read one. */
+  leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
 }): readonly MemberLivenessReport[] {
   return options.members.map((taskId) => ({
     taskId,
@@ -705,6 +719,7 @@ export function reportMemberLiveness(options: {
       taskId,
       scan: options.scan,
       ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
+      ...(options.leaseFor === undefined ? {} : { lease: options.leaseFor(taskId) }),
     }),
   }));
 }
@@ -712,6 +727,11 @@ export function reportMemberLiveness(options: {
 function formatLiveness(liveness: FleetMemberLiveness): string {
   switch (liveness.kind) {
     case "live":
+      if (liveness.leaseHeartbeatAt !== undefined) {
+        return `orchestrator live (worktree lease renewed ${new Date(
+          liveness.leaseHeartbeatAt,
+        ).toISOString()})`;
+      }
       return `orchestrator live (pid ${liveness.pids.join(", ")})`;
     case "absent":
       return "orchestrator not running";
@@ -821,6 +841,7 @@ function reconcileSupervision(options: {
     members: intent.taskIds,
     scan: reconcile.scan,
     ...(reconcile.selfPid === undefined ? {} : { selfPid: reconcile.selfPid }),
+    ...(reconcile.leaseFor === undefined ? {} : { leaseFor: reconcile.leaseFor }),
   });
   run.lines.push(
     ...(liveness.length === 0

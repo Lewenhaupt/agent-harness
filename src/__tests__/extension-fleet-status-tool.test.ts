@@ -169,6 +169,7 @@ function memberStatus() {
         branch: "feat/bd-12",
         workflow: { kind: "ok", state: sampleWorkflow() },
         runs: [],
+        lease: { state: "absent" },
       },
     ],
   });

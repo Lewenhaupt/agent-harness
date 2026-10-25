@@ -101,17 +101,21 @@ barrel — a module whose symbols are not re-exported there is internal.
 
 | File | Purpose |
 |---|---|
+| `src/fleet-accept.ts` | Accepting a landed member: close the bead, remove the worktree (bd-126 P5) |
 | `src/fleet-beads.ts` | Batched, read-only bead lookup for the fleet observer (bd-126 P0) |
+| `src/fleet-heartbeat.ts` | Supervisor heartbeat for a run-mode fleet (bd-126 P5) |
 | `src/fleet-launch.ts` | Fleet launch: the decision half of `belayd_fleet_launch` / `/fleet` (bd-126 P1) |
 | `src/fleet-mailbox.ts` | Fleet mailbox rendering (bd-126 P1) |
 | `src/fleet-merge.ts` | Fleet merge queue — P2 of the fleet supervisor (bd-126) |
 | `src/fleet-mode.ts` | Fleet supervisor mode (bd-126 P1) |
 | `src/fleet-pause.ts` | Cooperative fleet pause and resume (bd-126 P4) |
 | `src/fleet-reconcile.ts` | Fleet-level crash reconcile and pause repair (bd-126 P4) |
+| `src/fleet-run.ts` | The run-to-completion loop's decision layer: one tick, one action (bd-126 P5) |
 | `src/fleet-schedule.ts` | Fleet scheduling — P3 of the fleet supervisor (bd-126) |
 | `src/fleet-sessions.ts` | Member-session liveness for the fleet supervisor (bd-126 P4) |
 | `src/fleet-state.ts` | Shared fleet state — the cross-tree substrate of the fleet supervisor |
 | `src/fleet-status.ts` | Fleet status — read-only aggregation for the multi-bead supervisor (bd-126) |
+| `src/orchestrator-claim.ts` | One-orchestrator-per-worktree lease (bd-126 P5) |
 
 ### AWS broker (`src/aws-broker/`)
 
@@ -163,7 +167,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |
-| `docs/fleet.md` (+ `fleet-status/launch/merge/reconcile.md`) | fleet supervisor |
+| `docs/fleet.md` (+ `fleet-run/status/launch/merge/reconcile.md`) | fleet supervisor |
 | `docs/aws-credential-isolation.md` | sandbox + credential broker |
 | `docs/pi-web-service.md`, `docs/pi-web-agent-browser.md` | pi-web units and wiring |
 | `docs/arion.md` | scotty/portainer containers |

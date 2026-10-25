@@ -72,9 +72,13 @@ vi.mock("../../src/index.js", async (importOriginal) => {
         return { ok: false as const, error: `not a git repository: ${cwd}` };
       return { ok: true as const, commonDir: git.commonDir };
     },
-    setupWorktree: () => {
+    setupWorktree: (_root: string, options: { branch: string }) => {
       if (worktree.failWith !== undefined) throw new Error(worktree.failWith);
-      return worktree.path;
+      // One directory per branch: the worktree lease is per worktree, so a stub
+      // that returned one path for every branch would refuse the second member.
+      const path = join(worktree.path, options.branch.replace(/\//g, "-"));
+      mkdirSync(path, { recursive: true });
+      return path;
     },
     awaitWorktreeReady: async () => ({ ok: true as const }),
     readStackNode: () => undefined,
@@ -315,7 +319,8 @@ describe("fleet supervisor mode", () => {
   ): Promise<void> {
     const command = mock.commands.get("fleet");
     if (command === undefined) throw new Error("/fleet was not registered");
-    await command.handler(args, ctx);
+    // These cases pin the explicit surface; run-mode behaviour has its own suite.
+    await command.handler(args.includes("--manual") ? args : `${args} --manual`, ctx);
   }
 
   function auditActions(): string[] {
@@ -369,7 +374,7 @@ describe("fleet supervisor mode", () => {
     // Pruning is gated on the member's evidence, not the supervisor's liveness —
     // the description must not promise the unreachable dead-supervisor rule.
     const reconcileDescription = mock.tools.get("belayd_fleet_reconcile")?.description ?? "";
-    expect(reconcileDescription).toContain("positive `absent` evidence");
+    expect(reconcileDescription).toContain("no live lease AND no matching process");
     expect(reconcileDescription).toContain("`unknown` is never");
     expect(reconcileDescription).not.toContain("supervisor is not running");
   });
@@ -765,7 +770,7 @@ describe("fleet supervisor mode", () => {
       const command = mock.commands.get("fleet");
       if (command === undefined) throw new Error("/fleet was not registered");
 
-      await command.handler("bd-12 bd-15", makeCtx(cwd, "operator-session"));
+      await command.handler("bd-12 bd-15 --manual", makeCtx(cwd, "operator-session"));
 
       expect(ctxNotifications[0]?.level).toBe("error");
       expect(ctxNotifications[0]?.message).toContain("needs a git repository");
@@ -777,7 +782,10 @@ describe("fleet supervisor mode", () => {
       const command = mock.commands.get("fleet");
       if (command === undefined) throw new Error("/fleet was not registered");
 
-      await command.handler("bd-12 bd-15 --concurrency 9", makeCtx(cwd, "operator-session"));
+      await command.handler(
+        "bd-12 bd-15 --concurrency 9 --manual",
+        makeCtx(cwd, "operator-session"),
+      );
 
       const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
       expect(intent).toHaveProperty("ok", true);
@@ -806,7 +814,7 @@ describe("fleet supervisor mode", () => {
       const command = mock.commands.get("fleet");
       if (command === undefined) throw new Error("/fleet was not registered");
 
-      await command.handler("bd-12", makeCtx(cwd, "audited-session"));
+      await command.handler("bd-12 --manual", makeCtx(cwd, "audited-session"));
 
       expect(auditActions()).toEqual(["schedule-planned", "launch", "member-launch"]);
     });
@@ -1671,7 +1679,7 @@ describe("belayd_fleet_merge", () => {
     const ctx = makeCtx(cwd, "supervisor-session");
     const command = mock.commands.get("fleet");
     if (command === undefined) throw new Error("/fleet was not registered");
-    await command.handler("bd-12", ctx);
+    await command.handler("bd-12 --manual", ctx);
 
     const tool = mock.tools.get("belayd_fleet_merge");
     if (tool === undefined) throw new Error("belayd_fleet_merge was not registered");
@@ -1728,5 +1736,181 @@ describe("belayd_fleet_merge", () => {
     const drained = await tool.execute("merge-5", { action: "drain" }, undefined, undefined, ctx);
     expect(drained.details.exitCode).toBe(0);
     expect(textOf(drained)).toContain("nothing is queued for merge");
+  });
+});
+
+/**
+ * `/fleet` runs to completion by default (bd-126 P5).
+ *
+ * The loop itself is exercised by the pure `fleet-run` cases; what is pinned here
+ * is the wiring: the launch records a run, names the members it started, and
+ * starts the ticker — and `--manual` / `untilComplete: false` writes no run at all,
+ * so the explicit surface is still reachable.
+ *
+ * Fake timers keep the first tick from running mid-assertion: this suite is about
+ * the record, and a tick would run project gates.
+ */
+describe("fleet run mode", () => {
+  let cwd: string;
+  let commonDir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-run-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", "default"), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    ctxNotifications = [];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+  });
+
+  function intentRun(): { mode?: string; accept?: boolean; members?: unknown } | undefined {
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    if (!intent.ok) return undefined;
+    return intent.intent?.run;
+  }
+
+  it("records a run for the members it launched and starts the loop", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12", ctx);
+
+    const run = intentRun();
+    expect(run).toMatchObject({ mode: "until-complete", accept: true });
+    expect(run?.members).toEqual([
+      { taskId: "bd-12", launchedAt: expect.any(Number), sessionId: "member-session-id" },
+    ]);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "running until every member is landed",
+    );
+    // The supervisor beat is what lets a later session tell a dead run-mode
+    // supervisor from a live one (the recorded pid is the shared daemon).
+    expect(existsSync(join(commonDir, "belayd", "fleet", "default", "supervisor.json"))).toBe(true);
+  });
+
+  it("leaves beads for the human with --no-accept", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12 --no-accept", ctx);
+
+    expect(intentRun()).toMatchObject({ mode: "until-complete", accept: false });
+  });
+
+  it("writes no run record with --manual", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12 --manual", ctx);
+
+    expect(intentRun()).toBeUndefined();
+    expect(existsSync(join(commonDir, "belayd", "fleet", "default", "supervisor.json"))).toBe(
+      false,
+    );
+  });
+
+  it("honours untilComplete: false on the launch tool", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const tool = mock.tools.get("belayd_fleet_launch");
+    if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+    const result = await tool.execute(
+      "launch-1",
+      { tasks: "bd-12", untilComplete: false },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.details.exitCode).toBe(0);
+    expect(intentRun()).toBeUndefined();
+  });
+});
+
+/**
+ * One orchestrator per worktree (bd-126 P5).
+ *
+ * The worktree lease is taken by the spawner before the session exists, so a
+ * launch into a worktree whose orchestrator is still alive must be refused before
+ * any session is created. This is the invariant the duplicate-bd-37 incident broke.
+ */
+describe("worktree orchestrator lease", () => {
+  let cwd: string;
+  let commonDir: string;
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-lease-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", "default"), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    ctxNotifications = [];
+  });
+
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+  });
+
+  function seedLiveLease(branch: string, sessionId: string): void {
+    const dir = join(worktree.path, branch.replace(/\//g, "-"), ".belayd");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "orchestrator.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        taskId: "bd-12",
+        branch,
+        sessionId,
+        pid: 4242,
+        claimedAt: Date.now(),
+        heartbeatAt: Date.now(),
+      }),
+    );
+  }
+
+  it("refuses a member whose worktree already has a live orchestrator", async () => {
+    seedLiveLease("feat/bd-12", "other-session");
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12 --manual", ctx);
+
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("live orchestrator lease");
+    expect(text).toContain("other-session");
+    // No session was created, and the refused member is not recorded as a member.
+    expect(daemon.calls.some((call) => call.path === "/sessions")).toBe(false);
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent.ok ? intent.intent?.taskIds : undefined).toEqual([]);
   });
 });

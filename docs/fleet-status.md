@@ -157,6 +157,8 @@ Header lines:
 | `intent:` | Contents of `fleet.json`, or `none recorded` |
 | `deferred:` | Members a launch deferred, with the reason each waits (`capacity`, `dependency`, `external-blocker`), bounded to 8 entries plus `...and N more`. Omitted when nothing is deferred |
 | `parked:` | Present only for a paused/parked fleet: `parked: <reason> (stash <sha>) — belayd_fleet_reconcile then belayd_fleet_resume`. This is the read-only pointer to the operator's stashed root work |
+| `run: <mode> — …` | The run loop's record (bd-126 P5): `n tick(s), last tick <ISO>` while live, `complete|partial at <ISO> (n tick(s))` when finished, `halted: <reason>` when parked or stalled. Absolute timestamps only, so two reads of unchanged files are identical. Absent for a `--manual` fleet |
+| `- stopped <taskId> (<reason>): <detail>` | One per member the run gave up on (needs a human); renders from `fleet.json` `run.stopped` |
 | `members:` | Number of worktrees in the view (the main checkout counts only when it holds workflow state). Deferred members are *not* counted here: they have no worktree yet |
 | `states:` | Count per derived state, printed in the fixed order `active blocked awaiting-human interrupted idle missing-state` |
 
@@ -172,6 +174,7 @@ unit order):
 | `pending: <phases>` | Phase order minus completed, or `none` |
 | `awaiting review response: yes\|no` | The workflow is parked waiting for the operator |
 | `interrupted runs: <n>` | How many run manifests are `interrupted` |
+| `orchestrator lease: …` | The worktree's one-orchestrator lease (bd-126 P5): `session <id> for <taskId>, renewed <ISO>`, `none` when the worktree has no lease, or `unreadable (<error>)`. It prints the record, not a verdict — a read-only view applies no clock, so "live vs stale" is the acting tools' decision |
 | `last updated: <ISO-8601>\|unknown` | `workflow.json` `updatedAt`, raised to the newest run timestamp when that is later |
 | `latest runs: <phase>=<status>, …` | Newest manifest per phase, in workflow phase order (`none` when no manifests exist) |
 | `workflow: missing` / `workflow: corrupt` | Replaces the `<type> n/m phases complete` line when `workflow.json` is absent or does not parse; the `pending:` and `awaiting review response:` lines are then omitted (the remaining lines are unchanged) |

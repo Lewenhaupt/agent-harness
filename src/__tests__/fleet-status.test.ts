@@ -87,6 +87,7 @@ function sampleMember(overrides: Partial<FleetMemberSnapshot> = {}): FleetMember
     branch: "feat/bd-12",
     workflow: okWorkflow(),
     runs: [],
+    lease: { state: "absent" },
     ...overrides,
   };
 }
@@ -398,6 +399,7 @@ describe("buildFleetStatus", () => {
           branch: "main",
           workflow: { kind: "missing" },
           runs: [],
+          lease: { state: "absent" },
         },
       ],
     });
@@ -830,6 +832,7 @@ describe("buildFleetStatus", () => {
           branch: "main",
           workflow: { kind: "corrupt" },
           runs: [],
+          lease: { state: "absent" },
         },
       ],
     });
@@ -962,6 +965,7 @@ describe("formatFleetStatus", () => {
         "  pending: implement, review, test, commit",
         "  awaiting review response: no",
         "  interrupted runs: 0",
+        "  orchestrator lease: none",
         "  last updated: 1970-01-01T00:00:02.000Z",
         "  latest runs: none",
       ].join("\n"),

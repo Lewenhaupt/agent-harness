@@ -86,11 +86,29 @@ export function isMemberOrchestratorArgv(options: {
   return options.argv.some((argument) => argument === token);
 }
 
-/** What the process table says about one member's orchestrator. */
+/** What the process table (and, when present, the worktree lease) says about one member. */
 export type FleetMemberLiveness =
-  | { kind: "live"; pids: readonly number[] }
+  | {
+      kind: "live";
+      pids: readonly number[];
+      /** When the live evidence is the worktree lease rather than an argv token. */
+      leaseHeartbeatAt?: number;
+    }
   | { kind: "absent" }
   | { kind: "unknown"; reason: string };
+
+/**
+ * The member's worktree lease, reduced to what liveness needs.
+ *
+ * A pi-web orchestrator is a session inside the daemon, so it has no argv token and
+ * the process table can never see it; the lease is the only evidence that exists.
+ * `corrupt` is unknown, never absent: an unreadable lease must not licence a prune.
+ */
+export type FleetMemberLeaseProbe =
+  | { state: "live"; heartbeatAt: number }
+  | { state: "stale" }
+  | { state: "absent" }
+  | { state: "corrupt"; error: string };
 
 /**
  * Classify one member from an already-taken snapshot (pure).
@@ -112,18 +130,40 @@ export function classifyMemberLiveness(options: {
   return pids.length === 0 ? { kind: "absent" } : { kind: "live", pids };
 }
 
-/** Classify one member from a scan, keeping "cannot tell" distinct from "gone". */
+/**
+ * Classify one member from a scan plus (when the caller has it) its worktree lease.
+ *
+ * Two evidence sources, and the combination is what makes it honest:
+ *
+ * - a live lease is positive proof — a session is renewing it, whatever the
+ *   process table shows (pi-web orchestrators never appear there);
+ * - a cold or missing lease proves nothing on its own, so a process carrying the
+ *   argv token still counts as live (a CLI-spawned orchestrator has no lease);
+ * - only "no lease AND no process AND the scan worked" is `absent`, which is the
+ *   one verdict that may be pruned;
+ * - an unreadable lease is `unknown`, because "cannot see" is not "gone".
+ */
 export function classifyMemberLivenessFromScan(options: {
   taskId: string;
   scan: FleetProcessScan;
   selfPid?: number;
+  lease?: FleetMemberLeaseProbe;
 }): FleetMemberLiveness {
+  const lease = options.lease;
+  if (lease?.state === "live") {
+    return { kind: "live", pids: [], leaseHeartbeatAt: lease.heartbeatAt };
+  }
+  if (lease?.state === "corrupt") {
+    return { kind: "unknown", reason: `worktree lease unreadable (${lease.error})` };
+  }
   if (!options.scan.ok) return { kind: "unknown", reason: options.scan.reason };
-  return classifyMemberLiveness({
+  const fromProcess = classifyMemberLiveness({
     taskId: options.taskId,
     processes: options.scan.processes,
     ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
   });
+  if (fromProcess.kind === "live") return fromProcess;
+  return { kind: "absent" };
 }
 
 export interface ScanProcessesOptions {

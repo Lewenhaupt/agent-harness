@@ -339,11 +339,35 @@ pinned to a worktree.` instead of silently planning against `/`.
   `git branch --show-current`) and `assertOwnedWorktree` (one workflow-state
   read).
 
+## Companion: the worktree orchestrator lease (bd-126 P5)
+
+The bd-119 preflight answers "does another **bead** own this tree?". It reads
+`.belayd/workflow.json`, which cannot answer "is another **session** driving it
+right now?": a completed workflow deletes that file, a failed launch leaves one
+behind, and the fleet's own repair paths can move it. Two orchestrators on one
+worktree therefore still passed the preflight, and that is what happened to bd-37
+(a second orchestrator started while the first was running).
+
+`src/orchestrator-claim.ts` adds the missing fact: `.belayd/orchestrator.json`, a
+lease created by the spawner, adopted and renewed by the orchestrator session's own
+timer (every 20 s), and removed on `session_shutdown`.
+
+| Question | Answer from the lease |
+|---|---|
+| May I launch an orchestrator here? | No while the lease is fresh — the launch is refused before a session is created |
+| May this session drive this workflow? | Only if it holds the lease; otherwise `session_start` refuses to arm the gate |
+| Is that member still running? | Yes while the lease is renewed, even though no process carries its session token (it is a session inside the daemon) |
+| May reconcile prune it? | Only when the lease is cold **and** no process carries `belayd-<taskId>` |
+
+The full contract, including takeover of a cold lease (archived, never deleted) and
+the start-grace window, is in `docs/fleet-run.md#one-orchestrator-per-worktree`.
+
 ## Related documentation
 
 - `docs/diff-scoped-review.md` — phase-tool call shapes with `{ task }` only.
 - `docs/proof-verifier.md` — verifier contract and prompt inputs.
 - `docs/subagent-sessions.md` — `belayd-<taskId>` / `belayd-<taskId>-sub-<phase>-…`
   session naming, used to find the owning orchestrator.
+- `docs/fleet-run.md` — the worktree lease that keeps one orchestrator per worktree.
 - `docs/model-capacity-and-telemetry.md` — per-cwd telemetry and run manifests
   under `.belayd/runs/`.
