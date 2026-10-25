@@ -29,14 +29,22 @@ This is the design record. All five milestones exist:
   `fleet.json` `deferred`.
 - **P4** — `belayd_fleet_pause` / `belayd_fleet_resume` (cooperative flag plus an
   explicitly-limited forceful stop), `belayd_fleet_advance` (an explicit,
-  audited wave advance — no background poller), and `belayd_fleet_reconcile`
-  (merge-queue repair under the existing lock primitive, parked-root restore, and
-  process-table member liveness). See `docs/fleet-reconcile.md`.
+  audited wave advance), and `belayd_fleet_reconcile` (merge-queue repair under
+  the existing lock primitive, parked-root restore, and member liveness). See
+  `docs/fleet-reconcile.md`.
+- **P5** — the run loop (`src/fleet-run.ts`, `src/fleet-accept.ts`) and the
+  one-orchestrator-per-worktree lease (`src/orchestrator-claim.ts`,
+  `src/fleet-heartbeat.ts`). `/fleet` runs to completion by default: it lands each
+  finished member, accepts it (closes the bead, removes the worktree), and starts
+  the next wave until every member is landed. `--manual` keeps the P1–P4 surface.
+  See `docs/fleet-run.md`.
 
-Nothing runs on its own: the supervisor never merges (P2's explicit
-enqueue/drain), never advances a wave (P4's explicit `belayd_fleet_advance`), and
-never repairs state (P4's explicit `belayd_fleet_reconcile`). Every one of those
-is a tool call the operator makes, recorded in `audit.log`. The operator entry
+An **explicit** (`--manual`) fleet runs nothing on its own: no merge, no wave
+advance, no repair. A **run** (`/fleet` with `untilComplete`, the default) does
+merge, accept, and advance from a supervisor-side ticker; every tick still goes
+through the same audited engines (`fleet-landed`, `fleet-run-stopped`,
+`fleet-run-halted`, `fleet-run-complete`), and `belayd_fleet_pause` stops it. The
+operator entry
 point for the whole surface is **`docs/fleet.md`** (end-to-end run, decision and
 failure-recovery tables, verification); per-area detail is in
 `docs/fleet-status.md` (status), `docs/fleet-launch.md` (launch, ordering,
@@ -179,7 +187,7 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | Supervisor working directory | main repo root |
 | May merge to `main`? | Yes, through a single-flight queue |
 | Dirty root at merge time | auto-stash, immediately restore; if the restore conflicts, park the fleet instead of losing work (P2: `merge-stash`/`merge-restore`; a conflicting restore keeps the stash, parks the fleet, and reports the ref) |
-| Bead status after merge | left `in_progress` + `human`; the human closes via `wt merge` (merging ≠ closing) — P2 has no bd seam at all |
+| Bead status after merge | `belayd_fleet_merge` never touches a bead: the merge leaves it `in_progress` + `human`. A **run** (`accept: true`, the default) accepts the member after landing — `bd close` + worktree removal — audited as `fleet-landed`; `--no-accept` keeps the human step |
 | Member communication | files-first mailbox, drained at turn start (members are detached pi sessions) |
 | Where merges happen | the operator's own checkout, because only the root can check out `main` |
 
@@ -206,14 +214,21 @@ writes anything; deriving it keeps the supervisor honest by construction.
   blocking edges, plans waves, and starts at most the free capacity. It runs no
   phase, merges nothing, advances no wave, and mutates no bead; every decision is
   audited and a deferred member is recorded, never dropped.
-- **P4 adds interruption and repair, never automation.** `belayd_fleet_pause`
-  writes the flag every starting action already checks (launch, merge, advance);
-  its forceful variant only signals orchestrator processes it can positively
-  identify. `belayd_fleet_resume` is the only writer that clears `paused`.
-  `belayd_fleet_advance` is an explicit, audited decision, not a poller.
+- **P4 adds interruption and repair, invoked explicitly.** `belayd_fleet_pause`
+  writes the flag every starting action already checks (launch, merge, advance) and
+  stops the P5 ticker; its forceful variant only signals orchestrator processes it
+  can positively identify. `belayd_fleet_resume` is the only writer that clears
+  `paused`, and it restarts the ticker. `belayd_fleet_advance` is an explicit,
+  audited decision (the run loop calls the same engine on its own tick).
   `belayd_fleet_reconcile` repairs the queue under the existing merge lock, retries
   a parked root restore from the recorded sha, and reports member liveness from the
-  process table instead of intent.
+  worktree lease plus the process table instead of intent.
+- **P5 adds the run loop and the worktree lease.** The ticker lives in the
+  supervisor session, acts only through the P2/P3/P4 engines, and records every
+  action in `audit.log`. The lease is created by the spawner and renewed by the
+  orchestrator session itself, which is the only liveness evidence a pi-web
+  session can produce; a live lease refuses a second orchestrator for that
+  worktree, and a cold lease is archived (never deleted) before a takeover.
 
 ## Milestones
 
@@ -223,7 +238,8 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | **P1** | `belayd_fleet_launch` on explicit instruction + file mailbox (`inbox/`, `events/`) for notes and rebase hints, delivered to members at turn start. | **Implemented** (`src/fleet-launch.ts`, `src/fleet-mode.ts`, `src/fleet-mailbox.ts`, `extensions/index.ts`) |
 | **P2** | Single-flight merge queue + base-moved propagation (`merge-queue.json`, `merge.lock.d`, `src/fleet-merge.ts`, `belayd_fleet_merge`): atomic acquire + renewable lease, rebase → gates → merge → broadcast in the operator's root checkout, root stash/restore with parking on a conflicting restore. | **Implemented** (`src/fleet-merge.ts`, `belayd_fleet_merge`; explicit enqueue/drain only) |
 | **P3** | Automatic ordering/parallelism + capacity-aware concurrency (ceiling 3 orchestrators): bd blocking edges → waves, cycle refusal, launch only the free capacity, record deferred members in `fleet.json` `deferred` with their reasons. The ceiling counts **every** recorded member of **every** fleet (a dead supervisor's detached members still run); an unreadable fleet intent refuses the launch instead of assuming zero. | **Implemented** (`src/fleet-schedule.ts`, `src/fleet-beads.ts`, `src/fleet-launch.ts`; wave 2+ is advanced explicitly by `belayd_fleet_advance`) |
-| **P4** | Cooperative/forceful pause + fleet-level crash reconcile: `belayd_fleet_pause`/`belayd_fleet_resume` (CAS intent writes, audited), `belayd_fleet_advance` (explicit wave advance over the persisted deferred plan), `belayd_fleet_reconcile` (merge-queue repair under the existing lock primitive, parked-root restore from the recorded stash sha, process-table member liveness). | **Implemented** (`src/fleet-pause.ts`, `src/fleet-reconcile.ts`, `src/fleet-sessions.ts`, `extensions/index.ts`; see `docs/fleet-reconcile.md`) |
+| **P4** | Cooperative/forceful pause + fleet-level crash reconcile: `belayd_fleet_pause`/`belayd_fleet_resume` (CAS intent writes, audited), `belayd_fleet_advance` (explicit wave advance over the persisted deferred plan), `belayd_fleet_reconcile` (merge-queue repair under the existing lock primitive, parked-root restore from the recorded stash sha, member liveness from the lease + process table). | **Implemented** (`src/fleet-pause.ts`, `src/fleet-reconcile.ts`, `src/fleet-sessions.ts`, `extensions/index.ts`; see `docs/fleet-reconcile.md`) |
+| **P5** | Run to completion: a durable `run` record in `fleet.json`, one deterministic tick per action (land → stop → advance → complete), accepting a landed member (`bd close`, worktree removal), the one-orchestrator-per-worktree lease, and the run-mode supervisor heartbeat that makes a re-arm possible. | **Implemented** (`src/fleet-run.ts`, `src/fleet-accept.ts`, `src/orchestrator-claim.ts`, `src/fleet-heartbeat.ts`, `extensions/index.ts`; see `docs/fleet-run.md`) |
 
 **What P2 inherited and reuses (no second mechanism was introduced):** per-recipient
 fan-out means a base-moved broadcast reaches every member exactly once under the
@@ -698,13 +714,16 @@ does not add. An observed count above 3 is corrected the normal way:
 `belayd_fleet_status` shows it, and the next launch refuses until a member exits
 or is pruned.
 
-P4's reconcile narrows that count through a real observation rather than a guess:
+Reconcile narrows that count through a real observation rather than a guess:
 `belayd_fleet_reconcile` with `pruneDeadMembers: true` removes members whose
-orchestrator session is proven absent (process table, exact
-`belayd-<taskId>` token). A live supervisor may prune — its liveness is not a
-precondition — while `unknown` liveness is never treated as gone. The
-conservative sum then simply has fewer members — no
-liveness heuristic is wired into the launch path itself.
+orchestrator is proven absent — no fresh worktree lease **and** no process carrying
+the exact `belayd-<taskId>` token. The lease is primary because a pi-web
+orchestrator is a session inside the daemon and never appears in the process table
+(`docs/fleet-reconcile.md`). A live supervisor may prune — its liveness is not a
+precondition — while `unknown` liveness (unreadable `/proc`, unreadable lease) is
+never treated as gone. The conservative sum then simply has fewer members — no
+liveness heuristic is wired into the launch path itself. A run also narrows the
+count the honest way: landing a member prunes it.
 
 ### What is deferred vs automatic
 
@@ -715,9 +734,10 @@ liveness heuristic is wired into the launch path itself.
 | Refusing a dependency cycle | yes (nothing is created) |
 | Starting wave 0 up to free capacity | yes |
 | Recording the deferred members + reasons | yes (`fleet.json` `deferred`, `audit.log`, report) |
-| Starting wave 1+ | **no** — `belayd_fleet_advance` (P4) or an explicit launch; there is no poller |
-| Merging | **no** — P2's explicit `belayd_fleet_merge` |
-| Pausing / resuming | **no** — P4's `belayd_fleet_pause` / `belayd_fleet_resume` |
+| Starting wave 1+ | yes in a **run** (P5 tick → `belayd_fleet_advance`'s engine); **no** in `--manual` (explicit tool call) |
+| Merging a finished member | yes in a **run** (P5 tick → the P2 queue); **no** in `--manual` (`belayd_fleet_merge`) |
+| Accepting (close bead + remove worktree) | yes in a **run** with `accept: true`; never by `belayd_fleet_merge` itself |
+| Pausing / resuming | **no** — P4's `belayd_fleet_pause` / `belayd_fleet_resume` (pause stops the run ticker) |
 | Repairing a crashed fleet | **no** — P4's `belayd_fleet_reconcile` |
 | Running phases | **never** — the supervisor is not an orchestrator |
 

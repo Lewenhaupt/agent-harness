@@ -6,12 +6,16 @@ session a two-way file mailbox to the members it launched. The supervisor is a
 **scheduler**: it arms no process gate and refuses to run phases.
 
 This is milestone **P1** of `docs/fleet-orchestrator.md`, extended by **P3**
-(ordering, waves, capacity-aware launch). P2 (the single-flight merge queue) and P4
-(pause, explicit advance, crash reconcile) are separate surfaces — see
-`docs/fleet-merge.md` and `docs/fleet-reconcile.md`. Launch never merges, pauses, or
-mutates a bead, and it starts wave 2+ only when you ask it to. For the whole
-operator story in one page — which tool for which situation, and how to get out of
-each failure — start at **`docs/fleet.md`**.
+(ordering, waves, capacity-aware launch) and **P5** (the run loop). P2 (the
+single-flight merge queue) and P4 (pause, advance, crash reconcile) are separate
+surfaces — see `docs/fleet-merge.md` and `docs/fleet-reconcile.md`.
+
+`/fleet` runs to completion by default (P5): after the launch it records a `run` in
+`fleet.json` and the supervisor lands, accepts, and advances members on its own
+ticks. `--manual` keeps this page's explicit surface, where nothing merges or
+advances until you call a tool. For the whole operator story in one page — which
+tool for which situation, and how to get out of each failure — start at
+**`docs/fleet.md`**; for the loop see **`docs/fleet-run.md`**.
 
 - [How to Use](#how-to-use)
   - [When to reach for it](#when-to-reach-for-it)
@@ -59,7 +63,7 @@ existing arm untouched.
 ### How to invoke it
 
 ```
-/fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>]
+/fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--no-accept]
 ```
 
 | Argument | Meaning |
@@ -67,6 +71,8 @@ existing arm untouched.
 | task ids | Beads to run as members. At least one. Every id must be valid, unique in the request, and not already a member of a **live** fleet. Ids that are already members of *this* fleet, whose supervisor is not running, are preserved (re-arm). |
 | `--fleet <id>` | Fleet directory name under `<git-common-dir>/belayd/fleet/`. Default `default`. Sanitized (anything outside `A-Za-z0-9._-` becomes `_`). |
 | `--concurrency <n>` | Requested concurrent orchestrators. **Capped at 3**; a larger value is clamped and the report says so, and a fraction is floored and reported. Only the free capacity starts now (see [P3](#ordering-waves-and-capacity-p3)). |
+| `--manual` | Do not start the run loop: launch only, then land/advance on explicit tool calls (the P1–P4 behaviour). No `run` record is written, and no supervisor heartbeat. |
+| `--no-accept` | Run to completion, but do not close the bead or remove the worktree when a member lands. The run still finishes: a landed member satisfies its dependents' edges. |
 
 The tool form takes the same request:
 
@@ -142,7 +148,7 @@ Scheduling: 1 member(s) now, 1 deferred (capacity 3, 2 already active, 1 free sl
 - wave 1 (later launch): bd-15
 - deferred bd-15 (dependency): wave 1: waits for bd-12 to land (launched by a later fleet launch or by belayd_fleet_advance)
 - bd-12: launched (feature) — worktree `feat/bd-12`, orchestrator session <id>
-Later waves are a plan, not a promise: this call launches only wave 0 up to capacity. Advance a later wave explicitly with belayd_fleet_advance (there is no background poller).
+Later waves are a plan: this call launches only wave 0 up to capacity. A run (untilComplete, the default) starts the rest as members land; with --manual advance explicitly with belayd_fleet_advance.
 …
 ```
 
@@ -261,17 +267,20 @@ injected (the block counts it and leaves it on disk).
 
 ### What it will not do
 
-- **No merges, no rebases of siblings, no pause** — launch does none of these;
-  merging is the separate P2 surface (`docs/fleet-merge.md`), pausing and repairing
-  are P4 (`docs/fleet-reconcile.md`). Ordering/capacity is P3 and stops at the
-  plan: wave 2+ is advanced explicitly, never by a background loop.
+- **No merges of its own.** The launch engine itself never merges, rebases a
+  sibling, or pauses: merging is the separate P2 surface (`docs/fleet-merge.md`),
+  pausing and repairing are P4 (`docs/fleet-reconcile.md`). Ordering/capacity is P3
+  and stops at the plan. What merge and advance happens next is the P5 run loop's
+  job (`docs/fleet-run.md`), which the launch starts by default and which acts
+  through those same engines on the supervisor's ticks.
 - **No launch that would start a member while the fleet is paused.**
   `belayd_fleet_pause` writes `paused` into `fleet.json`, and a request that would
   actually launch something refuses until `belayd_fleet_resume` clears it. A pure
   re-arm is the one exception: it starts nothing, so it still works while paused —
   that is the path back to a supervised fleet.
-- **No bead mutation.** The fleet family never changes a bead's status, labels, or
-  notes; merging ≠ closing stays true in P2 too.
+- **No bead mutation by the launch or the merge.** `belayd_fleet_merge` never
+  changes a bead's status, labels, or notes; merging ≠ closing stays true. Only a
+  run's acceptance step (`accept: true`, audited as `fleet-landed`) closes a bead.
 - **No phases.** The supervisor never runs one, and it cannot arm a gate.
 - **No cross-tree reach from the phase family.** Phase tools, the proof verifier,
   and the commit path are unchanged; only the fleet family acts across worktrees.
@@ -288,6 +297,10 @@ injected (the block counts it and leaves it on disk).
   one bead is exactly the invariant bd-119 exists to protect. A member of a fleet
   whose supervisor is dead is either preserved by a re-arm of *that* fleet or
   refused with a split-brain message — never silently launched into a second one.
+- **No second orchestrator on a worktree.** The spawner takes the worktree lease
+  before the session exists; a worktree whose lease is still fresh is refused
+  (`live orchestrator lease`) instead of getting a competitor
+  (`docs/fleet-run.md#one-orchestrator-per-worktree`).
 
 ### Common situations
 

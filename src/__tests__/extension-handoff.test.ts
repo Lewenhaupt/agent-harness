@@ -651,11 +651,15 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
       ?.execute("status", {}, undefined, undefined, restarted);
     expect(statusText(status)).toContain("Handed off");
 
-    // A different (child) session in the same worktree still arms the child's
-    // workflow — the marker is scoped to the caller, not the directory.
-    const childSession = createCtx(cwd);
-    await harness.handlers.get("session_start")?.[0]?.({}, childSession);
-    expect(await runBeforeAgentStart(harness, childSession)).toContain("bd-101");
+    // A different session in the same worktree must NOT arm that workflow: one
+    // orchestrator per worktree, and the worktree lease names `sess-child` as the
+    // owner. The marker is scoped to the caller; the lease is scoped to the tree.
+    const otherSession = createCtx(cwd);
+    await harness.handlers.get("session_start")?.[0]?.({}, otherSession);
+    expect(await runBeforeAgentStart(harness, otherSession)).toBeUndefined();
+    expect(String(otherSession.ui.notify.mock.calls.at(-1)?.[0] ?? "")).toContain(
+      "Refusing to drive",
+    );
   });
 
   it("aborts the handoff when the caller-scoped marker cannot be written", async () => {

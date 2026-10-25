@@ -32,7 +32,7 @@ import {
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
   runFleetReconcile,
 } from "../fleet-reconcile.js";
-import type { FleetProcessScan } from "../fleet-sessions.js";
+import type { FleetMemberLeaseProbe, FleetProcessScan } from "../fleet-sessions.js";
 import type { FleetMergeQueue, FleetStateFs } from "../fleet-state.js";
 import {
   createFleetMergeQueue,
@@ -241,6 +241,8 @@ async function reconcile(
   options: {
     git?: FleetMergeGitRunner;
     scan?: FleetProcessScan;
+    /** Worktree lease per member, the pi-web orchestrator's only liveness evidence. */
+    leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
     pruneDeadMembers?: boolean;
     supervisorAlive?: boolean;
     fs?: FleetStateFs;
@@ -258,6 +260,7 @@ async function reconcile(
     isPidAlive: () => options.supervisorAlive === true,
     selfPid: process.pid,
     ...(options.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
+    ...(options.leaseFor === undefined ? {} : { leaseFor: options.leaseFor }),
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
 }
@@ -912,6 +915,42 @@ describe("runFleetReconcile: supervision", () => {
 
     expect(result.repairs).toEqual([]);
     expect(result.text).toContain("nothing to prune");
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12", "bd-15"]);
+  });
+
+  it("reads liveness from the worktree lease, not only the process table", async () => {
+    // A pi-web orchestrator is a session inside the daemon: no process carries
+    // `belayd-<taskId>`, so the table is empty and the lease is the only evidence.
+    // Without it this member was pruned while it was running, and a later launch
+    // started a second orchestrator on the same worktree.
+    const fixture = tempCommonDir("prune-lease-live");
+    seedIntent(fixture.commonDir, fixture.fleetId);
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      leaseFor: (taskId) =>
+        taskId === "bd-12" ? { state: "live", heartbeatAt: 99_000 } : { state: "absent" },
+    });
+
+    expect(result.text).toContain("orchestrator live (worktree lease renewed");
+    // bd-12 is live by lease; bd-15 has no lease and no process, so it is gone.
+    expect(result.repairs).toContain("member-pruned:bd-15");
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12"]);
+  });
+
+  it("never prunes a member whose lease cannot be read", async () => {
+    const fixture = tempCommonDir("prune-lease-corrupt");
+    seedIntent(fixture.commonDir, fixture.fleetId);
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      leaseFor: () => ({ state: "corrupt", error: "not an orchestrator lease" }),
+    });
+
+    expect(result.repairs).toEqual([]);
+    expect(result.text).toContain("liveness unknown");
     expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12", "bd-15"]);
   });
 

@@ -130,6 +130,14 @@ export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export type { ChdirTargetInput, ChdirTargetResult } from "./chdir-guard.js";
 export { isSafeChdirTarget } from "./chdir-guard.js";
+// Accepting a landed member (P5): close the bead, remove the worktree
+export type {
+  AcceptLandedMemberOptions,
+  AcceptLandedMemberResult,
+  FleetAcceptFailureReason,
+  FleetAcceptRunner,
+} from "./fleet-accept.js";
+export { acceptLandedMember } from "./fleet-accept.js";
 // Shared fleet state substrate (bd-126 P1–P4): paths, intent, audit, mailbox, queue
 export type {
   BeadShowArgvBuilder,
@@ -145,6 +153,18 @@ export {
   lookupFleetBeads,
   lookupFleetDependencies,
 } from "./fleet-beads.js";
+// Supervisor heartbeat for a run-mode fleet (P5)
+export type { SupervisorBeatVerdict, SupervisorHeartbeat } from "./fleet-heartbeat.js";
+export {
+  classifySupervisorBeat,
+  FLEET_SUPERVISOR_HEARTBEAT_FILE,
+  FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION,
+  FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
+  parseSupervisorHeartbeat,
+  readSupervisorHeartbeat,
+  supervisorHeartbeatPath,
+  writeSupervisorHeartbeat,
+} from "./fleet-heartbeat.js";
 export type {
   CollectFleetLaunchContextOptions,
   FleetAdvancePlan,
@@ -287,6 +307,45 @@ export {
   reportMemberLiveness,
   runFleetReconcile,
 } from "./fleet-reconcile.js";
+// Autonomous fleet run loop (P5)
+export type {
+  DeriveFleetMemberProgressOptions,
+  FleetMemberClaim,
+  FleetMemberObservation,
+  FleetMemberProgress,
+  FleetRun,
+  FleetRunMember,
+  FleetRunMode,
+  FleetRunOutcome,
+  FleetRunStop,
+  FleetRunStopReason,
+  FleetTickAction,
+  FleetWorkflowProgressSnapshot,
+  PlanFleetTickOptions,
+} from "./fleet-run.js";
+export {
+  deriveFleetMemberProgress,
+  FLEET_RUN_ACTION_TICK_INTERVAL_MS,
+  FLEET_RUN_MAX_IDLE_TICKS,
+  FLEET_RUN_MEMBERS_MAX,
+  FLEET_RUN_MODES,
+  FLEET_RUN_OUTCOMES,
+  FLEET_RUN_SCHEMA_VERSION,
+  FLEET_RUN_START_GRACE_MS,
+  FLEET_RUN_STOP_REASONS,
+  FLEET_RUN_TICK_INTERVAL_MS,
+  FleetRunSchema,
+  finishFleetRun,
+  formatFleetRunLine,
+  formatFleetRunStops,
+  isFleetRunActive,
+  planFleetTick,
+  recordRunMemberLanded,
+  recordRunMemberLaunched,
+  recordRunMemberStopped,
+  recordRunTick,
+  startFleetRun,
+} from "./fleet-run.js";
 export type {
   FleetDependencyEdge,
   FleetDependencyGraph,
@@ -305,6 +364,7 @@ export {
   planFleetSchedule,
 } from "./fleet-schedule.js";
 export type {
+  FleetMemberLeaseProbe,
   FleetMemberLiveness,
   FleetPidProbe,
   FleetProcessFs,
@@ -409,6 +469,8 @@ export type {
   FleetBead,
   FleetBeadLookup,
   FleetIntent,
+  FleetLeaseSnapshot,
+  FleetLeaseView,
   FleetMemberSnapshot,
   FleetMemberState,
   FleetMemberView,
@@ -440,6 +502,7 @@ export {
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
+  fleetLeaseView,
   fleetMergeQueueFilePath,
   fleetStateDir,
   formatFleetStatus,
@@ -623,6 +686,38 @@ export {
   sumModelTelemetryStats,
   writeModelTelemetry,
 } from "./model-telemetry.js";
+// One-orchestrator-per-worktree lease
+export type {
+  AcquireOrchestratorClaimOptions,
+  AcquireOrchestratorClaimResult,
+  AdoptOrchestratorClaimResult,
+  OrchestratorClaim,
+  OrchestratorClaimFs,
+  OrchestratorClaimRead,
+  OrchestratorClaimReadFs,
+  OrchestratorClaimVerdict,
+} from "./orchestrator-claim.js";
+export {
+  acquireOrchestratorClaim,
+  adoptOrchestratorClaim,
+  assignOrchestratorClaimSession,
+  classifyOrchestratorClaim,
+  describeOrchestratorClaim,
+  heartbeatOrchestratorClaim,
+  isPendingOrchestratorClaim,
+  ORCHESTRATOR_CLAIM_ARCHIVE_PREFIX,
+  ORCHESTRATOR_CLAIM_FILE_NAME,
+  ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
+  ORCHESTRATOR_CLAIM_PENDING_PREFIX,
+  ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
+  ORCHESTRATOR_CLAIM_STALE_MS,
+  orchestratorClaimFs,
+  orchestratorClaimPath,
+  parseOrchestratorClaim,
+  readOrchestratorClaim,
+  releaseOrchestratorClaim,
+  replaceOrchestratorClaim,
+} from "./orchestrator-claim.js";
 export type {
   OutlineAppliedFilters,
   OutlineFile,

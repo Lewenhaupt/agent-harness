@@ -13,9 +13,11 @@
 
 import { basename, join } from "node:path";
 import { z } from "zod";
-
+import { FleetRunSchema, formatFleetRunLine, formatFleetRunStops } from "./fleet-run.js";
 import { FLEET_SCHEDULE_DEFERRAL_REASONS } from "./fleet-schedule.js";
 import { taskIdFromBranch } from "./handoff.js";
+import type { OrchestratorClaim } from "./orchestrator-claim.js";
+import { orchestratorClaimPath, parseOrchestratorClaim } from "./orchestrator-claim.js";
 import type { RunManifest, RunManifestFs } from "./run-manifest.js";
 import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
 import { isValidTaskId } from "./session-naming.js";
@@ -112,6 +114,14 @@ const FleetIntentSchema = z.object({
     })
     .optional(),
   note: z.string().optional(),
+  /**
+   * P5 autonomous-run record.
+   *
+   * Absent for an explicit, operator-driven fleet; present once a launch asked to
+   * run until every member is landed. It lives in the intent so a supervisor
+   * restart resumes the loop instead of re-landing members it already landed.
+   */
+  run: FleetRunSchema.optional(),
   /** Branch merges land on (P2). Absent means the repository's default branch. */
   baseBranch: z.string().optional(),
   /**
@@ -209,6 +219,45 @@ export interface FleetMemberSnapshot {
   workflow: FleetWorkflowSnapshot;
   /** Run manifests from `listRuns` at that worktree. */
   runs: readonly RunManifest[];
+  /** Orchestrator lease as read; no clock is applied here (freshness is the tools' job). */
+  lease: FleetLeaseSnapshot;
+}
+
+/**
+ * The worktree's orchestrator lease as the observer saw it.
+ *
+ * Deliberately clock-free: a read-only view must stay byte-stable, so this says
+ * *what the file says* and leaves "live vs stale" to the tools that act on it.
+ */
+export type FleetLeaseSnapshot =
+  | { state: "absent" }
+  | { state: "held"; claim: OrchestratorClaim }
+  | { state: "corrupt"; error: string };
+
+/** Lease fields the view exposes; a `claim` is the raw record when it parsed. */
+export interface FleetLeaseView {
+  state: "absent" | "held" | "corrupt";
+  taskId?: string;
+  sessionId?: string;
+  heartbeatAt?: number;
+  error?: string;
+}
+
+/** Reduce a lease snapshot to the fields the text view prints. */
+export function fleetLeaseView(snapshot: FleetLeaseSnapshot): FleetLeaseView {
+  switch (snapshot.state) {
+    case "absent":
+      return { state: "absent" };
+    case "corrupt":
+      return { state: "corrupt", error: snapshot.error };
+    case "held":
+      return {
+        state: "held",
+        taskId: snapshot.claim.taskId,
+        sessionId: snapshot.claim.sessionId,
+        heartbeatAt: snapshot.claim.heartbeatAt,
+      };
+  }
 }
 
 /**
@@ -258,6 +307,8 @@ export interface FleetMemberView {
   interruptedRunCount: number;
   /** workflow.json `updatedAt`, raised to the newest run timestamp when that is later. */
   updatedAt: number | undefined;
+  /** Orchestrator lease: the only honest evidence of a live member orchestrator. */
+  lease: FleetLeaseView;
   /** Read-only `bd show` metadata, when a lookup succeeded for this task id. */
   bead?: FleetBead;
   state: FleetMemberState;
@@ -455,6 +506,7 @@ function memberView(snapshot: FleetMemberSnapshot): FleetMemberView {
       latestRuns: latestRunPerPhase(snapshot.runs, []),
       interruptedRunCount,
       updatedAt: runTimestamp,
+      lease: fleetLeaseView(snapshot.lease),
       state: "missing-state",
     };
   }
@@ -481,6 +533,7 @@ function memberView(snapshot: FleetMemberSnapshot): FleetMemberView {
     interruptedRunCount,
     updatedAt:
       runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
+    lease: fleetLeaseView(snapshot.lease),
     state: deriveFleetMemberState({
       workflow: snapshot.workflow,
       runs: snapshot.runs,
@@ -797,6 +850,29 @@ function formatBeadLine(bead: FleetBead): string {
   return `  bead: ${title} (${status})`;
 }
 
+/**
+ * The orchestrator lease line.
+ *
+ * It prints the record, not a verdict: a read-only view cannot say "live" without
+ * reading a clock, and the tools that act on liveness classify it themselves.
+ */
+function formatLeaseLine(lease: FleetLeaseView): string {
+  switch (lease.state) {
+    case "absent":
+      return "  orchestrator lease: none";
+    case "corrupt":
+      return `  orchestrator lease: unreadable (${lease.error ?? "unknown error"})`;
+    case "held": {
+      const renewed =
+        lease.heartbeatAt === undefined ? "unknown" : new Date(lease.heartbeatAt).toISOString();
+      return (
+        `  orchestrator lease: session ${lease.sessionId ?? "unknown"} for ` +
+        `${lease.taskId ?? "unknown"}, renewed ${renewed}`
+      );
+    }
+  }
+}
+
 function formatMember(member: FleetMemberView): string[] {
   const branch = member.branch === undefined ? "detached HEAD" : member.branch;
   const lines = [
@@ -822,6 +898,7 @@ function formatMember(member: FleetMemberView): string[] {
   }
 
   lines.push(`  interrupted runs: ${member.interruptedRunCount}`);
+  lines.push(formatLeaseLine(member.lease));
   lines.push(
     `  last updated: ${member.updatedAt === undefined ? "unknown" : new Date(member.updatedAt).toISOString()}`,
   );
@@ -843,6 +920,8 @@ export function formatFleetStatus(status: FleetStatus): string {
   const deferred =
     status.intent === undefined ? undefined : formatDeferred(status.intent.deferred ?? []);
   const park = status.intent === undefined ? undefined : formatPark(status.intent);
+  const run = formatFleetRunLine(status.intent?.run);
+  const stops = formatFleetRunStops(status.intent?.run);
   const lines = [
     // Name only the id that actually located the files; a sanitized id keeps
     // traversal input from printing as if it were a real directory.
@@ -850,6 +929,8 @@ export function formatFleetStatus(status: FleetStatus): string {
     `  intent: ${formatIntent(status.intent)}`,
     ...(deferred === undefined ? [] : [`  ${deferred}`]),
     ...(park === undefined ? [] : [`  ${park}`]),
+    ...(run === undefined ? [] : [`  ${run}`]),
+    ...stops.map((line) => `  ${line}`),
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
   ];
@@ -927,7 +1008,25 @@ function readMemberSnapshot(fs: FleetStatusFs, entry: WorktreeListEntry): FleetM
     branch: entry.branch,
     workflow,
     runs: listRuns({ cwd: entry.path, fs }),
+    lease: readLeaseSnapshot(fs, entry.path),
   };
+}
+
+/** Read the worktree's orchestrator lease without applying a clock. */
+function readLeaseSnapshot(fs: FleetStatusFs, worktreePath: string): FleetLeaseSnapshot {
+  const path = orchestratorClaimPath(worktreePath);
+  if (!fs.existsSync(path)) return { state: "absent" };
+  try {
+    const parsed = parseOrchestratorClaim(JSON.parse(fs.readFileSync(path)));
+    return parsed === undefined
+      ? { state: "corrupt", error: `${path} is not an orchestrator lease` }
+      : { state: "held", claim: parsed };
+  } catch (error) {
+    return {
+      state: "corrupt",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 /**

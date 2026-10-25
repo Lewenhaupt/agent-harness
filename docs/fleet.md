@@ -3,12 +3,17 @@
 `/fleet bd-12 bd-15 bd-19` takes several beads at once, runs each as a normal
 Belayd workflow in its own worktree and its own detached orchestrator session,
 orders them by bd's blocking dependencies inside a ceiling of **3 concurrent
-orchestrators**, carries notes between you and the members, and lands finished
-branches on the base branch one at a time — always on an explicit call, never on a
-timer.
+orchestrators**, carries notes between you and the members, and then **runs to
+completion**: it lands each finished branch on the base branch, accepts it (closes
+the bead, removes the worktree), and starts the next wave until every member is
+done.
 
-All five milestones are implemented: **P0** status, **P1** launch + mailbox,
-**P2** merge queue, **P3** ordering/capacity, **P4** pause/advance/reconcile.
+All six milestones are implemented: **P0** status, **P1** launch + mailbox,
+**P2** merge queue, **P3** ordering/capacity, **P4** pause/advance/reconcile,
+**P5** the run loop and the one-orchestrator-per-worktree lease.
+
+`--manual` restores the older explicit surface (launch, land, and advance only when
+you call a tool); `--no-accept` lands without closing beads.
 
 This page is the map: the end-to-end run, which tool for which situation, how to
 get out of each failure, and how to verify the surface. Detail stays in the
@@ -16,6 +21,7 @@ per-area docs.
 
 | Doc | Covers |
 |-----|--------|
+| `docs/fleet-run.md` | P5: run-to-completion, the tick, accepting a landed member, the worktree lease, supervisor heartbeat |
 | `docs/fleet-status.md` | P0: `belayd_fleet_status`, field/state decoding, warning triage, read-only proof |
 | `docs/fleet-launch.md` | P1+P3: `/fleet`, `belayd_fleet_launch`, waves and capacity, the mailbox, the fleet refusal |
 | `docs/fleet-merge.md` | P2: `belayd_fleet_merge` enqueue/drain, root stash/park, gates |
@@ -33,7 +39,9 @@ process gate, worktree, and `.belayd/` directory. Cross-tree state lives in
 `<git-common-dir>/belayd/fleet/<fleetId>/`:
 
 ```text
-fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, supervisor record
+fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, run record, supervisor record
+supervisor.json    run-mode supervisor heartbeat (re-arm eligibility)
+orchestrator.json  in each member worktree: the one-orchestrator lease
 audit.log          append-only: every cross-tree action
 inbox/             member → supervisor notes      (belayd_fleet_inbox drains + acks)
 events/            supervisor → member notes      (drained at each member's turn start)
@@ -49,19 +57,31 @@ the fleet's live supervisor.
 #### 1. Launch
 
 ```text
-/fleet bd-12 bd-15 bd-19
+/fleet bd-12 bd-15 bd-19            # run to completion (the default)
+/fleet bd-12 bd-15 --manual         # explicit surface: nothing lands or advances on its own
+/fleet bd-12 bd-15 --no-accept      # land, but leave the beads for you to close
 ```
 
 or the tool form:
 
 ```json
-{ "tasks": ["bd-12", "bd-15", "bd-19"], "fleetId": "default", "concurrency": 3 }
+{
+  "tasks": ["bd-12", "bd-15", "bd-19"],
+  "fleetId": "default",
+  "concurrency": 3,
+  "untilComplete": true,
+  "accept": true
+}
 ```
 
 Validate → write intent → launch → prune. Validation happens first and a refusal
 creates nothing at all (no fleet directory, no worktree, no session): invalid ids,
 duplicate ids, an id already in a live fleet, a worktree owned by another bead, a
-bead already driven by a standalone orchestrator.
+bead already driven by a standalone orchestrator, or a worktree whose orchestrator
+lease is still live (one orchestrator per worktree — see `docs/fleet-run.md`).
+
+With `untilComplete` (the default) the launch then records a **run** in
+`fleet.json` and starts the supervisor's ticker; see [step 8](#8-let-it-run-to-completion).
 
 The report tells you what started and what waits (wording is the tool's own; the
 counts come from your request):
@@ -149,7 +169,8 @@ belayd_fleet_note { "to": "all", "body": "pause after your current phase", "kind
 
 #### 4. Merge finished work
 
-Merging is explicit and one member at a time:
+In run mode this happens by itself, one member at a time. The explicit queue is
+still there for a `--manual` fleet:
 
 ```text
 belayd_fleet_merge { "action": "enqueue", "task": "bd-12" }
@@ -174,7 +195,8 @@ sha) → rebase the member onto the base → the target's own gates
   `fleet.json` `park.stashRef`. See [step 7](#7-reconcile-after-a-crash).
 - **Merging is not closing.** `src/fleet-merge.ts` has no bd seam at all. After a
   successful drain the bead is still `in_progress` + `human`; the report says so.
-  You accept it with `wt merge` / `bd close`.
+  You accept it with `wt merge` / `bd close` — or let a run accept it (step 8),
+  which closes the bead and removes the worktree.
 
 #### 5. Advance the next wave
 
@@ -187,12 +209,12 @@ re-read the edges, refuse a cycle, re-apply the ceiling, launch what fits, recor
 the rest again. Audited as `advance` + `schedule-planned` + per-member deferrals.
 It refuses while the fleet is paused, with no deferred members, or with no intent.
 
-**Waves do not advance on a merge, and nothing advances on its own.** A blocked
-member becomes eligible only when bd stops reporting the blocking edge — i.e. when
-the blocker bead is `closed` (or `done`). Merging a sibling's branch leaves its
-bead `in_progress`, so the edge survives and the waiting member stays deferred
-with reason `external-blocker` until a human closes it. There is no poller:
-advance is a call you make (or an explicit `/fleet bd-19`).
+**In run mode the loop advances itself** (step 8). For a `--manual` fleet nothing
+advances on its own: advance is a call you make (or an explicit `/fleet bd-19`).
+Either way a blocked member becomes eligible only when bd stops reporting the
+blocking edge — i.e. when the blocker bead is `closed` (or `done`) — **or** when
+this fleet already landed that blocker, which satisfies the edge before the bead is
+closed (`docs/fleet-run.md`).
 
 #### 6. Pause and resume
 
@@ -251,23 +273,24 @@ Operational limits, at the point you hit them:
   `git stash list`, reconcile reports "already restored or dropped", leaves the
   checkout alone, and unparks.
 - **Pruning changes the count, not the worktree.** With `pruneDeadMembers`, a
-  member whose orchestrator is provably absent (a completed process-table scan
-  found no process carrying `belayd-<taskId>`) is removed from `taskIds`; its
-  worktree, transcript, and bead stay. A live supervisor may prune — that is the
-  realistic case — while `unknown` liveness (unreadable `/proc`, scan over its
-  cap) is never pruned. The parameter is `pruneDeadMembers` (camelCase) — the
-  refusal hint in the report says "re-run with prune-dead-members", which is
-  prose, not the parameter name.
+  member whose orchestrator is provably absent is removed from `taskIds`; its
+  worktree, transcript, and bead stay. "Provably absent" now means **no live
+  worktree lease AND no matching process** (a completed process-table scan found
+  no `belayd-<taskId>` argv): a pi-web orchestrator never appears in the process
+  table, so the lease is what keeps a running member from being pruned — the
+  bd-37 incident pruned a live member 25 s after its launch, which freed a slot
+  and started a second orchestrator on one worktree. `unknown` liveness
+  (unreadable `/proc`, an unreadable lease) is never pruned. The parameter is
+  `pruneDeadMembers` (camelCase) — the refusal hint in the report says "re-run
+  with prune-dead-members", which is prose, not the parameter name.
 - **Capacity is narrowed by pruning, never by liveness subtraction at launch.**
   The launch path always counts every recorded member of every fleet; a verdict
-  from the process table is not wired into it. So a dead member holds a slot until
-  you prune it, and `unknown` liveness (unreadable `/proc`, scan over its cap) is
-  never treated as `absent`.
-- **A pruned member cannot be relaunched through the fleet.** Its
-  `.belayd/workflow.json` still exists, so the bd-119 preflight refuses a second
-  orchestrator for that worktree (`already driven by a standalone orchestrator`).
-  Resume it with the single-bead runbook (`/belayd` handoff, `pi --resume
-  belayd-<taskId>`) or remove the worktree if the work is abandoned.
+  from the process table or the lease is not wired into it. So a dead member holds
+  a slot until you prune it (or the run loop lands it, which prunes it).
+- **A pruned member cannot be relaunched through the fleet while its lease is
+  live.** The lease names the session that owns the worktree, so a second launch is
+  refused (`live orchestrator lease`) instead of creating a duplicate orchestrator.
+  Once the lease is cold, relaunch normally, or resume the old session.
 - **The intent CAS is check-then-write.** `fleet.json` updates compare the bytes
   they read and then rename, so two simultaneous supervisors can both win that
   window (the merge lock is the only `mkdir`-based primitive). There is at most
@@ -276,25 +299,60 @@ Operational limits, at the point you hit them:
   inside a writable fleet directory is outside that guarantee; see the threat
   model in `docs/fleet-orchestrator.md`.
 
+#### 8. Let it run to completion
+
+```text
+/fleet bd-12 bd-15 bd-19
+```
+
+The launch records a `run` in `fleet.json` and starts the supervisor's ticker.
+Every tick does exactly one thing, in this order — land the first finished member,
+stop the first member that needs a human, advance the deferred wave, or finish:
+
+```text
+1  land     bd-12: merged into main, bead closed, worktree removed
+2  advance  bd-19 launched (bd-12 landed, so its edge is satisfied)
+…
+   run: until-complete — complete (11 tick(s))
+```
+
+- **Accepting is the run's landing step**: `bd close` + `git worktree remove` +
+  `git branch -d`, all conservative (no `--force`, no `-D`). `--no-accept` skips
+  the close and leaves the beads for you.
+- **A member that needs a human is stopped, never relaunched.** `awaiting-human`,
+  failed phase, interrupted run, unreadable state, or a vanished orchestrator all
+  end that member's part of the run with a reason in `belayd_fleet_status`.
+- **Pause stops the timer without finishing the run**; `belayd_fleet_resume` starts
+  it again. A parked or stalled run is halted and recorded.
+- **A re-arm resumes the run.** After a supervisor restart, `/fleet <ids> --fleet
+  <id>` preserves the members and restarts the ticker from the persisted run
+  record. The run-mode supervisor heartbeat is what makes that re-arm possible.
+
+The full contract — tick table, run record fields, stop reasons, acceptance, the
+worktree lease — is in `docs/fleet-run.md`.
+
 ### Decision table
 
 | Situation | Tool | What it writes |
 |-----------|------|----------------|
-| Start several beads | `/fleet`, `belayd_fleet_launch` | `fleet.json`, `audit.log`, worktrees + sessions |
-| Recover supervision after a pi restart | `/fleet <ids> --fleet <id>` | supervisor record + `re-arm` audit; members preserved |
+| Start several beads and run to completion | `/fleet`, `belayd_fleet_launch` | `fleet.json` (intent + `run`), `audit.log`, worktrees + sessions |
+| Start several beads without the loop | `/fleet <ids> --manual` | the same, without a `run` record |
+| Recover supervision after a pi restart | `/fleet <ids> --fleet <id>` | supervisor record + `re-arm` audit; members preserved; the run loop resumes |
 | What is every worktree doing? | `belayd_fleet_status` | nothing (read-only; no fleet dir created) |
 | Ask one member something / tell it main moved | `belayd_fleet_note` (`kind: rebase-hint`) | one file in `events/` |
 | Tell every member | `belayd_fleet_note` `to: "all"` | one file per member in `events/` |
 | Did a member report? | `belayd_fleet_inbox` | drains + acks `inbox/`, `inbox-drain` audit |
-| Land a finished member | `belayd_fleet_merge` `enqueue` then `drain` | `merge-queue.json`, the base branch, `base-moved` notes |
+| Land a finished member (manual fleet) | `belayd_fleet_merge` `enqueue` then `drain` | `merge-queue.json`, the base branch, `base-moved` notes |
+| Land + accept, automatically | the run loop (default) | the base branch, bead status, worktree removal, `fleet-landed` audit |
 | What is queued / is a merge in flight? | `belayd_fleet_merge` `list` | nothing |
 | Start the deferred members | `belayd_fleet_advance` | new members, updated `deferred` |
 | Stop starting new work | `belayd_fleet_pause` | `paused`, `pause` notes, `fleet-paused` audit |
 | Stop a member that ignores mail | `belayd_fleet_pause` `force` | SIGTERM + per-pid audit (delivery only) |
 | Come back | `belayd_fleet_resume` | clears `paused`/`park`, `resume` notes |
 | Repair after a crash | `belayd_fleet_reconcile` | queue/park repair, liveness report |
-| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with positive `absent` evidence from `taskIds` (never `unknown`) |
-| Accept the work / close the bead (human) | `wt merge`, `bd close` | bead status — **never** a fleet tool |
+| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease and no process from `taskIds` (never `unknown`) |
+| Accept one member's work + worktree | a run with `accept: true` | bead status + worktree removal, audited |
+| Accept the work without the loop | `wt merge`, `bd close` | bead status — `belayd_fleet_merge` itself never touches a bead |
 
 `belayd_fleet_status` and `belayd_fleet_note` work in any session that is inside a
 fleet (the supervisor writes `events/`, a member writes `inbox/`). `belayd_fleet_inbox`,
@@ -310,7 +368,9 @@ left by a dead process does not count — re-arm with `/fleet` first.
 | `Fleet \`default\` is paused (<park reason>); resume it with belayd_fleet_resume before launching more members (run belayd_fleet_reconcile first if the root work is parked)` | P2 stashed your dirty root, landed the merge, and could not restore the stash cleanly. Your work is in the stash | `belayd_fleet_reconcile` restores the recorded sha, verifies it, drops it, and unparks — or reports exactly what blocks it (root is a linked worktree, root moved off the base branch, sha gone, apply conflict). Then `belayd_fleet_resume`. `resume force` clears the pause and leaves the stash, naming the ref. Never delete the stash by hand first |
 | `merge lock is held by … until …` | Another drain (or a dead supervisor's lease) owns the queue | Wait, or let the lease expire — the expiry is the only takeover authority, the recorded pid is diagnostic. `belayd_fleet_reconcile` takes over an expired lease for you |
 | `<lockDir> exists without a lock record (acquisition in progress, or a holder crashed before writing its lease); retry after 30s or remove the directory by hand` | A holder crashed between `mkdir` and writing its lease, or is inside that window | Retry after ~30 s (grace window); reconcile reclaims it past the grace. Removing `merge.lock.d` by hand is safe only when no drain is running |
-| Supervisor is gone; members keep running; every fleet tool says `supervisor-only` | The supervisor session died. Detached members survive it — that is why the capacity count still counts them | `/fleet <its ids> --fleet <id>` in a new session (re-arm: members preserved, record rewritten). Then `belayd_fleet_status` to see them, `belayd_fleet_reconcile` if the queue was left mid-flight |
+| Supervisor is gone; every fleet tool says `supervisor-only` | The supervisor session died. Its lease and run record survive on disk, and a run-mode fleet's recorded pid is the shared daemon, so only the supervisor heartbeat can say it is gone | `/fleet <its ids> --fleet <id>` in a new session: re-arm rewrites the supervisor record, preserves the members, and (because the intent has a `run`) resumes the loop. Then `belayd_fleet_status`; `belayd_fleet_reconcile` if the queue or root was left mid-flight |
+| A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause, then `/fleet <its id>` to run that bead again (it is no longer a member of the old fleet). The loop never relaunches a stopped member by itself |
+| `Refusing to launch … live orchestrator lease` | The worktree already has a live orchestrator session (its lease is fresh) | One orchestrator per worktree: finish or stop that session. If it is really gone, the lease goes cold after ~3 min and the next launch takes it over (the old record is archived, and the takeover is reported) |
 | Launch refused with `dependency-cycle` and a closed path (`bd-12 → bd-15 → bd-12`) | bd's `blocks` edges form a cycle; no valid order exists | `bd dep remove`, then relaunch. Nothing was created, so there is nothing to clean up |
 | `Scheduling: 0 member(s) now, N deferred (capacity 3, 3 already active, 0 free slot(s))` | The ceiling is full — normally because members of another fleet (or a dead supervisor's fleet) are still recorded | Not an error (exit 0). `belayd_fleet_status` shows who is active; let a member finish, or `belayd_fleet_reconcile` `pruneDeadMembers` (positive `absent` evidence only — never `unknown`), then `belayd_fleet_advance`. Do not edit `fleet.json` by hand to drop ids |
 | `<n> fleet intent(s) under this repository's fleet root cannot be read (<ids>). Counting only the readable fleets could exceed the ceiling of 3 …` | `fleet.json` does not parse (hand edit, truncation, newer schema). Writers refuse to replace a present-but-unparsable record, and an unreadable intent refuses a launch rather than assuming zero active members | Inspect `fleet.json`; restore a valid record (or move it aside if the fleet is really finished). Reconcile and launch both refuse until it parses — this is deliberate, because guessing the member count can overshoot the ceiling |
@@ -333,10 +393,13 @@ pnpm lint              # Checked 177 files in 340ms. No fixes applied.
 pnpm build             # tsc — no output
 ```
 
-The fleet suites are the eleven files matching `src/__tests__/fleet-*.test.ts` plus
+The fleet suites are the files matching `src/__tests__/fleet-*.test.ts`, plus
+`src/__tests__/orchestrator-claim.test.ts`,
 `src/__tests__/extension-fleet-status-tool.test.ts` and
 `src/__tests__/extension-fleet-p1.test.ts`, and the two integration files
 `test/fleet-status.integration.test.ts` and `test/fleet-merge.integration.test.ts`.
+The P5 property table (which case pins which invariant) is in
+`docs/fleet-run.md#how-to-verify`.
 
 ### 2. See a real fleet view in this repo
 

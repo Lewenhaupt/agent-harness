@@ -5,9 +5,16 @@ the next wave, and how to repair it after a crash. Operator entry point for the
 whole surface: `docs/fleet.md`. Design record: `docs/fleet-orchestrator.md`; merge
 mechanics: `docs/fleet-merge.md`; launch and ordering: `docs/fleet-launch.md`.
 
-Everything here is **explicit and audited**. There is no daemon, no poller, and no
-background retry loop: each of these is a tool call you make, and each decision is
-appended to `<git-common-dir>/belayd/fleet/<fleetId>/audit.log`.
+Everything here is **explicitly invoked and audited**. Pause, resume, advance, and
+reconcile are tool calls you make, and each decision is appended to
+`<git-common-dir>/belayd/fleet/<fleetId>/audit.log`.
+
+The one background loop in the fleet family is the **run ticker** (bd-126 P5,
+`docs/fleet-run.md`): it is started by `/fleet` unless `--manual` is passed, it
+stops on `belayd_fleet_pause`, and it restarts on `belayd_fleet_resume` or a
+re-arm. It acts only through the same engines these tools use, and every action is
+audited (`fleet-landed`, `fleet-run-stopped`, `fleet-run-halted`,
+`fleet-run-complete`).
 
 ## Contents
 
@@ -195,7 +202,7 @@ untouched and the fleet parked.
 | Parked fleet, root is a linked worktree | `rev-parse --absolute-git-dir` differs from `--git-common-dir` | **blocked before any stash work** | A linked worktree can hold the base branch while the root moved away; restoring there would leave the root with neither the work nor the pointer. Run reconcile from the repository root |
 | Parked fleet, root not on the base branch | git shows another branch checked out | **blocked, report the exact steps** | Applying onto another branch would move the operator's work into the wrong checkout. The stash ref and the branch to check out are printed |
 | Parked fleet, stash no longer resolves or conflicts | git refuses the apply | **blocked, stash untouched** | The conflict is reset out of the checkout and the fleet stays parked with the ref in `park` |
-| Member orchestrator absent | process table readable, no process carries `belayd-<taskId>` | **report**; **prune** with `pruneDeadMembers: true` | Removes phantom members so the conservative capacity count is not held forever by sessions that provably do not exist. A live supervisor may prune — it is the entity that needs the count back. The worktree, transcript, and bead are untouched |
+| Member orchestrator absent | no fresh worktree lease AND (process table readable, no process carries `belayd-<taskId>`) | **report**; **prune** with `pruneDeadMembers: true` | Removes phantom members so the conservative capacity count is not held forever by sessions that provably do not exist. A live supervisor may prune — it is the entity that needs the count back. The worktree, transcript, and bead are untouched |
 | Member orchestrator live | a process carries the token | **leave alone** | The work is advancing; only a dead supervisor needs re-arming with `/fleet <ids> --fleet <id>` |
 | Member liveness unknown | `/proc` unreadable / scan over its cap | **never prune**, warn | "Cannot see" is not "gone". Every member stays in the capacity count, even when the supervisor is live and asks to prune |
 
@@ -259,23 +266,40 @@ unexplained "lock held" on later drains.
 
 #### Member liveness model
 
-A member session is spawned as `pi --session-id belayd-<taskId> --name
-belayd-<taskId>` (`src/spawn.ts`, `computeOrchestratorSessionName`), so the process
-table is the only honest liveness evidence. `belayd_fleet_reconcile` takes one
-`/proc/<pid>/cmdline` snapshot (bounded, numeric pids only) and classifies each
-member:
+Two evidence sources, and the combination is what makes the verdict honest.
 
-| Result | Meaning | Consequence |
-|--------|---------|-------------|
-| `live` | a process carries the exact `belayd-<taskId>` token | never pruned; the work is running |
-| `absent` | the scan worked and nothing carries it | report; prunable with `pruneDeadMembers: true` (a live supervisor may prune; the supervisor's liveness is not a precondition) |
-| `unknown` | `/proc` unreadable, or more processes than the scan cap | never pruned; warning that the capacity count stays conservative |
+**The worktree lease (primary).** Every member worktree carries
+`.belayd/orchestrator.json`, created by the spawner, adopted and then renewed every
+20 s by the orchestrator session's own timer
+(`src/orchestrator-claim.ts`, `docs/fleet-run.md`). A fresh lease proves a session
+is alive.
 
-The scan is a heuristic in one direction only: a false `live` costs nothing (a dead
-member keeps a slot until you prune it), while a false `absent` would remove a
-running member — which is why the scan's failure mode is `unknown`, never `absent`,
-and why the capacity count is narrowed by *pruning a member that provably does not
-exist*, not by subtracting liveness verdicts at launch time.
+Why not just the process table: a member launched by `/fleet` or `/belayd` is a
+**pi-web session inside the session daemon**. No process carries
+`belayd-<taskId>` — the argv belongs to `sessiond.js` — so a scan of `/proc`
+reports every live member as `absent`. That was the bd-37 incident: the member was
+pruned 25 s after its launch, capacity freed a slot, and the next launch created a
+second orchestrator on the same worktree.
+
+**The process table (secondary).** A CLI-spawned orchestrator
+(`pi --session-id belayd-<taskId>`, `src/spawn.ts`) has no lease; its argv token is
+still evidence. Reconcile takes one `/proc/<pid>/cmdline` snapshot (bounded,
+numeric pids only) and combines it with the lease per member:
+
+| Lease | Process | Result | Consequence |
+|---|---|---|---|
+| fresh | either | `live` | never pruned; the work is running |
+| cold/absent | exact `belayd-<taskId>` argv | `live` | never pruned (CLI-spawned member) |
+| cold/absent | nothing, scan completed | `absent` | report; prunable with `pruneDeadMembers: true` |
+| unreadable | either | `unknown` | never pruned; warning |
+| cold/absent | scan could not read `/proc` | `unknown` | never pruned; warning |
+
+The combination is a heuristic in one direction only: a false `live` costs nothing
+(a dead member keeps a slot until you prune it), while a false `absent` removes a
+running member — which is why an unreadable lease or an unreadable `/proc` is
+`unknown`, never `absent`, and why the capacity count is narrowed by *pruning a
+member that provably does not exist*, not by subtracting liveness verdicts at launch
+time.
 
 ## How to Verify
 
