@@ -37,6 +37,16 @@ export interface FleetDependencyEdge {
 export interface FleetScheduleInput {
   /** Members to schedule, in caller order (the deterministic tie-break). */
   taskIds: readonly string[];
+  /**
+   * Ids that already belong to this fleet but are not on this worklist.
+   *
+   * A stopped member is the case this exists for: its bead still blocks its
+   * siblings, and it is part of the fleet, so an edge from it must never read as
+   * an `external-blocker` ("a bead outside this fleet"). Every such id seeds wave 0,
+   * so a member waiting on one is planned for wave 1 instead of being refused as
+   * an unplannable outsider — whether the blocker is still working or has stopped.
+   */
+  memberIds?: readonly string[];
   /** Known blocking edges; a blocker outside `taskIds` means "wait for that bead". */
   edges: readonly FleetDependencyEdge[];
   /** Concurrency ceiling in effect (already clamped to the locked maximum). */
@@ -48,8 +58,10 @@ export interface FleetScheduleInput {
 /**
  * Why a member did not make the first launch.
  *
- * `dependency` — an in-set blocker is planned before it (a later wave).
- * `external-blocker` — a bead outside this launch still blocks it.
+ * `dependency` — a blocker the fleet owns holds the member back: it is planned for
+ * an earlier wave of this plan, already in flight, or a fleet member this call is
+ * not launching (a stopped one, say), so the member waits for it to land.
+ * `external-blocker` — a bead that is not part of this fleet still blocks it.
  * `capacity` — ready to go, but every slot is taken.
  *
  * The array is the single source of truth: the `fleet.json` intent schema
@@ -167,10 +179,13 @@ function normalizeActiveCount(activeCount: number): number {
 }
 
 /**
- * Blocking edges that concern the planned members, deduplicated and deterministic.
+ * Blocking edges that concern the worklist's members, deduplicated and
+ * deterministic.
  *
  * Caller order first, then blocker id: the same edges in a different order must
- * produce the same plan, which is what makes the report reproducible.
+ * produce the same plan, which is what makes the report reproducible. Every edge
+ * whose blocked member is not on the worklist is dropped here, which is why
+ * {@link collectBlockers} needs no such guard of its own.
  */
 function orderEdges(
   edges: readonly FleetDependencyEdge[],
@@ -198,31 +213,32 @@ function orderEdges(
 }
 
 interface BlockerMaps {
-  /** In-set blockers per member (the ordering edges). */
+  /** In-fleet blockers per member (the ordering edges). */
   internal: ReadonlyMap<string, readonly string[]>;
-  /** Blockers outside the launch per member. */
+  /** Blockers outside the fleet per member. */
   external: ReadonlyMap<string, readonly string[]>;
 }
 
-/** Split the edges by whether the blocker is part of this launch. */
+/** Split the edges by whether the blocker belongs to this fleet at all. */
 function collectBlockers(
   order: readonly string[],
   edges: readonly FleetDependencyEdge[],
-  planned: ReadonlySet<string>,
+  fleet: ReadonlySet<string>,
 ): BlockerMaps {
   const internal = new Map<string, string[]>(order.map((taskId) => [taskId, []]));
   const external = new Map<string, string[]>(order.map((taskId) => [taskId, []]));
   for (const edge of edges) {
-    if (!planned.has(edge.blocked)) continue;
-    const target = planned.has(edge.blocker) ? internal : external;
+    // `orderEdges` already dropped every edge whose blocked member is not on the
+    // worklist, so each remaining edge names a member this call plans.
+    const target = fleet.has(edge.blocker) ? internal : external;
     target.get(edge.blocked)?.push(edge.blocker);
   }
   return { internal, external };
 }
 
 /**
- * Members that cannot be planned because something outside the launch blocks
- * them — directly, or through an in-set blocker that cannot start either.
+ * Members that cannot be planned because something outside the fleet blocks
+ * them — directly, or through an in-fleet blocker that cannot start either.
  */
 function propagateUnplannable(
   order: readonly string[],
@@ -265,14 +281,17 @@ function waveForMember(
  * Assign each plannable member a wave: one past the deepest blocker it waits for.
  *
  * A member left without a wave is in (or behind) a cycle; the caller turns that
- * into a refusal with the path.
+ * into a refusal with the path. The fleet's existing members seed wave 0 — whether
+ * they are still running or already stopped, a member waiting on one is planned
+ * for wave 1 rather than looking like a cycle.
  */
 function assignWaves(
   order: readonly string[],
   internal: ReadonlyMap<string, readonly string[]>,
   unplannable: ReadonlyMap<string, readonly string[]>,
+  fleetMembers: readonly string[],
 ): Map<string, number> {
-  const waveOf = new Map<string, number>();
+  const waveOf = new Map<string, number>(fleetMembers.map((taskId) => [taskId, 0]));
   for (const taskId of order) {
     if (!unplannable.has(taskId) && (internal.get(taskId) ?? []).length === 0) {
       waveOf.set(taskId, 0);
@@ -347,7 +366,8 @@ interface DeferralInput {
   activeCount: number;
   edges: readonly FleetDependencyEdge[];
   unplannable: ReadonlyMap<string, readonly string[]>;
-  planned: ReadonlySet<string>;
+  /** Every id this fleet owns: the worklist plus its existing members (launched or stopped). */
+  fleet: ReadonlySet<string>;
 }
 
 function capacityDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
@@ -377,7 +397,7 @@ function dependencyDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
         blockers,
         detail:
           `wave ${wave.index}: waits for ${blockers.join(", ")} to land ` +
-          "(launched by a later fleet launch or by belayd_fleet_advance)",
+          "(this wave starts when that member lands and belayd_fleet_advance re-plans it)",
       });
     }
   }
@@ -389,7 +409,7 @@ function unplannableDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
   for (const taskId of input.order) {
     const blockedBy = input.unplannable.get(taskId);
     if (blockedBy === undefined) continue;
-    const outside = blockedBy.filter((blocker) => !input.planned.has(blocker));
+    const outside = blockedBy.filter((blocker) => !input.fleet.has(blocker));
     // A direct outside blocker and a member waiting for one that is itself
     // blocked read differently to the operator, so they get different reasons.
     if (outside.length > 0) {
@@ -398,7 +418,7 @@ function unplannableDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
         reason: "external-blocker",
         blockers: outside,
         detail:
-          `blocked by ${outside.join(", ")}, which is not part of this launch; it cannot be ` +
+          `blocked by ${outside.join(", ")}, which is not part of this fleet; it cannot be ` +
           "planned for any wave until that bead lands",
       });
       continue;
@@ -409,7 +429,7 @@ function unplannableDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
       blockers: blockedBy,
       detail:
         `waits for ${blockedBy.join(", ")}, which cannot start either (blocked by a bead ` +
-        "outside this launch); no wave can be planned until that bead lands",
+        "outside this fleet); no wave can be planned until that bead lands",
     });
   }
   return deferrals;
@@ -438,10 +458,10 @@ function buildReasons(input: DeferralInput): string[] {
     );
   }
   const outside = input.order.filter((taskId) =>
-    (input.unplannable.get(taskId) ?? []).some((blocker) => !input.planned.has(blocker)),
+    (input.unplannable.get(taskId) ?? []).some((blocker) => !input.fleet.has(blocker)),
   );
   if (outside.length > 0) {
-    reasons.push(`${outside.join(", ")} cannot be planned: blocked by a bead outside this launch`);
+    reasons.push(`${outside.join(", ")} cannot be planned: blocked by a bead outside this fleet`);
   }
   return reasons;
 }
@@ -451,12 +471,17 @@ function buildReasons(input: DeferralInput): string[] {
  *
  * Capacity is subtracted first: `slots = max(0, capacity - activeCount)`. Wave 0
  * is the set that could start now; only its first `slots` members are launched.
- * Everything else is deferred with a reason — capacity, an in-set dependency, or
- * a blocker outside this launch.
+ * Everything else is deferred with a reason — capacity, an in-fleet dependency, or
+ * a blocker outside this fleet.
  *
  * A dependency cycle refuses the whole plan (with the path) instead of silently
  * dropping members: an order that cannot exist is not a plan, and launching part
  * of a cycle would leave the rest waiting forever.
+ *
+ * `memberIds` marks ids the fleet already owns (a stopped or already-launched
+ * member). They are *not* launched by this call, but an edge from one is internal:
+ * its dependent is planned for a later wave, never reported as blocked by a bead
+ * outside the fleet.
  */
 export function planFleetSchedule(input: FleetScheduleInput): FleetScheduleResult {
   const invalid = validateScheduleInput(input);
@@ -475,11 +500,13 @@ export function planFleetSchedule(input: FleetScheduleInput): FleetScheduleResul
   const capacity = input.capacity;
   const slots = Math.max(0, capacity - activeCount);
   const planned = new Set(order);
+  const memberIds = (input.memberIds ?? []).filter((taskId) => !planned.has(taskId));
+  const fleet = new Set([...order, ...memberIds]);
 
   const edges = orderEdges(input.edges, planned, order);
-  const blockers = collectBlockers(order, edges, planned);
+  const blockers = collectBlockers(order, edges, fleet);
   const unplannable = propagateUnplannable(order, blockers.internal, blockers.external);
-  const waveOf = assignWaves(order, blockers.internal, unplannable);
+  const waveOf = assignWaves(order, blockers.internal, unplannable, memberIds);
 
   const unplaced = order.filter((taskId) => !waveOf.has(taskId) && !unplannable.has(taskId));
   if (unplaced.length > 0) {
@@ -505,7 +532,7 @@ export function planFleetSchedule(input: FleetScheduleInput): FleetScheduleResul
     activeCount,
     edges,
     unplannable,
-    planned,
+    fleet,
   };
 
   return {

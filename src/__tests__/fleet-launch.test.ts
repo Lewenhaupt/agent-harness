@@ -25,6 +25,7 @@ import {
   runFleetLaunch,
   validateFleetLaunch,
 } from "../fleet-launch.js";
+import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { fleetDir, formatAuditEntry } from "../fleet-state.js";
 import { FLEET_INTENT_DEFERRED_MAX, type FleetIntent } from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
@@ -1032,6 +1033,61 @@ describe("runFleetLaunch: P3 ordering and capacity", () => {
     expect(intent.deferred).toEqual([
       expect.objectContaining({ taskId: "bd-15", reason: "dependency" }),
     ]);
+  });
+
+  it("treats a stopped fleet member as an internal blocker, never an outsider (C2)", async () => {
+    // bd-150 was stopped by the run and kept as a member (bd-156), and bd-152 waits
+    // on it. The schedule only sees that as a sibling dependency when the launch
+    // supplies the fleet's existing members, so this asserts the wiring itself and
+    // not just `planFleetSchedule`'s unit behavior.
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, fleetId, ["bd-150"], {
+      supervisor: { sessionId: "supervisor-session", pid: 4242, armToken: "arm-token" },
+      run: recordRunMemberStopped({
+        run: startFleetRun({
+          now: 1,
+          accept: true,
+          members: [{ taskId: "bd-150", sessionId: "member-session" }],
+        }),
+        taskId: "bd-150",
+        reason: "phase-failed",
+        detail: "phase test failed: gate failed",
+        now: 2,
+      }),
+    });
+    const launched: string[] = [];
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-152"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => {
+        launched.push(taskId);
+        return { taskId, ok: true, detail: "unexpected" };
+      },
+      lookupDependencies: async () => ({
+        edges: [{ blocker: "bd-150", blocked: "bd-152" }],
+        warnings: [],
+      }),
+      fs,
+    });
+
+    expect(result.ok).toBe(true);
+    // Nothing starts: bd-150 is stopped until a human lands or removes it, and
+    // bd-152 waits one wave behind it — it is never relaunched here.
+    expect(launched).toEqual([]);
+    const intent = intentOf(fs);
+    expect(intent.taskIds).toEqual(["bd-150"]);
+    expect(intent.run?.stopped?.map((entry) => entry.taskId)).toEqual(["bd-150"]);
+    expect(intent.deferred).toEqual([
+      expect.objectContaining({ taskId: "bd-152", reason: "dependency" }),
+    ]);
+    // The regression this guards: without `memberIds`, bd-150 reads as an outsider
+    // and the sibling is deferred as an `external-blocker`.
+    const details = (intent.deferred ?? []).map((entry) => entry.detail).join("\n");
+    expect(details).not.toContain("outside this fleet");
+    expect(result.text).not.toContain("not part of this fleet");
+    expect(result.text).toContain("deferred bd-152 (dependency)");
   });
 
   it("audits a wave advance as `advance`, not as a fresh launch", async () => {

@@ -1134,6 +1134,10 @@ function planLaunchSchedule(options: {
   });
   const scheduled: FleetScheduleResult = planFleetSchedule({
     taskIds: options.taskIds,
+    // Members this fleet already owns (launched, or stopped by the run) are not on
+    // this worklist, but they are still the fleet's: an edge from one is a
+    // dependency on a sibling's landing, never an outsider blocking the wave.
+    memberIds: options.context.targetIntent?.taskIds ?? [],
     edges: options.dependencyGraph.edges,
     capacity: options.maxConcurrent,
     activeCount,

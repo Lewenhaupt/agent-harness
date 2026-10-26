@@ -71,6 +71,15 @@ export const FLEET_INTENT_SUMMARY_MAX = 8;
 const FleetIntentSchema = z.object({
   schemaVersion: z.literal(FLEET_SCHEMA_VERSION),
   fleetId: z.string(),
+  /**
+   * Members this fleet owns: launched and running, plus any the run stopped.
+   *
+   * A stopped member deliberately stays here. Its stop record (`run.stopped`)
+   * says why it needs a human; its worktree, branch, and bead are still live, so
+   * dropping it would erase the fleet's only handle on that work (and make a
+   * sibling's blocker look like a bead outside the fleet). Only a land or an
+   * explicit operator removal takes an id out.
+   */
   taskIds: z.array(z.string()).max(FLEET_INTENT_MEMBERS_MAX),
   createdAt: z.number().finite(),
   updatedAt: z.number().finite(),
@@ -80,11 +89,11 @@ const FleetIntentSchema = z.object({
    * Members P3 deferred to a later launch (P3 ordering/capacity).
    *
    * A deferred member is **not** launched, so it is deliberately absent from
-   * `taskIds`: the intent's member list stays "what is actually running". Each
-   * entry says why it waits. A launch that adds members unions its new plan with
-   * the entries it did not schedule, and a supervisor re-arm leaves the whole
-   * list untouched. P4's explicit advance step (`belayd_fleet_advance`) uses this
-   * list as its worklist.
+   * `taskIds` until it starts: each entry says why it waits. A launch that adds
+   * members unions its new plan with the entries it did not schedule, and a
+   * supervisor re-arm leaves the whole list untouched. P4's explicit advance step
+   * (`belayd_fleet_advance`) uses this list as its worklist. A member the run
+   * stopped is retired from it, so an advance cannot relaunch it.
    */
   deferred: z
     .array(

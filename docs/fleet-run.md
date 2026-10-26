@@ -86,7 +86,7 @@ Member bd-12 — active
 
 ```text
 belayd_fleet_pause { "reason": "stepping away" }   # stops the ticker at its next tick
-belayd_fleet_resume { }                            # restarts the same run
+belayd_fleet_resume { }                            # restarts a paused run's ticker
 ```
 
 A **paused** run is not finished: the ticker stops, the run record stays live, and
@@ -94,14 +94,27 @@ A **paused** run is not finished: the ticker stops, the run record stays live, a
 recorded (`haltedReason`), because both need a human:
 
 - `parked` — the root checkout could not be restored after a merge (reconcile,
-  then resume).
+  then re-arm).
 - `stalled` — `FLEET_RUN_MAX_IDLE_TICKS` ticks with no progress (240 at the 15 s
   interval). The run stops instead of spinning; the record names the members still
   in flight.
 
+A halt is terminal **for that run record**: `haltedReason` is never cleared, and
+both the ticker (`fleetTick`) and `resumeFleetRunLoop` only act on an active run
+(`isFleetRunActive` requires `haltedReason === undefined`). So `belayd_fleet_resume`
+restarts the ticker only for a *paused* run. After a `parked` halt it clears the
+pause and park flags (refusing while a recorded stash is still unrestored), but
+nothing ticks again because the run is no longer active; after a `stalled` halt no
+pause flag is set (a paused fleet halts as `paused` instead), so resume is an
+`alreadyResumed` no-op that changes nothing at all. Either way, continuing needs a
+re-arm — `/fleet <ids> --fleet <id>`
+(for a parked fleet, run `belayd_fleet_reconcile` first to unpark) — which
+preserves the members and starts a **new** run record in place of the halted one.
+
 Kill the loop without touching the fleet's flag by closing the supervisor session
 (`session_shutdown` clears the timer). The run record survives, and a later
-`/fleet <ids> --fleet <id>` re-arms and resumes it.
+`/fleet <ids> --fleet <id>` re-arms it: the members are preserved and the loop runs
+again.
 
 ### Recover after the supervisor dies
 
@@ -127,17 +140,39 @@ One action per tick, in this order (`src/fleet-run.ts`):
 | Order | Action | When |
 |---|---|---|
 | 0 | `halt` | the fleet is paused (`resume` restarts) or parked (needs a human) |
-| 1 | `land` | the first member whose workflow is complete (all phases done, or a completed final-phase run with no state file) |
+| 1 | `land` | the first landable member whose workflow is complete (all phases done, or a completed final-phase run with no state file), including one the run stopped earlier and whose retry finished |
 | 2 | `stop` | the first member that needs a human: `awaiting-human`, `phase-failed`, `phase-interrupted`, `state-corrupt`, or `orchestrator-missing` |
-| 3 | `advance` | nothing to land or stop and the deferred list is non-empty |
-| 4 | `complete` | no members and no deferred work (`partial` when something stopped) |
-| 5 | `wait` | members are working — unless the idle cap is reached, then `halt`/`stalled` |
+| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached, then `halt`/`stalled` |
+| 4 | `advance` | nothing is working and the deferred list is non-empty |
+| 5 | `complete` | nothing is working and no deferred work remains (`partial` when something stopped) |
 
 Landing first is deliberate: it frees a capacity slot and unblocks dependents in
 the same tick. Stopping second is the safety property: **a member that stopped is
 never relaunched by the loop.** A vanished orchestrator is reported for a human,
 not retried, because the retry is exactly what started a second orchestrator on
-one worktree before the lease existed.
+one worktree before the lease existed. Waiting third keeps the run alive while
+anything can still deliver work; `advance` and `complete` only run once nothing
+is working at all.
+
+A stop takes the member *out of the plan*, never out of the fleet: `taskIds` keeps
+it (its worktree, branch, and bead are still live), `run.stopped` says why it needs
+a human, and a later tick still lands it if its own retry finished the work. Only
+landing (and an explicit operator prune) removes a member. That is why a bead
+blocking a sibling stays a fleet dependency — `dependency`, not
+`external-blocker` — instead of being reclassified as an outsider.
+
+**The landing window is the run's lifetime.** Because a finished or halted run is
+not ticked again, the tick keeps the run open (a `wait`) while a stopped member's
+retry is observably alive: a live orchestrator lease for a `running` member, or
+the start grace for a member that has not written state yet. Nothing else keeps it
+open — a stopped member with no lease is only *described* as running by stale
+files, and waiting on it would hold the run and its capacity slots forever. The
+wait is also bounded by the idle cap, so a silent retry halts the run as `stalled`.
+A halt is not a *finish* (the record keeps the members and the stop reasons), but
+it does end the run's ticking, so the landing window is closed either way: to land
+a stopped member after a halt or a finish, re-arm the fleet (`/fleet <ids> --fleet
+<id>`, which starts a new run and keeps the members as the fleet's `taskIds`) or
+land the bead explicitly.
 
 ### The run record
 
@@ -277,9 +312,11 @@ for a human instead of silently relaunched.
 - **`accept` is the run's decision, not the merge engine's.** `belayd_fleet_merge`
   keeps "merging is not closing"; only a run with `accept: true` closes beads, and
   every close is audited.
-- **A stopped member is out of the member list.** `fleet.json` `taskIds` no longer
-  names it; `run.stopped` does, and `belayd_fleet_status` renders that line. Re-run
-  the bead with a new `/fleet` launch when you have fixed what stopped it.
+- **A stopped member stays a fleet member.** `fleet.json` `taskIds` still names it,
+  `run.stopped` carries its reason, and `belayd_fleet_status` renders both the
+  `stopped …` line and its live worktree. Its deferred plan entry is retired, so an
+  advance never relaunches it; fix the cause and the loop lands it if its own retry
+  already finished the work.
 
 ## How to Verify
 

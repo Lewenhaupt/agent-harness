@@ -119,7 +119,7 @@ the graph cannot be read (no bd, timeout, non-JSON), the launch still runs in
   crash, using the process table rather than an assumption.
 - **Deferred** — everything else is deferred, never dropped: ready-but-no-slot
   members are `capacity`, later-wave members are `dependency`, and members
-  blocked by a bead outside this launch are `external-blocker`. Each one is
+  blocked by a bead outside this fleet are `external-blocker`. Each one is
   listed in the report, audited (`member-deferred` / `capacity-blocked`), and
   recorded in `fleet.json` `deferred` with its reason. A launch (or advance) that
   starts nothing because every slot is busy is a **success** (exit 0): the plan
@@ -146,7 +146,7 @@ Fleet `default`: 1/2 member(s) launched (maxConcurrent 3).
 Scheduling: 1 member(s) now, 1 deferred (capacity 3, 2 already active, 1 free slot(s)).
 - wave 0 (now): bd-12
 - wave 1 (later launch): bd-15
-- deferred bd-15 (dependency): wave 1: waits for bd-12 to land (launched by a later fleet launch or by belayd_fleet_advance)
+- deferred bd-15 (dependency): wave 1: waits for bd-12 to land (this wave starts when that member lands and belayd_fleet_advance re-plans it)
 - bd-12: launched (feature) — worktree `feat/bd-12`, orchestrator session <id>
 Later waves are a plan: this call launches only wave 0 up to capacity. A run (untilComplete, the default) starts the rest as members land; with --manual advance explicitly with belayd_fleet_advance.
 …

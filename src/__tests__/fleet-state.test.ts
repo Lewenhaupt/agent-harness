@@ -46,8 +46,10 @@ import {
   isLockExpired,
   parseFleetMergeQueue,
   parseFleetNote,
+  pruneLandedFleetMember,
   readFleetIntent,
   readFleetMergeQueue,
+  retireFleetDeferral,
   updateFleetIntent,
   updateFleetMergeQueue,
   withoutPauseFields,
@@ -423,6 +425,42 @@ describe("fleet.json intent", () => {
     expect(updated).toHaveProperty("reason", "conflict");
     // Compare-and-replace: the concurrent write is not clobbered.
     expect(JSON.parse(fs.files.get(path) ?? "{}")).toEqual(base);
+  });
+
+  it("prunes a landed member from both the member list and the deferred plan", () => {
+    const intent = createFleetIntent({
+      fleetId,
+      taskIds: ["bd-12", "bd-15"],
+      now: 1_000,
+      deferred: [{ taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" }],
+    });
+
+    const pruned = pruneLandedFleetMember(intent, "bd-12", 2_000);
+    expect(pruned.taskIds).toEqual(["bd-15"]);
+    expect(pruned.deferred).toEqual([
+      { taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" },
+    ]);
+    expect(pruned.updatedAt).toBe(2_000);
+  });
+
+  it("retires a stopped member's deferral without forgetting the member", () => {
+    const intent = createFleetIntent({
+      fleetId,
+      taskIds: ["bd-12", "bd-15"],
+      now: 1_000,
+      deferred: [
+        { taskId: "bd-12", reason: "capacity", detail: "no slot" },
+        { taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" },
+      ],
+    });
+
+    const retired = retireFleetDeferral(intent, "bd-12", 2_000);
+    // The worktree, branch, and bead are still live: only the plan entry goes.
+    expect(retired.taskIds).toEqual(["bd-12", "bd-15"]);
+    expect(retired.deferred).toEqual([
+      { taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" },
+    ]);
+    expect(retired.updatedAt).toBe(2_000);
   });
 });
 

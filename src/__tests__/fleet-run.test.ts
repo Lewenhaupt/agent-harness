@@ -167,6 +167,17 @@ function observation(
   return { taskId, progress, claim, ...(launchedAt === undefined ? {} : { launchedAt }) };
 }
 
+/** A single-member run that already stopped its member for a failed phase. */
+function stopRun(options: { taskId: string }): FleetRun {
+  return recordRunMemberStopped({
+    run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: options.taskId }] }),
+    taskId: options.taskId,
+    reason: "phase-failed",
+    detail: "gate failed",
+    now: 2_000,
+  });
+}
+
 describe("planFleetTick", () => {
   it("halts a paused or parked fleet instead of starting work", () => {
     expect(
@@ -312,6 +323,124 @@ describe("planFleetTick", () => {
     });
     expect(action).toEqual({ kind: "land", taskId: "bd-15" });
   });
+
+  it("lands a stopped member whose own retry finished the work", () => {
+    const run0 = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "phase-failed",
+      detail: "gate failed",
+      now: 2_000,
+    });
+    // The member stayed in the fleet after the stop, so the loop still observes it
+    // and must land the work its retry finished instead of stranding the branch.
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: run0 }),
+      observations: [observation("bd-12", { kind: "complete" })],
+      now: 5_000,
+    });
+    expect(action).toEqual({ kind: "land", taskId: "bd-12" });
+  });
+
+  it("never retries a member stopped by a land attempt", () => {
+    const run0 = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail: "rebase conflict",
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: run0 }),
+      observations: [observation("bd-12", { kind: "complete" })],
+      now: 5_000,
+    });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+  });
+
+  it("does not land a member the run already landed", () => {
+    const landed = recordRunMemberLanded({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: landed }),
+      observations: [observation("bd-12", { kind: "complete" })],
+      now: 5_000,
+    });
+    expect(action.kind).not.toBe("land");
+  });
+
+  it("keeps the run open while a stopped member's retry is alive (single-member fleet)", () => {
+    // The stop tick must not be the run's last tick: the retry may still deliver
+    // work, and a finished run can never be resumed.
+    const stopped = stopRun({ taskId: "bd-12" });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      now: 5_000,
+    });
+    expect(action).toMatchObject({ kind: "wait" });
+  });
+
+  it("completes partial once a stopped member's retry has no live lease", () => {
+    // The phase files may still say `running`; without a lease nothing is running
+    // the work, and waiting would hold the run and its capacity slots forever.
+    const stopped = stopRun({ taskId: "bd-12" });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "absent")],
+      now: 5_000,
+    });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+  });
+
+  it("bounds the wait for a stopped retry with the idle cap", () => {
+    const stopped = stopRun({ taskId: "bd-12" });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+    });
+    expect(action).toMatchObject({ kind: "halt", reason: "stalled" });
+  });
+
+  it("never waits on a stopped member a land attempt gave up on", () => {
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail: "rebase conflict",
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      now: 5_000,
+    });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+  });
+
+  it("lands a stopped retry that finished, then completes the run", () => {
+    const stopped = stopRun({ taskId: "bd-12" });
+    const land = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [observation("bd-12", { kind: "complete" })],
+      now: 5_000,
+    });
+    expect(land).toEqual({ kind: "land", taskId: "bd-12" });
+
+    // What the landing tick does: merge, prune the member, record the landing.
+    const landed = recordRunMemberLanded({ run: stopped, taskId: "bd-12", now: 6_000 });
+    const after = planFleetTick({
+      intent: intent({ taskIds: [], run: landed }),
+      observations: [],
+      now: 7_000,
+    });
+    expect(after).toMatchObject({ kind: "complete", outcome: "complete" });
+  });
 });
 
 describe("run record", () => {
@@ -353,6 +482,19 @@ describe("run record", () => {
     const twice = recordRunMemberLanded({ run: once, taskId: "bd-12", now: 3_000 });
     expect(twice.members).toHaveLength(1);
     expect(twice.members?.[0]?.landedAt).toBe(3_000);
+  });
+
+  it("clears a stop record once the member lands", () => {
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "phase-failed",
+      detail: "gate failed",
+      now: 2_000,
+    });
+    const landed = recordRunMemberLanded({ run: stopped, taskId: "bd-12", now: 3_000 });
+    expect(landed.stopped).toEqual([]);
+    expect(landed.members?.[0]).toMatchObject({ taskId: "bd-12", landedAt: 3_000 });
   });
 
   it("counts ticks and resets the idle counter on progress", () => {
