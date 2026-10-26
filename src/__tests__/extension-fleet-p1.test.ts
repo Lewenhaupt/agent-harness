@@ -28,6 +28,7 @@ import type { HandoffPacket } from "../handoff.js";
 import {
   buildFleetNote,
   COMMENT_EXCERPT_MAX_CHARS,
+  createFleetMergeQueue,
   drainNotes,
   enqueueNote,
   FLEET_NOTE_BODY_MAX_LENGTH,
@@ -36,6 +37,7 @@ import {
   fleetNoteFileName,
   formatFleetRefusal,
   readFleetIntent,
+  writeFleetMergeQueue,
 } from "../index.js";
 import { RunStatus, writeRunManifest } from "../run-manifest.js";
 import { writeWorkflowState } from "../workflow-state.js";
@@ -292,6 +294,49 @@ function makeCtx(dir: string, sessionId: string) {
 // Notifications are asserted per test; the mock pi and the ctx both expose the
 // same sink so a refusal can be checked from either side.
 let ctxNotifications: Array<{ message: string; level: string }> = [];
+
+/**
+ * Write a member's workflow snapshot, with a failed run for the pending phase.
+ *
+ * Matches the tick's own reading: a pending phase whose newest run failed is
+ * `phase-failed`, and a workflow whose phases are all complete is `complete`.
+ */
+function writeMemberState(options: { cwd: string; completedPhaseNames: readonly string[] }): void {
+  const phaseOrder = ["plan", "implement"];
+  const pending =
+    phaseOrder.find((phase) => !options.completedPhaseNames.includes(phase)) ?? "commit";
+  const state = writeWorkflowState({
+    cwd: options.cwd,
+    state: {
+      schemaVersion: 1,
+      taskId: "bd-12",
+      workflowType: "feature",
+      resolutionSource: "default",
+      branch: "feat/bd-12",
+      originalCwd: options.cwd,
+      phaseOrder,
+      completedPhaseNames: [...options.completedPhaseNames],
+      startedAt: 1,
+      updatedAt: 1,
+    },
+  });
+  if (!state.ok) throw new Error(`could not write workflow state: ${state.error}`);
+  const manifest = writeRunManifest({
+    cwd: options.cwd,
+    manifest: {
+      schemaVersion: 1,
+      runId: `run-${pending}`,
+      taskId: "bd-12",
+      phase: pending,
+      sessionName: `belayd-bd-12-${pending}`,
+      status: RunStatus.Failed,
+      startedAt: 2,
+      completedAt: 3,
+      failureReason: "gate failed",
+    },
+  });
+  if (!manifest.ok) throw new Error(`could not write run manifest: ${manifest.error}`);
+}
 
 describe("fleet supervisor mode", () => {
   let cwd: string;
@@ -1940,6 +1985,113 @@ describe("fleet run mode", () => {
     // The supervisor beat is what lets a later session tell a dead run-mode
     // supervisor from a live one (the recorded pid is the shared daemon).
     expect(existsSync(join(commonDir, "belayd", "fleet", "default", "supervisor.json"))).toBe(true);
+  });
+
+  it("keeps a stopped member in the fleet, and still lands it once its retry finishes", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // The member's own run failed: the first tick stops it for a human. The state
+    // is written after the launch, because a worktree that already holds workflow
+    // state is refused as a second orchestrator.
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan"] });
+    await vi.advanceTimersByTimeAsync(1);
+
+    const stopped = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(stopped).toHaveProperty("ok", true);
+    if (!stopped.ok) return;
+    // A stop reports the session; it never erases membership (bd-156).
+    expect(stopped.intent?.taskIds).toEqual(["bd-12"]);
+    expect(stopped.intent?.deferred ?? []).toEqual([]);
+    expect(stopped.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "phase-failed" }),
+    ]);
+
+    // The member's own retry finished: the run must still land it, even though it
+    // is stopped, and a refused land must keep the membership too.
+    writeMemberState({
+      cwd: memberDir,
+      completedPhaseNames: ["plan", "implement"],
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "could not land bd-12",
+    );
+    const afterLandAttempt = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(afterLandAttempt).toHaveProperty("ok", true);
+    if (!afterLandAttempt.ok) return;
+    expect(afterLandAttempt.intent?.taskIds).toEqual(["bd-12"]);
+    expect(afterLandAttempt.intent?.run?.stopped?.map((entry) => entry.reason)).toEqual([
+      "land-failed",
+    ]);
+  });
+
+  it("lands a stopped member once its retry finished and the merge went through", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan"] });
+    await vi.advanceTimersByTimeAsync(1);
+    const stopped = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(stopped).toHaveProperty("ok", true);
+    if (!stopped.ok) return;
+    expect(stopped.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "phase-failed" }),
+    ]);
+
+    // The retry finished and the work is on the base branch: the queue says
+    // `merged`, so the landing tick must prune the member rather than skip it
+    // because it is stopped.
+    const queue = createFleetMergeQueue(1);
+    const written = writeFleetMergeQueue({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      queue: {
+        ...queue,
+        entries: [
+          {
+            taskId: "bd-12",
+            branch: "feat/bd-12",
+            requestedAt: 1,
+            state: "merged",
+            attempts: 1,
+            updatedAt: 2,
+          },
+        ],
+      },
+    });
+    expect(written).toEqual({ ok: true });
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const afterLand = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(afterLand).toHaveProperty("ok", true);
+    if (!afterLand.ok) return;
+    // Landing is the one automatic path that prunes: the member leaves taskIds
+    // and the run records when it landed.
+    expect(afterLand.intent?.taskIds).toEqual([]);
+    expect(afterLand.intent?.run?.members?.[0]).toMatchObject({
+      taskId: "bd-12",
+      landedAt: expect.any(Number),
+    });
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "could not land bd-12",
+    );
   });
 
   it("leaves beads for the human with --no-accept", async () => {

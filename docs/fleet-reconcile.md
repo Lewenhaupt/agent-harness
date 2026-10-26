@@ -11,10 +11,10 @@ reconcile are tool calls you make, and each decision is appended to
 
 The one background loop in the fleet family is the **run ticker** (bd-126 P5,
 `docs/fleet-run.md`): it is started by `/fleet` unless `--manual` is passed, it
-stops on `belayd_fleet_pause`, and it restarts on `belayd_fleet_resume` or a
-re-arm. It acts only through the same engines these tools use, and every action is
-audited (`fleet-landed`, `fleet-run-stopped`, `fleet-run-halted`,
-`fleet-run-complete`).
+stops on `belayd_fleet_pause`, and it restarts on `belayd_fleet_resume` (a paused
+run) or a re-arm (after a halt or a supervisor restart). It acts only through the
+same engines these tools use, and every action is audited (`fleet-landed`,
+`fleet-run-stopped`, `fleet-run-halted`, `fleet-run-complete`).
 
 ## Contents
 

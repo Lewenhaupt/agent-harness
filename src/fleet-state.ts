@@ -406,6 +406,42 @@ export function fleetMemberTaskIds(intent: FleetIntent): readonly string[] {
   return [...intent.taskIds, ...deferred.filter((taskId) => !intent.taskIds.includes(taskId))];
 }
 
+/**
+ * Drop a **landed** member: out of the member list and out of the deferred plan.
+ *
+ * Only landing (or an explicit operator removal) may take a member out of
+ * `taskIds`: a member that stopped but did not land still has a worktree, a
+ * branch, and a bead, and dropping its id is what made a sibling's blocker read as
+ * a bead outside the fleet.
+ */
+export function pruneLandedFleetMember(
+  intent: FleetIntent,
+  taskId: string,
+  now: number,
+): FleetIntent {
+  return {
+    ...intent,
+    taskIds: intent.taskIds.filter((candidate) => candidate !== taskId),
+    deferred: (intent.deferred ?? []).filter((entry) => entry.taskId !== taskId),
+    updatedAt: now,
+  };
+}
+
+/**
+ * Retire a stopped member's deferral entry while keeping its membership.
+ *
+ * A stop is not a landing, so the member stays in `taskIds` with its stop record
+ * on the run (status, reconcile, and a later land all read it there). The plan
+ * entry goes so a later advance cannot relaunch a member the run gave up on.
+ */
+export function retireFleetDeferral(intent: FleetIntent, taskId: string, now: number): FleetIntent {
+  return {
+    ...intent,
+    deferred: (intent.deferred ?? []).filter((entry) => entry.taskId !== taskId),
+    updatedAt: now,
+  };
+}
+
 // ── audit.log ─────────────────────────────────────────────────────────
 
 /** Characters of `detail` kept in one audit line. */

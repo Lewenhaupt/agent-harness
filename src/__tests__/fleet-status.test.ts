@@ -10,6 +10,7 @@
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import {
   applyFleetBeadLookup,
   buildFleetStatus,
@@ -411,6 +412,29 @@ describe("buildFleetStatus", () => {
       members: [sampleMember({ worktreePath: "/repo", isMainWorktree: true, branch: "main" })],
     });
     expect(inPlace.members).toHaveLength(1);
+  });
+
+  it("renders a stopped member with its stop reason and its live worktree", () => {
+    const run = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "phase-failed",
+      detail: "phase test failed: gate failed",
+      now: 2_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12", "bd-15"], run }),
+      members: [sampleMember()],
+    });
+
+    const text = formatFleetStatus(status);
+    // The stop is a report about the session, not a removal: the member is still
+    // in the intent and still observed in its worktree.
+    expect(text).toContain("intent: bd-12, bd-15");
+    expect(text).toContain("stopped bd-12 (phase-failed): phase test failed: gate failed");
+    expect(text).toContain("Member bd-12");
+    expect(text).toContain("worktree: /repo.feat-bd-12");
   });
 
   it("renders persisted deferrals so a waiting member is never invisible (W3)", () => {

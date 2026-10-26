@@ -334,6 +334,66 @@ function isStopped(run: FleetRun | undefined, taskId: string): boolean {
 }
 
 /**
+ * Stop reasons this loop recorded *because* it tried to land the member.
+ *
+ * Every other reason (a failed phase, a missing orchestrator) is a report about
+ * the member's session, not about its work: the branch may still finish on a
+ * retry, and the run must land that. A member stopped by a land attempt must not
+ * be retried, because the next attempt would burn the same gates on the same
+ * conflict.
+ *
+ * `accept-failed` is defense for legacy records only: the current flow records it
+ * *after* pruning the landed member, so a scannable member never carries it.
+ */
+const LAND_ATTEMPT_STOP_REASONS: readonly FleetRunStopReason[] = ["land-failed", "accept-failed"];
+
+/** Whether this run may still land the member (not already landed, no failed land attempt). */
+function canLandMember(run: FleetRun | undefined, taskId: string): boolean {
+  const member = (run?.members ?? []).find((entry) => entry.taskId === taskId);
+  if (member?.landedAt !== undefined) return false;
+  const stop = (run?.stopped ?? []).find((entry) => entry.taskId === taskId);
+  return stop === undefined || !LAND_ATTEMPT_STOP_REASONS.includes(stop.reason);
+}
+
+/**
+ * Stopped members whose own retry is observably alive.
+ *
+ * The run stays open for them because landing is only possible while the run is
+ * live: a finished run cannot be resumed, and a stopped member cannot be launched
+ * again through the fleet. The evidence is the orchestrator lease, not the phase
+ * files: a stale `running` snapshot whose lease is gone would otherwise keep the
+ * run — and the cross-fleet capacity slots it holds — open forever.
+ */
+function stoppedMembersRetrying(
+  intent: FleetIntent,
+  byTask: ReadonlyMap<string, FleetMemberObservation>,
+): readonly string[] {
+  return (intent.run?.stopped ?? [])
+    .map((entry) => entry.taskId)
+    .filter(
+      (taskId) =>
+        intent.taskIds.includes(taskId) &&
+        canLandMember(intent.run, taskId) &&
+        retryIsAlive(byTask.get(taskId)),
+    );
+}
+
+/** Whether a stopped member's observation proves its retry is still working. */
+function retryIsAlive(observation: FleetMemberObservation | undefined): boolean {
+  if (observation === undefined) return false;
+  switch (observation.progress.kind) {
+    case "starting":
+      // The start grace already bounds this: it only holds just after a launch.
+      return true;
+    case "running":
+      // Without a live lease nothing is running the work, only writing files about it.
+      return observation.claim === "live";
+    default:
+      return false;
+  }
+}
+
+/**
  * Decide the single next action of a run.
  *
  * Order is the whole contract: **land** a finished member first (it frees a slot
@@ -348,14 +408,26 @@ export function planFleetTick(options: PlanFleetTickOptions): FleetTickAction {
   const byTask = new Map(options.observations.map((entry) => [entry.taskId, entry]));
   const members = options.intent.taskIds.filter((taskId) => !isStopped(options.intent.run, taskId));
 
-  // Land first: a finished member frees a slot and unblocks its dependents.
-  const finished = members.find((taskId) => byTask.get(taskId)?.progress.kind === "complete");
+  // Land first: a finished member frees a slot and unblocks its dependents. A
+  // member the run *stopped* is still landable — a stop reports its session, and
+  // its orchestrator can finish on a retry — which is why this scans every member
+  // instead of only the ones still running.
+  const finished = options.intent.taskIds.find(
+    (taskId) =>
+      canLandMember(options.intent.run, taskId) && byTask.get(taskId)?.progress.kind === "complete",
+  );
   if (finished !== undefined) return { kind: "land", taskId: finished };
 
   const stop = firstStop(options, members, byTask);
   if (stop !== undefined) return stop;
 
   if (members.length > 0) return idleOrWait(options, members);
+
+  // Nothing healthy is left, but a stopped member's retry may still deliver work
+  // the run is the only thing that can land. Waiting is bounded twice: by the
+  // lease evidence above and by the idle cap in `idleOrWait`.
+  const retrying = stoppedMembersRetrying(options.intent, byTask);
+  if (retrying.length > 0) return idleOrWait(options, retrying);
   return completionAction(options.intent);
 }
 
@@ -412,7 +484,7 @@ function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): 
       detail: `no member progressed for ${maxIdle} ticks; ${members.join(", ")} still in flight`,
     };
   }
-  return { kind: "wait", detail: `${members.length} member(s) in flight` };
+  return { kind: "wait", detail: `${members.length} member(s) in flight: ${members.join(", ")}` };
 }
 
 /**
@@ -552,6 +624,9 @@ export function recordRunMemberLanded(options: {
     ...options.run,
     updatedAt: options.now,
     members: [...members.filter((member) => member.taskId !== options.taskId), next],
+    // A member that landed no longer needs a human, so a stop it carried while its
+    // retry finished must not survive into the run's outcome.
+    stopped: (options.run.stopped ?? []).filter((entry) => entry.taskId !== options.taskId),
   };
 }
 

@@ -17,12 +17,14 @@ import {
 
 function scheduleOrFail(input: {
   taskIds: readonly string[];
+  memberIds?: readonly string[];
   edges?: readonly FleetDependencyEdge[];
   capacity?: number;
   activeCount?: number;
 }): FleetSchedule {
   const result = planFleetSchedule({
     taskIds: input.taskIds,
+    ...(input.memberIds === undefined ? {} : { memberIds: input.memberIds }),
     edges: input.edges ?? [],
     capacity: input.capacity ?? 3,
     activeCount: input.activeCount ?? 0,
@@ -96,8 +98,8 @@ describe("planFleetSchedule: order, waves, capacity", () => {
         wave: 1,
         blockers: ["bd-12"],
         detail:
-          "wave 1: waits for bd-12 to land (launched by a later fleet launch or by " +
-          "belayd_fleet_advance)",
+          "wave 1: waits for bd-12 to land (this wave starts when that member lands and " +
+          "belayd_fleet_advance re-plans it)",
       },
     ]);
   });
@@ -114,7 +116,7 @@ describe("planFleetSchedule: order, waves, capacity", () => {
     expect(schedule.launchNow).toEqual(["bd-12"]);
   });
 
-  it("defers a member whose blocker is outside this launch", () => {
+  it("defers a member whose blocker is outside this fleet", () => {
     const schedule = scheduleOrFail({
       taskIds: ["bd-12", "bd-15"],
       edges: [{ blocker: "bd-9", blocked: "bd-15" }],
@@ -127,14 +129,53 @@ describe("planFleetSchedule: order, waves, capacity", () => {
         reason: "external-blocker",
         blockers: ["bd-9"],
         detail:
-          "blocked by bd-9, which is not part of this launch; it cannot be planned for any wave " +
+          "blocked by bd-9, which is not part of this fleet; it cannot be planned for any wave " +
           "until that bead lands",
       },
     ]);
-    expect(schedule.reasons.join("\n")).toContain("blocked by a bead outside this launch");
+    expect(schedule.reasons.join("\n")).toContain("blocked by a bead outside this fleet");
   });
 
-  it("propagates an external blocker through in-set edges", () => {
+  it("treats a blocker the fleet already owns as an internal dependency, never an outsider", () => {
+    // bd-150 is a stopped member of this fleet: not on the advance worklist, but
+    // its bead still blocks bd-152, so bd-152 waits a wave instead of being called
+    // blocked by a bead "outside this fleet".
+    const schedule = scheduleOrFail({
+      taskIds: ["bd-152"],
+      memberIds: ["bd-150", "bd-151"],
+      edges: [{ blocker: "bd-150", blocked: "bd-152" }],
+    });
+    expect(schedule.waves).toEqual([
+      { index: 0, taskIds: [] },
+      { index: 1, taskIds: ["bd-152"] },
+    ]);
+    expect(schedule.launchNow).toEqual([]);
+    expect(schedule.deferred.map((entry) => [entry.taskId, entry.reason])).toEqual([
+      ["bd-152", "dependency"],
+    ]);
+    expect(schedule.deferred[0]?.wave).toBe(1);
+    expect(schedule.deferred[0]?.blockers).toEqual(["bd-150"]);
+    expect(schedule.reasons.join("\n")).not.toContain("outside this fleet");
+  });
+
+  it("plans a member blocked by a fleet member after an already-planned wave", () => {
+    const schedule = scheduleOrFail({
+      taskIds: ["bd-12", "bd-19"],
+      memberIds: ["bd-9"],
+      edges: [
+        { blocker: "bd-9", blocked: "bd-12" },
+        { blocker: "bd-12", blocked: "bd-19" },
+      ],
+    });
+    expect(schedule.waves).toEqual([
+      { index: 0, taskIds: [] },
+      { index: 1, taskIds: ["bd-12"] },
+      { index: 2, taskIds: ["bd-19"] },
+    ]);
+    expect(schedule.deferred.every((entry) => entry.reason === "dependency")).toBe(true);
+  });
+
+  it("propagates an external blocker through in-fleet edges", () => {
     const schedule = scheduleOrFail({
       taskIds: ["bd-12", "bd-15"],
       edges: [

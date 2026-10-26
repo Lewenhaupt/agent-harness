@@ -235,6 +235,7 @@ import {
   phaseCommentBody,
   planFleetAdvance,
   planFleetTick,
+  pruneLandedFleetMember,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
   RunStatus,
@@ -271,6 +272,7 @@ import {
   resolveWorkflowSelection,
   resolveWorktreePath,
   resumeFleet,
+  retireFleetDeferral,
   runArchify,
   runArchifyText,
   runFleetLaunch as runFleetLaunchEngine,
@@ -6902,7 +6904,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
   }
 
-  /** Close or remove a landed member from the fleet's member list. */
+  /**
+   * Drop a landed member from the fleet's member list and its deferred plan.
+   *
+   * Landing is the one automatic path allowed to forget a member: its branch is on
+   * the base branch, so nothing is left to observe or land. A stop keeps the member
+   * (see {@link retireDeferredMember}): its worktree and bead are still live.
+   */
   function pruneLandedMember(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
@@ -6912,12 +6920,28 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     return mutateFleetIntent({
       gitCommonDir: options.mode.gitCommonDir,
       fleetId: options.mode.fleetId,
-      mutate: (intent) => ({
-        ...intent,
-        taskIds: intent.taskIds.filter((taskId) => taskId !== options.taskId),
-        deferred: (intent.deferred ?? []).filter((entry) => entry.taskId !== options.taskId),
-        updatedAt: options.now,
-      }),
+      mutate: (intent) => pruneLandedFleetMember(intent, options.taskId, options.now),
+    });
+  }
+
+  /**
+   * Retire a stopped member's deferral entry, keeping it a fleet member.
+   *
+   * The member must stay in `taskIds`: its worktree, branch, and bead still exist,
+   * `run.stopped` explains why it needs a human, and the loop still lands it if its
+   * own retry finished the work. Only the plan entry goes, so an advance cannot
+   * relaunch a member the run gave up on.
+   */
+  function retireDeferredMember(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+  }): { ok: true } | { ok: false; error: string } {
+    return mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (intent) => retireFleetDeferral(intent, options.taskId, options.now),
     });
   }
 
@@ -7123,8 +7147,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       return { run: landed.run, lines: landed.lines, stop: false, acted: true };
     }
     // A merge or gate refusal is not retried: the next tick would re-run the same
-    // minutes of gating against the same failure. The member is stopped for a human.
-    const pruned = pruneLandedMember({
+    // minutes of gating against the same failure. The member is stopped for a human
+    // but stays a member — its worktree, branch, and bead are all still there, and
+    // dropping it is what made a sibling's blocker look like an outsider.
+    const retired = retireDeferredMember({
       ctx: options.ctx,
       mode: options.mode,
       taskId: action.taskId,
@@ -7141,7 +7167,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       }),
       lines: [
         `Fleet ${fleetId}: could not land ${action.taskId}: ${landed.error}`,
-        ...(pruned.ok ? [] : [`Fleet ${fleetId}: ${pruned.error}`]),
+        ...(retired.ok ? [] : [`Fleet ${fleetId}: ${retired.error}`]),
       ],
       stop: false,
       acted: true,
@@ -7153,7 +7179,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     action: Extract<FleetTickAction, { kind: "stop" }>,
   ): FleetTickOutcome {
     const { ctx, mode, now } = options;
-    const pruned = pruneLandedMember({ ctx, mode, taskId: action.taskId, now });
+    // A stop never prunes: the member keeps its worktree, branch, and bead, so the
+    // registry must keep it for status, reconcile, and a later land. Only the plan
+    // entry is retired, so an advance cannot relaunch it.
+    const retired = retireDeferredMember({ ctx, mode, taskId: action.taskId, now });
     auditFleetAction({
       ctx,
       gitCommonDir: mode.gitCommonDir,
@@ -7172,7 +7201,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       }),
       lines: [
         `Fleet ${mode.fleetId}: stopped ${action.taskId} (${action.reason}): ${action.detail}`,
-        ...(pruned.ok ? [] : [`Fleet ${mode.fleetId}: ${pruned.error}`]),
+        ...(retired.ok ? [] : [`Fleet ${mode.fleetId}: ${retired.error}`]),
       ],
       stop: false,
       acted: true,

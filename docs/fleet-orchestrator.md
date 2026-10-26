@@ -667,10 +667,13 @@ without git, bd, or a filesystem.
   remaining blocker; a member's wave is one past the deepest blocker it waits
   for. Inside one wave, caller order is the deterministic tie-break, so the same
   request (in any edge order) produces the same plan.
-- **External blockers are deferred, not invented.** A bead outside the launch
-  that still blocks a member means that member cannot be planned for any wave
-  yet (`external-blocker`); the same applies transitively to members waiting for
-  it (`dependency`). Once the outside bead lands, a later launch schedules it.
+- **External blockers are deferred, not invented.** A bead *outside the fleet*
+  that still blocks a member means that member cannot be planned for any wave yet
+  (`external-blocker`); the same applies transitively to members waiting for it
+  (`dependency`). A blocker that belongs to the fleet — an already-launched or
+  stopped member — is not external: its dependents are planned for a later wave
+  (`dependency`) and become eligible when that member lands. Once the outside bead
+  lands, a later launch (or advance) schedules the waiting members.
 - **Unreadable graphs degrade.** bd absent, failing, timing out, or printing
   non-JSON yields "no known edges" plus a warning — never a crash and never a
   fabricated edge. The members still launch (in caller order), without ordering.
@@ -723,7 +726,10 @@ orchestrator is a session inside the daemon and never appears in the process tab
 precondition — while `unknown` liveness (unreadable `/proc`, unreadable lease) is
 never treated as gone. The conservative sum then simply has fewer members — no
 liveness heuristic is wired into the launch path itself. A run also narrows the
-count the honest way: landing a member prunes it.
+count the honest way: landing a member prunes it. A **stopped** member keeps
+counting (bd-156: its worktree, branch, and bead are still live), and a member
+whose retry session is alive is never prunable, so a fleet whose members all stop
+can hold the ceiling until those retries end, land, or the sessions are gone.
 
 ### What is deferred vs automatic
 
