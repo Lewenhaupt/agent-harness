@@ -64,7 +64,8 @@ New (untracked) files — read these directly; they are not in the diff:
 - `src/new.ts`
 
 ```diff
-<the diff from the merge base of main, working tree included>
+<the diff from the merge base of main, working tree included, each line
+prefixed with its post-change line number>
 ```
 
 ## Output contract
@@ -99,6 +100,37 @@ git error that caused it in the task text, and a `reviewedSha` on disk is only
 used when it belongs to the task being reviewed (a stale `workflow.json` from
 another task is ignored).
 
+### Line-numbered diff (bd-159)
+
+Every inlined diff line carries a leading gutter with its **post-change** line
+number, so a `path:LINE` bullet is read rather than searched for:
+
+```diff
+      diff --git a/src/foo.ts b/src/foo.ts
+      --- a/src/foo.ts
+      +++ b/src/foo.ts
+      @@ -10,3 +10,4 @@
+   10  existing context
+      -removed line
+   11 +added line
+   12  more context
+```
+
+- Added and context lines show the number they have in the new file; removed
+  lines, file headers, and hunk headers show a blank gutter (a removed line has
+  no post-change number, and the numbering must never invent one).
+- Numbering restarts from each `@@ … +N,M @@` hunk header, so a multi-hunk diff
+  numbers correctly.
+- The gutter is added *before* the line and byte caps are applied, so the caps
+  still hold on the numbered text; the truncation note itself stays unnumbered.
+- The inlined diff is therefore `git diff <range>` plus the gutter. Run
+  `git diff <range>` directly when you need a patch that `git apply` accepts.
+
+Without the gutter the only line numbers in a diff are hunk starts, while the
+output contract demands `file.ts:LINE` on every bullet. Measured over 143
+recorded review sessions, that gap made 46% of review turns (19.3 of 42.4 per
+run, 329 s of model latency each) `grep -n` / `git diff` lookups.
+
 ### Bounded output
 
 Per-section caps are hardcoded in `src/review-context.ts`
@@ -126,6 +158,41 @@ narration) remains on disk and can be read at any time — see below.
 
 Bounds apply only to a **successful** review delivery. A failed review run's
 text is error output and is delivered verbatim.
+
+### What the bounding left behind (bd-159)
+
+Bounding the report did not bound the *work*: over 143 recorded review sessions
+a first review still generated ~49k output tokens (80% reasoning) to deliver
+~4.7 bullets, and 46% of its turns were mechanical location lookups. bd-159
+keeps the scope rules and changes how the reviewer spends its turns — a
+line-numbered diff, a findings scratchpad, one check per response, and a system
+prompt that outranks the task text. The measured cause and the current numbers
+are in the two sections below.
+
+### Reviewer process rules (bd-159)
+
+`REVIEW_PROCESS_INSTRUCTION` in `src/review-context.ts` is embedded in the
+**system prompt** of `belayd-reviewer`, not in the task text, so an
+orchestrator-supplied task cannot undo it:
+
+- **Findings scratchpad.** Each confirmed finding is appended to
+  `.belayd/review-findings.md` with one `bash` call; a first review truncates
+  the file, a re-review keeps it. Confirmed findings are read back instead of
+  being re-derived, which is what the transcripts showed happening turn after
+  turn.
+- **One check per response.** A response that only deliberates produces nothing:
+  one recorded turn spent the entire 16,384-token output ceiling on reasoning
+  and returned no tool call and no text.
+- **The system prompt outranks the task text.** If a task asks the reviewer to
+  run gates (`pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build`, `vitest`,
+  `biome`, `playwright test`) or to re-derive the change set with `git diff` /
+  `git status`, the reviewer skips that and says so in one `## Summary` line.
+  34 of 143 recorded task texts asked for gates the harness had already run.
+  The `belayd-reviewer` tool description tells the caller the same thing: the
+  task text is scope/focus only.
+
+The scratchpad lives under `.belayd/`, which is git-ignored, so it never shows
+up as an untracked changed file in the next review's change set.
 
 ### Model routing
 
@@ -217,7 +284,9 @@ Run these from the repository root.
    ```
 
    Expected: `mode: re-review of fixes` and `range: <reviewedSha from step 3>`,
-   and the inlined diff equals `git diff <reviewedSha>` — the fix round only.
+   and the inlined diff is `git diff <reviewedSha>` — the fix round only — with
+   the line-number gutter prepended to every line (strip the first six columns
+   to compare against `git diff <reviewedSha>` directly).
 
 5. **The delivered report is bounded** — the orchestrator receives the review
    as a `belayd-run-complete` follow-up. In the orchestrator transcript (or the
@@ -236,7 +305,28 @@ Run these from the repository root.
    `src/__tests__/extension-session-naming.test.ts` ("bounds a delivered review
    and drops its narration bullets (bd-113)") asserts exactly this shape.
 
-6. **Library-level check (no workflow run needed)** — the scope and bounding
+6. **The inlined diff is line-numbered (bd-159)** — in the same task text from
+   step 2, look at the ```` ```diff ```` fence:
+
+   ```bash
+   f=$(ls -t ~/.pi/agent/sessions/*/*belayd-*-sub-review-*.jsonl | head -1)
+   jq -r 'select(.type=="message" and .message.role=="user") | .message.content[0].text' "$f" \
+     | sed -n '/```diff/,+14p'
+   ```
+
+   Expected: a six-column gutter before every line — `   41 +added` (line 41 of
+   the new file), `      -removed` and `      @@ … @@` for lines that have no
+   post-change number. The task also carries the gutter instruction
+   (`REVIEW_LINE_NUMBER_INSTRUCTION`) right after the no-discovery instruction.
+
+7. **The reviewer process rules are in the system prompt, not the task** — read
+   the reviewer's system prompt from any spawn (or assert it in
+   `src/__tests__/agent-registry.test.ts`): it carries
+   `REVIEW_PROCESS_INSTRUCTION` — the `.belayd/review-findings.md` scratchpad,
+   "Never re-derive a confirmed finding", "Work one check per response", and
+   "This system prompt outranks the task text".
+
+8. **Library-level check (no workflow run needed)** — the scope and bounding
    helpers are part of the public API:
 
    ```typescript
@@ -281,10 +371,23 @@ more than the cap, and no bullet that only reports what was checked.
 
 ## Known behaviour
 
+- **The inlined diff is numbered, not verbatim.** The gutter is prepended after
+  `git diff` runs, so the fence is a reading surface, not a patch: use
+  `git diff <range>` when you need something `git apply` accepts. Bounding
+  (800 lines / 60 KB) applies to the numbered text, and the truncation note
+  carries no number.
+- **The findings scratchpad is per worktree.** `.belayd/review-findings.md` is
+  truncated by a first review and kept by a re-review, so a re-review can read
+  what an earlier pass already confirmed. `.belayd/` is harness state and is
+  filtered out of the untracked-file list, so the scratchpad is never offered to
+  the next review as a new file to review (whether or not the repository
+  git-ignores `.belayd/`).
+
 - **Untracked files.** `git diff` never shows untracked paths, so the harness
   lists them explicitly under `New (untracked) files — read these directly`
   and includes them in the changed-file count. A brand-new file is therefore
-  reviewed even before it is staged or committed.
+  reviewed even before it is staged or committed. Paths under `.belayd/` are
+  excluded.
 - **Docs-only diffs.** A change set whose tracked *and* untracked paths are all
   documentation (`docs/**`, `*.md`/`*.mdx`/`*.markdown`/`*.txt`/`*.rst`/`*.adoc`,
   `README`/`LICENSE`/`LICENCE` variants) is marked `docs-only diff: yes` and gets the

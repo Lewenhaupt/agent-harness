@@ -8,7 +8,7 @@
 import type { AgentModelSpec } from "./model-classes.js";
 import { PROOF_ARTIFACT_EXTENSIONS } from "./proof-verification.js";
 import { gateFullValidation, gateProofContent, gateTests, gateUserGuide } from "./quality-gates.js";
-import { REVIEW_OUTPUT_CONTRACT } from "./review-context.js";
+import { REVIEW_OUTPUT_CONTRACT, REVIEW_PROCESS_INSTRUCTION } from "./review-context.js";
 import type { WorktreeOptions } from "./worktree.js";
 
 /** A single agent's configuration. */
@@ -366,6 +366,8 @@ Also check these codebase conventions:
 
 DO NOT run unit tests, linting, typechecking. This is handled elsewhere and will already have passed.
 
+${REVIEW_PROCESS_INSTRUCTION}
+
 Output format:
 
 ${REVIEW_OUTPUT_CONTRACT}${SHARED_AGENT_GUIDANCE}`;
@@ -620,7 +622,8 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
   },
   {
     name: "belayd-reviewer",
-    description: "Adversarial code review — checks for bugs, security issues, design problems",
+    description:
+      "Adversarial code review — checks for bugs, security issues, design problems. The task text is scope/focus only: never ask it to run gates or re-derive the diff.",
     modelClass: "standard",
     tools: [
       "read",

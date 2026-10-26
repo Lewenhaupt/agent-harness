@@ -13,7 +13,9 @@ import {
   classifyDiffScope,
   collectReviewDiff,
   formatReviewTask,
+  REVIEW_LINE_NUMBER_INSTRUCTION,
   REVIEW_OUTPUT_CONTRACT,
+  REVIEW_PROCESS_INSTRUCTION,
   REVIEW_SCOPE_INSTRUCTION,
   REVIEW_SECTION_LIMITS,
   type ReviewDiff,
@@ -89,6 +91,38 @@ function diffFixture(overrides: Partial<ReviewDiff> = {}): ReviewDiff {
 }
 
 const PREVIOUS_HEADER = ["diff", "--stat", "base123"];
+
+/** A diff with hunk headers, the shape the reviewer actually receives. */
+const HUNKED_DIFF = [
+  "diff --git a/src/a.ts b/src/a.ts",
+  "index 1111111..2222222 100644",
+  "--- a/src/a.ts",
+  "+++ b/src/a.ts",
+  "@@ -1,3 +1,4 @@",
+  " context one",
+  "-removed one",
+  "+added two",
+  " context three",
+  "@@ -40,2 +41,2 @@",
+  " context 41",
+  "-removed 42",
+  " context 42",
+  "",
+].join("\n");
+
+/**
+ * Install a `collectReviewDiff` git fake that answers the three diff calls with
+ * one canned diff body.
+ */
+function installDiffHandler(diffBody: string, nameOnly = "src/a.ts"): void {
+  mockExecFile.setHandler((args) => {
+    if (args[0] === "merge-base") return { stdout: "base123\n" };
+    if (args[0] === "diff" && args.includes("--stat")) return { stdout: " src/a.ts | 4 ++--\n" };
+    if (args[0] === "diff" && args.includes("--name-only")) return { stdout: `${nameOnly}\n` };
+    return { stdout: diffBody };
+  });
+  mockExecFile.reset();
+}
 
 // ── boundReviewOutput ──────────────────────────────────────────────────
 
@@ -422,6 +456,132 @@ describe("collectReviewDiff", () => {
   });
 });
 
+// ── annotated diff line numbers (bd-159) ─────────────────────────────
+
+describe("collectReviewDiff line-number gutter", () => {
+  it("numbers added and context lines with their post-change line", async () => {
+    installDiffHandler(HUNKED_DIFF);
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const lines = result.value.diff.split("\n");
+    // Headers, hunk headers and removed lines carry a blank gutter so the
+    // numbering column stays aligned but never invents a line number.
+    expect(lines[0]).toBe("      diff --git a/src/a.ts b/src/a.ts");
+    expect(lines[4]).toBe("      @@ -1,3 +1,4 @@");
+    expect(lines[5]).toBe("    1  context one");
+    expect(lines[6]).toBe("      -removed one");
+    expect(lines[7]).toBe("    2 +added two");
+    expect(lines[8]).toBe("    3  context three");
+  });
+
+  it("restarts the numbering at each hunk header", async () => {
+    installDiffHandler(HUNKED_DIFF);
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const lines = result.value.diff.split("\n");
+    expect(lines[9]).toBe("      @@ -40,2 +41,2 @@");
+    expect(lines[10]).toBe("   41  context 41");
+    expect(lines[11]).toBe("      -removed 42");
+    expect(lines[12]).toBe("   42  context 42");
+  });
+
+  it("leaves a no-newline marker unnumbered and does not advance the cursor", async () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,1 +1,1 @@",
+      "-old",
+      "+new",
+      "\\ No newline at end of file",
+      "",
+    ].join("\n");
+    installDiffHandler(diff);
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const lines = result.value.diff.split("\n");
+    expect(lines[4]).toBe("      -old");
+    expect(lines[5]).toBe("    1 +new");
+    expect(lines[6]).toBe("      \\ No newline at end of file");
+  });
+
+  it("keeps the gutter on a diff that hits the line cap", async () => {
+    const longDiff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "@@ -1,900 +1,900 @@",
+      ...Array.from({ length: 900 }, (_, index) => `+line ${index}`),
+    ].join("\n");
+    installDiffHandler(longDiff);
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.truncated).toBe(true);
+    const lines = result.value.diff.split("\n");
+    // The last kept hunk line is still numbered, and the truncation note is not.
+    const noteIndex = lines.findIndex((line) => line.includes("(diff truncated:"));
+    expect(noteIndex).toBeGreaterThan(0);
+    expect(lines[noteIndex - 1]).toMatch(/^ +\d+ \+line /);
+    expect(lines[noteIndex]).not.toMatch(/^ +\d+ /);
+  });
+
+  it("keeps the byte cap while numbering lines", async () => {
+    const hugeLine = `+${"x".repeat(1024 * 1024)}`;
+    installDiffHandler(
+      ["diff --git a/src/a.ts b/src/a.ts", "@@ -1,1 +1,1 @@", hugeLine, ""].join("\n"),
+    );
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.truncated).toBe(true);
+    expect(Buffer.byteLength(result.value.diff, "utf8")).toBeLessThanOrEqual(60_000);
+    expect(result.value.diff).toMatch(/^ {6}diff --git/m);
+  });
+
+  it("keeps the reviewer's own scratchpad out of the change set (bd-159)", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "merge-base") return { stdout: "base123\n" };
+      if (args[0] === "status") {
+        return { stdout: "?? .belayd/review-findings.md\n?? src/new.ts\n" };
+      }
+      if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
+      if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
+      return { stdout: HUNKED_DIFF };
+    });
+    mockExecFile.reset();
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untrackedFiles).toEqual(["src/new.ts"]);
+    expect(result.value.changedFiles).toEqual(["src/a.ts", "src/new.ts"]);
+  });
+});
+
+// ── review process rules (bd-159) ────────────────────────────────────
+
+describe("REVIEW_PROCESS_INSTRUCTION", () => {
+  it("carries the scratchpad, one-check-per-response, and precedence rules", () => {
+    expect(REVIEW_PROCESS_INSTRUCTION).toContain(".belayd/review-findings.md");
+    expect(REVIEW_PROCESS_INSTRUCTION).toContain("Never re-derive a confirmed finding");
+    expect(REVIEW_PROCESS_INSTRUCTION).toContain("one check per response");
+    expect(REVIEW_PROCESS_INSTRUCTION).toContain("outranks the task text");
+  });
+});
+
 // ── formatReviewTask ──────────────────────────────────────────────────
 
 describe("formatReviewTask", () => {
@@ -435,6 +595,7 @@ describe("formatReviewTask", () => {
     expect(text).toContain("```diff");
     expect(text).toContain("+line");
     expect(text).toContain(REVIEW_SCOPE_INSTRUCTION);
+    expect(text).toContain(REVIEW_LINE_NUMBER_INSTRUCTION);
     expect(text).toContain("## Output contract");
     expect(text).toContain(REVIEW_OUTPUT_CONTRACT);
     expect(text).toContain("## Task\nReview the change.");
@@ -503,6 +664,8 @@ describe("formatReviewTask", () => {
     expect(text).toContain("diff unavailable (merge-base failed)");
     expect(text).toContain("fall back to your own `git diff`/`git status`");
     expect(text).not.toContain(REVIEW_SCOPE_INSTRUCTION);
+    // No diff is inlined here, so there is no gutter to read either.
+    expect(text).not.toContain(REVIEW_LINE_NUMBER_INSTRUCTION);
     expect(text).toContain("## Output contract");
     expect(text).toContain("## Task\nReview.");
   });
