@@ -36,7 +36,7 @@ Run these commands from the repository root. Run each command to completion.
    pnpm test
    ```
 
-   Expected: Vitest exits 0 with **110 test files / 2562 tests passed**. The
+   Expected: Vitest exits 0 with **114 test files / 2650 tests passed**. The
    bd-116 suites alone:
 
    ```bash
@@ -160,7 +160,7 @@ so the variable must be set before `pi` starts.
    import { createServer } from "node:http";
    const body =
      process.env.CAPACITY_BODY ??
-     '{"providers":{"opencode-go":{"resetsInSeconds":3600}}}';
+     '{"providers":{"llmgateway":{"resetsInSeconds":3600}}}';
    createServer((_req, res) => {
      res.writeHead(200, { "content-type": "application/json" });
      res.end(body);
@@ -182,8 +182,8 @@ so the variable must be set before `pi` starts.
    /belayd bd-X feature --no-worktree
    ```
 
-3. **Reorder.** With the default fixture body the fast-class scout candidates
-   (`opencode-go/mimo-v2.6-flash` first) are reordered so `llmgateway/mimo-v2.6-flash`
+3. **Reorder.** With the default fixture body the fast-class scout primary
+   (`llmgateway/mimo-v2.6-flash`) is reordered so `opencode-go/mimo-v2.6-flash`
    runs first. The reorder is deliberately silent — its point is to *not*
    spawn a doomed attempt — so the observable signal is an **absence**:
 
@@ -197,13 +197,13 @@ so the variable must be set before `pi` starts.
      Expected: only base-named sessions such as
      `belayd-bd-X-sub-scout-<runId>` — no `...-fallback-1`.
 
-4. **All-exhausted fast-fail.** Restart the fixture with every
-   `PROVIDER_PREFERENCE` provider (`opencode-go`, `llmgateway`, `openrouter`)
-   inside a reset window, and re-run the phase:
+4. **All-exhausted fast-fail.** Restart the fixture with every provider the
+   candidate list uses (`llmgateway`, `opencode-go`, `openrouter`) inside a
+   reset window, and re-run the phase:
 
    ```bash
    kill %1 2>/dev/null
-   CAPACITY_BODY='{"providers":{"opencode-go":{"resetsInSeconds":3600},"llmgateway":{"resetsInSeconds":3600},"openrouter":{"resetsInSeconds":3600}}}' \
+   CAPACITY_BODY='{"providers":{"llmgateway":{"resetsInSeconds":3600},"opencode-go":{"resetsInSeconds":3600},"openrouter":{"resetsInSeconds":3600}}}' \
      node /tmp/capacity-fixture.mjs &
    ```
 
@@ -212,10 +212,14 @@ so the variable must be set before `pi` starts.
    trail:
 
    ```text
-   All candidate models are capacity-exhausted providers (opencode-go, llmgateway, openrouter); retry after reset. Candidates: opencode-go/mimo-v2.6-flash, llmgateway/mimo-v2.6-flash, openrouter/xiaomi/mimo-v2.6-flash, ...
+   All candidate models are capacity-exhausted providers (llmgateway, opencode-go, openrouter); retry after reset. Candidates: llmgateway/mimo-v2.6-flash, opencode-go/mimo-v2.6-flash, openrouter/xiaomi/mimo-v2.6-flash, ...
 
-   [belayd model fallback] opencode-go/mimo-v2.6-flash (provider opencode-go capacity-exhausted) → llmgateway/mimo-v2.6-flash (provider llmgateway capacity-exhausted) → openrouter/xiaomi/mimo-v2.6-flash (provider openrouter capacity-exhausted) → ...
+   [belayd model fallback] llmgateway/mimo-v2.6-flash (provider llmgateway capacity-exhausted) → opencode-go/mimo-v2.6-flash (provider opencode-go capacity-exhausted) → openrouter/xiaomi/mimo-v2.6-flash (provider openrouter capacity-exhausted) → ...
    ```
+
+   The provider tuple is derived from the fixture body's key order (the capacity
+   windows the probe reported), not from the candidate list, which is why body
+   and trail are written in the same order here.
 
    If a quality gate is configured for the phase it will retry the phase; each
    retry hits the same fast-fail instead of minting `-fallback-N` sessions.
@@ -338,7 +342,8 @@ mechanism that pre-empts the *first* attempt.
 frontier/standard model spends capability on a judge whose failure cannot fail
 the workflow. Its fallback candidates are now the `fast` class
 (`mimo-v2.6-flash`, `deepseek-v4-flash`, `glm-5.3-flash`), primary
-`opencode-go/mimo-v2.6-flash`.
+`llmgateway/mimo-v2.6-flash` (bd-147 moved the non-DeepSeek primaries onto the
+per-token gateway; see `docs/agent-model-class.md`).
 
 Unchanged: scout was already `fast`, and the tester remains `frontier`
 (bd-102) because generated tests are a correctness artifact. Everything else
@@ -451,7 +456,7 @@ Semantics:
   [belayd model telemetry] attempts=7 fallbacks=2 quotaFailures=2 noOps=1 cost=$0.1840
     implement opencode-go/deepseek-v4.1-flash: attempts=3 fallbacks=1 quota=1 noops=0 cost=$0.1200
     plan opencode-go/deepseek-v4.1-flash: attempts=2 fallbacks=1 quota=1 noops=0 cost=$0.0500
-    scout opencode-go/mimo-v2.6-flash: attempts=2 fallbacks=0 quota=0 noops=1 cost=$0.0140
+    scout llmgateway/mimo-v2.6-flash: attempts=2 fallbacks=0 quota=0 noops=1 cost=$0.0140
   ```
 
   It is emitted on workflow **completion**, `belayd_stop_task`, and

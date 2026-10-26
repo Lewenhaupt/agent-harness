@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { providerOf, providerPreferenceFor } from "../model-classes.js";
 import { gateStaticValidation } from "../quality-gates.js";
 import {
   getPhasesForType,
@@ -143,6 +144,29 @@ describe("WORKFLOW_REGISTRY", () => {
     // Research often needs to run and inspect CLI tools, so the research
     // workflow's plan phase keeps bash (unlike planning mode's scout).
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bash");
+  });
+
+  it("pins the override models to their preferred provider", () => {
+    // bd-147: only deepseek-v4.1-flash prefers opencode-go; every other model
+    // bills per-token on llmgateway. A registry pin that keeps the old
+    // opencode-go prefix would silently spawn on the subscription bucket for a
+    // model that does not belong there, so assert the exact pins AND that each
+    // pin agrees with the model's own preference order.
+    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.model).toBe("llmgateway/glm-5.3");
+    expect(WORKFLOW_REGISTRY.documentation.agentOverrides?.implement?.model).toBe(
+      "llmgateway/deepseek-v4-flash",
+    );
+    expect(WORKFLOW_REGISTRY.hotfix.agentOverrides?.implement?.model).toBe(
+      "llmgateway/deepseek-v4-flash",
+    );
+    for (const config of Object.values(WORKFLOW_REGISTRY)) {
+      for (const [phase, override] of Object.entries(config.agentOverrides ?? {})) {
+        if (override.model === undefined) continue;
+        expect(providerOf(override.model), `${config.name}/${phase}`).toBe(
+          providerPreferenceFor(override.model)[0],
+        );
+      }
+    }
   });
 
   it("every agentOverride systemPrompt still carries the stale-worktree rebase guidance", () => {

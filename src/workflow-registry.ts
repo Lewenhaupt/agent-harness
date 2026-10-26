@@ -103,7 +103,7 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     proofRequired: false,
     agentOverrides: {
       plan: {
-        model: "opencode-go/glm-5.3",
+        model: "llmgateway/glm-5.3",
         tools: RESEARCHER_TOOLS,
         systemPrompt: RESEARCHER_SYSTEM_PROMPT,
       },
@@ -130,7 +130,7 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     proofRequired: false,
     agentOverrides: {
       implement: {
-        model: "opencode-go/deepseek-v4-flash",
+        model: "llmgateway/deepseek-v4-flash",
       },
     },
   },
@@ -152,7 +152,7 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     gateOverrides: { implement: gateStaticValidation },
     agentOverrides: {
       implement: {
-        model: "opencode-go/deepseek-v4-flash",
+        model: "llmgateway/deepseek-v4-flash",
       },
     },
   },
