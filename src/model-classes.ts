@@ -6,12 +6,14 @@
  * the same class (same model on an alternate provider first, then a different
  * model), preserving the capability level the agent role requires.
  *
- * Providers are expanded from a preference order: `opencode-go` is the primary
- * (cheap, fast) provider and `llmgateway` mirrors every opencode-go model id,
- * so the first failover hop is the SAME model id on the alternate provider —
- * identical behavior, different credential/quota bucket. `openrouter` carries
- * the same models as a last-resort quota bucket, but under vendor-qualified
- * ids (e.g. `z-ai/glm-5.2`), mapped in `PROVIDER_MODEL_IDS`.
+ * Providers are expanded from a per-model preference order. `llmgateway` is the
+ * default primary (per-token billing) and mirrors every model id on the other
+ * providers, so the first failover hop is the SAME model id on the alternate
+ * provider — identical behavior, different credential/quota bucket.
+ * `opencode-go` is the exception preferred provider for `deepseek-v4.1-flash`,
+ * whose subscription bucket is far cheaper than per-token for that one model.
+ * `openrouter` carries the same models as a last-resort quota bucket, but under
+ * vendor-qualified ids (e.g. `z-ai/glm-5.2`), mapped in `PROVIDER_MODEL_IDS`.
  */
 
 export type ModelClass = "frontier" | "standard" | "fast";
@@ -25,8 +27,44 @@ export type AgentModelSpec =
   | { model: string; modelClass?: never }
   | { model?: never; modelClass: ModelClass };
 
-/** Providers tried for each model id, in preference order. */
-export const PROVIDER_PREFERENCE: readonly string[] = ["opencode-go", "llmgateway", "openrouter"];
+/**
+ * Providers tried for a model id, in preference order, unless the model has an
+ * entry in `MODEL_PROVIDER_PREFERENCE`. Kept exported for callers that only
+ * need the default order.
+ */
+export const DEFAULT_PROVIDER_PREFERENCE: readonly string[] = [
+  "llmgateway",
+  "opencode-go",
+  "openrouter",
+];
+
+/**
+ * @deprecated Use `DEFAULT_PROVIDER_PREFERENCE` or, for a specific model,
+ * `providerPreferenceFor(modelId)`. Retained as a re-export of the default so
+ * the global order keeps a single source of truth.
+ */
+export const PROVIDER_PREFERENCE: readonly string[] = DEFAULT_PROVIDER_PREFERENCE;
+
+/**
+ * The one model whose opencode-go subscription bucket is far cheaper than
+ * per-token billing. Named once and reused by the class spec, the class lookup
+ * and the provider override below, so the exemption cannot drift away from the
+ * model it exempts.
+ */
+const SUBSCRIPTION_PREFERRED_MODEL = "deepseek-v4.1-flash";
+
+/**
+ * Per-model provider overrides. opencode-go's plan gives that subscription-
+ * preferred model generous headroom, so the subscription bucket is reserved for
+ * it; every other model bills per-token and stays on llmgateway. Values must
+ * stay a permutation of `DEFAULT_PROVIDER_PREFERENCE` (asserted in the tests):
+ * the same provider set, only reordered, so no model loses a failover bucket.
+ * Exported so the tests can assert over the override keys themselves and catch
+ * an override for a model that is not in a class spec.
+ */
+export const MODEL_PROVIDER_PREFERENCE: Readonly<Record<string, readonly string[]>> = {
+  [SUBSCRIPTION_PREFERRED_MODEL]: ["opencode-go", "llmgateway", "openrouter"],
+};
 
 /**
  * Provider-specific model ids. Most providers accept the canonical bare id,
@@ -36,7 +74,7 @@ export const PROVIDER_PREFERENCE: readonly string[] = ["opencode-go", "llmgatewa
 const PROVIDER_MODEL_IDS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   openrouter: {
     "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
-    "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
+    [SUBSCRIPTION_PREFERRED_MODEL]: `deepseek/${SUBSCRIPTION_PREFERRED_MODEL}`,
     "gpt-5.6-luna": "openai/gpt-5.6-luna",
     "glm-5.2": "z-ai/glm-5.2",
     "glm-5.3": "z-ai/glm-5.3",
@@ -62,22 +100,23 @@ interface ModelClassSpec {
  * Model ids below are GATEWAY ids, not official API ids. `deepseek-v4.1-flash`
  * is a provider slug (the official DeepSeek id is `deepseek-flash`), and
  * `deepseek-v4-flash` is retired upstream but still legacy-routed, so it keeps
- * working through the gateways listed in PROVIDER_PREFERENCE. Both facts, plus
- * the reasoning_content round-trip invariant that bites any adapter talking to
- * api.deepseek.com directly, are recorded in docs/deepseek-provider-notes.md.
+ * working through the gateways listed in its provider preference order. Both
+ * facts, plus the reasoning_content round-trip invariant that bites any adapter
+ * talking to api.deepseek.com directly, are recorded in
+ * docs/deepseek-provider-notes.md.
  */
 export const MODEL_CLASS_SPECS: Record<ModelClass, ModelClassSpec> = {
   frontier: {
     name: "frontier",
     rationale:
       "Ordered by capability then cost: deepseek-v4.1-flash, glm-5.3, gpt-5.6-luna. The first entry is the class primary (frontier's default first choice).",
-    models: ["deepseek-v4.1-flash", "glm-5.3", "gpt-5.6-luna"],
+    models: [SUBSCRIPTION_PREFERRED_MODEL, "glm-5.3", "gpt-5.6-luna"],
   },
   standard: {
     name: "standard",
     rationale:
       "glm-5.3-flash is the class primary (higher capability and far cheaper than the deprecated glm-5.2); gpt-5.6-luna for doc-quality output; deepseek-v4.1-flash as the capability ceiling.",
-    models: ["glm-5.3-flash", "gpt-5.6-luna", "deepseek-v4.1-flash"],
+    models: ["glm-5.3-flash", "gpt-5.6-luna", SUBSCRIPTION_PREFERRED_MODEL],
   },
   fast: {
     name: "fast",
@@ -93,7 +132,7 @@ export const MODEL_TO_CLASS: Record<string, ModelClass> = {
   "deepseek-v4-flash": "fast",
   "glm-5.3-flash": "standard",
   "glm-5.3": "frontier",
-  "deepseek-v4.1-flash": "frontier",
+  [SUBSCRIPTION_PREFERRED_MODEL]: "frontier",
   "gpt-5.6-luna": "frontier",
 };
 
@@ -131,12 +170,25 @@ export function modelClassOf(model: string): ModelClass | undefined {
   return MODEL_TO_CLASS[canonicalModelId(model)];
 }
 
-/** Ordered candidates for a class: each bare id expanded across providers. */
+/**
+ * Providers tried for `modelId`, in preference order. Resolved through the
+ * canonical id so an OpenRouter vendor-qualified spelling (`deepseek/…`) picks
+ * up the same override as the bare id.
+ */
+export function providerPreferenceFor(modelId: string): readonly string[] {
+  return MODEL_PROVIDER_PREFERENCE[canonicalModelId(modelId)] ?? DEFAULT_PROVIDER_PREFERENCE;
+}
+
+/**
+ * Ordered candidates for a class: each bare id expanded across its own provider
+ * preference order, so the model-major / same-id-adjacent invariant holds even
+ * when one model in the class prefers a different provider.
+ */
 export function resolveModelCandidates(modelClass: ModelClass): string[] {
   const { models } = MODEL_CLASS_SPECS[modelClass];
   const candidates: string[] = [];
   for (const id of models) {
-    for (const provider of PROVIDER_PREFERENCE) {
+    for (const provider of providerPreferenceFor(id)) {
       candidates.push(`${provider}/${providerModelId(provider, id)}`);
     }
   }
@@ -173,10 +225,10 @@ export function candidatesForModel(model: string, modelClass?: ModelClass): stri
   return [model, ...sameModelAlternateProvider, ...otherModels];
 }
 
-/** The class primary: first models entry on the first-preference provider. */
+/** The class primary: first models entry on that model's first-preference provider. */
 export function primaryModelOf(modelClass: ModelClass): string {
-  const provider = PROVIDER_PREFERENCE[0];
   const primaryId = MODEL_CLASS_SPECS[modelClass].models[0];
+  const provider = primaryId === undefined ? undefined : providerPreferenceFor(primaryId)[0];
   if (provider === undefined || primaryId === undefined) {
     throw new Error(`model class ${modelClass} has no primary model`);
   }

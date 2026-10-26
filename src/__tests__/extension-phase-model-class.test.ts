@@ -262,7 +262,7 @@ describe("extension modelClass threading", () => {
     const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as
       | { model: string; modelClass?: string; detached?: boolean }
       | undefined;
-    expect(options?.model).toBe("opencode-go/mimo-v2.6-flash");
+    expect(options?.model).toBe("llmgateway/mimo-v2.6-flash");
     expect(options?.modelClass).toBe("fast");
     expect(options?.detached).toBe(true);
   });
@@ -298,7 +298,7 @@ describe("extension modelClass threading", () => {
     // Documentation workflow overrides the implement model without a class:
     // the effective class is undefined so candidatesForModel derives it from
     // the override model — NOT the implementer agent's default "frontier".
-    expect(first?.model).toBe("opencode-go/deepseek-v4-flash");
+    expect(first?.model).toBe("llmgateway/deepseek-v4-flash");
     expect(first?.modelClass).toBeUndefined();
 
     const retry = mockSpawnAgentWithFallback.mock.calls[1]?.[0] as
@@ -310,7 +310,7 @@ describe("extension modelClass threading", () => {
           resumeSession?: boolean;
         }
       | undefined;
-    expect(retry?.model).toBe("opencode-go/deepseek-v4-flash");
+    expect(retry?.model).toBe("llmgateway/deepseek-v4-flash");
     // spawnGateRetry intentionally has no `?? agent.modelClass` fallback: with
     // an override model in play that fallback would misclassify the tier.
     expect(retry?.modelClass).toBeUndefined();

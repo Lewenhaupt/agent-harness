@@ -7,12 +7,15 @@ import {
   bareModelId,
   candidatesForModel,
   canonicalModelId,
+  DEFAULT_PROVIDER_PREFERENCE,
   MODEL_CLASS_SPECS,
+  MODEL_PROVIDER_PREFERENCE,
   MODEL_TO_CLASS,
   modelClassOf,
   PROVIDER_PREFERENCE,
   primaryModelOf,
   providerOf,
+  providerPreferenceFor,
   resolveModelCandidates,
   resolveModelSpec,
 } from "../model-classes.js";
@@ -88,18 +91,64 @@ describe("modelClassOf", () => {
 });
 
 describe("resolveModelCandidates", () => {
-  it("expands each bare id across the provider preference order", () => {
+  it("expands each bare id across its provider preference order", () => {
     expect(resolveModelCandidates("fast")).toEqual([
-      "opencode-go/mimo-v2.6-flash",
       "llmgateway/mimo-v2.6-flash",
+      "opencode-go/mimo-v2.6-flash",
       "openrouter/xiaomi/mimo-v2.6-flash",
-      "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
+      "opencode-go/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
-      "opencode-go/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
+      "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
     ]);
+  });
+
+  it("keeps the standard class model-major with deepseek's override last", () => {
+    // `standard` is the class where the flipped default and the single
+    // per-model override meet: the first two models open on llmgateway while
+    // deepseek-v4.1-flash — last in the class — still opens on opencode-go.
+    // A regression that applied the override globally (or lost it) shows up
+    // here as a reordered block, not just a changed primary.
+    expect(resolveModelCandidates("standard")).toEqual([
+      "llmgateway/glm-5.3-flash",
+      "opencode-go/glm-5.3-flash",
+      "openrouter/z-ai/glm-5.3-flash",
+      "llmgateway/gpt-5.6-luna",
+      "opencode-go/gpt-5.6-luna",
+      "openrouter/openai/gpt-5.6-luna",
+      "opencode-go/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash",
+      "openrouter/deepseek/deepseek-v4.1-flash",
+    ]);
+  });
+
+  it("emits each class model's providers contiguously, in its own order", () => {
+    // The same-id-adjacency invariant, asserted structurally so it holds for
+    // every class and every future model rather than at a few fixed indexes.
+    for (const modelClass of ["frontier", "standard", "fast"] as const) {
+      const candidates = resolveModelCandidates(modelClass);
+      // `canonicalModelId` maps OpenRouter's vendor-qualified suffix back, so the
+      // provider/canonical pairs are the expected model-major expansion.
+      const pairs = candidates.map(
+        (candidate) => `${providerOf(candidate)}/${canonicalModelId(candidate)}`,
+      );
+      expect(pairs, modelClass).toEqual(
+        MODEL_CLASS_SPECS[modelClass].models.flatMap((id) =>
+          providerPreferenceFor(id).map((provider) => `${provider}/${id}`),
+        ),
+      );
+      // Contiguity: each canonical id's providers form one uninterrupted block.
+      const canonicalIds = candidates.map(canonicalModelId);
+      for (const id of MODEL_CLASS_SPECS[modelClass].models) {
+        const first = canonicalIds.indexOf(id);
+        const last = canonicalIds.lastIndexOf(id);
+        expect(canonicalIds.slice(first, last + 1), `${modelClass}/${id}`).toEqual(
+          canonicalIds.filter((candidate) => candidate === id),
+        );
+      }
+    }
   });
 
   it("keeps the same model id adjacent across providers", () => {
@@ -107,6 +156,70 @@ describe("resolveModelCandidates", () => {
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
     expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
     expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+    // The non-DeepSeek frontier models flip to the llmgateway-first default.
+    expect(candidates[3]).toBe("llmgateway/glm-5.3");
+    expect(candidates[4]).toBe("opencode-go/glm-5.3");
+    expect(candidates[5]).toBe("openrouter/z-ai/glm-5.3");
+  });
+});
+
+describe("providerPreferenceFor", () => {
+  it("keeps deepseek-v4.1-flash on opencode-go first", () => {
+    expect(providerPreferenceFor("deepseek-v4.1-flash")).toEqual([
+      "opencode-go",
+      "llmgateway",
+      "openrouter",
+    ]);
+    expect(providerPreferenceFor("opencode-go/deepseek-v4.1-flash")).toEqual([
+      "opencode-go",
+      "llmgateway",
+      "openrouter",
+    ]);
+    // Canonical resolution: OpenRouter's vendor-qualified spelling hits the
+    // same override.
+    expect(providerPreferenceFor("openrouter/deepseek/deepseek-v4.1-flash")).toEqual([
+      "opencode-go",
+      "llmgateway",
+      "openrouter",
+    ]);
+  });
+
+  it("defaults every other model to llmgateway first", () => {
+    for (const spec of Object.values(MODEL_CLASS_SPECS)) {
+      for (const id of spec.models) {
+        if (id === "deepseek-v4.1-flash") continue;
+        expect(providerPreferenceFor(id)[0], id).toBe("llmgateway");
+      }
+    }
+    expect(providerPreferenceFor("glm-5.3-flash")).toEqual(DEFAULT_PROVIDER_PREFERENCE);
+    expect(providerPreferenceFor("unknown/x")).toEqual(DEFAULT_PROVIDER_PREFERENCE);
+  });
+
+  it("keeps every override a permutation of the default provider set", () => {
+    // An override may reorder providers but must never add or drop one: a
+    // dropped provider silently removes a failover bucket for that model. The
+    // ids come from the class specs AND the override map itself, so an override
+    // keyed by a model outside every class spec is still checked here.
+    const defaultProviders = [...DEFAULT_PROVIDER_PREFERENCE].sort();
+    const candidateIds = new Set([
+      ...Object.values(MODEL_CLASS_SPECS).flatMap((spec) => spec.models),
+      ...Object.keys(MODEL_PROVIDER_PREFERENCE),
+    ]);
+    for (const id of candidateIds) {
+      expect([...providerPreferenceFor(id)].sort(), id).toEqual(defaultProviders);
+    }
+  });
+
+  it("keys every provider override to a model that has a class", () => {
+    // An override for an id that is not in MODEL_TO_CLASS would be dead weight
+    // (no class to expand) and would escape the class-spec sweep above.
+    for (const id of Object.keys(MODEL_PROVIDER_PREFERENCE)) {
+      expect(modelClassOf(id), id).toBeDefined();
+    }
+  });
+
+  it("keeps PROVIDER_PREFERENCE as the default order", () => {
+    expect(PROVIDER_PREFERENCE).toEqual(DEFAULT_PROVIDER_PREFERENCE);
   });
 });
 
@@ -140,14 +253,14 @@ describe("candidatesForModel", () => {
   it("uses an explicit class to expand candidates even when the model is known", () => {
     const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash", "fast");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(candidates[1]).toBe("opencode-go/mimo-v2.6-flash");
+    expect(candidates[1]).toBe("llmgateway/mimo-v2.6-flash");
     expect(candidates).toHaveLength(1 + resolveModelCandidates("fast").length);
   });
 
   it("expands an unknown model when an explicit class is provided", () => {
     const candidates = candidatesForModel("unknown/x", "fast");
     expect(candidates[0]).toBe("unknown/x");
-    expect(candidates[1]).toBe("opencode-go/mimo-v2.6-flash");
+    expect(candidates[1]).toBe("llmgateway/mimo-v2.6-flash");
   });
 
   it("treats an omitted class identically to an explicit undefined", () => {
@@ -163,18 +276,33 @@ describe("candidatesForModel", () => {
 
   it("resolves a bare known id through its class (class-of-one entry first)", () => {
     // The empty sameModelAlternateProvider partition for bare ids: the bare
-    // id leads, then every provider-qualified same-id candidate, then the rest.
+    // id leads, then every provider-qualified same-id candidate (in the
+    // model's own preference order), then the rest of the class.
     expect(candidatesForModel("glm-5.3")).toEqual([
       "glm-5.3",
-      "opencode-go/glm-5.3",
       "llmgateway/glm-5.3",
+      "opencode-go/glm-5.3",
       "openrouter/z-ai/glm-5.3",
       "opencode-go/deepseek-v4.1-flash",
       "llmgateway/deepseek-v4.1-flash",
       "openrouter/deepseek/deepseek-v4.1-flash",
-      "opencode-go/gpt-5.6-luna",
       "llmgateway/gpt-5.6-luna",
+      "opencode-go/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
+    ]);
+  });
+
+  it("keeps the standard primary on llmgateway with deepseek as last resort", () => {
+    expect(candidatesForModel("llmgateway/glm-5.3-flash")).toEqual([
+      "llmgateway/glm-5.3-flash",
+      "opencode-go/glm-5.3-flash",
+      "openrouter/z-ai/glm-5.3-flash",
+      "llmgateway/gpt-5.6-luna",
+      "opencode-go/gpt-5.6-luna",
+      "openrouter/openai/gpt-5.6-luna",
+      "opencode-go/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash",
+      "openrouter/deepseek/deepseek-v4.1-flash",
     ]);
   });
 
@@ -185,14 +313,14 @@ describe("candidatesForModel", () => {
   it("expands a bare id when an explicit class is provided", () => {
     expect(candidatesForModel("glm-5.2", "fast")).toEqual([
       "glm-5.2",
-      "opencode-go/mimo-v2.6-flash",
       "llmgateway/mimo-v2.6-flash",
+      "opencode-go/mimo-v2.6-flash",
       "openrouter/xiaomi/mimo-v2.6-flash",
-      "opencode-go/deepseek-v4-flash",
       "llmgateway/deepseek-v4-flash",
+      "opencode-go/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
-      "opencode-go/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
+      "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
     ]);
   });
@@ -242,17 +370,17 @@ describe("model class coverage", () => {
 });
 
 describe("primaryModelOf", () => {
-  it("resolves each class to its first-preference-provider primary", () => {
+  it("resolves each class to its primary model's first-preference provider", () => {
     expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(primaryModelOf("standard")).toBe("opencode-go/glm-5.3-flash");
-    expect(primaryModelOf("fast")).toBe("opencode-go/mimo-v2.6-flash");
+    expect(primaryModelOf("standard")).toBe("llmgateway/glm-5.3-flash");
+    expect(primaryModelOf("fast")).toBe("llmgateway/mimo-v2.6-flash");
   });
 });
 
 describe("resolveModelSpec", () => {
   it("resolves a modelClass-only spec to the class primary", () => {
     expect(resolveModelSpec({ modelClass: "standard" })).toEqual({
-      model: "opencode-go/glm-5.3-flash",
+      model: "llmgateway/glm-5.3-flash",
       modelClass: "standard",
     });
   });

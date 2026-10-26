@@ -380,7 +380,7 @@ describe("spawnAgentWithFallback", () => {
   it("expands an unknown model using the explicit class", async () => {
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("unknown/x"))
-      .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
     const { result, attempts } = await spawnAgentWithFallback({
       model: "unknown/x",
@@ -391,8 +391,8 @@ describe("spawnAgentWithFallback", () => {
       classify: seqClassifier("quota", "success"),
     });
 
-    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/mimo-v2.6-flash");
-    expect(attempts.map((a) => a.model)).toEqual(["unknown/x", "opencode-go/mimo-v2.6-flash"]);
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/mimo-v2.6-flash");
+    expect(attempts.map((a) => a.model)).toEqual(["unknown/x", "llmgateway/mimo-v2.6-flash"]);
     expect(attempts.map((a) => a.model)).not.toContain("llmgateway/unknown");
   });
 

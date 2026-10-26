@@ -39,9 +39,15 @@ test — not the request shape.
 | `deepseek-v4-flash` | **retired**; still accepted and legacy-routed to V4.1-Flash-1017 |
 | `deepseek-v4.1-flash` | **not** an official DeepSeek id — the provider slug gateways serve |
 
-`src/model-classes.ts` lists the *gateway* ids on purpose: `PROVIDER_PREFERENCE`
-tries `opencode-go`, then `llmgateway`, then `openrouter`, and those resolve
-`deepseek-v4.1-flash` / `deepseek-v4-flash` as shipped. If a `deepseek` provider is
+`src/model-classes.ts` lists the *gateway* ids on purpose: the default provider
+preference tries `llmgateway`, then `opencode-go`, then `openrouter`, except for
+`deepseek-v4.1-flash`, whose `MODEL_PROVIDER_PREFERENCE` entry puts `opencode-go`
+first (the subscription bucket is cheaper than per-token for that one model).
+Those orders resolve `deepseek-v4.1-flash` / `deepseek-v4-flash` as shipped. Note
+that `opencode-go`'s live catalog does not serve `deepseek-v4-flash` at all, so
+the pins that use it (`documentation` / `hotfix` implement) point at
+`llmgateway` — an opencode-go pin would burn a 404/410 attempt first.
+If a `deepseek` provider is
 ever added, its model ids must be the official ones, and `MODEL_TO_CLASS` /
 `MODEL_CLASS_SPECS` need entries for the official spelling rather than a rename of
 the existing ones. `src/__tests__/model-classes.test.ts` asserts that every id in

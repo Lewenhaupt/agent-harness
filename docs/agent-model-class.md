@@ -10,11 +10,19 @@ type AgentModelSpec =
 
 An agent declares EITHER an explicit `model` OR a `modelClass` capability tier;
 TypeScript rejects both fields together. A `modelClass` resolves to its class
-primary model (the first model entry on the first-preference provider). An
-explicit `model` is used as requested and derives a class through
+primary model (the first model entry on that model's first-preference
+provider). An explicit `model` is used as requested and derives a class through
 `MODEL_TO_CLASS` when it is known, so quota-fallback routing remains available.
 Unknown explicit models have no class-derived fallback. The valid tiers are
 `frontier`, `standard`, and `fast`.
+
+Provider preference is per model, not global: `DEFAULT_PROVIDER_PREFERENCE`
+orders the gateways `llmgateway`, `opencode-go`, `openrouter`, and
+`MODEL_PROVIDER_PREFERENCE` overrides that for models whose subscription bucket
+is cheaper. Today the only override is `deepseek-v4.1-flash`, which prefers
+`opencode-go` first; every other model bills per-token and stays on
+`llmgateway`. `providerPreferenceFor(modelId)` resolves the effective order
+(canonicalizing provider-qualified ids first).
 
 ## How to Verify
 
@@ -23,7 +31,7 @@ Run these commands from the repository root. Run each command to completion:
 1. ```bash
    pnpm test
    ```
-   Expected: 2562 unit tests in 110 files pass; Vitest exits with status 0.
+   Expected: 2650 unit tests in 114 files pass; Vitest exits with status 0.
    This includes
    the model-class, agent-registry, spawn-fallback, and extension
    phase-threading tests, plus the bd-142 classification cases
@@ -77,28 +85,40 @@ Expected behavior:
 
   | Agent | Class primary (first-choice model) |
   | --- | --- |
-  | `belayd-scout` | `fast` → `opencode-go/mimo-v2.6-flash` |
+  | `belayd-scout` | `fast` → `llmgateway/mimo-v2.6-flash` |
   | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-reviewer` | `standard` → `opencode-go/glm-5.3-flash` |
+  | `belayd-reviewer` | `standard` → `llmgateway/glm-5.3-flash` |
   | `belayd-tester` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-documenter` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-committer` | `fast` → `opencode-go/mimo-v2.6-flash` |
+  | `belayd-committer` | `fast` → `llmgateway/mimo-v2.6-flash` |
+
+The separate proof-verifier agent declares `fast`, so it also resolves to
+`llmgateway/mimo-v2.6-flash`.
 
 The tier-to-primary mapping used by `primaryModelOf` is:
 
 | `modelClass` | Primary model |
 | --- | --- |
 | `frontier` | `opencode-go/deepseek-v4.1-flash` |
-| `standard` | `opencode-go/glm-5.3-flash` |
-| `fast` | `opencode-go/mimo-v2.6-flash` |
+| `standard` | `llmgateway/glm-5.3-flash` |
+| `fast` | `llmgateway/mimo-v2.6-flash` |
+
+Only `frontier` stays on the opencode-go subscription: its primary is the one
+model the subscription is cheap for. Every other class bills per-token on
+`llmgateway`, which makes opencode-go only the second hop for their own models
+and puts the `deepseek-v4.1-flash` group — led by
+`opencode-go/deepseek-v4.1-flash` — at the end of each non-frontier class's
+candidate list.
 
 - On a quota, transient, or model-unavailable failure, the next attempt stays
-  within that class: the same model on each alternate provider (in
-  `PROVIDER_PREFERENCE` order — `opencode-go`, then `llmgateway`, then
-  `openrouter`) is preferred before another model in the class. OpenRouter
+  within that class: the same model on each alternate provider (in that
+  model's `providerPreferenceFor` order — for `deepseek-v4.1-flash`
+  `opencode-go`, then `llmgateway`, then `openrouter`; for every other model
+  `llmgateway`, then `opencode-go`, then `openrouter`) is preferred before
+  another model in the class. OpenRouter
   serves the same models under vendor-qualified ids (`glm-5.3-flash` →
   `z-ai/glm-5.3-flash`, `mimo-v2.6-flash` → `xiaomi/mimo-v2.6-flash`,
   `gpt-5.6-luna` → `openai/gpt-5.6-luna`, `deepseek-*` →
@@ -134,6 +154,21 @@ The tier-to-primary mapping used by `primaryModelOf` is:
   pi --resume | grep belayd-bd-X
   ```
 
+### Consequences of the per-model preference
+
+- **Provider-scoped failures overflow onto the subscription.** Cooldowns
+  (`src/model-cooldown.ts`) and the capacity cache both work per provider, so a
+  single llmgateway 429 moves **every** non-DeepSeek phase onto opencode-go and
+  spends the subscription bucket on glm/mimo work. That overflow is accepted
+  for now; guarding it would mean an opencode-go restriction on models other
+  than `deepseek-v4.1-flash`.
+- **Cost moves onto the meter** for every non-DeepSeek phase.
+  `.belayd/telemetry.json` records per-`(phase, model)` rows, so the delta is
+  measurable after one workflow run.
+- **A llmgateway stall lands on the generous bucket**, not on another per-token
+  model: the `deepseek-v4.1-flash` group leads with
+  `opencode-go/deepseek-v4.1-flash` and sits last in every non-frontier class.
+
 To verify a workflow model override, use a fresh task with a workflow that has
 one. For example:
 
@@ -142,7 +177,7 @@ one. For example:
 ```
 
 The documentation workflow overrides its implement model to
-`opencode-go/deepseek-v4-flash`. Because that override does not declare a
+`llmgateway/deepseek-v4-flash`. Because that override does not declare a
 `modelClass`, its class is derived from the override model (`fast`), not copied
 from the implementer agent's default (`frontier`). The same behavior applies
 to the implement override in the `hotfix` workflow. The default feature
@@ -173,15 +208,15 @@ Alternatively, pin an explicit model instead of a class (never both):
 const customAgent: AgentDefinition = {
   name: "belayd-custom-reviewer",
   description: "Review repository changes",
-  model: "opencode-go/glm-5.3-flash",
+  model: "llmgateway/glm-5.3-flash",
   tools: ["read", "grep", "find", "ls", "ast_grep"],
   systemPrompt: "Review the changes and report actionable findings.",
 };
 ```
 
 The model arm still receives class-derived fallback for known models:
-`resolveModelSpec({ model: "opencode-go/glm-5.3-flash" })` returns
-`{ model: "opencode-go/glm-5.3-flash", modelClass: "standard" }`. An unknown
+`resolveModelSpec({ model: "llmgateway/glm-5.3-flash" })` returns
+`{ model: "llmgateway/glm-5.3-flash", modelClass: "standard" }`. An unknown
 explicit model has `modelClass: undefined` and is attempted as-is without
 class expansion. To use a fallback class for an otherwise unknown model,
 declare the `modelClass` arm instead.
@@ -197,10 +232,10 @@ primary directly):
 import { candidatesForModel, primaryModelOf, resolveModelSpec } from "belayd-agent-harness";
 
 primaryModelOf("fast");
-// "opencode-go/mimo-v2.6-flash"
+// "llmgateway/mimo-v2.6-flash"
 
 resolveModelSpec({ modelClass: "standard" });
-// { model: "opencode-go/glm-5.3-flash", modelClass: "standard" }
+// { model: "llmgateway/glm-5.3-flash", modelClass: "standard" }
 
 resolveModelSpec({ model: "vendor/x" });
 // { model: "vendor/x", modelClass: undefined }
@@ -212,14 +247,14 @@ import { candidatesForModel } from "belayd-agent-harness";
 const candidates = candidatesForModel("opencode-go/glm-5.3", "fast");
 // [
 //   "opencode-go/glm-5.3",        // requested model always comes first
-//   "opencode-go/mimo-v2.6-flash",
 //   "llmgateway/mimo-v2.6-flash",
+//   "opencode-go/mimo-v2.6-flash",
 //   "openrouter/xiaomi/mimo-v2.6-flash",
-//   "opencode-go/deepseek-v4-flash",
 //   "llmgateway/deepseek-v4-flash",
+//   "opencode-go/deepseek-v4-flash",
 //   "openrouter/deepseek/deepseek-v4-flash",
-//   "opencode-go/glm-5.3-flash",
 //   "llmgateway/glm-5.3-flash",
+//   "opencode-go/glm-5.3-flash",
 //   "openrouter/z-ai/glm-5.3-flash",
 // ]
 ```
@@ -290,6 +325,6 @@ Assume the agent defaults to model
 | absent | set | Explicit override class | The explicit class replaces the agent class, even if it differs from the agent model's implicit class. |
 | set | set | Explicit override class | The explicit class wins over both the agent class and the override model's implicit class. |
 
-For example, an implement override of `{ model: "opencode-go/glm-5.3-flash" }`
+For example, an implement override of `{ model: "llmgateway/glm-5.3-flash" }`
 passes no explicit class, so it derives `standard`; an override of
-`{ model: "opencode-go/glm-5.3-flash", modelClass: "fast" }` uses `fast` instead.
+`{ model: "llmgateway/glm-5.3-flash", modelClass: "fast" }` uses `fast` instead.
