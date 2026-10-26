@@ -121,6 +121,13 @@ export type {
   MirrorAssigneeOptions,
 } from "./beads-assignee.js";
 export { clearAssignee, isGuardMismatch, mirrorAssignee } from "./beads-assignee.js";
+export type { PhaseCommentAuthor } from "./bead-comments.js";
+export {
+  PHASE_COMMENT_PREFIX,
+  phaseCommentBody,
+  phaseCommentHeader,
+  stripBdShowComments,
+} from "./bead-comments.js";
 export type { BelaydCommandArgs, BelaydCommandArgsParse } from "./belayd-command-args.js";
 export { parseBelaydCommandArgs } from "./belayd-command-args.js";
 export type {

@@ -105,16 +105,17 @@ evidence: ...
 
 ### 5. Confirm the verdict is recorded on the bead
 
-After `belayd_commit` with a `taskId`, the verifier verdict is appended to the
-bead as a note (`appendTaskNotes` in `extensions/index.ts`). Run:
+After `belayd_commit` with a `taskId`, the verifier verdict is recorded as a
+`[belayd:proof-verifier]` bead comment (`appendPhaseDeliverables` in
+`extensions/index.ts`). Run:
 
 ```bash
-bd show <task-id>
+bd comments <task-id>
 ```
 
-and confirm the note contains the `## Verdict` / `reasonable:` / `reason:` /
-`evidence:` block alongside the userguide note. The userguide note is a pointer
-plus the agent's report: it names the committed record
+and confirm the comment contains the `## Verdict` / `reasonable:` / `reason:` /
+`evidence:` block alongside the userguide comment. The userguide comment is a
+pointer plus the agent's report: it names the committed record
 (`docs/<task-id>-userguide.md`) instead of inlining the whole guide. See
 [userguide-phase.md](userguide-phase.md).
 
@@ -150,7 +151,8 @@ uncertain:
 belayd_proof_verifier
 ```
 
-Read the verdict, then record it in the task's Final Summary and bead notes. A
+Read the verdict, then record it in the task's Final Summary; `belayd_commit`
+also records it as a `[belayd:proof-verifier]` bead comment. A
 `reasonable: false` verdict means "investigate the proof" — it never requires
 re-running the proof phase and never blocks commit.
 

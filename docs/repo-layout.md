@@ -57,6 +57,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/bd-command.ts` | Validation for `bd` (beads) commands proxied by the `bd` tool |
 | `src/beads-actor.ts` | Beads actor identity (bd-150) |
 | `src/beads-assignee.ts` | Assignee ownership mirror (bd-150) |
+| `src/bead-comments.ts` | Phase-deliverable bead comments: `[belayd:<phase>]` body header and `bd show` comment stripping |
 | `src/belayd-command-args.ts` | `/belayd` argument parsing |
 | `src/bash-timeout.ts` | Enforce a bounded timeout on every agent bash call |
 | `src/instruction-groups.ts` | Managed instruction groups for the pi system prompt |

@@ -15,8 +15,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
-// The phase-run machinery spawns sub-agents; the userguide-note test only needs
-// a deterministic result so `appendTaskNotes` has content to append.
+// The phase-run machinery spawns sub-agents; the userguide-comment test only
+// needs a deterministic result so `appendPhaseDeliverables` has content to append.
 const mockSpawnAgentProcess = vi.hoisted(() =>
   vi.fn().mockResolvedValue({
     content: [{ type: "text" as const, text: "## How to Verify\n1. Run tests\n" }],
@@ -419,7 +419,7 @@ describe("belayd_commit shell safety (bd-70)", () => {
     expect(callsFor("bd")).toEqual([]);
   });
 
-  it("appends the userguide via bd note --stdin", async () => {
+  it("records the userguide as an authored bead comment via bd comment --stdin", async () => {
     // Must satisfy the userguide quality gate, otherwise the gate appends
     // failure text and the ledger content no longer matches the spawn result.
     const userGuide = [
@@ -474,13 +474,15 @@ describe("belayd_commit shell safety (bd-70)", () => {
     mockExecFile.clear();
     await commit({ message: "feat: note", taskId: "bd-42" });
 
-    const noteCall = callsFor("bd").find((call) => call.args[0] === "note");
-    expect(noteCall?.args).toEqual(["note", "--stdin", "--", "bd-42"]);
+    const commentCall = callsFor("bd").find((call) => call.args[0] === "comment");
+    expect(commentCall?.args).toEqual(["comment", "--stdin", "--", "bd-42"]);
+    // The phase header names the authoring phase; the body travels on stdin.
+    expect(commentCall?.stdin).toContain("[belayd:userguide]");
     // The quality gate may append a summary; the body must still travel on stdin.
-    expect(noteCall?.stdin).toContain(userGuide);
+    expect(commentCall?.stdin).toContain(userGuide);
   });
 
-  it("preserves CRLF line endings verbatim on bd note --stdin", async () => {
+  it("preserves CRLF line endings verbatim on bd comment --stdin", async () => {
     const userGuideWithCrlf = [
       "## How to Verify",
       "1. Run tests",
@@ -533,9 +535,15 @@ describe("belayd_commit shell safety (bd-70)", () => {
     mockExecFile.clear();
     await commit({ message: "feat: crlf", taskId: "bd-42" });
 
-    const noteCall = callsFor("bd").find((call) => call.args[0] === "note");
-    expect(noteCall).toBeDefined();
-    expect(noteCall?.stdin).toContain("## How to Verify\r\n1. Run tests");
+    const commentCall = callsFor("bd").find((call) => call.args[0] === "comment");
+    expect(commentCall).toBeDefined();
+    // The whole report block survives verbatim: a normalising writer would
+    // collapse these CRLF pairs into bare LFs and break the contiguous match.
+    const stdin = commentCall?.stdin ?? "";
+    expect(stdin).toContain(userGuideWithCrlf);
+    // Every CRLF pair is the phase's own (the gate verdict appended after it is
+    // LF-only), so a single collapsed pair would change the count.
+    expect(stdin.match(/\r\n/g)?.length ?? 0).toBe(userGuideWithCrlf.match(/\r\n/g)?.length ?? 0);
   });
 
   it("removes the temp message file even when git commit throws", async () => {

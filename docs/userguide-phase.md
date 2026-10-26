@@ -20,11 +20,11 @@ gone, and even a successful note was visible only via `bd show <id>`.
 | Piece | Behaviour |
 |---|---|
 | Agent tools | `belayd-userguide` has `read`, `write`, `edit`, `grep`, `find`, `ls`, `bash`, `ast_grep`, `belayd_outline`, `web_search_exa`, `web_fetch_exa`. |
-| Deliverable | `docs/<task-id>-userguide.md` (`userGuideDocPath` in `src/quality-gates.ts`). The path is derived from the bead id, never chosen by the agent, so the prompt, the gate, the follow-up, and the bead note agree. |
+| Deliverable | `docs/<task-id>-userguide.md` (`userGuideDocPath` in `src/quality-gates.ts`). The path is derived from the bead id, never chosen by the agent, so the prompt, the gate, the follow-up, and the bead comment agree. |
 | Prompt | `buildFullPhaseTask` appends a `## Deliverable` block naming the exact path and stating that the file, not the chat answer, is the record. |
 | Gate | `gateUserGuide` receives `userGuidePath` through `GateOptions` and validates the file on disk: both sections plus the 200-char minimum. A missing file fails with `Missing user guide file: <path>`. A path that resolves outside the worktree fails closed (`escapes the worktree`). Without `userGuidePath` the gate keeps the legacy chat-text contract for direct callers. |
 | Run follow-up | The `belayd-run-complete` message is prefixed with `📄 **User guide written to `docs/<id>-userguide.md`**` when the file exists (`userGuideArtifactLine`). |
-| Bead note | `belayd_commit` still appends a note, now headed by the record path (`userGuideNoteBody`); it says `(no guide file found in the worktree …)` instead of naming a file that does not exist. |
+| Bead comment | `belayd_commit` records the guide as an authored `bd comment`, headed by the `[belayd:userguide]` phase tag and by the record path (`userGuideCommentBody`); it says `(no guide file found in the worktree …)` instead of naming a file that does not exist. |
 | Proof context | `collectChangeContext` gets the guide read **from disk** (`readUserGuideForContext`), so `## How to Verify` still reaches the advisory verifier even though the agent's chat report is now short. |
 | Scope | `userguide` stays a **feature-only** phase (`src/workflow-registry.ts`); `bugfix`, `refactor`, `chore`, `hotfix`, `documentation`, and `research` do not include it. |
 
@@ -71,7 +71,7 @@ Run from the repo root in the devShell.
    head -3 docs/bd-99-userguide.md           # level-1 title naming the feature
    grep -n '^## How to Verify' docs/bd-99-userguide.md
    grep -n '^## How to Use'    docs/bd-99-userguide.md
-   bd show bd-99                             # NOTES names docs/bd-99-userguide.md
+   bd show bd-99                             # COMMENTS has the [belayd:userguide] entry naming docs/bd-99-userguide.md
    ```
 
    The `belayd_userguide` run-complete follow-up in the session also shows
@@ -126,7 +126,9 @@ Writing a guide by hand for a bead that skipped the phase (`chore`, `hotfix`,
 ```bash
 mkdir -p docs
 $EDITOR docs/bd-77-userguide.md   # level-1 title, then ## How to Verify / ## How to Use
-bd note bd-77 --stdin <<'EOF'
+bd comment bd-77 --stdin <<'EOF'
+[belayd:userguide]
+
 ## User guide
 
 `docs/bd-77-userguide.md` — How to Verify and How to Use.

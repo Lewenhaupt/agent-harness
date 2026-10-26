@@ -12,6 +12,7 @@ import {
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
 } from "../agent-registry.js";
+import { phaseCommentHeader } from "../bead-comments.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
 import { PROOF_ARTIFACT_EXTENSIONS } from "../proof-verification.js";
 import { REVIEW_OUTPUT_CONTRACT } from "../review-context.js";
@@ -459,9 +460,11 @@ describe("RESEARCHER_SYSTEM_PROMPT", () => {
     expect(RESEARCHER_SYSTEM_PROMPT).toContain("planning mode");
   });
 
-  it("tells the researcher to record notes via the stdin parameter", () => {
-    expect(RESEARCHER_SYSTEM_PROMPT).toContain("--stdin");
-    expect(RESEARCHER_SYSTEM_PROMPT).toContain("stdin");
+  it("tells the researcher to record findings as a phase-tagged bead comment", () => {
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain("comment <task-id> --stdin");
+    // The prose must emit the union member exactly; the helper is the source.
+    expect(RESEARCHER_SYSTEM_PROMPT).toContain(phaseCommentHeader("research"));
+    expect(RESEARCHER_SYSTEM_PROMPT).not.toContain("note <task-id> --stdin");
   });
 
   it("tells the researcher bash is for inspecting CLI tools, not editing", () => {

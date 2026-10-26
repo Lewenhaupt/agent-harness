@@ -447,6 +447,46 @@ describe("/belayd implement-first workflow (bd-51)", () => {
     expect(first.task).toContain("Plan text here");
   });
 
+  it("keeps deliverable comments out of the implement phase prompt", async () => {
+    // Deliverables are recorded as bead comments; `bd show` prints the thread,
+    // so the plan reader must drop it or every phase prompt grows forever.
+    mockExecFile.setShowOutput(
+      [
+        "DESCRIPTION",
+        "",
+        "  Plan text here",
+        "",
+        "COMMENTS",
+        "  2026-10-26 10:00 Hugo",
+        "",
+        "      [belayd:userguide]",
+        "",
+        "      ## User guide",
+      ].join("\n"),
+    );
+    const { api, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx(cwd);
+    const start = tools.get("belayd_start_task");
+    expect(start).toBeDefined();
+    await start?.execute("call-start", { taskId: "bd-42" }, undefined, undefined, ctx);
+
+    const impl = tools.get("belayd_implement");
+    expect(impl).toBeDefined();
+    await impl?.execute("call-1", { task: "implement plan" }, undefined, undefined, ctx);
+
+    await vi.waitFor(() => {
+      expect(spawnCalls.calls.length).toBeGreaterThan(0);
+    });
+
+    const first = spawnCalls.calls[0] as { task?: string };
+    expect(first.task).toContain("Plan text here");
+    expect(first.task).not.toContain("[belayd:userguide]");
+    expect(first.task).not.toContain("## User guide");
+  });
+
   it("routes bd show through execFile argv and never the shell", async () => {
     // isValidTaskId rejects shell metacharacters, so the security property is
     // that the shell (exec) path is never used for bd at all.

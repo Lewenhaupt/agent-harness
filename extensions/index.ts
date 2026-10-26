@@ -75,6 +75,7 @@ import type {
   OutlineKind,
   OwnedWorktreeResult,
   Phase,
+  PhaseCommentAuthor,
   QualityGate,
   RunDelivery,
   RunHandle,
@@ -221,6 +222,7 @@ import {
   parseSubagentSessionName,
   parseWorkflowLabel,
   pauseFleet,
+  phaseCommentBody,
   planFleetAdvance,
   planFleetTick,
   RESEARCHER_SYSTEM_PROMPT,
@@ -274,6 +276,7 @@ import {
   spawnDetachedRun,
   startFleetRun,
   stopMemberSession,
+  stripBdShowComments,
   taskIdFromBranch,
   updateFleetIntent,
   userGuideDocPath,
@@ -1019,14 +1022,14 @@ function abortAndResetRunTracking(state: SessionState): void {
  * Human-readable phase description, workflow-aware.
  *
  * In research workflows the "plan" phase is overridden to the research agent,
- * which records findings as a bead note — it never writes an implementation
- * plan file. Label it accordingly; otherwise the orchestrator reads "create
- * implementation plan" and re-delegates `belayd_plan` to force a research .md
- * file that the researcher contract explicitly forbids.
+ * which records findings as a `[belayd:research]` bead comment — it never writes
+ * an implementation plan file. Label it accordingly; otherwise the orchestrator
+ * reads "create implementation plan" and re-delegates `belayd_plan` to force a
+ * research .md file that the researcher contract explicitly forbids.
  */
 function describePhase(phase: string, workflowType: WorkflowSubType): string {
   if (workflowType === "research" && phase === "plan") {
-    return "Research the question and record findings as a bead note (never a .md file)";
+    return "Research the question and record findings as a bead comment (never a .md file)";
   }
   const descriptions: Record<string, string> = {
     scout: "Fast codebase recon — returns structured findings",
@@ -2124,14 +2127,14 @@ export default function belaydAgentHarness(
     }
 
     // Research workflows: the plan phase is the research agent — it records
-    // findings as a bead note (not a .md file). Create follow-up tasks before
-    // committing so they're included in the final commit.
+    // findings as a `[belayd:research]` bead comment (not a .md file). Create
+    // follow-up tasks before committing so they're included in the final commit.
     if (type === "research") {
       lines.push(
         "",
         "**Research deliverable:**",
-        "- `belayd_plan` is the research agent. Pass it the task ID and the research question; it records findings as a bead note (never a research .md file).",
-        "- The deliverable is the bead note — NOT a committed file. Do not re-delegate `belayd_plan` to write a research .md file, and do not expect `belayd_commit` to commit one.",
+        "- `belayd_plan` is the research agent. Pass it the task ID and the research question; it records findings as a bead comment tagged `[belayd:research]` (never a research .md file).",
+        "- The deliverable is the bead comment — NOT a committed file. Do not re-delegate `belayd_plan` to write a research .md file, and do not expect `belayd_commit` to commit one.",
         "",
         "**Before `belayd_commit`:**",
         '- Create follow-up implementation tasks with the `bd` tool (e.g. `bd create --title="..." --type=task`) for any action items uncovered.',
@@ -2607,8 +2610,11 @@ export default function belaydAgentHarness(
   }
 
   /**
-   * Read a bead's full plain-text content via `bd show <taskId>`.
-   * Returns undefined on error so callers can proceed without the plan.
+   * Read a bead's plan via `bd show <taskId>`: description, design, notes and
+   * relations only. The COMMENTS thread is dropped because deliverables land
+   * there and would otherwise grow every later phase prompt without bound (and
+   * can carry secrets). Returns undefined on error so callers can proceed
+   * without the plan.
    */
   async function readTaskPlan(taskId: string, cwd: string): Promise<string | undefined> {
     try {
@@ -2618,7 +2624,7 @@ export default function belaydAgentHarness(
         timeoutInMs: 15_000,
         maxBufferInBytes: 1024 * 1024,
       });
-      return stdout.trim() || undefined;
+      return stripBdShowComments(stdout).trim() || undefined;
     } catch {
       return undefined;
     }
@@ -4072,7 +4078,7 @@ export default function belaydAgentHarness(
       "**Proof verifier** (after `belayd_proof`):",
       "- Call `belayd_proof_verifier` when proof relevance or quality is uncertain.",
       "- It is ADVISORY and non-blocking: a `reasonable: false` verdict is worth investigating, but never blocks the commit phase.",
-      "- Record the verdict in the task's Final Summary and bead notes.",
+      "- Record the verdict in the task's Final Summary; the commit phase also records it as a `[belayd:proof-verifier]` bead comment.",
     ];
   }
 
@@ -4112,7 +4118,7 @@ export default function belaydAgentHarness(
       (p) => `- \`belayd_${p}\` — ${describePhase(p, workflowType)}`,
     );
 
-    // Research workflows record findings as a bead note — there is no research
+    // Research workflows record findings as a bead comment — there is no research
     // .md file to write and no committed-file deliverable. State this every
     // turn, not just at workflow start, because the orchestrator otherwise
     // re-delegates `belayd_plan` to force a research .md file that the
@@ -4121,7 +4127,7 @@ export default function belaydAgentHarness(
       workflowType === "research"
         ? [
             "",
-            "RESEARCH workflow: the `plan` phase is the research agent. Its deliverable is a bead note (via `bd note`) — NOT a committed file or research .md document. Do not re-delegate to write a research file.",
+            "RESEARCH workflow: the `plan` phase is the research agent. Its deliverable is a bead comment tagged `[belayd:research]` (via `bd comment <id> --stdin`) — NOT a committed file or research .md document. Do not re-delegate to write a research file.",
           ]
         : [];
 
@@ -9008,19 +9014,30 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
   }
 
-  /** Append a note to a task's notes field; best-effort and non-blocking. */
-  async function appendTaskNote(taskId: string, content: string, cwd: string): Promise<void> {
+  /**
+   * Append a phase-deliverable comment to a task; best-effort and non-blocking.
+   *
+   * Deliverables go to the comment thread (authored + timestamped + ordered)
+   * rather than the notes blob, which is reserved for the plan that later phase
+   * prompts read back.
+   */
+  async function appendTaskComment(options: {
+    taskId: string;
+    phase: PhaseCommentAuthor;
+    content: string;
+    cwd: string;
+  }): Promise<void> {
     try {
       // Piping via `--stdin` keeps the body out of argv and avoids a temp file
       // that could leak if the process dies mid-append.
-      await runBdCommand(["note", "--stdin", "--", taskId], {
-        cwd,
-        stdin: content,
+      await runBdCommand(["comment", "--stdin", "--", options.taskId], {
+        cwd: options.cwd,
+        stdin: phaseCommentBody(options.phase, options.content),
         timeoutInMs: 15_000,
         maxBufferInBytes: 1024 * 1024,
       });
     } catch {
-      // Best-effort: don't block commit on note append failure
+      // Best-effort: don't block commit on comment append failure
     }
   }
 
@@ -9130,27 +9147,41 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
   }
 
-  /** Append userguide + proof-verifier verdict notes (best-effort). */
-  async function appendTaskNotes(taskId: string, state: SessionState, cwd: string): Promise<void> {
+  /** Append userguide + proof-verifier deliverable comments (best-effort). */
+  async function appendPhaseDeliverables(
+    taskId: string,
+    state: SessionState,
+    cwd: string,
+  ): Promise<void> {
     if (state.userGuideContent && state.phaseOrder.includes("userguide")) {
-      await appendTaskNote(
+      await appendTaskComment({
         taskId,
-        userGuideNoteBody({ cwd, taskId: state.currentTaskId, report: state.userGuideContent }),
+        phase: "userguide",
+        content: userGuideCommentBody({
+          cwd,
+          taskId,
+          report: state.userGuideContent,
+        }),
         cwd,
-      );
+      });
     }
     if (state.proofVerifierVerdict) {
-      await appendTaskNote(taskId, state.proofVerifierVerdict, cwd);
+      await appendTaskComment({
+        taskId,
+        phase: "proof-verifier",
+        content: state.proofVerifierVerdict,
+        cwd,
+      });
     }
   }
 
   /**
-   * Bead note for the userguide phase: a stable pointer to the committed guide
-   * plus the agent's own report. The pointer is emitted on its own line so
-   * `bd show` names the record even when the report is only a summary, and it
+   * Bead comment body for the userguide phase: a stable pointer to the committed
+   * guide plus the agent's own report. The pointer is emitted on its own line so
+   * the thread names the record even when the report is only a summary, and it
    * is omitted when no file was written rather than claiming one that is absent.
    */
-  function userGuideNoteBody(options: { cwd: string; taskId: string; report: string }): string {
+  function userGuideCommentBody(options: { cwd: string; taskId: string; report: string }): string {
     const docPath = userGuideDocPath(options.taskId);
     const wroteFile = existsSync(resolve(options.cwd, docPath));
     const pointer = wroteFile
@@ -9164,7 +9195,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     return `Invalid task id: ${taskId}. Expected a beads id like "bd-42" or "bd-42.1" (letters/digits after "bd-", dot-separated segments).`;
   }
 
-  /** Flag a task for human review and append its notes, when a task id was given. */
+  /** Flag a task for human review and record its deliverables, when a task id was given. */
   async function maybeFlagTaskForHumanReview(
     taskId: string | undefined,
     state: SessionState,
@@ -9172,7 +9203,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   ): Promise<void> {
     if (taskId === undefined) return;
     await flagForHumanReview(taskId, cwd);
-    await appendTaskNotes(taskId, state, cwd);
+    await appendPhaseDeliverables(taskId, state, cwd);
   }
 
   /**
