@@ -6,9 +6,13 @@
  * gets a mocked `node:child_process`.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { WorktreeBranch } from "../owned-worktree.js";
 import {
+  adoptableWorktreeTaskId,
   assertOwnedWorktree,
   formatWorktreePreamble,
   isSameOrDescendantTask,
@@ -301,6 +305,103 @@ describe("readWorktreeBranch", () => {
       reason: "unavailable",
       error: "not a git repository",
     });
+  });
+
+  it("reports the branch a rebase in progress is replaying", () => {
+    // A rebase checks out the onto-commit detached, so `--show-current` prints
+    // nothing; the branch being replayed is the worktree's identity.
+    const gitDir = mkdtempSync(join(tmpdir(), "belayd-rebase-merge-"));
+    const rebaseDir = join(gitDir, "rebase-merge");
+    mkdirSync(rebaseDir, { recursive: true });
+    const headName = join(rebaseDir, "head-name");
+    writeFileSync(headName, "refs/heads/feat/bd-42\n", "utf8");
+    try {
+      mockExecFileSync.mockReset();
+      mockExecFileSync.mockImplementation((_file: string, args: readonly string[]) =>
+        args[0] === "branch" ? "\n" : `${headName}\n`,
+      );
+
+      expect(readWorktreeBranch("/repo/feat-bd-42")).toEqual({ ok: true, branch: "feat/bd-42" });
+    } finally {
+      rmSync(gitDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the patch-based rebase state file", () => {
+    const gitDir = mkdtempSync(join(tmpdir(), "belayd-rebase-apply-"));
+    const rebaseDir = join(gitDir, "rebase-apply");
+    mkdirSync(rebaseDir, { recursive: true });
+    const headName = join(rebaseDir, "head-name");
+    writeFileSync(headName, "refs/heads/feat/bd-7\n", "utf8");
+    try {
+      mockExecFileSync.mockReset();
+      mockExecFileSync.mockImplementation((_file: string, args: readonly string[]) => {
+        if (args[0] === "branch") return "\n";
+        // Only the apply backend has a state file here.
+        return args[2]?.startsWith("rebase-apply") === true ? headName : "";
+      });
+
+      expect(readWorktreeBranch("/repo/feat-bd-7")).toEqual({ ok: true, branch: "feat/bd-7" });
+    } finally {
+      rmSync(gitDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stays detached when a detached HEAD has no rebase state", () => {
+    mockExecFileSync.mockReset();
+    mockExecFileSync.mockImplementation((_file: string, args: readonly string[]) =>
+      args[0] === "branch" ? "\n" : "",
+    );
+
+    expect(readWorktreeBranch("/repo/detached")).toEqual({ ok: false, reason: "detached" });
+  });
+});
+
+describe("adoptableWorktreeTaskId", () => {
+  function options(overrides: Partial<Parameters<typeof adoptableWorktreeTaskId>[0]> = {}) {
+    return {
+      currentTaskId: "",
+      gateActive: false,
+      handedOff: false,
+      branch: onBranch("feat/bd-42"),
+      persisted: undefined,
+      ...overrides,
+    };
+  }
+
+  it("adopts the bead on the worktree branch after a completed workflow", () => {
+    // Workflow completion deleted workflow.json and a restart cleared the
+    // in-memory id: the branch is the surviving record (bd-144).
+    expect(adoptableWorktreeTaskId(options())).toBe("bd-42");
+  });
+
+  it("adopts a sub-bead on its own branch", () => {
+    expect(adoptableWorktreeTaskId(options({ branch: onBranch("feat/bd-42.1") }))).toBe("bd-42.1");
+  });
+
+  it("never overrides an id the session already holds", () => {
+    expect(adoptableWorktreeTaskId(options({ currentTaskId: "bd-9" }))).toBeUndefined();
+  });
+
+  it("never overrides an armed gate", () => {
+    expect(adoptableWorktreeTaskId(options({ gateActive: true }))).toBeUndefined();
+  });
+
+  it("never overrides a handoff to a child orchestrator", () => {
+    expect(adoptableWorktreeTaskId(options({ handedOff: true }))).toBeUndefined();
+  });
+
+  it("never adopts over live workflow state in the directory", () => {
+    expect(
+      adoptableWorktreeTaskId(options({ persisted: workflowState("bd-99", "feat/bd-99") })),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined when the branch names no bead", () => {
+    expect(adoptableWorktreeTaskId(options({ branch: onBranch("feat/review-surface") }))).toBe(
+      undefined,
+    );
+    expect(adoptableWorktreeTaskId(options({ branch: detached }))).toBeUndefined();
   });
 });
 

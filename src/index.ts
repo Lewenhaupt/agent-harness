@@ -783,6 +783,7 @@ export type {
 } from "./outline-extract.js";
 export { extractOutlineSymbols } from "./outline-extract.js";
 export type {
+  AdoptableTaskIdOptions,
   AssertOwnedWorktreeOptions,
   MatchOwnedWorktreeOptions,
   OwnedWorktreeResult,
@@ -791,6 +792,7 @@ export type {
   WorktreeBranch,
 } from "./owned-worktree.js";
 export {
+  adoptableWorktreeTaskId,
   assertOwnedWorktree,
   formatWorktreePreamble,
   isSameOrDescendantTask,

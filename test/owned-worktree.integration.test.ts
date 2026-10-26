@@ -193,6 +193,28 @@ describe("owned worktree preflight (integration)", () => {
     expect(runManifests(worktreeB)).toEqual([]);
   });
 
+  it("reports the branch a real rebase in progress is replaying", () => {
+    // Real git: a conflicted rebase detaches HEAD, and `branch --show-current`
+    // then prints nothing. The worktree still belongs to feat/bd-a, which is
+    // what ownership and run naming must use (bd-144).
+    commit(worktreeA, "conflict.txt", "ours\n", "ours");
+    commit(repo, "conflict.txt", "theirs\n", "theirs");
+    expect(() => git(["rebase", "main"], worktreeA)).toThrow();
+    try {
+      expect(git(["branch", "--show-current"], worktreeA)).toBe("");
+      expect(readWorktreeBranch(worktreeA)).toEqual({ ok: true, branch: "feat/bd-a" });
+      expect(
+        assertOwnedWorktree({
+          cwd: worktreeA,
+          taskId: "bd-a",
+          branch: readWorktreeBranch(worktreeA),
+        }),
+      ).toEqual({ ok: true, branch: "feat/bd-a" });
+    } finally {
+      git(["rebase", "--abort"], worktreeA);
+    }
+  });
+
   it("refuses a session with no active task in another task's live worktree", async () => {
     const mod = await import("../extensions/index.js");
     const { api, tools } = createMockPi();

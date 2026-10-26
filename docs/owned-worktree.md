@@ -30,6 +30,7 @@ bd-119 makes that identity a hard precondition:
 | `belayd_commit` | no branch/task identity check | refuses before staging on task or branch mismatch |
 | `belayd_plan_scout`, `belayd_plan_research` | silently fell back to `process.cwd()` (`/` in pi-web session processes) | hard error when the session has no working directory |
 | Phase sub-agent prompt | bead plan only | prefix `Your worktree is <path> on <branch>; writing elsewhere is a bug, not a workaround.` |
+| Resumed session whose workflow already finished | every phase tool threw `taskId must be a non-empty string` (empty in-memory id, `workflow.json` deleted at completion) | adopts the bead from the worktree branch (rebase included); a named refusal when nothing resolves |
 
 ## What an operator sees now
 
@@ -109,8 +110,8 @@ pnpm vitest run src/__tests__/extension-session-naming.test.ts -t "another task"
 pnpm vitest run --config vitest.integration.config.ts test/owned-worktree.integration.test.ts
 ```
 
-Expected: `24 passed`, `3 passed | 23 skipped`, `2 passed | 58 skipped`, and
-`3 passed`.
+Expected: `34 passed`, `3 passed | 23 skipped`, `2 passed | 65 skipped`, and
+`4 passed`.
 
 What each pins:
 
@@ -119,11 +120,12 @@ What each pins:
 | `src/__tests__/owned-worktree.test.ts` → `matchOwnedWorktree` (match / foreign task / branch mismatch / no workflow.json / detached HEAD / unreadable repo / legacy empty branch) | the pure matcher and every message shape |
 | same file → `isSameOrDescendantTask` | sub-bead accepted, parent from a sub-bead session refused, `bd-42x` / `bd-42.` refused |
 | same file → `matchSessionOwnedWorktree` | gate-off rework allowed, foreign live workflow refused, unknown branch tolerated |
-| same file → `readWorktreeBranch`, `formatWorktreePreamble` | detached vs unavailable distinction; preamble wording and branch-clause omission |
+| same file → `readWorktreeBranch`, `formatWorktreePreamble` | detached vs unavailable distinction, rebase-in-progress branch resolution (`rebase-merge` and `rebase-apply`); preamble wording and branch-clause omission |
+| same file → `adoptableWorktreeTaskId` | a restarted session adopts the branch's bead; never over a held id, armed gate, handoff, or live `workflow.json`; `undefined` when the branch names no bead |
 | `src/__tests__/extension-commit-tool.test.ts` → `refuses to stage a tree whose branch is not the workflow branch`, `refuses to commit another task's id from a pinned session`, `refuses a stale workflow branch even when no task id is supplied` | `belayd_commit` refuses **and** `git add` / `git commit` are never invoked |
 | same file → `allows a sub-bead taskId from the parent session` | `bd-42.1` from a `bd-42` session still commits |
-| `src/__tests__/extension-session-naming.test.ts` → `refuses a phase whose workflow.json belongs to another task (W1)`, `refuses to review when workflow.json belongs to another task (bd-113)` | phase tools refuse a foreign `workflow.json`; `mockSpawnAgentProcess` is not called and the foreign ledger is untouched |
-| `test/owned-worktree.integration.test.ts` | two real linked worktrees: a session that owns A gets `exitCode 1` when the tool is invoked with `cwd = B`, **both** trees show empty `git status --porcelain`, and `.belayd/runs` is empty in both |
+| `src/__tests__/extension-session-naming.test.ts` → `refuses a phase whose workflow.json belongs to another task (W1)`, `refuses to review when workflow.json belongs to another task (bd-113)`, `adopts the worktree branch's bead after a restart… (bd-144)`, `refuses a phase run with a named reason when no bead can be derived (bd-144)` | phase tools refuse a foreign `workflow.json`; a restarted completed-workflow session runs again under its real bead id (and no `workflow.json` is resurrected); a session with no derivable id gets a named refusal, no spawn, and no raw internal error |
+| `test/owned-worktree.integration.test.ts` | two real linked worktrees: a session that owns A gets `exitCode 1` when the tool is invoked with `cwd = B`, **both** trees show empty `git status --porcelain`, and `.belayd/runs` is empty in both; a real conflicted rebase still reports its branch and passes the ownership check |
 
 ### 2. Manual scratch repro (two worktrees, no pi session needed)
 
@@ -280,6 +282,7 @@ pnpm test && pnpm test:integration && pnpm typecheck && pnpm lint && pnpm build
 | `this session is in detached HEAD — check out <branch> in <cwd>` | `git -C <cwd> switch <branch>`. |
 | `could not read the branch here (…)` | The directory is not a git checkout (or git is missing): run from a checkout of the recorded branch. |
 | `<task> owns <cwd> … run this phase from your own worktree` | This session has no active task but sits in another bead's worktree: start that bead here or move to your own tree. |
+| `<tool> needs a bead id for its run, and this session has none …` | No workflow state and no bead on the branch: `belayd_start_task <taskId>` here, or check out the bead's branch (`feat/bd-42`) and retry. |
 
 Stacked follow-up work belongs in `belayd_start_followup <taskId>` (stacks on the
 current branch, records base + fork point, rebased later with
@@ -291,6 +294,26 @@ Post-completion rework is still allowed: with the gate off (`belayd_stop_task`)
 and no `.belayd/workflow.json` at `cwd`, a phase call in that directory passes.
 Any workflow file that *is* present still pins the tree to its owner, even for a
 gate-off or task-less session.
+
+That allowance needs a bead id to name the run (`belayd-<taskId>-sub-<phase>-…`,
+run metrics, the scoped review diff). Completing a workflow deletes
+`workflow.json`, and a pi-web restart clears the in-memory id, so a resumed
+orchestrator used to come back with **no** identity: every phase tool then failed
+inside subagent session naming with the raw `taskId must be a non-empty string`
+(bd-144). A phase call now adopts the bead from the worktree branch
+(`feat/bd-42` → `bd-42`) when the session holds no id, the gate is off, there is
+no handoff, and no live `workflow.json` is present. The adopted id is used for the
+run only: the gate stays off, so no phase state and no `workflow.json` reappear.
+
+A mid-rebase worktree is covered too. `git rebase` checks out the onto-commit
+detached, so `git branch --show-current` prints nothing; `readWorktreeBranch`
+therefore falls back to `rebase-merge/head-name` (or `rebase-apply/head-name`) and
+reports the branch being replayed — which is also what ownership checks compare,
+instead of refusing with "this session is in detached HEAD — check out <branch>"
+while that branch *is* the checkout's branch.
+
+When nothing resolves the id (a branch that names no bead, no workflow state), the
+phase tool refuses before any run, naming the recovery instead of throwing.
 
 ### Sub-bead commits
 
