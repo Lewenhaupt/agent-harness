@@ -553,6 +553,7 @@ describe("extension session naming (bd-10)", () => {
     mockHttpRequest.mockClear();
     mockExec.mockClear();
     mockExecFile.clear();
+    mockExecFile.setArgHandler(null);
     setExecToFail();
     mockRequestResponses.clear();
     // Reset default sessions response to empty
@@ -690,6 +691,93 @@ describe("extension session naming (bd-10)", () => {
       );
       // scout matches sess-1 + sess-2, plan matches sess-3, commit matches none.
       expect(compactCalls.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it("clears a harness assignee when the workflow completes (bd-150)", async () => {
+      const { api, tools, eventHandlers, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+
+      const startTask = tools.get("belayd_start_task");
+      await startTask?.execute(
+        "call-1",
+        { taskId: "bd-42", workflowType: "research" },
+        undefined,
+        undefined,
+        bd10Ctx(),
+      );
+
+      const ctx = bd10Ctx();
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+      await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
+      await runCommitTool(tools, ctx);
+
+      // Completion is a workflow end, so the bead must not stay assigned to the
+      // harness actor afterwards.
+      mockExecFile.clear();
+      mockExecFile.setMode("succeed");
+      mockExecFile.setArgHandler((file, args) => {
+        if (file !== "bd" || args[0] !== "show") return undefined;
+        return {
+          stdout: JSON.stringify([{ id: "bd-42", assignee: "belayd:bd-42:orchestrator" }]),
+        };
+      });
+
+      const agentEndHandler = eventHandlers.get("agent_end");
+      await agentEndHandler?.({}, ctx);
+
+      const bdCalls = mockExecFile.calls.filter((call) => call.file === "bd");
+      expect(bdCalls.map((call) => [...call.args])).toEqual([
+        ["show", "bd-42", "--json"],
+        [
+          "update",
+          "--actor",
+          "belayd:bd-42:orchestrator",
+          "--if-assignee",
+          "belayd:bd-42:orchestrator",
+          "--assignee",
+          "",
+          "--",
+          "bd-42",
+        ],
+      ]);
+    });
+
+    it("leaves a human assignment alone when the workflow completes (bd-150)", async () => {
+      // A human who picked the bead outranks the harness, so completion must not
+      // write at all — the same rule fleet-accept.test.ts pins for acceptance.
+      const { api, tools, eventHandlers, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+
+      const startTask = tools.get("belayd_start_task");
+      await startTask?.execute(
+        "call-1",
+        { taskId: "bd-42", workflowType: "research" },
+        undefined,
+        undefined,
+        bd10Ctx(),
+      );
+
+      const ctx = bd10Ctx();
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+      await runPhaseToolAndWait(tools, "belayd_plan", messages, ctx);
+      await runCommitTool(tools, ctx);
+
+      mockExecFile.clear();
+      mockExecFile.setMode("succeed");
+      mockExecFile.setArgHandler((file, args) => {
+        if (file !== "bd" || args[0] !== "show") return undefined;
+        return { stdout: JSON.stringify([{ id: "bd-42", assignee: "Hugo Lewenhaupt" }]) };
+      });
+
+      const agentEndHandler = eventHandlers.get("agent_end");
+      await agentEndHandler?.({}, ctx);
+
+      const updateCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "update",
+      );
+      expect(updateCalls).toEqual([]);
     });
 
     it("handles empty sessions list gracefully", async () => {

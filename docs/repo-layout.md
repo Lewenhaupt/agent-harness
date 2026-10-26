@@ -55,6 +55,8 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/chdir-guard.ts` | Guard for restoring a session's working directory |
 | `src/argv.ts` | Minimal POSIX-ish argv tokenizer, shared by the `bd` tool and `/belayd` |
 | `src/bd-command.ts` | Validation for `bd` (beads) commands proxied by the `bd` tool |
+| `src/beads-actor.ts` | Beads actor identity (bd-150) |
+| `src/beads-assignee.ts` | Assignee ownership mirror (bd-150) |
 | `src/belayd-command-args.ts` | `/belayd` argument parsing |
 | `src/bash-timeout.ts` | Enforce a bounded timeout on every agent bash call |
 | `src/instruction-groups.ts` | Managed instruction groups for the pi system prompt |
@@ -159,6 +161,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `docs/planning-implement-workflows.md` | `/plan` vs `/belayd`, gate behaviour, tool sets per mode |
 | `docs/owned-worktree.md` | bead ↔ branch ↔ worktree ownership preflight |
 | `docs/bash-timeout.md` | per-call bash timeout clamp |
+| `docs/beads-actor.md` | beads actor identity (`--actor` / `BEADS_ACTOR`) and assignee ownership mirror |
 | `docs/instruction-groups.md` | managed prompt sections (browser instructions) |
 | `docs/model-capacity-and-telemetry.md` | capacity probing, cooldowns, per-phase telemetry |
 | `docs/artifacts.md` | per-phase worktree artifacts and how a phase prompt references them |

@@ -635,6 +635,74 @@ describe("launchAgentProcess env (W5)", () => {
   });
 });
 
+describe("launchAgentProcess BEADS_ACTOR (bd-150)", () => {
+  /** env handed to the most recent spawn, i.e. the child's effective env. */
+  function lastSpawnEnv(): NodeJS.ProcessEnv {
+    const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+    return (callArgs[2] as { env: NodeJS.ProcessEnv }).env;
+  }
+
+  /** Run one launch with the inherited BEADS_ACTOR removed, restoring it after. */
+  async function withInheritedActorAbsent(run: () => Promise<void>): Promise<void> {
+    const inherited = process.env.BEADS_ACTOR;
+    delete process.env.BEADS_ACTOR;
+    try {
+      await run();
+    } finally {
+      if (inherited !== undefined) process.env.BEADS_ACTOR = inherited;
+    }
+  }
+
+  it("derives the actor from a phase session name so raw bash bd calls are attributed", async () => {
+    await withInheritedActorAbsent(async () => {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        sessionName: "belayd-bd-42-sub-implement-run1",
+      };
+      const handle = mod.launchAgentProcess(options, mod.buildSpawnArgs(options));
+      expect(lastSpawnEnv().BEADS_ACTOR).toBe("belayd:bd-42:implement");
+      handle.cleanup();
+    });
+  });
+
+  it("leaves the inherited value alone when the session name resolves to no actor", async () => {
+    await withInheritedActorAbsent(async () => {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        sessionName: "belayd-planning-sub-scout-abc123",
+      };
+      const handle = mod.launchAgentProcess(options, mod.buildSpawnArgs(options));
+      expect(lastSpawnEnv()).not.toHaveProperty("BEADS_ACTOR");
+      handle.cleanup();
+    });
+  });
+
+  it("lets an explicit options.env.BEADS_ACTOR win", async () => {
+    await withInheritedActorAbsent(async () => {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        sessionName: "belayd-bd-42-sub-implement-run1",
+        env: { BEADS_ACTOR: "custom:actor" },
+      };
+      const handle = mod.launchAgentProcess(options, mod.buildSpawnArgs(options));
+      expect(lastSpawnEnv().BEADS_ACTOR).toBe("custom:actor");
+      handle.cleanup();
+    });
+  });
+});
+
 describe("collectSpawnResult (bd-41)", () => {
   it("flushes a trailing partial stdout line on close", async () => {
     const mod = await import("../spawn.js");

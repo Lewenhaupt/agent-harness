@@ -70,7 +70,15 @@ describe("acceptLandedMember", () => {
 
     expect(result).toMatchObject({ ok: true, beadClosed: true, worktreeRemoved: true });
     expect(bdCalls.map((call) => [...call.argv])).toEqual([
-      ["close", "bd-12", "--reason", "merged into main via belayd_fleet_merge"],
+      ["show", "bd-12", "--json"],
+      [
+        "close",
+        "--actor",
+        "belayd:bd-12:orchestrator",
+        "bd-12",
+        "--reason",
+        "merged into main via belayd_fleet_merge",
+      ],
     ]);
     expect(calls.map((call) => [...call.argv])).toEqual([
       ["worktree", "remove", "/repo.feat-bd-12"],
@@ -87,6 +95,72 @@ describe("acceptLandedMember", () => {
     expect(result).toMatchObject({ ok: true, beadClosed: false });
     expect(bdCalls).toEqual([]);
     expect(result.ok ? result.warnings : []).toEqual([]);
+  });
+
+  it("clears a harness assignee before closing the bead", async () => {
+    const calls: Call[] = [];
+    const bdCalls: Call[] = [];
+    const result = await acceptLandedMember(
+      baseOptions({
+        calls,
+        bdCalls,
+        bdStdout: (argv) =>
+          argv[0] === "show"
+            ? JSON.stringify([{ id: "bd-12", assignee: "belayd:bd-12:orchestrator" }])
+            : "",
+      }),
+    );
+
+    expect(result).toMatchObject({ ok: true, beadClosed: true });
+    expect(bdCalls.map((call) => [...call.argv])).toEqual([
+      ["show", "bd-12", "--json"],
+      [
+        "update",
+        "--actor",
+        "belayd:bd-12:orchestrator",
+        "--if-assignee",
+        "belayd:bd-12:orchestrator",
+        "--assignee",
+        "",
+        "--",
+        "bd-12",
+      ],
+      [
+        "close",
+        "--actor",
+        "belayd:bd-12:orchestrator",
+        "bd-12",
+        "--reason",
+        "merged into main via belayd_fleet_merge",
+      ],
+    ]);
+    // The close is attributed to the workflow's orchestrator, so `bd history`
+    // names the agent that accepted the member (bd-150). Assert the value bd
+    // applies (the last `--actor` wins), not the argv layout.
+    const closeArgv = bdCalls[2]?.argv ?? [];
+    const actorValues = closeArgv.flatMap((arg, index) =>
+      arg === "--actor" ? [closeArgv[index + 1]] : [],
+    );
+    expect(actorValues.at(-1)).toBe("belayd:bd-12:orchestrator");
+    expect(closeArgv).toContain("bd-12");
+    expect(closeArgv).toContain("--reason");
+  });
+
+  it("leaves a human assignee alone when accepting", async () => {
+    const calls: Call[] = [];
+    const bdCalls: Call[] = [];
+    const result = await acceptLandedMember(
+      baseOptions({
+        calls,
+        bdCalls,
+        bdStdout: (argv) =>
+          argv[0] === "show" ? JSON.stringify([{ id: "bd-12", assignee: "Hugo Lewenhaupt" }]) : "",
+      }),
+    );
+
+    expect(result).toMatchObject({ ok: true, beadClosed: true });
+    expect(bdCalls.map((call) => call.argv[0])).toEqual(["show", "close"]);
+    expect(result.ok ? result.warnings.join("\n") : "").toContain("Hugo Lewenhaupt");
   });
 
   it("treats an already-closed bead as accepted", async () => {

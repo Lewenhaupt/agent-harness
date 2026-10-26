@@ -25,6 +25,9 @@
  *   already closed (someone else accepted it) is not an error.
  */
 
+import { orchestratorActor, withActorArgv } from "./beads-actor.js";
+import { clearAssignee } from "./beads-assignee.js";
+
 /** One process run for the accept step; injected so tests never touch a real repo. */
 export type FleetAcceptRunner = (
   argv: readonly string[],
@@ -103,11 +106,21 @@ async function closeBead(
 ): Promise<{ ok: true; warnings: string[] } | { ok: false; error: string }> {
   const warnings: string[] = [];
   try {
-    await options.runBd(["close", options.taskId, "--reason", closeReason(options.baseBranch)], {
-      cwd: options.rootCwd,
-      timeoutInMs: ACCEPT_TIMEOUT_MS,
-      maxBufferInBytes: ACCEPT_MAX_BUFFER_BYTES,
-    });
+    // Attribute the close to the workflow's orchestrator (bd-150). Lifecycle
+    // writes act *for* the workflow, so `bd history` must name the agent that
+    // performed them instead of the operator's git identity. Index 1 keeps
+    // `close` as argv[0] and the reason flags before any `--`.
+    await options.runBd(
+      withActorArgv(
+        ["close", options.taskId, "--reason", closeReason(options.baseBranch)],
+        orchestratorActor(options.taskId),
+      ),
+      {
+        cwd: options.rootCwd,
+        timeoutInMs: ACCEPT_TIMEOUT_MS,
+        maxBufferInBytes: ACCEPT_MAX_BUFFER_BYTES,
+      },
+    );
     return { ok: true, warnings };
   } catch (error) {
     const status = await readBeadStatus(options);
@@ -177,6 +190,20 @@ export async function acceptLandedMember(
   }
 
   if (options.closeBead) {
+    // Release the driving actor before closing (bd-150): closing a bead that is
+    // still assigned leaves a dangling owner, and a human's own assignment is
+    // deliberately left alone by clearAssignee. A refused clear is a warning.
+    const released = await clearAssignee({
+      taskId: options.taskId,
+      cwd: options.rootCwd,
+      runBd: options.runBd,
+    });
+    if (released.ok) {
+      warnings.push(...released.warnings);
+    } else {
+      warnings.push(`could not clear the assignee of ${options.taskId}: ${released.error}`);
+    }
+
     const closed = await closeBead(options);
     if (!closed.ok) {
       return {

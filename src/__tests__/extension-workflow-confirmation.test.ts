@@ -20,6 +20,7 @@ const bdState = vi.hoisted(() => ({
   labels: [] as string[],
   title: "",
   updateCalls: [] as string[][],
+  calls: [] as string[][],
 }));
 
 const mockExecFile = vi.hoisted(() =>
@@ -31,8 +32,25 @@ const mockExecFile = vi.hoisted(() =>
       cb: (err: Error | null, stdout: string, stderr: string) => void,
     ) => {
       let stdout = "";
+      bdState.calls.push([...args]);
       if (args[0] === "show") {
-        stdout = JSON.stringify([{ title: bdState.title, labels: bdState.labels }]);
+        // These tests assert label writes only. Reporting the launching
+        // orchestrator as the assignee keeps the bd-150 assignee mirror a
+        // no-op here, so its `update --if-assignee` never pollutes the count.
+        // Derived from the argv's task-id token (never a fixed index) so a
+        // change in attribution or argv order cannot silently fabricate
+        // `belayd:--actor:orchestrator`.
+        const taskId = [...args].reverse().find((arg) => /^bd-[a-z0-9.]+$/i.test(arg));
+        if (taskId === undefined) {
+          throw new Error(`bd show mock received no task id: ${args.join(" ")}`);
+        }
+        stdout = JSON.stringify([
+          {
+            title: bdState.title,
+            labels: bdState.labels,
+            assignee: `belayd:${taskId}:orchestrator`,
+          },
+        ]);
       } else if (args[0] === "update") {
         bdState.updateCalls.push([...args]);
       }
@@ -123,6 +141,7 @@ describe("workflow type confirmation (bd-106)", () => {
     bdState.labels = ["wf:chore"];
     bdState.title = "Producer authentication: project-scoped upload tokens and CI OIDC exchange";
     bdState.updateCalls.length = 0;
+    bdState.calls.length = 0;
     vi.clearAllMocks();
   });
 
@@ -190,8 +209,11 @@ describe("workflow type confirmation (bd-106)", () => {
     const state = readWorkflowStateFile(cwd);
     expect(state.workflowType).toBe("bugfix");
     expect(state.resolutionSource).toBe("arg");
-    // The override type is persisted exactly once for the next run.
-    expect(bdState.updateCalls).toEqual([["update", "--add-label", "wf:bugfix", "--", "bd-42"]]);
+    // The override type is persisted exactly once for the next run, attributed
+    // to the workflow's orchestrator (bd-150).
+    expect(bdState.updateCalls).toEqual([
+      ["update", "--actor", "belayd:bd-42:orchestrator", "--add-label", "wf:bugfix", "--", "bd-42"],
+    ]);
     expect(JSON.stringify(sentMessages[0])).toContain("Belayd bugfix workflow started");
   });
 
@@ -366,5 +388,30 @@ describe("workflow type confirmation (bd-106)", () => {
     const state = readWorkflowStateFile(cwd);
     expect(state.workflowType).toBe("bugfix");
     expect(state.resolutionSource).toBe("arg");
+  });
+
+  it("does not touch bd on a stop after the gate is gone (bd-150)", async () => {
+    const { api, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = {
+      cwd,
+      hasUI: true,
+      ui: { select: vi.fn(async () => "Confirm chore"), notify: vi.fn() },
+      sessionManager: { getSessionId: () => "stop-session" },
+    };
+    await tools
+      .get("belayd_start_task")
+      ?.execute("call-start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await tools.get("belayd_stop_task")?.execute("call-stop", {}, undefined, undefined, ctx);
+
+    // A stop leaves `currentTaskId` set but disarms the gate. Because the actor
+    // string is shared per task id, a second stop must not CAS-clear the
+    // assignment a new driver could already hold.
+    bdState.calls.length = 0;
+    await tools.get("belayd_stop_task")?.execute("call-stop-again", {}, undefined, undefined, ctx);
+
+    expect(bdState.calls).toEqual([]);
   });
 });
