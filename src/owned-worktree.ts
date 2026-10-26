@@ -9,6 +9,9 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { taskIdFromBranch } from "./handoff.js";
 import { isValidTaskId } from "./session-naming.js";
 import type { WorkflowState } from "./workflow-state.js";
 import { readWorkflowState } from "./workflow-state.js";
@@ -54,6 +57,18 @@ export interface SessionOwnedWorktreeOptions {
   currentTaskId: string;
   gateActive: boolean;
   branch: WorktreeBranch;
+  persisted: WorkflowState | undefined;
+}
+
+export interface AdoptableTaskIdOptions {
+  /** The session's in-memory task id, `""` when it has none. */
+  currentTaskId: string;
+  gateActive: boolean;
+  /** The session handed its workflow to a child orchestrator. */
+  handedOff: boolean;
+  /** Branch probe for the session's own cwd. */
+  branch: WorktreeBranch;
+  /** Persisted `.belayd/workflow.json` at that cwd, or undefined when there is none. */
   persisted: WorkflowState | undefined;
 }
 
@@ -170,6 +185,29 @@ export function matchSessionOwnedWorktree(
   return matchOwnedWorktree({ cwd, taskId: currentTaskId, branch, persisted });
 }
 
+/**
+ * Task id a resumed session should adopt for its own worktree, or `undefined`.
+ *
+ * Workflow completion deletes `.belayd/workflow.json`, and `session_start` resets
+ * the in-memory task id, so a resumed orchestrator comes back with no identity at
+ * all. Every phase tool then died in subagent session naming with the raw
+ * `taskId must be a non-empty string`, which broke the post-completion rework
+ * (rebases, review follow-ups) that this preflight otherwise allows. The worktree
+ * branch is the surviving record of the bead.
+ *
+ * A session that already holds an id, an armed gate, a handoff, or any workflow
+ * state in the directory keeps what it has: that state is authoritative, and
+ * adopting over it would let one bead's runs report under another bead's id.
+ */
+export function adoptableWorktreeTaskId(options: AdoptableTaskIdOptions): string | undefined {
+  const { currentTaskId, gateActive, handedOff, branch, persisted } = options;
+  if (currentTaskId !== "" || gateActive || handedOff) return undefined;
+  if (persisted !== undefined) return undefined;
+  if (!branch.ok) return undefined;
+  const taskId = taskIdFromBranch(branch.branch);
+  return taskId !== undefined && isValidTaskId(taskId) ? taskId : undefined;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -177,9 +215,17 @@ function errorMessage(error: unknown): string {
 /**
  * Read the checked-out branch with `git branch --show-current`.
  *
- * Side effect: one synchronous git child process. An empty result is a
- * detached HEAD, while a git failure (no repository, missing binary) is
- * reported separately so callers can give the right recovery instructions.
+ * A rebase checks out the onto-commit detached, so during one (`git status`:
+ * "rebase in progress") that command prints nothing even though the worktree is
+ * still identified by the branch being replayed. Ownership checks and phase-run
+ * naming need that branch — a mid-rebase worktree used to look detached, which
+ * refused runs with "check out <branch>" while that branch *was* the checkout's
+ * branch — so the rebase state file is the fallback.
+ *
+ * Side effect: one synchronous git child process (two when HEAD is detached).
+ * An empty result is a plain detached HEAD, while a git failure (no repository,
+ * missing binary) is reported separately so callers can give the right recovery
+ * instructions.
  */
 export function readWorktreeBranch(cwd: string): WorktreeBranch {
   try {
@@ -189,10 +235,39 @@ export function readWorktreeBranch(cwd: string): WorktreeBranch {
       encoding: "utf8",
       stdio: "pipe",
     }).trim();
-    return output === "" ? { ok: false, reason: "detached" } : { ok: true, branch: output };
+    if (output !== "") return { ok: true, branch: output };
+    const rebasing = readRebaseBranch(cwd);
+    return rebasing === undefined
+      ? { ok: false, reason: "detached" }
+      : { ok: true, branch: rebasing };
   } catch (error) {
     return { ok: false, reason: "unavailable", error: errorMessage(error) };
   }
+}
+
+/**
+ * Branch an in-progress rebase is replaying, or undefined when none is running.
+ *
+ * Both backends record it: `rebase-merge` (interactive/merge) and `rebase-apply`
+ * (patch-based). `--git-path` resolves the file for linked worktrees too, and a
+ * missing state file simply means the rebase finished between the two calls.
+ */
+function readRebaseBranch(cwd: string): string | undefined {
+  for (const stateDir of ["rebase-merge", "rebase-apply"]) {
+    try {
+      const headNamePath = execFileSync(
+        "git",
+        ["rev-parse", "--git-path", `${stateDir}/head-name`],
+        { cwd, timeout: 10_000, encoding: "utf8", stdio: "pipe" },
+      ).trim();
+      if (headNamePath === "") continue;
+      const ref = readFileSync(resolve(cwd, headNamePath), "utf8").trim();
+      if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
+    } catch {
+      // Not this backend, or the rebase ended: try the next one.
+    }
+  }
+  return undefined;
 }
 
 /** Assert that `cwd` is the worktree that owns `taskId` and `branch`. */

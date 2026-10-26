@@ -153,11 +153,18 @@ const mockExecFile = vi.hoisted(() => {
 // resume tests use temp directories outside git with a seeded workflow.json, so
 // report the branch that fixture records.
 const mockExecFileSync = vi.hoisted(() =>
-  vi.fn((file: string, args: readonly string[]) => {
+  vi.fn((file: string, args: readonly string[]): string => {
     if (file === "git" && args[0] === "branch") return "feat/bd-42\n";
     return "";
   }),
 );
+
+/** Point the mocked `git branch --show-current` at a different branch. */
+function setMockGitBranch(branch: string): void {
+  mockExecFileSync.mockImplementation((file: string, args: readonly string[]) =>
+    file === "git" && args[0] === "branch" ? `${branch}\n` : "",
+  );
+}
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -2015,8 +2022,14 @@ describe("session_start resume from disk (bd-40)", () => {
     mockSpawnAgentProcess.mockClear();
     mockExec.mockClear();
     mockExecFile.setArgHandler(null);
+    setMockGitBranch("feat/bd-42");
     // Restore the default success spawn result other describe blocks expect.
-    mockSpawnAgentProcess.mockResolvedValue({
+    mockSpawnAgentProcess.mockResolvedValue(successfulSpawn());
+  });
+
+  /** Default spawn result the quality gates accept. */
+  function successfulSpawn() {
+    return {
       content: [{ type: "text" as const, text: "done" }],
       details: {
         messages: [],
@@ -2032,8 +2045,8 @@ describe("session_start resume from disk (bd-40)", () => {
         exitCode: 0,
       },
       sessionName: "mocked",
-    });
-  });
+    };
+  }
 
   function freshWorktree(): string {
     const dir = mkdtempSync(join(tmpdir(), "belayd-resume-"));
@@ -2149,6 +2162,60 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(message).toContain("**Stacked follow-up worktree?**");
     expect(message).toContain("belayd_stack_rebase");
     expect(message).not.toContain("call `belayd_scout`");
+  });
+
+  it("adopts the worktree branch's bead after a restart, so a finished workflow can still rework (bd-144)", async () => {
+    // Workflow completion deleted workflow.json and the restart cleared the
+    // in-memory task id. Before the fix every phase call died in subagent
+    // session naming with the raw `taskId must be a non-empty string`.
+    const cwd = freshWorktree();
+    const { eventHandlers, tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    mockSpawnAgentProcess.mockResolvedValue(successfulSpawn());
+
+    await fireSessionStart(eventHandlers, ctx);
+
+    const result = (await tools
+      .get("belayd_scout")
+      ?.execute(
+        "scout",
+        { task: "resolve the in-progress rebase" },
+        undefined,
+        undefined,
+        ctx,
+      )) as { content: Array<{ type: string; text: string }> };
+
+    expect(result.content[0]?.text).toContain("run started in the background");
+    expect(result.content[0]?.text).toContain("belayd-bd-42-sub-scout-");
+    // The promised follow-up still arrives outside the gate.
+    await vi.waitFor(() => {
+      expect(runCompletionCount(messages)).toBe(1);
+    });
+    const spawned = mockSpawnAgentProcess.mock.calls.at(-1)?.[0] as { sessionName: string };
+    expect(spawned.sessionName).toMatch(/^belayd-bd-42-sub-scout-/);
+    // ...and the finished workflow's state is not resurrected.
+    expect(readWorkflowStateFromDisk({ cwd })).toBeUndefined();
+  });
+
+  it("refuses a phase run with a named reason when no bead can be derived (bd-144)", async () => {
+    const cwd = freshWorktree();
+    const { eventHandlers, tools } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+    setMockGitBranch("feat/review-surface");
+
+    await fireSessionStart(eventHandlers, ctx);
+
+    const result = (await tools
+      .get("belayd_implement")
+      ?.execute("implement", { task: "resolve the rebase" }, undefined, undefined, ctx)) as {
+      content: Array<{ type: string; text: string }>;
+      details: { exitCode: number };
+    };
+
+    // No raw internal error, and no run started without a bead id.
+    expect(result.content[0]?.text).toContain("needs a bead id for its run");
+    expect(result.details.exitCode).toBe(1);
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
   });
 
   it("emits the stale-worktree guidance for a non-feature workflow type (bugfix)", async () => {

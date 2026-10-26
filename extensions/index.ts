@@ -97,6 +97,7 @@ import {
   acceptLandedMember,
   ackNotes,
   acquireOrchestratorClaim,
+  adoptableWorktreeTaskId,
   adoptOrchestratorClaim,
   appendFleetAuditEntry,
   appendMetricsEvent,
@@ -2138,6 +2139,20 @@ export default function belaydAgentHarness(
   /** Shared no-cwd refusal for every tool that must stay pinned to a worktree. */
   function missingWorkingDirectoryError(label: string): string {
     return `${label} has no working directory: this session cannot be pinned to a worktree.`;
+  }
+
+  /**
+   * Refusal for a phase tool that cannot name its run: without a bead id the
+   * subagent session name, run metrics, and scoped review diff would all be
+   * wrong, so the run is refused instead of failing later or bypassing them.
+   */
+  function missingTaskIdError(toolName: string, cwd: string): string {
+    return (
+      `${toolName} needs a bead id for its run, and this session has none: ` +
+      `no Belayd workflow state in ${cwd} and its branch does not name a bead. ` +
+      `Start a workflow here (belayd_start_task <taskId>) or check out the bead's branch ` +
+      `(e.g. feat/bd-42) and retry.`
+    );
   }
 
   /** Shape a read-only guidance result (exit 1 on transport/parse failure). */
@@ -4367,6 +4382,29 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }
 
   /**
+   * Restore the bead identity of a session that lost it across a restart.
+   *
+   * Completion deletes `.belayd/workflow.json` and `session_start` clears the
+   * in-memory task id, so a resumed orchestrator came back with no identity and
+   * every phase tool died in subagent session naming with the raw
+   * `taskId must be a non-empty string` — which killed the post-completion
+   * rework (rebases, review follow-ups) this preflight allows. The branch is the
+   * surviving record of the bead; the gate stays off, so nothing is persisted
+   * and no phase state is re-armed.
+   */
+  function adoptWorktreeTaskId(state: SessionState, cwd: string): void {
+    const taskId = adoptableWorktreeTaskId({
+      currentTaskId: state.currentTaskId,
+      gateActive: state.gateActive,
+      handedOff: state.handedOffTo !== undefined,
+      branch: readWorktreeBranch(cwd),
+      persisted: readWorkflowState({ cwd }),
+    });
+    if (taskId === undefined) return;
+    state.currentTaskId = taskId;
+  }
+
+  /**
    * Start a phase run in the background and return its handle immediately.
    *
    * The run owns its abort signal — the tool-call signal belongs to the
@@ -4946,8 +4984,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         if (cwd === undefined || cwd === "") {
           return textToolResult(missingWorkingDirectoryError("Belayd phase run"), 1);
         }
+        adoptWorktreeTaskId(state, cwd);
         const ownership = activeWorkflowOwnership(state, cwd);
         if (!ownership.ok) return textToolResult(ownership.error, 1);
+        if (state.currentTaskId === "") {
+          return textToolResult(missingTaskIdError(toolName, cwd), 1);
+        }
         const runId = generateShortRunId();
         const { sessionName, ledgerWarning } = startPhaseRun({
           agent,
