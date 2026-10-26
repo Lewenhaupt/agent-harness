@@ -103,6 +103,13 @@ export {
   parseBdCommand,
   validateBdCommand,
 } from "./bd-command.js";
+export type { PhaseCommentAuthor } from "./bead-comments.js";
+export {
+  PHASE_COMMENT_PREFIX,
+  phaseCommentBody,
+  phaseCommentHeader,
+  stripBdShowComments,
+} from "./bead-comments.js";
 export {
   clearAssigneeArgv,
   isBelaydActor,
@@ -121,13 +128,6 @@ export type {
   MirrorAssigneeOptions,
 } from "./beads-assignee.js";
 export { clearAssignee, isGuardMismatch, mirrorAssignee } from "./beads-assignee.js";
-export type { PhaseCommentAuthor } from "./bead-comments.js";
-export {
-  PHASE_COMMENT_PREFIX,
-  phaseCommentBody,
-  phaseCommentHeader,
-  stripBdShowComments,
-} from "./bead-comments.js";
 export type { BelaydCommandArgs, BelaydCommandArgsParse } from "./belayd-command-args.js";
 export { parseBelaydCommandArgs } from "./belayd-command-args.js";
 export type {
@@ -922,7 +922,9 @@ export {
   collectReviewDiff,
   countReviewFindings,
   formatReviewTask,
+  REVIEW_LINE_NUMBER_INSTRUCTION,
   REVIEW_OUTPUT_CONTRACT,
+  REVIEW_PROCESS_INSTRUCTION,
   REVIEW_SCOPE_INSTRUCTION,
   REVIEW_SECTION_LIMITS,
 } from "./review-context.js";

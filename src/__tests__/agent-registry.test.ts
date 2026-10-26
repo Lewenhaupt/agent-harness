@@ -15,7 +15,11 @@ import {
 import { phaseCommentHeader } from "../bead-comments.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
 import { PROOF_ARTIFACT_EXTENSIONS } from "../proof-verification.js";
-import { REVIEW_OUTPUT_CONTRACT } from "../review-context.js";
+import {
+  REVIEW_LINE_NUMBER_INSTRUCTION,
+  REVIEW_OUTPUT_CONTRACT,
+  REVIEW_PROCESS_INSTRUCTION,
+} from "../review-context.js";
 
 describe("DEFAULT_AGENTS", () => {
   it("defines all 9 agents", () => {
@@ -131,6 +135,26 @@ describe("DEFAULT_AGENTS", () => {
     expect(prompt).toContain("Do NOT re-derive the change set");
     // The narration-inviting "Files Reviewed" section must not come back.
     expect(prompt).not.toContain("## Files Reviewed");
+  });
+
+  it("reviewer prompt carries the process rules that keep turns productive (bd-159)", () => {
+    const reviewer = DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer");
+    const prompt = reviewer?.systemPrompt ?? "";
+
+    // The process rules live in the system prompt so an orchestrator task text
+    // cannot quietly undo them; the scratchpad needs the reviewer's bash tool.
+    expect(prompt).toContain(REVIEW_PROCESS_INSTRUCTION);
+    expect(prompt).toContain(".belayd/review-findings.md");
+    expect(prompt).toContain("outranks the task text");
+    expect(reviewer?.tools).toContain("bash");
+    // The gutter rule ships with the diff, not the prompt: it only holds when a
+    // diff was inlined.
+    expect(prompt).not.toContain(REVIEW_LINE_NUMBER_INSTRUCTION);
+  });
+
+  it("tells the caller the review task is scope-only (bd-159)", () => {
+    const reviewer = DEFAULT_AGENTS.find((a) => a.name === "belayd-reviewer");
+    expect(reviewer?.description).toContain("never ask it to run gates");
   });
 
   it("scout and committer declare the fast class", () => {

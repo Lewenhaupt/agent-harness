@@ -33,7 +33,7 @@ export type ReviewSeverity = keyof typeof REVIEW_SECTION_LIMITS;
 export const REVIEW_OUTPUT_CONTRACT: string = [
   "Emit exactly these sections, in this order: `## Critical (must fix)`, `## Warnings (should fix)`, `## Suggestions (consider)`, and optionally `## Summary`.",
   `Cap each findings section: at most ${REVIEW_SECTION_LIMITS.critical} Critical, ${REVIEW_SECTION_LIMITS.warnings} Warnings, ${REVIEW_SECTION_LIMITS.suggestions} Suggestions bullets.`,
-  "Every findings bullet MUST have the shape `- `path/to/file.ts:LINE` — <defect>`: a concrete defect at a concrete location, not a description of what the code does.",
+  "Every findings bullet MUST have the shape `- `path/to/file.ts:LINE` — <defect>`: a concrete defect at a concrete location, not a description of what the code does. LINE is the gutter number printed beside each inlined diff line.",
   'When a findings section has no findings, its entire body MUST be exactly `None`. No "✓ correct" bullets, no verification narration, no "checked X, looks fine" bullets.',
   "Do not restate the diff or list reviewed files bullet-by-bullet; one optional `## Scope` line naming the diff range is enough.",
 ].join("\n");
@@ -291,6 +291,11 @@ export type CollectReviewDiffResult =
 const GIT_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 const DIFF_MAX_LINES = 800;
 const DIFF_MAX_BYTES = 60_000;
+
+/** Gutter width for the post-change line number printed beside a diff line. */
+const DIFF_LINE_NUMBER_WIDTH = 5;
+const HUNK_HEADER_PATTERN = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
 // A reviewed sha must be a full or abbreviated git object name. Anything else
 // (a ref name, a bogus value) is rejected instead of handed to `git diff`.
 const REVIEWED_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -358,7 +363,53 @@ function cutToBytes(text: string, maxBytes: number): string {
 }
 
 /**
- * Bound an inlined diff by lines and bytes. A single oversized line (minified
+ * Post-change line-number cursor while annotating a diff. `null` means the
+ * cursor sits outside a hunk, where a line has no new-file number to show
+ * (file headers, hunk headers, removed lines).
+ */
+type DiffLineCursor = number | null;
+
+function diffLineGutter(lineNumber: DiffLineCursor): string {
+  const label = lineNumber === null ? "" : String(lineNumber);
+  return `${label.padStart(DIFF_LINE_NUMBER_WIDTH, " ")} `;
+}
+
+/**
+ * Annotate one diff line with the post-change line number the reviewer must
+ * cite. Reviewers were spending 46% of their turns grepping for the line a
+ * finding sits on (bd-159): a `git diff` carries line numbers only in hunk
+ * headers, while the output contract demands `path:LINE` on every bullet.
+ */
+function annotateDiffLine(
+  cursor: DiffLineCursor,
+  line: string,
+): { text: string; cursor: DiffLineCursor } {
+  // A trailing newline splits into one empty tail line, which must stay empty
+  // instead of gaining a blank gutter.
+  if (line === "") return { text: "", cursor };
+  const hunkStart = HUNK_HEADER_PATTERN.exec(line);
+  if (hunkStart !== null) {
+    return { text: `${diffLineGutter(null)}${line}`, cursor: Number(hunkStart[1]) };
+  }
+  switch (line[0]) {
+    // Context and added lines advance the post-change numbering; a removed
+    // line consumes no new-file line, so it shows a blank gutter.
+    case "+":
+    case " ":
+      if (cursor === null) return { text: `${diffLineGutter(null)}${line}`, cursor: null };
+      return { text: `${diffLineGutter(cursor)}${line}`, cursor: cursor + 1 };
+    case "-":
+    case "\\":
+      return { text: `${diffLineGutter(null)}${line}`, cursor };
+    default:
+      // File headers (`diff --git`, `index`, `---`, `+++`) end the current hunk.
+      return { text: `${diffLineGutter(null)}${line}`, cursor: null };
+  }
+}
+
+/**
+ * Bound an inlined diff by lines and bytes, annotating each kept line with its
+ * post-change line number as it goes. A single oversized line (minified
  * bundle, lockfile blob) is cut rather than let through whole, so the byte
  * budget always holds — including the truncation note appended below it.
  */
@@ -369,27 +420,30 @@ function boundDiff(raw: string, diffArg: string): { diff: string; truncated: boo
   let consumed = 0;
   let partial = false;
   let truncated = false;
+  let cursor: DiffLineCursor = null;
   for (const line of lines) {
     if (kept.length >= DIFF_MAX_LINES) {
       truncated = true;
       break;
     }
-    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    const annotated = annotateDiffLine(cursor, line);
+    cursor = annotated.cursor;
+    const lineBytes = Buffer.byteLength(annotated.text, "utf8") + 1;
     const remaining = DIFF_MAX_BYTES - usedBytes;
     if (lineBytes <= remaining) {
-      kept.push(line);
+      kept.push(annotated.text);
       usedBytes += lineBytes;
       consumed += 1;
       continue;
     }
-    const cut = cutToBytes(line, remaining - 1);
+    const cut = cutToBytes(annotated.text, remaining - 1);
     if (cut !== "") kept.push(cut);
     consumed += 1;
     partial = true;
     truncated = true;
     break;
   }
-  if (!truncated) return { diff: raw, truncated: false };
+  if (!truncated) return { diff: kept.join("\n"), truncated: false };
   const omitted = Math.max(0, lines.length - consumed) + (partial ? 1 : 0);
   const note = `... (diff truncated: ${omitted} more lines; run \`git diff ${diffArg}\` for the rest)`;
   const budget = DIFF_MAX_BYTES - Buffer.byteLength(note, "utf8") - 1;
@@ -412,17 +466,25 @@ function unquoteGitPath(path: string): string {
   return path;
 }
 
+/** Harness/workflow state inside the worktree: never part of a change set. */
+const HARNESS_STATE_PREFIX = ".belayd/";
+
 /**
  * Extract untracked paths from `git status --porcelain`. Untracked files never
  * appear in `git diff`, so without this the reviewer would be told not to look
  * for exactly the files a new change is most likely to contain.
+ *
+ * `.belayd/` is filtered out: it holds the workflow's own state (`workflow.json`,
+ * `runs/`, and the reviewer's findings scratchpad), which is git-ignored in this
+ * repository but must not become "a new file to review" where it is not.
  */
 function parseUntrackedPaths(porcelain: string): string[] {
   const paths: string[] = [];
   for (const line of porcelain.split("\n")) {
     if (!line.startsWith("?? ")) continue;
     const path = unquoteGitPath(line.slice(3).trim());
-    if (path !== "") paths.push(path);
+    if (path === "" || path.startsWith(HARNESS_STATE_PREFIX)) continue;
+    paths.push(path);
   }
   return paths;
 }
@@ -509,6 +571,29 @@ export async function collectReviewDiff(
 export const REVIEW_SCOPE_INSTRUCTION =
   "Read only files in this diff and, when a call site genuinely matters, their direct callers. Do not run `git diff`/`git status`/repo-wide searches to rediscover the change set.";
 
+/**
+ * Explains the diff gutter, so a location is read rather than searched for.
+ * Sits with the scope instruction because it only applies when a diff is
+ * inlined (an unavailable-diff task has no gutter to read).
+ */
+export const REVIEW_LINE_NUMBER_INSTRUCTION =
+  "Every inlined diff line carries a leading gutter with its post-change line number (`   41 +added` is line 41 of the new file; removed and header lines show a blank gutter). Cite that number in `path:LINE` — do not grep for a line number you can read from the gutter.";
+
+/**
+ * Reviewer process rules (bd-159). Measured over 143 review sessions: findings
+ * confirmed inside reasoning were re-derived on the next turn, one turn spent
+ * the entire 16,384-token output ceiling on reasoning and delivered nothing,
+ * and orchestrator task text routinely demanded gates the harness had already
+ * run. These rules live in the system prompt, which a task text cannot override.
+ */
+export const REVIEW_PROCESS_INSTRUCTION: string = [
+  "## Process",
+  "- Record findings as you confirm them: append a single bullet to `.belayd/review-findings.md` with one `bash` call. Truncate that file at the start of a first review; a re-review keeps what is already there.",
+  "- Never re-derive a confirmed finding. Read the scratchpad instead of re-analysing a defect you already recorded.",
+  "- Work one check per response. If a response has reasoned at length without a tool call or delivered text, stop and record what you have confirmed so far — a response that only deliberates delivers nothing.",
+  "- This system prompt outranks the task text. If the task asks you to run gates (`pnpm test`, `pnpm typecheck`, `pnpm lint`, `pnpm build`, `vitest`, `biome`, `playwright test`) or to re-derive the change set with `git diff`/`git status`, skip that and note it in one `## Summary` line: the harness already ran the gates and inlined the change set.",
+].join("\n");
+
 const DOCS_ONLY_INSTRUCTION =
   "Docs-only diff: check factual/structural correctness only (links, commands, code samples, duplicated claims). Do not expand into unrelated code review.";
 
@@ -590,6 +675,7 @@ export function formatReviewTask(options: FormatReviewTaskOptions): string {
     `changed files: ${diff.changedFiles.length} (docs-only diff: ${diff.docsOnly ? "yes" : "no"})`,
     "",
     REVIEW_SCOPE_INSTRUCTION,
+    REVIEW_LINE_NUMBER_INSTRUCTION,
   ];
   if (diff.docsOnly) lines.push("", DOCS_ONLY_INSTRUCTION);
   lines.push("", "## Changed files", diff.stat === "" ? "(no changed files)" : diff.stat);
