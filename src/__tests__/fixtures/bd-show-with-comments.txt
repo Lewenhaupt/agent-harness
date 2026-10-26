@@ -1,0 +1,38 @@
+○ sandbox-dfr · Fixture bead for bd show comment stripping   [P2 · OPEN]
+Created by: Hugo Lewenhaupt · Type: task
+Created: 2026-10-26 · Updated: 2026-10-26
+
+DESCRIPTION
+
+  Sandbox bead used to capture a real bd show transcript for the bd-151       
+  comment-strip fixture.                                                      
+
+
+
+DESIGN
+
+  ## Design                                                                   
+                                                                              
+  Capture output shape.                                                       
+
+
+
+NOTES
+
+  ## Notes                                                                    
+                                                                              
+  The notes blob stays the plan.                                              
+
+
+
+COMMENTS
+  2026-10-26 18:45 Hugo Lewenhaupt
+    
+      [belayd:userguide]                                                          
+                                                                                  
+      ## User guide                                                               
+                                                                                  
+      docs/sandbox-dfr-userguide.md — How to Verify and How to Use.               
+
+
+💡 Tip: Install the beads plugin for automatic workflow context, or run 'bd setup claude' for CLI-only mode

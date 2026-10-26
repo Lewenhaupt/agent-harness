@@ -1005,8 +1005,8 @@ describe("extension session naming (bd-10)", () => {
       await runPhaseToolAndWait(tools, "belayd_userguide", messages, bd10Ctx());
 
       // Now call commit with the taskId — if userGuideContent is set,
-      // commit appends the note. execFile is mocked to fail, so we only
-      // check that the calls were attempted.
+      // commit records the deliverable comment. execFile is mocked to fail, so
+      // we only check that the calls were attempted.
       const commit = tools.get("belayd_commit");
       expect(commit).toBeDefined();
 
@@ -1030,16 +1030,16 @@ describe("extension session naming (bd-10)", () => {
           call.args.includes("bd-77") &&
           call.args.includes("human"),
       );
-      const noteCalls = mockExecFile.calls.filter(
-        (call) => call.file === "bd" && call.args[0] === "note" && call.args.includes("bd-77"),
+      const commentCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "comment" && call.args.includes("bd-77"),
       );
 
       expect(updateCalls.length).toBeGreaterThanOrEqual(1);
-      expect(noteCalls.length).toBeGreaterThanOrEqual(1);
+      expect(commentCalls.length).toBeGreaterThanOrEqual(1);
 
-      // The guide is a repo record now: the bead note and the run follow-up both
-      // name the file the phase wrote, not a wall of pasted markdown.
-      expect(noteCalls[0]?.stdin).toContain("docs/bd-77-userguide.md");
+      // The guide is a repo record now: the bead comment and the run follow-up
+      // both name the file the phase wrote, not a wall of pasted markdown.
+      expect(commentCalls[0]?.stdin).toContain("docs/bd-77-userguide.md");
       const runComplete = messages.filter((m) => m.customType === "belayd-run-complete");
       expect(runComplete.at(-1)?.content).toContain("docs/bd-77-userguide.md");
     });
@@ -1090,12 +1090,12 @@ describe("extension session naming (bd-10)", () => {
         bd10Ctx(),
       );
 
-      // Since userGuideContent was cleared, no bd note call should happen
-      const noteCalls = mockExecFile.calls.filter(
-        (call) => call.file === "bd" && call.args[0] === "note",
+      // Since userGuideContent was cleared, no bd comment call should happen
+      const commentCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "comment",
       );
 
-      expect(noteCalls).toHaveLength(0);
+      expect(commentCalls).toHaveLength(0);
     });
 
     it("clears userGuideContent on belayd_stop_task", async () => {
@@ -1132,7 +1132,7 @@ describe("extension session naming (bd-10)", () => {
 
       await stopTask?.execute("call-stop", {}, undefined, undefined, bd10Ctx());
 
-      // Start a new task and commit — no append-notes should happen
+      // Start a new task and commit — no deliverable comment should happen
       await startTask?.execute("call-2", { taskId: "bd-88" }, undefined, undefined, bd10Ctx());
 
       const commit = tools.get("belayd_commit");
@@ -1148,11 +1148,11 @@ describe("extension session naming (bd-10)", () => {
         bd10Ctx(),
       );
 
-      const noteCalls = mockExecFile.calls.filter(
-        (call) => call.file === "bd" && call.args[0] === "note",
+      const commentCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "comment",
       );
 
-      expect(noteCalls).toHaveLength(0);
+      expect(commentCalls).toHaveLength(0);
     });
 
     it("overwrites userGuideContent when userguide phase runs twice", async () => {
@@ -1227,12 +1227,12 @@ describe("extension session naming (bd-10)", () => {
         bd10Ctx(),
       );
 
-      // The commit appends the user guide content via bd note.
-      const noteCalls = mockExecFile.calls.filter(
-        (call) => call.file === "bd" && call.args[0] === "note" && call.args.includes("bd-77"),
+      // The commit records the user guide content as a bead comment.
+      const commentCalls = mockExecFile.calls.filter(
+        (call) => call.file === "bd" && call.args[0] === "comment" && call.args.includes("bd-77"),
       );
 
-      expect(noteCalls.length).toBeGreaterThanOrEqual(1);
+      expect(commentCalls.length).toBeGreaterThanOrEqual(1);
     });
 
     it("handles userguide-only session with no commit gracefully", async () => {
