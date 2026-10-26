@@ -947,7 +947,11 @@ export {
   resolveProjectSessionExists,
 } from "./session-naming.js";
 export type { TranscriptEntry } from "./session-transcript.js";
-export { lastAssistantText, narrowTranscriptEntries } from "./session-transcript.js";
+export {
+  hasConversation,
+  lastAssistantText,
+  narrowTranscriptEntries,
+} from "./session-transcript.js";
 export type { AgentProcessHandle, BuiltSpawnArgs, SpawnStream } from "./spawn.js";
 export {
   buildSpawnArgs,

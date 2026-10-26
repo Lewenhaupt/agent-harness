@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { lastAssistantText, narrowTranscriptEntries } from "../session-transcript.js";
+import {
+  hasConversation,
+  lastAssistantText,
+  narrowTranscriptEntries,
+} from "../session-transcript.js";
 
 function assistantMessage(content: unknown): { type: string; message: unknown } {
   return { type: "message", message: { role: "assistant", content } };
@@ -29,6 +33,38 @@ describe("narrowTranscriptEntries", () => {
     ]);
 
     expect(lastAssistantText(narrowed)).toBe("narrowed answer");
+  });
+});
+
+describe("hasConversation", () => {
+  it("is false for a session nobody has spoken in", () => {
+    expect(hasConversation([])).toBe(false);
+  });
+
+  it("is true for a user or an assistant turn", () => {
+    expect(hasConversation([{ type: "message", message: { role: "user", content: "hi" } }])).toBe(
+      true,
+    );
+    expect(hasConversation([assistantMessage("hi")])).toBe(true);
+  });
+
+  it("is false when the only entries are non-message or non-conversation ones", () => {
+    const branch = [
+      { type: "custom", customType: "belayd-plan", data: {} },
+      { type: "message", message: { role: "tool", content: "result" } },
+      { type: "message" },
+      { type: "message", message: null },
+      { type: "usage" },
+    ];
+    expect(hasConversation(branch)).toBe(false);
+  });
+
+  it("finds a conversation after leading extension entries", () => {
+    const branch = [
+      { type: "custom", customType: "belayd-fleet-events", data: {} },
+      { type: "message", message: { role: "user", content: "go" } },
+    ];
+    expect(hasConversation(branch)).toBe(true);
   });
 });
 

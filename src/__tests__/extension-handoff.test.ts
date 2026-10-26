@@ -275,7 +275,12 @@ async function loadPi() {
 
 let nextSessionId = 0;
 
-function createCtx(cwd: string, options: { sessionId?: string; sessionFile?: string } = {}) {
+const CALLER_TURN = { type: "message", message: { role: "user", content: "start bd-100" } };
+
+function createCtx(
+  cwd: string,
+  options: { sessionId?: string; sessionFile?: string; transcript?: unknown[] } = {},
+) {
   const sessionId = options.sessionId ?? `handoff-session-${nextSessionId++}`;
   return {
     cwd,
@@ -284,6 +289,9 @@ function createCtx(cwd: string, options: { sessionId?: string; sessionFile?: str
       getSessionId: () => sessionId,
       getSessionName: () => "orchestrator-session",
       getSessionFile: () => options.sessionFile ?? `${cwd}/session.jsonl`,
+      // A live caller has spoken at least once; `transcript: []` models a
+      // session /belayd is run in before anything was said.
+      getBranch: () => options.transcript ?? [CALLER_TURN],
     },
   };
 }
@@ -442,6 +450,33 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
     expect(text).toContain("no longer drives a workflow");
     // The caller must not present itself as a live workflow.
     expect(text).not.toContain("Next required step");
+  });
+
+  it("stays silent when the caller has no conversation yet (bd-148)", async () => {
+    const harness = await loadPi();
+    // An empty session: /belayd is the first thing that ever ran here.
+    const ctx = createCtx(cwd, { transcript: [] });
+
+    const outcome = await harness.tools
+      .get("belayd_start_followup")
+      ?.execute("followup", { taskId: "bd-101", base: "main" }, undefined, undefined, ctx);
+
+    expect(toolExitCode(outcome)).toBe(0);
+    // No bubble and no triggered model turn, because nothing in this session
+    // can act on the announcement.
+    expect(harness.messages.some((m) => m.customType === "belayd-handoff")).toBe(false);
+    // The handoff itself is still recorded, so status and restart recovery work.
+    expect(readCallerHandoff({ cwd, sessionKey: ctx.sessionManager.getSessionId() })).toEqual({
+      taskId: "bd-101",
+      branch: "feat/bd-101",
+      sessionId: "sess-child",
+    });
+
+    const status = await harness.tools
+      .get("belayd_status")
+      ?.execute("status", {}, undefined, undefined, ctx);
+    expect(statusText(status)).toContain("Handed off");
+    expect(statusText(status)).toContain("bd-101");
   });
 
   it("does not re-arm a handed-off workflow when the caller restarts", async () => {
