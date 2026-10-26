@@ -134,7 +134,7 @@ Still allowed: `bd list --status=open` (read subcommand), and
 Targeted suites (fast):
 
 ```bash
-pnpm test extension-handoff            # 13 tests — src/__tests__/extension-handoff.test.ts
+pnpm test extension-handoff            # 14 tests — src/__tests__/extension-handoff.test.ts
 pnpm test workflow-state               # 36 tests — src/__tests__/workflow-state.test.ts
 pnpm test extension-belayd-command     #  1 test  — caller/worktree layout in /belayd
 pnpm test:integration workflow-handoff #  3 tests — test/workflow-handoff.integration.test.ts
@@ -373,11 +373,18 @@ want one session to drive the workflow in its own directory.
 
 #### What the caller sees afterwards
 
-1. A displayed handoff message (`customType: "belayd-handoff"`):
+1. A displayed handoff message (`customType: "belayd-handoff"`) — **only when the
+   caller already has a conversation** (any user/assistant turn on its branch):
 
    > Handed off bd-121 to session belayd-bd-121 in `feat/bd-121`; you no longer
    > drive a workflow. The new orchestrator owns this bead — do not start phase
    > runs for it here.
+
+   `/belayd` run from a session with no conversations stays silent: the message
+   is sent with `triggerTurn: true`, so in an empty transcript it would be the
+   first entry and would start a model turn that can only restate it (bd-148).
+   The handoff is still recorded (see 3) and the launch is still announced by
+   the `Belayd <type> workflow started for …` notification.
 
    `belayd_start_followup` also returns
    `Follow-up <type> workflow started for bd-121 on feat/bd-121, stacked on <base>.`

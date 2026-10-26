@@ -58,6 +58,26 @@ function textFromContent(content: unknown): string | undefined {
 }
 
 /**
+ * Whether the branch holds a real conversation (a user or assistant turn).
+ *
+ * A `/belayd` handoff posts a displayed follow-up with `triggerTurn: true`,
+ * which starts a model turn. In a session nobody has said anything in, that
+ * turn has nothing to answer and the follow-up is the transcript's first
+ * entry, so callers check this first and stay silent instead. Counting entries
+ * is not enough: an extension-created custom message (e.g. a `/plan` kickoff)
+ * is persisted before any user speaks, yet it is not a conversation.
+ */
+export function hasConversation(entries: readonly TranscriptEntry[]): boolean {
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (!isRecord(message)) continue;
+    if (message.role === "user" || message.role === "assistant") return true;
+  }
+  return false;
+}
+
+/**
  * The text of the last assistant message on the active branch.
  *
  * Walks from the end and returns the first `message` entry whose role is

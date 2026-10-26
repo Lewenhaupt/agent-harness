@@ -166,6 +166,7 @@ import {
   getNextPhase,
   getPhasesForType,
   getPhaseToolName,
+  hasConversation,
   heartbeatOrchestratorClaim,
   INSTRUCTION_GROUPS_CHANNEL,
   ignoredArchifyParams,
@@ -3188,17 +3189,26 @@ export default function belaydAgentHarness(
         toSessionId: marker.sessionId,
       });
     }
-    pi.sendMessage(
-      {
-        customType: "belayd-handoff",
-        content:
-          `Handed off ${marker.taskId} to session ${options.sessionName} in \`${marker.branch}\`; ` +
-          "you no longer drive a workflow. The new orchestrator owns this bead — do not start " +
-          "phase runs for it here.",
-        display: true,
-      },
-      { triggerTurn: true },
-    );
+    // Only a session that already holds a conversation is told about the
+    // handoff. Nothing in a message-less session can act on it, and because the
+    // follow-up is sent with `triggerTurn: true` it would also start a model
+    // turn whose only possible answer is a restatement — an output the user
+    // never asked for. The launch is announced by the `ctx.ui.notify` in
+    // `createOrchestratorSession`, and `belayd_status` still reports the handoff
+    // (bd-148).
+    if (hasConversation(readSessionBranch(ctx))) {
+      pi.sendMessage(
+        {
+          customType: "belayd-handoff",
+          content:
+            `Handed off ${marker.taskId} to session ${options.sessionName} in \`${marker.branch}\`; ` +
+            "you no longer drive a workflow. The new orchestrator owns this bead — do not start " +
+            "phase runs for it here.",
+          display: true,
+        },
+        { triggerTurn: true },
+      );
+    }
     return { ok: true, handoff: marker };
   }
 
