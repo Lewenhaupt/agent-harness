@@ -20,6 +20,7 @@ import type { SpawnOptions, SpawnResult, SpawnUsage } from "./agent-registry.js"
 import { ensureScopeSync } from "./aws-broker/ensure.ts";
 import { planCommandArgv, resolveSandboxPlan } from "./aws-broker/plan.ts";
 import { scrubAwsEnv } from "./aws-broker/scope.ts";
+import { resolveBdActor } from "./beads-actor.js";
 import { type PiBinaryResolution, piBinaryNotice, resolvePiBinaryPath } from "./pi-binary.js";
 import { resolveProjectSessionExists } from "./session-naming.js";
 import { setupWorktree } from "./worktree.js";
@@ -238,6 +239,18 @@ export function launchAgentProcess(
   // inheriting the parent repo's devShell. HOME/PATH stay intact so harness
   // tools (bd/dolt/wt/pnpm/node) remain available at lower priority.
   const baseChildEnv: NodeJS.ProcessEnv = { ...process.env, ...options.env };
+  // Beads actor (bd-150). A phase agent is a real child process, so BEADS_ACTOR
+  // reaches every raw `bash` `bd` call it makes, including in gate retries,
+  // cross-run epochs and the commit phase, without touching each call site. The
+  // orchestrator cannot use this seam: it is in-process in the pi-web session
+  // daemon, where one process env would attribute every session in the daemon,
+  // so it gets a `--actor` flag from the bd tool proxy instead. An explicit
+  // options.env.BEADS_ACTOR wins, and an unparseable session name leaves the
+  // inherited value (scotty's, or the operator's) untouched.
+  const sessionBeadsActor = resolveBdActor(options.sessionName);
+  if (options.env?.BEADS_ACTOR === undefined && sessionBeadsActor !== undefined) {
+    baseChildEnv.BEADS_ACTOR = sessionBeadsActor;
+  }
   delete baseChildEnv.BELAYD_SHELL_ACTIVE;
   for (const key of DIRENV_STATE_ENV_KEYS) delete baseChildEnv[key];
 

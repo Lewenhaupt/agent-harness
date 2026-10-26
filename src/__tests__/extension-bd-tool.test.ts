@@ -93,6 +93,17 @@ async function loadBdTool(): Promise<BdTool> {
   return tool;
 }
 
+/** A tool ctx with pi's session manager, the way a live session calls it. */
+function sessionCtx(sessionName: string, cwd: string): Record<string, unknown> {
+  return {
+    cwd,
+    sessionManager: {
+      getSessionId: () => "session-1",
+      getSessionName: () => sessionName,
+    },
+  };
+}
+
 describe("bd tool proxy", () => {
   let cwd: string;
   let tool: BdTool;
@@ -176,5 +187,73 @@ describe("bd tool proxy", () => {
     expect(result.details.exitCode).toBe(1);
     expect(result.content[0]?.text).toContain("not allowed");
     expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("attributes a write to the orchestrator session's actor at index 1", async () => {
+    await tool.execute(
+      "c7",
+      { command: "update --add-label from-agent -- bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150", cwd),
+    );
+    const args = execFileMock.calls[0]?.args ?? [];
+    expect(args).toEqual([
+      "update",
+      "--actor",
+      "belayd:bd-150:orchestrator",
+      "--add-label",
+      "from-agent",
+      "--",
+      "bd-150",
+    ]);
+    // argv[0] stays the subcommand: the read/write guards inspect it.
+    expect(args[0]).toBe("update");
+    expect(args.indexOf("--actor")).toBeLessThan(args.indexOf("--"));
+  });
+
+  it("attributes a write to the phase session's actor", async () => {
+    await tool.execute(
+      "c8",
+      { command: "note bd-150 ok" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(execFileMock.calls[0]?.args).toEqual([
+      "note",
+      "--actor",
+      "belayd:bd-150:review",
+      "bd-150",
+      "ok",
+    ]);
+  });
+
+  it("lets an explicit caller --actor win over the injected default", async () => {
+    await tool.execute(
+      "c9",
+      { command: "update --actor custom:actor --add-label x -- bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150", cwd),
+    );
+    const args = [...(execFileMock.calls[0]?.args ?? [])];
+    // The injected default is present, and the caller's later `--actor` is the
+    // value bd applies, because bd's last flag wins. Positions are deliberately
+    // not pinned: the contract is the winning value, not the argv layout.
+    const actorValues = args.flatMap((arg, index) => (arg === "--actor" ? [args[index + 1]] : []));
+    expect(actorValues).toContain("belayd:bd-150:orchestrator");
+    expect(actorValues.at(-1)).toBe("custom:actor");
+  });
+
+  it("leaves a human session's write unattributed", async () => {
+    await tool.execute(
+      "c10",
+      { command: "show bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("human-session", cwd),
+    );
+    expect(execFileMock.calls[0]?.args).toEqual(["show", "bd-150"]);
   });
 });

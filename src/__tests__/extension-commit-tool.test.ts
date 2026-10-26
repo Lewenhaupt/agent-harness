@@ -396,9 +396,12 @@ describe("belayd_commit shell safety (bd-70)", () => {
     await commit({ message: "feat: review", taskId: "bd-42" });
 
     const updateCall = callsFor("bd").find((call) => call.args[0] === "update");
-    // Flags precede `--` so the taskId is a literal positional.
+    // Flags precede `--` so the taskId is a literal positional, and the write is
+    // attributed to the workflow's orchestrator (bd-150).
     expect(updateCall?.args).toEqual([
       "update",
+      "--actor",
+      "belayd:bd-42:orchestrator",
       "--status",
       "in_progress",
       "--add-label",

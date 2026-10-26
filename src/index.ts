@@ -103,6 +103,24 @@ export {
   parseBdCommand,
   validateBdCommand,
 } from "./bd-command.js";
+export {
+  clearAssigneeArgv,
+  isBelaydActor,
+  orchestratorActor,
+  parseAssignee,
+  phaseActor,
+  resolveBdActor,
+  setAssigneeArgv,
+  withActorArgv,
+  withActorForSession,
+} from "./beads-actor.js";
+export type {
+  BeadsAssigneeResult,
+  BeadsAssigneeRunner,
+  ClearAssigneeOptions,
+  MirrorAssigneeOptions,
+} from "./beads-assignee.js";
+export { clearAssignee, isGuardMismatch, mirrorAssignee } from "./beads-assignee.js";
 export type { BelaydCommandArgs, BelaydCommandArgsParse } from "./belayd-command-args.js";
 export { parseBelaydCommandArgs } from "./belayd-command-args.js";
 export type {

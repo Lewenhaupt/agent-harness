@@ -48,6 +48,7 @@ import type {
   ArchifyDiagramType,
   ArchifyQuality,
   ArchifyTextResult,
+  BeadsAssigneeResult,
   BelaydCommandArgs,
   FleetBeadLookup,
   FleetEventBatch,
@@ -121,6 +122,7 @@ import {
   buildVerifierPrompt,
   checkToolAllowed,
   classifyOrchestratorClaim,
+  clearAssignee,
   clearHandoff,
   collectChangeContext,
   collectHandoffDefault,
@@ -200,12 +202,14 @@ import {
   matchSessionOwnedWorktree,
   memberSessionToken,
   metricsHostname,
+  mirrorAssignee,
   NO_GROUP_REGISTERED_WARNING,
   narrowTranscriptEntries,
   ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
   ORCHESTRATOR_CLAIM_PENDING_PREFIX,
   OUTLINE_FILE_EXTENSIONS,
   OUTLINE_KINDS,
+  orchestratorActor,
   outlineFiles,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_TOOL_SET,
@@ -241,6 +245,7 @@ import {
   resolveArchifyHome,
   resolveAutoRebaseEnabled,
   resolveBashTimeout,
+  resolveBdActor,
   resolveFleetMode,
   resolveFleetNoteRecipients,
   resolveGitCommonDir,
@@ -277,6 +282,7 @@ import {
   WORKFLOW_REGISTRY,
   WORKFLOW_SUB_TYPES,
   watchRunCompletion,
+  withActorArgv,
   workflowGateToolSet,
   writeHandoff,
   writePhaseArtifact,
@@ -649,6 +655,34 @@ function runBdCommand(
   return runFileCommand("bd", argv, options);
 }
 
+/**
+ * `bd` runner for the assignee mirror (bd-150).
+ *
+ * The mirror only reads `bd show --json` and writes one CAS-guarded `update`, so
+ * it never has content for stdin and takes the narrower runner shape the fleet
+ * accept path already uses.
+ */
+function runBdForAssignee(
+  argv: readonly string[],
+  options: { cwd: string; timeoutInMs: number; maxBufferInBytes: number },
+): Promise<{ stdout: string; stderr: string }> {
+  return runBdCommand(argv, { ...options, stdin: undefined });
+}
+
+/**
+ * Report an assignee mirror/clear outcome without ever blocking the caller.
+ *
+ * Ownership is a reporting property (bd-150): a missing or refused assignment
+ * must degrade to a log line, never to a refused launch, accept, or stop.
+ */
+function reportAssigneeResult(result: BeadsAssigneeResult): void {
+  if (!result.ok) {
+    console.warn(`[belayd-harness] beads assignee update failed: ${result.error}`);
+    return;
+  }
+  for (const warning of result.warnings) console.warn(`[belayd-harness] ${warning}`);
+}
+
 /** Run `git` with an explicit argv array and no shell. */
 function runGitCommand(
   argv: readonly string[],
@@ -758,6 +792,54 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
     sessionStates.set(id, state);
   }
   return state;
+}
+
+/** The subset of pi's session manager the bd actor resolution needs. */
+type BdActorSessionManager = {
+  getSessionName?: () => string | undefined;
+  getSessionId?: () => string;
+};
+
+function bdActorSessionManager(ctx: unknown): BdActorSessionManager | undefined {
+  if (typeof ctx !== "object" || ctx === null) return undefined;
+  const manager = (ctx as { sessionManager?: unknown }).sessionManager;
+  return typeof manager === "object" && manager !== null
+    ? (manager as BdActorSessionManager)
+    : undefined;
+}
+
+/**
+ * The beads actor this session's `bd` writes carry (bd-150).
+ *
+ * Two sources, in order: the session name pi reports, then the armed gate. The
+ * gate fallback exists because a `belayd --no-worktree` run drives a bead from a
+ * session whose name pi cannot resolve to a task id. A human session (no gate,
+ * no harness name) resolves to undefined on purpose: its writes keep the git
+ * `user.name` / scotty's inherited `BEADS_ACTOR`, never a harness actor.
+ */
+function resolveSessionBdActor(ctx: unknown): string | undefined {
+  const manager = bdActorSessionManager(ctx);
+  if (manager === undefined) return undefined;
+  const sessionName =
+    typeof manager.getSessionName === "function" ? manager.getSessionName() : undefined;
+  const fromName = resolveBdActor(sessionName);
+  if (fromName !== undefined) return fromName;
+  if (typeof manager.getSessionId !== "function") return undefined;
+  const state = getSessionState(ctx as { sessionManager: { getSessionId: () => string } });
+  return state.gateActive && state.currentTaskId !== ""
+    ? orchestratorActor(state.currentTaskId)
+    : undefined;
+}
+
+/**
+ * Attribute a validated `bd` argv to this session's actor, when one resolves.
+ *
+ * Kept out of the tool's `execute` so that callback stays under the complexity
+ * limit; the argv is returned untouched for humans.
+ */
+function attributedBdArgv(argv: readonly string[], ctx: unknown): readonly string[] {
+  const actor = resolveSessionBdActor(ctx);
+  return actor === undefined ? argv : withActorArgv(argv, actor);
 }
 
 interface ToolCallGateEvent {
@@ -1878,12 +1960,22 @@ export default function belaydAgentHarness(
     if (parseWorkflowLabel(options.existingLabels)?.type === options.type) return;
     const label = `${WF_LABEL_PREFIX}${options.type}`;
     try {
-      await runBdCommand(["update", "--add-label", label, "--", options.taskId], {
-        cwd: options.cwd,
-        stdin: undefined,
-        timeoutInMs: 15_000,
-        maxBufferInBytes: 1024 * 1024,
-      });
+      // Attribute the label write-back to the workflow's orchestrator (bd-150).
+      // It is a lifecycle write made *for* the workflow, so `bd history` must
+      // name the driver rather than the operator. Index 1 keeps `update` as
+      // argv[0] and the label before the `--` terminator.
+      await runBdCommand(
+        withActorArgv(
+          ["update", "--add-label", label, "--", options.taskId],
+          orchestratorActor(options.taskId),
+        ),
+        {
+          cwd: options.cwd,
+          stdin: undefined,
+          timeoutInMs: 15_000,
+          maxBufferInBytes: 1024 * 1024,
+        },
+      );
     } catch (error) {
       console.warn(
         `[belayd-harness] could not write ${label} to ${options.taskId}: ${
@@ -2792,6 +2884,17 @@ export default function belaydAgentHarness(
     });
     if (!persisted.ok) return { ok: false, error: persisted.error };
 
+    // Mirror the driving actor as the bead's assignee (bd-150). Only an
+    // unassigned bead is taken (CAS-guarded), and a failure is a warning: a
+    // missing assignee degrades ownership reporting, it does not block work.
+    const mirrored = await mirrorAssignee({
+      taskId,
+      actor: orchestratorActor(taskId),
+      cwd: worktreePath,
+      runBd: runBdForAssignee,
+    });
+    reportAssigneeResult(mirrored);
+
     // Delegate to pi-web session daemon for persistent session management.
     const orchestrationName = computeOrchestratorSessionName(taskId);
 
@@ -3289,13 +3392,22 @@ export default function belaydAgentHarness(
    * `/belayd --no-worktree`: activate the gate in this session. Extracted from
    * the command handler so the handler stays a readable sequence of guards.
    */
-  function startInSessionWorkflow(options: {
+  async function startInSessionWorkflow(options: {
     ctx: ExtensionContext;
     taskId: string;
     workflowType: WorkflowSubType;
     resolution: WorkflowResolution;
-  }): void {
+  }): Promise<void> {
     const { ctx, taskId, workflowType, resolution } = options;
+    // Claim the bead for the workflow's actor before the gate goes live, so the
+    // assignment exists for the whole run (bd-150).
+    const mirrored = await mirrorAssignee({
+      taskId,
+      actor: orchestratorActor(taskId),
+      cwd: ctx.cwd,
+      runBd: runBdForAssignee,
+    });
+    reportAssigneeResult(mirrored);
     activateGate({
       ctx,
       taskId,
@@ -3382,7 +3494,7 @@ export default function belaydAgentHarness(
     resolution = confirmed.resolution;
 
     if (args.noWorktree) {
-      startInSessionWorkflow({
+      await startInSessionWorkflow({
         ctx,
         taskId: args.taskId,
         workflowType: resolution.type,
@@ -3680,6 +3792,11 @@ export default function belaydAgentHarness(
   }): void {
     const { state, cwd, marker } = options;
     state.gateActive = false;
+    // Deliberately no assignee clear on handoff (bd-150). Ownership transfers to
+    // the child orchestrator, which re-mirrors the identical
+    // `belayd:<taskId>:orchestrator` actor string; a parent-side clear would race
+    // that mirror and wipe the child's assignment. Completion, accept and stop
+    // clear instead.
     state.handedOffTo = { ...marker };
 
     // In a same-directory handoff the child orchestrator owns this cwd's state
@@ -5562,8 +5679,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       }
 
       const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
+      // Attribute the write to the workflow actor (bd-150). A caller-supplied
+      // `--actor` still wins: this default sits at index 1 and bd's last flag
+      // wins. `--claim` stays rejected above, which is what keeps assign legal.
+      const argv = attributedBdArgv(validation.argv, ctx);
       try {
-        const { stdout, stderr } = await runBdCommand(validation.argv, {
+        const { stdout, stderr } = await runBdCommand(argv, {
           cwd,
           stdin,
           timeoutInMs: 30_000,
@@ -8206,6 +8327,14 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         });
       }
 
+      const mirrored = await mirrorAssignee({
+        taskId: params.taskId,
+        actor: orchestratorActor(params.taskId),
+        cwd,
+        runBd: runBdForAssignee,
+      });
+      reportAssigneeResult(mirrored);
+
       const state = activateGate({
         ctx,
         taskId: params.taskId,
@@ -8501,6 +8630,24 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
       const telemetryCwd = ctx.cwd;
+
+      // Release the bead's assignee before teardown (bd-150). Gated on
+      // `gateActive`: losing the orchestrator lease disarms the gate but leaves
+      // `currentTaskId` naming the workflow this session was driving, and the
+      // actor string is per task id — so a stale session clearing on the id
+      // alone would CAS-clear the assignment the *new* driver now holds. Only a
+      // harness actor is cleared: a human's own assignment survives a stop. A
+      // refusal warns and teardown continues — ownership reporting never blocks
+      // a stop.
+      if (state.gateActive === true && state.currentTaskId !== "") {
+        const cleared = await clearAssignee({
+          taskId: state.currentTaskId,
+          holder: orchestratorActor(state.currentTaskId),
+          cwd: ctx.cwd,
+          runBd: runBdForAssignee,
+        });
+        reportAssigneeResult(cleared);
+      }
 
       // In-flight background runs must not survive task teardown.
       abortAndResetRunTracking(state);
@@ -8798,9 +8945,14 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       // The `human` label surfaces the bead in Bead Me Up, Scotty's "Needs You"
       // inbox; `in_progress` keeps it out of `bd ready` until the human merges.
       // Flags precede `--` so the taskId is parsed as a positional even if it
-      // starts with `-`; pflag stops flag parsing at the separator.
+      // starts with `-`; pflag stops flag parsing at the separator. Attributed
+      // to the workflow's orchestrator (bd-150): this is a lifecycle write made
+      // for the workflow, not the operator's own bd edit.
       await runBdCommand(
-        ["update", "--status", "in_progress", "--add-label", "human", "--", taskId],
+        withActorArgv(
+          ["update", "--status", "in_progress", "--add-label", "human", "--", taskId],
+          orchestratorActor(taskId),
+        ),
         {
           cwd,
           stdin: undefined,
@@ -9246,6 +9398,20 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       const currentPhaseOrder = [...state.phaseOrder];
       const currentTaskId = state.currentTaskId;
       const currentCompleted = [...state.completedPhaseNames];
+
+      // Release the bead's assignee at completion (bd-150): the workflow is over
+      // and ownership is stale. Cleared while the gate is still armed so the same
+      // ownership rule as stop applies (only an actor we hold), and awaited so a
+      // bd refusal degrades to a warning without blocking completion.
+      if (currentTaskId !== "") {
+        const cleared = await clearAssignee({
+          taskId: currentTaskId,
+          holder: orchestratorActor(currentTaskId),
+          cwd: ctx.cwd,
+          runBd: runBdForAssignee,
+        });
+        reportAssigneeResult(cleared);
+      }
 
       // Compact completed phase sessions before resetting state
       await compactTaskSessions(currentTaskId, currentCompleted);

@@ -176,6 +176,11 @@ export function validateBdCommand(command: string): BdCommandValidation {
       };
     }
     if (argv.some((token) => token === "--claim")) {
+      // Load-bearing for assignment (bd-150): a claim takes a lease on the bead,
+      // and every later `bd update --assignee`/`bd assign` refuses while a lease
+      // is live. The harness instead mirrors the driving actor as the assignee
+      // with a CAS-guarded `--if-assignee` write (see src/beads-actor.ts), which
+      // only works because no harness code path ever takes a claim.
       return {
         ok: false,
         error: "bd <sub> --claim is not allowed through the bd tool.",

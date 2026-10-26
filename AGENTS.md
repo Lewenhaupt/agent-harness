@@ -22,6 +22,7 @@ it instead of carrying all of it in every session.
 | Which extension/tool loads here, and which pi binary runs an agent? | `docs/packaging.md` (start with `belayd_doctor`) |
 | Where does module X live? | `docs/repo-layout.md` |
 | How does a phase agent, retry or resume work? | `docs/subagent-sessions.md`, `docs/planning-implement-workflows.md` |
+| Which agent wrote a bead, and who is it assigned to? | `docs/beads-actor.md` |
 | How do I operate pi-web / AWS sandbox / containers? | `docs/pi-web-service.md`, `docs/aws-credential-isolation.md`, `docs/arion.md` |
 | Fleet (`/fleet`), proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
 
