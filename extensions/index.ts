@@ -48,6 +48,7 @@ import type {
   ArchifyDiagramType,
   ArchifyQuality,
   ArchifyTextResult,
+  AwaitingHuman,
   BeadsAssigneeResult,
   BelaydCommandArgs,
   FleetBeadLookup,
@@ -114,6 +115,8 @@ import {
   buildArchifyGuideArgs,
   buildArchifyInspectArgs,
   buildFleetNote,
+  buildGateCreateArgv,
+  buildGateResolveArgv,
   buildGateResultEvent,
   buildOrchestratorPrompt,
   buildPhaseAdvanceEvent,
@@ -121,6 +124,7 @@ import {
   buildRunEndEvent,
   buildRunStartEvent,
   buildVerifierPrompt,
+  COMMENT_EXCERPT_MAX_CHARS,
   checkToolAllowed,
   classifyOrchestratorClaim,
   clearAssignee,
@@ -128,6 +132,7 @@ import {
   collectChangeContext,
   collectHandoffDefault,
   collectReviewDiff,
+  commentTimeInMs,
   countReviewFindings,
   createInstructionGroupCollector,
   currentBranch,
@@ -141,6 +146,7 @@ import {
   drainNotes,
   enqueueFleetMerge,
   enqueueNoteFanout,
+  excerptComment,
   extractOutlineSymbols,
   extractProofArtifacts,
   FLEET_NOTE_BROADCAST,
@@ -179,6 +185,7 @@ import {
   isFleetNoteKind,
   isFleetRefusedTool,
   isFleetRunActive,
+  isHumanComment,
   isInsideWorktreeForBranch,
   isOutlineKind,
   isProcessAlive,
@@ -192,8 +199,10 @@ import {
   listPendingUserCompletions,
   listRuns,
   loadMetricsQueries,
+  lookupBeadComments,
   lookupFleetBeads,
   lookupFleetDependencies,
+  lookupOpenHumanGate,
   type MetricsEvent,
   type MetricsQuery,
   manageInstructionGroups,
@@ -217,6 +226,7 @@ import {
   PROOF_VERIFIER_AGENT,
   PROOF_VERIFIER_TOOLS,
   parseBelaydCommandArgs,
+  parseCreatedGateId,
   parseFleetCommandArgs,
   parseFleetTaskIds,
   parseSubagentSessionName,
@@ -592,6 +602,27 @@ type SessionState = {
   fleetRunTimer?: ReturnType<typeof setInterval>;
   /** One tick at a time: a landing tick runs the project gates for minutes. */
   fleetTickInFlight?: boolean;
+  /**
+   * Set while the workflow waits on a human answer (bd-152): the open `human` bd
+   * gate, mirrored in memory so the tool gate can refuse synchronously.
+   *
+   * The bd gate — not this field — is the durable state: a restart re-discovers
+   * it at session start, and delivering the answer clears both together.
+   */
+  awaitingHuman?: AwaitingHuman & { gateId?: string };
+  /**
+   * Interval polling the open human gate and its comment thread. Armed only for
+   * an orchestrator session that asked a question, so an idle fleet of members
+   * with nothing outstanding spawns no `bd` at all.
+   */
+  humanAnswerTimer?: ReturnType<typeof setInterval>;
+  /**
+   * One delivery at a time: the timer and the turn-start fallback can overlap,
+   * and only the caller holding this claim may send the answer or settle it.
+   */
+  humanAnswerClaimed?: boolean;
+  /** The unrecognized-gate warning was already logged for the current wait. */
+  humanAnswerWarned?: boolean;
 };
 
 const sessionStates = new Map<string, SessionState>();
@@ -896,6 +927,7 @@ function evaluateToolCallGate(
     state.workflowType,
     state.optionalPhases,
     state.consultPhases,
+    state.awaitingHuman,
   );
   if (!check.allowed) {
     abortToolCall(event, "phase-order-blocked", check.reason ?? "Phase order violation");
@@ -1838,6 +1870,10 @@ export default function belaydAgentHarness(
     state.planningTarget = undefined;
     state.gateActive = false;
     state.currentTaskId = "";
+    // The child orchestrator takes over the bead, so a wait that belongs to this
+    // session's gate goes quiet here; the child re-discovers the bd gate
+    // (bd-152).
+    clearHumanAnswerWait(state);
     // Neutral phase configuration: no phase-order check can trip on a workflow
     // the session no longer owns (the gate itself is off).
     state.workflowType = "feature";
@@ -3362,7 +3398,14 @@ export default function belaydAgentHarness(
 
       // Reset any prior implementation gate before entering planning mode.
       abortAndResetRunTracking(state);
+      const droppedTaskId = state.currentTaskId;
       state.gateActive = false;
+      // A prior human wait belongs to the workflow being dropped. Resolve its
+      // gate the same way stop/completion do (bd-152): the `clearWorkflowState`
+      // below deletes the only rediscovery path, so clearing the in-memory wait
+      // alone would leave the bead gate-blocked in bd/Scotty with no answer
+      // channel.
+      await reapHumanGateForTask({ ctx, state, beadId: droppedTaskId });
       clearWorkflowState({ cwd: ctx.cwd });
       clearHandoff({ cwd: ctx.cwd });
 
@@ -3927,14 +3970,14 @@ export default function belaydAgentHarness(
     state.handoffPendingNotice = undefined;
     state.runEpoch = 0;
     resetRunTracking(state);
+    clearHumanAnswerWait(state);
     applyToolGate(state);
 
     // Sub-agents have "-sub-" in their session name (set by computeSubagentSessionName).
     // Only the orchestrator session should activate the gate; sub-agents get their
     // tool restrictions from their agent definition's tools allowlist, not the gate.
     const sessionName = ctx.sessionManager.getSessionName();
-    const isSubAgent = sessionName?.includes("-sub-");
-    if (!ctx.sessionManager.getSessionFile() || isSubAgent) return;
+    if (!ctx.sessionManager.getSessionFile() || isSubAgentSession(sessionName)) return;
 
     // P5: settle worktree ownership *before* the gate can arm. Two sessions in one
     // worktree share `.belayd/workflow.json` and `.belayd/runs/`, so the session
@@ -3971,6 +4014,9 @@ export default function belaydAgentHarness(
     // A user completion persisted before an orchestrator restart is recovered
     // from disk; the in-memory delivery marker was lost with the process.
     reconcileUserCompletions({ state, cwd: ctx.cwd });
+    // The open human gate (bd-152) is the durable "waiting on a human" state: a
+    // restart mid-wait re-discovers it here and re-arms the poll.
+    discoverHumanAnswerWait({ ctx, state });
     resumeFleetRunLoop(ctx, state);
   });
 
@@ -4003,6 +4049,10 @@ export default function belaydAgentHarness(
       // Neither may the fleet loop or the worktree lease: the whole point of the
       // lease is that it stops being renewed exactly when this session stops.
       stopFleetRunTimer(state);
+      // The answer poll's timer holds this state in its closure and would keep
+      // spawning bd reads — and could `sendUserMessage` into a dead session — so
+      // shutdown drops the wait without delivering anything.
+      clearHumanAnswerWait(state);
       releaseSessionOrchestratorLease(state, id, ctx.cwd);
     }
     sessionStates.delete(id);
@@ -4190,14 +4240,395 @@ export default function belaydAgentHarness(
           ...worktreeSyncGuidanceLines(),
           ...handoffLines,
           ...activeRunLines,
+          ...humanAnswerGuidanceLines(state),
           "",
           "Task tracking: the `bd` tool is available for beads commands (create, update, label, note, show, search, list, ready, etc.).",
-          "",
-          nextStepLine,
+          ...nextStepBlockLines(state, nextStepLine),
         ].join("\n"),
         display: false,
       },
     };
+  }
+
+  /**
+   * The next-step block, or nothing while a human answer is pending.
+   *
+   * Split out of {@link gateContextMessage} so the prompt builder stays under the
+   * complexity limit, and because "no next step" is the whole rule: a waiting
+   * workflow must not be told to call a phase tool the gate will refuse.
+   */
+  function nextStepBlockLines(state: SessionState, nextStepLine: string): string[] {
+    return state.awaitingHuman === undefined ? ["", nextStepLine] : [];
+  }
+
+  /**
+   * Prompt guidance for the human answer channel (bd-152).
+   *
+   * The ask line is unconditional: the one moment the orchestrator needs
+   * `belayd_ask_human` is the moment it feels blocked, which is exactly when an
+   * advisory note is not read unless it has been repeated every turn. The wait
+   * block replaces the "call belayd_X" next step, because a refused tool with no
+   * explanation is what makes a model retry or guess instead of waiting.
+   */
+  function humanAnswerGuidanceLines(state: SessionState): string[] {
+    const lines = [
+      "",
+      "**Blocked on a human decision?** Call `belayd_ask_human` with the question, then END YOUR TURN: it posts the question as a bd comment, opens a `human` gate, and refuses every phase tool until an answer arrives. Never guess and never proceed without the answer.",
+    ];
+    const awaiting = state.awaitingHuman;
+    if (awaiting === undefined) return lines;
+    lines.push(
+      "",
+      `⏸ **Waiting for a human answer on ${awaiting.beadId}** — phase tools are refused until the answer arrives.`,
+      `Asked ${formatAskedAt(awaiting.askedAt)}. Reply on the bead (bd comment ${awaiting.beadId} --stdin, or in Scotty); the answer arrives in this session as a user message.`,
+    );
+    return lines;
+  }
+
+  /** Human-readable ask time; a corrupt timestamp must not throw in a prompt. */
+  function formatAskedAt(askedAt: number): string {
+    return Number.isFinite(askedAt) ? new Date(askedAt).toISOString() : "recently";
+  }
+
+  // ── Human answer channel (bd-152) ────────────────────────────────────
+  //
+  // A workflow blocked on a human used to be a dead end: the tool posts the
+  // question as an authored bd comment and opens a `human` gate, and this poll
+  // turns the first non-`belayd:` comment on the bead into a real user turn.
+  // The bd gate is the durable state (`bd gate list`), so a restart re-discovers
+  // the wait, and the timer is armed only while a question is open — the cost is
+  // bounded by open questions, normally 0–1.
+
+  /** How often an open question re-reads its gate and comments. */
+  const HUMAN_ANSWER_POLL_INTERVAL_MS = 30_000;
+
+  /**
+   * True for a phase sub-agent session (`-sub-` marker from
+   * `computeSubagentSessionName`).
+   *
+   * Sub-agents share their orchestrator's worktree and bead but must never act
+   * for it (no gate arming, no fleet drain, no human-answer poll), so this one
+   * heuristic is named once instead of being re-derived at each call site.
+   */
+  function isSubAgentSession(sessionName: string | undefined): boolean {
+    return sessionName?.includes("-sub-") === true;
+  }
+
+  /**
+   * Arm the self-poll. Mirrors the orchestrator lease heartbeat: the timer runs
+   * in the session daemon while the session is idle, and `unref()` keeps a pi
+   * process from living just to wait for an answer.
+   */
+  function startHumanAnswerPoll(state: SessionState, ctx: ExtensionContext): void {
+    stopHumanAnswerPoll(state);
+    // A phase sub-agent shares its orchestrator's worktree and bead, so arming a
+    // poll there would deliver the answer into a session that cannot act on it.
+    if (isSubAgentSession(ctx.sessionManager.getSessionName())) return;
+    const timer = setInterval(() => {
+      void pollHumanAnswerOnce(state, ctx).catch((error: unknown) => {
+        console.warn(`[belayd-harness] human answer poll failed: ${errorText(error)}`);
+      });
+    }, HUMAN_ANSWER_POLL_INTERVAL_MS);
+    timer.unref();
+    state.humanAnswerTimer = timer;
+  }
+
+  function stopHumanAnswerPoll(state: SessionState): void {
+    if (state.humanAnswerTimer === undefined) return;
+    clearInterval(state.humanAnswerTimer);
+    state.humanAnswerTimer = undefined;
+  }
+
+  /** Drop the in-memory wait and its timer; the bd gate is resolved separately. */
+  function clearHumanAnswerWait(state: SessionState): void {
+    stopHumanAnswerPoll(state);
+    state.awaitingHuman = undefined;
+    // A new question deserves its own warning budget.
+    state.humanAnswerWarned = false;
+  }
+
+  /** What one gate + comment read says about the open question. */
+  type HumanAnswerObservation =
+    | { kind: "pending" }
+    | { kind: "unknown" }
+    | { kind: "resolved" }
+    | { kind: "answered"; author: string; text: string };
+
+  /** Observations that carry something worth delivering. */
+  type DeliverableObservation = Extract<HumanAnswerObservation, { kind: "resolved" | "answered" }>;
+
+  function isDeliverable(observed: HumanAnswerObservation): observed is DeliverableObservation {
+    return observed.kind === "resolved" || observed.kind === "answered";
+  }
+
+  /**
+   * Read the gate and the thread and decide whether an answer exists.
+   *
+   * Fail closed: only `status: "open"` (then read the thread) and `status:
+   * "none"` (the gate really is gone) can settle the wait. An `unrecognized`
+   * gate record — renamed `status`/`await_type`, a timer gate, a malformed
+   * entry — and a failed read both keep it armed, because "bd changed its JSON"
+   * must never look like "a human answered".
+   */
+  async function observeHumanAnswer(
+    state: SessionState,
+    awaiting: AwaitingHuman & { gateId?: string },
+    cwd: string,
+  ): Promise<HumanAnswerObservation> {
+    const gate = await lookupOpenHumanGate({ beadId: awaiting.beadId, cwd, runBd: runBdCommand });
+    if (!gate.ok) return { kind: "unknown" };
+    if (gate.status === "unrecognized") {
+      warnUnrecognizedHumanGate(state, awaiting.beadId);
+      return { kind: "unknown" };
+    }
+    if (gate.status === "none") return { kind: "resolved" };
+
+    const comments = await lookupBeadComments({
+      beadId: awaiting.beadId,
+      cwd,
+      runBd: runBdCommand,
+    });
+    if (!comments.ok) return { kind: "unknown" };
+
+    // The gate's creation time is the baseline: it is written by bd itself, so a
+    // restart loses nothing (the old design had to persist the comment id). bd
+    // timestamps have second granularity, hence `>=` — a human answering in the
+    // same second the question was asked is still an answer.
+    const gateTime =
+      gate.gate.createdAt === undefined ? Number.NaN : Date.parse(gate.gate.createdAt);
+    const baseline = Number.isFinite(gateTime) ? gateTime : awaiting.askedAt;
+    const answer = comments.comments.find(
+      (comment) => isHumanComment(comment) && commentTimeInMs(comment) >= baseline,
+    );
+    if (answer === undefined) return { kind: "pending" };
+    return { kind: "answered", author: answer.author, text: answer.text };
+  }
+
+  /** Say once per wait that bd's gate JSON no longer parses; never spam the poll. */
+  function warnUnrecognizedHumanGate(state: SessionState, beadId: string): void {
+    if (state.humanAnswerWarned === true) return;
+    state.humanAnswerWarned = true;
+    console.warn(
+      `[belayd-harness] bd reported gates for ${beadId} that are not open human gates; ` +
+        "the human wait stays armed (bd gate JSON may have changed).",
+    );
+  }
+
+  /** A detected answer plus the wait it belongs to. */
+  interface DetectedHumanAnswer {
+    awaiting: AwaitingHuman & { gateId?: string };
+    message: string;
+  }
+
+  /**
+   * Detect an answer and claim its delivery, without delivering anything yet.
+   *
+   * The claim (a per-session flag) is what stops the poll timer and the
+   * turn-start fallback from both delivering: the first caller holds it until it
+   * settles (success) or releases it (nothing deliverable, failed send). The
+   * wait is NOT cleared here — clearing before the send is what used to lose an
+   * answer when `sendUserMessage` threw.
+   */
+  async function claimHumanAnswer(
+    state: SessionState,
+    ctx: ExtensionContext,
+  ): Promise<DetectedHumanAnswer | undefined> {
+    const awaiting = state.awaitingHuman;
+    if (awaiting === undefined) return undefined;
+    if (state.humanAnswerClaimed === true) return undefined;
+    state.humanAnswerClaimed = true;
+    try {
+      const observed = await observeHumanAnswer(state, awaiting, ctx.cwd);
+      if (isDeliverable(observed) && state.awaitingHuman === awaiting) {
+        return { awaiting, message: humanAnswerText(awaiting, observed) };
+      }
+    } catch (error) {
+      console.warn(`[belayd-harness] human answer check failed: ${errorText(error)}`);
+    }
+    state.humanAnswerClaimed = false;
+    return undefined;
+  }
+
+  /** The message a delivered answer (or an out-of-band gate resolve) becomes. */
+  function humanAnswerText(
+    awaiting: AwaitingHuman & { gateId?: string },
+    observed: DeliverableObservation,
+  ): string {
+    if (observed.kind === "resolved") {
+      return `The human gate on ${awaiting.beadId} was resolved without a comment; you may proceed.`;
+    }
+    return `${observed.author} answered: ${excerptComment(observed.text)}`;
+  }
+
+  /**
+   * Settle a delivered answer: clear the wait, stop the timer, resolve the gate.
+   *
+   * Called only after the delivery succeeded (or, at turn start, immediately
+   * before returning the message that IS the delivery), so an unblocked workflow
+   * and a resolved gate always mean the answer actually reached the session.
+   */
+  async function settleHumanAnswer(options: {
+    state: SessionState;
+    ctx: ExtensionContext;
+    awaiting: AwaitingHuman & { gateId?: string };
+  }): Promise<void> {
+    try {
+      clearHumanAnswerWait(options.state);
+      await resolveHumanGate({ awaiting: options.awaiting, ctx: options.ctx });
+    } finally {
+      options.state.humanAnswerClaimed = false;
+    }
+  }
+
+  /**
+   * Resolve the human gate after an answer (or on teardown).
+   *
+   * Reports whether the gate is actually gone: the ask tool's compensation path
+   * must keep the wait armed when it is not, so a failed resolve cannot leave an
+   * open gate with nobody watching it. A failure here after a successful delivery
+   * is only logged — the answer already reached the session, and a restart
+   * re-discovers the still-open gate.
+   */
+  async function resolveHumanGate(options: {
+    awaiting: AwaitingHuman & { gateId?: string };
+    ctx: ExtensionContext;
+  }): Promise<{ resolved: boolean; error?: string }> {
+    const gateId = await findHumanGateId(options.awaiting, options.ctx.cwd);
+    if (gateId === undefined) {
+      return {
+        resolved: false,
+        error: `no open human gate found for ${options.awaiting.beadId}`,
+      };
+    }
+    const actor = resolveSessionBdActor(options.ctx) ?? orchestratorActor(options.awaiting.beadId);
+    try {
+      await runBdCommand(withActorArgv(buildGateResolveArgv(gateId), actor), {
+        cwd: options.ctx.cwd,
+        stdin: undefined,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      return { resolved: true };
+    } catch (error) {
+      const detail = errorText(error);
+      console.warn(
+        `[belayd-harness] could not resolve the human gate ${gateId} on ${options.awaiting.beadId}: ${detail}`,
+      );
+      return { resolved: false, error: detail };
+    }
+  }
+
+  /** The wait's gate id, re-read from the bead when `bd gate create` did not name it. */
+  async function findHumanGateId(
+    awaiting: AwaitingHuman & { gateId?: string },
+    cwd: string,
+  ): Promise<string | undefined> {
+    if (awaiting.gateId !== undefined) return awaiting.gateId;
+    const found = await lookupOpenHumanGate({ beadId: awaiting.beadId, cwd, runBd: runBdCommand });
+    return found.ok && found.status === "open" ? found.gate.gateId : undefined;
+  }
+
+  /**
+   * One poll tick: detect, own, deliver, THEN settle.
+   *
+   * The send comes first on purpose. A failed send releases the claim and leaves
+   * the wait armed, so the next tick retries and the gate stays open as the
+   * durable record of the unanswered question.
+   */
+  async function pollHumanAnswerOnce(state: SessionState, ctx: ExtensionContext): Promise<void> {
+    if (state.awaitingHuman === undefined) {
+      stopHumanAnswerPoll(state);
+      return;
+    }
+    const detected = await claimHumanAnswer(state, ctx);
+    if (detected === undefined) return;
+    if (!sendHumanAnswer(detected.message)) {
+      state.humanAnswerClaimed = false;
+      return;
+    }
+    await settleHumanAnswer({ state, ctx, awaiting: detected.awaiting });
+  }
+
+  /**
+   * Deliver a detected answer as a real user turn (bd-148: no triggerTurn needed).
+   * Returns whether the session accepted it, so the caller can retry later.
+   */
+  function sendHumanAnswer(text: string): boolean {
+    try {
+      pi.sendUserMessage(text);
+      return true;
+    } catch (error) {
+      console.warn(`[belayd-harness] could not deliver a human answer: ${errorText(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Turn-start fallback for the self-poll.
+   *
+   * The timer needs the session daemon to keep running; when that route is not
+   * available the next turn still injects the answer. Both paths share the claim,
+   * so the answer is delivered exactly once either way; here the returned message
+   * IS the delivery, so the wait settles before returning.
+   */
+  async function humanAnswerMessage(
+    ctx: ExtensionContext,
+  ): Promise<{ message: { customType: string; content: string; display: boolean } } | undefined> {
+    const state = getSessionState(ctx);
+    const detected = await claimHumanAnswer(state, ctx);
+    if (detected === undefined) return undefined;
+    await settleHumanAnswer({ state, ctx, awaiting: detected.awaiting });
+    return {
+      message: { customType: "belayd-human-answer", content: detected.message, display: true },
+    };
+  }
+
+  /**
+   * Re-arm the wait after a restart (bd-152): the bd gate IS the durable state.
+   *
+   * One read of the active bead's gates restores exactly what the dropped marker
+   * file would have stored, so nothing persistent is written and no stale marker
+   * can survive a workflow that already ended.
+   */
+  function discoverHumanAnswerWait(options: { ctx: ExtensionContext; state: SessionState }): void {
+    const { ctx, state } = options;
+    if (!state.gateActive || state.awaitingHuman !== undefined) return;
+    const beadId = state.currentTaskId;
+    if (beadId === "") return;
+    void (async () => {
+      const found = await lookupOpenHumanGate({ beadId, cwd: ctx.cwd, runBd: runBdCommand });
+      // Only a real open human gate re-arms the wait: `unrecognized` records are
+      // not a wait the poll could ever answer (bd-152 fail-closed).
+      if (!found.ok || found.status !== "open") return;
+      // The workflow may have been torn down while the read was in flight.
+      if (!state.gateActive || state.awaitingHuman !== undefined) return;
+      state.awaitingHuman = { beadId, gateId: found.gate.gateId, askedAt: Date.now() };
+      startHumanAnswerPoll(state, ctx);
+    })().catch((error: unknown) => {
+      console.warn(`[belayd-harness] human gate discovery failed: ${errorText(error)}`);
+    });
+  }
+
+  /**
+   * Resolve a torn-down workflow's human gate (bd-152).
+   *
+   * An orphan gate keeps the bead blocked in bd/Scotty long after the workflow
+   * stopped, so the gate goes with the workflow. Best-effort and bounded: a
+   * teardown must never fail because bd did.
+   */
+  async function reapHumanGateForTask(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    beadId: string;
+  }): Promise<void> {
+    const awaiting = options.state.awaitingHuman;
+    clearHumanAnswerWait(options.state);
+    if (options.beadId === "") return;
+    if (awaiting !== undefined && awaiting.beadId !== options.beadId) return;
+    await resolveHumanGate({
+      awaiting: awaiting ?? { beadId: options.beadId, askedAt: Date.now() },
+      ctx: options.ctx,
+    });
   }
 
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -4213,11 +4644,22 @@ export default function belaydAgentHarness(
   // be able to skip it. A supervisor → member note is a file in `events/`, so it
   // is drained here, at the start of the turn, bounded, acked once, and silent
   // when nothing is addressed to this member.
+  //
+  // Human answers ride along (bd-152): when the self-poll timer cannot wake the
+  // session (no daemon route), the next turn still injects the answer. Both
+  // paths funnel through `claimHumanAnswer`, which clears the wait before it
+  // delivers, so the answer is never injected twice.
   pi.on("before_agent_start", async (_event, ctx) => {
     try {
-      return drainFleetEventsMessage(ctx);
+      const fleet = drainFleetEventsMessage(ctx);
+      if (fleet !== undefined) return fleet;
     } catch (error) {
       console.warn(`[belayd-harness] fleet events delivery failed: ${errorText(error)}`);
+    }
+    try {
+      return await humanAnswerMessage(ctx);
+    } catch (error) {
+      console.warn(`[belayd-harness] human answer delivery failed: ${errorText(error)}`);
       return undefined;
     }
   });
@@ -5479,6 +5921,211 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     },
   });
 
+  // ── Register ask-human tool (bd-152) ─────────────────────────────────
+  // Orchestrator-only and deliberately gate-free: this is the one action a
+  // blocked workflow must still be able to take. It is in
+  // WORKFLOW_CONTROL_TOOLS so a gated session can see it at the blocked moment.
+  pi.registerTool({
+    name: "belayd_ask_human",
+    label: "Ask a human",
+    description:
+      "Stop and ask a human a question about the current bead. Posts the question as a bd " +
+      "comment, opens a `human` bd gate that blocks the bead, and refuses every phase tool " +
+      "until someone answers (a comment authored by anyone other than belayd:*). The answer " +
+      "arrives in this session as a user message. Use this instead of guessing when the work " +
+      "is blocked on a decision only a human can make; END YOUR TURN after calling it.",
+    parameters: Type.Object({
+      question: Type.String({
+        description:
+          "The question, with the options you are choosing between (answerable in a comment)",
+      }),
+      beadId: Type.Optional(
+        Type.String({ description: "Bead to ask about (default: the active workflow's bead)" }),
+      ),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      return askHuman({ params, ctx: ctx as ExtensionContext });
+    },
+  });
+
+  /**
+   * Implement `belayd_ask_human`: gate + authored question, then stop.
+   *
+   * Two bd writes, deliberately NOT through the `bd` proxy: argv validation only
+   * inspects `argv[0]`, so allowing `gate` there would expose the whole gate
+   * lifecycle (src/bd-command.ts). Order matters — the gate is created first, so
+   * the wait is visible in bd/Scotty even if the comment write fails; the comment
+   * carries the question and is authored by the workflow actor, which is what
+   * keeps it from ever counting as the answer.
+   */
+  async function askHuman(options: {
+    params: { question?: string; beadId?: string };
+    ctx: ExtensionContext;
+  }): Promise<ReturnType<typeof textToolResult>> {
+    const { ctx } = options;
+    const state = getSessionState(ctx);
+    const target = resolveAskTarget(options.params, state);
+    if (!target.ok) return textToolResult(target.error, target.exitCode);
+    if (state.awaitingHuman !== undefined) {
+      return textToolResult(
+        `Already waiting for a human answer on ${state.awaitingHuman.beadId} — END YOUR TURN.`,
+        0,
+      );
+    }
+
+    const actor = resolveSessionBdActor(ctx) ?? orchestratorActor(target.taskId);
+    const created = await createHumanGate({
+      taskId: target.taskId,
+      question: target.question,
+      actor,
+      ctx,
+    });
+    if (!created.ok) {
+      // No gate means no wait: leave awaitingHuman unset so the workflow is not
+      // blocked on a gate bd never created.
+      return textToolResult(`belayd_ask_human: could not open a human gate: ${created.error}`, 1);
+    }
+    const awaiting: AwaitingHuman & { gateId?: string } = {
+      beadId: target.taskId,
+      askedAt: Date.now(),
+      ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
+    };
+
+    const posted = await runBdResult(
+      withActorArgv(["comment", "--stdin", "--", target.taskId], actor),
+      { cwd: ctx.cwd, stdin: target.question },
+    );
+    if (!posted.ok) {
+      // An unasked question must not leave an orphan gate blocking the bead. When
+      // the compensation also fails the gate is genuinely open (that is usually
+      // why both writes failed), so the wait stays armed: the poll keeps watching
+      // the bead, and a teardown reaps the gate instead of leaving it orphaned.
+      const cleaned = await resolveHumanGate({ awaiting, ctx });
+      if (!cleaned.resolved) {
+        state.awaitingHuman = awaiting;
+        startHumanAnswerPoll(state, ctx);
+        return textToolResult(
+          [
+            `belayd_ask_human: could not post the question as a bd comment (${posted.error}).`,
+            `Resolving the gate it created also failed (${cleaned.error ?? "unknown error"}).`,
+            "The bead may be left blocked by an open human gate and the question may not be posted.",
+            `Check with bd gate list ${target.taskId}, resolve it with bd gate resolve <gate>, or retry.`,
+          ].join(" "),
+          1,
+        );
+      }
+      return textToolResult(
+        `belayd_ask_human: could not post the question as a bd comment: ${posted.error}`,
+        1,
+      );
+    }
+
+    state.awaitingHuman = awaiting;
+    startHumanAnswerPoll(state, ctx);
+    return textToolResult(askResultText({ taskId: target.taskId, gateId: created.gateId }), 0);
+  }
+
+  /**
+   * Upper bound on one question: it is interpolated into `bd gate create
+   * --reason` argv, which bd/posix caps well below a comment body, so an
+   * over-long question fails here with a clear message instead of at spawn.
+   */
+  const ASK_HUMAN_QUESTION_MAX_CHARS = 2_000;
+
+  /** Validate the ask target: a trimmed question plus the bead it concerns. */
+  function resolveAskTarget(
+    params: { question?: string; beadId?: string },
+    state: SessionState,
+  ):
+    | { ok: true; taskId: string; question: string }
+    | { ok: false; error: string; exitCode: number } {
+    const question = (params.question ?? "").trim();
+    if (question === "") {
+      return {
+        ok: false,
+        exitCode: 1,
+        error: "belayd_ask_human: the question is empty — ask something answerable in a comment.",
+      };
+    }
+    if (question.includes("\u0000")) {
+      return {
+        ok: false,
+        exitCode: 1,
+        error: "belayd_ask_human: the question must not contain NUL bytes.",
+      };
+    }
+    if (question.length > ASK_HUMAN_QUESTION_MAX_CHARS) {
+      return {
+        ok: false,
+        exitCode: 1,
+        error:
+          `belayd_ask_human: the question is ${question.length} characters; keep it under ` +
+          `${ASK_HUMAN_QUESTION_MAX_CHARS} so it fits bd gate create --reason ` +
+          "(summarize the question and put the details in a bead note).",
+      };
+    }
+    const taskId = (params.beadId ?? "").trim() || state.currentTaskId;
+    if (taskId === "" || !isValidTaskId(taskId)) {
+      return {
+        ok: false,
+        exitCode: 1,
+        error:
+          "belayd_ask_human: no bead to ask about. It needs an active workflow, or an explicit beadId.",
+      };
+    }
+    return { ok: true, taskId, question };
+  }
+
+  /** Create the `human` bd gate for one question. */
+  async function createHumanGate(options: {
+    taskId: string;
+    question: string;
+    actor: string;
+    ctx: ExtensionContext;
+  }): Promise<{ ok: true; gateId?: string } | { ok: false; error: string }> {
+    const created = await runBdResult(
+      withActorArgv(
+        [...buildGateCreateArgv({ beadId: options.taskId, reason: options.question }), "--json"],
+        options.actor,
+      ),
+      { cwd: options.ctx.cwd, stdin: undefined },
+    );
+    if (!created.ok) return { ok: false, error: created.error };
+    const gateId = parseCreatedGateId(created.stdout, options.taskId);
+    return gateId === undefined ? { ok: true } : { ok: true, gateId };
+  }
+
+  /** What the orchestrator is told after a question was asked. */
+  function askResultText(options: { taskId: string; gateId?: string }): string {
+    const gate = options.gateId === undefined ? "" : ` (gate ${options.gateId})`;
+    const lines = [
+      `Asked a human on ${options.taskId}${gate}.`,
+      "The bead is blocked by a `human` gate and every phase tool is REFUSED until an answer arrives.",
+      "END YOUR TURN NOW — do not guess, do not proceed, do not call another phase tool. The answer arrives as a user message.",
+    ];
+    if (options.gateId === undefined) {
+      lines.push("Note: bd did not report the gate id; the poll re-reads the gate from the bead.");
+    }
+    return lines.join("\n");
+  }
+
+  /** `runBdCommand` as an error value, so tool handlers never throw on bd. */
+  async function runBdResult(
+    argv: readonly string[],
+    options: { cwd: string; stdin: string | undefined },
+  ): Promise<{ ok: true; stdout: string; stderr: string } | { ok: false; error: string }> {
+    try {
+      const result = await runBdCommand(argv, {
+        ...options,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      return { ok: true, ...result };
+    } catch (error) {
+      return { ok: false, error: errorText(error) };
+    }
+  }
+
   // ── Register metrics tool ────────────────────────────────────────────
   // Read-only analytics over the append-only metrics log (bd-140). The SQL lives
   // in metrics/queries/*.sql so it is reviewable in git, and DuckDB answers with
@@ -6017,6 +6664,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         `This session lost the orchestrator lease for ${options.worktreePath} (${renewed.error}); ` +
         "phase tools are disabled here so two sessions cannot drive one worktree.";
       options.state.gateActive = false;
+      // Losing the lease means this session is no longer the orchestrator; the
+      // new driver re-discovers the human gate from bd (bd-152).
+      clearHumanAnswerWait(options.state);
       applyToolGate(options.state);
       console.warn(`[belayd-harness] ${options.state.orchestratorLeaseRefusal}`);
     }
@@ -7199,7 +7849,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       });
       if (!resolved.ok) return textToolResult(resolved.error, 1);
 
-      const written = writeFleetNote({
+      const written = await writeFleetNote({
         ctx: extensionCtx,
         resolved,
         kind,
@@ -7211,18 +7861,26 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   });
 
   /**
-   * Validate the address, fan the note out, and audit the outcome.
+   * Validate the address, fan the note out, mirror it to bd, and audit the
+   * outcome.
    *
    * Split out of the tool handler so the handler stays a short orchestration of
    * "narrow the parameter → resolve the mailbox → write → report".
+   *
+   * A supervisor → member note is ALSO written as one bd comment per recipient
+   * on the recipient's bead (bd-152). The file mailbox stays the delivery/ack
+   * protocol — the comment is the human-visible mirror, so fleet traffic shows up
+   * in bd/Scotty instead of only in `events/` files. The author is always a
+   * `belayd:` actor, which is what keeps the mirror from ever being mistaken for
+   * a human answer by the answer poll.
    */
-  function writeFleetNote(options: {
+  async function writeFleetNote(options: {
     ctx: ExtensionContext;
     resolved: FleetNoteTarget;
     kind: FleetNoteKind;
     to: string;
     body: string;
-  }): { ok: true; text: string } | { ok: false; error: string } {
+  }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
     const { ctx, resolved, kind } = options;
     const recipients = resolveFleetNoteRecipients({
       direction: resolved.channel === "events" ? "supervisor-to-member" : "member-to-supervisor",
@@ -7267,6 +7925,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       taskIds: recipients.recipients,
       detail: `${resolved.channel} ${kind} to ${recipients.recipients.length} recipient(s)`,
     });
+    const mirrored = await mirrorFleetNoteComments({
+      ctx,
+      resolved,
+      recipients: recipients.recipients,
+      body: options.body,
+    });
     const audience =
       recipients.recipients.length === 1
         ? `to ${recipients.recipients[0] ?? ""}`
@@ -7275,8 +7939,55 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       ok: true,
       text:
         `Fleet \`${resolved.fleetId}\`: ${kind} from ${resolved.from} ${audience} queued in ` +
-        `${resolved.channel} (${enqueued.paths.length} file(s)).`,
+        `${resolved.channel} (${enqueued.paths.length} file(s)).` +
+        (mirrored === 0 ? "" : ` Mirrored to ${mirrored} bd comment(s).`),
     };
+  }
+
+  /**
+   * Mirror a supervisor → member note onto each recipient's bead (bd-152).
+   *
+   * Best-effort by design: the note is already in the mailbox, which is the
+   * delivery protocol, so a bd refusal must never fail it. Failures are logged
+   * and audited as one warning entry, and the count of written comments is
+   * returned so the tool text can state what actually happened.
+   */
+  async function mirrorFleetNoteComments(options: {
+    ctx: ExtensionContext;
+    resolved: FleetNoteTarget;
+    recipients: readonly string[];
+    body: string;
+  }): Promise<number> {
+    if (options.resolved.channel !== "events") return 0;
+    // An explicit actor that always starts with `belayd:` — a mirror must never
+    // look like a human answer even in a session whose actor does not resolve.
+    const actor = resolveSessionBdActor(options.ctx) ?? "belayd:supervisor";
+    const capped = excerptComment(options.body, COMMENT_EXCERPT_MAX_CHARS);
+    const settled = await Promise.allSettled(
+      options.recipients.map((recipient) =>
+        runBdCommand(withActorArgv(["comment", "--stdin", "--", recipient], actor), {
+          cwd: options.ctx.cwd,
+          stdin: `[belayd:supervisor->${recipient}] ${capped}`,
+          timeoutInMs: 15_000,
+          maxBufferInBytes: 1024 * 1024,
+        }),
+      ),
+    );
+    const failures = settled.filter((result) => result.status === "rejected");
+    if (failures.length === 0) return settled.length;
+    const reasons = failures
+      .map((result) => (result.status === "rejected" ? errorText(result.reason) : ""))
+      .join("; ");
+    console.warn(`[belayd-harness] fleet note mirror failed: ${reasons}`);
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.resolved.gitCommonDir,
+      fleetId: options.resolved.fleetId,
+      action: "note-mirror-failed",
+      taskIds: options.recipients,
+      detail: `${failures.length} of ${settled.length} bd comment(s) not written: ${reasons}`,
+    });
+    return settled.length - failures.length;
   }
 
   /** Audit detail for an inbox drain; a partial ack is stated, never hidden. */
@@ -8127,7 +8838,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     // A phase sub-agent shares its orchestrator's worktree and workflow state, so
     // draining here would consume the orchestrator's events in a session the
     // supervisor never addressed (and that cannot act on them).
-    if (ctx.sessionManager.getSessionName()?.includes("-sub-") === true) return undefined;
+    if (isSubAgentSession(ctx.sessionManager.getSessionName())) return undefined;
     // Delivery keys on the worktree's task id, so the fleet assumes one member
     // orchestrator per worktree (docs/fleet-launch.md "One session per
     // worktree"). A second session opened in the same worktree would drain and
@@ -8653,6 +9364,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           runBd: runBdForAssignee,
         });
         reportAssigneeResult(cleared);
+        // A stopped workflow must not leave a human gate blocking its bead in
+        // bd/Scotty (bd-152). Bounded and best-effort, like the assignee clear
+        // above; it also stops the answer poll, which only exists for the wait.
+        await reapHumanGateForTask({ ctx, state, beadId: state.currentTaskId });
+      } else {
+        clearHumanAnswerWait(state);
       }
 
       // In-flight background runs must not survive task teardown.
@@ -9446,6 +10163,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
 
       // Compact completed phase sessions before resetting state
       await compactTaskSessions(currentTaskId, currentCompleted);
+
+      // A completed workflow must not leave a human gate blocking its bead:
+      // comments carry answers, but close/merge is still the acceptance signal
+      // (bd-152), so the gate is resolved here rather than kept open.
+      await reapHumanGateForTask({ ctx, state, beadId: currentTaskId });
 
       // Workflow complete: the persisted state file is no longer needed.
       clearWorkflowState({ cwd: ctx.cwd });

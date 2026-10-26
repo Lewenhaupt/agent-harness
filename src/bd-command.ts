@@ -69,9 +69,46 @@ export const BD_ALLOWED_SUBCOMMANDS: readonly string[] = [
   ...BD_WRITE_SUBCOMMANDS,
 ].sort();
 
+/** `bd gate <child>` invocations that only read (bd-152). */
+export const BD_GATE_READ_SUBCOMMANDS: readonly string[] = ["list", "show"];
+
 /** Whether `bd <subcommand>` is on the read-only list. */
 export function isBdReadSubcommand(subcommand: string): boolean {
   return BD_READ_SUBCOMMANDS.includes(subcommand);
+}
+
+/**
+ * Whether an argv only reads beads, including the `bd gate <child>` reads.
+ *
+ * `gate` is deliberately absent from {@link BD_ALLOWED_SUBCOMMANDS}: argv
+ * validation inspects only `argv[0]`, so allowing `gate` through the `bd` proxy
+ * would expose `gate create`/`gate resolve` too. The harness still needs to READ
+ * gates (the human-answer poll), so the read-only predicate is widened here
+ * instead — the writers go through a direct `runBdCommand` call.
+ *
+ * The child is the first positional token after the subcommand, skipping
+ * `--actor <value>` because the actor is injected at index 1.
+ */
+export function isBdReadArgv(argv: readonly string[]): boolean {
+  const subcommand = argv[0] ?? "";
+  if (isBdReadSubcommand(subcommand)) return true;
+  if (subcommand !== "gate") return false;
+  return BD_GATE_READ_SUBCOMMANDS.includes(gateChildArgv(argv));
+}
+
+/** First positional token after `bd gate`, skipping flags and their values. */
+function gateChildArgv(argv: readonly string[]): string {
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === "--actor") {
+      i += 1;
+      continue;
+    }
+    if (token.startsWith("-")) continue;
+    return token;
+  }
+  return "";
 }
 
 /**

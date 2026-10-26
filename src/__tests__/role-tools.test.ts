@@ -69,8 +69,15 @@ describe("workflowGateToolSet", () => {
     for (const type of Object.keys(WORKFLOW_REGISTRY) as Array<keyof typeof WORKFLOW_REGISTRY>) {
       // The pre-bd-133 surface was 35 tools (10 phase + 15 control/fleet/consult
       // + 5 browse + 5 assorted). Anything above this bound means a family
-      // crept back into the gated set.
-      expect(toolSetSize(setFor(type)), `${type} declares too many tools`).toBeLessThanOrEqual(24);
+      // crept back into the gated set. The bound moved 24 → 25 for
+      // belayd_ask_human (bd-152), a deliberate one-tool exception.
+      expect(toolSetSize(setFor(type)), `${type} declares too many tools`).toBeLessThanOrEqual(25);
+    }
+  });
+
+  it("declares belayd_ask_human in every workflow catalog (bd-152)", () => {
+    for (const type of Object.keys(WORKFLOW_REGISTRY) as Array<keyof typeof WORKFLOW_REGISTRY>) {
+      expect(setFor(type), `${type} is missing belayd_ask_human`).toContain("belayd_ask_human");
     }
   });
 

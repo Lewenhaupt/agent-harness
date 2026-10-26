@@ -740,6 +740,9 @@ describe("extension session naming (bd-10)", () => {
           "--",
           "bd-42",
         ],
+        // Completion reaps an open human gate (bd-152): one read, and no resolve
+        // because this workflow never asked a question.
+        ["gate", "list", "bd-42", "--json"],
       ]);
     });
 

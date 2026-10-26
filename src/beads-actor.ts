@@ -21,19 +21,28 @@
 import { z } from "zod";
 import { isValidTaskId, parseSubagentSessionName } from "./session-naming.js";
 
+/**
+ * Prefix every harness-authored bd actor carries (bd-150).
+ *
+ * The single source of truth for "this write came from the harness": the answer
+ * channel treats any comment author outside this prefix as a human, so a second
+ * copy of the string would be a silent way to misclassify harness traffic.
+ */
+export const BELAYD_ACTOR_PREFIX = "belayd:";
+
 /** Actor for a workflow's orchestrator session: `belayd:<taskId>:orchestrator`. */
 export function orchestratorActor(taskId: string): string {
-  return `belayd:${taskId}:orchestrator`;
+  return `${BELAYD_ACTOR_PREFIX}${taskId}:orchestrator`;
 }
 
 /** Actor for one phase agent: `belayd:<taskId>:<phase>`. */
 export function phaseActor(taskId: string, phase: string): string {
-  return `belayd:${taskId}:${phase}`;
+  return `${BELAYD_ACTOR_PREFIX}${taskId}:${phase}`;
 }
 
 /** True when `value` names a harness actor rather than a human/other tool. */
 export function isBelaydActor(value: string | undefined): boolean {
-  return typeof value === "string" && value.startsWith("belayd:");
+  return typeof value === "string" && value.startsWith(BELAYD_ACTOR_PREFIX);
 }
 
 const ORCHESTRATOR_SESSION_PREFIX = "belayd-";
