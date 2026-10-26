@@ -886,3 +886,87 @@ describe("getNextPhase with custom phaseOrder", () => {
     ).toBeUndefined();
   });
 });
+
+describe("checkToolAllowed while awaiting a human answer (bd-152)", () => {
+  // A feature workflow: its phases plus the consult phases it may run.
+  const featureOrder = ["implement", "review", "test", "userguide", "proof", "commit"];
+  const consult = ["scout", "plan"];
+  const askedAt = Date.parse("2026-10-26T20:14:26Z");
+  const awaitingHuman = { beadId: "bd-152", askedAt };
+  const allDone = [...featureOrder, ...consult];
+
+  const check = (
+    toolName: string,
+    awaiting = awaitingHuman,
+  ): { allowed: boolean; reason?: string } =>
+    checkToolAllowed(toolName, allDone, true, featureOrder, "feature", [], consult, awaiting);
+
+  it("refuses every phase tool of the workflow, even when its order is satisfied", () => {
+    for (const phase of featureOrder) {
+      const result = check(`belayd_${phase}`);
+      expect(result.allowed, `${phase} was allowed`).toBe(false);
+      expect(result.reason).toContain("Waiting for a human answer on bd-152");
+      expect(result.reason).toContain("2026-10-26T20:14:26.000Z");
+    }
+  });
+
+  it("refuses the consult phases and the tools that start work or spawn a run", () => {
+    for (const tool of [
+      "belayd_scout",
+      "belayd_plan",
+      "belayd_start_followup",
+      "belayd_stack_rebase",
+      "belayd_proof_verifier",
+    ]) {
+      expect(check(tool).allowed, `${tool} was allowed`).toBe(false);
+    }
+  });
+
+  it("still allows asking again, reporting, stopping, and every non-phase tool", () => {
+    for (const tool of [
+      "belayd_ask_human",
+      "belayd_status",
+      "belayd_doctor",
+      "belayd_stop_task",
+      "read",
+      "grep",
+      "bd",
+      "belayd_outline",
+    ]) {
+      expect(check(tool), `${tool} was refused`).toEqual({ allowed: true });
+    }
+  });
+
+  it("does not refuse anything when the workflow is not awaiting a human", () => {
+    const result = checkToolAllowed(
+      "belayd_commit",
+      allDone,
+      true,
+      featureOrder,
+      "feature",
+      [],
+      consult,
+    );
+    expect(result).toEqual({ allowed: true });
+  });
+
+  it("does not refuse anything when the gate is inactive", () => {
+    const result = checkToolAllowed(
+      "belayd_implement",
+      [],
+      false,
+      featureOrder,
+      "feature",
+      [],
+      consult,
+      awaitingHuman,
+    );
+    expect(result).toEqual({ allowed: true });
+  });
+
+  it("explains a corrupt ask time instead of throwing", () => {
+    const result = check("belayd_implement", { beadId: "bd-152", askedAt: Number.NaN });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain("Waiting for a human answer on bd-152.");
+  });
+});

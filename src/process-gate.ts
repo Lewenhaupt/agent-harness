@@ -49,6 +49,32 @@ PHASE_ORDER.forEach((phase, index) => {
 });
 
 /**
+ * An open human question (bd-152).
+ *
+ * `beadId` is the work bead a `human` bd gate blocks and `askedAt` is when the
+ * harness asked, in epoch ms. The state itself lives in the bd gate; this is the
+ * in-memory mirror the gate needs to refuse phase tools.
+ */
+export interface AwaitingHuman {
+  beadId: string;
+  askedAt: number;
+}
+
+/**
+ * Control tools that start new work and therefore wait with the phases.
+ *
+ * `belayd_start_followup` and `belayd_stack_rebase` create or replay a branch
+ * off the blocked bead's work, and `belayd_proof_verifier` spawns a run on the
+ * blocked bead; letting any of them run would advance a workflow whose open
+ * question has not been answered yet.
+ */
+const HUMAN_BLOCKED_CONTROL_TOOLS: readonly string[] = [
+  "belayd_start_followup",
+  "belayd_stack_rebase",
+  "belayd_proof_verifier",
+];
+
+/**
  * Check whether a tool call is allowed at this point in the process.
  *
  * @param toolName - The pi tool name (e.g. "belayd_review")
@@ -59,6 +85,8 @@ PHASE_ORDER.forEach((phase, index) => {
  * @param optionalPhases - Optional list of phases that can be skipped
  * @param allowedExtraPhases - Phases whose tools stay callable but are not
  *   required steps (defaults to none)
+ * @param awaitingHuman - Set while the workflow waits on a human answer
+ *   (bd-152). Phase tools refuse until an answer resolves the bd gate.
  * @returns `{ allowed: true, reason: undefined }` if allowed,
  *          `{ allowed: false, reason: string }` if blocked
  */
@@ -70,12 +98,21 @@ export function checkToolAllowed(
   workflowType?: string,
   optionalPhases?: readonly string[],
   allowedExtraPhases?: readonly string[],
+  awaitingHuman?: AwaitingHuman,
 ): { allowed: boolean; reason?: string } {
   if (!active) return { allowed: true };
 
   const order = phaseOrder ?? PHASE_ORDER;
   const optional = optionalPhases ?? [];
   const extras = allowedExtraPhases ?? [];
+
+  // A human wait outranks phase order: no phase may run, in order or not, until
+  // the question is answered. Checked before the order walk so the refusal names
+  // the human answer instead of the next missing phase.
+  if (awaitingHuman !== undefined) {
+    const refusal = awaitingHumanRefusal(toolName, order, extras, awaitingHuman);
+    if (refusal !== undefined) return { allowed: false, reason: refusal };
+  }
 
   // Extract phase name from tool name (e.g., "belayd_scout" → "scout")
   const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
@@ -98,6 +135,38 @@ export function checkToolAllowed(
   }
 
   return { allowed: true };
+}
+
+/**
+ * Refusal text while a human answer is pending, or undefined when the tool is
+ * still allowed.
+ *
+ * Refused: the workflow's phase tools (required AND consultable — a blocked
+ * workflow must not start scout/research either) plus the control tools that
+ * start new work or spawn a run on the blocked bead. Everything else —
+ * `belayd_ask_human`, `belayd_status`, `belayd_doctor`, `belayd_stop_task`,
+ * read/grep/bd/… — stays callable, so the session can still ask again, report,
+ * and be stopped.
+ */
+function awaitingHumanRefusal(
+  toolName: string,
+  order: readonly string[],
+  extras: readonly string[],
+  awaitingHuman: AwaitingHuman,
+): string | undefined {
+  const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
+  const isWorkflowPhase = order.includes(toolBase) || extras.includes(toolBase);
+  if (!isWorkflowPhase && !HUMAN_BLOCKED_CONTROL_TOOLS.includes(toolName)) return undefined;
+
+  const beadId = awaitingHuman.beadId;
+  const asked = Number.isFinite(awaitingHuman.askedAt)
+    ? ` (asked ${new Date(awaitingHuman.askedAt).toISOString()})`
+    : "";
+  return (
+    `Waiting for a human answer on ${beadId}${asked}. ` +
+    `Post a comment on the bead (bd comment ${beadId} --stdin, or reply in Scotty) — ` +
+    "phase tools stay refused until the answer arrives."
+  );
 }
 
 /**

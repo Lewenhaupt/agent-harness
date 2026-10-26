@@ -96,21 +96,51 @@ export {
 export type { BdCommandParse, BdCommandValidation } from "./bd-command.js";
 export {
   BD_ALLOWED_SUBCOMMANDS,
+  BD_GATE_READ_SUBCOMMANDS,
   BD_READ_SUBCOMMANDS,
   bdCommandReadsStdin,
   buildBeadShowArgv,
+  isBdReadArgv,
   isBdReadSubcommand,
   parseBdCommand,
   validateBdCommand,
 } from "./bd-command.js";
-export type { PhaseCommentAuthor } from "./bead-comments.js";
+export type {
+  BeadComment,
+  BeadCommentLookup,
+  LookupBeadCommentsOptions,
+  PhaseCommentAuthor,
+} from "./bead-comments.js";
 export {
+  BEAD_READ_MAX_BUFFER_BYTES,
+  BEAD_READ_TIMEOUT_MS,
+  buildBeadCommentsArgv,
+  COMMENT_EXCERPT_MAX_CHARS,
+  commentTimeInMs,
+  excerptComment,
+  isHumanComment,
+  lookupBeadComments,
   PHASE_COMMENT_PREFIX,
+  parseBeadComments,
   phaseCommentBody,
   phaseCommentHeader,
   stripBdShowComments,
 } from "./bead-comments.js";
+export type {
+  LookupOpenHumanGateOptions,
+  OpenHumanGate,
+  OpenHumanGateLookup,
+} from "./bead-gates.js";
 export {
+  buildGateCreateArgv,
+  buildGateListArgv,
+  buildGateResolveArgv,
+  lookupOpenHumanGate,
+  parseCreatedGateId,
+  parseOpenHumanGate,
+} from "./bead-gates.js";
+export {
+  BELAYD_ACTOR_PREFIX,
   clearAssigneeArgv,
   isBelaydActor,
   orchestratorActor,
@@ -842,7 +872,7 @@ export {
   resolvePiBinaryPath,
   SYSTEM_PI_BINARY,
 } from "./pi-binary.js";
-export type { Phase } from "./process-gate.js";
+export type { AwaitingHuman, Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,
   ALL_PHASE_TOOLS,

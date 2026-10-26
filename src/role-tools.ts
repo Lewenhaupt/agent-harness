@@ -19,12 +19,18 @@
  * session is already inside a task, and planning mode is a separate mode. Starting
  * another task mid-workflow would need a stop first, so declaring the tool only
  * invites a mode switch the gate would then have to refuse.
+ *
+ * `belayd_ask_human` is here (bd-152) because the control set is the documented
+ * reason a gated session sees a tool at all: the one moment the orchestrator is
+ * blocked on a human decision is exactly the moment it needs this tool, and a
+ * workflow-gated surface would otherwise deny it.
  */
 export const WORKFLOW_CONTROL_TOOLS: readonly string[] = [
   "belayd_start_followup",
   "belayd_stack_rebase",
   "belayd_stop_task",
   "belayd_status",
+  "belayd_ask_human",
   "belayd_doctor",
   "belayd_proof_verifier",
   "bd",

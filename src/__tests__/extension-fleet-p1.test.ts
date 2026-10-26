@@ -27,6 +27,7 @@ import type { FleetForceStopSeams } from "../../extensions/index.js";
 import type { HandoffPacket } from "../handoff.js";
 import {
   buildFleetNote,
+  COMMENT_EXCERPT_MAX_CHARS,
   drainNotes,
   enqueueNote,
   FLEET_NOTE_BODY_MAX_LENGTH,
@@ -134,17 +135,44 @@ vi.mock("node:http", async (importOriginal) => {
   return { ...actual, request };
 });
 
+const childProcess = vi.hoisted(() => ({
+  /** Every execFile call: argv plus the stdin body a write carried (bd-152). */
+  execFileCalls: [] as Array<{ file: string; args: readonly string[]; stdin: string }>,
+  /** Fail every `bd comment` write, to pin the mirror's best-effort behaviour. */
+  failBdComment: false,
+}));
+
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   // Any real git/bd/wt call throws: the probes then degrade exactly as they do
   // in a directory with no repository, and no test depends on a live binary.
+  // Calls are recorded anyway, because the bd comment mirror (bd-152) is only
+  // visible through argv + stdin.
   return {
     ...actual,
-    execFile: vi.fn((_file: string, _args: unknown, _options: unknown, callback: unknown) => {
-      const done = callback as (error: Error | null, stdout: string, stderr: string) => void;
-      done(null, "", "");
-      return { stdin: undefined };
-    }),
+    execFile: vi.fn(
+      (file: string, args: readonly string[], _options: unknown, callback: unknown) => {
+        const done = callback as (error: Error | null, stdout: string, stderr: string) => void;
+        const record = { file, args: [...args], stdin: "" };
+        childProcess.execFileCalls.push(record);
+        const fails = childProcess.failBdComment && file === "bd" && args[0] === "comment";
+        // Answer synchronously, like the successful stub this file always had:
+        // some callers (the fleet git runner) spawn through their own promise
+        // wrapper and never close stdin. bd goes through `runFileCommand`, which
+        // closes it right after, so the recorded body is still set before the
+        // awaiting test resumes — and a failing comment rejects on that close,
+        // where the real child would have failed.
+        if (!fails) done(null, "", "");
+        const childStdin = {
+          on: () => {},
+          end: (chunk?: string) => {
+            record.stdin = chunk ?? "";
+            if (fails) done(new Error("bd: comment write failed"), "", "");
+          },
+        };
+        return { stdin: childStdin };
+      },
+    ),
     exec: vi.fn((_command: string, _options: unknown, callback: unknown) => {
       // `countUncommittedFiles` runs on agent_end; without a callback the handler
       // would never settle.
@@ -282,6 +310,7 @@ describe("fleet supervisor mode", () => {
     mkdirSync(worktree.path, { recursive: true });
     daemon.calls = [];
     daemon.failWith = undefined;
+    childProcess.failBdComment = false;
     ctxNotifications = [];
   });
 
@@ -1091,6 +1120,115 @@ describe("fleet supervisor mode", () => {
       expect(drained.deliveries.map((delivery) => delivery.note.body)).toEqual([
         "main moved; rebase before review",
       ]);
+      expect(auditActions()).toContain("note");
+    });
+
+    it("mirrors a supervisor note onto the recipient's bead as a belayd comment (bd-152)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      // Only the note write matters here; the launch issued its own bd calls.
+      childProcess.execFileCalls.length = 0;
+      const note = mock.tools.get("belayd_fleet_note");
+      if (note === undefined) throw new Error("belayd_fleet_note was not registered");
+
+      const result = await note.execute(
+        "note-1",
+        { to: "bd-15", body: "main moved; rebase before review", kind: "base-moved" },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+      expect(result.details.exitCode).toBe(0);
+      expect(textOf(result)).toContain("Mirrored to 1 bd comment(s)");
+      const mirror = childProcess.execFileCalls.find(
+        (call) =>
+          call.file === "bd" && call.args.includes("comment") && call.args.includes("bd-15"),
+      );
+      expect(mirror?.stdin).toBe("[belayd:supervisor->bd-15] main moved; rebase before review");
+      // A mirror must never look like a human answer, even from a session whose
+      // own actor does not resolve.
+      const actorIndex = mirror?.args.indexOf("--actor") ?? -1;
+      expect(mirror?.args[actorIndex + 1]).toBe("belayd:supervisor");
+      // The file mailbox is still the delivery protocol, so the note is queued.
+      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      if (!drained.ok) throw new Error("drain failed");
+      expect(drained.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
+    });
+
+    it("mirrors a broadcast as one comment per recipient bead, excerpt-capped (bd-152)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      childProcess.execFileCalls.length = 0;
+      const note = mock.tools.get("belayd_fleet_note");
+      if (note === undefined) throw new Error("belayd_fleet_note was not registered");
+
+      // Longer than a comment mirror may inject, so the cap is observable.
+      const body = `line one\n\n${"detail ".repeat(1_000)}`;
+      const result = await note.execute(
+        "broadcast-1",
+        { to: "all", body, kind: "base-moved" },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+      expect(result.details.exitCode).toBe(0);
+      expect(textOf(result)).toContain("Mirrored to 2 bd comment(s)");
+      const mirrors = childProcess.execFileCalls.filter(
+        (call) => call.file === "bd" && call.args[0] === "comment",
+      );
+      // One comment per recipient bead — not one for the broadcast address.
+      expect(mirrors.map((call) => call.args[call.args.length - 1]).sort()).toEqual([
+        "bd-12",
+        "bd-15",
+      ]);
+      for (const mirror of mirrors) {
+        const recipient = mirror.args[mirror.args.length - 1];
+        const prefix = `[belayd:supervisor->${recipient}] `;
+        expect(mirror.stdin.startsWith(prefix)).toBe(true);
+        expect(mirror.stdin).not.toContain("\n");
+        expect(mirror.stdin).toHaveLength(prefix.length + COMMENT_EXCERPT_MAX_CHARS);
+        expect(mirror.stdin.endsWith("…")).toBe(true);
+        expect(mirror.args[mirror.args.indexOf("--actor") + 1]).toBe("belayd:supervisor");
+      }
+    });
+
+    it("keeps the note delivered when the bd mirror fails (bd-152)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      childProcess.execFileCalls.length = 0;
+      childProcess.failBdComment = true;
+      const note = mock.tools.get("belayd_fleet_note");
+      if (note === undefined) throw new Error("belayd_fleet_note was not registered");
+
+      const result = await note.execute(
+        "note-1",
+        { to: "bd-15", body: "main moved; rebase before review", kind: "base-moved" },
+        undefined,
+        undefined,
+        ctx,
+      );
+
+      // The file mailbox is the delivery protocol: a bd refusal must not fail the
+      // note, and the tool must not claim a mirror it did not write.
+      expect(result.details.exitCode).toBe(0);
+      expect(textOf(result)).toContain("queued in events");
+      expect(textOf(result)).not.toContain("Mirrored to");
+      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      if (!drained.ok) throw new Error("drain failed");
+      expect(drained.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
+
+      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
+      const entries = readFileSync(auditPath, "utf8")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as { action: string; detail: string });
+      const failure = entries.find((entry) => entry.action === "note-mirror-failed");
+      expect(failure?.detail).toContain("bd: comment write failed");
       expect(auditActions()).toContain("note");
     });
 
