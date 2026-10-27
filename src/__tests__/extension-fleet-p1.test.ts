@@ -337,8 +337,10 @@ function writeMemberState(options: { cwd: string; completedPhaseNames: readonly 
       phase: pending,
       sessionName: `belayd-bd-12-${pending}`,
       status: RunStatus.Failed,
-      startedAt: 2,
-      completedAt: 3,
+      // The member's own run, dated at/after its launch, so both run filters keep
+      // it: the taskId matches and it does not predate the launch (bd-161).
+      startedAt: Date.now(),
+      completedAt: Date.now(),
       failureReason: "gate failed",
     },
   });
@@ -2036,6 +2038,86 @@ describe("fleet run mode", () => {
 
     // A pause resumes the same run, so a "(paused)" suffix would outlive the pause.
     expect(mock.sessionNames).toEqual(["Fleet supervisor: bd-12"]);
+  });
+
+  // bd-161: `.belayd/` is gitignored and `wt step copy-ignored` copies it into every
+  // new worktree, so a member inherited the primary checkout's failed bd-37 implement
+  // run and was stopped as `phase implement failed` while it was still scouting.
+  it("ignores a run manifest inherited from the primary checkout", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const inherited = writeRunManifest({
+      cwd: memberDir,
+      manifest: {
+        schemaVersion: 1,
+        runId: "mthosemh",
+        taskId: "bd-37",
+        phase: "implement",
+        sessionName: "belayd-bd-37-sub-implement-mthosemh",
+        status: RunStatus.Failed,
+        startedAt: 1_788_207_858_953,
+        completedAt: 1_788_208_222_826,
+        exitCode: 143,
+      },
+    });
+    expect(inherited).toHaveProperty("ok", true);
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const observed = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(observed).toHaveProperty("ok", true);
+    if (!observed.ok) return;
+    // Another bead's failure is not this member's evidence: no stop, still in flight.
+    expect(observed.intent?.run?.stopped ?? []).toEqual([]);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "stopped bd-12",
+    );
+  });
+
+  it("ignores this member's own run manifest copied in from an earlier launch", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    // The same bead, but from the execution before this fleet launched it: the
+    // manifest carries a matching taskId, so only the launch cutoff rejects it.
+    const copied = writeRunManifest({
+      cwd: memberDir,
+      manifest: {
+        schemaVersion: 1,
+        runId: "earlier-run",
+        taskId: "bd-12",
+        phase: "implement",
+        sessionName: "belayd-bd-12-sub-implement-earlier-run",
+        status: RunStatus.Failed,
+        startedAt: 2,
+        completedAt: 3,
+        failureReason: "gate failed",
+      },
+    });
+    expect(copied).toHaveProperty("ok", true);
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const observed = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(observed).toHaveProperty("ok", true);
+    if (!observed.ok) return;
+    // Re-launching a bead into a fresh worktree must not inherit its own past
+    // failure as a stop verdict for the new execution.
+    expect(observed.intent?.run?.stopped ?? []).toEqual([]);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "stopped bd-12",
+    );
   });
 
   it("keeps a stopped member in the fleet, and still lands it once its retry finishes", async () => {
