@@ -516,6 +516,16 @@ The main checkout is absent because it holds no
 workflow state. `latest runs` is alphabetical here only because `phaseOrder` is
 unknown without `workflow.json`.
 
+That block was captured before the run-ownership filter landed (bd-146/bd-161).
+`latest runs` keeps only manifests whose `taskId` is the member's own, keyed the
+way the run loop keys the member: the branch's task id when it names a fleet
+member, otherwise `workflow.json`'s task id, otherwise the id the branch or
+directory name implies — so a completed workflow whose state file is gone still
+reports its own final phase. A worktree that inherited another bead's manifests
+therefore shows only its own phases. Filtering needs a resolvable task id: a
+worktree whose branch and directory name yield none, and that has no
+`workflow.json`, still lists the manifests as read.
+
 A view with an intent, a deferral and a park — in a throwaway repository, so
 nothing here touches your checkout:
 

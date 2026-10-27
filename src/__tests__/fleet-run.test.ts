@@ -135,6 +135,29 @@ describe("deriveFleetMemberProgress", () => {
     expect(progress).toEqual({ kind: "complete" });
   });
 
+  it("keeps deriving complete from its own final phase among another task's manifests", () => {
+    const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
+      workflow: { kind: "missing" },
+      runs: [
+        run({ runId: "own-commit", phase: "commit", status: RunStatus.Completed }),
+        // Committed `.belayd/runs` entries for other beads (bd-146): newer, and
+        // the newest manifest is what an unfiltered missing-state read follows.
+        run({ runId: "bd16-scout", taskId: "bd-16", phase: "scout", startedAt: 3_000 }),
+        run({ runId: "bd83-test", taskId: "bd-83", phase: "test", startedAt: 3_100 }),
+        run({
+          runId: "bd83-implement",
+          taskId: "bd-83",
+          phase: "implement",
+          status: RunStatus.Failed,
+          startedAt: 3_200,
+        }),
+      ],
+      now: 5_000,
+    });
+    expect(progress).toEqual({ kind: "complete" });
+  });
+
   it("reports a missing member only after the start grace", () => {
     const withinGrace = deriveFleetMemberProgress({
       taskId: MEMBER,

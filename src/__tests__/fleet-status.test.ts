@@ -101,6 +101,73 @@ function okWorkflow(overrides: Partial<WorkflowState> = {}): FleetWorkflowSnapsh
   return { kind: "ok", state: sampleWorkflow(overrides) };
 }
 
+/**
+ * Manifests another bead left in the same `.belayd/runs` directory.
+ *
+ * Two task ids, several phases of a finished workflow, a crash and a failure:
+ * exactly what a fresh worktree inherits when a consumer repository commits its
+ * manifests (bd-146). All start after this member's own runs, so an unfiltered
+ * view would prefer them — including a `plan` manifest, so a regression that
+ * filters by phase instead of by task id cannot pass unnoticed.
+ */
+function inheritedRuns(): RunManifest[] {
+  return [
+    sampleRun({
+      runId: "bd16-scout",
+      taskId: "bd-16",
+      phase: "scout",
+      sessionName: "belayd-bd-16-sub-scout",
+      startedAt: 3_000,
+      completedAt: 3_100,
+    }),
+    sampleRun({
+      runId: "bd16-commit",
+      taskId: "bd-16",
+      phase: "commit",
+      sessionName: "belayd-bd-16-sub-commit",
+      startedAt: 3_200,
+      completedAt: 3_300,
+    }),
+    sampleRun({
+      runId: "bd83-test",
+      taskId: "bd-83",
+      phase: "test",
+      sessionName: "belayd-bd-83-sub-test",
+      startedAt: 3_400,
+      completedAt: 3_500,
+    }),
+    sampleRun({
+      runId: "bd83-implement",
+      taskId: "bd-83",
+      phase: "implement",
+      sessionName: "belayd-bd-83-sub-implement",
+      status: RunStatus.Interrupted,
+      startedAt: 3_600,
+      completedAt: 3_700,
+    }),
+    sampleRun({
+      runId: "bd16-review",
+      taskId: "bd-16",
+      phase: "review",
+      sessionName: "belayd-bd-16-sub-review",
+      status: RunStatus.Failed,
+      startedAt: 3_800,
+      completedAt: 3_900,
+      failureReason: "gate failed",
+    }),
+    // Same phase as the member's own `plan` run and newer, so only the task id
+    // separates them.
+    sampleRun({
+      runId: "bd16-plan",
+      taskId: "bd-16",
+      phase: "plan",
+      sessionName: "belayd-bd-16-sub-plan",
+      startedAt: 3_950,
+      completedAt: 3_970,
+    }),
+  ];
+}
+
 function sampleMember(overrides: Partial<FleetMemberSnapshot> = {}): FleetMemberSnapshot {
   return {
     worktreePath: "/repo.feat-bd-12",
@@ -727,6 +794,105 @@ describe("buildFleetStatus", () => {
     // Without a member id there is nothing to attribute the manifest to, so the
     // view stays file-truth instead of hiding every run behind a missing key.
     expect(status.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["run-1"]);
+  });
+
+  it("reports only the workflow's own manifests out of a mixed set (bd-146)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: undefined,
+      members: [
+        sampleMember({
+          // A fresh worktree inherits another bead's manifests when they are
+          // committed to git (bd-146: three bd-16 manifests were checked out
+          // from main), and they must not become this member's evidence.
+          runs: [
+            sampleRun({ runId: "own-plan", taskId: "bd-12", phase: "plan", startedAt: 1_100 }),
+            ...inheritedRuns(),
+          ],
+        }),
+      ],
+    });
+
+    const member = status.members[0];
+    expect(member?.latestRuns.map((run) => `${run.phase}=${run.status}`)).toEqual([
+      "plan=completed",
+    ]);
+    // Pin the identity: `inheritedRuns` carries a newer `bd16-plan`, so a
+    // phase-only filter would report a foreign run as this member's.
+    expect(member?.latestRuns.map((run) => run.runId)).toEqual(["own-plan"]);
+    // The foreign interrupted run is not this member's crash either.
+    expect(member).toHaveProperty("interruptedRunCount", 0);
+    // Nor does a foreign failure of a phase this member still owes make it
+    // `blocked`.
+    expect(member).toHaveProperty("state", "active");
+    // Nor may a foreign run push `last updated` past this member's own evidence.
+    expect(member).toHaveProperty("updatedAt", 2_000);
+  });
+
+  it("still counts its own interrupted run among another task's manifests (bd-146)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: undefined,
+      members: [
+        sampleMember({
+          runs: [
+            sampleRun({
+              runId: "own-implement",
+              taskId: "bd-12",
+              phase: "implement",
+              status: RunStatus.Interrupted,
+              startedAt: 1_300,
+              completedAt: 1_400,
+            }),
+            ...inheritedRuns(),
+          ],
+        }),
+      ],
+    });
+
+    const member = status.members[0];
+    // The filter must not swallow this member's own evidence: a foreign crash is
+    // ignored, its own still stops the member.
+    expect(member?.latestRuns.map((run) => run.runId)).toEqual(["own-implement"]);
+    expect(member).toHaveProperty("interruptedRunCount", 1);
+    expect(member).toHaveProperty("state", "interrupted");
+    // `updatedAt` takes the newer of the manifests and `workflow.json` (2_000).
+    expect(member).toHaveProperty("updatedAt", 2_000);
+    expect(status.counts.interrupted).toBe(1);
+  });
+
+  it("keeps its own completed final phase when the state file is gone (bd-146)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: undefined,
+      members: [
+        sampleMember({
+          workflow: { kind: "missing" },
+          runs: [
+            sampleRun({
+              runId: "own-commit",
+              taskId: "bd-12",
+              phase: "commit",
+              startedAt: 1_900,
+              completedAt: 1_950,
+            }),
+            // Newer, and therefore the runs an unfiltered view would prefer.
+            ...inheritedRuns(),
+          ],
+        }),
+      ],
+    });
+
+    const member = status.members[0];
+    // Completion clears `.belayd/workflow.json` while the manifests stay, so the
+    // branch's task id is the only key that still attributes the final phase.
+    expect(member).toHaveProperty("workflowFile", "missing");
+    expect(member?.latestRuns.map((run) => `${run.phase}=${run.status}`)).toEqual([
+      "commit=completed",
+    ]);
+    expect(member?.latestRuns.map((run) => run.runId)).toEqual(["own-commit"]);
+    expect(member).toHaveProperty("updatedAt", 1_950);
+    expect(member).toHaveProperty("state", "missing-state");
   });
 
   it("distinguishes a running run from an interrupted one", () => {
@@ -1492,6 +1658,31 @@ describe("readFleetStatus", () => {
     expect(result.value.members[0]).toHaveProperty("taskId", "bd-12");
     expect(result.value.members[0]?.latestRuns[0]).toHaveProperty("status", RunStatus.Completed);
     expect(result.value.warnings).toEqual([]);
+  });
+
+  it("reads a fresh worktree's committed manifests without adopting another task's (bd-146)", () => {
+    // The consumer repository commits `.belayd/runs`, so a worktree created
+    // minutes ago checks out manifests for beads it has never touched.
+    const fs = createFakeFs({
+      [workflowStateFilePath("/repo.feat-bd-12")]: JSON.stringify(sampleWorkflow()),
+      [runManifestPath("/repo.feat-bd-12", "own-plan")]: JSON.stringify(
+        sampleRun({ runId: "own-plan", taskId: "bd-12", phase: "plan", startedAt: 1_100 }),
+      ),
+      ...Object.fromEntries(
+        inheritedRuns().map((run) => [
+          runManifestPath("/repo.feat-bd-12", run.runId),
+          JSON.stringify(run),
+        ]),
+      ),
+    });
+
+    const result = readWith(fs);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["own-plan"]);
+    expect(result.value.members[0]).toHaveProperty("interruptedRunCount", 0);
+    expect(formatFleetStatus(result.value)).toContain("latest runs: plan=completed");
   });
 
   it("reads a member whose worktree path contains a newline", () => {
