@@ -104,16 +104,29 @@ describe("lookupFleetBeads", () => {
     expect(malformed).toHaveProperty("ok", false);
   });
 
-  it("flattens an envelope payload to no beads rather than throwing", async () => {
-    // bd wrapping its records would otherwise look like "the beads vanished";
-    // the fleet layer turns this into a bounded warning instead of silence.
+  it("reads an envelope payload instead of flattening it to no beads", async () => {
+    // bd wrapping its records must not look like "the beads vanished": the
+    // envelope is read, so a fleet keeps its bead metadata through the change.
     const { runBd } = recorder(JSON.stringify({ issues: [{ id: "bd-12" }] }));
 
     const result = await lookupFleetBeads({ taskIds: ["bd-12"], cwd: "/repo", runBd });
 
     expect(result).toHaveProperty("ok", true);
     if (!result.ok) return;
-    expect(result.beads).toEqual([]);
+    expect(result.beads.map((bead) => bead.id)).toEqual(["bd-12"]);
+  });
+
+  it("fails the read when the payload shape is unrecognized", async () => {
+    // A successful process exit with an unreadable shape is not an empty answer:
+    // callers act on "these beads are gone" (resolving ordering gates, dropping
+    // metadata), so this must degrade to a failed read instead.
+    const { runBd } = recorder(JSON.stringify({ data: { beads: [] } }));
+
+    const result = await lookupFleetBeads({ taskIds: ["bd-12"], cwd: "/repo", runBd });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.error).toContain("unrecognized `bd show` payload");
   });
 });
 

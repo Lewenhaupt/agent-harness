@@ -35,9 +35,9 @@ This is the design record. All five milestones exist:
 - **P5** — the run loop (`src/fleet-run.ts`, `src/fleet-accept.ts`) and the
   one-orchestrator-per-worktree lease (`src/orchestrator-claim.ts`,
   `src/fleet-heartbeat.ts`). `/fleet` runs to completion by default: it lands each
-  finished member, accepts it (closes the bead, removes the worktree), and starts
-  the next wave until every member is landed. `--manual` keeps the P1–P4 surface.
-  See `docs/fleet-run.md`.
+  finished member — merging the branch and removing the merged worktree — closes
+  the bead only when `--accept` asked for it, and starts the next wave until every
+  member is landed. `--manual` keeps the P1–P4 surface. See `docs/fleet-run.md`.
 
 An **explicit** (`--manual`) fleet runs nothing on its own: no merge, no wave
 advance, no repair. A **run** (`/fleet` with `untilComplete`, the default) does
@@ -187,7 +187,7 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | Supervisor working directory | main repo root |
 | May merge to `main`? | Yes, through a single-flight queue |
 | Dirty root at merge time | auto-stash, immediately restore; if the restore conflicts, park the fleet instead of losing work (P2: `merge-stash`/`merge-restore`; a conflicting restore keeps the stash, parks the fleet, and reports the ref) |
-| Bead status after merge | `belayd_fleet_merge` never touches a bead: the merge leaves it `in_progress` + `human`. A **run** (`accept: true`, the default) accepts the member after landing — `bd close` + worktree removal — audited as `fleet-landed`; `--no-accept` keeps the human step |
+| Bead status after merge | `belayd_fleet_merge` never touches a bead: the merge leaves it `in_progress` + `human`. A **run** leaves it there too (bd-158): landing resolves the member's bd ordering gates instead of closing its bead. The merged worktree is removed on every landing; `--accept` opts into closing the bead as well, audited as `fleet-landed` |
 | Member communication | files-first mailbox, drained at turn start (members are detached pi sessions) |
 | Where merges happen | the operator's own checkout, because only the root can check out `main` |
 
@@ -239,7 +239,7 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | **P2** | Single-flight merge queue + base-moved propagation (`merge-queue.json`, `merge.lock.d`, `src/fleet-merge.ts`, `belayd_fleet_merge`): atomic acquire + renewable lease, rebase → gates → merge → broadcast in the operator's root checkout, root stash/restore with parking on a conflicting restore. | **Implemented** (`src/fleet-merge.ts`, `belayd_fleet_merge`; explicit enqueue/drain only) |
 | **P3** | Automatic ordering/parallelism + capacity-aware concurrency (ceiling 3 orchestrators): bd blocking edges → waves, cycle refusal, launch only the free capacity, record deferred members in `fleet.json` `deferred` with their reasons. The ceiling counts **every** recorded member of **every** fleet (a dead supervisor's detached members still run); an unreadable fleet intent refuses the launch instead of assuming zero. | **Implemented** (`src/fleet-schedule.ts`, `src/fleet-beads.ts`, `src/fleet-launch.ts`; wave 2+ is advanced explicitly by `belayd_fleet_advance`) |
 | **P4** | Cooperative/forceful pause + fleet-level crash reconcile: `belayd_fleet_pause`/`belayd_fleet_resume` (CAS intent writes, audited), `belayd_fleet_advance` (explicit wave advance over the persisted deferred plan), `belayd_fleet_reconcile` (merge-queue repair under the existing lock primitive, parked-root restore from the recorded stash sha, member liveness from the lease + process table). | **Implemented** (`src/fleet-pause.ts`, `src/fleet-reconcile.ts`, `src/fleet-sessions.ts`, `extensions/index.ts`; see `docs/fleet-reconcile.md`) |
-| **P5** | Run to completion: a durable `run` record in `fleet.json`, one deterministic tick per action (land → stop → advance → complete), accepting a landed member (`bd close`, worktree removal), the one-orchestrator-per-worktree lease, and the run-mode supervisor heartbeat that makes a re-arm possible. | **Implemented** (`src/fleet-run.ts`, `src/fleet-accept.ts`, `src/orchestrator-claim.ts`, `src/fleet-heartbeat.ts`, `extensions/index.ts`; see `docs/fleet-run.md`) |
+| **P5** | Run to completion: a durable `run` record in `fleet.json`, one deterministic tick per action (land → stop → advance → complete), accepting a landed member (worktree removal on every landing; `bd close` when accepted), the one-orchestrator-per-worktree lease, and the run-mode supervisor heartbeat that makes a re-arm possible. | **Implemented** (`src/fleet-run.ts`, `src/fleet-accept.ts`, `src/orchestrator-claim.ts`, `src/fleet-heartbeat.ts`, `extensions/index.ts`; see `docs/fleet-run.md`) |
 
 **What P2 inherited and reuses (no second mechanism was introduced):** per-recipient
 fan-out means a base-moved broadcast reaches every member exactly once under the
@@ -504,6 +504,11 @@ complete set:
 | `merge-stash-drop-mismatch` | once when the entry git reports as dropped is not the recorded sha (an interloper `stash push` shifted the index between verify and drop) |
 | `base-moved` / `sibling-landed` / `rebase-hint` | once per broadcast kind, naming the members whose note files were written |
 | `schedule-planned` / `member-deferred` / `capacity-blocked` | once per launch or advance: the plan, and one per deferred member with its reason |
+| `ordering-gates` | once per launch that created (or adopted) bd ordering gates, naming each `blocker->blocked (gate)` |
+| `ordering-gates-adopted` | once per tick/reconcile sweep that wrote a record for a gate bd already had (the crash window between `bd gate create` and the intent write), naming each `blocker->blocked (gate)` |
+| `ordering-gates-resolved` | once per landing / closed-bead / pruned-member resolve, naming the gate ids bd confirmed resolved (bd-158) |
+| `ordering-gate-unresolved` | once when a landing merged but bd refused the gate resolve: the record stays and the next tick retries (bd-158) |
+| `fleet-landed` | once per landing, with the member and base branch |
 | `fleet-paused` / `fleet-pause-failed` | once per pause attempt (applied / refused or failed to write) |
 | `fleet-resumed` / `fleet-unparked` / `fleet-resume-refused` | once per resume attempt: resumed, park cleared, or refused (a park that still names a stash) |
 | `member-stopped` / `member-stop-skipped` / `member-stop-failed` / `member-stop-unavailable` | once per pid the forceful pause considered: signalled / identity changed or unreadable, so skipped / `kill` failed / process table unreadable |
@@ -742,7 +747,7 @@ can hold the ceiling until those retries end, land, or the sessions are gone.
 | Recording the deferred members + reasons | yes (`fleet.json` `deferred`, `audit.log`, report) |
 | Starting wave 1+ | yes in a **run** (P5 tick → `belayd_fleet_advance`'s engine); **no** in `--manual` (explicit tool call) |
 | Merging a finished member | yes in a **run** (P5 tick → the P2 queue); **no** in `--manual` (`belayd_fleet_merge`) |
-| Accepting (close bead + remove worktree) | yes in a **run** with `accept: true`; never by `belayd_fleet_merge` itself |
+| Accepting (close bead + remove worktree) | yes in a **run** with `accept: true` (opt-in, bd-158); never by `belayd_fleet_merge` itself |
 | Pausing / resuming | **no** — P4's `belayd_fleet_pause` / `belayd_fleet_resume` (pause stops the run ticker) |
 | Repairing a crashed fleet | **no** — P4's `belayd_fleet_reconcile` |
 | Running phases | **never** — the supervisor is not an orchestrator |

@@ -54,6 +54,8 @@ import type {
   FleetBeadLookup,
   FleetEngagementLookup,
   FleetEventBatch,
+  FleetGateNotice,
+  FleetGateNoticePlan,
   FleetIntent,
   FleetMemberClaim,
   FleetMemberLaunchOutcome,
@@ -63,6 +65,7 @@ import type {
   FleetMode,
   FleetNoteDelivery,
   FleetNoteKind,
+  FleetOrderingGate,
   FleetPidProbe,
   FleetProcessScan,
   FleetRun,
@@ -103,6 +106,7 @@ import {
   acceptLandedMember,
   ackNotes,
   acquireOrchestratorClaim,
+  addFleetOrderingGates,
   adoptableWorktreeTaskId,
   adoptOrchestratorClaim,
   appendFleetAuditEntry,
@@ -139,6 +143,7 @@ import {
   commentTimeInMs,
   computeFleetSupervisorName,
   countReviewFindings,
+  createFleetOrderingGates,
   createInstructionGroupCollector,
   currentBranch,
   DEFAULT_AGENTS,
@@ -149,6 +154,7 @@ import {
   deriveFleetMemberProgress,
   drainFleetMerge,
   drainNotes,
+  dropFleetOrderingGates,
   emptyAdvanceAction,
   enqueueFleetMerge,
   enqueueNoteFanout,
@@ -206,6 +212,7 @@ import {
   isWorkflowComplete,
   lastAssistantText,
   listArchifyExamples,
+  listFleetOrderingGatesForBead,
   listPendingUserCompletions,
   listRuns,
   loadMetricsQueries,
@@ -250,6 +257,7 @@ import {
   phaseCommentBody,
   planFleetAdvance,
   planFleetTick,
+  planGateNotices,
   projectWorkspacesPath,
   pruneLandedFleetMember,
   RESEARCHER_SYSTEM_PROMPT,
@@ -265,6 +273,8 @@ import {
   readStackNode,
   readSupervisorHeartbeat,
   readWorktreeBranch,
+  reapFleetOrderingGatesByPrefix,
+  recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
@@ -277,6 +287,8 @@ import {
   resolveBdActor,
   resolveFleetMode,
   resolveFleetNoteRecipients,
+  resolveFleetOrderingGates,
+  resolveFleetOrderingGatesForBead,
   resolveGitCommonDir,
   resolveMemberFleet,
   resolveMetricsDir,
@@ -1146,6 +1158,15 @@ function isResumablePhase(phaseName: string): phaseName is (typeof RESUMABLE_PHA
  * terminates instead of spinning forever.
  */
 const MAX_EPOCH_ADVANCES = 1000;
+
+/**
+ * How many member beads a full reconcile sweep asks bd about at once (bd-158).
+ *
+ * A reconcile pass sweeps every member — unlike the tick's one-bead rotation — so
+ * the reads are bounded to a small concurrency instead of either a serial crawl or
+ * a burst of processes against the same database.
+ */
+const ORDERING_SWEEP_CONCURRENCY = 3;
 
 /**
  * Resolve a re-invocation's session, skipping past fresh cross-run epochs whose
@@ -7151,6 +7172,86 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     });
   }
 
+  /**
+   * The beads bd reports `closed`/`done` (the wait is moot), from a bead read that
+   * has already been proven complete (see `reapClosedBeadGates`).
+   */
+  function closedBeadsOf(beads: readonly { id: string; status?: string }[]): ReadonlySet<string> {
+    return new Set(
+      beads
+        .filter((bead) => bead.status === "closed" || bead.status === "done")
+        .map((bead) => bead.id),
+    );
+  }
+
+  /**
+   * Resolve the bd ordering gates that touch `taskId`, then forget them (bd-158).
+   *
+   * Called on a landing (the merge satisfied every dependent's wait) and wherever
+   * the fleet learns that a bead or member is gone. A gate is only meaningful
+   * while both its beads are live members, and an open gate with no member is the
+   * one orphan this design must never leave behind: nothing would ever resolve it.
+   *
+   * `beadId` matches either side, because both directions end the gate's purpose:
+   * the blocker landing releases the dependent, and the dependent closing makes the
+   * wait moot.
+   */
+  async function releaseOrderingGatesForBead(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+  }): Promise<{ ok: true; resolved: number } | { ok: false; error: string }> {
+    const loaded = readFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+    });
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+    const recorded = loaded.intent?.orderingGates ?? [];
+    const touching = recorded.filter(
+      (gate) => gate.blocker === options.taskId || gate.blocked === options.taskId,
+    );
+    if (touching.length === 0) return { ok: true, resolved: 0 };
+
+    const resolved = await resolveFleetOrderingGatesForBead({
+      gates: touching,
+      beadId: options.taskId,
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    });
+    // Drop only the records bd confirmed, and by *gate id*: another gate of this
+    // same member may still be open (a shared blocker with two dependents), and
+    // forgetting it would leave it open with nothing able to resolve it. A failed
+    // bookkeeping write is self-healing: the record survives, and the next reap
+    // sees bd report the gate as gone (`gate not found`) and drops it then.
+    const gateIds = resolved.resolved.map((gate) => gate.gateId);
+    if (gateIds.length > 0) {
+      mutateFleetIntent({
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        mutate: (intent) => dropFleetOrderingGates(intent, gateIds, options.now),
+      });
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "ordering-gates-resolved",
+        taskIds: [options.taskId],
+        detail: `${gateIds.length} gate(s): ${resolved.resolved
+          .map((gate) => `${gate.blocker}->${gate.blocked} (${gate.gateId})`)
+          .join(", ")}`,
+      });
+    }
+    return resolved.ok
+      ? { ok: true, resolved: resolved.resolved.length }
+      : {
+          ok: false,
+          error:
+            `could not resolve the ordering gate(s) for ${options.taskId}: ${resolved.error}` +
+            ` (${resolved.remaining.length} still recorded)`,
+        };
+  }
+
   /** Land one finished member: merge, accept, and drop it from the member list. */
   async function landFleetMember(options: {
     ctx: ExtensionContext;
@@ -7166,6 +7267,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     const merged = await mergeLandedMember({ ctx, mode, taskId, now });
     if (!merged.ok) return merged;
 
+    // The landing is recorded before anything else can fail, because it is the one
+    // fact bd cannot express and the scheduler's `fleetLandedTaskIds` rule needs
+    // (bd-158). A merge that succeeded must never look unlanded: that would hold
+    // the member's capacity slot and stall its dependents on an event that already
+    // happened.
     const pruned = pruneLandedMember({ ctx, mode, taskId, now });
     if (!pruned.ok) return { ok: false, error: pruned.error };
     const landed = recordRunMemberLanded({ run: options.run, taskId, now });
@@ -7185,6 +7291,16 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       accept: options.run.accept === true,
       now,
     });
+    // bd-158: the landing, not a close, is what releases a dependent's ordering
+    // gate — so it is resolved after the land is recorded, and a failure is a
+    // *retryable* warning rather than a stop: the merge cannot be undone, the
+    // dependent is already released on the fleet side, and the tick reaper
+    // retries the resolve from the still-recorded gate (the landed member is no
+    // longer a member, which is exactly the orphan case it reaps). Stopping here
+    // would end the run `partial` on a transient bd failure and wedge a merged
+    // member forever.
+    const gateLines = await resolveLandedOrderingGates({ ctx, mode, taskId, now });
+
     if (!accepted.ok) {
       // The work landed, so the member is out of the member list; only the bead
       // (or the worktree) still needs a human, which is what the stop records.
@@ -7197,10 +7313,44 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           detail: accepted.text,
           now,
         }),
-        lines: [`Fleet ${mode.fleetId}: ${accepted.text}`],
+        lines: [`Fleet ${mode.fleetId}: ${accepted.text}`, ...gateLines],
       };
     }
-    return { ok: true, run: landed, lines: [`Fleet ${mode.fleetId}: ${accepted.text}`] };
+    return {
+      ok: true,
+      run: landed,
+      lines: [`Fleet ${mode.fleetId}: ${accepted.text}`, ...gateLines],
+    };
+  }
+
+  /**
+   * Resolve the ordering gates a just-landed member released, reporting failures.
+   *
+   * Deliberately not fatal: the reaper owns the retry. The queue entry for this
+   * member is already `merged`, so a later land attempt for the same member returns
+   * immediately in `mergeLandedMember` and only this resolve runs again — a second
+   * merge of the same member is impossible by construction, not by hope.
+   */
+  async function resolveLandedOrderingGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+  }): Promise<readonly string[]> {
+    const released = await releaseOrderingGatesForBead(options);
+    if (released.ok) return [];
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      action: "ordering-gate-unresolved",
+      taskIds: [options.taskId],
+      detail: released.error,
+    });
+    return [
+      `Fleet ${options.mode.fleetId}: landed ${options.taskId} but could not resolve its ordering ` +
+        `gate(s): ${released.error} — the tick reaper retries; \`bd gate list\` shows them`,
+    ];
   }
 
   /** Queue and drain one member's merge; a failure here is a `land-failed` stop. */
@@ -7297,6 +7447,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     for (const warning of accepted.warnings) {
       ctx.ui.notify(warning, "warning");
       console.warn(`[belayd-harness] ${warning}`);
+    }
+    // bd-158: an accepted (closed) bead ends every ordering gate that touched it.
+    // The landing already released them; this covers a record written before the
+    // gate was resolved (and is idempotent when there is nothing left).
+    if (options.accept && accepted.ok) {
+      await releaseGatesAfterMerge({ ctx, mode, taskId, now: options.now });
     }
     return { ok: accepted.ok, text: accepted.text };
   }
@@ -7605,6 +7761,487 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     };
   }
 
+  /**
+   * Reap ordering gates whose reason to exist is gone, and adopt the ones bd knows.
+   *
+   * Three kinds:
+   *
+   * - **orphans** — a recorded gate naming a bead that is no longer a member
+   *   (removed, pruned, or a failed launch): nothing in the fleet can ever resolve
+   *   it, and it would block that bead in bd forever.
+   * - **closed beads** — a gate where either bead is `closed`/`done` (a human ran
+   *   `bd close`, or `--accept` did): the wait is satisfied or moot either way, and
+   *   bd would otherwise leave an open gate blocking nothing.
+   * - **unrecorded gates** — bd has a fleet-ordering gate that `fleet.json` does not
+   *   name (a crash between `bd gate create` and the intent write). One member bead
+   *   per tick is asked directly, rotating through the fleet, so the sweep is
+   *   bounded to a single extra read per tick and still reaches every member. A
+   *   reconcile pass asks every member instead (`sweep: "all"`), because it is an
+   *   explicit repair and the operator expects the whole fleet swept.
+   *
+   * Records are dropped by **gate id**, never by member id: resolving one gate of a
+   * member with two dependents says nothing about the other, and forgetting the
+   * other would leave it open with nothing able to resolve it.
+   *
+   * A resolve failure keeps the record (so the next tick retries) and is reported
+   * rather than swallowed.
+   *
+   * Warnings about one *gate* (drifted reason, unrecordable adoption) are keyed by
+   * gate id and shown once per run: the sweep rediscovers them on every rotation, and
+   * the tick loop notifies every line it gets back. The caller persists the returned
+   * `gateNoticeIds` on the run record so a restart does not re-warn either.
+   */
+  async function reapOrderingGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    now: number;
+    /** Monotonic run tick, used to rotate the unrecorded-gate sweep. */
+    tick: number;
+    /** `all` sweeps every member (reconcile); `tick` rotates one bead per tick. */
+    sweep?: "tick" | "all";
+    /**
+     * Beads to sweep although they are not members any more (members a repair just
+     * pruned). They are deliberately *not* added to the member set: a pruned bead
+     * must count as released so its gates are resolved, not adopted.
+     */
+    extraBeads?: readonly string[];
+  }): Promise<{ warnings: readonly string[]; gateNoticeIds: readonly string[] }> {
+    const gates = options.intent.orderingGates ?? [];
+    const members = new Set(fleetMemberTaskIds(options.intent));
+    const landed = new Set(
+      (options.intent.run?.members ?? [])
+        .filter((member) => member.landedAt !== undefined)
+        .map((member) => member.taskId),
+    );
+    // A gate has served its purpose once either bead stops being a member or the
+    // blocker lands: the merge happened, or nothing in the fleet can wait on that
+    // edge any more. This is the same predicate the recorded-gate orphan path uses,
+    // applied to bd's own answer for the unrecorded sweep.
+    const gateReleased = (gate: { blocker: string; blocked: string }): boolean =>
+      !members.has(gate.blocker) || !members.has(gate.blocked) || landed.has(gate.blocker);
+
+    const orphans = gates.filter(
+      (gate) => !members.has(gate.blocker) || !members.has(gate.blocked),
+    );
+    const orphaned =
+      orphans.length === 0
+        ? {
+            remaining: gates,
+            resolvedGateIds: [],
+            adopted: [],
+            warnings: [],
+            notices: [],
+          }
+        : await reapGateSubset(orphans, { ...options, label: "orphan" });
+    // Only a gate whose beads are still members is left to the bead-status read:
+    // the rest is already resolved above.
+    const live = orphaned.remaining.filter(
+      (gate) => members.has(gate.blocker) && members.has(gate.blocked),
+    );
+    const stale = await reapClosedBeadGates(live, options);
+    const unrecorded = await reapUnrecordedGates({
+      ...options,
+      members,
+      gateReleased,
+      recorded: gates,
+    });
+    const resolvedGateIds = [
+      ...orphaned.resolvedGateIds,
+      ...stale.resolvedGateIds,
+      ...unrecorded.resolvedGateIds,
+    ];
+    const adopted = [...orphaned.adopted, ...stale.adopted, ...unrecorded.adopted];
+    const warnings = [...orphaned.warnings, ...stale.warnings, ...unrecorded.warnings];
+    const notices: FleetGateNotice[] = [
+      ...orphaned.notices,
+      ...stale.notices,
+      ...unrecorded.notices,
+    ];
+    const persisted = persistGateReap({
+      mode: options.mode,
+      now: options.now,
+      resolvedGateIds,
+      adopted,
+      notices,
+    });
+    warnings.push(...persisted.warnings);
+    if (persisted.accepted.length > 0) {
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "ordering-gates-adopted",
+        taskIds: persisted.accepted.map((gate) => gate.blocked),
+        detail: persisted.accepted
+          .map((gate) => `${gate.blocker}->${gate.blocked} (${gate.gateId})`)
+          .join(", "),
+      });
+    }
+    const planned = reportGateNotices(options, notices, resolvedGateIds);
+    return {
+      warnings: [...warnings, ...planned.fresh.map((notice) => notice.message)],
+      gateNoticeIds: planned.noticeIds,
+    };
+  }
+
+  /**
+   * Write the reaper's decisions: drop what bd resolved, record what it adopted.
+   *
+   * A refused adoption (one that would pass the intent's gate bound) becomes a
+   * notice instead of a record: the gate must stay open in bd — resolving it would
+   * release a dependent before its blocker landed — so naming it for a human is the
+   * only correct move. Its error is returned rather than thrown so the rest of the
+   * reap still writes.
+   */
+  function persistGateReap(options: {
+    mode: FleetMode;
+    now: number;
+    resolvedGateIds: readonly string[];
+    adopted: readonly FleetOrderingGate[];
+    notices: FleetGateNotice[];
+  }): { warnings: readonly string[]; accepted: readonly FleetOrderingGate[] } {
+    if (options.resolvedGateIds.length === 0 && options.adopted.length === 0) {
+      return { warnings: [], accepted: [] };
+    }
+    // Filled inside the compare-and-replace, because only the record actually
+    // written says which adoptions survived the bound (and a CAS retry re-decides).
+    const accepted: FleetOrderingGate[] = [];
+    const written = mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (intent) => {
+        const dropped = dropFleetOrderingGates(intent, options.resolvedGateIds, options.now);
+        const added = addFleetOrderingGates(dropped, options.adopted, options.now);
+        const refusedIds = new Set(
+          (added.ok ? [] : added.refused).map((entry) => entry.gate.gateId),
+        );
+        accepted.length = 0;
+        accepted.push(...options.adopted.filter((gate) => !refusedIds.has(gate.gateId)));
+        if (!added.ok) options.notices.push(...refusalNotices(options.mode.fleetId, added.refused));
+        return added.intent;
+      },
+    });
+    // A lost CAS race leaves the adopted gates open in bd with no record here, so
+    // name them for a human: `bd gate list` would otherwise be the only way to find
+    // the ids that must be resolved by hand.
+    const unrecorded =
+      options.adopted.length === 0
+        ? ""
+        : ` (unrecorded ordering gates: ${options.adopted
+            .map((gate) => `${gate.blocker}->${gate.blocked} (${gate.gateId})`)
+            .join(", ")})`;
+    const warnings = written.ok
+      ? []
+      : [`Fleet ${options.mode.fleetId}: ${written.error}${unrecorded}`];
+    return { warnings, accepted };
+  }
+
+  /** Refused adoptions, worded so a human knows which dependent stays bd-blocked. */
+  function refusalNotices(
+    fleetId: string,
+    refused: readonly { gate: FleetOrderingGate; error: string }[],
+  ): readonly FleetGateNotice[] {
+    return refused.map((refusal) => ({
+      gateId: refusal.gate.gateId,
+      message:
+        `Fleet ${fleetId}: ordering gate ${refusal.gate.gateId} ` +
+        `(${refusal.gate.blocker} -> ${refusal.gate.blocked}) is open in bd but ` +
+        `could not be recorded: ${refusal.error}`,
+    }));
+  }
+
+  /**
+   * Which gate findings to show now, and the ledger the caller must persist.
+   *
+   * A drift or an adoption refusal is rediscovered on every rotation of the sweep,
+   * and the tick loop notifies every line it gets back: report each gate once per
+   * run instead of once per pass. A reconcile pass is an explicit repair by a
+   * human, so it shows every finding it made instead of the once-per-run subset.
+   */
+  function reportGateNotices(
+    options: { sweep?: "tick" | "all"; intent: FleetIntent },
+    notices: readonly FleetGateNotice[],
+    releasedGateIds: readonly string[],
+  ): FleetGateNoticePlan {
+    if (options.sweep === "all") {
+      return { fresh: notices, noticeIds: options.intent.run?.gateNoticeIds ?? [] };
+    }
+    return planGateNotices({
+      ...(options.intent.run?.gateNoticeIds === undefined
+        ? {}
+        : { existing: options.intent.run.gateNoticeIds }),
+      notices,
+      releasedGateIds,
+    });
+  }
+
+  /** What one reap step resolved, what is still recorded, and what to report. */
+  interface ReapOutcome {
+    remaining: readonly FleetOrderingGate[];
+    /** Gate ids bd confirmed resolved; the only thing the records may drop. */
+    resolvedGateIds: readonly string[];
+    /** Unrecorded gates adopted into `fleet.json` so a landing can resolve them. */
+    adopted: readonly FleetOrderingGate[];
+    /** Plain warnings: read failures and the like, reported every pass. */
+    warnings: readonly string[];
+    /** Per-gate findings, reported once per gate per run (`planGateNotices`). */
+    notices: readonly FleetGateNotice[];
+  }
+
+  /** Resolve a chosen set of gates, keeping every record bd did not confirm. */
+  async function reapGateSubset(
+    gates: readonly FleetOrderingGate[],
+    options: { ctx: ExtensionContext; mode: FleetMode; label: string },
+  ): Promise<ReapOutcome> {
+    // An empty selection resolves nothing and keeps nothing back: the caller's
+    // other gates are not this step's business.
+    if (gates.length === 0) {
+      return { remaining: gates, resolvedGateIds: [], adopted: [], warnings: [], notices: [] };
+    }
+    const result = await resolveFleetOrderingGates({
+      gates,
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    });
+    if (!result.ok) {
+      return {
+        remaining: result.remaining,
+        resolvedGateIds: result.resolved.map((gate) => gate.gateId),
+        adopted: [],
+        notices: [],
+        warnings: [
+          `Fleet ${options.mode.fleetId}: could not resolve ${options.label} ordering ` +
+            `gate(s): ${result.error}`,
+        ],
+      };
+    }
+    return {
+      remaining: result.remaining,
+      resolvedGateIds: result.resolved.map((gate) => gate.gateId),
+      warnings: [],
+      adopted: [],
+      notices: [],
+    };
+  }
+
+  /**
+   * Resolve the gates whose beads bd reports closed/done or missing altogether.
+   *
+   * One batched read-only `bd show` per tick covers every gated bead, and a read
+   * failure degrades to a warning: the tick can retry it, and an unreadable bd
+   * must not stop the fleet from making progress on the rest.
+   */
+  async function reapClosedBeadGates(
+    live: readonly FleetOrderingGate[],
+    options: { ctx: ExtensionContext; mode: FleetMode },
+  ): Promise<ReapOutcome> {
+    if (live.length === 0)
+      return { remaining: live, resolvedGateIds: [], adopted: [], warnings: [], notices: [] };
+    const beadIds = [...new Set(live.flatMap((gate) => [gate.blocker, gate.blocked]))].sort();
+    const lookup = await lookupFleetBeads({
+      taskIds: beadIds,
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    });
+    if (!lookup.ok) {
+      return {
+        remaining: live,
+        resolvedGateIds: [],
+        adopted: [],
+        notices: [],
+        warnings: [
+          `Fleet ${options.mode.fleetId}: could not read the beads behind its ordering ` +
+            `gates: ${lookup.error}`,
+        ],
+      };
+    }
+    // An answer that does not name every requested bead is ambiguous: bd changed
+    // its payload shape, the read hit a different database, or ids were silently
+    // dropped. Treating a missing record as "that bead is gone" would mass-resolve
+    // gates whose blockers have not landed, so only a *complete* answer can decide
+    // which beads are absent — and an absent record is not evidence of death when
+    // bd normally fails the whole read for an unknown id.
+    const returned = new Set(lookup.beads.map((bead) => bead.id));
+    const missing = beadIds.filter((beadId) => !returned.has(beadId));
+    if (missing.length > 0) {
+      return {
+        remaining: live,
+        resolvedGateIds: [],
+        adopted: [],
+        notices: [],
+        warnings: [
+          `Fleet ${options.mode.fleetId}: bd returned no record for ${missing.length} of ` +
+            `${beadIds.length} bead(s) behind its ordering gates (${missing.join(", ")}); ` +
+            "not reaping on an ambiguous answer",
+        ],
+      };
+    }
+    const closed = closedBeadsOf(lookup.beads);
+    const stale = live.filter((gate) => closed.has(gate.blocker) || closed.has(gate.blocked));
+    const reaped = await reapGateSubset(stale, { ...options, label: "closed-bead" });
+    // The gates that are not stale stay recorded and untouched.
+    const untouched = live.filter((gate) => !stale.includes(gate));
+    return { ...reaped, remaining: [...reaped.remaining, ...untouched] };
+  }
+
+  /**
+   * Sweep bd for ordering gates `fleet.json` does not name, and adopt them.
+   *
+   * The record list cannot name a gate the fleet never wrote down, so asking bd
+   * directly is the only way to close the crash window between `bd gate create` and
+   * the intent write. Two outcomes per gate:
+   *
+   * - **released** (a bead left the fleet, or the blocker landed) → resolve: nothing
+   *   is left to wait for.
+   * - **still live** (both ends are members and the blocker has not landed) → adopt:
+   *   write the record so the blocker's landing resolves it like any other gate.
+   *   Resolving it instead would release a dependent before its blocker landed —
+   *   ordering correctness beats tidiness.
+   *
+   * A tick asks one member bead (rotating by `run.ticks`), which keeps a 15-second
+   * loop cheap while covering every member within a few minutes. A reconcile pass
+   * asks every member, bounded by a small concurrency, because it is an explicit
+   * repair rather than a heartbeat.
+   */
+  async function reapUnrecordedGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    tick: number;
+    sweep?: "tick" | "all";
+    members: ReadonlySet<string>;
+    extraBeads?: readonly string[];
+    gateReleased: (gate: { blocker: string; blocked: string }) => boolean;
+    /** Records the intent already holds, so an adoption never duplicates an edge. */
+    recorded: readonly FleetOrderingGate[];
+  }): Promise<ReapOutcome> {
+    const beads = sweepBeads(options);
+    if (beads.length === 0)
+      return { remaining: [], resolvedGateIds: [], adopted: [], warnings: [], notices: [] };
+    const lookups = await mapBounded(beads, ORDERING_SWEEP_CONCURRENCY, (beadId) =>
+      listFleetOrderingGatesForBead({
+        beadId,
+        cwd: options.ctx.cwd,
+        runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+      }).then((lookup) => ({ beadId, lookup })),
+    );
+
+    const recordedByEdge = new Map(options.recorded.map((gate) => [edgeKeyOf(gate), gate.gateId]));
+    const resolvedGateIds: string[] = [];
+    const adopted: FleetOrderingGate[] = [];
+    const warnings: string[] = [];
+    const notices: FleetGateNotice[] = [];
+    for (const { beadId, lookup } of lookups) {
+      if (!lookup.ok) {
+        warnings.push(
+          `Fleet ${options.mode.fleetId}: could not read the ordering gates of ${beadId}: ` +
+            lookup.error,
+        );
+        continue;
+      }
+      // Drift is per gate and rediscovered on every rotation, so it travels as a
+      // keyed notice instead of a plain warning the tick would repeat forever.
+      notices.push(...lookup.drifts);
+      for (const gate of lookup.gates) {
+        const swept = await sweepOneGate(gate, options, recordedByEdge);
+        resolvedGateIds.push(...swept.resolvedGateIds);
+        warnings.push(...swept.warnings);
+        if (swept.adopt !== undefined) {
+          adopted.push(swept.adopt);
+          // A second gate for the same edge in this same answer is a duplicate: the
+          // record just adopted keeps the ordering, so this one is resolved below.
+          recordedByEdge.set(edgeKeyOf(swept.adopt), swept.adopt.gateId);
+        }
+      }
+    }
+    return { remaining: [], resolvedGateIds, adopted, warnings, notices };
+  }
+
+  /** What one discovered gate needs: a resolve, an adoption, or nothing. */
+  interface SweptGate {
+    resolvedGateIds: readonly string[];
+    adopt?: FleetOrderingGate;
+    warnings: readonly string[];
+  }
+
+  /**
+   * Decide one discovered gate: duplicate, released, or adopt.
+   *
+   * Split out of the sweep because the three cases are the whole point of the pass
+   * and each has its own failure mode; sharing this with the tick keeps a 15-second
+   * loop and an explicit repair behaving identically.
+   */
+  async function sweepOneGate(
+    gate: { fleetId: string; blocker: string; blocked: string; gateId: string },
+    options: {
+      ctx: ExtensionContext;
+      mode: FleetMode;
+      gateReleased: (gate: { blocker: string; blocked: string }) => boolean;
+    },
+    recordedByEdge: ReadonlyMap<string, string>,
+  ): Promise<SweptGate> {
+    if (gate.fleetId !== options.mode.fleetId) return { resolvedGateIds: [], warnings: [] };
+    const record = { blocker: gate.blocker, blocked: gate.blocked, gateId: gate.gateId };
+    const recordedGateId = recordedByEdge.get(edgeKeyOf(record));
+    // Already recorded with this very id: nothing to do.
+    if (recordedGateId === gate.gateId) return { resolvedGateIds: [], warnings: [] };
+    // A second gate for a recorded edge is a duplicate the record does not need; the
+    // recorded twin keeps the ordering intact. A released gate has nothing left to
+    // wait for. Both are resolved; everything else is adopted.
+    if (recordedGateId !== undefined || options.gateReleased(gate)) {
+      const resolved = await resolveFleetOrderingGates({
+        gates: [record],
+        cwd: options.ctx.cwd,
+        runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+      });
+      return resolved.ok
+        ? { resolvedGateIds: resolved.resolved.map((entry) => entry.gateId), warnings: [] }
+        : {
+            resolvedGateIds: [],
+            warnings: [`Fleet ${options.mode.fleetId}: ${resolved.error}`],
+          };
+    }
+    return { resolvedGateIds: [], adopt: record, warnings: [] };
+  }
+
+  /** The beads a sweep asks bd about: one rotating (per tick) or all (per repair). */
+  function sweepBeads(options: {
+    tick: number;
+    sweep?: "tick" | "all";
+    members: ReadonlySet<string>;
+    extraBeads?: readonly string[];
+  }): readonly string[] {
+    const beads = [...new Set([...options.members, ...(options.extraBeads ?? [])])].sort();
+    if (options.sweep === "all") return beads;
+    const index = Math.abs(Math.trunc(options.tick)) % Math.max(1, beads.length);
+    const bead = beads[index];
+    return bead === undefined ? [] : [bead];
+  }
+
+  /** Map with a small fixed concurrency, preserving input order in the result. */
+  async function mapBounded<T, R>(
+    items: readonly T[],
+    limit: number,
+    fn: (item: T) => Promise<R>,
+  ): Promise<R[]> {
+    const results: R[] = new Array<R>(items.length);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (cursor < items.length) {
+        const index = cursor;
+        cursor += 1;
+        const item = items[index];
+        if (item !== undefined) results[index] = await fn(item);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
+
+  function edgeKeyOf(edge: { blocker: string; blocked: string }): string {
+    return `${edge.blocker}\u0000${edge.blocked}`;
+  }
+
   /** One deterministic tick: observe, decide, act, persist. */
   async function fleetTick(options: {
     ctx: ExtensionContext;
@@ -7657,12 +8294,29 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
 
     const observations = readFleetMemberObservations({ cwd: ctx.cwd, intent, run, now });
+    // Reap before planning: a gate whose member is gone must not outlive the tick
+    // that could have noticed, and a closed blocker bead means its dependent is no
+    // longer waiting on the fleet.
+    const reaped = await reapOrderingGates({
+      ctx,
+      mode: current,
+      intent,
+      now,
+      tick: run.ticks,
+    });
     const action = planFleetTick({ intent, observations, now, idleTicks: run.idleTicks ?? 0 });
     const result = await executeFleetTickAction({ ctx, mode: current, intent, run, action, now });
     const progressed = result.acted && action.kind !== "halt";
     const ticked = recordRunTick({ run: result.run, now, progressed });
-    persistFleetRun({ ctx, mode: current, run: ticked, now });
-    return { lines: result.lines, stop: result.stop, acted: result.acted };
+    // The gate-notice ledger rides on the run this tick persists, so the next
+    // rotation does not re-notify the same drifted or unrecordable gate.
+    persistFleetRun({
+      ctx,
+      mode: current,
+      run: recordFleetGateNotices(ticked, reaped.gateNoticeIds),
+      now,
+    });
+    return { lines: [...reaped.warnings, ...result.lines], stop: result.stop, acted: result.acted };
   }
 
   /** Stop the loop's timer (the durable run record is what survives). */
@@ -8169,8 +8823,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         });
         // A member this fleet has already merged satisfies its dependents' edges:
         // the premise bd's edge encodes ("that work is on the base branch") is true
-        // even before someone closes the bead. Without this, a run would stall on
-        // its own landed work whenever acceptance is disabled.
+        // even before someone closes the bead. This is the fleet-side half of
+        // bd-158: bd's own blocked-ness is released by the ordering gate that
+        // `landFleetMember` resolves on landing, and this rule releases the
+        // scheduler at the same instant without touching the bead. Without it a run
+        // would stall on its own landed work, since landing never closes a bead.
         const landed = fleetLandedTaskIds({
           gitCommonDir: input.gitCommonDir,
           fleetId: options.fleetId,
@@ -8179,6 +8836,35 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           edges: graph.edges.filter((edge) => !landed.has(edge.blocker)),
           warnings: graph.warnings,
         };
+      },
+      // bd-158: the fleet owns its wave ordering through bd gates, so a landing
+      // releases a dependent in bd without closing the blocker's bead. Created
+      // before the intent write and resolved on landing / when a member or bead
+      // goes away.
+      orderingGates: {
+        create: (gateInput) =>
+          createFleetOrderingGates({
+            fleetId: gateInput.fleetId,
+            taskIds: gateInput.taskIds,
+            edges: gateInput.edges,
+            existing: gateInput.existing,
+            cwd: ctx.cwd,
+            runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+          }),
+        resolve: (gateInput) =>
+          resolveFleetOrderingGates({
+            gates: gateInput.gates,
+            cwd: ctx.cwd,
+            runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+            ...(gateInput.beadId === undefined ? {} : { beadId: gateInput.beadId }),
+            ...(gateInput.blocker === undefined ? {} : { blocker: gateInput.blocker }),
+          }),
+        reapByPrefix: (gateInput) =>
+          reapFleetOrderingGatesByPrefix({
+            ...gateInput,
+            cwd: ctx.cwd,
+            runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+          }),
       },
     };
   }
@@ -8280,11 +8966,15 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       "orchestrator per worktree). Orders members by bd's blocking dependencies (blocked-by " +
       "edges; a dependency cycle refuses the launch and names the cycle) and launches only the " +
       "free capacity: at most 3 orchestrators in flight, counting the ones already running. " +
+      "Every dependency edge between two members gets its own bd ordering gate, so a dependent " +
+      "unblocks when its blocker LANDS, not when its bead is closed. " +
       "Members beyond that, or in a later wave, are deferred — reported per member and recorded " +
       "in fleet.json — never silently dropped. By default (untilComplete) this session then runs " +
-      "the fleet TO COMPLETION: it lands each finished member, accepts it (closes the bead and " +
-      "removes the worktree when accept is true), and starts the next wave as dependencies " +
-      "clear, until every member is landed. untilComplete=false keeps the explicit surface " +
+      "the fleet TO COMPLETION: it lands each finished member, releases the ordering gates its " +
+      "landing satisfied, and starts the next wave as dependencies clear, until every member is " +
+      "landed. Landing never closes a bead: each one is left in_progress + human for you to " +
+      "accept, unless accept=true (then the bead is closed and the worktree removed). " +
+      "untilComplete=false keeps the explicit surface " +
       "(belayd_fleet_merge / belayd_fleet_advance on call). This session becomes the fleet " +
       "supervisor: it runs no phases and owns no worktree — observe with belayd_fleet_status, " +
       "message members with belayd_fleet_note, read reports with belayd_fleet_inbox, pause with " +
@@ -8312,8 +9002,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       accept: Type.Optional(
         Type.Boolean({
           description:
-            "Close each landed bead and remove its worktree (default true). false leaves every " +
-            "bead in_progress + human for you to accept with `bd close` / `wt merge`",
+            "Also close each landed bead (default false). The merged worktree is removed on " +
+            "landing either way; without this flag every landed bead is left in_progress + " +
+            "human, and the human accepts with `wt merge` / `bd close`; dependents still " +
+            "advance because the fleet resolves its bd ordering gates on landing",
         }),
       ),
     }),
@@ -8326,7 +9018,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         taskIds: parsed.taskIds,
         fleetId: fleetIdParam(params.fleetId),
         ...(params.concurrency === undefined ? {} : { requestedConcurrency: params.concurrency }),
-        ...(params.untilComplete === false ? {} : { runMode: { accept: params.accept !== false } }),
+        ...(params.untilComplete === false ? {} : { runMode: { accept: params.accept === true } }),
       });
       return textToolResult(result.text, result.ok ? 0 : 1);
     },
@@ -8706,10 +9398,36 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       options.ctx.ui.notify(warning, "warning");
       console.warn(`[belayd-harness] ${warning}`);
     }
+    if (drained.ok) {
+      await releaseGatesAfterMerge({ ...options, taskId: drained.taskId });
+    }
     // An empty queue is not a failure: the operator asked for the next merge and
     // there is none, which exits 0 with an explanatory result.
     const exitCode = drained.ok || drained.reason === "no-queued-entry" ? 0 : 1;
     return textToolResult(drained.text, exitCode);
+  }
+
+  /**
+   * Release a merged member's ordering gates outside the run's own landing step.
+   *
+   * Both callers have already merged: a manual `belayd_fleet_merge` drain, and the
+   * opt-in acceptance after a landing (where the records are normally already gone
+   * — this only catches a `fleet.json` written before the resolve). A failure is a
+   * warning, not a failed merge: the work is on the base branch, and the gate stays
+   * recorded for the next tick or reconcile.
+   */
+  async function releaseGatesAfterMerge(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+  }): Promise<void> {
+    const released = await releaseOrderingGatesForBead(options);
+    if (released.ok) return;
+    options.ctx.ui.notify(
+      `Fleet ${options.mode.fleetId}: ${released.error}; resolve it with \`bd gate resolve\``,
+      "warning",
+    );
   }
 
   pi.registerTool({
@@ -9192,11 +9910,55 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           return worktreePath === undefined ? undefined : leaseProbeFor(worktreePath, Date.now());
         },
         ...(params.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
+        // bd-158: a prune removes members, so their ordering gates must be
+        // resolved by the same repair — otherwise only a later tick could.
+        orderingGates: {
+          resolve: (gates) =>
+            resolveFleetOrderingGates({
+              gates,
+              cwd: extensionCtx.cwd,
+              runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+            }),
+          reapByPrefix: (gateInput) =>
+            reapFleetOrderingGatesByPrefix({
+              ...gateInput,
+              cwd: extensionCtx.cwd,
+              runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+            }),
+        },
       });
       for (const warning of result.warnings) {
         extensionCtx.ui.notify(warning, "warning");
         console.warn(`[belayd-harness] ${warning}`);
       }
+      // A prune removes a member, which orphans its bd ordering gates (bd-158):
+      // reap them here so a repair leaves no open gate behind. Re-read the intent,
+      // because the reconcile may have just pruned a member.
+      const reconciled = readFleetIntent({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+      });
+      const pruned = result.repairs
+        .filter((repair) => repair.startsWith("member-pruned:"))
+        .map((repair) => repair.slice("member-pruned:".length))
+        .filter((taskId) => taskId !== "");
+      // A repair is not a tick: sweep every member *and* the members it just pruned
+      // (a pruned bead is no longer a member, so only a full pass still asks bd
+      // about the gates that block it). One rotating bead would leave the rest of
+      // the fleet unswept while the output claimed otherwise.
+      const reaped =
+        reconciled.ok && reconciled.intent !== undefined
+          ? await reapOrderingGates({
+              ctx: extensionCtx,
+              mode,
+              intent: reconciled.intent,
+              now: Date.now(),
+              tick: 0,
+              sweep: "all",
+              extraBeads: pruned,
+            })
+          : { warnings: [], gateNoticeIds: [] };
+      for (const warning of reaped.warnings) extensionCtx.ui.notify(warning, "warning");
       return textToolResult(result.text, result.ok ? 0 : 1);
     },
   });
@@ -9490,11 +10252,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   pi.registerCommand("fleet", {
     description:
       "Start a fleet supervisor session for several beads, each as its own worktree workflow, and " +
-      "run it to completion: members are ordered by bd dependencies, only the free capacity starts " +
-      "now (max 3 orchestrators), and the supervisor then lands each finished member, accepts it " +
-      "(closes the bead, removes the worktree) and starts the next wave until every member is " +
-      "landed. `--manual` keeps the explicit surface; `--no-accept` leaves beads for you. " +
-      "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>] [--manual] [--no-accept].",
+      "run it to completion: members are ordered by bd dependencies (a bd gate per edge, resolved " +
+      "when the blocker lands), only the free capacity starts " +
+      "now (max 3 orchestrators), and the supervisor then lands each finished member, " +
+      "releases the gates the landing satisfied and starts the next wave until every member is " +
+      "landed. Landing never closes a bead: they stay in_progress + human for you to accept. " +
+      "`--manual` keeps the explicit surface; `--accept` also closes each landed bead. " +
+      "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>] [--manual] [--accept].",
     handler: async (args, ctx) => {
       const parsed = parseFleetCommandArgs(args);
       if (!parsed.ok) {
@@ -9509,11 +10273,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           ? {}
           : { requestedConcurrency: parsed.args.concurrency }),
         // `/fleet` runs to completion unless `--manual` asked for the explicit
-        // surface; accepting landed beads is the default because an open bead
-        // keeps blocking its dependents in bd.
+        // surface; acceptance is opt-in (bd-158), so a bare `/fleet` lands members
+        // and leaves every bead for the human. Ordering no longer needs a close:
+        // the fleet's bd ordering gates are resolved on landing.
         ...(parsed.args.untilComplete === false
           ? {}
-          : { runMode: { accept: parsed.args.accept !== false } }),
+          : { runMode: { accept: parsed.args.accept === true } }),
       });
       ctx.ui.notify(result.text, result.ok ? "info" : "error");
     },

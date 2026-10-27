@@ -1340,6 +1340,32 @@ describe("formatFleetStatus", () => {
     );
   });
 
+  it("lists the ordering gates bd still blocks on, so a wedge is visible", () => {
+    // C4: a landing that merged but could not resolve its gate leaves the record.
+    // Before this line the only way to see the wedge was `bd gate list` or the docs.
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        orderingGates: [
+          { blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" },
+          { blocker: "bd-12", blocked: "bd-16", gateId: "bd-902" },
+        ],
+      }),
+      members: [],
+    });
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain(
+      "ordering gates open: bd-12 -> bd-15 (gate bd-901), bd-12 -> bd-16 (gate bd-902)",
+    );
+
+    // No records means no line at all: a healthy fleet's header does not grow.
+    const without = formatFleetStatus(
+      buildFleetStatus({ fleetId: "fleet-1", intent: sampleIntent({}), members: [] }),
+    );
+    expect(without).not.toContain("ordering gates");
+  });
+
   it("renders one member stably", () => {
     const status = buildFleetStatus({
       fleetId: "fleet-1",

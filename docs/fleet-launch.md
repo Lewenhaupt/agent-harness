@@ -63,7 +63,7 @@ existing arm untouched.
 ### How to invoke it
 
 ```
-/fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--no-accept]
+/fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--accept]
 ```
 
 | Argument | Meaning |
@@ -72,7 +72,7 @@ existing arm untouched.
 | `--fleet <id>` | Fleet directory name under `<git-common-dir>/belayd/fleet/`. Default `default`. Sanitized (anything outside `A-Za-z0-9._-` becomes `_`). |
 | `--concurrency <n>` | Requested concurrent orchestrators. **Capped at 3**; a larger value is clamped and the report says so, and a fraction is floored and reported. Only the free capacity starts now (see [P3](#ordering-waves-and-capacity-p3)). |
 | `--manual` | Do not start the run loop: launch only, then land/advance on explicit tool calls (the P1–P4 behaviour). No `run` record is written, and no supervisor heartbeat. |
-| `--no-accept` | Run to completion, but do not close the bead or remove the worktree when a member lands. The run still finishes: a landed member satisfies its dependents' edges. |
+| `--accept` | Also close each landed bead. The merged worktree and branch are removed on **every** landing, with or without this flag (the branch is already on the base branch, so the worktree has no remaining purpose); `--accept` only adds the `bd close`. Off by default (bd-158): a landing leaves the bead `in_progress` + `human` and resolves the bd ordering gate its dependents wait on, so the run still finishes without a close. `--no-accept` restates the default. |
 
 The tool form takes the same request:
 
@@ -134,9 +134,11 @@ the graph cannot be read (no bd, timeout, non-JSON), the launch still runs in
 
 **What is not automatic:** advancing a wave. When a blocker lands, advance
 (`belayd_fleet_advance`) or launch the waiting members explicitly (`/fleet
-bd-15`). Waves are never advanced by a background loop. A dependency wave still
-only becomes eligible once bd stops reporting the blocking edge — merging a
-sibling's branch is not closing its bead.
+bd-15`). Waves are never advanced by a background loop *in a `--manual` fleet*. A
+dependency wave becomes eligible when bd stops reporting the blocking edge (the
+blocker's bead is `closed`/`done`) **or** when this fleet already landed that
+blocker: a landing satisfies the edge and the scheduler drops it
+(`fleetLandedTaskIds`, bd-158), so the branch merge alone advances the wave.
 
 Example — `bd-15` is blocked by `bd-12`, and two other orchestrators are already
 running:
@@ -279,13 +281,21 @@ injected (the block counts it and leaves it on disk).
   re-arm is the one exception: it starts nothing, so it still works while paused —
   that is the path back to a supervised fleet.
 - **No bead mutation by the launch or the merge.** `belayd_fleet_merge` never
-  changes a bead's status, labels, or notes; merging ≠ closing stays true. Only a
-  run's acceptance step (`accept: true`, audited as `fleet-landed`) closes a bead.
+  changes a bead's status, labels, or notes; merging ≠ closing stays true. The
+  launch does create **bd ordering gates** (one per dependency edge between two
+  fleet members — including a member that started in an earlier wave, recorded in
+  `fleet.json`), and a landing resolves them; neither touches a bead. Before
+  creating one it reads the dependent's open gates (`bd gate list`) and adopts the
+  gate bd already has, so a record lost to a crash cannot make a relaunch mint a
+  second gate for the same edge. Only an opt-in acceptance step (`accept: true`,
+  audited as `fleet-landed`) closes a bead.
 - **No phases.** The supervisor never runs one, and it cannot arm a gate.
 - **No cross-tree reach from the phase family.** Phase tools, the proof verifier,
   and the commit path are unchanged; only the fleet family acts across worktrees.
   Every such action is audited: `launch`, `re-arm`, `member-launch`,
-  `member-launch-failed`, `member-pruned`, `note`, `note-partial`,
+  `member-launch-failed`, `member-pruned`, `ordering-gates`,
+  `ordering-gates-adopted`, `ordering-gates-resolved`, `ordering-gate-unresolved`, `note`,
+  `note-partial`,
   `inbox-drain`, `events-acked` (the one exemption is the quarantine rename of a
   corrupt or oversize note during a drain, documented in the design record). P2
   adds the `merge-*`, `base-moved`, `sibling-landed`, `rebase-hint`, and

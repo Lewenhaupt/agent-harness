@@ -45,6 +45,12 @@ import {
 import type { FleetSupervisorState } from "./fleet-mode.js";
 import { classifyFleetSupervisor } from "./fleet-mode.js";
 import type {
+  FleetOrderingGate,
+  FleetOrderingGateReapScope,
+  ReapFleetOrderingGatesResult,
+  ResolveFleetOrderingGatesResult,
+} from "./fleet-ordering-gates.js";
+import type {
   FleetMemberLeaseProbe,
   FleetMemberLiveness,
   FleetProcessScan,
@@ -54,6 +60,7 @@ import type { FleetMergeQueue, FleetMergeQueueEntry, FleetStateFs } from "./flee
 import {
   appendFleetAuditEntry,
   createFleetMergeQueue,
+  dropFleetOrderingGates,
   FLEET_MERGE_LEASE_MS,
   fleetMergeLockDir,
   readFleetIntent,
@@ -365,7 +372,24 @@ export interface RunFleetReconcileOptions {
    * count sees, so it is never implicit.
    */
   pruneDeadMembers?: boolean;
+  /**
+   * bd ordering-gate lifecycle (bd-158), injected so this module stays bd-free.
+   *
+   * A prune removes members, and a removed member's open ordering gates are
+   * orphans: nothing else in the fleet can ever resolve them, so the prune path
+   * itself must. Kept optional because direct callers that never touch gates (the
+   * pure unit tests) should not have to stub bd.
+   */
+  orderingGates?: FleetOrderingGateSeam;
   fs?: FleetStateFs;
+}
+
+/** The two bd operations a prune needs, as injected seams. */
+export interface FleetOrderingGateSeam {
+  resolve: (gates: readonly FleetOrderingGate[]) => Promise<ResolveFleetOrderingGatesResult>;
+  reapByPrefix: (
+    input: { fleetId: string; beadIds: readonly string[] } & FleetOrderingGateReapScope,
+  ) => Promise<ReapFleetOrderingGatesResult>;
 }
 
 export interface RunFleetReconcileResult {
@@ -766,14 +790,21 @@ function describeSupervisor(supervisor: FleetSupervisorState, fleetId: string): 
  * being held by sessions that provably do not exist. The worktree, session
  * transcript, and bead are untouched — pruning changes which sessions the fleet
  * *counts*, not what exists on disk.
+ *
+ * The member's bd ordering gates are resolved here, before its records go: a
+ * pruned member can never land, so its open gates would be orphans nothing else
+ * could resolve (bd-158). The module stays bd-free by taking the resolver as an
+ * injected seam, and an absent seam keeps the records (a caller that does not own
+ * gates must not be told they were resolved).
  */
-function pruneDeadMembers(options: {
+async function pruneDeadMembers(options: {
   run: ReconcileRun;
   reconcile: RunFleetReconcileOptions;
   fs: FleetStateFs;
   deadMembers: readonly string[];
-}): void {
+}): Promise<void> {
   const dead = new Set(options.deadMembers);
+  const resolvedGateIds = await resolveGatesOfPrunedMembers({ ...options }, dead);
   let pruned: readonly string[] = [];
   const written = updateFleetIntent({
     gitCommonDir: options.reconcile.gitCommonDir,
@@ -786,11 +817,14 @@ function pruneDeadMembers(options: {
       const removed = current.taskIds.filter((taskId) => dead.has(taskId));
       if (removed.length === 0) return current;
       pruned = removed;
-      return {
+      const kept = {
         ...current,
         taskIds: current.taskIds.filter((taskId) => !dead.has(taskId)),
         updatedAt: options.reconcile.now,
       };
+      return resolvedGateIds.length === 0
+        ? kept
+        : dropFleetOrderingGates(kept, resolvedGateIds, options.reconcile.now);
     },
   });
   if (!written.ok) {
@@ -820,13 +854,60 @@ function pruneDeadMembers(options: {
   if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
 }
 
+/**
+ * Resolve the ordering gates of the members about to be pruned, and return the
+ * gate ids whose records may go (bd-158).
+ *
+ * Two passes, because a record can be missing: the recorded gates touching a dead
+ * member, and a by-prefix sweep of its bead in bd (a crash between create and the
+ * intent write leaves a gate no record names). Failures are warnings and keep the
+ * records: this module must not claim a gate was resolved when bd disagreed.
+ */
+async function resolveGatesOfPrunedMembers(
+  options: { run: ReconcileRun; reconcile: RunFleetReconcileOptions; fs: FleetStateFs },
+  dead: ReadonlySet<string>,
+): Promise<readonly string[]> {
+  const seam = options.reconcile.orderingGates;
+  const deadIds = [...dead];
+  if (seam === undefined || deadIds.length === 0) return [];
+  const loaded = loadIntent({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    fs: options.fs,
+  });
+  const recorded = loaded.ok ? (loaded.intent.orderingGates ?? []) : [];
+  const touching = recorded.filter((gate) => dead.has(gate.blocker) || dead.has(gate.blocked));
+  const resolved: string[] = [];
+  if (touching.length > 0) {
+    const result = await seam.resolve(touching);
+    resolved.push(...result.resolved.map((gate) => gate.gateId));
+    if (!result.ok) {
+      options.run.warnings.push(
+        `could not resolve the ordering gate(s) of the pruned member(s): ${result.error}`,
+      );
+    }
+  }
+  const prefix = await seam.reapByPrefix({
+    fleetId: options.reconcile.fleetId,
+    beadIds: deadIds,
+    scope: "whole-bead",
+  });
+  resolved.push(...prefix.resolved.map((gate) => gate.gateId));
+  if (!prefix.ok) {
+    options.run.warnings.push(
+      `could not reap every ordering gate of the pruned member(s): ${prefix.error}`,
+    );
+  }
+  return resolved;
+}
+
 /** Supervisor + member liveness: the read-only half of reconcile. */
-function reconcileSupervision(options: {
+async function reconcileSupervision(options: {
   run: ReconcileRun;
   reconcile: RunFleetReconcileOptions;
   intent: FleetIntent;
   fs: FleetStateFs;
-}): void {
+}): Promise<void> {
   const { reconcile, intent, run } = options;
   const supervisor = classifyFleetSupervisor({
     supervisor: intent.supervisor,
@@ -887,9 +968,8 @@ function reconcileSupervision(options: {
   }
   // A live supervisor may prune: dropping phantom members is how the capacity
   // count stops being held by sessions that provably do not exist.
-  pruneDeadMembers({ run, reconcile, fs: options.fs, deadMembers });
+  await pruneDeadMembers({ run, reconcile, fs: options.fs, deadMembers });
 }
-
 // ── The reconcile engine ──────────────────────────────────────────────
 
 /** What the queue looked like, plus the repairs it calls for. */
@@ -1179,7 +1259,7 @@ export async function runFleetReconcile(
   }
 
   await reconcileQueueAndPark({ run, reconcile: options, intent: loaded.intent, fs });
-  reconcileSupervision({ run, reconcile: options, intent: loaded.intent, fs });
+  await reconcileSupervision({ run, reconcile: options, intent: loaded.intent, fs });
 
   const repaired = run.repairs.length;
   const lines = [

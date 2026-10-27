@@ -7,6 +7,10 @@
  * do: the comment thread (`bd comments <id> --json`) and the bd-152 `human` gate
  * (`bd gate list <id> --json`).
  *
+ * The same gate read also names a bd-158 fleet *ordering* gate: that one is a
+ * wait on another member's landing, never on a person, so it is reported as
+ * `orderingBlocker` and leaves `awaitingHuman` false.
+ *
  * Read-only by construction, exactly like `fleet-beads.ts`: the argv builders
  * live in `bead-comments.ts` / `bead-gates.ts` and both lookups refuse a
  * non-read argv before spawning, so this path cannot become a writer. No bd
@@ -155,6 +159,13 @@ async function readOne(input: ReadOneInput): Promise<BeadReadOutcome> {
   };
   const awaitingHuman = gateLookup === undefined ? undefined : awaitingHumanFrom(gateLookup);
   if (awaitingHuman !== undefined) engagement.awaitingHuman = awaitingHuman;
+  // A fleet ordering gate (bd-158) is a wait on another *member*, not on a person:
+  // only the successful "no human gate" read can name it, and it never becomes
+  // `awaitingHuman: true` (so the member stays out of "Needs you").
+  if (gateLookup?.ok === true && gateLookup.status === "none") {
+    const blocker = gateLookup.orderingBlocker;
+    if (blocker !== undefined) engagement.orderingBlocker = blocker;
+  }
 
   const error = firstError(comments, gate);
   return {

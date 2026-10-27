@@ -25,11 +25,13 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import type { FleetIntent } from "./fleet-status.js";
 import {
+  FLEET_INTENT_ORDERING_GATES_MAX,
   FLEET_SCHEMA_VERSION,
   fleetAuditLogPath,
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
+  fleetIntentWriteRefusal,
   fleetMergeQueueFilePath,
   fleetStateDir,
   parseFleetIntent,
@@ -247,14 +249,21 @@ export function writeFleetIntent(options: WriteFleetIntentOptions): FleetStateWr
  * decided the replace is safe (the compare-and-replace path below, which just
  * compared the on-disk bytes). Never export this: it is the hole
  * {@link writeFleetIntent} exists to close.
+ *
+ * "Unchecked" is about the *replace*, not the *record*: the schema check runs
+ * here because this is the one place every writer reaches, and a record the
+ * reader would refuse must never land (it would brick the fleet intent for good —
+ * see {@link fleetIntentWriteRefusal}).
  */
 function writeFleetIntentUnchecked(options: WriteFleetIntentOptions): FleetStateWriteResult {
   const fs = options.fs ?? nodeFsSeam;
-  return atomicWriteJson(
-    fleetIntentFilePath(options.gitCommonDir, options.fleetId),
-    withDirectoryFleetId(options.intent, options.fleetId),
-    fs,
-  );
+  const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
+  const intent = withDirectoryFleetId(options.intent, options.fleetId);
+  const refusal = fleetIntentWriteRefusal(intent);
+  if (refusal !== undefined) {
+    return { ok: false, error: `refusing to write ${filePath}: ${refusal}` };
+  }
+  return atomicWriteJson(filePath, intent, fs);
 }
 
 /**
@@ -419,12 +428,122 @@ export function pruneLandedFleetMember(
   taskId: string,
   now: number,
 ): FleetIntent {
+  // The ordering-gate records are deliberately left alone here: resolving a gate
+  // needs bd, so the caller resolves first and forgets second (or the run's tick
+  // reaper notices the gate's member is gone). Dropping the record here would
+  // orphan an open gate that nothing could resolve any more (bd-158).
   return {
     ...intent,
     taskIds: intent.taskIds.filter((candidate) => candidate !== taskId),
     deferred: (intent.deferred ?? []).filter((entry) => entry.taskId !== taskId),
     updatedAt: now,
   };
+}
+
+/** One gate the intent refused to record, with the reason a human can act on. */
+export interface RefusedFleetOrderingGate {
+  gate: { blocker: string; blocked: string; gateId: string };
+  error: string;
+}
+
+/**
+ * Outcome of recording adopted gates: the record to write, plus anything refused.
+ *
+ * A refusal is a refusal of *that gate*, never a truncation of the set: the gates
+ * that fit are recorded, and every gate left out is reported with its own reason so
+ * the caller can leave it open in bd and name it for a human. Silently cutting the
+ * array (or writing it over-bound) would either orphan an open gate or brick the
+ * whole intent.
+ */
+export type AddFleetOrderingGatesResult =
+  | { ok: true; intent: FleetIntent }
+  | { ok: false; intent: FleetIntent; refused: readonly RefusedFleetOrderingGate[] };
+
+/**
+ * Record ordering gates the fleet found in bd but had no record of (bd-158).
+ *
+ * Adoption exists for the crash window between `bd gate create` and the intent
+ * write: the gate is live and correctly blocks its dependent, so the fleet's job is
+ * to remember it (the blocker's landing then resolves it), never to resolve it early
+ * by hand. The unit is again the gate id — an edge already recorded is kept as-is,
+ * because two records for one edge would make the resolver resolve one and forget
+ * the other.
+ *
+ * The record bound is enforced **here**, not only at launch: bd's gate count is
+ * bounded by nothing this process controls (a crashed launch can leave arbitrarily
+ * many), so one sweep over a damaged fleet could otherwise append past
+ * {@link FLEET_INTENT_ORDERING_GATES_MAX} and write a record every reader refuses —
+ * the permanent `corrupt-intent` that takes status, launch, tick, and reconcile down
+ * at once. Gates that do not fit are refused individually and stay open in bd; the
+ * caller must report them rather than resolve them (resolving would release a
+ * dependent before its blocker landed).
+ */
+export function addFleetOrderingGates(
+  intent: FleetIntent,
+  gates: readonly { blocker: string; blocked: string; gateId: string }[],
+  now: number,
+): AddFleetOrderingGatesResult {
+  if (gates.length === 0) return { ok: true, intent };
+  const kept = intent.orderingGates ?? [];
+  const edges = new Set(kept.map((gate) => `${gate.blocker}\u0000${gate.blocked}`));
+  const gateIds = new Set(kept.map((gate) => gate.gateId));
+  const candidates = gates.filter((gate) => {
+    const edge = `${gate.blocker}\u0000${gate.blocked}`;
+    if (edges.has(edge) || gateIds.has(gate.gateId)) return false;
+    edges.add(edge);
+    gateIds.add(gate.gateId);
+    return true;
+  });
+  if (candidates.length === 0) return { ok: true, intent };
+
+  const accepted: RefusedFleetOrderingGate["gate"][] = [];
+  const refused: RefusedFleetOrderingGate[] = [];
+  for (const gate of candidates) {
+    if (kept.length + accepted.length >= FLEET_INTENT_ORDERING_GATES_MAX) {
+      refused.push({
+        gate,
+        error:
+          `\`fleet.json\` already records ${FLEET_INTENT_ORDERING_GATES_MAX} ordering gates ` +
+          "(its bound); this gate stays open in bd and is not recorded, so a human must " +
+          "resolve it or prune the fleet",
+      });
+      continue;
+    }
+    accepted.push(gate);
+  }
+  const next: FleetIntent =
+    accepted.length === 0
+      ? intent
+      : { ...intent, orderingGates: [...kept, ...accepted], updatedAt: now };
+  return refused.length === 0 ? { ok: true, intent: next } : { ok: false, intent: next, refused };
+}
+
+/**
+ * Drop the recorded ordering gates with these **gate ids** (bd-158).
+ *
+ * Pure, so it only forgets: the caller resolves the gate in bd first, because an
+ * open gate with no record is an orphan nobody can find again.
+ *
+ * The unit is the gate id, never the member id. A member can be the blocker of
+ * several gates (dependents B and C), and resolving one of them says nothing about
+ * the other: dropping records by member would forget a still-open gate that no
+ * later landing or reap could ever resolve, leaving that dependent blocked in bd
+ * forever.
+ */
+export function dropFleetOrderingGates(
+  intent: FleetIntent,
+  gateIds: readonly string[],
+  now: number,
+): FleetIntent {
+  const gates = intent.orderingGates;
+  if (gates === undefined || gates.length === 0 || gateIds.length === 0) return intent;
+  const dropped = new Set(gateIds);
+  const kept = gates.filter((gate) => !dropped.has(gate.gateId));
+  if (kept.length === gates.length) return intent;
+  const next: FleetIntent = { ...intent, updatedAt: now };
+  if (kept.length === 0) delete next.orderingGates;
+  else next.orderingGates = kept;
+  return next;
 }
 
 /**

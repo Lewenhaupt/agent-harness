@@ -231,6 +231,40 @@ describe("lookupFleetBeadEngagement", () => {
     });
   });
 
+  it("reads a fleet ordering gate as waiting on its blocker, never as a human wait", async () => {
+    // bd-158: the same `gate list` read names the member a bead is ordered behind.
+    // It must not land in `awaitingHuman` (nobody has to answer it) and must not
+    // leave the member in "Needs you".
+    const { runBd } = instrumentedRunner({
+      gates: () => [
+        {
+          id: "bd-950",
+          status: "open",
+          await_type: "human",
+          title: "belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
+          description:
+            "Ad-hoc gate blocking bd-15\n\nReason: belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
+        },
+      ],
+    });
+
+    const result = await lookupFleetBeadEngagement({ taskIds: ["bd-15"], cwd: CWD, runBd });
+
+    expect(result).toEqual({
+      ok: true,
+      entries: [
+        {
+          taskId: "bd-15",
+          engagement: {
+            comments: { state: "read" },
+            awaitingHuman: false,
+            orderingBlocker: "bd-12",
+          },
+        },
+      ],
+    });
+  });
+
   it("breaks equal timestamps by comment id, deterministically", async () => {
     const { runBd } = instrumentedRunner({
       comments: () => [comment("c-1", { text: "first" }), comment("c-2", { text: "second" })],

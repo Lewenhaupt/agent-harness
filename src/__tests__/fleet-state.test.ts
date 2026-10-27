@@ -12,12 +12,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   ackNotes,
+  addFleetOrderingGates,
   appendFleetAuditEntry,
   canAcquireFleetMerge,
   createFleetIntent,
   createFleetMergeLock,
   createFleetMergeQueue,
   drainNotes,
+  dropFleetOrderingGates,
   enqueueNote,
   enqueueNoteFanout,
   FLEET_AUDIT_ACTION_MAX_LENGTH,
@@ -56,7 +58,8 @@ import {
   writeFleetIntent,
   writeFleetMergeQueue,
 } from "../fleet-state.js";
-import { fleetStateDir } from "../fleet-status.js";
+import type { FleetIntent } from "../fleet-status.js";
+import { FLEET_INTENT_ORDERING_GATES_MAX, fleetStateDir } from "../fleet-status.js";
 
 const commonDir = "/repo/.git";
 const fleetId = "fleet-1";
@@ -441,6 +444,132 @@ describe("fleet.json intent", () => {
       { taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" },
     ]);
     expect(pruned.updatedAt).toBe(2_000);
+  });
+
+  it("drops ordering-gate records by gate id, never by member id", () => {
+    // C1: one blocker can order two dependents. Resolving one gate says nothing
+    // about the other, so forgetting records by member would leave the sibling's
+    // still-open bd gate with nothing able to resolve it.
+    const intent: FleetIntent = {
+      ...createFleetIntent({ fleetId, taskIds: ["bd-12", "bd-13", "bd-14"], now: 1_000 }),
+      orderingGates: [
+        { blocker: "bd-12", blocked: "bd-13", gateId: "bd-901" },
+        { blocker: "bd-12", blocked: "bd-14", gateId: "bd-902" },
+      ],
+    };
+
+    const dropped = dropFleetOrderingGates(intent, ["bd-901"], 2_000);
+    expect(dropped.orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-14", gateId: "bd-902" },
+    ]);
+    expect(dropped.updatedAt).toBe(2_000);
+    // The last gate takes the field with it, so an empty list never reaches disk.
+    expect(dropFleetOrderingGates(dropped, ["bd-902"], 3_000).orderingGates).toBeUndefined();
+    // Nothing matched: the intent is returned as-is (no spurious write).
+    expect(dropFleetOrderingGates(intent, ["bd-999"], 4_000)).toBe(intent);
+  });
+
+  it("refuses an adopted gate that would pass the intent's gate bound", () => {
+    // C1: bd's gate count is bounded by nothing this process controls (a crashed
+    // launch can leave arbitrarily many). One sweep must never append past the
+    // bound: the written record would then fail its own reader, and every later
+    // status/launch/tick/reconcile would report `corrupt-intent` forever.
+    const atBound: FleetIntent = {
+      ...createFleetIntent({ fleetId, taskIds: ["bd-12", "bd-13"], now: 1_000 }),
+      orderingGates: Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX }, (_, index) => ({
+        blocker: `bd-${3000 + index}`,
+        blocked: `bd-${4000 + index}`,
+        gateId: `bd-${5000 + index}`,
+      })),
+    };
+
+    const refused = addFleetOrderingGates(
+      atBound,
+      [{ blocker: "bd-12", blocked: "bd-13", gateId: "bd-950" }],
+      2_000,
+    );
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.refused.map((entry) => entry.gate.gateId)).toEqual(["bd-950"]);
+    expect(refused.refused[0]?.error).toContain(
+      `${FLEET_INTENT_ORDERING_GATES_MAX} ordering gates`,
+    );
+    expect(refused.refused[0]?.error).toContain("stays open in bd");
+    // Never truncated: the recorded set is exactly what it was.
+    expect(refused.intent.orderingGates).toEqual(atBound.orderingGates);
+  });
+
+  it("records the gates that fit and refuses only the ones past the bound", () => {
+    const atBoundMinusOne: FleetIntent = {
+      ...createFleetIntent({ fleetId, taskIds: ["bd-12", "bd-13", "bd-14"], now: 1_000 }),
+      orderingGates: Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX - 1 }, (_, index) => ({
+        blocker: `bd-${3000 + index}`,
+        blocked: `bd-${4000 + index}`,
+        gateId: `bd-${5000 + index}`,
+      })),
+    };
+
+    const added = addFleetOrderingGates(
+      atBoundMinusOne,
+      [
+        { blocker: "bd-12", blocked: "bd-13", gateId: "bd-950" },
+        { blocker: "bd-12", blocked: "bd-14", gateId: "bd-951" },
+      ],
+      2_000,
+    );
+    expect(added.ok).toBe(false);
+    if (added.ok) return;
+    // The gate that fits is remembered (its blocker's landing resolves it); the one
+    // that does not is reported and left open in bd.
+    expect(added.intent.orderingGates).toHaveLength(FLEET_INTENT_ORDERING_GATES_MAX);
+    expect(added.intent.orderingGates?.at(-1)).toEqual({
+      blocker: "bd-12",
+      blocked: "bd-13",
+      gateId: "bd-950",
+    });
+    expect(added.refused.map((entry) => entry.gate.gateId)).toEqual(["bd-951"]);
+  });
+
+  it("refuses to write an intent record its own reader would reject", () => {
+    // C1 defence in depth: the write choke point validates against the reader's
+    // schema, so no caller can brick `fleet.json` with a record that only shows up
+    // as `corrupt-intent` afterwards. One over-bound write is enough to lose the
+    // fleet intent permanently.
+    const fs = createFakeFs();
+    const base = createFleetIntent({ fleetId, taskIds: ["bd-12"], now: 1_000 });
+    writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: base, fs });
+    const before = fs.files.get(path);
+    const overBound: FleetIntent = {
+      ...base,
+      orderingGates: Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX + 1 }, (_, index) => ({
+        blocker: `bd-${3000 + index}`,
+        blocked: `bd-${4000 + index}`,
+        gateId: `bd-${5000 + index}`,
+      })),
+    };
+
+    const written = writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: overBound, fs });
+    expect(written).toHaveProperty("ok", false);
+    if (written.ok) return;
+    expect(written.error).toContain("invalid fleet intent");
+    expect(written.error).toContain("orderingGates");
+    expect(fs.files.get(path)).toBe(before);
+
+    const updated = updateFleetIntent({
+      gitCommonDir: commonDir,
+      fleetId,
+      fs,
+      update: () => overBound,
+    });
+    expect(updated).toHaveProperty("reason", "write-failed");
+    if (updated.ok) return;
+    expect(updated.error).toContain("invalid fleet intent");
+    // The record on disk is untouched and still readable.
+    expect(fs.files.get(path)).toBe(before);
+    expect(readFleetIntent({ gitCommonDir: commonDir, fleetId, fs })).toHaveProperty(
+      "intent.taskIds",
+      ["bd-12"],
+    );
   });
 
   it("retires a stopped member's deferral without forgetting the member", () => {

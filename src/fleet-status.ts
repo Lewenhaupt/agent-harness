@@ -63,6 +63,18 @@ export const FLEET_INTENT_MEMBERS_MAX = 256;
  */
 export const FLEET_INTENT_DEFERRED_MAX = 1000;
 
+/**
+ * Upper bound on the intent's recorded fleet-ordering gates (bd-158).
+ *
+ * One gate per dependency edge *between two members*, so the membership cap
+ * bounds those edges far below any real fleet's needs: this is a trust-boundary
+ * guard (the intent is untrusted input to the reader), not a practical limit. A
+ * launch whose merged record set would exceed it is refused (`fleet-launch.ts`
+ * `orderingGateBudgetRefusal`) rather than truncated, because a cut record is an
+ * open gate nothing can resolve any more.
+ */
+export const FLEET_INTENT_ORDERING_GATES_MAX = 256;
+
 /** Members rendered in the one-line intent summary before it is elided. */
 export const FLEET_INTENT_SUMMARY_MAX = 8;
 
@@ -130,6 +142,26 @@ const FleetIntentSchema = z.object({
     .optional(),
   note: z.string().optional(),
   /**
+   * bd gates that order this fleet's members (bd-158).
+   *
+   * Ordering lives here, not in `bd dep list`: each entry says which member blocks
+   * which, and under which gate bead, so a landing can resolve exactly the gates
+   * its merge satisfied and the reaper can find orphans after a supervisor
+   * restart. It belongs to the *intent* rather than to the `run` record because
+   * gates outlive a run: a re-arm, a wave advance, or a second run over the same
+   * fleet must still find (and finish resolving) them.
+   */
+  orderingGates: z
+    .array(
+      z.object({
+        blocker: z.string().min(1).max(128),
+        blocked: z.string().min(1).max(128),
+        gateId: z.string().min(1).max(128),
+      }),
+    )
+    .max(FLEET_INTENT_ORDERING_GATES_MAX)
+    .optional(),
+  /**
    * P5 autonomous-run record.
    *
    * Absent for an explicit, operator-driven fleet; present once a launch asked to
@@ -166,6 +198,27 @@ export type FleetSupervisor = NonNullable<FleetIntent["supervisor"]>;
 export function parseFleetIntent(raw: unknown): FleetIntent | undefined {
   const result = FleetIntentSchema.safeParse(raw);
   return result.success ? result.data : undefined;
+}
+
+/**
+ * Why a value cannot be stored as `fleet.json`, or undefined when it can.
+ *
+ * The reader refuses a record it cannot parse, so an unvalidated write is
+ * unrecoverable: one over-long or over-bound field makes the fleet intent
+ * permanently unreadable for status, launch, tick, and reconcile, with no
+ * self-repair (`writeFleetIntent` refuses to replace a corrupt file). The write
+ * path therefore validates before the bytes land, and this is the schema check it
+ * shares with the reader — one schema, so a writer can never mint a record its own
+ * reader rejects.
+ */
+export function fleetIntentWriteRefusal(raw: unknown): string | undefined {
+  const result = FleetIntentSchema.safeParse(raw);
+  if (result.success) return undefined;
+  const issues = result.error.issues.slice(0, 3).map((issue) => {
+    const path = issue.path.length === 0 ? "(root)" : issue.path.join(".");
+    return `${path}: ${issue.message}`;
+  });
+  return `invalid fleet intent (${issues.join("; ")})`;
 }
 
 // ── Shared fleet state paths ──────────────────────────────────────────
@@ -791,6 +844,14 @@ export interface FleetBeadEngagement {
   comments: FleetBeadCommentRead;
   /** open = a human gate blocks it; none = resolved; undefined = unknown (read failed/malformed). */
   awaitingHuman?: boolean;
+  /**
+   * The fleet member this bead is ordered behind (bd-158 ordering gate).
+   *
+   * Absent means no readable ordering gate. It is deliberately *not* folded into
+   * `awaitingHuman`: an ordering gate waits on another member's landing, so the
+   * view says `waiting on: bd-12` and never puts the member in "Needs you".
+   */
+  orderingBlocker?: string;
 }
 
 /**
@@ -836,13 +897,61 @@ export function parseBeadView(raw: unknown): FleetBead | undefined {
  * beads rather than an exception.
  */
 export function parseBeadViews(raw: unknown): FleetBead[] {
-  const records = Array.isArray(raw) ? raw : [raw];
+  const parsed = parseBeadViewPayload(raw);
+  return parsed.ok ? [...parsed.beads] : [];
+}
+
+/**
+ * A bd bead payload, or bd answering in a shape this version cannot read.
+ *
+ * The distinction matters because "no beads" and "unreadable beads" are opposite
+ * conclusions: a caller that reaps state on "these beads are gone" must never act
+ * on a payload it does not understand. An empty array is a recognized answer; any
+ * object without a bead list is not.
+ */
+export type BeadViewPayload =
+  | { ok: true; beads: readonly FleetBead[] }
+  | { ok: false; reason: "unrecognized-payload" };
+
+/** Keys bd has used (or is documented to use) for a wrapped bead list. */
+const BEAD_LIST_KEYS = ["beads", "issues"] as const;
+
+/**
+ * Parse a bd bead payload, tolerating the documented envelope shapes and
+ * reporting anything else as unrecognized.
+ *
+ * `{issues: [...]}` is the wrapper bd was expected to grow, so it is read rather
+ * than rejected: flattening it to "no beads" is the silent failure that made the
+ * fleet report every member's bead as missing.
+ */
+export function parseBeadViewPayload(raw: unknown): BeadViewPayload {
+  if (Array.isArray(raw)) return { ok: true, beads: beadsFromRecords(raw) };
+  const record = asRecord(raw);
+  if (record === undefined) return { ok: false, reason: "unrecognized-payload" };
+  for (const key of BEAD_LIST_KEYS) {
+    const nested = record[key];
+    if (Array.isArray(nested)) return { ok: true, beads: beadsFromRecords(nested) };
+  }
+  const bead = parseBeadView(record);
+  if (bead !== undefined) return { ok: true, beads: [bead] };
+  return { ok: false, reason: "unrecognized-payload" };
+}
+
+function beadsFromRecords(records: readonly unknown[]): readonly FleetBead[] {
   const beads: FleetBead[] = [];
   for (const record of records) {
     const bead = parseBeadView(record);
     if (bead !== undefined) beads.push(bead);
   }
   return beads;
+}
+
+function asRecord(raw: unknown): Record<string, unknown> | undefined {
+  return isRecord(raw) ? raw : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -1024,6 +1133,29 @@ function formatDeferred(deferred: NonNullable<FleetIntent["deferred"]>): string 
   return `deferred: ${shown.join(", ")}${suffix}`;
 }
 
+/** Rest of the ordering gates beyond the summary, so a wedge is never hidden. */
+const ORDERING_GATES_LINE_MAX = 8;
+
+/**
+ * Recorded ordering gates, one bounded line.
+ *
+ * A record exists only while bd still has the gate open (a resolve drops it), so
+ * this is exactly the list of dependents bd is still blocking on the fleet's
+ * behalf. A landing that merged but could not resolve its gate leaves its record
+ * here on purpose: without this line the only way to see that wedge would be to
+ * read `bd gate list` or the docs.
+ */
+function formatOrderingGates(intent: FleetIntent | undefined): string | undefined {
+  const gates = intent?.orderingGates ?? [];
+  if (gates.length === 0) return undefined;
+  const shown = gates
+    .slice(0, ORDERING_GATES_LINE_MAX)
+    .map((gate) => `${gate.blocker} -> ${gate.blocked} (gate ${gate.gateId})`);
+  const hidden = gates.length - shown.length;
+  const suffix = hidden > 0 ? `, ...and ${hidden} more` : "";
+  return `ordering gates open: ${shown.join(", ")}${suffix} — resolved when the blocker lands`;
+}
+
 /** The park reason for a paused fleet, or undefined when it is not parked. */
 function formatPark(intent: FleetIntent): string | undefined {
   if (intent.park === undefined) return undefined;
@@ -1117,6 +1249,9 @@ function formatOwnershipLines(member: FleetMemberView): string[] {
   // the regression contract is that a view without engagement data is unchanged.
   if (member.engagement !== undefined) {
     lines.push(`  awaiting human: ${awaitingHumanText(member.engagement)}`);
+    if (member.engagement.orderingBlocker !== undefined) {
+      lines.push(`  waiting on: ${member.engagement.orderingBlocker} (fleet ordering gate)`);
+    }
     lines.push(`  newest comment: ${newestCommentText(member.engagement)}`);
   }
   return lines;
@@ -1203,6 +1338,9 @@ export function formatBeadOwnership(input: BeadOwnershipInput): string | undefin
   }
   if (input.engagement !== undefined) {
     lines.push(`- awaiting human: ${awaitingHumanText(input.engagement)}`);
+    if (input.engagement.orderingBlocker !== undefined) {
+      lines.push(`- waiting on: ${input.engagement.orderingBlocker} (fleet ordering gate)`);
+    }
     lines.push(`- newest comment: ${newestCommentText(input.engagement)}`);
   }
   if (input.error !== undefined) {
@@ -1287,6 +1425,7 @@ export function formatFleetStatus(status: FleetStatus): string {
   const park = status.intent === undefined ? undefined : formatPark(status.intent);
   const run = formatFleetRunLine(status.intent?.run);
   const stops = formatFleetRunStops(status.intent?.run);
+  const ordering = formatOrderingGates(status.intent);
   const lines = [
     // Name only the id that actually located the files; a sanitized id keeps
     // traversal input from printing as if it were a real directory.
@@ -1295,6 +1434,7 @@ export function formatFleetStatus(status: FleetStatus): string {
     ...(deferred === undefined ? [] : [`  ${deferred}`]),
     ...(park === undefined ? [] : [`  ${park}`]),
     ...(run === undefined ? [] : [`  ${run}`]),
+    ...(ordering === undefined ? [] : [`  ${ordering}`]),
     ...stops.map((line) => `  ${line}`),
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
