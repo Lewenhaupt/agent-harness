@@ -36,6 +36,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/spawn.ts` | Agent process spawner |
 | `src/spawn-with-fallback.ts` | Quota-aware spawn loop |
 | `src/pi-binary.ts` | pi binary resolution for spawned harness agents |
+| `src/pi-web-navigation.ts` | pi-web session pins over the web server's navigation-preferences API |
 | `src/role-tools.ts` | Per-role tool surfaces |
 | `src/tool-audit.ts` | Tool-surface auditing for the harness |
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
@@ -118,6 +119,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/fleet-sessions.ts` | Member-session liveness for the fleet supervisor (bd-126 P4) |
 | `src/fleet-state.ts` | Shared fleet state — the cross-tree substrate of the fleet supervisor |
 | `src/fleet-status.ts` | Fleet status — read-only aggregation for the multi-bead supervisor (bd-126) |
+| `src/fleet-supervisor-name.ts` | The supervisor session's display name: `Fleet supervisor: <beads> (<status>)` |
 | `src/orchestrator-claim.ts` | One-orchestrator-per-worktree lease (bd-126 P5) |
 
 ### AWS broker (`src/aws-broker/`)

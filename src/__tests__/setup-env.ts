@@ -7,3 +7,14 @@
  * that assert on metrics set their own BELAYD_METRICS_DIR.
  */
 process.env.BELAYD_METRICS = "0";
+
+/**
+ * No test may reach the operator's live pi-web.
+ *
+ * The fleet supervisor pins its own session through the pi-web web server, and a
+ * session's environment carries PI_WEB_PORT — so an inherited value would make
+ * `pnpm test` read and write the real navigation preferences of whoever ran it.
+ * Clearing it here turns pinning into the documented no-op (the same shape as a
+ * plain `pi` CLI run, which has no web server at all).
+ */
+process.env.PI_WEB_PORT = "";
