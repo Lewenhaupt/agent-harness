@@ -411,11 +411,11 @@
         # those paths via a common environment.
         pi-web = pkgs.buildNpmPackage {
           pname = "pi-web";
-          version = "1.202610.6";
+          version = "1.202610.8";
           src = pkgs.fetchFromGitHub {
             owner = "jmfederico";
             repo = "pi-web";
-            # Upstream tag v1.202610.6. Its package-lock.json resolves
+            # Upstream tag v1.202610.8. Its package-lock.json resolves
             # @earendil-works/pi-coding-agent to 1.3.0 (with pi-agent-core/pi-ai
             # at 1.3.0), which satisfies pi-agent-browser-native's declared Pi
             # >= 1.0.0 floor so its defaultActive/namespace/outputSchema
@@ -424,10 +424,10 @@
             # The nested @earendil-works entries that needed integrity values
             # patched in at 1.202610.1 no longer exist, so
             # nix/pi-web-integrity.patch is no longer applied.
-            rev = "5b30d2ede183cfee4fd66ae9d22dab318b066c09";
-            hash = "sha256-WWjsirNju/9phxkeiQZTL/ERZl3ARANqCTCdwKvof/U=";
+            rev = "5ebda4decf14d759f4ee099e0ce03ddd8d64d85c";
+            hash = "sha256-UuULxPfMl6zq5paeJB2lJ2loXe4bldfygXS+nF4izZY=";
           };
-          npmDepsHash = "sha256-3QkqOGTwQgY/byenRG5eXTTdrn6Uq3GSXkTTVp16mFw=";
+          npmDepsHash = "sha256-LISPv0qeHS6aRvBvlUBpBOvAOf5zyWpw0hVRG4+WVBs=";
           npmFlags = [
             "--no-audit"
             "--no-fund"
@@ -440,18 +440,13 @@
           # adds nodejs-slim.python; an explicit python3 keeps it unambiguous.
           nativeBuildInputs = [ pkgs.python3 ];
 
-          # Upstream polls GET /sessions/<id>/transcript-snapshot every 5s for the
-          # selected session. That response is the whole transcript (1.4 MB for a
-          # 270-message session) and carries no ETag/Last-Modified, so every tick
-          # re-transfers and re-parses it even when nothing changed -- continuous
-          # CPU and allocation churn on the tab that is left open all day (bd-123).
-          # 20s cuts that 4x; the session socket, not this poll, carries live
-          # updates. Drop this patch once upstream honours conditional requests.
-          postPatch = ''
-            substituteInPlace src/client/src/components/PiWebApp.ts \
-              --replace-fail "const SELECTED_SESSION_REFRESH_MS = 5_000;" \
-              "const SELECTED_SESSION_REFRESH_MS = 20_000;"
-          '';
+          # No local client patch any more (bd-123). Upstream v1.202610.8 polls
+          # the selected transcript every 30s (SELECTED_SESSION_REFRESH_MS),
+          # which is gentler than the 20s this derivation used to substitute for
+          # upstream's 5s, so the patch is dropped rather than retargeted.
+          # Re-check `src/client/src/components/PiWebApp.ts` before adding an
+          # interval patch again; live updates ride the session socket, so this
+          # poll is only a backstop.
 
           buildPhase = ''
             runHook preBuild
@@ -731,7 +726,7 @@
             src = ./.;
             pnpm = pkgs.pnpm;
             fetcherVersion = 4;
-            hash = "sha256-gxdGqSNzSWzWFFGW9jI7/x/zZit0oi9m3sL85DLDx7k=";
+            hash = "sha256-wMo7l8+4LqYMdxUBGM/AH5/6xRUq4d7naMrCM5HTMt8=";
           };
           dontBuild = true;
           installPhase = ''
