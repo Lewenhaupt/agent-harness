@@ -34,12 +34,18 @@ is reported once per process and never fails the phase.
 | Event | Emitted when | Key fields |
 |---|---|---|
 | `run_start` | a phase run spawns | `task, phase, runId, workflowType, model, session` |
-| `gate_result` | each gate evaluation, including retries | `task, phase, attempt, passed, durationMs, failureKind` |
+| `gate_result` | each gate evaluation, including retries | `task, phase, runId, attempt, passed, durationMs, failureKind` |
 | `run_end` | a run settles and delivers | `runId, status, exitCode, toolCalls, cost, tokens{In,Out,CacheRead}, wallMs` |
 | `phase_advance` | a gate-owned run completes its phase | `task, phase, nextPhase` |
 | `review_findings` | a successful review delivery | `critical, warnings, suggestions` |
 
 Every event also carries `ts` (epoch ms) and `host`.
+
+`run_start` deliberately has no `attempt`: it is emitted when a phase run
+spawns, before any gate runs. The attempt counter belongs to `gate_result`, where
+`attempt = 1` is the first-pass signal and every later row is a retry. `run_end`
+carries `tokensIn`/`tokensOut`/`tokensCacheRead` flat rather than a nested
+`tokens` object, so the queries read them without an unnest.
 
 ## First-pass rate
 
@@ -67,9 +73,10 @@ ORDER BY pct;
 
 ## Status
 
-Phase 1 (this page) is the event log plus the DuckDB binary. Phase 2 adds the
-versioned queries and a `belayd_metrics` tool; phase 3 backfills the existing
-session corpus into the same file. See bd-140.
+All three phases are in place: the event log plus the DuckDB binary (this page),
+the versioned queries and their loader/runner (`metrics/queries/*.sql`,
+`src/metrics-query.ts`) exposed through the `belayd_metrics` tool registered in
+`extensions/index.ts`, and the session-corpus backfill below. See bd-140.
 
 ## Backfill (recorded sessions)
 
@@ -97,6 +104,21 @@ Two rules keep the history honest:
   and do. Getting this wrong made implement read 6.1 runs/task instead of 2.2.
 - Backfilled events carry `"source": "backfill"`, so a query can separate
   reconstructed history from live events (which also have real workflow types).
+
+`first_pass_by_phase` needs live `gate_result` events, and backfill never writes
+them. On a **backfill-only** host that query therefore returns an empty table
+(zero rows) rather than a DuckDB binder error: the query declares its columns, so
+`attempt`/`passed` are NULL where no file supplies them and nothing matches
+`event = 'gate_result'`. Read that as "no live gate results yet" — run a phase
+and its gate, then query again. Cost and run-count queries cover the backfilled
+history immediately.
+
+A failed query is reported in the tool output **and** in the tool result itself: a
+partial report still shows every query that ran and lists the failing ones with
+DuckDB's message, while the result carries `ok: false` (`details.exitCode` 1).
+`belayd_metrics` is a pi tool, not a CLI, so a shell script has no process exit
+code to read — an agent or a driver inspecting the tool result is what detects
+the failure.
 
 ## Test isolation
 

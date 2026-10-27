@@ -694,6 +694,7 @@ export {
 } from "./metrics.js";
 export type {
   MetricsQuery,
+  MetricsQueryFailure,
   MetricsQueryIo,
   MetricsQueryResult,
   MetricsReport,
@@ -701,6 +702,8 @@ export type {
 } from "./metrics-query.js";
 export {
   buildDuckdbArgs,
+  formatMetricsFailures,
+  formatMetricsHeader,
   formatMetricsResults,
   formatMetricsTable,
   loadMetricsQueries,
