@@ -20,6 +20,14 @@
  *
  * Status codes and network-error signatures harvested from
  * @pedro_klein/pi-gateway's detect.ts.
+ *
+ * A quota failure's suggested cooldown is resolved by `resolveQuotaCooldown`: a
+ * provider reset hint ("Resets in 7hr 57min") wins, provider subscription
+ * usage-limit wording without a hint gets the long
+ * `DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS` window, and everything else
+ * falls back to `DEFAULT_QUOTA_COOLDOWN_SECONDS`. The resolver also reports
+ * whether a hint produced the value, which is what tells the cooldown store's
+ * mark path apart from its escalate path.
  */
 
 import type { SpawnDetails } from "./agent-registry.js";
@@ -41,10 +49,37 @@ export interface FailureClassification {
   reason?: string;
   /** Suggested cooldown, when the kind is retryable elsewhere (quota/transient/unavailable). */
   cooldownSeconds?: number;
+  /**
+   * True when `cooldownSeconds` is an authoritative provider-supplied window
+   * (parsed from a "Resets in ..." hint) rather than a harness guess.
+   *
+   * The cooldown store uses this to decide between *replacing* a window and
+   * *escalating* one: only a guess is repeat-escalated, because re-guessing the
+   * same span against a provider that is still exhausted is exactly the
+   * wasted-spawn loop this distinction exists to stop.
+   */
+  cooldownHinted?: boolean;
 }
 
 /** Default cooldown when a quota failure has no parseable reset hint. */
 export const DEFAULT_QUOTA_COOLDOWN_SECONDS = 15 * 60;
+/**
+ * Cooldown for an unhinted *provider* usage-limit failure (e.g. opencode-go's
+ * `GoUsageLimitError`).
+ *
+ * These are weekly/monthly subscription buckets, not per-minute rate limits: a
+ * body that says "Go usage limit exceeded" with no reset hint cannot plausibly
+ * clear in the 15-minute default. Fifteen minutes was actively harmful — the
+ * provider was re-probed every quarter hour, and each premature probe spawned a
+ * real `-fallback-N` session that burned budget rediscovering the same
+ * exhaustion (bd-38 fleet evidence: three members, three wasted sessions).
+ *
+ * Six hours is deliberately conservative: long enough to stop the re-probe
+ * churn within a workflow, short enough that a limit which does reset earlier is
+ * picked up the same working day. Renewed unhinted failures escalate from here,
+ * and any parsed reset hint always wins over this value.
+ */
+export const DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS = 6 * 60 * 60;
 /** Cooldown for transient network/service failures. */
 export const DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 5 * 60;
 /**
@@ -111,6 +146,19 @@ const MODEL_UNAVAILABLE_PATTERN =
  */
 const QUOTA_WORDING_PATTERN =
   /usage limit|quota|insufficient (?:credit|credits|funds|balance|quota)|credit balance|rate limit|too many requests|billing/i;
+
+/**
+ * Wording that identifies a *provider subscription* usage limit rather than a
+ * short-lived rate limit. Observed live from opencode-go:
+ *
+ * - `429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 7hr 57min. ..."}`
+ * - `429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}`
+ *
+ * The second body carries no reset hint, which is why the class needs its own
+ * (long) fallback instead of the generic 15-minute default.
+ */
+const PROVIDER_USAGE_LIMIT_PATTERN =
+  /gousagelimiterror|usage limit (?:exceeded|reached|hit)|"?(?:weekly|monthly|daily) (?:usage )?limit\b/i;
 
 /**
  * Gateway-side rejection wording in 400 bodies that is scoped to one model's
@@ -189,7 +237,7 @@ function classifyProcessFailure(details: SpawnDetails): FailureClassification {
       kind: "quota",
       model,
       reason: "Process exited non-zero on a quota/rate-limit message.",
-      cooldownSeconds: parseQuotaResetSeconds(stderr) ?? DEFAULT_QUOTA_COOLDOWN_SECONDS,
+      ...resolveQuotaCooldown(stderr),
     };
   }
 
@@ -214,7 +262,7 @@ const quotaStatusRule: ClassificationRule = (status, errorMessage) => {
   return {
     kind: "quota",
     reason: `Quota/credit/rate limit (HTTP ${status}).`,
-    cooldownSeconds: parseQuotaResetSeconds(errorMessage) ?? DEFAULT_QUOTA_COOLDOWN_SECONDS,
+    ...resolveQuotaCooldown(errorMessage),
   };
 };
 
@@ -279,7 +327,7 @@ const quotaWordingRule: ClassificationRule = (status, errorMessage) => {
   return {
     kind: "quota",
     reason: "Quota/credit/rate limit reported without a status code.",
-    cooldownSeconds: parseQuotaResetSeconds(errorMessage) ?? DEFAULT_QUOTA_COOLDOWN_SECONDS,
+    ...resolveQuotaCooldown(errorMessage),
   };
 };
 
@@ -346,6 +394,36 @@ export function isFallbackWorthy(kind: FailureKind): boolean {
     case "other":
       return false;
   }
+}
+
+/**
+ * The cooldown a quota failure deserves, plus whether a provider reset hint
+ * produced it — the store needs the second half to decide mark-vs-escalate.
+ */
+export interface QuotaCooldown {
+  cooldownSeconds: number;
+  cooldownHinted: boolean;
+}
+
+/**
+ * The single place that decides a quota failure's cooldown: a parsed provider
+ * reset hint wins, an unhinted provider usage-limit body gets the long provider
+ * window, everything else falls back to the generic default. Pure, so the
+ * three-way rule (and the hinted flag every caller needs) is testable alone.
+ *
+ * Resolved once per classification: the reset-hint regex runs here and nowhere
+ * else, so the three quota paths (status, wording, stderr) cannot drift apart.
+ */
+export function resolveQuotaCooldown(errorMessage?: string): QuotaCooldown {
+  const hinted = parseQuotaResetSeconds(errorMessage);
+  if (hinted !== undefined) return { cooldownSeconds: hinted, cooldownHinted: true };
+  if (errorMessage !== undefined && PROVIDER_USAGE_LIMIT_PATTERN.test(errorMessage)) {
+    return {
+      cooldownSeconds: DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
+      cooldownHinted: false,
+    };
+  }
+  return { cooldownSeconds: DEFAULT_QUOTA_COOLDOWN_SECONDS, cooldownHinted: false };
 }
 
 /** Parse "Resets in 2d 3h 45m"-style hints into total seconds, if present. */

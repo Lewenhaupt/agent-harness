@@ -36,7 +36,7 @@ Run these commands from the repository root. Run each command to completion.
    pnpm test
    ```
 
-   Expected: Vitest exits 0 with **114 test files / 2650 tests passed**. The
+   Expected: Vitest exits 0 with **122 test files / 2975 tests passed**. The
    bd-116 suites alone:
 
    ```bash
@@ -48,8 +48,8 @@ Run these commands from the repository root. Run each command to completion.
      src/__tests__/extension-model-telemetry.test.ts
    ```
 
-   Expected: 6 files / 118 tests passed (30 capacity-cache, 21 model-telemetry,
-   9 model-session-state, 30 spawn-with-fallback, 26 run-manifest, 2
+   Expected: 6 files / 124 tests passed (33 capacity-cache, 21 model-telemetry,
+   9 model-session-state, 33 spawn-with-fallback, 26 run-manifest, 2
    extension-model-telemetry).
 
    > Known flake unrelated to bd-116: `belayd-direnv-setup (unit) > sweeps a
@@ -57,15 +57,55 @@ Run these commands from the repository root. Run each command to completion.
    > intermittently (it shells out to the real `direnv` binary). Re-run the
    > suite before investigating.
 
-2. Integration tests:
+2. The bd-38 suites (unhinted provider window, escalation ladder, cross-process
+   refresh):
+
+   ```bash
+   pnpm vitest run src/__tests__/quota-failure.test.ts \
+     src/__tests__/model-cooldown.test.ts \
+     src/__tests__/capacity-cache.test.ts \
+     src/__tests__/spawn-with-fallback.test.ts
+   ```
+
+   Expected: 4 files / 151 tests passed (50 quota-failure, 35 model-cooldown,
+   33 capacity-cache, 33 spawn-with-fallback). Names to look for — the
+   behaviours those names assert are listed in
+   [Unhinted provider usage limits and cooldown escalation (bd-38)](#unhinted-provider-usage-limits-and-cooldown-escalation-bd-38):
+
+   - `quota-failure.test.ts`: `uses the long provider window for an unhinted
+     GoUsageLimitError body`, `parses the reset hint out of the live
+     GoUsageLimitError body`, `lets a parsed hint win over the long provider
+     window`, `returns the long provider window for unhinted provider
+     usage-limit wording`, `does not read the long window out of a body with no
+     quota wording at all`.
+   - `model-cooldown.test.ts`: `doubles an unhinted provider window that is
+     still cooling`, `clamps the escalated window at the hard ceiling`,
+     `treats a hinted reset as authoritative and clears the ladder`, `keeps one
+     complete mark per key, preferring the longer window on a tie`, `keeps the
+     higher ladder count on a mark-time tie in both directions`, `loads a
+     version-1 file written before escalation existed`, `skips only the
+     malformed entries of a hand-edited file`.
+   - `capacity-cache.test.ts`: `sees a cooldown written by another store instance
+     sharing the same file`, `never throws and yields no windows for a missing
+     or corrupt file`.
+   - `spawn-with-fallback.test.ts`: `cools the provider for hours, so 15 minutes
+     later it is still skipped`, `escalates the provider window on a repeated
+     unhinted 429`, `does not apply the long provider window on a model-scoped
+     failure`.
+
+   Then run the real thing against a scratch cooldown file: see
+   [Manual recipe: the long provider window, its ladder, and cross-process
+   visibility](#manual-recipe-the-long-provider-window-its-ladder-and-cross-process-visibility-bd-38).
+
+3. Integration tests:
 
    ```bash
    pnpm test:integration
    ```
 
-   Expected: 11 files / 90 tests passed.
+   Expected: 13 files / 98 tests passed.
 
-3. Static checks and build:
+4. Static checks and build:
 
    ```bash
    pnpm typecheck && pnpm lint && pnpm build
@@ -238,6 +278,237 @@ so the variable must be set before `pi` starts.
    [belayd-harness] BELAYD_CAPACITY_PROBE_URL produced no capacity signal (request failed (...)); falling back to the cooldown store.
    ```
 
+### Manual recipe: the long provider window, its ladder, and cross-process visibility (bd-38)
+
+This drives the real classifier and the real cooldown store — not a stub — over a
+scratch cooldown file, so the persisted state can be read back with `jq`. It is
+the fastest way to see the three bd-38 behaviours by hand; the spawn-level skip
+is covered by `spawn-with-fallback.test.ts` (see above), because reproducing a
+live opencode-go exhaustion is not something a recipe can schedule.
+
+1. Build the library output the script imports (the extension itself runs from
+   `src/`, but a throwaway `node` script needs `dist/`):
+
+   ```bash
+   pnpm build
+   ```
+
+2. Write the scratch script at the repository root (delete it afterwards; it is
+   not tracked and would otherwise reach `pnpm lint`):
+
+   ```bash
+   cat > bd38-check.mjs <<'EOF'
+   // Scratch verification script for bd-38 — run from the repo root after `pnpm build`.
+   import { readFileSync } from "node:fs";
+   import { setTimeout as sleep } from "node:timers/promises";
+   import { classifySpawnFailure } from "./dist/src/quota-failure.js";
+   import { createModelCooldownStore, defaultModelCooldownPath } from "./dist/src/model-cooldown.js";
+   import { probeFromCooldownStore } from "./dist/src/capacity-cache.js";
+
+   const UNHINTED = '429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}';
+   const HINTED =
+     '429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 20min."}';
+
+   const detailsOf = (errorMessage) => ({
+     messages: [
+       {
+         role: "assistant",
+         content: [],
+         model: "opencode-go/mimo-v2.6-flash",
+         stopReason: "error",
+         errorMessage,
+       },
+     ],
+     usage: {},
+     exitCode: 0,
+   });
+
+   // Mirrors recordCooldown() in src/spawn-with-fallback.ts.
+   const applyFailure = async (store, body) => {
+     const classification = classifySpawnFailure(detailsOf(body));
+     await sleep(5); // keep mark timestamps distinct, as they are in a real workflow
+     if (classification.kind === "quota") {
+       store.markProviderCooldown(
+         "opencode-go",
+         classification.cooldownSeconds,
+         classification.reason,
+         { hinted: classification.cooldownHinted === true },
+       );
+     }
+     return classification;
+   };
+
+   const hoursOut = (entry) => ((entry.until - Date.now()) / 3_600_000).toFixed(2);
+   const show = (label, store) => {
+     const entry = store.providerEntries().get("opencode-go");
+     console.log(`${label}: until ~${hoursOut(entry)}h out, escalations=${entry.escalations ?? 0}`);
+   };
+
+   const file = defaultModelCooldownPath();
+   const store = createModelCooldownStore({ filePath: file });
+   const otherMember = createModelCooldownStore({ filePath: file });
+   console.log("cooldown file:", file);
+
+   for (const attempt of [1, 2, 3, 4]) {
+     const { cooldownSeconds } = await applyFailure(store, UNHINTED);
+     show(`unhinted #${attempt} (${cooldownSeconds}s requested)`, store);
+   }
+
+   console.log("\nfile after four unhinted failures:");
+   console.log(readFileSync(file, "utf8"));
+
+   console.log("hinted failure (20 min, authoritative):");
+   const hinted = await applyFailure(store, HINTED);
+   console.log(`cooldownHinted=${hinted.cooldownHinted}`);
+   show("hinted", store);
+   console.log("escalation ladder in the file:", JSON.parse(readFileSync(file, "utf8")).escalations);
+
+   console.log("\nsecond store over the same file, before its probe:", otherMember.providerEntries().size);
+   const { windows } = await probeFromCooldownStore(otherMember)();
+   console.log("probe windows:", windows);
+   EOF
+   ```
+
+3. Run it against a scratch file, so the real
+   `~/.pi/agent/model-cooldowns.json` is untouched (`defaultModelCooldownPath()`
+   honours `BELAYD_MODEL_COOLDOWN_FILE`):
+
+   ```bash
+   rm -f /tmp/bd38-cooldowns.json
+   BELAYD_MODEL_COOLDOWN_FILE=/tmp/bd38-cooldowns.json node bd38-check.mjs
+   ```
+
+   Expected output — 6 h, then doubling, then clamped at 24 h:
+
+   ```text
+   cooldown file: /tmp/bd38-cooldowns.json
+   unhinted #1 (21600s requested): until ~6.00h out, escalations=1
+   unhinted #2 (21600s requested): until ~12.00h out, escalations=2
+   unhinted #3 (21600s requested): until ~24.00h out, escalations=3
+   unhinted #4 (21600s requested): until ~24.00h out, escalations=4
+   ```
+
+   Then the hinted mark, which overrides the escalated window and clears the
+   ladder (the ladder record survives with `count: 0`, which is how "cleared at
+   this time" is recorded):
+
+   ```text
+   hinted failure (20 min, authoritative):
+   cooldownHinted=true
+   hinted: until ~0.33h out, escalations=0
+   escalation ladder in the file: { 'opencode-go': { count: 0, lastMarkedAt: ... } }
+   ```
+
+   And the fleet case — a store created *before* the mark saw nothing until its
+   probe refreshed the file:
+
+   ```text
+   second store over the same file, before its probe: 0
+   probe windows: [ { provider: 'opencode-go', resetAt: ..., reason: 'Quota/credit/rate limit (HTTP 429).' } ]
+   ```
+
+4. **The persisted file.** After four unhinted failures it looks like this —
+   this is the whole `model-cooldowns.json` shape (default path
+   `~/.pi/agent/model-cooldowns.json`, override with
+   `BELAYD_MODEL_COOLDOWN_FILE`):
+
+   ```jsonc
+   {
+     "version": 1,
+     "providers": {
+       "opencode-go": {
+         "until": 1793192324182,      // epoch ms; the window end
+         "reason": "Quota/credit/rate limit (HTTP 429).",  // display only, never branch on it
+         "escalations": 4,           // optional: absent on hinted and model-scoped windows
+         "lastMarkedAt": 1793105924182 // optional: when this window was marked
+       }
+     },
+     "models": {},                    // endpoint-scoped windows (transient/unavailable)
+     "escalations": {                 // the ladder, kept across window expiry
+       "opencode-go": { "count": 4, "lastMarkedAt": 1793105924182 }
+     }
+   }
+   ```
+
+   Field notes:
+
+   | Field | Required | Meaning |
+   | --- | --- | --- |
+   | `version` | no | always rewritten as `1`; a file without it loads fine |
+   | `providers` / `models` | no | scope maps; each entry needs `until` + `reason` |
+   | `until` | yes | epoch ms. `<= now` means expired; expired entries are pruned on load, refresh, and persist |
+   | `reason` | yes | free text from the classification (`Quota/credit/rate limit (HTTP 429).`), for humans only |
+   | `escalations` (entry) | no | ladder rung that produced this window; absent for hinted and model-scoped windows |
+   | `lastMarkedAt` (entry) | no | epoch ms of the mark. Merge order uses this, never `until` |
+   | `escalations` (map) | no | per-provider `{ count, lastMarkedAt }`; `count: 0` records a hinted reset. Remembered for `COOLDOWN_ESCALATION_MEMORY_MS` (7 days) after the last mark, then pruned |
+
+   Backward compatibility: a file written by an older build — no `version`, no
+   `escalations`, no `lastMarkedAt` — loads unchanged; the missing stamp only
+   means the merge cannot order it against this process's entry and falls back
+   to the safer window (longer `until`, then higher count). Unknown keys written
+   by another version (or by hand) are carried through a read-modify-write. A
+   malformed single entry is skipped and its healthy siblings load; a corrupt
+   file reads as empty rather than throwing.
+
+5. **Read the live file on a real machine.** The same numbers without the
+   script:
+
+   ```bash
+   jq -r '.providers | to_entries[]
+     | "\(.key)\t\(((.value.until/1000 - now)/3600*10|round)/10)h\t\(.value.reason)"' \
+     ~/.pi/agent/model-cooldowns.json
+   jq -c '.escalations' ~/.pi/agent/model-cooldowns.json
+   ```
+
+   Expected after one unhinted `GoUsageLimitError`: an `opencode-go` row about
+   `6h` out and an `escalations` record with `count: 1` — not a 15-minute
+   window. Two failures an hour apart: about `12h` and `count: 2`.
+
+6. Clean up:
+
+   ```bash
+   rm -f bd38-check.mjs /tmp/bd38-cooldowns.json
+   ```
+
+### What you should see in the logs (the fleet symptom bd-38 fixes)
+
+The observable difference is in the phase result's fallback trail
+(`[belayd model fallback] ...`, emitted only when a spawn made more than one
+attempt entry) and in the sub-agent session names.
+
+**Before** — every re-probe paid for a session, because the 15-minute window
+always expired before the weekly bucket reset:
+
+```text
+[belayd model fallback] opencode-go/mimo-v2.6-flash (quota) → llmgateway/mimo-v2.6-flash (success)
+```
+
+repeated on each phase, roughly every 15 minutes, each repeat minting a
+`belayd-<task>-sub-<phase>-<runId>-fallback-1` session and a fresh
+`429: {"type":"GoUsageLimitError", ...}` line in the transcript.
+
+**After** — one 429, a multi-hour provider window, and then skips that spawn
+nothing:
+
+```text
+[belayd model fallback] opencode-go/mimo-v2.6-flash (provider opencode-go exhausted) → llmgateway/mimo-v2.6-flash (success)
+```
+
+What to check:
+
+- Later phases of the same workflow show `(provider opencode-go exhausted)` (a
+  cooldown-store skip) or `(provider opencode-go capacity-exhausted)` (the
+  pre-dispatch cache) for the first candidate, and **no** `-fallback-N` session
+  is created — verify with `pi --resume | grep 'belayd-<task-id>'`; only
+  base-named sessions should appear.
+- No second `429 ... Go usage limit exceeded` line for the same provider inside
+  the window. A second one means either the window expired (escalation now
+  doubles it) or a body carried a shorter "Resets in ..." hint, which is
+  authoritative by design.
+- `.belayd/telemetry.json` shows `quotaFailures` no longer growing per phase
+  while `fallbacks` stays flat: the failed attempt happened once, later attempts
+  were skips and never entered the counts.
+
 ## How to Use
 
 ### 1. `BELAYD_CAPACITY_PROBE_URL`
@@ -286,7 +557,21 @@ prefix never matches a window (exhaustion is provider-scoped).
 
 **When the variable is unset** the probe reads the persisted cooldown store
 (`probeFromCooldownStore`), so capacity still reflects provider limits learned
-from earlier 429s and survives orchestrator restarts. **When it is set but the
+from earlier 429s and survives orchestrator restarts. The probe re-reads that
+file first (`ModelCooldownStore.refresh`), because every process — including
+each fleet member — owns its own store and loads the file only once at creation;
+without the re-read a cooldown another member just wrote stays invisible until
+the next orchestrator restart. The merge orders per key by *when the window was
+marked* (`lastMarkedAt`), never by how long it is, so the newest observation
+wins in both directions; a `lastMarkedAt` tie keeps the longer window, ladder
+ties keep the higher count, and expired entries are pruned. Entries written
+before that field existed — including entries a fleet member still running an
+older build writes *right now* — carry no stamp, and stamp absence is not
+evidence of age: when only one side of a merge is stamped, the merge falls back
+to the tie ordering (longer `until`, then higher escalation count) instead of
+treating the unstamped window as old. It is a no-op for an in-memory store and
+never throws on a missing, corrupt, or unreadable file.
+**When it is set but the
 endpoint yields nothing** (non-200, malformed JSON, timeout, oversized body,
 zero windows, request failure) the probe falls back to those same cooldown
 windows and emits a warning, throttled to one per 5 minutes:
@@ -326,7 +611,8 @@ refreshes the cached capacity signal (TTL permitting) and then:
 - **Refreshes from observed failures:** a real quota/429 failure observed
   mid-workflow is written back into the cache as a provider window
   (`recordCapacityFromFailure`, using `classification.cooldownSeconds` — parsed
-  from the 429 body when present, else the class default),
+  from the 429 body when present, else the 6-hour provider usage-limit window for
+  provider subscription wording, else the 15-minute class default),
   so the rest of the workflow benefits immediately instead of waiting out the
   TTL. Only provider-scoped quota failures are recorded — a transient failure is
   endpoint-specific and must not reorder that provider's other models.
@@ -401,6 +687,74 @@ Named tests: `src/__tests__/quota-failure.test.ts` →
 `classifies a non-zero exit on an unknown model as unavailable`; and
 `src/__tests__/spawn-with-fallback.test.ts` →
 `falls back on a deactivated model (410) and cools only that endpoint`.
+
+### Unhinted provider usage limits and cooldown escalation (bd-38)
+
+A provider *subscription* limit is not a rate limit, and the difference was
+costing real sessions. opencode-go returned
+
+```text
+429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}
+```
+
+with **no reset hint** (the same error sometimes carries
+`Weekly usage limit reached. Resets in 7hr 57min.`, sometimes not). The
+classifier fell back to the 15-minute default,
+`~/.pi/agent/model-cooldowns.json` got `until = now + 15min`, and a **weekly**
+bucket was re-probed every 15 minutes forever. Three fleet members each spent a
+`-fallback-1` session rediscovering the same exhausted provider.
+
+What changed:
+
+- **Longer window for unhinted provider usage limits.** New
+  `DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS` (6 h) applies when a quota
+  failure matches provider subscription wording (`GoUsageLimitError`,
+  `usage limit exceeded`/`reached`/`hit`, `weekly|monthly|daily usage limit`)
+  **and** no reset hint parsed. A parsed hint always wins
+  (`resolveQuotaCooldown` is the one resolver — hint → long window → 15-minute
+  default — for all three quota paths: status, wording, and stderr, and it
+  reports `cooldownHinted` so no caller has to re-parse the body). `transient`,
+  `unavailable`, and `auth` classifications are untouched.
+- **Escalation on repeated unhinted 429s.** A provider mark that carries no
+  reset hint escalates the previous one: each repeat doubles the window from the
+  requested duration (`COOLDOWN_ESCALATION_FACTOR`, ceiling
+  `MAX_ESCALATED_COOLDOWN_SECONDS` = 24 h), so 6 h → 12 h → 24 h instead of a
+  fresh 6 h every time. The ladder (`escalations` per provider) lives in its own
+  map, survives the window's expiry and an orchestrator restart
+  (`COOLDOWN_ESCALATION_MEMORY_MS` = 7 days), and is persisted as an optional
+  field — an older version-1 file without it loads unchanged. A hinted mark is
+  authoritative: it sets exactly the parsed window (even when that is *shorter*
+  than an earlier escalated guess) and clears the ladder, because ladder merge
+  order follows the mark event time. The mark API takes an options object:
+  `markProviderCooldown(provider, seconds, reason, { hinted, nowMs })`;
+  model-scoped marks never escalate.
+- **Cross-process cooldown visibility.** `probeFromCooldownStore` calls the new
+  `ModelCooldownStore.refresh()` before reading `providerEntries()`, so a
+  cooldown another fleet member persisted is visible on the next capacity probe
+  instead of after an orchestrator restart. `refresh()` and the lock-protected
+  `persist()` apply the *same* ordering rule per key — newest `lastMarkedAt`
+  wins, never the longer `until` — so neither direction can shorten a live
+  escalated window from a stale file (nor lengthen it back from an old guess),
+  and a fresh shorter hint from another writer is respected. A side without a
+  stamp (a pre-mark-time file, or a member on an older build) is not assumed
+  old: the merge then falls back to the safer window. Ties keep the longer
+  window; escalation ladders merge by event time, keeping the higher count on a
+  tie. Missing, corrupt, or unreadable file → no throw; in-memory store →
+  no-op. A disk error never fails a spawn.
+
+Named tests: `src/__tests__/quota-failure.test.ts` →
+`parses the reset hint out of the live GoUsageLimitError body`,
+`uses the long provider window for an unhinted GoUsageLimitError body`,
+`lets a parsed hint win over the long provider window`; `src/__tests__/model-cooldown.test.ts`
+→ `doubles an unhinted provider window that is still cooling`, `clamps the escalated window at the hard ceiling`,
+`treats a hinted reset as authoritative and clears the ladder`,
+`loads a version-1 file written before escalation existed`,
+`keeps one complete mark per key, preferring the longer window on a tie`,
+`keeps the higher ladder count on a mark-time tie in both directions`;
+`src/__tests__/capacity-cache.test.ts` →
+`sees a cooldown written by another store instance sharing the same file`; and
+`src/__tests__/spawn-with-fallback.test.ts` →
+`cools the provider for hours, so 15 minutes later it is still skipped`.
 
 ### 4. Telemetry artifacts: `.belayd/telemetry.json`
 
@@ -610,10 +964,14 @@ All of the following are re-exported from `src/index.ts`:
 ```typescript
 import {
   CAPACITY_PROBE_URL_ENV,
+  COOLDOWN_ESCALATION_FACTOR,
+  COOLDOWN_ESCALATION_MEMORY_MS,
   DEFAULT_CAPACITY_BODY_LIMIT_BYTES,
   DEFAULT_CAPACITY_PROBE_TIMEOUT_MS,
   DEFAULT_CAPACITY_TTL_MS,
+  DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
   MAX_CAPACITY_WINDOWS,
+  MAX_ESCALATED_COOLDOWN_SECONDS,
   createCapacityCache,
   createEndpointCapacityProbe,
   createFallbackCapacityProbe,
@@ -621,10 +979,23 @@ import {
   orderCandidatesByCapacity,
   parseCapacityWindows,
   probeFromCooldownStore,
+  resolveQuotaCooldown,
 } from "belayd-agent-harness";
 
 // Capacity windows are plain data, so parsing and ordering are testable alone.
 const cooldownStore = createModelCooldownStore();
+
+// Cooldown resolution for a 429 body: hint → provider usage-limit window → default.
+// It returns { cooldownSeconds, cooldownHinted } — the flag the mark API needs.
+resolveQuotaCooldown("Weekly usage limit reached. Resets in 7hr 57min.");
+// { cooldownSeconds: 28 620, cooldownHinted: true }
+resolveQuotaCooldown('{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}');
+// { cooldownSeconds: 21 600, cooldownHinted: false } — the long provider window
+
+// A hinted mark is authoritative; an unhinted one escalates (6 h → 12 h → 24 h).
+cooldownStore.markProviderCooldown("opencode-go", 21_600, "GoUsageLimitError");
+cooldownStore.markProviderCooldown("opencode-go", 21_600, "GoUsageLimitError");
+cooldownStore.markProviderCooldown("opencode-go", 28_620, "resets in 7hr 57min", { hinted: true });
 
 const windows = parseCapacityWindows(
   { providers: { "opencode-go": { resetsInSeconds: 3600 } } },
@@ -640,6 +1011,9 @@ const capacity = createCapacityCache({
 });
 
 await capacity.refreshIfStale();               // never rejects
+// The probe itself re-reads the shared cooldown file, so an explicit
+// cooldownStore.refresh() is only needed when reading the store directly.
+cooldownStore.refresh(); // merge other processes' cooldowns; no-op in-memory
 capacity.record({ provider: "opencode-go", resetAt: Date.now() + 3_600_000, reason: "429" });
 capacity.isModelExhausted("opencode-go/mimo-v2.6-flash"); // true
 orderCandidatesByCapacity(["opencode-go/a", "llmgateway/a"], (c) =>

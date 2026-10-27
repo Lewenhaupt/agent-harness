@@ -736,11 +736,18 @@ export {
 export type {
   CooldownEntry,
   CooldownFs,
+  CooldownMarkOptions,
   CooldownScope,
   ModelCooldownStore,
   ModelCooldownStoreOptions,
 } from "./model-cooldown.js";
-export { createModelCooldownStore, defaultModelCooldownPath } from "./model-cooldown.js";
+export {
+  COOLDOWN_ESCALATION_FACTOR,
+  COOLDOWN_ESCALATION_MEMORY_MS,
+  createModelCooldownStore,
+  defaultModelCooldownPath,
+  MAX_ESCALATED_COOLDOWN_SECONDS,
+} from "./model-cooldown.js";
 export type {
   CreateModelSessionStateOptions,
   FlushAndResetModelTelemetryOptions,
@@ -982,14 +989,16 @@ export {
   gateUserGuide,
   userGuideDocPath,
 } from "./quality-gates.js";
-export type { FailureClassification, FailureKind } from "./quota-failure.js";
+export type { FailureClassification, FailureKind, QuotaCooldown } from "./quota-failure.js";
 export {
   classifySpawnFailure,
   DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
+  DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
   DEFAULT_QUOTA_COOLDOWN_SECONDS,
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   isFallbackWorthy,
   parseQuotaResetSeconds,
+  resolveQuotaCooldown,
 } from "./quota-failure.js";
 export type {
   CollectReviewDiffOptions,

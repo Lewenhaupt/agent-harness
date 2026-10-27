@@ -11,7 +11,48 @@ import {
   parseCapacityWindows,
   probeFromCooldownStore,
 } from "../capacity-cache.js";
-import { createModelCooldownStore } from "../model-cooldown.js";
+import { type CooldownFs, createModelCooldownStore } from "../model-cooldown.js";
+
+/** Minimal in-memory fs seam so two stores can share one "file" without disk I/O. */
+function createFakeFs(initial: Record<string, string> = {}): CooldownFs & {
+  files: Map<string, string>;
+} {
+  const files = new Map(Object.entries(initial));
+  const enoent = (path: string): Error => {
+    const error = new Error(`ENOENT: ${path}`) as Error & { code: string };
+    error.code = "ENOENT";
+    return error;
+  };
+  return {
+    files,
+    existsSync: (path) => files.has(path),
+    readFileSync: (path) => {
+      const content = files.get(path);
+      if (content === undefined) throw enoent(path);
+      return content;
+    },
+    writeFileSync: (path, data, options) => {
+      if (options?.flag === "wx" && files.has(path)) {
+        const error = new Error(`EEXIST: ${path}`) as Error & { code: string };
+        error.code = "EEXIST";
+        throw error;
+      }
+      files.set(path, data);
+    },
+    renameSync: (oldPath, newPath) => {
+      const content = files.get(oldPath);
+      if (content === undefined) throw enoent(oldPath);
+      files.delete(oldPath);
+      files.set(newPath, content);
+    },
+    mkdirSync: () => {
+      // No directory hierarchy in the in-memory seam.
+    },
+    unlinkSync: (path) => {
+      files.delete(path);
+    },
+  };
+}
 
 describe("orderCandidatesByCapacity", () => {
   it("moves exhausted candidates behind healthy ones, preserving order", () => {
@@ -117,6 +158,67 @@ describe("probeFromCooldownStore", () => {
     expect(result.windows).toEqual([
       { provider: "opencode-go", resetAt: 1_000 + 3_600_000, reason: "quota" },
     ]);
+  });
+
+  it("sees a cooldown written by another store instance sharing the same file", async () => {
+    // Fleet members each own a store and load the shared file once at creation,
+    // so a cooldown written by a member after this one was created is invisible
+    // without a re-read. That is the cross-process freshness case bd-38 fixes:
+    // three members each re-probed the same exhausted provider.
+    const fs = createFakeFs();
+    const filePath = "/tmp/model-cooldowns.json";
+    const thisProcess = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+
+    expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([]);
+
+    otherMember.markProviderCooldown("opencode-go", 6 * 60 * 60, "GoUsageLimitError");
+
+    expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([
+      {
+        provider: "opencode-go",
+        resetAt: 1_000_000 + 6 * 60 * 60 * 1000,
+        reason: "GoUsageLimitError",
+      },
+    ]);
+  });
+
+  it("never throws and yields no windows for a missing or corrupt file", async () => {
+    // The probe runs on every pre-dispatch refresh, so a hand-edited or
+    // half-written file must degrade to capacity ignorance, never fail a spawn.
+    const filePath = "/tmp/model-cooldowns.json";
+    const missing = createModelCooldownStore({
+      now: () => 1_000_000,
+      filePath,
+      fs: createFakeFs(),
+    });
+    await expect(Promise.resolve(probeFromCooldownStore(missing)())).resolves.toEqual({
+      windows: [],
+    });
+
+    const corrupt = createModelCooldownStore({
+      now: () => 1_000_000,
+      filePath,
+      fs: createFakeFs({ [filePath]: "{ broken" }),
+    });
+    await expect(Promise.resolve(probeFromCooldownStore(corrupt)())).resolves.toEqual({
+      windows: [],
+    });
+  });
+
+  it("keeps the longest window when both stores marked the same provider", async () => {
+    const fs = createFakeFs();
+    const filePath = "/tmp/model-cooldowns.json";
+    const first = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const second = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+
+    first.markProviderCooldown("opencode-go", 60, "quota");
+    second.markProviderCooldown("opencode-go", 7_200, "weekly limit");
+
+    const windows = (await probeFromCooldownStore(first)()).windows;
+    expect(windows).toHaveLength(1);
+    expect(windows[0]).toHaveProperty("resetAt", 1_000_000 + 7_200_000);
+    expect(windows[0]).toHaveProperty("reason", "weekly limit");
   });
 });
 
