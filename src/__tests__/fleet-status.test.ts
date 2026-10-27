@@ -7,18 +7,24 @@
  * shelling out to git.
  */
 
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import {
+  applyFleetBeadEngagement,
   applyFleetBeadLookup,
+  beadNeedsHuman,
   buildFleetStatus,
   DEFAULT_FLEET_ID,
   deriveFleetMemberState,
   FLEET_MEMBER_STATES,
+  type FleetBeadEngagement,
   type FleetIntent,
   type FleetMemberSnapshot,
+  type FleetStatus,
   type FleetStatusFs,
   type FleetWorkflowSnapshot,
   fleetAuditLogPath,
@@ -28,7 +34,11 @@ import {
   fleetIntentFilePath,
   fleetMergeQueueFilePath,
   fleetStateDir,
+  formatBeadOwnership,
   formatFleetStatus,
+  formatNeedsYou,
+  NEEDS_YOU_EXCERPT_MAX_CHARS,
+  NEEDS_YOU_LIST_MAX,
   parseBeadView,
   parseBeadViews,
   parseFleetIntent,
@@ -47,6 +57,16 @@ import {
 } from "../worktree.js";
 
 const PHASES = ["plan", "implement", "review", "test", "commit"];
+
+// Real `bd show --json` payload (bd 1.3.0 dev), so the ownership columns are
+// checked against bd's actual field names/types instead of a hand-written
+// object. Provenance: `bd show bd-26 --json --brief-deps` in this repo, captured
+// verbatim; `--brief-deps` only trims dependency bodies, and every top-level
+// field asserted below is byte-identical to a plain `bd show bd-26 --json`.
+const REAL_SHOW_JSON = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "fixtures", "bd-show-real.json"),
+  "utf8",
+);
 
 function sampleWorkflow(overrides: Partial<WorkflowState> = {}): WorkflowState {
   return {
@@ -1593,5 +1613,612 @@ describe("read-only contract", () => {
 
     expect(result).toEqual({ ok: false, error: "not a git repository" });
     expect(gitCalls).toEqual([]);
+  });
+});
+
+describe("bead ownership and human surfaces (bd-153)", () => {
+  function statusOf(members: readonly FleetMemberSnapshot[]): FleetStatus {
+    return buildFleetStatus({ fleetId: "fleet-1", intent: undefined, members });
+  }
+
+  function member(taskId: string): FleetMemberSnapshot {
+    const branch = `feat/${taskId}`;
+    return sampleMember({
+      worktreePath: `/repo.${taskId}`,
+      branch,
+      workflow: okWorkflow({ taskId, branch }),
+    });
+  }
+
+  function beadRecord(id: string, overrides: Record<string, unknown> = {}) {
+    return { id, title: `Title ${id}`, status: "open", priority: 2, labels: [], ...overrides };
+  }
+
+  function enriched(
+    members: readonly FleetMemberSnapshot[],
+    beads: readonly Record<string, unknown>[],
+    entries: readonly { taskId: string; engagement: FleetBeadEngagement }[],
+  ): FleetStatus {
+    const base = applyFleetBeadLookup(statusOf(members), {
+      ok: true,
+      beads: beads.map((record) => parseBeadView(record)).filter((bead) => bead !== undefined),
+    });
+    return applyFleetBeadEngagement(base, { ok: true, entries });
+  }
+
+  it("parses ownership fields and degrades each one independently", () => {
+    expect(
+      parseBeadView({
+        id: "bd-12",
+        title: "Fix login",
+        status: "open",
+        priority: 1,
+        labels: ["human"],
+        assignee: "belayd:bd-12:implement",
+        owner: "hugo",
+        comment_count: 3,
+        updated_at: "2026-10-27T07:47:29Z",
+      }),
+    ).toEqual({
+      id: "bd-12",
+      title: "Fix login",
+      status: "open",
+      priority: 1,
+      labels: ["human"],
+      assignee: "belayd:bd-12:implement",
+      owner: "hugo",
+      commentCount: 3,
+      updatedAt: "2026-10-27T07:47:29Z",
+    });
+
+    // A renamed or re-typed field costs that column, never the whole record.
+    const renamed = parseBeadView({
+      id: "bd-12",
+      assignee_name: "renamed",
+      owner_id: 7,
+      comments: 3,
+      modified_at: 12345,
+    });
+    expect(renamed).toHaveProperty("id", "bd-12");
+    expect(renamed).toHaveProperty("commentCount", undefined);
+    expect(renamed).toHaveProperty("assignee", undefined);
+    expect(renamed).toHaveProperty("owner", undefined);
+    expect(renamed).toHaveProperty("updatedAt", undefined);
+
+    // A negative count is not a comment thread; it degrades too.
+    expect(parseBeadView({ id: "bd-12", comment_count: -1 })).toHaveProperty(
+      "commentCount",
+      undefined,
+    );
+
+    const bare = parseBeadView({ id: "bd-12" });
+    expect(bare).toHaveProperty("assignee", undefined);
+    expect(bare).toHaveProperty("owner", undefined);
+    expect(bare).toHaveProperty("commentCount", undefined);
+    expect(bare).toHaveProperty("updatedAt", undefined);
+  });
+
+  it("keeps id, title and labels when all four ownership fields are malformed", () => {
+    // Every new field wrong at once (wrong types, not just renames): the record
+    // and the columns bd did report must still render.
+    const raw = {
+      id: "bd-12",
+      title: "Fix login",
+      status: "open",
+      priority: 1,
+      labels: ["human"],
+      assignee: 42,
+      owner: { name: "hugo" },
+      comment_count: "3",
+      updated_at: 1729,
+    };
+    const bead = parseBeadView(raw);
+    expect(bead).toHaveProperty("id", "bd-12");
+    expect(bead).toHaveProperty("title", "Fix login");
+    expect(bead?.labels).toEqual(["human"]);
+    expect(bead).toHaveProperty("assignee", undefined);
+    expect(bead).toHaveProperty("owner", undefined);
+    expect(bead).toHaveProperty("commentCount", undefined);
+    expect(bead).toHaveProperty("updatedAt", undefined);
+
+    const text = formatFleetStatus(enriched([member("bd-12")], [raw], []));
+    expect(text).toContain("  bead: Fix login (open)");
+    expect(text).toContain("  human: yes");
+    // A malformed field degrades to its own "not reported" text, and a
+    // malformed optional field adds no line at all.
+    expect(text).toContain("  owner: (unknown)");
+    expect(text).toContain("  assignee: (unassigned)");
+    expect(text).not.toContain("  comment count:");
+    expect(text).not.toContain("  bead updated:");
+  });
+
+  it("parses a real bd 1.3.0 `bd show --json` payload", () => {
+    const beads = parseBeadViews(JSON.parse(REAL_SHOW_JSON));
+    expect(beads).toHaveLength(1);
+    const bead = beads[0];
+    expect(bead).toHaveProperty("id", "bd-26");
+    expect(bead).toHaveProperty(
+      "title",
+      "Investigate moving proof-of-work artifacts out of the git worktree",
+    );
+    expect(bead).toHaveProperty("status", "open");
+    expect(bead).toHaveProperty("priority", 2);
+    // bd reports a person's display name as `assignee` and their email as
+    // `owner`; both are plain strings, and `comment_count` is a JSON number.
+    expect(bead).toHaveProperty("assignee", "Hugo Lewenhaupt");
+    expect(bead).toHaveProperty("owner", "hugo.lewenhaupt@gmail.com");
+    expect(bead).toHaveProperty("commentCount", 2);
+    expect(bead).toHaveProperty("updatedAt", "2026-08-31T19:53:54Z");
+
+    // bd omits `assignee` entirely for an unassigned bead (recorded from
+    // `bd show bd-159 --json`): that absence must render as (unassigned).
+    const record: Record<string, unknown> = JSON.parse(REAL_SHOW_JSON)[0];
+    const unassigned = Object.fromEntries(
+      Object.entries(record).filter(([key]) => key !== "assignee"),
+    );
+    expect(parseBeadView(unassigned)).toHaveProperty("assignee", undefined);
+
+    // And the whole record still renders through the surface it feeds.
+    const text = formatFleetStatus(enriched([member("bd-26")], [record], []));
+    expect(text).toContain(
+      "  bead: Investigate moving proof-of-work artifacts out of the git worktree (open)",
+    );
+    expect(text).toContain("  owner: hugo.lewenhaupt@gmail.com");
+    expect(text).toContain("  assignee: Hugo Lewenhaupt");
+    expect(text).toContain("  bead updated: 2026-08-31T19:53:54Z");
+    expect(text).toContain("  comment count: 2");
+  });
+
+  it("flags the bd human label", () => {
+    expect(beadNeedsHuman(parseBeadView(beadRecord("bd-12", { labels: ["human"] })))).toBe(true);
+    expect(beadNeedsHuman(parseBeadView(beadRecord("bd-12")))).toBe(false);
+    expect(beadNeedsHuman(undefined)).toBe(false);
+  });
+
+  it("attaches engagement by task id, case-insensitively, and leaves a missing member unknown", () => {
+    const status = statusOf([member("bd-12"), member("bd-15")]);
+
+    const attached = applyFleetBeadEngagement(status, {
+      ok: true,
+      entries: [
+        {
+          taskId: "BD-12",
+          engagement: {
+            comments: {
+              state: "read",
+              newest: { author: "hugo", text: "q", createdAt: "2026-10-27T07:47:29Z" },
+            },
+            awaitingHuman: true,
+          },
+        },
+      ],
+    });
+
+    expect(attached.members[0]?.engagement).toEqual({
+      comments: {
+        state: "read",
+        newest: { author: "hugo", text: "q", createdAt: "2026-10-27T07:47:29Z" },
+      },
+      awaitingHuman: true,
+    });
+    // A missing entry means "unknown", not a fleet-wide warning.
+    expect(attached.members[1]?.engagement).toBe(undefined);
+    expect(attached.warnings).toEqual(status.warnings);
+  });
+
+  it("degrades engagement to exactly one fleet-level warning", () => {
+    const status = statusOf([member("bd-12"), member("bd-15")]);
+
+    const degraded = applyFleetBeadEngagement(status, {
+      ok: false,
+      error: "no beads database found\nsecond line",
+    });
+
+    expect(degraded.members.map((view) => view.engagement)).toEqual([undefined, undefined]);
+    expect(degraded.warnings).toHaveLength(1);
+    expect(degraded.warnings[0]).toHaveProperty("kind", "bead-engagement-unavailable");
+    expect(degraded.warnings[0]?.message).toContain("no beads database found");
+    expect(degraded.warnings[0]?.message).not.toContain("\n");
+    expect(formatFleetStatus(degraded)).toContain("Warnings (1):");
+  });
+
+  it("bounds a runaway engagement read error into one line", () => {
+    const degraded = applyFleetBeadEngagement(statusOf([member("bd-12")]), {
+      ok: false,
+      error: `${"x".repeat(10_000)}\nsecond line`,
+    });
+
+    const message = degraded.warnings[0]?.message ?? "";
+    expect(message.length).toBeLessThan(400);
+    expect(message).toContain("…");
+  });
+
+  it("renders owner, assignee and the human flag under the bead line", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [
+        beadRecord("bd-12", {
+          labels: ["human"],
+          assignee: "belayd:bd-12:implement",
+          owner: "hugo",
+          comment_count: 1,
+          updated_at: "2026-10-27T07:47:29Z",
+        }),
+      ],
+      [],
+    );
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain(
+      [
+        "  bead: Title bd-12 (open)",
+        "  owner: hugo",
+        "  assignee: belayd:bd-12:implement",
+        "  human: yes",
+        "  bead updated: 2026-10-27T07:47:29Z",
+        "  comment count: 1",
+      ].join("\n"),
+    );
+  });
+
+  it("says (unknown) for an unreported owner and (unassigned) for a missing assignee", () => {
+    const status = applyFleetBeadLookup(statusOf([member("bd-12")]), {
+      ok: true,
+      beads: [
+        { id: "bd-12", title: undefined, status: undefined, priority: undefined, labels: [] },
+      ],
+    });
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain("  owner: (unknown)");
+    expect(text).toContain("  assignee: (unassigned)");
+    expect(text).toContain("  human: no");
+    // bd did not report these, so no fabricated timestamp or count is shown.
+    expect(text).not.toContain("  bead updated:");
+    expect(text).not.toContain("  comment count:");
+    // No engagement read ⇒ no engagement lines at all (regression contract).
+    expect(text).not.toContain("awaiting human:");
+    expect(text).not.toContain("newest comment:");
+  });
+
+  it("renders an unread comment column as unknown, never none", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [{ taskId: "bd-12", engagement: { comments: { state: "unknown" } } }],
+    );
+
+    const text = formatFleetStatus(status);
+    expect(text).toContain("  awaiting human: unknown");
+    expect(text).toContain("  newest comment: (unknown)");
+    expect(text).not.toContain("  newest comment: (none)");
+    expect(text).not.toContain("  awaiting human: no");
+  });
+
+  it("renders (none) only when the comment read succeeded and the thread is empty", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [{ taskId: "bd-12", engagement: { comments: { state: "read" } } }],
+    );
+
+    expect(formatFleetStatus(status)).toContain("  newest comment: (none)");
+  });
+
+  it("caps the per-member newest-comment excerpt", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [
+        {
+          taskId: "bd-12",
+          engagement: {
+            comments: {
+              state: "read",
+              newest: {
+                author: "hugo",
+                text: "x".repeat(500),
+                createdAt: "2026-10-27T00:00:00Z",
+              },
+            },
+          },
+        },
+      ],
+    );
+
+    expect(formatFleetStatus(status)).toContain(
+      `  newest comment: hugo 2026-10-27T00:00:00Z: "${"x".repeat(NEEDS_YOU_EXCERPT_MAX_CHARS - 1)}…"`,
+    );
+  });
+
+  it("caps a multi-byte excerpt by code point, not by byte length", () => {
+    // CJK characters are three UTF-8 bytes each but one JS code unit, so a
+    // byte-based cap would cut this to ~40 characters.
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [
+        {
+          taskId: "bd-12",
+          engagement: {
+            comments: {
+              state: "read",
+              newest: {
+                author: "hugo",
+                text: "漢".repeat(400),
+                createdAt: "2026-10-27T00:00:00Z",
+              },
+            },
+          },
+        },
+      ],
+    );
+
+    const line = formatFleetStatus(status)
+      .split("\n")
+      .find((entry) => entry.includes("newest comment:"));
+    const quoted = (line ?? "").slice((line ?? "").indexOf('Z: "') + 4);
+    expect(quoted).toBe(`${"漢".repeat(NEEDS_YOU_EXCERPT_MAX_CHARS - 1)}…"`);
+    // 120 code points of 3-byte characters: the excerpt is bounded by count,
+    // not by the 362-byte input.
+    expect(quoted.length).toBe(NEEDS_YOU_EXCERPT_MAX_CHARS + 1);
+    expect(quoted).not.toContain("\uFFFD");
+  });
+
+  it("renders byte-identically across calls and member orderings, with no relative age", () => {
+    const beads = [
+      beadRecord("bd-19", {
+        labels: ["human"],
+        assignee: "belayd:bd-19:orchestrator",
+        owner: "hugo",
+        comment_count: 2,
+        updated_at: "2026-10-27T07:47:29Z",
+      }),
+      beadRecord("bd-22"),
+    ];
+    const entries: { taskId: string; engagement: FleetBeadEngagement }[] = [
+      {
+        taskId: "bd-19",
+        engagement: {
+          comments: {
+            state: "read",
+            newest: {
+              author: "hugo",
+              text: "should we drop the marker?",
+              createdAt: "2026-10-27T07:47:29Z",
+            },
+          },
+          awaitingHuman: true,
+        },
+      },
+      { taskId: "bd-22", engagement: { comments: { state: "read" }, awaitingHuman: false } },
+    ];
+
+    const first = formatFleetStatus(enriched([member("bd-19"), member("bd-22")], beads, entries));
+    const again = formatFleetStatus(enriched([member("bd-19"), member("bd-22")], beads, entries));
+    const reversed = formatFleetStatus(
+      enriched([member("bd-22"), member("bd-19")], beads, entries),
+    );
+
+    expect(again).toBe(first);
+    expect(reversed).toBe(first);
+    // Every timestamp is printed as bd reported it: nothing reads a clock.
+    expect(first).toContain("bead updated: 2026-10-27T07:47:29Z");
+    expect(first).not.toMatch(
+      /\b\d+\s*(?:s|sec|secs|second|seconds|min|mins|minute|minutes|h|hr|hour|hours|day|days)\s+ago\b/u,
+    );
+  });
+
+  it("formatNeedsYou is undefined when nothing needs a human", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [{ taskId: "bd-12", engagement: { comments: { state: "read" }, awaitingHuman: false } }],
+    );
+
+    expect(formatNeedsYou(status)).toBe(undefined);
+    expect(formatFleetStatus(status)).not.toContain("Needs you");
+  });
+
+  it("names every waiting bead together, with assignee and newest comment", () => {
+    const status = enriched(
+      [member("bd-19"), member("bd-22")],
+      [
+        beadRecord("bd-19", { labels: ["human"], assignee: "belayd:bd-19:orchestrator" }),
+        beadRecord("bd-22", { labels: ["human"] }),
+      ],
+      [
+        {
+          taskId: "bd-19",
+          engagement: {
+            comments: {
+              state: "read",
+              newest: {
+                author: "hugo",
+                text: "should we drop the marker?",
+                createdAt: "2026-10-27T07:47:29Z",
+              },
+            },
+            awaitingHuman: true,
+          },
+        },
+        {
+          taskId: "bd-22",
+          engagement: { comments: { state: "read" }, awaitingHuman: false },
+        },
+      ],
+    );
+
+    expect(formatNeedsYou(status)).toBe(
+      [
+        "Needs you (2): bd-19, bd-22",
+        '  - bd-19 (assignee belayd:bd-19:orchestrator, awaiting human) — hugo 2026-10-27T07:47:29Z: "should we drop the marker?"',
+        "  - bd-22 (assignee (unassigned)) — (no comments yet)",
+      ].join("\n"),
+    );
+
+    const text = formatFleetStatus(status);
+    const header = text.indexOf("Needs you (2)");
+    expect(header).toBeGreaterThan(text.indexOf("  states:"));
+    expect(header).toBeLessThan(text.indexOf("Member bd-19"));
+  });
+
+  it("includes a bead with an open human gate even without the human label", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [beadRecord("bd-12")],
+      [{ taskId: "bd-12", engagement: { comments: { state: "unknown" }, awaitingHuman: true } }],
+    );
+
+    expect(formatNeedsYou(status)).toContain("Needs you (1): bd-12");
+    expect(formatNeedsYou(status)).toContain("(assignee (unassigned), awaiting human)");
+    // The comment read is unread, not empty: never "(no comments yet)".
+    expect(formatNeedsYou(status)).toContain("(comments unknown)");
+  });
+
+  it("says (unknown) for the assignee when the bead record failed to read", () => {
+    const status = enriched(
+      [member("bd-12")],
+      [],
+      [{ taskId: "bd-12", engagement: { comments: { state: "read" }, awaitingHuman: true } }],
+    );
+
+    const block = formatNeedsYou(status) ?? "";
+    expect(block).toContain("(assignee (unknown), awaiting human)");
+    expect(block).not.toContain("(unassigned)");
+  });
+
+  it("caps the needs-you list and names the remainder", () => {
+    const total = NEEDS_YOU_LIST_MAX + 3;
+    const members = Array.from({ length: total }, (_, index) => member(`bd-${100 + index}`));
+    const status = enriched(
+      members,
+      members.map((_, index) => beadRecord(`bd-${100 + index}`, { labels: ["human"] })),
+      [],
+    );
+
+    const block = formatNeedsYou(status) ?? "";
+    const lines = block.split("\n");
+    expect(lines[0]).toBe(
+      `Needs you (${total}): ${members
+        .map((_, index) => `bd-${100 + index}`)
+        .slice(0, NEEDS_YOU_LIST_MAX)
+        .join(", ")}`,
+    );
+    expect(lines.at(-1)).toBe("  …and 3 more");
+    expect(lines).toHaveLength(1 + NEEDS_YOU_LIST_MAX + 1);
+  });
+
+  it("orders the listed beads by task id", () => {
+    const status = enriched(
+      [member("bd-22"), member("bd-19")],
+      [beadRecord("bd-19", { labels: ["human"] }), beadRecord("bd-22", { labels: ["human"] })],
+      [],
+    );
+
+    expect(formatNeedsYou(status)?.split("\n")[0]).toBe("Needs you (2): bd-19, bd-22");
+  });
+});
+
+describe("formatBeadOwnership (belayd_status section)", () => {
+  const bead = {
+    id: "bd-19",
+    title: "Ownership surfaces",
+    status: "open",
+    priority: 2,
+    labels: ["human"],
+    assignee: "belayd:bd-19:orchestrator",
+    owner: "hugo",
+  };
+
+  it("renders the bead columns and the needs-you line", () => {
+    expect(
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        bead,
+        engagement: {
+          comments: {
+            state: "read",
+            newest: {
+              author: "hugo",
+              text: "should we drop the marker?",
+              createdAt: "2026-10-27T07:47:29Z",
+            },
+          },
+          awaitingHuman: true,
+        },
+      }),
+    ).toBe(
+      [
+        "**Bead bd-19**",
+        "- title: Ownership surfaces",
+        "- status: open",
+        "- owner: hugo",
+        "- assignee: belayd:bd-19:orchestrator",
+        "- human: yes",
+        "- awaiting human: yes",
+        '- newest comment: hugo 2026-10-27T07:47:29Z: "should we drop the marker?"',
+        "**Needs you** — bd-19 is waiting on a human.",
+      ].join("\n"),
+    );
+  });
+
+  it("prints nothing without a task id or without any bead data", () => {
+    expect(formatBeadOwnership({ cwdTaskId: "" })).toBe(undefined);
+    expect(formatBeadOwnership({ cwdTaskId: "bd-19" })).toBe(undefined);
+  });
+
+  it("renders unknown for an unrecognized gate and never says no", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        engagement: { comments: { state: "unknown" } },
+      }) ?? "";
+    expect(section).toContain("- awaiting human: unknown");
+    expect(section).toContain("- newest comment: (unknown)");
+    expect(section).not.toContain("- awaiting human: no");
+    // "needs you" must not fire on an unknown gate.
+    expect(section).not.toContain("**Needs you**");
+  });
+
+  it("renders (none) and no for an empty thread and a resolved gate", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        bead,
+        engagement: { comments: { state: "read" }, awaitingHuman: false },
+      }) ?? "";
+
+    // The two non-unknown outcomes, on the belayd_status surface: a successful
+    // empty read says (none), a `none` gate says no (and it is the only `no`).
+    expect(section).toContain("- awaiting human: no");
+    expect(section).toContain("- newest comment: (none)");
+    expect(section).not.toContain("(unknown)");
+    // The `human` label still names the bead even though the gate is resolved.
+    expect(section).toContain("**Needs you** — bd-19 is waiting on a human.");
+  });
+
+  it("keeps the bead columns when only the engagement read failed", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        bead,
+        error: "gate list failed",
+      }) ?? "";
+
+    expect(section).toContain("- title: Ownership surfaces");
+    expect(section).toContain("- owner: hugo");
+    expect(section).toContain("- assignee: belayd:bd-19:orchestrator");
+    expect(section).toContain("bead engagement unavailable (bd read failed): gate list failed");
+  });
+
+  it("degrades a read failure to one bounded line", () => {
+    const section = formatBeadOwnership({
+      cwdTaskId: "bd-19",
+      error: `${"x".repeat(10_000)}\nsecond line`,
+    });
+    expect(section?.startsWith("bead detail unavailable (bd read failed): ")).toBe(true);
+    expect(section).not.toContain("\n");
+    expect((section ?? "").length).toBeLessThan(400);
   });
 });

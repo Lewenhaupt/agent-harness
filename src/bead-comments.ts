@@ -121,13 +121,35 @@ export function buildBeadCommentsArgv(beadId: string): readonly string[] {
  * that lack the fields the answer channel needs are dropped rather than fatal:
  * one malformed comment must not hide the human's answer, and this never throws
  * because it runs inside a poll that may not surface an exception.
+ *
+ * Callers that only need the usable comments (the answer poll) use this; display
+ * paths that must tell "empty thread" from "bd returned records we could not
+ * parse" use {@link parseBeadCommentsWithDropped}.
  */
 export function parseBeadComments(raw: unknown): BeadComment[] {
+  return parseBeadCommentsWithDropped(raw).comments;
+}
+
+interface ParsedBeadComments {
+  comments: BeadComment[];
+  /** Records bd returned that lacked a usable `id`/`text` (schema drift, not an empty thread). */
+  dropped: number;
+}
+
+/** Parse plus the dropped-record count, so a view can fail closed on schema drift. */
+export function parseBeadCommentsWithDropped(raw: unknown): ParsedBeadComments {
   const records = normalizeRecords(raw);
   const comments: BeadComment[] = [];
+  let dropped = 0;
   for (const record of records) {
-    if (typeof record.id !== "string" || record.id === "") continue;
-    if (typeof record.text !== "string") continue;
+    if (typeof record.id !== "string" || record.id === "") {
+      dropped += 1;
+      continue;
+    }
+    if (typeof record.text !== "string") {
+      dropped += 1;
+      continue;
+    }
     comments.push({
       id: record.id,
       issueId: typeof record.issue_id === "string" ? record.issue_id : "",
@@ -138,7 +160,7 @@ export function parseBeadComments(raw: unknown): BeadComment[] {
       text: record.text,
     });
   }
-  return comments;
+  return { comments, dropped };
 }
 
 /** Array-or-single-object tolerance for untrusted bd JSON. */
@@ -173,18 +195,33 @@ export function isHumanComment(comment: Pick<BeadComment, "author"> | string): b
  * into a prompt, so it is flattened (a fenced block or a multi-paragraph answer
  * would wreck the injected message) and truncated. The cap includes the
  * ellipsis, so the result never exceeds `maxChars`.
+ *
+ * The cap counts code points, not UTF-16 code units: `maxChars` is a display and
+ * prompt budget expressed in characters, and a code-unit slice can cut a
+ * surrogate pair in half. bd-153 renders arbitrary bd comment text into a status
+ * line, where a lone surrogate prints as `\ud83d` mojibake.
  */
 export function excerptComment(text: string, maxChars: number = COMMENT_EXCERPT_MAX_CHARS): string {
   const collapsed = text.replace(/\s+/gu, " ").trim();
   const cap = Math.max(1, maxChars);
-  if (collapsed.length <= cap) return collapsed;
+  const characters = Array.from(collapsed);
+  if (characters.length <= cap) return collapsed;
   if (cap === 1) return ELLIPSIS;
-  return `${collapsed.slice(0, cap - 1).trimEnd()}${ELLIPSIS}`;
+  const head = characters
+    .slice(0, cap - 1)
+    .join("")
+    .trimEnd();
+  return `${head}${ELLIPSIS}`;
 }
 
 /** Outcome of one comment read. */
 export type BeadCommentLookup =
-  | { ok: true; comments: BeadComment[] }
+  | {
+      ok: true;
+      comments: BeadComment[];
+      /** Records bd returned that the parser could not use; `0` with no comments means an empty thread. */
+      dropped: number;
+    }
   | { ok: false; error: string };
 
 export interface LookupBeadCommentsOptions {
@@ -221,7 +258,12 @@ export async function lookupBeadComments(
       timeoutInMs: BEAD_READ_TIMEOUT_MS,
       maxBufferInBytes: BEAD_READ_MAX_BUFFER_BYTES,
     });
-    return { ok: true, comments: parseBeadComments(JSON.parse(stdout)) };
+    const parsed = parseBeadCommentsWithDropped(JSON.parse(stdout));
+    return {
+      ok: true,
+      comments: parsed.comments,
+      dropped: parsed.dropped,
+    };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

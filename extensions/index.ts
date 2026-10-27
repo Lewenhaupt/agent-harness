@@ -52,6 +52,7 @@ import type {
   BeadsAssigneeResult,
   BelaydCommandArgs,
   FleetBeadLookup,
+  FleetEngagementLookup,
   FleetEventBatch,
   FleetIntent,
   FleetMemberClaim,
@@ -104,6 +105,7 @@ import {
   adoptOrchestratorClaim,
   appendFleetAuditEntry,
   appendMetricsEvent,
+  applyFleetBeadEngagement,
   applyFleetBeadLookup,
   assertOwnedWorktree,
   assignOrchestratorClaimSession,
@@ -161,6 +163,7 @@ import {
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
   formatArtifactIndex,
+  formatBeadOwnership,
   formatDoctorReport,
   formatFleetInbox,
   formatFleetMergeQueue,
@@ -200,6 +203,7 @@ import {
   listRuns,
   loadMetricsQueries,
   lookupBeadComments,
+  lookupFleetBeadEngagement,
   lookupFleetBeads,
   lookupFleetDependencies,
   lookupOpenHumanGate,
@@ -5888,12 +5892,22 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   pi.registerTool({
     name: "belayd_status",
     label: "Belayd Status",
-    description: "Show Belayd process state, active background runs, and run history.",
+    description:
+      "Show Belayd process state, active background runs, run history, and — when a task id " +
+      "is recorded — that bead's owner, assignee, human flag, update time, comment " +
+      "count, human-gate wait and newest comment. Reads only: no writes, no phase runs.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const state = getSessionState(ctx);
       const cwd = (ctx as { cwd?: string }).cwd ?? process.cwd();
       const sections: string[] = [formatWorkflowStatusSection(state)];
+
+      // Ownership/human columns for the bead this session drives (bd-153).
+      // Read-only and best-effort: bd may be absent, and a gated session must
+      // still be able to ask "what am I blocked on", so a failure renders one
+      // bounded line instead of failing the tool.
+      const ownership = await readBeadOwnership(state.currentTaskId, cwd);
+      if (ownership !== undefined) sections.push(ownership);
 
       // Leftovers from the caller's own directory are reported instead of lost
       // when a handed-off session resumes (bd-120).
@@ -6527,17 +6541,94 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     });
   }
 
+  // Ownership/human columns (bd-153). Same task ids as the bead read, but two
+  // extra best-effort read-only `bd` calls per bead (`comments --json`,
+  // `gate list --json`). read-only: no bd write is issued on this path. A
+  // per-bead failure degrades only that bead's columns to `unknown`; only when
+  // every bead fails both reads is there one fleet-level warning.
+  async function readFleetEngagement(
+    status: FleetStatus,
+    cwd: string,
+  ): Promise<FleetEngagementLookup> {
+    return lookupFleetBeadEngagement({
+      taskIds: fleetBeadTaskIds(status),
+      cwd,
+      runBd: (argv, options) => runBdCommand(argv, options),
+    });
+  }
+
+  /**
+   * One bead's ownership/human section for `belayd_status` (bd-153).
+   *
+   * Undefined when the session records no task id, so a session without a
+   * workflow prints exactly what it printed before. A bd that is absent or
+   * failing renders one bounded `bead detail unavailable (bd read failed)` line
+   * rather than throwing: `belayd_status` is the status surface a gated session
+   * still has, so a read failure never fails the tool. When only the engagement
+   * read failed, the title/status/owner columns already read from `bd show` are
+   * still printed, so a partial read is not thrown away.
+   */
+  async function readBeadOwnership(taskId: string, cwd: string): Promise<string | undefined> {
+    // Same shape guard as `fleetBeadTaskIds`: a recorded value starting with `-`
+    // would reach bd argv as a flag, so it never reaches bd at all.
+    if (taskId === "" || !isValidTaskId(taskId)) return undefined;
+    // `show` and the comments/gate pair are independent, so they run together:
+    // a hung bd costs one timeout instead of three sequential ones, and the
+    // engagement reader already bounds its own pair.
+    const [beadLookup, engagementLookup] = await Promise.all([
+      findBead(taskId, cwd),
+      lookupFleetBeadEngagement({
+        taskIds: [taskId],
+        cwd,
+        runBd: (argv, options) => runBdCommand(argv, options),
+      }),
+    ]);
+    if (!beadLookup.ok) {
+      return formatBeadOwnership({ cwdTaskId: taskId, error: beadLookup.error });
+    }
+    const lowered = taskId.toLowerCase();
+    const bead = beadLookup.beads.find((candidate) => candidate.id.toLowerCase() === lowered);
+    if (!engagementLookup.ok) {
+      return formatBeadOwnership({
+        cwdTaskId: taskId,
+        ...(bead === undefined ? {} : { bead }),
+        error: engagementLookup.error,
+      });
+    }
+    const engagement = engagementLookup.entries.find(
+      (entry) => entry.taskId.toLowerCase() === lowered,
+    )?.engagement;
+    return formatBeadOwnership({
+      cwdTaskId: taskId,
+      ...(bead === undefined ? {} : { bead }),
+      ...(engagement === undefined ? {} : { engagement }),
+    });
+  }
+
+  function findBead(taskId: string, cwd: string): Promise<FleetBeadLookup> {
+    return lookupFleetBeads({
+      taskIds: [taskId],
+      cwd,
+      runBd: (argv, options) => runBdCommand(argv, options),
+    });
+  }
+
   pi.registerTool({
     name: "belayd_fleet_status",
     label: "Belayd fleet status",
     description:
       "Read-only fleet status: aggregates every git worktree's Belayd workflow into one " +
-      "view (task id, bead title/status, branch, workflow type, completed/pending phases, " +
+      "view (task id, bead title/status, owner, assignee, human flag, bead update time, " +
+      "comment count, human-gate wait, newest comment, branch, workflow type, " +
+      "completed/pending phases, " +
       "latest run per phase with its status, interrupted-run count, last update, derived " +
       "state) and warns about duplicate task ids, workflow task ids that disagree with the " +
-      "branch or directory, and worktrees without workflow state. Reads only: no writes, no " +
-      "merges, no spawns, no phase runs. Bead metadata is one best-effort `bd show --json` " +
-      "read; without bd the view still renders. fleetId selects " +
+      "branch or directory, and worktrees without workflow state. Beads that need a person " +
+      '(the `human` label or an open human gate) are named together in a "Needs you" block. ' +
+      "Reads only: no writes, no merges, no spawns, no phase runs. Bead metadata is one " +
+      "best-effort `bd show --json` read plus `bd comments --json` and `bd gate list --json` " +
+      "per member, all read-only and best-effort (bounded concurrency); without bd the view " +
+      "still renders. fleetId selects " +
       `<git-common-dir>/belayd/fleet/<fleetId>/fleet.json (default: ${DEFAULT_FLEET_ID}); ` +
       "P0 never creates that file.",
     parameters: Type.Object({
@@ -6555,7 +6646,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       const result = readFleetStatus({ cwd, fleetId });
       if (!result.ok) return textToolResult(result.error, 1);
       const lookup = await readFleetBeads(result.value, cwd);
-      return textToolResult(formatFleetStatus(applyFleetBeadLookup(result.value, lookup)), 0);
+      const engagement = await readFleetEngagement(result.value, cwd);
+      const enriched = applyFleetBeadEngagement(
+        applyFleetBeadLookup(result.value, lookup),
+        engagement,
+      );
+      return textToolResult(formatFleetStatus(enriched), 0);
     },
   });
 
