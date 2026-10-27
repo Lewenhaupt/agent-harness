@@ -820,6 +820,9 @@ async function pruneDeadMembers(options: {
       const kept = {
         ...current,
         taskIds: current.taskIds.filter((taskId) => !dead.has(taskId)),
+        ...(current.released === undefined
+          ? {}
+          : { released: current.released.filter((entry) => !dead.has(entry.taskId)) }),
         updatedAt: options.reconcile.now,
       };
       return resolvedGateIds.length === 0
@@ -1228,6 +1231,65 @@ async function reconcileQueueAndPark(options: {
   } finally {
     run.warnings.push(...acquired.release());
   }
+}
+
+/** The fleet a cross-fleet repair names, and the session asking for it. */
+export interface ReconcileAuthorityOptions {
+  /** Fleet the call targets (its own, or one named explicitly). */
+  targetFleetId: string;
+  /** The fleet this session actually supervises, when it holds fleet mode. */
+  ownFleetId?: string;
+  /** Fleet ids whose intent records this session as supervisor. */
+  supervisedFleetIds: readonly string[];
+  /** Every fleet directory found in this repository, for the refusal message. */
+  repoFleetIds: readonly string[];
+  sessionId: string;
+  /** The call asks to remove members (`pruneDeadMembers: true`). */
+  pruneDeadMembers?: boolean;
+}
+
+export type ReconcileAuthority = { ok: true; crossFleet: boolean } | { ok: false; error: string };
+
+/**
+ * Who may reconcile which fleet (bd-166).
+ *
+ * A supervisor may always repair its own fleet. Repairing a *named* fleet — the
+ * leaderless one whose stale slots nobody could clear without a hand edit — is
+ * allowed when this session supervises some fleet in the same repository: same
+ * authority rule as launch, where a session that owns a fleet is the operator's
+ * agent for the rest of that repo. Naming a fleet never grants authority by
+ * itself, and the caller audits the cross-fleet target.
+ */
+export function reconcileAuthority(options: ReconcileAuthorityOptions): ReconcileAuthority {
+  if (options.ownFleetId !== undefined && options.ownFleetId === options.targetFleetId) {
+    return { ok: true, crossFleet: false };
+  }
+  // Cross-fleet authority covers repair (queue, park, liveness report), never
+  // destructive removal: a prune erases another fleet's members from the capacity
+  // arithmetic, and only that fleet's own supervisor (or the explicit per-member
+  // `belayd_fleet_release`) should decide that. Queue/park repair is still the
+  // leaderless-fleet escape hatch this feature exists for.
+  if (options.pruneDeadMembers === true) {
+    return {
+      ok: false,
+      error:
+        `Fleet reconcile refused: pruneDeadMembers is only allowed on this session's own ` +
+        `fleet. \`${options.targetFleetId}\` is owned by its own supervisor: re-arm it ` +
+        `(/fleet <ids> --fleet ${options.targetFleetId}) and run the reconcile (or ` +
+        `belayd_fleet_release) from that session. Cross-fleet reconcile still repairs ` +
+        "the queue and park without pruning.",
+    };
+  }
+  if (options.supervisedFleetIds.length > 0) return { ok: true, crossFleet: true };
+  const known = options.repoFleetIds.length === 0 ? "none" : options.repoFleetIds.join(", ");
+  return {
+    ok: false,
+    error:
+      `Fleet reconcile refused: this session (${options.sessionId}) supervises no fleet in this ` +
+      `repository, so it cannot repair \`${options.targetFleetId}\`. Fleets found here: ${known}. ` +
+      "Launch or re-arm a fleet from this session first (/fleet <ids> --fleet <fleetId>), then " +
+      "reconcile the named fleet.",
+  };
 }
 
 /**

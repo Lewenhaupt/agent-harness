@@ -446,6 +446,22 @@ describe("fleet.json intent", () => {
     expect(pruned.updatedAt).toBe(2_000);
   });
 
+  it("drops a landed member's release entry (bd-166)", () => {
+    const intent: FleetIntent = {
+      ...createFleetIntent({ fleetId, taskIds: ["bd-12", "bd-15"], now: 1_000 }),
+      released: [
+        { taskId: "bd-12", reason: "operator-release", at: 1_100 },
+        { taskId: "bd-15", reason: "run-halted", at: 1_200 },
+      ],
+    };
+
+    const pruned = pruneLandedFleetMember(intent, "bd-12", 2_000);
+    // The member is gone, so a release that skipped its slot describes nothing; the
+    // sibling's release is untouched.
+    expect(pruned.released).toEqual([{ taskId: "bd-15", reason: "run-halted", at: 1_200 }]);
+    expect(pruned.taskIds).toEqual(["bd-15"]);
+  });
+
   it("drops ordering-gate records by gate id, never by member id", () => {
     // C1: one blocker can order two dependents. Resolving one gate says nothing
     // about the other, so forgetting records by member would leave the sibling's

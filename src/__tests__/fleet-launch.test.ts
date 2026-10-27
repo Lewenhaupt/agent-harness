@@ -26,6 +26,7 @@ import {
   validateFleetLaunch,
 } from "../fleet-launch.js";
 import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
+import { classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
 import { fleetDir, formatAuditEntry } from "../fleet-state.js";
 import {
   FLEET_INTENT_DEFERRED_MAX,
@@ -1441,6 +1442,259 @@ describe("countActiveFleetOrchestrators", () => {
     // detached orchestrator may still run, so it counts too; bd-22 is preserved by
     // the target's re-arm.
     expect(active).toBe(3);
+  });
+
+  it("stops counting a member whose orchestrator is provably absent (bd-166)", () => {
+    const active = countActiveFleetOrchestrators({
+      fleets: [
+        {
+          fleetId: "default",
+          members: ["bd-12", "bd-15"],
+          supervisor: { kind: "dead", sessionId: "dead-session" },
+        },
+      ],
+      launchingTaskIds: [],
+      livenessFor: (fleetId, taskId) =>
+        fleetId === "default" && taskId === "bd-12"
+          ? { kind: "live", pids: [42] }
+          : { kind: "absent" },
+    });
+    // bd-15 held a slot before only because it was recorded; its worktree is gone.
+    expect(active).toBe(1);
+  });
+
+  it("keeps counting unknown liveness, so a missing probe never frees a slot", () => {
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [{ fleetId: "default", members: ["bd-12"], supervisor: { kind: "none" } }],
+        launchingTaskIds: [],
+      }),
+    ).toBe(1);
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [{ fleetId: "default", members: ["bd-12"], supervisor: { kind: "none" } }],
+        launchingTaskIds: [],
+        livenessFor: () => ({ kind: "unknown", reason: "scan failed" }),
+      }),
+    ).toBe(1);
+  });
+
+  it("keeps counting a live member whose supervisor is dead (detached orchestrator)", () => {
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [
+          {
+            fleetId: "abandoned",
+            members: ["bd-19"],
+            supervisor: { kind: "dead", sessionId: "s" },
+          },
+        ],
+        launchingTaskIds: [],
+        livenessFor: () => ({ kind: "live", pids: [7] }),
+      }),
+    ).toBe(1);
+  });
+
+  it("skips a released member even when its liveness is unknown", () => {
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [
+          {
+            fleetId: "default",
+            members: ["bd-12", "bd-15"],
+            supervisor: { kind: "none" },
+            released: ["bd-12"],
+          },
+        ],
+        launchingTaskIds: [],
+      }),
+    ).toBe(1);
+  });
+
+  it("applies a release only to the fleet that records it (bd-166)", () => {
+    // Members are disjoint across fleets by convention, not validation: the same id
+    // released in one fleet must still hold the other fleet's slot.
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [
+          {
+            fleetId: "a",
+            members: ["bd-12"],
+            supervisor: { kind: "none" },
+            released: ["bd-12"],
+          },
+          { fleetId: "b", members: ["bd-12"], supervisor: { kind: "none" } },
+        ],
+        launchingTaskIds: [],
+      }),
+    ).toBe(1);
+  });
+});
+
+describe("runFleetLaunch: liveness-aware capacity and releases (bd-166)", () => {
+  const base = {
+    gitCommonDir: commonDir,
+    fleetId,
+    sessionId: "supervisor-session",
+    pid: 4242,
+    armToken: "arm-token",
+    liveness: { isPidAlive: (pid: number) => pid === 4242 },
+    now: 1_700_000_000_000,
+    baseBranch: "main",
+  };
+
+  function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
+    return JSON.parse(
+      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
+    ) as FleetIntent;
+  }
+
+  it("frees an abandoned fleet's slots once its members are absent", async () => {
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, "abandoned", ["bd-30", "bd-31", "bd-32"], {
+      supervisor: { sessionId: "long-gone", pid: 999_999 },
+    });
+    const launched: string[] = [];
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-12"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => {
+        launched.push(taskId);
+        return { taskId, ok: true, detail: "ok" };
+      },
+      // The phantom records were the whole bug: nothing carries these members.
+      memberLivenessFor: () => ({ kind: "absent" }),
+      fs,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(launched).toEqual(["bd-12"]);
+    expect(intentOf(fs).taskIds).toEqual(["bd-12"]);
+  });
+
+  it("does not count a released member of another fleet", async () => {
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, "abandoned", ["bd-30", "bd-31", "bd-32"], {
+      supervisor: { sessionId: "long-gone", pid: 999_999 },
+      released: [{ taskId: "bd-30", reason: "operator-release", at: 1 }],
+    });
+    const launched: string[] = [];
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-12"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => {
+        launched.push(taskId);
+        return { taskId, ok: true, detail: "ok" };
+      },
+      fs,
+    });
+
+    // Two unknown members hold two slots, so one is free for bd-12.
+    expect(result.ok).toBe(true);
+    expect(launched).toEqual(["bd-12"]);
+  });
+
+  it("counts a mid-spawn member in the in-write recount, so the ceiling holds (bd-166)", async () => {
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, "spawning", ["bd-30"], {
+      supervisor: { sessionId: "dead-session", pid: 999_999 },
+    });
+    // Fleet A is between "worktree exists" and "pending spawn lease written": the
+    // shared classifier calls that unknown, which the recount must count.
+    const midSpawn = classifyMemberLivenessInWorktree({
+      taskId: "bd-30",
+      worktreePath: "/repo.feat-bd-30",
+      memberRanEvidence: false,
+      scan: { ok: true, processes: [] },
+    });
+    expect(midSpawn.kind).toBe("unknown");
+    let probes = 0;
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-12"],
+      requestedConcurrency: 1,
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({ taskId, ok: true, detail: "ok" }),
+      // The plan read said absent (one free slot); the recount inside the CAS sees
+      // the mid-spawn member as unknown and refuses instead of overshooting.
+      memberLivenessFor: () => {
+        probes += 1;
+        return probes === 1 ? { kind: "absent" } : midSpawn;
+      },
+      fs,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("count changed while launching");
+    expect(probes).toBeGreaterThanOrEqual(2);
+  });
+
+  it("refuses when the in-write recount finds a slot taken by a now-live member", async () => {
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, "abandoned", ["bd-30"], {
+      supervisor: { sessionId: "long-gone", pid: 999_999 },
+    });
+    let probes = 0;
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-12"],
+      requestedConcurrency: 1,
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({ taskId, ok: true, detail: "ok" }),
+      // The plan read said absent (one free slot), the recount inside the CAS says
+      // live: the same window a concurrent launch fills.
+      memberLivenessFor: () => {
+        probes += 1;
+        return probes === 1 ? { kind: "absent" } : { kind: "live", pids: [42] };
+      },
+      fs,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("count changed while launching");
+    expect(probes).toBeGreaterThanOrEqual(2);
+  });
+
+  it("clears a member's release entry when a launch re-arms it", () => {
+    const current: FleetIntent = {
+      schemaVersion: 1,
+      fleetId,
+      taskIds: ["bd-12", "bd-15"],
+      createdAt: 1_000,
+      updatedAt: 2_000,
+      released: [
+        { taskId: "bd-12", reason: "operator-release", at: 1_500 },
+        { taskId: "bd-15", reason: "run-halted", at: 1_600 },
+      ],
+    };
+
+    const merged = mergeFleetIntent({
+      current,
+      fleetId,
+      taskIds: ["bd-12"],
+      now: 3_000,
+      maxConcurrent: 3,
+      supervisor: { sessionId: "supervisor-session", pid: 4242, armToken: "arm-token" },
+    });
+
+    // The relaunched member holds a slot again; the other release is untouched.
+    expect(merged.released).toEqual([{ taskId: "bd-15", reason: "run-halted", at: 1_600 }]);
+    // A re-arm with no new members keeps every release (nothing was relaunched).
+    const rearm = mergeFleetIntent({
+      current,
+      fleetId,
+      taskIds: [],
+      now: 3_000,
+      maxConcurrent: 3,
+      supervisor: { sessionId: "supervisor-session", pid: 4242, armToken: "arm-token" },
+    });
+    expect(rearm.released).toHaveLength(2);
   });
 });
 

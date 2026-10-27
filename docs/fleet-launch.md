@@ -104,19 +104,32 @@ the graph cannot be read (no bd, timeout, non-JSON), the launch still runs in
   `bd dep remove` first.
 - **Capacity** — the ceiling is 3 concurrent **orchestrators**, and orchestrators
   already running count against it: `slots = 3 - active`. Only wave 0 up to
-  `slots` starts now. `active` counts the recorded members of **every** fleet,
-  whatever its supervisor's liveness: a detached member orchestrator keeps running
-  after the supervisor that launched it dies, so a dead-supervisor fleet is not
-  free capacity. If any fleet's `fleet.json` cannot be read the count is unknown
-  and the whole launch is refused — under-counting is the unsafe direction. The
+  `slots` starts now. `active` counts every recorded member of **every** fleet
+  whose orchestrator liveness is `live` **or** `unknown`, classified from one
+  process-table snapshot plus each member's worktree lease (the probes reconcile
+  already trusts). A member whose liveness is provably `absent` — a bead merged by
+  hand, a member stopped awaiting a human, a workflow that finished and cleared its
+  state file — no longer holds a slot, and a member
+  listed in the intent's `released` holds none by explicit decision (bd-166).
+  "Provably" includes which execution the evidence belongs to: a run manifest counts
+  only when it postdates the worktree's creation instant (and the run's recorded
+  `launchedAt`, when newer), so a re-launched bead that inherited its own earlier
+  manifest from the primary checkout keeps its slot while it spawns.
+  Neither is removed from `taskIds`: status, mail, and a later landing still see
+  them. `unknown` is still counted, because a member of a dead-supervisor fleet may
+  be a detached orchestrator that is still running and a missing probe is not
+  proof; under-counting is the unsafe direction. If any fleet's `fleet.json`
+  cannot be read the count is unknown and the whole launch is refused. The
   count is re-read **inside** the intent's compare-and-replace and the launch is
   refused (nothing recorded, nothing started) if a concurrent launch spent the
   planned slots in the meantime; there is no fleet-wide lock, so two launches from
   *different* fleets at the same instant can still both write from their own
   pre-launch reads — see
   [the capacity accounting note](fleet-orchestrator.md#capacity-accounting).
-  `belayd_fleet_reconcile` with `pruneDeadMembers: true` is how you narrow that count after a
-  crash, using the process table rather than an assumption.
+  Liveness already narrows the count without a prune; `belayd_fleet_release
+  <taskId>` frees one slot by hand (the member stays), and
+  `belayd_fleet_reconcile` with `pruneDeadMembers: true` removes a provably dead
+  member from `taskIds` after a crash.
 - **Deferred** — everything else is deferred, never dropped: ready-but-no-slot
   members are `capacity`, later-wave members are `dependency`, and members
   blocked by a bead outside this fleet are `external-blocker`. Each one is

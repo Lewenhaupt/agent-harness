@@ -23,6 +23,7 @@ import {
   RunStatus,
   readFleetStatus,
   resolveGitCommonDir,
+  writeFleetIntent,
   writeRunManifest,
   writeWorkflowState,
 } from "../src/index.js";
@@ -233,6 +234,39 @@ describe("fleet status (integration, real git)", () => {
     } finally {
       rmSync(newlinePath, { recursive: true, force: true });
     }
+  });
+
+  it("renders the capacity arithmetic without holding a slot for an absent member", () => {
+    const commonDir = resolveGitCommonDir(repo);
+    expect(commonDir).toHaveProperty("ok", true);
+    if (!commonDir.ok) return;
+    // Both members have a real worktree; neither has a live orchestrator, so the
+    // view counts zero slots and says so (bd-166: records no longer hold the
+    // ceiling by themselves).
+    expect(
+      writeFleetIntent({
+        gitCommonDir: commonDir.commonDir,
+        fleetId: DEFAULT_FLEET_ID,
+        intent: {
+          schemaVersion: 1,
+          fleetId: DEFAULT_FLEET_ID,
+          taskIds: ["bd-a", "bd-b"],
+          createdAt: 1_700_000_000_000,
+          updatedAt: 1_700_000_000_000,
+          released: [{ taskId: "bd-b", reason: "operator-release", at: 1_700_000_000_100 }],
+        },
+      }),
+    ).toEqual({ ok: true });
+
+    const result = readFleetStatus({ cwd: repo, fleetId: DEFAULT_FLEET_ID });
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ ceiling: 3, counted: 0, free: 3 });
+    const text = formatFleetStatus(result.value);
+    expect(text).toContain("capacity: ceiling 3, 3 free, 0 counted");
+    expect(text).toContain("default: 2 member(s), 0 counted");
+    expect(text).toContain("1 released");
+    expect(text).toContain("released: bd-b (operator-release)");
   });
 
   it("returns an error value for a directory that is not a git repository", () => {

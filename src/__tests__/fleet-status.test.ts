@@ -12,7 +12,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
+import { FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "../fleet-capacity.js";
+import { countActiveFleetOrchestrators } from "../fleet-launch.js";
+import { FLEET_RUN_STALE_TICK_MS, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
+import { classifyMemberLease, classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
 import {
   applyFleetBeadEngagement,
   applyFleetBeadLookup,
@@ -22,6 +25,7 @@ import {
   deriveFleetMemberState,
   FLEET_MEMBER_STATES,
   type FleetBeadEngagement,
+  type FleetCapacityInput,
   type FleetIntent,
   type FleetMemberSnapshot,
   type FleetStatus,
@@ -45,6 +49,7 @@ import {
   readFleetStatus,
   sanitizeFleetId,
 } from "../fleet-status.js";
+import { ORCHESTRATOR_CLAIM_STALE_MS } from "../orchestrator-claim.js";
 import type { RunManifest } from "../run-manifest.js";
 import { RunStatus, runManifestPath } from "../run-manifest.js";
 import { isValidTaskId } from "../session-naming.js";
@@ -193,13 +198,27 @@ function sampleIntent(overrides: Partial<FleetIntent> = {}): FleetIntent {
 
 interface FakeFs extends FleetStatusFs {
   files: Map<string, string>;
+  /** Directory creation instants for the capacity evidence cutoff (bd-166). */
+  worktrees: Map<string, number>;
 }
 
 /** In-memory fs supporting the reads and the `readdirSync` that listRuns needs. */
-function createFakeFs(initial: Record<string, string> = {}): FakeFs {
+function createFakeFs(
+  initial: Record<string, string> = {},
+  worktreeCreatedAt: Record<string, number> = {},
+): FakeFs {
   const files = new Map(Object.entries(initial));
+  const worktrees = new Map(Object.entries(worktreeCreatedAt));
   return {
     files,
+    worktrees,
+    // A path with no recorded instant fails like a vanished directory: the reader
+    // then has no cutoff, which is the conservative direction (`unknown`, counted).
+    statSync: (path) => {
+      const createdAt = worktrees.get(path);
+      if (createdAt === undefined) throw new Error(`ENOENT: ${path}`);
+      return { birthtimeMs: createdAt, mtimeMs: createdAt };
+    },
     existsSync: (path) => files.has(path),
     readFileSync: (path) => {
       const content = files.get(path);
@@ -286,6 +305,16 @@ describe("parseFleetIntent", () => {
     expect(parseFleetIntent("not json")).toBe(undefined);
     expect(parseFleetIntent({ ...sampleIntent(), schemaVersion: 2 })).toBe(undefined);
     expect(parseFleetIntent({ ...sampleIntent(), taskIds: "bd-12" })).toBe(undefined);
+  });
+
+  it("rejects an unknown release reason, like the deferred reason enum (bd-166)", () => {
+    const released = (reason: string) => ({
+      ...sampleIntent(),
+      released: [{ taskId: "bd-12", reason, at: 1 }],
+    });
+    expect(parseFleetIntent(released("operator-release"))).toHaveProperty("released");
+    // A hand edit (or a future writer) must not mint a label the code cannot read.
+    expect(parseFleetIntent(released("run-completed"))).toBe(undefined);
   });
 });
 
@@ -1450,6 +1479,318 @@ describe("formatFleetStatus", () => {
   });
 });
 
+describe("capacity arithmetic (bd-166)", () => {
+  const NOW = 1_700_000_000_000;
+
+  function capacityInput(overrides: Partial<FleetCapacityInput> = {}): FleetCapacityInput {
+    return {
+      ceiling: 3,
+      fleets: [
+        {
+          fleetId: "default",
+          supervisor: "live",
+          members: [
+            { taskId: "bd-12", liveness: { kind: "live", pids: [42] }, worktreePresent: true },
+            { taskId: "bd-15", liveness: { kind: "absent" }, worktreePresent: true },
+          ],
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  it("counts live and unknown members, skips absent and released ones", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12", "bd-15", "bd-19", "bd-22"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "dead",
+            members: [
+              { taskId: "bd-12", liveness: { kind: "live", pids: [42] }, worktreePresent: true },
+              {
+                taskId: "bd-15",
+                liveness: { kind: "unknown", reason: "scan failed" },
+                worktreePresent: true,
+              },
+              { taskId: "bd-19", liveness: { kind: "absent" }, worktreePresent: true },
+              {
+                taskId: "bd-22",
+                liveness: { kind: "live", pids: [43] },
+                released: true,
+                worktreePresent: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(status.capacity).toMatchObject({ ceiling: 3, counted: 2, free: 1 });
+    expect(status.capacity?.contributors[0]).toMatchObject({
+      fleetId: "default",
+      members: 4,
+      live: 2,
+      unknown: 1,
+      absent: 1,
+      released: 1,
+      counted: 2,
+      supervisor: "dead",
+    });
+  });
+
+  it("renders the ceiling, free slots, and one line per contributing fleet", () => {
+    const text = formatFleetStatus(
+      buildFleetStatus({
+        fleetId: "fleet-1",
+        intent: sampleIntent({ taskIds: ["bd-12"] }),
+        members: [],
+        capacity: capacityInput(),
+      }),
+    );
+
+    expect(text).toContain("capacity: ceiling 3, 2 free, 1 counted");
+    expect(text).toContain(
+      "default: 2 member(s), 1 counted (1 live, 0 unknown, 1 absent), 0 stopped, 0 released; supervisor live",
+    );
+  });
+
+  it("warns about a recorded member whose worktree is gone, unless it is released", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12", "bd-15"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "none",
+            members: [
+              { taskId: "bd-12", liveness: { kind: "absent" }, worktreePresent: false },
+              {
+                taskId: "bd-15",
+                liveness: { kind: "absent" },
+                released: true,
+                worktreePresent: false,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(status.warnings.map((warning) => warning.kind)).toEqual(["stale-member"]);
+    expect(status.warnings[0]).toHaveProperty("taskId", "bd-12");
+  });
+
+  it("warns capacity-held when a fleet without a live supervisor still counts slots", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [],
+      capacity: capacityInput(),
+    });
+    const held = status.warnings.filter((warning) => warning.kind === "capacity-held");
+    // The input's supervisor is live, so nothing is held.
+    expect(held).toEqual([]);
+
+    const dead = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "dead",
+            members: [{ taskId: "bd-12", liveness: { kind: "live", pids: [42] } }],
+          },
+        ],
+      },
+    });
+    expect(dead.warnings.map((warning) => warning.kind)).toEqual(["capacity-held"]);
+    expect(dead.warnings[0]?.message).toContain("counts 1 member(s) against the ceiling of 3");
+  });
+
+  it("warns run-not-ticking for an active run older than the derived bound", () => {
+    const stale = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [{ taskId: "bd-12", liveness: { kind: "live", pids: [42] } }],
+            run: { ticks: 3, updatedAt: NOW - FLEET_RUN_STALE_TICK_MS - 1, active: true },
+          },
+        ],
+      },
+      now: NOW,
+    });
+    expect(stale.warnings.map((warning) => warning.kind)).toEqual(["run-not-ticking"]);
+    expect(stale.warnings[0]?.message).toContain("3 tick(s)");
+
+    const fresh = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({}),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [],
+            run: { ticks: 3, updatedAt: NOW - 1_000, active: true },
+          },
+        ],
+      },
+      now: NOW,
+    });
+    expect(fresh.warnings.map((warning) => warning.kind)).toEqual([]);
+
+    const finished = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({}),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [],
+            run: { ticks: 3, updatedAt: NOW - FLEET_RUN_STALE_TICK_MS - 1, active: false },
+          },
+        ],
+      },
+      now: NOW,
+    });
+    expect(finished.warnings.map((warning) => warning.kind)).toEqual([]);
+
+    // No clock means no freshness verdict: a pure build without `now` never guesses
+    // that a run is stale.
+    const noClock = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({}),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [],
+            run: { ticks: 3, updatedAt: 1, active: true },
+          },
+        ],
+      },
+    });
+    expect(noClock.warnings.map((warning) => warning.kind)).toEqual([]);
+  });
+
+  it("counts a stale pending spawn lease exactly as the launch count does (bd-166)", () => {
+    const stalePending = classifyMemberLease({
+      read: {
+        kind: "ok",
+        claim: {
+          schemaVersion: 1 as const,
+          taskId: "bd-12",
+          branch: "feat/bd-12",
+          sessionId: "pending:spawn-token",
+          pid: 42,
+          claimedAt: 1_000,
+          heartbeatAt: 1_000,
+        },
+      },
+      now: 1_000 + ORCHESTRATOR_CLAIM_STALE_MS + 1,
+    });
+    const liveness = classifyMemberLivenessInWorktree({
+      taskId: "bd-12",
+      worktreePath: "/repo.feat-bd-12",
+      memberRanEvidence: true,
+      scan: { ok: true, processes: [] },
+      lease: stalePending,
+    });
+    // A crashed spawn is unclassifiable, so it is counted — the status header and
+    // the launch ceiling must agree instead of the view showing a free slot.
+    expect(liveness.kind).toBe("unknown");
+
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [{ taskId: "bd-12", liveness, worktreePresent: true }],
+          },
+        ],
+      },
+    });
+    expect(status.capacity).toMatchObject({ ceiling: 3, counted: 1, free: 2 });
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [
+          {
+            fleetId: "default",
+            members: ["bd-12"],
+            supervisor: { kind: "live", sessionId: "supervisor-session" },
+          },
+        ],
+        launchingTaskIds: [],
+        livenessFor: () => liveness,
+      }),
+    ).toBe(1);
+  });
+
+  it("renders only known release reasons, even for a hand-built intent", () => {
+    const raw = {
+      ...sampleIntent(),
+      released: [{ taskId: "bd-12", reason: "run-completed", at: 1 }],
+    };
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: raw as unknown as FleetIntent,
+      members: [],
+    });
+
+    expect(formatFleetStatus(status)).toContain("released: bd-12 (unrecognized)");
+  });
+
+  it("names a recorded member bd reports closed while it is not released", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12", "bd-15"],
+        released: [{ taskId: "bd-15", reason: "operator-release", at: 1 }],
+      }),
+      members: [sampleMember()],
+    });
+    const closed = [
+      { id: "bd-12", status: "closed", title: "a", priority: 1, labels: [] },
+      { id: "bd-15", status: "closed", title: "b", priority: 1, labels: [] },
+    ];
+
+    const enriched = applyFleetBeadLookup(status, { ok: true, beads: closed });
+    const stale = enriched.warnings.filter((warning) => warning.kind === "stale-member");
+    // bd-15 is released, so its closed bead is expected and silent.
+    expect(stale.map((warning) => warning.taskId)).toEqual(["bd-12"]);
+  });
+});
+
 describe("bead metadata (read-only bd enrichment)", () => {
   function statusOf(members: readonly FleetMemberSnapshot[]) {
     return buildFleetStatus({ fleetId: "fleet-1", intent: undefined, members });
@@ -1683,7 +2024,15 @@ describe("readFleetStatus", () => {
     expect(result.value.members).toHaveLength(1);
     expect(result.value.members[0]).toHaveProperty("taskId", "bd-12");
     expect(result.value.members[0]?.latestRuns[0]).toHaveProperty("status", RunStatus.Completed);
-    expect(result.value.warnings).toEqual([]);
+    // bd-15 is recorded but no worktree holds its branch: the capacity view names it
+    // as stale, and a recorded member with no worktree counts as liveness-unknown —
+    // so this supervisor-less fleet also holds a slot (bd-166).
+    expect(result.value.warnings.map((warning) => warning.kind)).toEqual([
+      "stale-member",
+      "capacity-held",
+    ]);
+    expect(result.value.warnings[0]).toHaveProperty("taskId", "bd-15");
+    expect(result.value.capacity?.ceiling).toBe(FLEET_MAX_CONCURRENT_ORCHESTRATORS);
   });
 
   it("reads a fresh worktree's committed manifests without adopting another task's (bd-146)", () => {
@@ -1709,6 +2058,187 @@ describe("readFleetStatus", () => {
     expect(result.value.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["own-plan"]);
     expect(result.value.members[0]).toHaveProperty("interruptedRunCount", 0);
     expect(formatFleetStatus(result.value)).toContain("latest runs: plan=completed");
+  });
+
+  it("frees the slot of a member whose completion cleared the state file (bd-166)", () => {
+    // `clearWorkflowState` deletes `.belayd/workflow.json` when a workflow finishes
+    // and the run manifests stay, so a completed member's worktree looks like a
+    // bare spawn tree except for those manifests. Counting it forever is the leak:
+    // the slot must come back without removing the member from `taskIds`. The
+    // manifest must postdate the worktree (its execution wrote it there).
+    const fs = createFakeFs(
+      {
+        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+          sampleIntent({ taskIds: ["bd-12"] }),
+        ),
+        [runManifestPath("/repo.feat-bd-12", "finished-commit")]: JSON.stringify(
+          sampleRun({ runId: "finished-commit", phase: "commit", startedAt: 1_100 }),
+        ),
+      },
+      { "/repo.feat-bd-12": 1_000 },
+    );
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      // The member's session is gone: no lease and no process, so the run manifest is
+      // the only thing separating completion from a spawn in flight.
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({
+      ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+      counted: 0,
+      free: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+    });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ members: 1, absent: 1 });
+    // The record stays: capacity is the only thing released.
+    expect(result.value.intent?.taskIds).toEqual(["bd-12"]);
+  });
+
+  it("does not count an inherited same-task manifest as this execution's evidence (bd-166)", () => {
+    // `.belayd/` is gitignored and `wt step copy-ignored` copies it into a new
+    // worktree, so a re-launched bd-12 inherits its own earlier manifest from the
+    // primary checkout. It predates the tree that holds it, so it proves nothing
+    // about the spawn that just recorded the member: the member keeps counting.
+    const fs = createFakeFs(
+      {
+        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+          sampleIntent({ taskIds: ["bd-12"] }),
+        ),
+        [runManifestPath("/repo.feat-bd-12", "inherited-commit")]: JSON.stringify(
+          sampleRun({ runId: "inherited-commit", phase: "commit", startedAt: 1_100 }),
+        ),
+      },
+      { "/repo.feat-bd-12": 2_000 },
+    );
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({
+      ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+      counted: 1,
+      free: FLEET_MAX_CONCURRENT_ORCHESTRATORS - 1,
+    });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ members: 1, unknown: 1 });
+  });
+
+  it("counts a same-task manifest it cannot attribute when the worktree cannot be stat'ed (bd-166)", () => {
+    // No creation instant, so no cutoff: a manifest that only names the task is not
+    // evidence of this execution. Never guess in the direction that frees a slot.
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-12"] }),
+      ),
+      [runManifestPath("/repo.feat-bd-12", "unattributed-commit")]: JSON.stringify(
+        sampleRun({ runId: "unattributed-commit", phase: "commit", startedAt: 1_100 }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 1 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ members: 1, unknown: 1 });
+  });
+
+  it("takes the fleet run's launchedAt when it is newer than the worktree (bd-166)", () => {
+    // A fleet that recorded the launch has a second, sharper cutoff: a manifest that
+    // predates `run.members[].launchedAt` belongs to a previous execution even if it
+    // happens to postdate the tree (an in-place run in the same checkout).
+    const fs = createFakeFs(
+      {
+        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+          sampleIntent({
+            taskIds: ["bd-12"],
+            run: startFleetRun({ now: 3_000, accept: false, members: [{ taskId: "bd-12" }] }),
+          }),
+        ),
+        [runManifestPath("/repo.feat-bd-12", "earlier-commit")]: JSON.stringify(
+          sampleRun({ runId: "earlier-commit", phase: "commit", startedAt: 2_000 }),
+        ),
+      },
+      { "/repo.feat-bd-12": 1_000 },
+    );
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 1 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ unknown: 1 });
+  });
+
+  it("keeps counting a bare worktree whose only manifest belongs to another task (bd-166)", () => {
+    // The bd-161 shape: `.belayd/` is copied into a fresh worktree, so another bead's
+    // completed run is present from the first second. Inherited evidence must not free
+    // a slot for an orchestrator that is still being spawned.
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-12"] }),
+      ),
+      [runManifestPath("/repo.feat-bd-12", "bd37-commit")]: JSON.stringify(
+        sampleRun({
+          runId: "bd37-commit",
+          taskId: "bd-37",
+          phase: "commit",
+          sessionName: "belayd-bd-37-sub-commit",
+          startedAt: 1_100,
+        }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({
+      ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+      counted: 1,
+      free: FLEET_MAX_CONCURRENT_ORCHESTRATORS - 1,
+    });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ members: 1, unknown: 1 });
   });
 
   it("reads a member whose worktree path contains a newline", () => {

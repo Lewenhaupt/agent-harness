@@ -224,6 +224,15 @@ export {
   lookupFleetBeads,
   lookupFleetDependencies,
 } from "./fleet-beads.js";
+// Repository-wide orchestrator capacity arithmetic (bd-166)
+export type {
+  FleetCapacityArithmetic,
+  FleetCapacityContributor,
+  FleetCapacityFleet,
+  FleetCapacityMember,
+  FleetCapacitySupervisor,
+} from "./fleet-capacity.js";
+export { describeFleetCapacity, memberHoldsCapacity } from "./fleet-capacity.js";
 // Supervisor heartbeat for a run-mode fleet (P5)
 export type { SupervisorBeatVerdict, SupervisorHeartbeat } from "./fleet-heartbeat.js";
 export {
@@ -336,6 +345,7 @@ export {
 export type {
   FleetLookupOptions,
   FleetMode,
+  FleetModeByIdOptions,
   FleetSupervisorLiveness,
   FleetSupervisorMatchOptions,
   FleetSupervisorRecord,
@@ -348,6 +358,7 @@ export {
   createFleetSupervisorRecord,
   FLEET_MIN_SUPERVISOR_PID,
   FLEET_REFUSED_TOOLS,
+  fleetModeForId,
   formatFleetRefusal,
   isFleetRefusedTool,
   isProcessAlive,
@@ -357,6 +368,7 @@ export {
   readProcessStartTime,
   resolveFleetMode,
   resolveMemberFleet,
+  sessionSupervisesFleetRecord,
 } from "./fleet-mode.js";
 // Fleet ordering as bd gates, so landing never closes a bead (bd-158)
 export type {
@@ -393,12 +405,15 @@ export type {
   FleetOrderingGateSeam,
   MemberLivenessReport,
   ParkRepairResult,
+  ReconcileAuthority,
+  ReconcileAuthorityOptions,
   RunFleetReconcileOptions,
   RunFleetReconcileResult,
 } from "./fleet-reconcile.js";
 export {
   diagnoseMergeQueue,
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
+  reconcileAuthority,
   reportMemberLiveness,
   runFleetReconcile,
 } from "./fleet-reconcile.js";
@@ -410,6 +425,8 @@ export type {
   FleetMemberClaim,
   FleetMemberObservation,
   FleetMemberProgress,
+  FleetMemberReleaseReason,
+  FleetReleasePlan,
   FleetRun,
   FleetRunMember,
   FleetRunMode,
@@ -423,6 +440,7 @@ export type {
 export {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
+  FLEET_MEMBER_RELEASE_REASONS,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
   FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
@@ -431,6 +449,8 @@ export {
   FLEET_RUN_MODES,
   FLEET_RUN_OUTCOMES,
   FLEET_RUN_SCHEMA_VERSION,
+  FLEET_RUN_STALE_TICK_INTERVALS,
+  FLEET_RUN_STALE_TICK_MS,
   FLEET_RUN_START_GRACE_MS,
   FLEET_RUN_STOP_REASONS,
   FLEET_RUN_TICK_INTERVAL_MS,
@@ -439,14 +459,19 @@ export {
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
+  memberEvidenceCutoff,
+  memberRanEvidence,
   planFleetTick,
   planGateNotices,
+  planOutsideFleetLandings,
   recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
   recordRunTick,
+  releaseRunMembers,
   startFleetRun,
+  worktreeCreatedAtFromStat,
 } from "./fleet-run.js";
 export type {
   FleetDependencyEdge,
@@ -479,8 +504,10 @@ export type {
   StopMemberSessionResult,
 } from "./fleet-sessions.js";
 export {
+  classifyMemberLease,
   classifyMemberLiveness,
   classifyMemberLivenessFromScan,
+  classifyMemberLivenessInWorktree,
   defaultFleetPidProbe,
   FLEET_ORCHESTRATOR_SESSION_PREFIX,
   FLEET_PROC_CMDLINE_MAX_BYTES,
@@ -580,6 +607,9 @@ export type {
   FleetBeadCommentRead,
   FleetBeadEngagement,
   FleetBeadLookup,
+  FleetCapacityFleetInput,
+  FleetCapacityInput,
+  FleetCapacityMemberInput,
   FleetEngagementLookup,
   FleetIntent,
   FleetLeaseSnapshot,

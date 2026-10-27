@@ -31,6 +31,7 @@ import {
   diagnoseMergeQueue,
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
   type RunFleetReconcileOptions,
+  reconcileAuthority,
   runFleetReconcile,
 } from "../fleet-reconcile.js";
 import type { FleetMemberLeaseProbe, FleetProcessScan } from "../fleet-sessions.js";
@@ -1280,5 +1281,77 @@ describe("runFleetReconcile: real git fixture", () => {
       isPidAlive: () => false,
     });
     expect(third.repairs).toEqual([]);
+  });
+});
+
+describe("reconcileAuthority (bd-166)", () => {
+  const base = {
+    targetFleetId: "wave1",
+    supervisedFleetIds: ["default"],
+    repoFleetIds: ["default", "wave1", "wave2"],
+    sessionId: "supervisor-session",
+  };
+
+  it("allows a supervisor to repair its own fleet", () => {
+    expect(
+      reconcileAuthority({ ...base, targetFleetId: "default", ownFleetId: "default" }),
+    ).toEqual({ ok: true, crossFleet: false });
+  });
+
+  it("allows a named fleet when the session supervises some fleet in the repository", () => {
+    // The wave1 supervisor died; this session owns wave2 and is the operator's
+    // repair path, so no hand edit of fleet.json is needed. Queue/park repair only.
+    expect(
+      reconcileAuthority({
+        ...base,
+        targetFleetId: "wave1",
+        ownFleetId: "wave2",
+        supervisedFleetIds: ["wave2"],
+      }),
+    ).toEqual({ ok: true, crossFleet: true });
+    expect(
+      reconcileAuthority({
+        ...base,
+        targetFleetId: "wave1",
+        ownFleetId: "wave2",
+        supervisedFleetIds: ["wave2"],
+        pruneDeadMembers: false,
+      }),
+    ).toEqual({ ok: true, crossFleet: true });
+  });
+
+  it("refuses a cross-fleet prune, naming the owning supervisor path (bd-166)", () => {
+    const refused = reconcileAuthority({
+      ...base,
+      targetFleetId: "wave1",
+      ownFleetId: "wave2",
+      supervisedFleetIds: ["wave2"],
+      pruneDeadMembers: true,
+    });
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.error).toContain("only allowed on this session's own fleet");
+    expect(refused.error).toContain("wave1");
+    expect(refused.error).toContain("belayd_fleet_release");
+  });
+
+  it("allows pruning the session's own fleet", () => {
+    expect(
+      reconcileAuthority({
+        ...base,
+        targetFleetId: "default",
+        ownFleetId: "default",
+        pruneDeadMembers: true,
+      }),
+    ).toEqual({ ok: true, crossFleet: false });
+  });
+
+  it("refuses a named fleet when this session supervises none, naming the reason", () => {
+    const refused = reconcileAuthority({ ...base, supervisedFleetIds: [] });
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.error).toContain("supervises no fleet in this repository");
+    expect(refused.error).toContain("wave1");
+    expect(refused.error).toContain("default, wave1, wave2");
   });
 });

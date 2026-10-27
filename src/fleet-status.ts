@@ -11,19 +11,46 @@
  * queue, audit log); P0 only reads the optional `fleet.json` intent.
  */
 
+import { statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { z } from "zod";
 import { excerptComment } from "./bead-comments.js";
+import type { FleetCapacityArithmetic, FleetCapacitySupervisor } from "./fleet-capacity.js";
+import { describeFleetCapacity, FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "./fleet-capacity.js";
+import type { FleetSupervisorLiveness } from "./fleet-mode.js";
+import { classifyFleetSupervisor, isProcessAlive, readProcessStartTime } from "./fleet-mode.js";
 import {
+  FLEET_MEMBER_RELEASE_REASONS,
+  FLEET_RUN_STALE_TICK_INTERVALS,
+  FLEET_RUN_STALE_TICK_MS,
+  FLEET_RUN_TICK_INTERVAL_MS,
   FleetRunSchema,
   formatFleetRunLine,
   formatFleetRunStops,
+  isFleetRunActive,
+  memberEvidenceCutoff,
+  memberRanEvidence,
   runsBelongingToMember,
+  worktreeCreatedAtFromStat,
 } from "./fleet-run.js";
 import { FLEET_SCHEDULE_DEFERRAL_REASONS } from "./fleet-schedule.js";
+import type {
+  FleetMemberLeaseProbe,
+  FleetMemberLiveness,
+  FleetProcessScan,
+} from "./fleet-sessions.js";
+import {
+  classifyMemberLease,
+  classifyMemberLivenessInWorktree,
+  scanProcesses,
+} from "./fleet-sessions.js";
 import { taskIdFromBranch } from "./handoff.js";
 import type { OrchestratorClaim } from "./orchestrator-claim.js";
-import { orchestratorClaimPath, parseOrchestratorClaim } from "./orchestrator-claim.js";
+import {
+  orchestratorClaimPath,
+  parseOrchestratorClaim,
+  readOrchestratorClaim,
+} from "./orchestrator-claim.js";
 import type { RunManifest, RunManifestFs } from "./run-manifest.js";
 import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
 import { isValidTaskId } from "./session-naming.js";
@@ -125,6 +152,30 @@ const FleetIntentSchema = z.object({
     .optional(),
   /** Set while the operator has paused the fleet (P4). */
   paused: z.boolean().optional(),
+  /**
+   * Members whose capacity slot has been given back without removing them
+   * (bd-166).
+   *
+   * A release is not a prune: the bead, worktree, transcript, and mailbox stay, and
+   * the id stays in `taskIds` so status, mail, and a later landing still see it. It
+   * only stops the member consuming one of the repository's concurrent-orchestrator
+   * slots. A terminal run writes one per member that did not land; the operator can
+   * write one with `belayd_fleet_release`. Cleared when the member lands or is
+   * launched again.
+   */
+  released: z
+    .array(
+      z.object({
+        taskId: z.string().min(1).max(128),
+        // One source of truth with `FLEET_MEMBER_RELEASE_REASONS`: a hand-edited or
+        // future-writer label must be rejected by the reader, not printed as if it
+        // were a reason the code knows (the deferred `reason` enum works the same).
+        reason: z.enum(FLEET_MEMBER_RELEASE_REASONS),
+        at: z.number().finite(),
+      }),
+    )
+    .max(FLEET_INTENT_MEMBERS_MAX)
+    .optional(),
   /**
    * Why the fleet is paused, when a repair path wrote a reason (P2/P4).
    *
@@ -287,6 +338,13 @@ export interface FleetMemberSnapshot {
   workflow: FleetWorkflowSnapshot;
   /** Run manifests from `listRuns` at that worktree. */
   runs: readonly RunManifest[];
+  /**
+   * The worktree directory's creation instant, when the seam can `stat` it (bd-166).
+   *
+   * The launch-evidence cutoff: an inherited run manifest predates the tree that
+   * holds it, so this keeps "this member ran" from meaning "this task ran once".
+   */
+  createdAt?: number;
   /** Orchestrator lease as read; no clock is applied here (freshness is the tools' job). */
   lease: FleetLeaseSnapshot;
 }
@@ -393,6 +451,9 @@ export const FLEET_WARNING_KINDS = [
   "bead-metadata-unavailable",
   "bead-metadata-missing",
   "bead-engagement-unavailable",
+  "stale-member",
+  "capacity-held",
+  "run-not-ticking",
 ] as const;
 
 export type FleetWarningKind = (typeof FLEET_WARNING_KINDS)[number];
@@ -413,7 +474,37 @@ export interface FleetStatus {
   intent: FleetIntent | undefined;
   members: FleetMemberView[];
   counts: FleetStateCounts;
+  /**
+   * The repository-wide capacity arithmetic (bd-166), when the caller supplied the
+   * per-fleet liveness observation. Absent for a pure build that has no such data,
+   * in which case the view renders exactly what it rendered before.
+   */
+  capacity?: FleetCapacityArithmetic;
   warnings: FleetWarning[];
+}
+
+/** One recorded member as the capacity arithmetic sees it (bd-166). */
+export interface FleetCapacityMemberInput {
+  taskId: string;
+  liveness: FleetMemberLiveness;
+  stopped?: boolean;
+  released?: boolean;
+  /** Whether any worktree in this repository holds the member's branch. */
+  worktreePresent?: boolean;
+}
+
+/** One fleet's recorded membership, as read for the capacity view. */
+export interface FleetCapacityFleetInput {
+  fleetId: string;
+  members: readonly FleetCapacityMemberInput[];
+  supervisor: FleetCapacitySupervisor;
+  /** The fleet's run record, for `run-not-ticking`. */
+  run?: { ticks: number; updatedAt: number; active: boolean };
+}
+
+export interface FleetCapacityInput {
+  ceiling: number;
+  fleets: readonly FleetCapacityFleetInput[];
 }
 
 export interface BuildFleetStatusOptions {
@@ -424,6 +515,10 @@ export interface BuildFleetStatusOptions {
   members: readonly FleetMemberSnapshot[];
   /** Worktree-enumeration warnings (e.g. an unrepresentable porcelain path). */
   worktreeWarnings?: readonly FleetWarning[];
+  /** Every fleet's membership + liveness, for the capacity block and its warnings. */
+  capacity?: FleetCapacityInput;
+  /** Clock for `run-not-ticking`; absent means "do not judge run freshness". */
+  now?: number;
 }
 
 /**
@@ -768,6 +863,102 @@ function collectWarnings(members: readonly FleetMemberView[]): FleetWarning[] {
 }
 
 /**
+ * Warnings only the capacity arithmetic can see (bd-166).
+ *
+ * Three shapes, all of them invisible before: a recorded member whose work is gone
+ * (`stale-member`), a fleet holding slots with nobody watching it
+ * (`capacity-held`), and an active run whose ticker stopped (`run-not-ticking`).
+ */
+function sortedCapacityFleets(capacity: FleetCapacityInput): FleetCapacityFleetInput[] {
+  return [...capacity.fleets].sort((left, right) => compareCodeUnits(left.fleetId, right.fleetId));
+}
+
+/** Recorded members whose worktree is gone and which nobody released (bd-166). */
+function staleMemberWarnings(fleets: readonly FleetCapacityFleetInput[]): FleetWarning[] {
+  const warnings: FleetWarning[] = [];
+  for (const fleet of fleets) {
+    for (const member of fleet.members) {
+      if (member.released === true || member.worktreePresent !== false) continue;
+      warnings.push({
+        kind: "stale-member",
+        taskId: member.taskId,
+        message:
+          `fleet ${fleet.fleetId} still records ${member.taskId}, but no worktree holds ` +
+          `feat/${member.taskId}; release it with belayd_fleet_release ${member.taskId} ` +
+          "(or reconcile --prune-dead-members) if its work is gone",
+      });
+    }
+  }
+  return warnings;
+}
+
+/** Fleets that still hold slots while no live supervisor watches them (bd-166). */
+function capacityHeldWarnings(options: {
+  fleets: readonly FleetCapacityFleetInput[];
+  arithmetic: FleetCapacityArithmetic;
+  ceiling: number;
+}): FleetWarning[] {
+  const contributors = new Map(
+    options.arithmetic.contributors.map((contributor) => [contributor.fleetId, contributor]),
+  );
+  const warnings: FleetWarning[] = [];
+  for (const fleet of options.fleets) {
+    const contributor = contributors.get(fleet.fleetId);
+    if (contributor === undefined || contributor.counted === 0) continue;
+    if (fleet.supervisor === "live") continue;
+    warnings.push({
+      kind: "capacity-held",
+      message:
+        `fleet ${fleet.fleetId} counts ${contributor.counted} member(s) against the ceiling of ` +
+        `${options.ceiling} but has no live supervisor ` +
+        `(recorded supervisor: ${fleet.supervisor}); re-arm it or release the members`,
+    });
+  }
+  return warnings;
+}
+
+/** Active runs whose ticker has been silent past the derived bound (bd-166). */
+function runNotTickingWarnings(
+  fleets: readonly FleetCapacityFleetInput[],
+  now: number,
+): FleetWarning[] {
+  const warnings: FleetWarning[] = [];
+  for (const fleet of fleets) {
+    const run = fleet.run;
+    if (run === undefined || !run.active) continue;
+    const age = now - run.updatedAt;
+    if (age <= FLEET_RUN_STALE_TICK_MS) continue;
+    warnings.push({
+      kind: "run-not-ticking",
+      message:
+        `fleet ${fleet.fleetId} has an active run whose last tick was at ` +
+        `${new Date(run.updatedAt).toISOString()} (${run.ticks} tick(s), ` +
+        `${Math.floor(age / FLEET_RUN_TICK_INTERVAL_MS)} tick interval(s) ago, bound ` +
+        `${FLEET_RUN_STALE_TICK_INTERVALS}); nothing will land or advance until a session ` +
+        "resumes the loop (re-arm the fleet) or an operator releases/lands the members",
+    });
+  }
+  return warnings;
+}
+
+function collectCapacityWarnings(options: {
+  capacity: FleetCapacityInput;
+  arithmetic: FleetCapacityArithmetic;
+  now: number | undefined;
+}): FleetWarning[] {
+  const fleets = sortedCapacityFleets(options.capacity);
+  return [
+    ...staleMemberWarnings(fleets),
+    ...capacityHeldWarnings({
+      fleets,
+      arithmetic: options.arithmetic,
+      ceiling: options.capacity.ceiling,
+    }),
+    ...(options.now === undefined ? [] : runNotTickingWarnings(fleets, options.now)),
+  ];
+}
+
+/**
  * Pure rollup: no fs, no git. Every input is already-read data, so tests need
  * no mocks and the same snapshot always yields the same view.
  */
@@ -781,6 +972,7 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
   }
   members.sort(compareMembers);
 
+  const capacity = capacityArithmeticOf(options.capacity);
   return {
     schemaVersion: FLEET_SCHEMA_VERSION,
     fleetId: options.fleetId,
@@ -791,8 +983,41 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
     intent: options.intent,
     members,
     counts: countMemberStates(members),
-    warnings: [...(options.worktreeWarnings ?? []), ...collectWarnings(members)],
+    ...(capacity === undefined ? {} : { capacity }),
+    warnings: [
+      ...(options.worktreeWarnings ?? []),
+      ...collectWarnings(members),
+      ...(options.capacity === undefined || capacity === undefined
+        ? []
+        : collectCapacityWarnings({
+            capacity: options.capacity,
+            arithmetic: capacity,
+            now: options.now,
+          })),
+    ],
   };
+}
+
+/** Project the reader's per-member observation onto the shared arithmetic. */
+function capacityArithmeticOf(
+  input: FleetCapacityInput | undefined,
+): FleetCapacityArithmetic | undefined {
+  if (input === undefined) return undefined;
+  return describeFleetCapacity({
+    ceiling: input.ceiling,
+    fleets: [...input.fleets]
+      .sort((left, right) => compareCodeUnits(left.fleetId, right.fleetId))
+      .map((fleet) => ({
+        fleetId: fleet.fleetId,
+        supervisor: fleet.supervisor,
+        members: fleet.members.map((member) => ({
+          taskId: member.taskId,
+          liveness: member.liveness,
+          ...(member.stopped === true ? { stopped: true } : {}),
+          ...(member.released === true ? { released: true } : {}),
+        })),
+      })),
+  });
 }
 
 // ── Bead metadata (read-only bd enrichment) ─────────────────────────
@@ -966,6 +1191,11 @@ export function fleetBeadTaskIds(status: FleetStatus): string[] {
     const taskId = member.taskId;
     if (taskId !== undefined && isValidTaskId(taskId)) ids.add(taskId);
   }
+  // Recorded members with no worktree are asked about too: a bead merged by hand
+  // leaves exactly that shape, and `stale-member` needs bd's status to say so.
+  for (const taskId of status.intent?.taskIds ?? []) {
+    if (isValidTaskId(taskId)) ids.add(taskId);
+  }
   return [...ids].sort(compareCodeUnits);
 }
 
@@ -1027,6 +1257,7 @@ export function applyFleetBeadLookup(status: FleetStatus, lookup: FleetBeadLooku
   const expected = fleetBeadTaskIds(status);
   const missing = expected.filter((taskId) => !byId.has(taskId.toLowerCase()));
   const warnings = [...status.warnings];
+  warnings.push(...collectStaleBeadWarnings(status, lookup.beads));
   if (missing.length > 0) {
     const shown = missing.slice(0, BEAD_MISSING_IDS_MAX);
     const remainder = missing.length - shown.length;
@@ -1048,6 +1279,47 @@ export function applyFleetBeadLookup(status: FleetStatus, lookup: FleetBeadLooku
     }),
     warnings,
   };
+}
+
+/** Bead statuses that prove the fleet's work is over, whatever fleet.json says. */
+const CLOSED_BEAD_STATUSES: readonly string[] = ["closed", "done"];
+
+/**
+ * Recorded members bd reports closed/done while they are not released (bd-166).
+ *
+ * This is the bd-37 shape: the work landed and the bead was closed by hand
+ * (`wt merge` / `bd close`), so no fleet path ever saw the landing and the member
+ * kept holding a capacity slot. Status alone is not proof of merging — that is what
+ * the tick's ancestor check is for — but it is exactly the evidence that the member
+ * needs a human decision, and the worktree-gone case has its own check at build
+ * time, so a task id already named by one of those is not repeated here.
+ */
+function collectStaleBeadWarnings(
+  status: FleetStatus,
+  beads: readonly FleetBead[],
+): FleetWarning[] {
+  const recorded = new Set(status.intent?.taskIds ?? []);
+  const released = new Set((status.intent?.released ?? []).map((entry) => entry.taskId));
+  const already = new Set(
+    status.warnings
+      .filter((warning) => warning.kind === "stale-member" && warning.taskId !== undefined)
+      .map((warning) => warning.taskId),
+  );
+  const warnings: FleetWarning[] = [];
+  for (const bead of [...beads].sort((left, right) => compareCodeUnits(left.id, right.id))) {
+    if (!recorded.has(bead.id) || released.has(bead.id) || already.has(bead.id)) continue;
+    const beadStatus = bead.status;
+    if (beadStatus === undefined || !CLOSED_BEAD_STATUSES.includes(beadStatus)) continue;
+    warnings.push({
+      kind: "stale-member",
+      taskId: bead.id,
+      message:
+        `fleet ${status.fleetId} still records ${bead.id}, but bd reports it ${beadStatus}; ` +
+        `the work is over — release it with belayd_fleet_release ${bead.id}, or land it if ` +
+        "its branch is on the base branch",
+    });
+  }
+  return warnings;
 }
 
 /**
@@ -1165,6 +1437,49 @@ function formatPark(intent: FleetIntent): string | undefined {
 
 function formatCounts(counts: FleetStateCounts): string {
   return FLEET_MEMBER_STATES.map((state) => `${state}=${counts[state]}`).join(" ");
+}
+
+/**
+ * Released members, one bounded line: a slot given back without losing the member.
+ *
+ * Without this line a released member looks identical to a live one in the intent,
+ * which is exactly the confusion the release mechanism exists to remove.
+ */
+function formatReleased(released: NonNullable<FleetIntent["released"]>): string | undefined {
+  if (released.length === 0) return undefined;
+  // Defensive even though the schema types the label: a caller can hand-build an
+  // intent object, and the view must not print a reason the code cannot interpret.
+  const known = new Set<string>(FLEET_MEMBER_RELEASE_REASONS);
+  const shown = released
+    .slice(0, FLEET_INTENT_SUMMARY_MAX)
+    .map((entry) => `${entry.taskId} (${known.has(entry.reason) ? entry.reason : "unrecognized"})`);
+  const hidden = released.length - shown.length;
+  const suffix = hidden > 0 ? `, ...and ${hidden} more` : "";
+  return `released: ${shown.join(", ")}${suffix} — slot given back, member kept`;
+}
+
+/**
+ * The repository-wide capacity arithmetic: the ceiling, what is free, and who
+ * holds what (bd-166).
+ *
+ * Fleets with no recorded members are left out: they contribute nothing, and a
+ * line per empty fleet directory would bury the ones that matter.
+ */
+function formatCapacity(capacity: FleetCapacityArithmetic | undefined): readonly string[] {
+  if (capacity === undefined) return [];
+  const lines = [
+    `  capacity: ceiling ${capacity.ceiling}, ${capacity.free} free, ${capacity.counted} counted`,
+  ];
+  for (const contributor of capacity.contributors) {
+    if (contributor.members === 0) continue;
+    lines.push(
+      `    ${contributor.fleetId}: ${contributor.members} member(s), ` +
+        `${contributor.counted} counted (${contributor.live} live, ${contributor.unknown} unknown, ` +
+        `${contributor.absent} absent), ${contributor.stopped} stopped, ` +
+        `${contributor.released} released; supervisor ${contributor.supervisor}`,
+    );
+  }
+  return lines;
 }
 
 function formatFleetId(status: FleetStatus): string {
@@ -1419,26 +1734,30 @@ function formatMember(member: FleetMemberView): string[] {
  * Deterministic plain text (no ANSI) for a pi tool result. Members are already
  * sorted by task id; warnings keep that order with duplicate-task warnings last.
  */
-export function formatFleetStatus(status: FleetStatus): string {
-  const deferred =
-    status.intent === undefined ? undefined : formatDeferred(status.intent.deferred ?? []);
-  const park = status.intent === undefined ? undefined : formatPark(status.intent);
-  const run = formatFleetRunLine(status.intent?.run);
-  const stops = formatFleetRunStops(status.intent?.run);
-  const ordering = formatOrderingGates(status.intent);
-  const lines = [
+/** The header block: intent facts, then membership counts and capacity. */
+function formatFleetHeader(status: FleetStatus): string[] {
+  const intentFacts = [
+    status.intent === undefined ? undefined : formatDeferred(status.intent.deferred ?? []),
+    status.intent === undefined ? undefined : formatReleased(status.intent.released ?? []),
+    status.intent === undefined ? undefined : formatPark(status.intent),
+    formatFleetRunLine(status.intent?.run),
+    formatOrderingGates(status.intent),
+  ].filter((line): line is string => line !== undefined);
+  return [
     // Name only the id that actually located the files; a sanitized id keeps
     // traversal input from printing as if it were a real directory.
     `Fleet ${formatFleetId(status)}`,
     `  intent: ${formatIntent(status.intent)}`,
-    ...(deferred === undefined ? [] : [`  ${deferred}`]),
-    ...(park === undefined ? [] : [`  ${park}`]),
-    ...(run === undefined ? [] : [`  ${run}`]),
-    ...(ordering === undefined ? [] : [`  ${ordering}`]),
-    ...stops.map((line) => `  ${line}`),
+    ...intentFacts.map((line) => `  ${line}`),
+    ...formatFleetRunStops(status.intent?.run).map((line) => `  ${line}`),
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
+    ...formatCapacity(status.capacity),
   ];
+}
+
+export function formatFleetStatus(status: FleetStatus): string {
+  const lines = formatFleetHeader(status);
 
   // After the header lines so "who is waiting on me" is the first thing read,
   // and before the member blocks so it is never buried in a long fleet.
@@ -1470,7 +1789,22 @@ export function formatFleetStatus(status: FleetStatus): string {
 // ── Reader (the only fs/git access in this module) ────────────────────
 
 /** Fs seam for the reader; compatible with the workflow-state and run-manifest seams. */
-export type FleetStatusFs = RunManifestFs;
+export interface FleetStatusFs extends RunManifestFs {
+  /**
+   * Worktree `stat`, for the launch-evidence cutoff (bd-166).
+   *
+   * Optional so read-only seams can omit it: without it a same-task run manifest
+   * names the task but cannot be attributed to this execution, which the capacity
+   * rule resolves by counting the member (`memberRanEvidence`).
+   */
+  statSync?(path: string): { birthtimeMs?: number; mtimeMs?: number };
+}
+
+/** The reader's default seam: the shared manifests' fs plus the capacity cutoff's stat. */
+const fleetStatusFs: FleetStatusFs = {
+  ...runManifestFs,
+  statSync: (path) => statSync(path),
+};
 
 export interface ReadFleetStatusOptions {
   cwd: string;
@@ -1480,6 +1814,27 @@ export interface ReadFleetStatusOptions {
   resolveCommonDir?: (cwd: string) => GitCommonDirResult;
   /** Test seam for worktree enumeration. */
   listWorktrees?: (cwd: string) => ReturnType<typeof defaultListWorktrees>;
+  /**
+   * Process-table snapshot for the capacity count (bd-166).
+   *
+   * Injected so a status read in a test never depends on the host's processes;
+   * the default is the real scan the reconcile and launch paths use.
+   */
+  scanProcesses?: () => FleetProcessScan;
+  /**
+   * Worktree lease per member, the only evidence a pi-web orchestrator produces.
+   *
+   * Absent means "classify the worktree's own lease"; `undefined` from the probe
+   * means "no evidence", which the classifier treats as `unknown` (counted).
+   */
+  memberLeaseFor?: (
+    taskId: string,
+    worktreePath: string | undefined,
+  ) => FleetMemberLeaseProbe | undefined;
+  /** Supervisor liveness probes, for `capacity-held`; injected in tests. */
+  supervisorLiveness?: FleetSupervisorLiveness;
+  /** Clock for lease freshness, the capacity view, and `run-not-ticking`. */
+  now?: number;
 }
 
 export type ReadFleetStatusResult = { ok: true; value: FleetStatus } | { ok: false; error: string };
@@ -1515,14 +1870,31 @@ function readMemberSnapshot(fs: FleetStatusFs, entry: WorktreeListEntry): FleetM
     }
   }
 
+  const createdAt = worktreeCreatedAt(fs, entry.path);
   return {
     worktreePath: entry.path,
     isMainWorktree: entry.isMainWorktree,
     branch: entry.branch,
     workflow,
     runs: listRuns({ cwd: entry.path, fs }),
+    ...(createdAt === undefined ? {} : { createdAt }),
     lease: readLeaseSnapshot(fs, entry.path),
   };
+}
+
+/**
+ * The worktree's creation instant, or undefined when the seam cannot `stat` it.
+ *
+ * A failed stat means "no cutoff", never "created now": the evidence rule answers
+ * that by counting the member, which is the safe direction (bd-166).
+ */
+function worktreeCreatedAt(fs: FleetStatusFs, worktreePath: string): number | undefined {
+  if (fs.statSync === undefined) return undefined;
+  try {
+    return worktreeCreatedAtFromStat(fs.statSync(worktreePath));
+  } catch {
+    return undefined;
+  }
 }
 
 /** Read the worktree's orchestrator lease without applying a clock. */
@@ -1543,14 +1915,234 @@ function readLeaseSnapshot(fs: FleetStatusFs, worktreePath: string): FleetLeaseS
 }
 
 /**
+ * Map every fleet member to a worktree path, from the one worktree enumeration.
+ *
+ * The branch is the identity (a worktree's directory name is a convention); an
+ * unrecognizable branch simply leaves that member without a path, which the
+ * capacity view reports as `worktreePresent: false`.
+ */
+/** One member worktree as the capacity arithmetic needs it. */
+interface FleetWorktreeEvidence {
+  path: string;
+  /** Whether `.belayd/workflow.json` exists, readable or corrupt. */
+  workflowStatePresent: boolean;
+  /** Run manifests read from the worktree; attributed per task id below. */
+  runs: readonly RunManifest[];
+  /** The worktree directory's creation instant, when the seam could `stat` it. */
+  createdAt?: number;
+}
+
+function worktreeEvidenceByTaskId(
+  entries: readonly WorktreeListEntry[],
+  snapshots: readonly FleetMemberSnapshot[],
+): Map<string, FleetWorktreeEvidence> {
+  const worktrees = new Map<string, FleetWorktreeEvidence>();
+  for (const [index, entry] of entries.entries()) {
+    const branch = entry.branch;
+    if (branch === undefined) continue;
+    const snapshot = snapshots[index];
+    // `snapshots` is the same enumeration in the same order. Corrupt state still
+    // proves the worktree is not a bare mid-spawn tree, and a cleared state (a
+    // finished workflow) leaves the run manifests behind — the evidence rule reads
+    // both, with the worktree's own creation instant as the cutoff bd-166 needs.
+    const workflowStatePresent = snapshot?.workflow.kind !== "missing";
+    const runs = snapshot?.runs ?? [];
+    const createdAt = snapshot?.createdAt;
+    // The fleet names a member's branch `feat/<taskId>`, so that suffix is the
+    // authority here. `taskIdFromBranch` is the stricter parser (numeric ids only)
+    // and is kept as a second key for branches that carry the id another way.
+    const candidates = [
+      branch.startsWith("feat/") ? branch.slice("feat/".length) : undefined,
+      taskIdFromBranch(branch),
+    ];
+    for (const taskId of candidates) {
+      if (taskId === undefined || taskId === "" || worktrees.has(taskId)) continue;
+      worktrees.set(taskId, {
+        path: entry.path,
+        workflowStatePresent,
+        runs,
+        ...(createdAt === undefined ? {} : { createdAt }),
+      });
+    }
+  }
+  return worktrees;
+}
+
+/**
+ * Whether this member's worktree proves its own execution ran.
+ *
+ * The cutoff is the newer of the worktree's creation instant and the fleet run's
+ * recorded `launchedAt` (`memberEvidenceCutoff`), so an inherited same-task manifest
+ * copied into a fresh worktree never counts as this member's evidence. No cutoff
+ * means no manifest evidence, which keeps the member counted.
+ */
+function memberRanInWorktree(options: {
+  intent: FleetIntent;
+  taskId: string;
+  worktree: FleetWorktreeEvidence | undefined;
+}): boolean {
+  const worktree = options.worktree;
+  if (worktree === undefined) return false;
+  const launchedAt = launchedAtFor(options.intent, options.taskId);
+  const since = memberEvidenceCutoff({
+    ...(worktree.createdAt === undefined ? {} : { worktreeCreatedAt: worktree.createdAt }),
+    ...(launchedAt === undefined ? {} : { launchedAt }),
+  });
+  return memberRanEvidence({
+    taskId: options.taskId,
+    workflowStatePresent: worktree.workflowStatePresent,
+    runs: worktree.runs,
+    ...(since === undefined ? {} : { since }),
+  });
+}
+
+/**
+ * The default lease probe: the same classifier the launch and reconcile probe use,
+ * so status and the ceiling arithmetic cannot disagree about a lease (bd-166).
+ */
+function leaseProbeOf(worktreePath: string | undefined, now: number): FleetMemberLeaseProbe {
+  if (worktreePath === undefined) return { state: "absent" };
+  return classifyMemberLease({ read: readOrchestratorClaim({ worktreePath }), now });
+}
+
+/**
+ * Fleet directory names under `<git-common-dir>/belayd/fleet`, code-unit sorted.
+ *
+ * A local listing, not `fleet-mode.listFleetIds`: that seam speaks the write-side
+ * `FleetStateFs`, and widening this reader's read-only fs just to enumerate a
+ * directory would drag the state writer's surface into the status path.
+ */
+function fleetDirectoryIds(fs: FleetStatusFs, gitCommonDir: string): readonly string[] {
+  const root = join(gitCommonDir, "belayd", "fleet");
+  try {
+    if (!fs.existsSync(root)) return [];
+    return [...fs.readdirSync(root)].sort(compareCodeUnits);
+  } catch {
+    // An unreadable fleet root means "no fleet" for this reader: the status view
+    // must never throw, and the single-fleet view below still reports its intent.
+    return [];
+  }
+}
+
+/**
+ * Every fleet's membership + liveness, for the capacity block (bd-166).
+ *
+ * One intent read per fleet directory plus one process snapshot for the whole view,
+ * and the member's own worktree lease per member: the same evidence reconcile
+ * trusts, so status and repair cannot disagree about what is running.
+ */
+function readFleetCapacity(options: {
+  fs: FleetStatusFs;
+  gitCommonDir: string;
+  targetFleetId: string;
+  targetIntent: FleetIntent | undefined;
+  worktrees: ReadonlyMap<string, FleetWorktreeEvidence>;
+  scan: FleetProcessScan;
+  now: number;
+  leaseFor: (taskId: string, worktreePath: string | undefined) => FleetMemberLeaseProbe | undefined;
+  supervisorLiveness: FleetSupervisorLiveness;
+}): FleetCapacityInput {
+  const fleets: FleetCapacityFleetInput[] = [];
+  let sawTarget = false;
+  for (const directoryId of fleetDirectoryIds(options.fs, options.gitCommonDir)) {
+    const fleetId = sanitizeFleetId(directoryId);
+    const intent =
+      fleetId === options.targetFleetId
+        ? options.targetIntent
+        : readFleetIntentFile(options.fs, options.gitCommonDir, fleetId);
+    if (fleetId === options.targetFleetId) sawTarget = true;
+    if (intent === undefined) continue;
+    fleets.push(
+      capacityFleetInput({
+        fleetId,
+        intent,
+        worktrees: options.worktrees,
+        scan: options.scan,
+        leaseFor: options.leaseFor,
+        supervisorLiveness: options.supervisorLiveness,
+      }),
+    );
+  }
+  // The root listing can be unreadable (or absent in an in-memory fs) while the
+  // requested intent itself read fine; the arithmetic must still describe the
+  // fleet the operator asked about.
+  if (!sawTarget && options.targetIntent !== undefined) {
+    fleets.push(
+      capacityFleetInput({
+        fleetId: options.targetFleetId,
+        intent: options.targetIntent,
+        worktrees: options.worktrees,
+        scan: options.scan,
+        leaseFor: options.leaseFor,
+        supervisorLiveness: options.supervisorLiveness,
+      }),
+    );
+  }
+  return { ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS, fleets };
+}
+
+/** One fleet's recorded membership, classified for the capacity arithmetic. */
+function capacityFleetInput(options: {
+  fleetId: string;
+  intent: FleetIntent;
+  worktrees: ReadonlyMap<string, FleetWorktreeEvidence>;
+  scan: FleetProcessScan;
+  leaseFor: (taskId: string, worktreePath: string | undefined) => FleetMemberLeaseProbe | undefined;
+  supervisorLiveness: FleetSupervisorLiveness;
+}): FleetCapacityFleetInput {
+  const released = new Set((options.intent.released ?? []).map((entry) => entry.taskId));
+  const stopped = new Set((options.intent.run?.stopped ?? []).map((entry) => entry.taskId));
+  const members = options.intent.taskIds.map((taskId): FleetCapacityMemberInput => {
+    const worktree = options.worktrees.get(taskId);
+    const lease = options.leaseFor(taskId, worktree?.path);
+    return {
+      taskId,
+      // Same rule as the launch probe: no worktree, or a worktree with no lease and
+      // no evidence this member's own execution ran, is a spawn in flight — unknown
+      // and counted, never absent (bd-166).
+      liveness: classifyMemberLivenessInWorktree({
+        taskId,
+        worktreePath: worktree?.path,
+        memberRanEvidence: memberRanInWorktree({ intent: options.intent, taskId, worktree }),
+        scan: options.scan,
+        ...(lease === undefined ? {} : { lease }),
+      }),
+      ...(released.has(taskId) ? { released: true } : {}),
+      ...(stopped.has(taskId) ? { stopped: true } : {}),
+      worktreePresent: worktree !== undefined,
+    };
+  });
+  const supervisor = classifyFleetSupervisor({
+    supervisor: options.intent.supervisor,
+    liveness: options.supervisorLiveness,
+  });
+  return {
+    fleetId: options.fleetId,
+    members,
+    supervisor: supervisor.kind,
+    ...(options.intent.run === undefined
+      ? {}
+      : {
+          run: {
+            ticks: options.intent.run.ticks,
+            updatedAt: options.intent.run.updatedAt,
+            active: isFleetRunActive(options.intent.run),
+          },
+        }),
+  };
+}
+
+/**
  * Read + derive the fleet view. Two read-only git probes (`rev-parse
- * --git-common-dir`, `worktree list --porcelain`) and fs reads only; no git
- * mutation, no writes, no spawns.
+ * --git-common-dir`, `worktree list --porcelain`) plus fs reads and one
+ * process-table snapshot; no git mutation, no writes, no spawns.
  */
 export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatusResult {
-  const fs = options.fs ?? runManifestFs;
+  const fs = options.fs ?? fleetStatusFs;
   const resolveCommonDir = options.resolveCommonDir ?? resolveGitCommonDir;
   const listWorktrees = options.listWorktrees ?? defaultListWorktrees;
+  const scan = options.scanProcesses ?? scanProcesses;
+  const now = options.now ?? Date.now();
 
   // One id: the sanitized value both locates the files and names the fleet in
   // the view, so the header can never point at a different directory.
@@ -1569,9 +2161,33 @@ export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatu
     kind: "unparsed-worktree-path",
     message,
   }));
+  const leaseFor =
+    options.memberLeaseFor ??
+    ((_taskId: string, worktreePath: string | undefined) => leaseProbeOf(worktreePath, now));
 
   return {
     ok: true,
-    value: buildFleetStatus({ fleetId, requestedFleetId, intent, members, worktreeWarnings }),
+    value: buildFleetStatus({
+      fleetId,
+      requestedFleetId,
+      intent,
+      members,
+      worktreeWarnings,
+      capacity: readFleetCapacity({
+        fs,
+        gitCommonDir: commonDirResult.commonDir,
+        targetFleetId: fleetId,
+        targetIntent: intent,
+        worktrees: worktreeEvidenceByTaskId(worktreeResult.entries, members),
+        scan: scan(),
+        now,
+        leaseFor,
+        supervisorLiveness: options.supervisorLiveness ?? {
+          isPidAlive: isProcessAlive,
+          pidStartTime: readProcessStartTime,
+        },
+      }),
+      now,
+    }),
   };
 }

@@ -1,0 +1,262 @@
+
+=== bd-166 refusal directions: release safety + cross-fleet prune authority
+date:   2026-10-28T00:35:25+01:00
+repo:   /home/hugo/git/feat-bd-166
+commit: 758dcb5caff9e79f18b296a41c75f6cab6905171
+
+
+### 2026-10-28T00:35:25+01:00 — A1 — belayd_fleet_release refuses an id that is not a member of this fleet
+
+$ rm -rf /tmp/bd166-proof-refuse /tmp/bd166-proof-refuse.feat-* && mkdir -p /tmp/bd166-proof-refuse && cd /tmp/bd166-proof-refuse && git init -q -b main ...
+[exit=0]
+
+
+### 2026-10-28T00:35:25+01:00 — re-arm (recorded supervisor is dead), then release bd-99 which is not a member
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-refuse [
+  ["belayd_fleet_launch",{"tasks":["bd-12","bd-15"],"fleetId":"default","untilComplete":false}],
+  ["belayd_fleet_release",{"taskId":"bd-99"}]]
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-12","bd-15"],"fleetId":"default","untilComplete":false}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-12 bd-15 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `default`: re-armed — supervisor record rewritten, 2 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-12, bd-15 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+=== belayd_fleet_release {"taskId":"bd-99"}
+bd-99 is not a member of fleet `default`; its members are bd-12, bd-15
+[belayd_fleet_release exit=1]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-12 bd-15 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:26+01:00 — A2 — belayd_fleet_release refuses a member whose orchestrator is live
+
+$ write a fresh orchestrator lease for bd-12 (sessionId sess-live, pid 12345)
+[exit=0]
+
+
+### 2026-10-28T00:35:26+01:00 — re-arm, then release bd-12 — refused; status shows the member as live (counted)
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-refuse [
+  ["belayd_fleet_launch",{"tasks":["bd-12","bd-15"],"fleetId":"default","untilComplete":false}],
+  ["belayd_fleet_release",{"taskId":"bd-12"}],
+  ["belayd_fleet_status",{}]]
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-12","bd-15"],"fleetId":"default","untilComplete":false}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-12 bd-15 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `default`: re-armed — supervisor record rewritten, 2 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-12, bd-15 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+=== belayd_fleet_release {"taskId":"bd-12"}
+Fleet release refused: bd-12's orchestrator is live, so it still holds a real slot. Stop it (belayd_fleet_pause) or let it land; a running member is never released out from under itself.
+[belayd_fleet_release exit=1]
+
+=== belayd_fleet_status {}
+Fleet default
+  intent: bd-12, bd-15, max 3 concurrent
+  members: 1
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=1
+  capacity: ceiling 3, 1 free, 2 counted
+    default: 2 member(s), 2 counted (1 live, 1 unknown, 0 absent), 0 stopped, 0 released; supervisor live
+
+Member (no task id) — missing-state
+  worktree: /tmp/bd166-proof-refuse.feat-bd-12 (branch feat/bd-12)
+  workflow: missing
+  interrupted runs: 0
+  orchestrator lease: session sess-live for bd-12, renewed 2026-10-27T23:35:26.664Z
+  last updated: unknown
+  latest runs: none
+
+Warnings (4):
+  - no .belayd/workflow.json in /tmp/bd166-proof-refuse.feat-bd-12; that worktree drives no workflow
+  - fleet default still records bd-15, but no worktree holds feat/bd-15; release it with belayd_fleet_release bd-15 (or reconcile --prune-dead-members) if its work is gone
+  - bead metadata unavailable (bd read failed): Command failed: bd show bd-12 bd-15 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+  - bead engagement unavailable (bd read failed): Command failed: bd comments bd-12 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+[belayd_fleet_status exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-12 bd-15 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:28+01:00 — A3 — nothing was released: fleet.json keeps bd-12 and has no released[] entry
+
+$ jq -c '{taskIds, released}' .git/belayd/fleet/default/fleet.json
+{"taskIds":["bd-12","bd-15"],"released":null}
+[exit=0]
+
+
+### 2026-10-28T00:35:28+01:00 — B — cross-fleet reconcile: repair allowed + audited, prune refused
+
+$ rm -rf /tmp/bd166-proof-cross && mkdir -p /tmp/bd166-proof-cross && cd /tmp/bd166-proof-cross && git init -q -b main ...
+[exit=0]
+
+
+### 2026-10-28T00:35:28+01:00 — this session supervises owned; reconcile orphan by name (repair only) -> allowed, exit 0
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-cross [
+  ["belayd_fleet_launch",{"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}],
+  ["belayd_fleet_reconcile",{"fleetId":"orphan"}]]
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `owned`: re-armed — supervisor record rewritten, 1 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-60 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+=== belayd_fleet_reconcile {"fleetId":"orphan"}
+Fleet `orphan` reconcile: nothing to repair.
+- queue: consistent (no lock, no in-flight entries)
+- supervisor: not running (recorded session dead-session: its pid is gone or was reused); re-arm with `/fleet <ids> --fleet orphan`
+- member bd-70: orchestrator not running
+- members: bd-70 have no orchestrator process; re-run with prune-dead-members to remove them from the intent (worktrees stay)
+[belayd_fleet_reconcile exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  },
+  {
+    "message": "Fleet orphan: could not read the ordering gates of bd-70: Command failed: bd gate list bd-70 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "warning"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:29+01:00 — same call with pruneDeadMembers on orphan -> refused, exit 1
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-cross [
+  ["belayd_fleet_launch",{"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}],
+  ["belayd_fleet_reconcile",{"fleetId":"orphan","pruneDeadMembers":true}]]
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `owned`: re-armed — supervisor record rewritten, 1 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-60 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+=== belayd_fleet_reconcile {"fleetId":"orphan","pruneDeadMembers":true}
+Fleet reconcile refused: pruneDeadMembers is only allowed on this session's own fleet. `orphan` is owned by its own supervisor: re-arm it (/fleet <ids> --fleet orphan) and run the reconcile (or belayd_fleet_release) from that session. Cross-fleet reconcile still repairs the queue and park without pruning.
+[belayd_fleet_reconcile exit=1]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:31+01:00 — the repair is audited on the TARGET fleet; orphan's members are untouched
+
+$ cat .git/belayd/fleet/orphan/audit.log
+{"timestamp":1793144129697,"fleetId":"orphan","actor":"demo-session","action":"reconcile-cross-fleet","taskIds":[],"detail":"target `orphan`; session supervises owned"}
+[exit=0]
+
+$ jq -c '.taskIds' .git/belayd/fleet/orphan/fleet.json
+["bd-70"]
+[exit=0]
+
+
+### 2026-10-28T00:35:31+01:00 — own fleet, named explicitly: prune is allowed (no reconcile-cross-fleet audit line)
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-cross [
+  ["belayd_fleet_launch",{"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}],
+  ["belayd_fleet_reconcile",{"fleetId":"owned","pruneDeadMembers":true}]]
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-60"],"fleetId":"owned","untilComplete":false}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `owned`: re-armed — supervisor record rewritten, 1 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-60 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+=== belayd_fleet_reconcile {"fleetId":"owned","pruneDeadMembers":true}
+[belayd-harness] could not reap every ordering gate of the pruned member(s): Command failed: bd gate list bd-60 --json
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+
+Fleet `owned` reconcile: 1 repair(s) applied.
+- queue: consistent (no lock, no in-flight entries)
+- supervisor: live (session demo-session)
+- member bd-60: orchestrator not running
+- members: pruned bd-60 (no orchestrator process carries the member session token); worktrees, transcripts, and beads are untouched
+
+Warnings (1):
+  - could not reap every ordering gate of the pruned member(s): Command failed: bd gate list bd-60 --json
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+
+[belayd_fleet_reconcile exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-60 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  },
+  {
+    "message": "could not reap every ordering gate of the pruned member(s): Command failed: bd gate list bd-60 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "warning"
+  },
+  {
+    "message": "Fleet owned: could not read the ordering gates of bd-60: Command failed: bd gate list bd-60 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "warning"
+  }
+]
+[exit=0]
+
+$ grep -c reconcile-cross-fleet .git/belayd/fleet/owned/audit.log || echo 'no reconcile-cross-fleet line for the own-fleet reconcile (expected)'
+0
+no reconcile-cross-fleet line for the own-fleet reconcile (expected)
+[exit=0]

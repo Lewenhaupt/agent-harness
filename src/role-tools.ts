@@ -72,6 +72,7 @@ export const SUPERVISOR_FLEET_TOOLS: readonly string[] = [
   "belayd_fleet_resume",
   "belayd_fleet_advance",
   "belayd_fleet_reconcile",
+  "belayd_fleet_release",
 ];
 
 /** Every fleet tool, for the contract audit. */

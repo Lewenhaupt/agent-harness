@@ -60,7 +60,9 @@ import type {
   FleetMemberClaim,
   FleetMemberLaunchOutcome,
   FleetMemberLeaseProbe,
+  FleetMemberLiveness,
   FleetMemberObservation,
+  FleetMemberReleaseReason,
   FleetMergeQueueEntry,
   FleetMode,
   FleetNoteDelivery,
@@ -134,7 +136,8 @@ import {
   buildVerifierPrompt,
   COMMENT_EXCERPT_MAX_CHARS,
   checkToolAllowed,
-  classifyOrchestratorClaim,
+  classifyMemberLease,
+  classifyMemberLivenessInWorktree,
   clearAssignee,
   clearHandoff,
   collectChangeContext,
@@ -171,6 +174,7 @@ import {
   finishFleetRun,
   fleetBeadTaskIds,
   fleetMemberTaskIds,
+  fleetModeForId,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
   formatArtifactIndex,
@@ -212,6 +216,7 @@ import {
   isWorkflowComplete,
   lastAssistantText,
   listArchifyExamples,
+  listFleetIds,
   listFleetOrderingGatesForBead,
   listPendingUserCompletions,
   listRuns,
@@ -230,6 +235,8 @@ import {
   matchProjectId,
   matchSessionOwnedWorktree,
   matchWorkspaceId,
+  memberEvidenceCutoff,
+  memberRanEvidence,
   memberSessionToken,
   metricsHostname,
   mirrorAssignee,
@@ -258,6 +265,7 @@ import {
   planFleetAdvance,
   planFleetTick,
   planGateNotices,
+  planOutsideFleetLandings,
   projectWorkspacesPath,
   pruneLandedFleetMember,
   RESEARCHER_SYSTEM_PROMPT,
@@ -274,12 +282,14 @@ import {
   readSupervisorHeartbeat,
   readWorktreeBranch,
   reapFleetOrderingGatesByPrefix,
+  reconcileAuthority,
   recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
   recordRunTick,
   releaseOrchestratorClaim,
+  releaseRunMembers,
   replaceOrchestratorClaim,
   resolveArchifyHome,
   resolveAutoRebaseEnabled,
@@ -311,6 +321,7 @@ import {
   scanProcesses,
   scanProofRefs,
   selectFleetEvents,
+  sessionSupervisesFleetRecord,
   setupWorktree,
   spawnAgentWithFallback,
   spawnDetachedRun,
@@ -330,6 +341,8 @@ import {
   withoutSessionPin,
   withSessionPin,
   workflowGateToolSet,
+  workflowStateFilePath,
+  worktreeCreatedAtFromStat,
   writeHandoff,
   writePhaseArtifact,
   writeSupervisorHeartbeat,
@@ -7042,20 +7055,140 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     now: number,
     sessionId?: string,
   ): FleetMemberLeaseProbe {
-    const verdict = classifyOrchestratorClaim({
+    // One rule with the status view: a fresh `pending:` spawn claim is live, a
+    // stale one is unclassifiable (never absent), and the rest follows the lease
+    // verdict (bd-166).
+    return classifyMemberLease({
       read: readOrchestratorClaim({ worktreePath }),
       now,
       ...(sessionId === undefined ? {} : { sessionId }),
     });
-    switch (verdict.kind) {
-      case "free":
-        return { state: "absent" };
-      case "corrupt":
-        return { state: "corrupt", error: verdict.error };
-      case "held":
-        return verdict.state === "live"
-          ? { state: "live", heartbeatAt: verdict.claim.heartbeatAt }
-          : { state: "stale" };
+  }
+
+  /**
+   * `taskId → launchedAt` from one fleet's run record.
+   *
+   * An unreadable or absent fleet simply records no launch: the worktree creation
+   * instant is still a cutoff, and no cutoff keeps the member counted (bd-166).
+   */
+  function recordedLaunches(options: {
+    gitCommonDir: string | undefined;
+    fleetId: string;
+  }): ReadonlyMap<string, number> {
+    const launches = new Map<string, number>();
+    if (options.gitCommonDir === undefined) return launches;
+    const loaded = readFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) return launches;
+    for (const member of loaded.intent.run?.members ?? []) {
+      launches.set(member.taskId, member.launchedAt);
+    }
+    return launches;
+  }
+
+  /**
+   * Per-member orchestrator liveness for the capacity count (bd-166).
+   *
+   * One process snapshot per launch — so two members cannot see two different
+   * process tables — plus each member's own worktree lease, because a pi-web
+   * orchestrator is a session inside the daemon and never appears in argv. The
+   * classification is the reconcile path's, reused rather than re-derived, so the
+   * capacity count and a repair read the same evidence. They deliberately differ on
+   * one verdict: a member with no worktree is `unknown` (counted) here, because a
+   * launch may be creating it, while reconcile needs positive `absent` evidence
+   * before it prunes (it reads such a member as absent, which is its documented
+   * escape hatch). Capacity errs to counted; pruning errs to keeping the record.
+   */
+  function memberLivenessProbe(
+    ctx: ExtensionContext,
+    /** `<git-common-dir>` for the launch cutoff's intent reads; both callers have it. */
+    gitCommonDir: string | undefined,
+  ): (fleetId: string, taskId: string) => FleetMemberLiveness {
+    const scan = scanProcesses();
+    const launchedAtFor = memberLaunchReader(gitCommonDir);
+    return (fleetId: string, taskId: string): FleetMemberLiveness => {
+      // The worktree is keyed by the task id; the fleet id keys the recorded launch
+      // that bounds the evidence cutoff.
+      const worktreePath = resolveWorktreePath(ctx.cwd, `feat/${taskId}`);
+      // A worktree with no evidence its session existed is a launch mid-spawn (the
+      // state is persisted after the worktree is ready), so absence only means gone
+      // once the member has something proving it was real (bd-166). Completion
+      // deletes the state file, so the evidence is that file *or* a run manifest this
+      // execution wrote — never an inherited same-task manifest, hence the cutoff.
+      const since = memberSince({
+        worktreePath,
+        launchedAt: launchedAtFor(fleetId, taskId),
+      });
+      const memberRan =
+        worktreePath !== undefined &&
+        memberRanEvidence({
+          taskId,
+          workflowStatePresent: existsSync(workflowStateFilePath(worktreePath)),
+          runs: listRuns({ cwd: worktreePath }),
+          ...(since === undefined ? {} : { since }),
+        });
+      return classifyMemberLivenessInWorktree({
+        taskId,
+        worktreePath,
+        memberRanEvidence: memberRan,
+        scan,
+        selfPid: process.pid,
+        ...(worktreePath === undefined ? {} : { lease: leaseProbeFor(worktreePath, Date.now()) }),
+      });
+    };
+  }
+
+  /**
+   * `launchedAt` per recorded member, read once per fleet for the evidence cutoff.
+   *
+   * The plan read and the in-write recount both ask about the same members, so each
+   * fleet's `fleet.json` is read once per probe rather than once per member. A fleet
+   * that cannot be read simply has no recorded launch: the worktree's creation
+   * instant is still a cutoff, and no cutoff at all keeps the member counted.
+   */
+  function memberLaunchReader(
+    gitCommonDir: string | undefined,
+  ): (fleetId: string, taskId: string) => number | undefined {
+    const byFleet = new Map<string, ReadonlyMap<string, number>>();
+    return (fleetId: string, taskId: string): number | undefined => {
+      const cached = byFleet.get(fleetId);
+      const launches = cached ?? recordedLaunches({ gitCommonDir, fleetId });
+      if (cached === undefined) byFleet.set(fleetId, launches);
+      return launches.get(taskId);
+    };
+  }
+
+  /**
+   * The launch-evidence cutoff for one member (bd-166).
+   *
+   * The newer of the worktree's creation instant and the run's recorded launch, or
+   * undefined when neither is known (which makes a same-task manifest non-evidence).
+   */
+  function memberSince(options: {
+    worktreePath: string | undefined;
+    launchedAt: number | undefined;
+  }): number | undefined {
+    const created =
+      options.worktreePath === undefined ? undefined : worktreeCreatedAt(options.worktreePath);
+    return memberEvidenceCutoff({
+      ...(created === undefined ? {} : { worktreeCreatedAt: created }),
+      ...(options.launchedAt === undefined ? {} : { launchedAt: options.launchedAt }),
+    });
+  }
+
+  /**
+   * The worktree directory's creation instant, or undefined when it cannot be read.
+   *
+   * A failed stat means "no cutoff", which makes a same-task manifest non-evidence
+   * rather than freeing the slot of a spawn in flight (bd-166).
+   */
+  function worktreeCreatedAt(worktreePath: string): number | undefined {
+    try {
+      return worktreeCreatedAtFromStat(statSync(worktreePath));
+    } catch {
+      return undefined;
     }
   }
 
@@ -7515,6 +7648,73 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     intent: FleetIntent;
     run: FleetRun;
     now: number;
+    /** What this tick observed, for the terminal release sweep (bd-166). */
+    observations: readonly FleetMemberObservation[];
+  }
+
+  /**
+   * Give back the slots of members a terminal run can no longer land (bd-166).
+   *
+   * A finished or halted run is the end of the line: no tick will land its members
+   * any more, so leaving them in the capacity count leaked the repository's 3
+   * slots forever. This releases what provably holds nothing (see
+   * `releaseRunMembers`) and is deliberately **not** a prune: the bead, worktree,
+   * transcript, and mailbox stay, and the id stays in `taskIds`, so status, mail,
+   * and a later landing still see it. A member whose work is complete stays
+   * landable; a paused run is resumable and is never swept.
+   *
+   * The decision is re-made inside the compare-and-replace, because the release is
+   * a cross-tree write and a concurrent writer may have landed or pruned a member
+   * since this tick read the intent. The observations are still the ones this tick
+   * took, so a member the tick never observed (just added by that concurrent
+   * writer) is *not* released: `releaseRunMembers` requires evidence for every id
+   * it frees (bd-166 review).
+   */
+  function releaseTerminalMembers(options: {
+    context: FleetTickContext;
+    reason: FleetMemberReleaseReason;
+  }): readonly string[] {
+    const released: string[] = [];
+    const written = mutateFleetIntent({
+      gitCommonDir: options.context.mode.gitCommonDir,
+      fleetId: options.context.mode.fleetId,
+      mutate: (current) => {
+        const run = current.run ?? options.context.run;
+        const plan = releaseRunMembers({
+          intent: current,
+          run,
+          observations: options.context.observations,
+          reason: options.reason,
+          now: options.context.now,
+        });
+        released.length = 0;
+        released.push(...plan.released);
+        return plan.released.length === 0 ? current : plan.intent;
+      },
+    });
+    const { ctx, mode } = options.context;
+    if (!written.ok) {
+      ctx.ui.notify(
+        `Fleet ${mode.fleetId}: could not release the capacity slot(s) of the terminal members: ${written.error}`,
+        "warning",
+      );
+      return [];
+    }
+    if (released.length === 0) return [];
+    auditFleetAction({
+      ctx,
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+      action: "members-released",
+      taskIds: released,
+      detail:
+        `${options.reason}: members that did not land no longer hold a capacity slot; ` +
+        "beads, worktrees, and transcripts stay",
+    });
+    return [
+      `Fleet ${mode.fleetId}: released the capacity slot(s) of ${released.join(", ")} ` +
+        `(${options.reason}); the members stay for status and a later landing`,
+    ];
   }
 
   async function executeFleetTickAction(
@@ -7762,9 +7962,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       taskIds: (run.members ?? []).map((member) => member.taskId),
       detail: `${action.outcome}: ${action.detail}`,
     });
+    const released = releaseTerminalMembers({ context: options, reason: "run-complete" });
     return {
       run: finishFleetRun({ run, now, outcome: action.outcome }),
-      lines: [`Fleet ${mode.fleetId}: run ${action.outcome}. ${action.detail}`],
+      lines: [`Fleet ${mode.fleetId}: run ${action.outcome}. ${action.detail}`, ...released],
       stop: true,
       acted: true,
     };
@@ -7791,6 +7992,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       taskIds: options.intent.taskIds,
       detail: haltedReason ?? `paused: ${action.detail}`,
     });
+    // Only a terminal halt releases: a pause keeps the run resumable, and its
+    // in-flight members are exactly the ones a resume continues (`haltedReason` is
+    // what distinguishes the two).
+    const released =
+      haltedReason === undefined
+        ? []
+        : releaseTerminalMembers({ context: options, reason: "run-halted" });
     return {
       run:
         haltedReason === undefined
@@ -7798,6 +8006,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           : { ...options.run, updatedAt: now, haltedReason },
       lines: [
         `Fleet ${mode.fleetId}: run ${resumable ? "paused" : "halted"} (${action.reason}): ${action.detail}`,
+        ...released,
       ],
       stop: true,
       acted: true,
@@ -8285,6 +8494,170 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     return `${edge.blocker}\u0000${edge.blocked}`;
   }
 
+  /**
+   * Whether git proves the member's branch is already on the base branch.
+   *
+   * `merge-base --is-ancestor` exits non-zero for "not an ancestor", and a missing
+   * branch or a failed git call throws; every one of those is "not proven landed",
+   * never "landed", because pruning on a probe that did not answer is exactly how a
+   * live member would disappear from the fleet.
+   */
+  async function branchIsOnBase(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+  }): Promise<boolean> {
+    const branch = memberMergeBranch(options.ctx.cwd, options.taskId);
+    if (!branch.ok) return false;
+    try {
+      await runGitCommand(
+        [
+          "merge-base",
+          "--is-ancestor",
+          branch.branch,
+          options.mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH,
+        ],
+        { cwd: options.ctx.cwd, timeoutInMs: 15_000, maxBufferInBytes: 1024 * 1024 },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Land a member whose work reached the base branch outside the fleet (bd-166).
+   *
+   * No merge happens: git already proved the branch is on the base. The landing is
+   * recorded, the member pruned, and its ordering gates resolved exactly like the
+   * loop's own landing, so a later tick does not see a phantom member. Acceptance is
+   * deliberately not re-run — the human who closed the bead already decided what to
+   * do with the bead and worktree.
+   */
+  async function landAlreadyMergedMember(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    run: FleetRun;
+    taskId: string;
+    now: number;
+  }): Promise<
+    | { ok: true; intent: FleetIntent; run: FleetRun; lines: readonly string[] }
+    | { ok: false; error: string }
+  > {
+    const pruned = pruneLandedMember({
+      ctx: options.ctx,
+      mode: options.mode,
+      taskId: options.taskId,
+      now: options.now,
+    });
+    if (!pruned.ok) return { ok: false, error: pruned.error };
+    const run = recordRunMemberLanded({
+      run: options.run,
+      taskId: options.taskId,
+      now: options.now,
+    });
+    const base = options.mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH;
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      action: "fleet-landed",
+      taskIds: [options.taskId],
+      detail: `${options.taskId} was already on ${base} (bead closed outside the fleet); pruned and gates resolved`,
+    });
+    const gateLines = await resolveLandedOrderingGates({
+      ctx: options.ctx,
+      mode: options.mode,
+      taskId: options.taskId,
+      now: options.now,
+    });
+    return {
+      ok: true,
+      intent: pruneLandedFleetMember(options.intent, options.taskId, options.now),
+      run,
+      lines: [
+        `Fleet ${options.mode.fleetId}: landed ${options.taskId} — its bead is closed and its branch is already on ${base}`,
+        ...gateLines,
+      ],
+    };
+  }
+
+  /**
+   * Detect members the fleet never landed but whose work is on the base branch.
+   *
+   * `docs/fleet.md` tells humans to accept with `wt merge` / `bd close`, a path that
+   * never touches `fleet.json` — that is bd-37, and the member kept its slot forever
+   * with nothing left to observe. A bead bd reports `closed`/`done` is a candidate,
+   * and only a git ancestor proof makes it a landing. Bead status alone is not proof
+   * of merging.
+   *
+   * The bead evidence uses the tick's existing budget: one member bead, rotating by
+   * `run.ticks` (`sweepBeads`, the same rotation the gate sweep uses), so a large
+   * fleet does not become a full-fleet `bd show` every 15 s. Each closed candidate
+   * costs exactly one `git merge-base --is-ancestor` probe, and a bd read failure
+   * just skips the sweep for this tick.
+   */
+  async function landMembersMergedOutsideFleet(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    run: FleetRun;
+    now: number;
+  }): Promise<{ intent: FleetIntent; run: FleetRun; lines: readonly string[] }> {
+    const landedIds = new Set(
+      (options.run.members ?? [])
+        .filter((member) => member.landedAt !== undefined)
+        .map((member) => member.taskId),
+    );
+    const candidates = options.intent.taskIds.filter((taskId) => !landedIds.has(taskId));
+    // One bead per tick, rotating with the run's tick counter: a hand merge becomes
+    // visible within a fleet-sized cycle rather than on one 15 s tick, and the tick
+    // keeps the read budget it already had (bd-166 review).
+    const rotating = sweepBeads({ tick: options.run.ticks, members: new Set(candidates) });
+    if (rotating.length === 0) {
+      return { intent: options.intent, run: options.run, lines: [] };
+    }
+    const lookup = await lookupFleetBeads({
+      taskIds: rotating,
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    });
+    // A failed read skips the sweep, silently: this pass is opportunistic (the gate
+    // reaper already reports an unreadable bd), and a per-tick warning about it
+    // would drown the run's own lines.
+    if (!lookup.ok) return { intent: options.intent, run: options.run, lines: [] };
+    const proven = await planOutsideFleetLandings({
+      intent: options.intent,
+      run: options.run,
+      closedBeadIds: closedBeadsOf(lookup.beads),
+      branchOnBase: (taskId) => branchIsOnBase({ ctx: options.ctx, mode: options.mode, taskId }),
+    });
+    let intent = options.intent;
+    let run = options.run;
+    const lines: string[] = [];
+    for (const taskId of proven) {
+      const landed = await landAlreadyMergedMember({
+        ctx: options.ctx,
+        mode: options.mode,
+        intent,
+        run,
+        taskId,
+        now: options.now,
+      });
+      if (!landed.ok) {
+        lines.push(
+          `Fleet ${options.mode.fleetId}: could not record the landing of ${taskId}: ${landed.error}`,
+        );
+        continue;
+      }
+      intent = landed.intent;
+      run = landed.run;
+      lines.push(...landed.lines);
+    }
+    return { intent, run, lines };
+  }
+
   /** One deterministic tick: observe, decide, act, persist. */
   async function fleetTick(options: {
     ctx: ExtensionContext;
@@ -8336,19 +8709,49 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       return { lines: [], stop: true, acted: false };
     }
 
-    const observations = readFleetMemberObservations({ cwd: ctx.cwd, intent, run, now });
+    // A member whose bead was closed and whose work is already on the base branch has
+    // landed outside the fleet; landing it first keeps the observations and the plan
+    // from treating a merged member as still in flight (bd-166).
+    const swept = await landMembersMergedOutsideFleet({
+      ctx,
+      mode: current,
+      intent,
+      run,
+      now,
+    });
+    const tickIntent = swept.intent;
+    const tickRun = swept.run;
+    const observations = readFleetMemberObservations({
+      cwd: ctx.cwd,
+      intent: tickIntent,
+      run: tickRun,
+      now,
+    });
     // Reap before planning: a gate whose member is gone must not outlive the tick
     // that could have noticed, and a closed blocker bead means its dependent is no
     // longer waiting on the fleet.
     const reaped = await reapOrderingGates({
       ctx,
       mode: current,
-      intent,
+      intent: tickIntent,
       now,
-      tick: run.ticks,
+      tick: tickRun.ticks,
     });
-    const action = planFleetTick({ intent, observations, now, idleTicks: run.idleTicks ?? 0 });
-    const result = await executeFleetTickAction({ ctx, mode: current, intent, run, action, now });
+    const action = planFleetTick({
+      intent: tickIntent,
+      observations,
+      now,
+      idleTicks: tickRun.idleTicks ?? 0,
+    });
+    const result = await executeFleetTickAction({
+      ctx,
+      mode: current,
+      intent: tickIntent,
+      run: tickRun,
+      action,
+      now,
+      observations,
+    });
     const progressed = result.acted && action.kind !== "halt";
     const ticked = recordRunTick({ run: result.run, now, progressed });
     // The gate-notice ledger rides on the run this tick persists, so the next
@@ -8359,7 +8762,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       run: recordFleetGateNotices(ticked, reaped.gateNoticeIds),
       now,
     });
-    return { lines: [...reaped.warnings, ...result.lines], stop: result.stop, acted: result.acted };
+    return {
+      lines: [...swept.lines, ...reaped.warnings, ...result.lines],
+      stop: result.stop,
+      acted: result.acted,
+    };
   }
 
   /** Stop the loop's timer (the durable run record is what survives). */
@@ -8809,7 +9216,70 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         outcomes: applied.outcomes ?? [],
       });
     }
+    // An advance is a step of the live run, so it must record the members it
+    // launched there and beat the supervisor heartbeat: without this they sat in
+    // `taskIds` while `run.members` stayed stale, invisible to idle/stall
+    // accounting and to status (bd-166, the wave2 record).
+    if (options.origin === "advance" && applied.ok) {
+      recordAdvanceRunMembers({
+        ctx,
+        fleetId: result.fleetId,
+        outcomes: applied.outcomes ?? [],
+      });
+    }
     return applied;
+  }
+
+  /**
+   * Record an advance's launches in the live run, then beat the heartbeat (bd-166).
+   *
+   * The ticker path already extends the run it holds in memory; the tool path is a
+   * fresh call that never saw the run, and an advance that launched nothing still
+   * needs the beat so a later session can tell a busy supervisor from a dead one.
+   * Both are idempotent: re-recording a member replaces its launch entry.
+   */
+  function recordAdvanceRunMembers(options: {
+    ctx: ExtensionContext;
+    fleetId: string;
+    outcomes: readonly FleetMemberLaunchOutcome[];
+  }): void {
+    const mode = fleetModeFor(options.ctx);
+    if (mode === undefined || mode.fleetId !== options.fleetId) return;
+    const now = Date.now();
+    if (options.outcomes.length > 0) {
+      const written = mutateFleetIntent({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        mutate: (intent) => {
+          const run = intent.run;
+          if (run === undefined || !isFleetRunActive(run)) return intent;
+          return {
+            ...intent,
+            run: extendRunWithLaunches({ run, outcomes: options.outcomes, now }),
+            updatedAt: now,
+          };
+        },
+      });
+      if (!written.ok) {
+        options.ctx.ui.notify(
+          `Fleet ${mode.fleetId}: could not record the advanced member(s) in the run: ${written.error}`,
+          "warning",
+        );
+      }
+    }
+    const beat = writeSupervisorHeartbeat({
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+      sessionId: options.ctx.sessionManager.getSessionId(),
+      pid: process.pid,
+      now,
+    });
+    if (!beat.ok) {
+      options.ctx.ui.notify(
+        `Fleet ${mode.fleetId}: could not write the supervisor heartbeat: ${beat.error}`,
+        "warning",
+      );
+    }
   }
 
   /**
@@ -8843,6 +9313,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       ...(input.pidStartTime === undefined ? {} : { pidStartTime: input.pidStartTime }),
       armToken: input.armToken,
       liveness: { isPidAlive: isProcessAlive, pidStartTime: readProcessStartTime },
+      // bd-166: the ceiling counts orchestrators that are actually running, so the
+      // engine needs per-member liveness. One snapshot per launch call, shared by
+      // both capacity reads (plan and the in-write recount).
+      memberLivenessFor: memberLivenessProbe(ctx, input.gitCommonDir),
       // Supervisor liveness for a run-mode fleet: its recorded pid is the shared
       // pi-web daemon and stays alive after the session dies, so the beat is the
       // only signal that says whether re-arming is safe.
@@ -9898,6 +10372,112 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     },
   });
 
+  /**
+   * Fleets whose intent records this session as supervisor (bd-166).
+   *
+   * The authority rule for a cross-fleet repair: naming another fleet must not by
+   * itself make the caller its supervisor, but a session that supervises *some*
+   * fleet in this repository is the operator's agent for the rest of it too. Read
+   * from the records, so a leaderless fleet is reachable without a hand edit.
+   */
+  function sessionSupervisedFleetIds(ctx: ExtensionContext, gitCommonDir: string): string[] {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const state = getSessionState(ctx);
+    const pidStartTime = readProcessStartTime(process.pid);
+    const supervised: string[] = [];
+    for (const directoryId of listFleetIds({ gitCommonDir })) {
+      const loaded = readFleetIntent({ gitCommonDir, fleetId: directoryId });
+      if (!loaded.ok || loaded.intent === undefined) continue;
+      const fleetId = sanitizeFleetId(directoryId);
+      // Same anchors as own-fleet mode, minus the requirement to hold the fleet:
+      // a resumed session keeps its id but not the recorded process/token, so it
+      // must not inherit cross-fleet repair authority from a stale record.
+      const matches = sessionSupervisesFleetRecord({
+        supervisor: loaded.intent.supervisor,
+        sessionId,
+        ...(state.fleetArm === undefined ? {} : { armToken: state.fleetArm }),
+        liveness: {
+          isPidAlive: isProcessAlive,
+          ...(pidStartTime === undefined ? {} : { pidStartTime: readProcessStartTime }),
+        },
+        fleetId,
+      });
+      if (matches) supervised.push(fleetId);
+    }
+    return supervised;
+  }
+
+  /**
+   * Refuse a cross-fleet repair unless this session supervises some fleet (bd-166),
+   * and audit the named target when it may proceed.
+   */
+  function reconcileAuthorityRefusal(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    own: FleetMode | undefined;
+    targetFleetId: string;
+    pruneDeadMembers: boolean;
+  }): string | undefined {
+    const supervised = sessionSupervisedFleetIds(options.ctx, options.gitCommonDir);
+    const authority = reconcileAuthority({
+      targetFleetId: options.targetFleetId,
+      ...(options.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
+      ...(options.own === undefined ? {} : { ownFleetId: options.own.fleetId }),
+      supervisedFleetIds: supervised,
+      repoFleetIds: listFleetIds({ gitCommonDir: options.gitCommonDir }),
+      sessionId: options.ctx.sessionManager.getSessionId(),
+    });
+    if (!authority.ok) return authority.error;
+    if (!authority.crossFleet) return undefined;
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.targetFleetId,
+      action: "reconcile-cross-fleet",
+      taskIds: [],
+      detail: `target \`${options.targetFleetId}\`; session supervises ${supervised.join(", ")}`,
+    });
+    return undefined;
+  }
+
+  /** Which fleet this reconcile call may repair, or the refusal text. */
+  function resolveReconcileTarget(options: {
+    ctx: ExtensionContext;
+    requested: string | undefined;
+    pruneDeadMembers: boolean;
+  }): { ok: true; mode: FleetMode } | { ok: false; text: string } {
+    const own = fleetModeFor(options.ctx);
+    const requestedFleetId =
+      options.requested === undefined || options.requested.trim() === ""
+        ? undefined
+        : options.requested.trim();
+    if (own === undefined && requestedFleetId === undefined) {
+      return { ok: false, text: fleetSupervisorOnly("belayd_fleet_reconcile") };
+    }
+    const common = gitCommonDirFor(options.ctx.cwd);
+    if (!common.ok) {
+      return { ok: false, text: `Fleet reconcile needs a git repository: ${common.error}` };
+    }
+    const targetFleetId = sanitizeFleetId(requestedFleetId ?? own?.fleetId ?? DEFAULT_FLEET_ID);
+    const mode = fleetModeForId({ gitCommonDir: common.gitCommonDir, fleetId: targetFleetId });
+    if (mode === undefined) {
+      return {
+        ok: false,
+        text:
+          `No fleet intent for \`${targetFleetId}\` under ${common.gitCommonDir}; nothing to ` +
+          "reconcile.",
+      };
+    }
+    const refusal = reconcileAuthorityRefusal({
+      ctx: options.ctx,
+      gitCommonDir: common.gitCommonDir,
+      own,
+      targetFleetId,
+      pruneDeadMembers: options.pruneDeadMembers,
+    });
+    return refusal === undefined ? { ok: true, mode } : { ok: false, text: refusal };
+  }
+
   pi.registerTool({
     name: "belayd_fleet_reconcile",
     label: "Belayd fleet reconcile",
@@ -9916,7 +10496,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       "prune-dead-members=true removes members whose orchestrator is provably gone (no live " +
       "lease AND no matching process — `unknown` is never pruned, and a live supervisor may " +
       "prune); worktrees, transcripts, and beads stay. A second run finds nothing to do. " +
-      "Supervisor sessions only; acts in this session's root checkout.",
+      "Targets this session's own fleet by default; fleetId names another fleet in this " +
+      "repository, which is accepted only when this session supervises some fleet there " +
+      "(audited), so a fleet whose supervisor died can be repaired without editing " +
+      "fleet.json. A cross-fleet call repairs the queue and park; pruneDeadMembers is " +
+      "refused unless the named fleet is this session's own (re-arm that fleet and run " +
+      "reconcile from its own session). Supervisor sessions only; acts in this " +
+      "session's root checkout.",
     parameters: Type.Object({
       pruneDeadMembers: Type.Optional(
         Type.Boolean({
@@ -9925,13 +10511,23 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
             "no `belayd-<taskId>` process); unknown liveness is never pruned and worktrees stay",
         }),
       ),
+      fleetId: Type.Optional(
+        Type.String({
+          description:
+            "Fleet to repair, when it is not this session's own (a fleet whose supervisor died). " +
+            "Accepted only when this session supervises some fleet in this repository",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const extensionCtx = ctx as ExtensionContext;
-      const mode = fleetModeFor(extensionCtx);
-      if (mode === undefined) {
-        return textToolResult(fleetSupervisorOnly("belayd_fleet_reconcile"), 1);
-      }
+      const target = resolveReconcileTarget({
+        ctx: extensionCtx,
+        requested: params.fleetId,
+        pruneDeadMembers: params.pruneDeadMembers === true,
+      });
+      if (!target.ok) return textToolResult(target.text, 1);
+      const mode = target.mode;
 
       const result = await runFleetReconcile({
         gitCommonDir: mode.gitCommonDir,
@@ -10003,6 +10599,154 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           : { warnings: [], gateNoticeIds: [] };
       for (const warning of reaped.warnings) extensionCtx.ui.notify(warning, "warning");
       return textToolResult(result.text, result.ok ? 0 : 1);
+    },
+  });
+
+  /** A release request's decision, or the refusal text (bd-166). */
+  function planFleetRelease(options: { ctx: ExtensionContext; taskId: string }):
+    | {
+        ok: true;
+        mode: FleetMode;
+        taskId: string;
+        already: boolean;
+        liveness: FleetMemberLiveness;
+      }
+    | { ok: false; text: string } {
+    const mode = fleetModeFor(options.ctx);
+    if (mode === undefined) {
+      return { ok: false, text: fleetSupervisorOnly("belayd_fleet_release") };
+    }
+    const taskId = options.taskId.trim();
+    const loaded = readFleetIntent({
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+    });
+    if (!loaded.ok) {
+      return { ok: false, text: `Could not read the fleet intent: ${loaded.error}` };
+    }
+    if (loaded.intent === undefined) {
+      return { ok: false, text: `No fleet intent for \`${mode.fleetId}\`; nothing to release.` };
+    }
+    if (!loaded.intent.taskIds.includes(taskId)) {
+      return {
+        ok: false,
+        text:
+          `${taskId} is not a member of fleet \`${mode.fleetId}\`; its members are ` +
+          `${loaded.intent.taskIds.join(", ") || "(none)"}`,
+      };
+    }
+    if ((loaded.intent.released ?? []).some((entry) => entry.taskId === taskId)) {
+      return {
+        ok: true,
+        mode,
+        taskId,
+        already: true,
+        liveness: { kind: "unknown", reason: "already released" },
+      };
+    }
+    const liveness = memberLivenessProbe(options.ctx, mode.gitCommonDir)(mode.fleetId, taskId);
+    // The same evidence reconcile trusts: a live lease (or a member argv token)
+    // means something is really running, and releasing it out from under itself
+    // would let the next fleet start a fourth orchestrator.
+    if (liveness.kind === "live") {
+      return {
+        ok: false,
+        text:
+          `Fleet release refused: ${taskId}'s orchestrator is live, so it still holds a real ` +
+          "slot. Stop it (belayd_fleet_pause) or let it land; a running member is never " +
+          "released out from under itself.",
+      };
+    }
+    return { ok: true, mode, taskId, already: false, liveness };
+  }
+
+  /**
+   * Write the release entry, re-deciding inside the compare-and-replace (bd-166).
+   *
+   * `released: false` means every call is idempotent: a second release finds the
+   * entry and reports that, instead of appending a duplicate.
+   */
+  function applyFleetRelease(options: {
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+  }): { ok: true; released: boolean } | { ok: false; error: string } {
+    let released = false;
+    const written = mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (intent) => {
+        if (!intent.taskIds.includes(options.taskId)) {
+          return { refuse: `${options.taskId} is no longer a member` };
+        }
+        const existing = intent.released ?? [];
+        if (existing.some((entry) => entry.taskId === options.taskId)) {
+          released = false;
+          return intent;
+        }
+        released = true;
+        return {
+          ...intent,
+          released: [
+            ...existing,
+            { taskId: options.taskId, reason: "operator-release", at: options.now },
+          ],
+          updatedAt: options.now,
+        };
+      },
+    });
+    return written.ok ? { ok: true, released } : { ok: false, error: written.error };
+  }
+
+  pi.registerTool({
+    name: "belayd_fleet_release",
+    label: "Belayd fleet release",
+    description:
+      "Give one member's capacity slot back without losing the member (bd-166). The id stays " +
+      "in the fleet intent (status, mail, and a later landing still see it) and its bead, " +
+      "worktree, transcript, and mailbox are untouched; only the repository-wide " +
+      "orchestrator ceiling stops counting it, so the next fleet can launch. Records " +
+      "released[] on the intent (reason operator-release) and audits member-released. " +
+      "Refused while the member's orchestrator is live (stop or land it instead), and " +
+      "refused for an id that is not a member of this fleet. Unknown liveness may be " +
+      "released, because that is exactly the operator saying the work is not running. " +
+      "Idempotent. Supervisor sessions only.",
+    parameters: Type.Object({
+      taskId: Type.String({
+        description: "Fleet member whose slot to give back (e.g. bd-37)",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const extensionCtx = ctx as ExtensionContext;
+      const plan = planFleetRelease({ ctx: extensionCtx, taskId: params.taskId });
+      if (!plan.ok) return textToolResult(plan.text, 1);
+      const { mode, taskId } = plan;
+      if (plan.already) {
+        return textToolResult(
+          `Fleet \`${mode.fleetId}\`: ${taskId}'s capacity slot is already released; ` +
+            "the bead, worktree, and transcript are unchanged.",
+          0,
+        );
+      }
+      const written = applyFleetRelease({ mode, taskId, now: Date.now() });
+      if (!written.ok) return textToolResult(`Fleet release refused: ${written.error}`, 1);
+      if (written.released) {
+        auditFleetAction({
+          ctx: extensionCtx,
+          gitCommonDir: mode.gitCommonDir,
+          fleetId: mode.fleetId,
+          action: "member-released",
+          taskIds: [taskId],
+          detail:
+            "operator-release: the capacity slot is free; the bead, worktree, and transcript stay",
+        });
+      }
+      return textToolResult(
+        `Fleet \`${mode.fleetId}\`: released ${taskId}'s capacity slot ` +
+          `(liveness: ${plan.liveness.kind}). The member, its bead, worktree, and transcript are ` +
+          "unchanged; it can still be landed, and the slot is free for the next fleet.",
+        0,
+      );
     },
   });
 

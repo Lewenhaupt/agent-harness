@@ -1,0 +1,758 @@
+
+=== bd-166 regression suites, one file per run
+date:   2026-10-28T00:34:54+01:00
+repo:   /home/hugo/git/feat-bd-166
+commit: 758dcb5caff9e79f18b296a41c75f6cab6905171
+
+
+### 2026-10-28T00:34:54+01:00 — vitest run src/__tests__/fleet-launch.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-launch.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-launch.test.ts (68 tests) 53ms
+
+ Test Files  1 passed (1)
+      Tests  68 passed (68)
+   Start at  00:34:54
+   Duration  765ms (transform 294ms, setup 12ms, collect 415ms, tests 53ms, environment 0ms, prepare 61ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:34:55+01:00 — vitest run src/__tests__/fleet-run.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-run.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-run.test.ts (94 tests) 20ms
+
+ Test Files  1 passed (1)
+      Tests  94 passed (94)
+   Start at  00:34:56
+   Duration  494ms (transform 123ms, setup 12ms, collect 181ms, tests 20ms, environment 0ms, prepare 56ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:34:56+01:00 — vitest run src/__tests__/fleet-status.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-status.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-status.test.ts (125 tests) 113ms
+
+ Test Files  1 passed (1)
+      Tests  125 passed (125)
+   Start at  00:34:57
+   Duration  864ms (transform 337ms, setup 13ms, collect 458ms, tests 113ms, environment 0ms, prepare 60ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:34:57+01:00 — vitest run src/__tests__/fleet-sessions.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-sessions.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-sessions.test.ts (30 tests) 11ms
+
+ Test Files  1 passed (1)
+      Tests  30 passed (30)
+   Start at  00:34:58
+   Duration  629ms (transform 225ms, setup 12ms, collect 329ms, tests 11ms, environment 0ms, prepare 55ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:34:59+01:00 — vitest run src/__tests__/fleet-reconcile.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-reconcile.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-reconcile.test.ts (41 tests) 249ms
+
+ Test Files  1 passed (1)
+      Tests  41 passed (41)
+   Start at  00:34:59
+   Duration  942ms (transform 289ms, setup 12ms, collect 401ms, tests 249ms, environment 0ms, prepare 61ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:35:00+01:00 — vitest run src/__tests__/fleet-mode.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-mode.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-mode.test.ts (32 tests) 13ms
+
+ Test Files  1 passed (1)
+      Tests  32 passed (32)
+   Start at  00:35:00
+   Duration  639ms (transform 227ms, setup 13ms, collect 330ms, tests 13ms, environment 0ms, prepare 61ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:35:01+01:00 — vitest run src/__tests__/fleet-state.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/fleet-state.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+ ✓ src/__tests__/fleet-state.test.ts (66 tests) 45ms
+
+ Test Files  1 passed (1)
+      Tests  66 passed (66)
+   Start at  00:35:01
+   Duration  697ms (transform 253ms, setup 12ms, collect 361ms, tests 45ms, environment 0ms, prepare 59ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:35:02+01:00 — vitest run src/__tests__/extension-fleet-p1.test.ts
+
+$ node_modules/.bin/vitest run src/__tests__/extension-fleet-p1.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > registers the fleet tool family and the /fleet command
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > pauses and resumes the fleet through the record, audited
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > pauses and resumes the fleet through the record, audited
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > pauses and resumes the fleet through the record, audited
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > never signals a process when no pid can be tied to the member (forceful pause)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > never signals a process when no pid can be tied to the member (forceful pause)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > signals a verified member pid once and audits it, never a real process (forceful pause)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > signals a verified member pid once and audits it, never a real process (forceful pause)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > treats a capacity-blocked advance as success, not as a failure (W6)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > treats a capacity-blocked advance as success, not as a failure (W6)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > treats a capacity-blocked advance as success, not as a failure (W6)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > sweeps every member's unrecorded ordering gates on a reconcile pass
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > sweeps every member's unrecorded ordering gates on a reconcile pass
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > leaves fleet.json readable when a sweep cannot adopt past the gate bound
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > leaves fleet.json readable when a sweep cannot adopt past the gate bound
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > reports a consistent fleet from reconcile and refuses it from a non-supervisor
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > reports a consistent fleet from reconcile and refuses it from a non-supervisor
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > repairs a stuck merge-queue entry through the tool, and a second call is a no-op
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > repairs a stuck merge-queue entry through the tool, and a second call is a no-op
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > refuses phase, proof, and commit tools with the fleet-specific message
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > refuses phase, proof, and commit tools with the fleet-specific message
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > leaves a normal orchestrator session unaffected
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > leaves a normal orchestrator session unaffected
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > is not entered by a supervisor record left behind by a dead process
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > is not entered by a hand-planted record naming this session and a live pid (W6)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > is not entered by a hand-planted record naming this session and a live pid (W6)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > is not entered by an intent with no supervisor record
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > keeps the bd-119 refusal for a member worktree (fleet refusal comes first, not instead)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > rejects an empty id list and arms no gate
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > reports a launch outside a git repository and arms no gate
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > launches members, records the intent, audits it, and still arms no gate
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > launches members, records the intent, audits it, and still arms no gate
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > audits the launch and each member attempt
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > audits the launch and each member attempt
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > re-arms a dead fleet: members kept, record rewritten, audited (C2)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > re-arms a dead fleet: members kept, record rewritten, audited (C2)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses to take over a fleet another live session supervises (W2)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses to take over a fleet another live session supervises (W2)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses a second fleet from an armed session and keeps the first drainable (W-B)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses a second fleet from an armed session and keeps the first drainable (W-B)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses a second fleet from an armed session and keeps the first drainable (W-B)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > keeps supervision when a member launch in the same fleet fails (W-B)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > keeps supervision when a member launch in the same fleet fails (W-B)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > keeps supervision when a member launch in the same fleet fails (W-B)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+[belayd-harness] fleet default: could not reap every ordering gate of the failed member(s): Unexpected end of JSON input
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses a worktree already driven by a standalone orchestrator (W-D)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > refuses a worktree already driven by a standalone orchestrator (W-D)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > audits the recipients a partial broadcast actually reached (W-A)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > /fleet > audits the recipients a partial broadcast actually reached (W-A)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > counts a bare spawn worktree against the ceiling, not as absent
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > counts a bare spawn worktree against the ceiling, not as absent
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > frees the slot of a member with workflow state but no orchestrator
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > frees the slot of a member with workflow state but no orchestrator
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > frees the slot of a completed member whose state file was cleared (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > frees the slot of a completed member whose state file was cleared (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > does not free a slot for a re-launched bead whose earlier manifest was copied in (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > does not free a slot for a re-launched bead whose earlier manifest was copied in (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > does not free a slot for a re-launched bead whose earlier manifest was copied in (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > still counts a bare worktree holding only another bead's manifest (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mid-spawn capacity (bd-166) > still counts a bare worktree holding only another bead's manifest (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > gives a member's slot back while keeping it a member
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > gives a member's slot back while keeping it a member
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > refuses an id that is not a member of this fleet
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > refuses an id that is not a member of this fleet
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > refuses to release a member whose orchestrator is live
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > release (bd-166) > refuses to release a member whose orchestrator is live
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > repairs a named fleet's queue/park and audits the target
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > repairs a named fleet's queue/park and audits the target
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > refuses pruneDeadMembers for a fleet this session does not supervise
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > refuses pruneDeadMembers for a fleet this session does not supervise
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > prunes its own fleet when the id is named explicitly
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > prunes its own fleet when the id is named explicitly
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > prunes its own fleet when the id is named explicitly
+[belayd-harness] could not reap every ordering gate of the pruned member(s): Unexpected end of JSON input
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > refuses a named fleet from a session that supervises none
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > refuses cross-fleet repair from a resumed session whose anchors no longer match
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > cross-fleet reconcile (bd-166) > still allows cross-fleet repair from a legacy record with no anchors
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > writes a supervisor note into events/ and audits it
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > writes a supervisor note into events/ and audits it
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > mirrors a supervisor note onto the recipient's bead as a belayd comment (bd-152)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > mirrors a supervisor note onto the recipient's bead as a belayd comment (bd-152)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > mirrors a broadcast as one comment per recipient bead, excerpt-capped (bd-152)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > mirrors a broadcast as one comment per recipient bead, excerpt-capped (bd-152)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > keeps the note delivered when the bd mirror fails (bd-152)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > keeps the note delivered when the bd mirror fails (bd-152)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > keeps the note delivered when the bd mirror fails (bd-152)
+[belayd-harness] fleet note mirror failed: bd: comment write failed
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > fans a broadcast out to one file per member, each delivered exactly once (C1)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a typo target instead of creating mail nobody can receive (S3)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a typo target instead of creating mail nobody can receive (S3)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a member writing into events/ for each kind (W1)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a member writing into events/ for each kind (W1)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > round-trips a note through the inbox and acknowledges it once
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > round-trips a note through the inbox and acknowledges it once
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > renders an inbox note even when its ack fails, and says what remains (W5)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > renders an inbox note even when its ack fails, and says what remains (W5)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a non-supervisor session and an unknown fleet id
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a fleet id the session does not supervise
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses a fleet id the session does not supervise
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses an unknown note kind and an over-long body is truncated, not rejected
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > mailbox > refuses an unknown note kind and an over-long body is truncated, not rejected
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects a pending event once, and acks it at agent_end (W4)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects a pending event once, and acks it at agent_end (W4)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects a pending event once, and acks it at agent_end (W4)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > replays an event whose turn never ended (at-least-once)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > replays an event whose turn never ended (at-least-once)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > replays an event whose turn never ended (at-least-once)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > leaves a sibling's event on disk and injects nothing
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > leaves a sibling's event on disk and injects nothing
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > ignores an event in events/ that a member planted (W1, defense in depth)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > ignores an event in events/ that a member planted (W1, defense in depth)
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > does not let a phase sub-agent consume the orchestrator's events
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > does not let a phase sub-agent consume the orchestrator's events
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects nothing for an empty mailbox or a session outside a fleet
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects nothing for an empty mailbox or a session outside a fleet
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet supervisor mode > member events at turn start > injects nothing for an empty mailbox or a session outside a fleet
+[belayd-harness] instruction-group gate skipped: no-sections
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > refuses an invalid id with no fleet intent and no spawn
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > refuses an invalid id with no fleet intent and no spawn
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > refuses a duplicate id
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > refuses a duplicate id
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > clamps an over-ceiling request and says so
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > clamps an over-ceiling request and says so
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+[belayd-harness] fleet default: could not reap every ordering gate of the failed member(s): Unexpected end of JSON input
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > launch tool validation > refuses a launch while this session drives a workflow
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > registers the merge tool and refuses it outside supervisor mode
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > lists an empty merge queue for an armed supervisor
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > lists an empty merge queue for an armed supervisor
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > enqueues one member and audits it, leaving the bead open
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > enqueues one member and audits it, leaving the bead open
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > reports an empty queue from drain without failing the tool
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > belayd_fleet_merge > reports an empty queue from drain without failing the tool
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ends a stopped-everything run as partial on the next tick, not after 240
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ends a stopped-everything run as partial on the next tick, not after 240
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > completes on a hard launch refusal instead of waiting out a capacity block
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > completes on a hard launch refusal instead of waiting out a capacity block
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > completes on a hard launch refusal instead of waiting out a capacity block
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > waits on a capacity-blocked advance, then halts as stalled at the idle cap
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > waits on a capacity-blocked advance, then halts as stalled at the idle cap
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > waits on a capacity-blocked advance, then halts as stalled at the idle cap
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > waits on a capacity-blocked advance, then halts as stalled at the idle cap
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > halts when the fleet record disappears while an advance is in flight
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > halts when the fleet record disappears while an advance is in flight
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > halts when the fleet record disappears while an advance is in flight
+[belayd-harness] bead dependency graph unavailable (Expected property name or '}' in JSON at position 1 (line 1 column 2)); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > records a run for the members it launched and starts the loop
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > records a run for the members it launched and starts the loop
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > names the supervisor session after the members it supervises
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > names the supervisor session after the members it supervises
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > does not re-apply the same supervisor name on every tick
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > does not re-apply the same supervisor name on every tick
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > keeps the supervisor name when the run is only paused
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > keeps the supervisor name when the run is only paused
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ignores a run manifest inherited from the primary checkout
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ignores a run manifest inherited from the primary checkout
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ignores this member's own run manifest copied in from an earlier launch
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > ignores this member's own run manifest copied in from an earlier launch
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > keeps a stopped member in the fleet, and still lands it once its retry finishes
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > keeps a stopped member in the fleet, and still lands it once its retry finishes
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > lands a stopped member once its retry finished and the merge went through
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > lands a stopped member once its retry finished and the merge went through
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > leaves beads for the human with --no-accept
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > leaves beads for the human with --no-accept
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > accepts landed beads only when --accept asked for it
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > accepts landed beads only when --accept asked for it
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > writes no run record with --manual
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > writes no run record with --manual
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > honours untilComplete: false on the launch tool
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > honours untilComplete: false on the launch tool
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > lands a member whose bead is closed and whose branch is already on the base (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > lands a member whose bead is closed and whose branch is already on the base (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > sweeps one member bead per tick, rotating with the run ticks (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > sweeps one member bead per tick, rotating with the run ticks (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > releases a finished run's unlanded member without pruning it (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > releases a finished run's unlanded member without pruning it (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > releases a halted run's unlanded members (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > releases a halted run's unlanded members (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > does not release members when a run merely pauses (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > does not release members when a run merely pauses (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > records an advance-launched member in the live run and beats the heartbeat (bd-166)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > records an advance-launched member in the live run and beats the heartbeat (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet run mode > records an advance-launched member in the live run and beats the heartbeat (bd-166)
+[belayd-harness] bead dependency graph unavailable (Unexpected end of JSON input); scheduling in the order given, without dependency ordering
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > gates an internal edge once and leaves external blockers to bd
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > creates no gate when every blocker is outside the fleet
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > refuses the launch when a gate cannot be created, resolving what it made
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > resolves its ordering gates on landing and never closes the bead
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > records the landing when its ordering gate cannot be resolved, then retries without re-merging
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps a gate whose bead a human closed
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps a gate whose member was removed
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps one dependent of a shared blocker without forgetting the other's gate
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps nothing when bd's bead payload shape is unrecognized
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > adopts the gate bd already has instead of creating a duplicate on relaunch
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps an unrecorded gate whose blocker is gone (crash-window sweep)
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > adopts an unrecorded gate whose blocker is still working instead of releasing it
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > names the adopted gate ids when the intent write loses its race twice
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > adopts one gate of an edge and resolves its duplicate in the same sweep
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > warns once per drifted gate across consecutive ticks
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > reaps nothing when bd answers for only some of the gated beads
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > advances a dependent whose blocker landed, though bd still reports the edge and the bead open
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > keeps that dependent deferred as a dependency while its blocker has not landed
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > fleet ordering gates > lands a blocker, then advances and lands its dependent, closing neither bead
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+stderr | src/__tests__/extension-fleet-p1.test.ts > worktree orchestrator lease > refuses a member whose worktree already has a live orchestrator
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+ ✓ src/__tests__/extension-fleet-p1.test.ts (107 tests) 820ms
+
+ Test Files  1 passed (1)
+      Tests  107 passed (107)
+   Start at  00:35:02
+   Duration  2.15s (transform 910ms, setup 12ms, collect 1.03s, tests 820ms, environment 0ms, prepare 57ms)
+
+[exit=0]
+
+
+### 2026-10-28T00:35:05+01:00 — vitest run --config vitest.integration.config.ts test/fleet-status.integration.test.ts
+
+$ node_modules/.bin/vitest run --config vitest.integration.config.ts test/fleet-status.integration.test.ts
+
+ RUN  v3.2.4 /home/hugo/git/feat-bd-166
+
+stderr | test/fleet-status.integration.test.ts > fleet status (integration, real git) > serves the belayd_fleet_status tool without touching any worktree
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+ ✓ test/fleet-status.integration.test.ts (6 tests) 823ms
+   ✓ fleet status (integration, real git) > serves the belayd_fleet_status tool without touching any worktree  487ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  00:35:05
+   Duration  1.87s (transform 684ms, setup 12ms, collect 763ms, tests 823ms, environment 0ms, prepare 59ms)
+
+[exit=0]

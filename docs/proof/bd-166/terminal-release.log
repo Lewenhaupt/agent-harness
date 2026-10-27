@@ -1,0 +1,266 @@
+
+=== bd-166 terminal-run release: run-complete / run-halted / paused
+date:   2026-10-28T00:35:32+01:00
+repo:   /home/hugo/git/feat-bd-166
+commit: 758dcb5caff9e79f18b296a41c75f6cab6905171
+
+
+### 2026-10-28T00:35:32+01:00 — CASE 1 — run finishes 0-for-N (no worktrees, no beads db): releases run-complete
+
+$ rm -rf /tmp/bd166-proof-complete && mkdir -p /tmp/bd166-proof-complete && cd /tmp/bd166-proof-complete && git init -q -b main ...
+[exit=0]
+
+$ jq -c '{taskIds, released, run: .run.outcome}' .git/belayd/fleet/default/fleet.json
+{"taskIds":["bd-20","bd-21"],"released":null,"run":null}
+[exit=0]
+
+
+### 2026-10-28T00:35:32+01:00 — launch until-complete and let the real ticker run (10 s), then status
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-complete [
+  ["belayd_fleet_launch",{"tasks":["bd-20","bd-21"],"fleetId":"default"}]] 10000
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-20","bd-21"],"fleetId":"default"}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-20 bd-21 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `default`: re-armed — supervisor record rewritten, 2 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-20, bd-21 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+… letting the supervisor ticker run for 10000 ms
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+
+=== belayd_fleet_status {}
+Fleet default
+  intent: bd-20, bd-21, max 3 concurrent
+  released: bd-20 (run-complete), bd-21 (run-complete) — slot given back, member kept
+  run: until-complete — partial at 2026-10-27T23:35:38.436Z (3 tick(s))
+  stopped bd-20 (orchestrator-missing): no worktree holds feat/bd-20
+  stopped bd-21 (orchestrator-missing): no worktree holds feat/bd-21
+  members: 0
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0
+  capacity: ceiling 3, 3 free, 0 counted
+    default: 2 member(s), 0 counted (0 live, 2 unknown, 0 absent), 2 stopped, 2 released; supervisor live
+
+No fleet members: no worktree holds Belayd workflow state.
+
+Warnings (2):
+  - bead metadata unavailable (bd read failed): Command failed: bd show bd-20 bd-21 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+  - bead engagement unavailable (bd read failed): Command failed: bd comments bd-20 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+[belayd_fleet_status exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-20 bd-21 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  },
+  {
+    "message": "Fleet default: running until every member is landed. Observe with belayd_fleet_status; pause with belayd_fleet_pause.",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: could not read the ordering gates of bd-20: Command failed: bd gate list bd-20 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: stopped bd-20 (orchestrator-missing): no worktree holds feat/bd-20",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: could not read the ordering gates of bd-21: Command failed: bd gate list bd-21 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: stopped bd-21 (orchestrator-missing): no worktree holds feat/bd-21",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: could not read the ordering gates of bd-20: Command failed: bd gate list bd-20 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: run partial. 2 member(s) need a human: bd-20, bd-21",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: released the capacity slot(s) of bd-20, bd-21 (run-complete); the members stay for status and a later landing",
+    "level": "info"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:44+01:00 — ON DISK: released[] reasons + members-released audit entry
+
+$ jq -c '{taskIds, released, outcome: .run.outcome}' .git/belayd/fleet/default/fleet.json
+{"taskIds":["bd-20","bd-21"],"released":[{"taskId":"bd-20","reason":"run-complete","at":1793144138436},{"taskId":"bd-21","reason":"run-complete","at":1793144138436}],"outcome":"partial"}
+[exit=0]
+
+$ grep members-released .git/belayd/fleet/default/audit.log
+{"timestamp":1793144138552,"fleetId":"default","actor":"demo-session","action":"members-released","taskIds":["bd-20","bd-21"],"detail":"run-complete: members that did not land no longer hold a capacity slot; beads, worktrees, and transcripts stay"}
+[exit=0]
+
+
+### 2026-10-28T00:35:44+01:00 — CASE 2 — run halts (root checkout parked): releases run-halted
+
+$ rm -rf /tmp/bd166-proof-parked && mkdir -p /tmp/bd166-proof-parked && cd /tmp/bd166-proof-parked && git init -q -b main ...
+[exit=0]
+
+
+### 2026-10-28T00:35:44+01:00 — launch until-complete and let the real ticker stop on the parked root (6 s)
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-parked [
+  ["belayd_fleet_launch",{"tasks":["bd-40","bd-41"],"fleetId":"default"}]] 6000
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-40","bd-41"],"fleetId":"default"}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-40 bd-41 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `default`: re-armed — supervisor record rewritten, 2 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-40, bd-41 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+… letting the supervisor ticker run for 6000 ms
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+
+=== belayd_fleet_status {}
+Fleet default
+  intent: bd-40, bd-41, max 3 concurrent
+  released: bd-40 (run-halted), bd-41 (run-halted) — slot given back, member kept
+  parked: root restore conflicted (stash refs/stash@{0}) — belayd_fleet_reconcile then belayd_fleet_resume
+  run: until-complete — halted: parked: the root checkout is parked (root restore conflicted); reconcile, then resume
+  members: 0
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0
+  capacity: ceiling 3, 3 free, 0 counted
+    default: 2 member(s), 0 counted (0 live, 2 unknown, 0 absent), 0 stopped, 2 released; supervisor live
+
+No fleet members: no worktree holds Belayd workflow state.
+
+Warnings (2):
+  - bead metadata unavailable (bd read failed): Command failed: bd show bd-40 bd-41 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+  - bead engagement unavailable (bd read failed): Command failed: bd comments bd-40 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+[belayd_fleet_status exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-40 bd-41 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  },
+  {
+    "message": "Fleet default: running until every member is landed. Observe with belayd_fleet_status; pause with belayd_fleet_pause.",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: could not read the ordering gates of bd-40: Command failed: bd gate list bd-40 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: run halted (parked): the root checkout is parked (root restore conflicted); reconcile, then resume",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: released the capacity slot(s) of bd-40, bd-41 (run-halted); the members stay for status and a later landing",
+    "level": "info"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:52+01:00 — ON DISK: released[] reasons + members-released audit entry
+
+$ jq -c '{taskIds, released, haltedReason: .run.haltedReason}' .git/belayd/fleet/default/fleet.json
+{"taskIds":["bd-40","bd-41"],"released":[{"taskId":"bd-40","reason":"run-halted","at":1793144145826},{"taskId":"bd-41","reason":"run-halted","at":1793144145826}],"haltedReason":"parked: the root checkout is parked (root restore conflicted); reconcile, then resume"}
+[exit=0]
+
+$ grep members-released .git/belayd/fleet/default/audit.log
+{"timestamp":1793144145945,"fleetId":"default","actor":"demo-session","action":"members-released","taskIds":["bd-40","bd-41"],"detail":"run-halted: members that did not land no longer hold a capacity slot; beads, worktrees, and transcripts stay"}
+[exit=0]
+
+
+### 2026-10-28T00:35:52+01:00 — CASE 3 — run is PAUSED (resumable): nothing is released
+
+$ rm -rf /tmp/bd166-proof-paused && mkdir -p /tmp/bd166-proof-paused && cd /tmp/bd166-proof-paused && git init -q -b main ...
+[exit=0]
+
+
+### 2026-10-28T00:35:52+01:00 — launch until-complete on a paused fleet and let the real ticker run (6 s)
+
+$ timeout 120 /home/hugo/git/feat-bd-166/node_modules/.bin/jiti /home/hugo/git/feat-bd-166/docs/proof/bd-166/scripts/bd166-fleet.ts /home/hugo/git/feat-bd-166 /tmp/bd166-proof-paused [
+  ["belayd_fleet_launch",{"tasks":["bd-30","bd-31"],"fleetId":"default"}]] 6000
+[belayd-harness] registering tools/commands from file:///home/hugo/git/feat-bd-166/extensions/index.ts
+
+=== belayd_fleet_launch {"tasks":["bd-30","bd-31"],"fleetId":"default"}
+[belayd-harness] bead dependency graph unavailable (Command failed: bd show bd-30 bd-31 --json --brief-deps
+Error: no beads database found
+Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database
+      or set BEADS_DIR to point to your .beads directory
+); scheduling in the order given, without dependency ordering
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+Fleet `default`: re-armed — supervisor record rewritten, 2 existing member(s) preserved, no new members (maxConcurrent 3).
+Preserved existing member(s): bd-30, bd-31 (not relaunched; their worktrees and orchestrators are untouched).
+Members are detached orchestrators; this session supervises them. It runs no phases and owns no worktree — use belayd_fleet_status, belayd_fleet_note, and belayd_fleet_inbox.
+[belayd_fleet_launch exit=0]
+
+… letting the supervisor ticker run for 6000 ms
+[belayd-harness] could not rename the supervisor session: pi.setSessionName is not a function
+
+=== belayd_fleet_status {}
+Fleet default
+  intent: bd-30, bd-31, max 3 concurrent, paused
+  run: until-complete — 1 tick(s), last tick 2026-10-27T23:35:53.453Z
+  members: 0
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0
+  capacity: ceiling 3, 1 free, 2 counted
+    default: 2 member(s), 2 counted (0 live, 2 unknown, 0 absent), 0 stopped, 0 released; supervisor live
+
+No fleet members: no worktree holds Belayd workflow state.
+
+Warnings (4):
+  - fleet default still records bd-30, but no worktree holds feat/bd-30; release it with belayd_fleet_release bd-30 (or reconcile --prune-dead-members) if its work is gone
+  - fleet default still records bd-31, but no worktree holds feat/bd-31; release it with belayd_fleet_release bd-31 (or reconcile --prune-dead-members) if its work is gone
+  - bead metadata unavailable (bd read failed): Command failed: bd show bd-30 bd-31 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+  - bead engagement unavailable (bd read failed): Command failed: bd comments bd-30 --json Error: no beads database found Hint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database or set BEADS_DIR to point to your .beads directory
+[belayd_fleet_status exit=0]
+
+notifications: [
+  {
+    "message": "bead dependency graph unavailable (Command failed: bd show bd-30 bd-31 --json --brief-deps\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n); scheduling in the order given, without dependency ordering",
+    "level": "warning"
+  },
+  {
+    "message": "Fleet default: running until every member is landed. Observe with belayd_fleet_status; pause with belayd_fleet_pause.",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: could not read the ordering gates of bd-30: Command failed: bd gate list bd-30 --json\nError: no beads database found\nHint: run 'bd where' to inspect the resolved workspace, or 'bd init' to create a new database\n      or set BEADS_DIR to point to your .beads directory\n",
+    "level": "info"
+  },
+  {
+    "message": "Fleet default: run paused (paused): stepping away",
+    "level": "info"
+  }
+]
+[exit=0]
+
+
+### 2026-10-28T00:35:59+01:00 — ON DISK: no released[] entries, no members-released audit line
+
+$ jq -c '{taskIds, released, paused, haltedReason: .run.haltedReason}' .git/belayd/fleet/default/fleet.json
+{"taskIds":["bd-30","bd-31"],"released":null,"paused":true,"haltedReason":null}
+[exit=0]
+
+$ grep -c members-released .git/belayd/fleet/default/audit.log || echo 'no members-released audit line (expected)'
+0
+no members-released audit line (expected)
+[exit=0]

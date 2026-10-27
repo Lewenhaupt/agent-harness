@@ -27,6 +27,12 @@
 
 import { readdirSync, readFileSync } from "node:fs";
 import { readProcessStartTime } from "./fleet-mode.js";
+import type { OrchestratorClaimRead } from "./orchestrator-claim.js";
+import {
+  classifyOrchestratorClaim,
+  isPendingOrchestratorClaim,
+  ORCHESTRATOR_CLAIM_STALE_MS,
+} from "./orchestrator-claim.js";
 
 /** Prefix of every Belayd session name; a member orchestrator is `belayd-<taskId>`. */
 export const FLEET_ORCHESTRATOR_SESSION_PREFIX = "belayd-";
@@ -164,6 +170,120 @@ export function classifyMemberLivenessFromScan(options: {
   });
   if (fromProcess.kind === "live") return fromProcess;
   return { kind: "absent" };
+}
+
+/**
+ * Classify one member from its worktree, the process snapshot, and its lease.
+ *
+ * A recorded member whose worktree does not exist yet cannot be evidenced at all:
+ * a launch writes the intent (member now in `taskIds`) *before* it creates the
+ * worktree and takes the spawn lease, so a concurrent launch recounting in that
+ * window would see "no worktree, no process, no lease" and classify `absent` —
+ * freeing a slot for an orchestrator that is being spawned right now (bd-166).
+ * `unknown` is the honest verdict there, and the capacity rule counts it.
+ *
+ * The real `absent` signal is a member whose session provably existed but which has
+ * no lease and no process now (a hand-merged bead, a member stopped awaiting a
+ * human, a workflow that ran to completion).
+ *
+ * "Its session existed" is what bounds the spawn window, and it is not the state
+ * file alone. A launch writes the intent, creates the worktree, waits for it to
+ * become ready (up to 60 s), and only then takes the `pending:` spawn lease; in the
+ * middle of that sequence the worktree exists but carries neither a lease nor
+ * evidence of a session. A bare worktree is therefore a spawn in flight —
+ * `unknown`, counted — not an absent member. Completion deletes
+ * `.belayd/workflow.json` (`clearWorkflowState`) while the run manifests stay, so
+ * the caller injects `memberRanEvidence` (state file present **or** a run manifest
+ * of this task); keying on the state file alone would count a finished member
+ * forever (bd-166).
+ */
+export function classifyMemberLivenessInWorktree(options: {
+  taskId: string;
+  /** The member's worktree, or undefined when none exists (yet). */
+  worktreePath: string | undefined;
+  /**
+   * Whether anything in the worktree proves this member's session existed: a
+   * `.belayd/workflow.json` (readable or corrupt) or a run manifest of this task
+   * (`memberRanEvidence`, `fleet-run.ts`).
+   *
+   * Injected, not read here: the classifier stays free of worktree I/O, and the
+   * caller (launch, status) already has the evidence. Only consulted for an
+   * otherwise-`absent` member with an existing worktree.
+   */
+  memberRanEvidence: boolean;
+  scan: FleetProcessScan;
+  selfPid?: number;
+  /** Classified lease for that worktree, when the caller could read one. */
+  lease?: FleetMemberLeaseProbe;
+}): FleetMemberLiveness {
+  if (options.worktreePath === undefined) {
+    // An argv token is evidence on its own (a CLI-spawned orchestrator), so a live
+    // process still wins when the worktree cannot be resolved. Otherwise the member
+    // is unclassifiable, never absent: the launch may still be creating the tree.
+    const fromScan = classifyMemberLivenessFromScan({
+      taskId: options.taskId,
+      scan: options.scan,
+      ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
+    });
+    if (fromScan.kind === "live") return fromScan;
+    return {
+      kind: "unknown",
+      reason: `no worktree for ${options.taskId} yet (a launch may still be creating it)`,
+    };
+  }
+  const fromScan = classifyMemberLivenessFromScan({
+    taskId: options.taskId,
+    scan: options.scan,
+    ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
+    ...(options.lease === undefined ? {} : { lease: options.lease }),
+  });
+  if (fromScan.kind !== "absent") return fromScan;
+  if (!options.memberRanEvidence) {
+    return {
+      kind: "unknown",
+      reason:
+        `worktree for ${options.taskId} has no lease and no evidence it ever ran ` +
+        "(a launch is spawning it)",
+    };
+  }
+  return fromScan;
+}
+
+/**
+ * Classify a worktree's orchestrator lease, the one source for both the launch /
+ * reconcile probe and the read-only status view (bd-166).
+ *
+ * A `pending:` claim is a spawner placeholder: while it is fresh the child
+ * orchestrator is being created and the member is `live`; once it is stale the
+ * spawn died mid-flight, which is *not* evidence of absence, so it is
+ * unclassifiable (`corrupt` → `unknown`) rather than `absent`.
+ */
+export function classifyMemberLease(options: {
+  read: OrchestratorClaimRead;
+  now: number;
+  /** Session asking, when the caller is deciding whether it already owns the tree. */
+  sessionId?: string;
+}): FleetMemberLeaseProbe {
+  if (options.read.kind === "ok" && isPendingOrchestratorClaim(options.read.claim)) {
+    return options.now - options.read.claim.heartbeatAt < ORCHESTRATOR_CLAIM_STALE_MS
+      ? { state: "live", heartbeatAt: options.read.claim.heartbeatAt }
+      : { state: "corrupt", error: "stale pending spawn lease (spawn never completed)" };
+  }
+  const verdict = classifyOrchestratorClaim({
+    read: options.read,
+    now: options.now,
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+  });
+  switch (verdict.kind) {
+    case "free":
+      return { state: "absent" };
+    case "corrupt":
+      return { state: "corrupt", error: verdict.error };
+    case "held":
+      return verdict.state === "live"
+        ? { state: "live", heartbeatAt: verdict.claim.heartbeatAt }
+        : { state: "stale" };
+  }
 }
 
 export interface ScanProcessesOptions {
