@@ -23,6 +23,7 @@ import {
   readProcessStartTime,
   resolveFleetMode,
   resolveMemberFleet,
+  sessionSupervisesFleetRecord,
 } from "../fleet-mode.js";
 import { fleetEventsDir, fleetInboxDir, sanitizeFleetId } from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
@@ -247,6 +248,94 @@ describe("fleet directory scan", () => {
     };
     // A reader inside the tool-call gate must never throw.
     expect(listFleetIds({ gitCommonDir: commonDir, fs })).toEqual([]);
+  });
+});
+
+describe("sessionSupervisesFleetRecord (bd-166)", () => {
+  const liveness = {
+    isPidAlive: (pid: number) => pid === 4242,
+    pidStartTime: (pid: number) => (pid === 4242 ? "start-1" : undefined),
+  };
+  const record = {
+    sessionId: "session-1",
+    pid: 4242,
+    pidStartTime: "start-1",
+    armToken: "token-1",
+  };
+
+  it("accepts a session holding the record's anchors and arm token", () => {
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: record,
+        sessionId: "session-1",
+        armToken: { fleetId: "default", token: "token-1" },
+        liveness,
+        fleetId: "default",
+      }),
+    ).toBe(true);
+  });
+
+  it("refuses a resumed session that lost the token or the process identity", () => {
+    // Same session id, new process, no arm token: own-fleet mode already refuses
+    // this, and cross-fleet authority must not be weaker.
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: record,
+        sessionId: "session-1",
+        liveness,
+        fleetId: "default",
+      }),
+    ).toBe(false);
+    // A reused pid with a different start time is not the same process.
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: record,
+        sessionId: "session-1",
+        armToken: { fleetId: "default", token: "token-1" },
+        liveness: { ...liveness, pidStartTime: () => "start-2" },
+        fleetId: "default",
+      }),
+    ).toBe(false);
+    // A token minted for another fleet does not authorize this one.
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: record,
+        sessionId: "session-1",
+        armToken: { fleetId: "other", token: "token-1" },
+        liveness,
+        fleetId: "default",
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to the session id for a legacy record with no anchors", () => {
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: { sessionId: "session-1", pid: 999_999 },
+        sessionId: "session-1",
+        liveness: { isPidAlive: () => false },
+        fleetId: "default",
+      }),
+    ).toBe(true);
+  });
+
+  it("still checks the process for a partial legacy record (start time, no token)", () => {
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: { sessionId: "session-1", pid: 4242, pidStartTime: "start-1" },
+        sessionId: "session-1",
+        liveness,
+        fleetId: "default",
+      }),
+    ).toBe(true);
+    expect(
+      sessionSupervisesFleetRecord({
+        supervisor: { sessionId: "session-1", pid: 4242, pidStartTime: "old-start" },
+        sessionId: "session-1",
+        liveness,
+        fleetId: "default",
+      }),
+    ).toBe(false);
   });
 });
 

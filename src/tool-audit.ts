@@ -106,6 +106,7 @@ export const HARNESS_TOOL_NAMES: readonly string[] = [
   "belayd_fleet_note",
   "belayd_fleet_pause",
   "belayd_fleet_reconcile",
+  "belayd_fleet_release",
   "belayd_fleet_resume",
   "belayd_fleet_status",
   "belayd_outline",

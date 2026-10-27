@@ -452,10 +452,12 @@ Operational limits, at the point you hit them:
   (unreadable `/proc`, an unreadable lease) is never pruned. The parameter is
   `pruneDeadMembers` (camelCase) — the refusal hint in the report says "re-run
   with prune-dead-members", which is prose, not the parameter name.
-- **Capacity is narrowed by pruning, never by liveness subtraction at launch.**
-  The launch path always counts every recorded member of every fleet; a verdict
-  from the process table or the lease is not wired into it. So a dead member holds
-  a slot until you prune it (or the run loop lands it, which prunes it).
+- **Capacity counts liveness, and a prune removes the record.** Since bd-166 the
+  launch counts a member only while its orchestrator is `live` or `unknown`; an
+  `absent` member stops consuming a slot without being removed, and a `released`
+  member never consumes one. A prune is still how you erase the record itself.
+  Both are narrowings of the `taskIds` count, not of the member's work: the
+  worktree, transcript, and bead stay either way.
 - **A pruned member cannot be relaunched through the fleet while its lease is
   live.** The lease names the session that owns the worktree, so a second launch is
   refused (`live orchestrator lease`) instead of creating a duplicate orchestrator.
@@ -524,16 +526,24 @@ worktree lease — is in `docs/fleet-run.md`.
 | Stop a member that ignores mail | `belayd_fleet_pause` `force` | SIGTERM + per-pid audit (delivery only) |
 | Come back | `belayd_fleet_resume` | clears `paused`/`park`, `resume` notes |
 | Repair after a crash | `belayd_fleet_reconcile` | queue/park repair, liveness report |
+| Give one member's slot back (keep the bead and worktree) | `belayd_fleet_release` | a `released` entry on the intent, `member-released` audit |
 | Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease and no process from `taskIds` (never `unknown`) |
+| Repair a fleet whose supervisor died | `belayd_fleet_reconcile` `fleetId: "<id>"` | queue/park repair in that fleet; accepted only when this session supervises some fleet in this repo (audited `reconcile-cross-fleet`). `pruneDeadMembers` is refused for a fleet that is not this session's own |
 | Accept one member's work (close its bead) | a run with `accept: true` (or `/fleet … --accept`) | bead status, audited; the merged worktree is removed on landing either way |
 | Accept the work without the loop | `wt merge`, `bd close` | bead status — `belayd_fleet_merge` itself never touches a bead |
 
 `belayd_fleet_status` and `belayd_fleet_note` work in any session that is inside a
 fleet (the supervisor writes `events/`, a member writes `inbox/`). `belayd_fleet_inbox`,
 `belayd_fleet_merge`, `belayd_fleet_pause`, `belayd_fleet_resume`,
-`belayd_fleet_advance`, and `belayd_fleet_reconcile` are **supervisor-only**: they
-refuse unless `fleet.json` names this session as the live supervisor, and a record
-left by a dead process does not count — re-arm with `/fleet` first.
+`belayd_fleet_advance`, `belayd_fleet_reconcile`, and `belayd_fleet_release` are
+**supervisor-only**: they refuse unless `fleet.json` names this session as the live
+supervisor, and a record left by a dead process does not count — re-arm with
+`/fleet` first. A reconcile that names another `fleetId` additionally requires this
+session to supervise *some* fleet in the repository (same session/process/token
+anchors as own-fleet mode; a legacy record with no anchors falls back to the
+session id), audits the cross-fleet target, and repairs only the queue/park —
+`pruneDeadMembers` on another fleet is refused (re-arm that fleet and run
+reconcile or `belayd_fleet_release` from its own session).
 
 ### Failure recovery
 
@@ -547,7 +557,7 @@ left by a dead process does not count — re-arm with `/fleet` first.
 | `ordering gates open: …` in the status header | This fleet still holds ordering-gate records: **normal** while the blocker has not landed, since an open gate is exactly what is holding the dependent back. When the blocker *has* landed the records should be gone, so it then names a landing whose resolve hit a transient bd failure | Nothing while the blocker is still working: the gate is doing its job. After the blocker landed, nothing either — the next tick retries the resolve and drops the record. If it stays, `bd gate resolve <gate-id>` and the record goes on the following tick |
 | `Refusing to launch … live orchestrator lease` | The worktree already has a live orchestrator session (its lease is fresh) | One orchestrator per worktree: finish or stop that session. If it is really gone, the lease goes cold after ~3 min and the next launch takes it over (the old record is archived, and the takeover is reported) |
 | Launch refused with `dependency-cycle` and a closed path (`bd-12 → bd-15 → bd-12`) | bd's `blocks` edges form a cycle; no valid order exists | `bd dep remove`, then relaunch. Nothing was created, so there is nothing to clean up |
-| `Scheduling: 0 member(s) now, N deferred (capacity 3, 3 already active, 0 free slot(s))` | The ceiling is full — normally because members of another fleet (or a dead supervisor's fleet) are still recorded | Not an error (exit 0). `belayd_fleet_status` shows who is active; let a member finish, or `belayd_fleet_reconcile` `pruneDeadMembers` (positive `absent` evidence only — never `unknown`), then `belayd_fleet_advance`. Do not edit `fleet.json` by hand to drop ids. **A stopped member holds its slot until it lands or is pruned**, and a member whose retry session is still alive is never prunable, so an all-stopped fleet can pin the ceiling of 3 until those retries end, land, or the supervisor prunes them after the sessions are gone |
+| `Scheduling: 0 member(s) now, N deferred (capacity 3, 3 already active, 0 free slot(s))` | The ceiling is full — normally because members of another fleet (or a dead supervisor's fleet) are still recorded | Not an error (exit 0). The status view's `capacity:` block names each fleet's live/absent/stopped/released members and who holds the slots. Since bd-166 an `absent` member (or one in `released`) does not hold a slot, so this line now means the slots really are busy. Let a member finish, `belayd_fleet_release <taskId>` a slot you know is not in use, or `belayd_fleet_reconcile` `pruneDeadMembers` (positive `absent` evidence only — never `unknown`), then `belayd_fleet_advance`. Do not edit `fleet.json` by hand to drop ids. A member whose retry session is still alive keeps its slot until the session ends or the run releases/lands/prunes it |
 | `<n> fleet intent(s) under this repository's fleet root cannot be read (<ids>). Counting only the readable fleets could exceed the ceiling of 3 …` | `fleet.json` does not parse (hand edit, truncation, newer schema). Writers refuse to replace a present-but-unparsable record, and an unreadable intent refuses a launch rather than assuming zero active members | Inspect `fleet.json`; restore a valid record (or move it aside if the fleet is really finished). Reconcile and launch both refuse until it parses — this is deliberate, because guessing the member count can overshoot the ceiling |
 | `bead metadata unavailable (bd read failed): …` in the status view | `bd show` failed, timed out, is not installed, or the checkout has no beads database | Nothing about the workflow view is wrong; states, phases, and runs still derive. Ignore unless you need titles/statuses |
 | `bead engagement unavailable (bd read failed): …` in the status view | **Every** member's `bd comments` **and** `bd gate list` reads failed (bd missing, wrong database, total outage) | Same: the derived view is intact, only owner/assignee/human/comment columns are missing. Reported once per fleet, not once per member. A mixed result (some beads readable) is not a warning: those beads render `unknown` columns |

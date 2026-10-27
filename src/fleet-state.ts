@@ -436,6 +436,12 @@ export function pruneLandedFleetMember(
     ...intent,
     taskIds: intent.taskIds.filter((candidate) => candidate !== taskId),
     deferred: (intent.deferred ?? []).filter((entry) => entry.taskId !== taskId),
+    // The member no longer exists, so a release that skipped its capacity slot has
+    // nothing left to describe; keeping it would leave a dangling entry no landing
+    // could ever clear.
+    ...(intent.released === undefined
+      ? {}
+      : { released: intent.released.filter((entry) => entry.taskId !== taskId) }),
     updatedAt: now,
   };
 }

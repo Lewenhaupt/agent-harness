@@ -69,6 +69,20 @@ export const FLEET_RUN_OUTCOMES = ["complete", "partial"] as const;
 
 export type FleetRunOutcome = (typeof FLEET_RUN_OUTCOMES)[number];
 
+/**
+ * Why a member's capacity slot was given back without removing it (bd-166).
+ *
+ * Every reason is recorded on the intent (`released[]`) and audited; the label is
+ * what tells a human later whether the run ended, halted, or an operator asked.
+ */
+export const FLEET_MEMBER_RELEASE_REASONS = [
+  "run-complete",
+  "run-halted",
+  "operator-release",
+] as const;
+
+export type FleetMemberReleaseReason = (typeof FLEET_MEMBER_RELEASE_REASONS)[number];
+
 /** Bound on the per-member records a run keeps (same ceiling as the intent). */
 export const FLEET_RUN_MEMBERS_MAX = 256;
 
@@ -115,6 +129,20 @@ export const FLEET_RUN_TICK_INTERVAL_MS = 15_000;
 
 /** Delay after an acting tick, so a landing wave does not wait a full interval. */
 export const FLEET_RUN_ACTION_TICK_INTERVAL_MS = 2_000;
+
+/**
+ * How many scheduled tick intervals may pass before a run looks stuck.
+ *
+ * The loop schedules a tick every {@link FLEET_RUN_TICK_INTERVAL_MS} (and sooner
+ * after one that acted), so ten missed intervals means nothing has written the run
+ * record for 2.5 minutes. Deriving the bound instead of hard-coding a duration keeps
+ * it tied to the loop's own cadence; it is deliberately far below
+ * {@link FLEET_RUN_MAX_IDLE_TICKS}, because a run whose supervisor died cannot wait
+ * an hour for the stall cap to notice.
+ */
+export const FLEET_RUN_STALE_TICK_INTERVALS = 10;
+
+export const FLEET_RUN_STALE_TICK_MS = FLEET_RUN_TICK_INTERVAL_MS * FLEET_RUN_STALE_TICK_INTERVALS;
 
 const FleetRunMemberSchema = z.object({
   taskId: z.string().min(1).max(128),
@@ -351,6 +379,87 @@ function runBelongsToMember(run: RunManifest, options: MemberRunsOptions): boole
     return !(options.failuresRequireLaunch === true && terminalFailure);
   }
   return run.startedAt >= options.launchedAt;
+}
+
+/**
+ * Whether a member's worktree proves its session actually ran (bd-166).
+ *
+ * Completion deletes `.belayd/workflow.json` (`clearWorkflowState`), so a finished
+ * member's tree looks exactly like one that was never spawned: worktree present, no
+ * state file, no lease, no process. A run manifest of this task is the remaining
+ * proof the session existed, and {@link runsBelongingToMember} is the ownership rule
+ * that keeps an inherited manifest of another bead (bd-161) out of the answer.
+ *
+ * `since` is the launch-evidence cutoff. `.belayd/` is gitignored and `.config/wt.toml`
+ * copies ignored files into a new worktree, so a *re-launched* member inherits its own
+ * earlier manifests from the primary checkout — a same-task manifest is not proof this
+ * execution started. With a cutoff, only manifests this execution wrote qualify (a
+ * `running` one always does, since a live run proves an execution is happening now);
+ * with no cutoff nothing qualifies, because guessing there would free a slot mid-spawn.
+ *
+ * Exported so launch, status and reconcile inject the same fact into the liveness
+ * classifier instead of each re-deriving "did it run".
+ */
+export function memberRanEvidence(options: {
+  taskId: string;
+  /** Whether `.belayd/workflow.json` exists, readable or corrupt. */
+  workflowStatePresent: boolean;
+  runs: readonly RunManifest[];
+  /** Newest trustworthy instant this execution could have started (epoch ms). */
+  since?: number;
+}): boolean {
+  if (options.workflowStatePresent) return true;
+  if (options.since === undefined) return false;
+  return (
+    runsBelongingToMember({
+      runs: options.runs,
+      taskId: options.taskId,
+      launchedAt: options.since,
+    }).length > 0
+  );
+}
+
+/**
+ * The cutoff {@link memberRanEvidence} needs: the newest instant this execution can
+ * have started at.
+ *
+ * Two sources, both conservative in the same direction (a later cutoff can only make
+ * evidence harder to claim):
+ *
+ * - the worktree's own creation instant, because an inherited manifest predates the
+ *   tree that holds it — this closes the copy-ignored channel even for a fleet with
+ *   no run record;
+ * - the fleet run's own `launchedAt` for this member, when it launched it.
+ *
+ * Exported so the launch probe and the status reader cannot derive it differently.
+ */
+export function memberEvidenceCutoff(options: {
+  worktreeCreatedAt?: number;
+  launchedAt?: number;
+}): number | undefined {
+  if (options.worktreeCreatedAt === undefined) return options.launchedAt;
+  if (options.launchedAt === undefined) return options.worktreeCreatedAt;
+  return Math.max(options.worktreeCreatedAt, options.launchedAt);
+}
+
+/**
+ * A worktree's creation instant from its `stat`, or undefined when it has none.
+ *
+ * The **earlier** of the two usable times, because neither can predate the tree: that
+ * is the tightest lower bound on when this worktree appeared, so an inherited manifest
+ * (which predates it) can never qualify as evidence. `birthtimeMs` is the honest
+ * answer; filesystems that cannot report it return 0, and `mtimeMs` covers those — a
+ * directory's mtime only moves later as entries are added, so taking the earlier time
+ * keeps a finished member's own manifests inside the cutoff.
+ */
+export function worktreeCreatedAtFromStat(stat: {
+  birthtimeMs?: number;
+  mtimeMs?: number;
+}): number | undefined {
+  const times = [stat.birthtimeMs, stat.mtimeMs].filter(
+    (time): time is number => time !== undefined && time > 0,
+  );
+  return times.length === 0 ? undefined : Math.min(...times);
 }
 
 /**
@@ -973,6 +1082,135 @@ export function finishFleetRun(options: {
 export function isFleetRunActive(run: FleetRun | undefined): boolean {
   if (run === undefined) return false;
   return run.finishedAt === undefined && run.haltedReason === undefined;
+}
+
+/** What a terminal run (or an operator) gives back, and what it leaves alone. */
+export interface FleetReleasePlan {
+  /** The intent after the sweep: `released` appended, `taskIds` untouched. */
+  intent: FleetIntent;
+  /** Ids newly released by this call, in intent order (empty when idempotent). */
+  released: readonly string[];
+}
+
+/**
+ * Members a terminal run gives back to the repository's capacity (bd-166).
+ *
+ * A finished or halted run is the end of the line for its members: no tick will
+ * land them any more, so keeping them in the capacity count leaks the repository's
+ * 3 slots forever. The sweep releases only what provably holds nothing:
+ *
+ * - a member whose work is `complete` stays **landable** and is not released; the
+ *   run's own landing path (or a later one) is what finishes it;
+ * - a member the run stopped is released — its session is gone, its bead and
+ *   worktree stay;
+ * - a member that never started (no state, no runs) is released for the same
+ *   reason;
+ * - a member whose worktree lease is live is never released: something is still
+ *   driving it, so the slot is real and only a stop or a landing may free it;
+ * - a member still running by other evidence is left counted; a later liveness
+ *   probe (or release) is what frees it once the session ends.
+ *
+ * Idempotent: an id already in `released` is skipped, and the same reason twice is
+ * a no-op. Nothing is removed from `taskIds`, so status, mail, and a later landing
+ * still see every member.
+ */
+export function releaseRunMembers(options: {
+  intent: FleetIntent;
+  run: FleetRun;
+  observations: readonly FleetMemberObservation[];
+  reason: FleetMemberReleaseReason;
+  now: number;
+}): FleetReleasePlan {
+  const already = new Set((options.intent.released ?? []).map((entry) => entry.taskId));
+  const byTask = new Map(options.observations.map((entry) => [entry.taskId, entry]));
+  const released: NonNullable<FleetIntent["released"]> = [];
+  for (const taskId of options.intent.taskIds) {
+    if (already.has(taskId)) continue;
+    if (
+      releaseEligible({
+        run: options.run,
+        taskId,
+        observation: byTask.get(taskId),
+      })
+    ) {
+      released.push({ taskId, reason: options.reason, at: options.now });
+    }
+  }
+  if (released.length === 0) return { intent: options.intent, released: [] };
+  return {
+    intent: {
+      ...options.intent,
+      released: [...(options.intent.released ?? []), ...released],
+      updatedAt: options.now,
+    },
+    released: released.map((entry) => entry.taskId),
+  };
+}
+
+/**
+ * Recorded members whose work reached the base branch outside the fleet (bd-166).
+ *
+ * `docs/fleet.md` tells humans to accept with `wt merge` / `bd close`, a path that
+ * never touches `fleet.json`; the member then keeps its bead, worktree, and capacity
+ * slot with nothing left to observe (bd-37). The tick asks once for every member's
+ * bead and offers the closed ones here.
+ *
+ * Two facts are required, and neither is sufficient:
+ *
+ * - bd reports the bead `closed`/`done` — given by the caller's closed set;
+ * - git proves the member's branch is an ancestor of the base branch — the injected
+ *   `branchOnBase` probe. Bead status alone is not proof of merging (a human may
+ *   close a bead whose branch was never merged), and a failed probe must answer
+ *   `false`, because pruning on a probe that did not answer would erase a live
+ *   member's only handle.
+ *
+ * Already-landed members are skipped so a landing is recorded once.
+ */
+export async function planOutsideFleetLandings(options: {
+  intent: FleetIntent;
+  run: FleetRun;
+  closedBeadIds: ReadonlySet<string>;
+  branchOnBase: (taskId: string) => Promise<boolean>;
+}): Promise<readonly string[]> {
+  const landed = new Set(
+    (options.run.members ?? [])
+      .filter((member) => member.landedAt !== undefined)
+      .map((member) => member.taskId),
+  );
+  const candidates = options.intent.taskIds.filter(
+    (taskId) => !landed.has(taskId) && options.closedBeadIds.has(taskId),
+  );
+  const proven: string[] = [];
+  for (const taskId of candidates) {
+    if (await options.branchOnBase(taskId)) proven.push(taskId);
+  }
+  return proven;
+}
+
+/** The per-member half of {@link releaseRunMembers}. */
+function releaseEligible(options: {
+  run: FleetRun;
+  taskId: string;
+  observation: FleetMemberObservation | undefined;
+}): boolean {
+  const member = (options.run.members ?? []).find((entry) => entry.taskId === options.taskId);
+  if (member?.landedAt !== undefined) return false;
+  const observation = options.observation;
+  // No observation means *no evidence from this tick*, which is exactly the
+  // just-launched/just-added member a concurrent writer put in `taskIds` between
+  // this tick's read and its CAS write. It is not "no work", so it is never
+  // released: a terminal run must not free a slot for something it never saw.
+  if (observation === undefined) return false;
+  if (observation.claim === "live") return false;
+  if (observation.progress.kind === "complete") return false;
+  if (isStopped(options.run, options.taskId)) return true;
+  switch (observation.progress.kind) {
+    case "starting":
+    case "missing":
+      return true;
+    default:
+      return false;
+  }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────

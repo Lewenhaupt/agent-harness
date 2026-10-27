@@ -16,6 +16,7 @@
  *   request would hide the operator's intent.
  */
 
+import { FLEET_MAX_CONCURRENT_ORCHESTRATORS, memberHoldsCapacity } from "./fleet-capacity.js";
 import type { SupervisorHeartbeat } from "./fleet-heartbeat.js";
 import { effectiveSupervisorState } from "./fleet-heartbeat.js";
 import type {
@@ -38,6 +39,7 @@ import type {
 import { orderingGateBudgetRefusal } from "./fleet-ordering-gates.js";
 import type { FleetDependencyGraph, FleetSchedule, FleetScheduleResult } from "./fleet-schedule.js";
 import { planFleetSchedule } from "./fleet-schedule.js";
+import type { FleetMemberLiveness } from "./fleet-sessions.js";
 import type { FleetStateFs } from "./fleet-state.js";
 import {
   appendFleetAuditEntry,
@@ -56,7 +58,7 @@ import {
 import { isValidTaskId } from "./session-naming.js";
 
 /** Locked concurrency ceiling: concurrent orchestrators, not total agents. */
-export const FLEET_MAX_CONCURRENT_ORCHESTRATORS = 3;
+export { FLEET_MAX_CONCURRENT_ORCHESTRATORS };
 
 export interface FleetConcurrencyResolution {
   /** Ceiling actually stored in `fleet.json`. */
@@ -140,6 +142,14 @@ export interface FleetLaunchFleet {
   fleetId: string;
   members: readonly string[];
   supervisor: FleetSupervisorState;
+  /**
+   * Members whose slot this fleet gave back (`intent.released`).
+   *
+   * They stay in `members` — a release is not a prune — but they no longer count
+   * against the ceiling. Present so the capacity count can skip them without a
+   * second intent read.
+   */
+  released?: readonly string[];
 }
 
 export interface ValidateFleetLaunchInput {
@@ -530,10 +540,15 @@ export function mergeFleetIntent(input: MergeFleetIntentInput): FleetIntent {
           planned: input.deferred,
         });
   const orderingGates = mergeOrderingGateRecords(current?.orderingGates, input.orderingGates);
+  // A launched member holds a slot from the moment this write lands, so a stale
+  // release entry must not survive re-arming it: that would count the member twice
+  // in opposite directions (in `taskIds`, out of `released`, but still skipped).
+  const released = current?.released?.filter((entry) => !input.taskIds.includes(entry.taskId));
   const merged: FleetIntent = {
     ...created,
     ...(deferred === undefined ? {} : { deferred }),
     ...(orderingGates === undefined ? {} : { orderingGates }),
+    ...(released === undefined || released.length === 0 ? {} : { released }),
   };
   return current === undefined ? merged : inheritFleetFacts(merged, current, input.run);
 }
@@ -995,9 +1010,11 @@ export function collectFleetLaunchContext(
       supervisor: loaded.intent.supervisor,
       liveness: options.liveness,
     });
+    const released = (loaded.intent.released ?? []).map((entry) => entry.taskId);
     fleets.push({
       fleetId: sanitized,
       members: [...loaded.intent.taskIds],
+      ...(released.length === 0 ? {} : { released }),
       supervisor: effectiveSupervisorState({
         state: supervisorState,
         runMode: loaded.intent.run !== undefined,
@@ -1080,6 +1097,17 @@ export interface RunFleetLaunchOptions {
    * later session that re-arming is safe.
    */
   supervisorBeat?: (fleetId: string) => SupervisorHeartbeat | undefined;
+  /**
+   * Per-member orchestrator liveness, for the capacity count (bd-166).
+   *
+   * Injected because the probes (one process-table snapshot plus each member's
+   * worktree lease) live in the caller. Absent — or an `undefined` answer for one
+   * member — is `unknown`, which is still counted: a launch must never assume a
+   * member is gone without evidence. The classification itself is
+   * `reportMemberLiveness`/`classifyMemberLivenessFromScan`; this seam only says
+   * whose member it is.
+   */
+  memberLivenessFor?: (fleetId: string, taskId: string) => FleetMemberLiveness | undefined;
   /** P5 run record this launch starts (written with the intent). */
   run?: FleetIntent["run"];
   /** Clock value supplied by the caller: one timestamp per launch, deterministic in tests. */
@@ -1193,13 +1221,22 @@ interface FleetLaunchPlan {
 /**
  * Orchestrators plausibly already running, counted against the same ceiling (P3).
  *
- * **Every known fleet's members count, whatever its supervisor's liveness.** A
- * detached member orchestrator keeps running after the supervisor session that
- * launched it dies, and validation keeps members disjoint across fleets, so a sum
- * is the count. Supervisor liveness deliberately qualifies only the *wording* of
- * reports, never the subtraction: counting live fleets only would under-count in
- * exactly the common recently-dead-supervisor case, and under-counting starts work
- * past the locked ceiling of 3.
+ * A member counts when its orchestrator liveness is `live` **or** `unknown`; an
+ * `absent` member does not (bd-166). The old rule — count every recorded member,
+ * never liveness — leaked slots: a bead merged by hand, or a member stopped
+ * awaiting a human, kept holding one of the repository's 3 slots forever.
+ *
+ * `unknown` stays counted on purpose, and so does a fleet whose supervisor is
+ * dead: a detached member orchestrator keeps running after the supervisor session
+ * that launched it dies, and an unreadable probe is not proof that nothing runs.
+ * Under-counting starts work past the locked ceiling, which is the direction this
+ * guard exists to prevent.
+ *
+ * No evidence counts as `unknown`: a caller that passes no `livenessFor` (the unit
+ * tests, or a path with no process scan) keeps the conservative old behaviour,
+ * and only positive `absent` evidence gives a slot back. A member is never removed
+ * from the intent here; `released` (an explicit decision) is the other way a slot
+ * is freed, and `absent` members stay visible to status, mail, and a later landing.
  *
  * The one case this cannot see (a fleet whose intent is unreadable) is refused by
  * the caller rather than assumed to contribute zero — the unknown is escalated,
@@ -1209,11 +1246,28 @@ export function countActiveFleetOrchestrators(options: {
   fleets: readonly FleetLaunchFleet[];
   /** Members this call is about to launch; they are not active yet. */
   launchingTaskIds: readonly string[];
+  /** Per-member liveness evidence; `undefined` means "no evidence" (`unknown`). */
+  livenessFor?: (fleetId: string, taskId: string) => FleetMemberLiveness | undefined;
 }): number {
   const launching = new Set(options.launchingTaskIds);
   let active = 0;
   for (const fleet of options.fleets) {
-    active += fleet.members.filter((taskId) => !launching.has(taskId)).length;
+    // Released ids are read per fleet: membership is disjoint only by convention,
+    // and a bare task-id set would let one fleet's release free the same id in
+    // another fleet that still records it as a live member.
+    const released = new Set(fleet.released ?? []);
+    for (const taskId of fleet.members) {
+      if (launching.has(taskId)) continue;
+      const holds = memberHoldsCapacity({
+        taskId,
+        liveness: options.livenessFor?.(fleet.fleetId, taskId) ?? {
+          kind: "unknown",
+          reason: "no liveness probe supplied",
+        },
+        ...(released.has(taskId) ? { released: true } : {}),
+      });
+      if (holds) active += 1;
+    }
   }
   return active;
 }
@@ -1230,6 +1284,7 @@ function planLaunchSchedule(options: {
   taskIds: readonly string[];
   maxConcurrent: number;
   dependencyGraph: FleetDependencyGraph;
+  livenessFor?: (fleetId: string, taskId: string) => FleetMemberLiveness | undefined;
 }): { ok: true; schedule?: FleetSchedule } | { ok: false; text: string } {
   // An unreadable fleet intent makes the true orchestrator count unknowable, and
   // assuming those members are gone is the unsafe direction: the ceiling of 3 is
@@ -1251,6 +1306,7 @@ function planLaunchSchedule(options: {
   const activeCount = countActiveFleetOrchestrators({
     fleets: options.context.fleets,
     launchingTaskIds: options.taskIds,
+    ...(options.livenessFor === undefined ? {} : { livenessFor: options.livenessFor }),
   });
   const scheduled: FleetScheduleResult = planFleetSchedule({
     taskIds: options.taskIds,
@@ -1433,6 +1489,7 @@ function planFleetLaunch(
     taskIds: validation.taskIds,
     maxConcurrent: validation.maxConcurrent,
     dependencyGraph,
+    ...(options.memberLivenessFor === undefined ? {} : { livenessFor: options.memberLivenessFor }),
   });
   if (!scheduled.ok) return { ok: false, text: scheduled.text };
 
@@ -1518,6 +1575,7 @@ function recountLaunchCapacity(
   const activeCount = countActiveFleetOrchestrators({
     fleets: context.fleets,
     launchingTaskIds: plan.taskIds,
+    ...(options.memberLivenessFor === undefined ? {} : { livenessFor: options.memberLivenessFor }),
   });
   if (activeCount + plan.taskIds.length <= plan.maxConcurrent) return { ok: true };
   return {

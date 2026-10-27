@@ -40,6 +40,7 @@ import {
   formatFleetRefusal,
   readFleetIntent,
   readFleetMergeQueue,
+  readSupervisorHeartbeat,
   recordRunMemberLanded,
   startFleetRun,
   updateFleetIntent,
@@ -80,10 +81,26 @@ const worktree = vi.hoisted(() => ({
 /** Force the next N intent writes to lose their CAS race (a two-attempt failure). */
 const intentCas = vi.hoisted(() => ({ conflictsRemaining: 0 }));
 
+/**
+ * Member orchestrators the stubbed process scan reports as running (bd-166).
+ *
+ * Capacity now counts liveness, so a test that needs a member to hold a slot must
+ * say the member is running: the real scan would see nothing and correctly free the
+ * slot.
+ */
+const liveness = vi.hoisted(() => ({ memberTaskIds: [] as string[] }));
+
 vi.mock("../../src/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/index.js")>();
   return {
     ...actual,
+    scanProcesses: () => ({
+      ok: true as const,
+      processes: liveness.memberTaskIds.map((taskId, index) => ({
+        pid: 4200 + index,
+        argv: ["pi", `belayd-${taskId}`],
+      })),
+    }),
     resolveGitCommonDir: (cwd: string) => {
       if (git.failWith !== undefined) return { ok: false as const, error: git.failWith };
       if (git.commonDir === "")
@@ -432,6 +449,9 @@ describe("fleet supervisor mode", () => {
   });
 
   afterEach(() => {
+    // The process-scan stub is global to the file, so a test's live members must not
+    // leak into the next one (bd-166).
+    liveness.memberTaskIds = [];
     rmSync(cwd, { recursive: true, force: true });
     git.commonDir = "";
     git.failWith = undefined;
@@ -683,7 +703,9 @@ describe("fleet supervisor mode", () => {
     await arm(mock, ctx);
 
     // Rewrite the armed fleet so every slot is already taken and a deferred
-    // member is waiting: the advance has nothing it can start.
+    // member is waiting: the advance has nothing it can start. The members must be
+    // reported live for their slots to count (bd-166 counts liveness, not records).
+    liveness.memberTaskIds = ["bd-12", "bd-15"];
     const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
     const armed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     writeFileSync(
@@ -1327,6 +1349,475 @@ describe("fleet supervisor mode", () => {
     if (!written.ok) throw new Error(`could not seed ${taskId} workflow state`);
     return makeCtx(memberCwd, `session-${taskId}`);
   }
+
+  describe("mid-spawn capacity (bd-166)", () => {
+    function bareMemberWorktree(taskId: string): string {
+      const path = join(worktree.path, `feat-${taskId}`);
+      mkdirSync(path, { recursive: true });
+      worktree.byBranch = { [`feat/${taskId}`]: path };
+      return path;
+    }
+
+    it("counts a bare spawn worktree against the ceiling, not as absent", async () => {
+      // The launch writes the intent before `awaitWorktreeReady`, so the worktree can
+      // exist for up to a minute with no lease and no workflow state. That is a spawn
+      // in flight: a concurrent launch must not take its slot.
+      bareMemberWorktree("bd-12");
+      writeIntent({ taskIds: ["bd-12"], supervisor: { sessionId: "dead-session", pid: 999_999 } });
+      const mock = await loadFleetExtension();
+      const tool = mock.tools.get("belayd_fleet_launch");
+      if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+      const result = await tool.execute(
+        "launch-1",
+        { tasks: "bd-13 bd-14", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+
+      const text = textOf(result);
+      expect(text).not.toContain("member(s) launched");
+      expect(text).toContain("capacity 1, 1 already active, 0 free slot(s)");
+      expect(text).toContain("deferred bd-13 (capacity)");
+    });
+
+    it("frees the slot of a member with workflow state but no orchestrator", async () => {
+      // The hand-merged-bead case the bead is about: the worktree and state are
+      // real, the session is gone, so the slot must come back.
+      const path = bareMemberWorktree("bd-12");
+      writeWorkflowState({
+        cwd: path,
+        state: {
+          schemaVersion: 1,
+          taskId: "bd-12",
+          workflowType: "feature",
+          resolutionSource: "default",
+          branch: "feat/bd-12",
+          originalCwd: cwd,
+          phaseOrder: ["plan"],
+          completedPhaseNames: [],
+          startedAt: 1,
+          updatedAt: 1,
+        },
+      });
+      writeIntent({ taskIds: ["bd-12"], supervisor: { sessionId: "dead-session", pid: 999_999 } });
+      const mock = await loadFleetExtension();
+      const tool = mock.tools.get("belayd_fleet_launch");
+      if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+      const result = await tool.execute(
+        "launch-1",
+        { tasks: "bd-13", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+
+      expect(textOf(result)).toContain("1/1 new member(s) launched");
+    });
+    it("frees the slot of a completed member whose state file was cleared (bd-166)", async () => {
+      // `clearWorkflowState` deletes `.belayd/workflow.json` when a workflow finishes,
+      // so a completed member leaves a bare-looking worktree plus its run manifests.
+      // Without the manifest evidence the capacity count called it `unknown` (a spawn
+      // in flight) and the finished member held a slot forever.
+      const path = bareMemberWorktree("bd-12");
+      const manifest = writeRunManifest({
+        cwd: path,
+        manifest: {
+          schemaVersion: 1,
+          runId: "finished-commit",
+          taskId: "bd-12",
+          phase: "commit",
+          sessionName: "belayd-bd-12-sub-commit",
+          status: RunStatus.Completed,
+          // This execution wrote it, so it postdates the worktree it lives in. The
+          // margin absorbs a sub-millisecond birthtime on the directory.
+          startedAt: Date.now() + 1_000,
+          completedAt: Date.now() + 1_000,
+        },
+      });
+      expect(manifest).toHaveProperty("ok", true);
+      writeIntent({ taskIds: ["bd-12"], supervisor: { sessionId: "dead-session", pid: 999_999 } });
+      const mock = await loadFleetExtension();
+      const tool = mock.tools.get("belayd_fleet_launch");
+      if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+      const result = await tool.execute(
+        "launch-1",
+        { tasks: "bd-13", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+
+      expect(textOf(result)).toContain("1/1 new member(s) launched");
+    });
+
+    it("does not free a slot for a re-launched bead whose earlier manifest was copied in (bd-166)", async () => {
+      // `.belayd/` is gitignored and `wt step copy-ignored` copies it into a new
+      // worktree, so a re-launched bd-12 inherits its *own* earlier run from the
+      // primary checkout. That manifest names the task but predates this tree, so it
+      // cannot be evidence that the spawn in flight already ran.
+      const path = bareMemberWorktree("bd-12");
+      const inherited = writeRunManifest({
+        cwd: path,
+        manifest: {
+          schemaVersion: 1,
+          runId: "inherited-commit",
+          taskId: "bd-12",
+          phase: "commit",
+          sessionName: "belayd-bd-12-sub-commit",
+          status: RunStatus.Completed,
+          startedAt: 1,
+          completedAt: 2,
+        },
+      });
+      expect(inherited).toHaveProperty("ok", true);
+      writeIntent({ taskIds: ["bd-12"], supervisor: { sessionId: "dead-session", pid: 999_999 } });
+      const mock = await loadFleetExtension();
+      const tool = mock.tools.get("belayd_fleet_launch");
+      if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+      const deferred = await tool.execute(
+        "launch-1",
+        { tasks: "bd-13", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+      expect(textOf(deferred)).not.toContain("member(s) launched");
+      expect(textOf(deferred)).toContain("deferred bd-13 (capacity)");
+
+      // Once this execution writes its own run, the member really did run here and
+      // its slot comes back on the next launch.
+      const own = writeRunManifest({
+        cwd: path,
+        manifest: {
+          schemaVersion: 1,
+          runId: "own-commit",
+          taskId: "bd-12",
+          phase: "commit",
+          sessionName: "belayd-bd-12-sub-commit",
+          status: RunStatus.Completed,
+          startedAt: Date.now() + 1_000,
+          completedAt: Date.now() + 1_000,
+        },
+      });
+      expect(own).toHaveProperty("ok", true);
+
+      const launched = await tool.execute(
+        "launch-2",
+        { tasks: "bd-13", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+      expect(textOf(launched)).toContain("1/1 member(s) launched");
+      expect(textOf(launched)).toContain("0 already active, 1 free slot(s)");
+    });
+
+    it("still counts a bare worktree holding only another bead's manifest (bd-166)", async () => {
+      // bd-161: `.belayd/` is copied into a new worktree, so another bead's completed
+      // run is there before this member ever starts. Inherited evidence must not free
+      // the slot of an orchestrator that is still being spawned.
+      const path = bareMemberWorktree("bd-12");
+      const inherited = writeRunManifest({
+        cwd: path,
+        manifest: {
+          schemaVersion: 1,
+          runId: "bd37-commit",
+          taskId: "bd-37",
+          phase: "commit",
+          sessionName: "belayd-bd-37-sub-commit",
+          status: RunStatus.Completed,
+          startedAt: 1,
+          completedAt: 2,
+        },
+      });
+      expect(inherited).toHaveProperty("ok", true);
+      writeIntent({ taskIds: ["bd-12"], supervisor: { sessionId: "dead-session", pid: 999_999 } });
+      const mock = await loadFleetExtension();
+      const tool = mock.tools.get("belayd_fleet_launch");
+      if (tool === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+      const result = await tool.execute(
+        "launch-1",
+        { tasks: "bd-13", concurrency: 1 },
+        undefined,
+        undefined,
+        makeCtx(cwd, "launcher-session"),
+      );
+
+      const text = textOf(result);
+      expect(text).not.toContain("member(s) launched");
+      expect(text).toContain("deferred bd-13 (capacity)");
+    });
+  });
+  describe("release (bd-166)", () => {
+    /** Every audit line for one action, with the ids it named. */
+    function auditEntries(action: string): Array<{ taskIds: readonly string[] }> {
+      const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
+      if (!existsSync(path)) return [];
+      return readFileSync(path, "utf8")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as { action: string; taskIds?: string[] })
+        .filter((entry) => entry.action === action)
+        .map((entry) => ({ taskIds: entry.taskIds ?? [] }));
+    }
+
+    it("gives a member's slot back while keeping it a member", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+
+      const tool = mock.tools.get("belayd_fleet_release");
+      if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
+      const released = await tool.execute(
+        "release-1",
+        { taskId: "bd-12" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(released.details).toHaveProperty("exitCode", 0);
+      expect(textOf(released as ToolResult)).toContain("released bd-12's capacity slot");
+
+      const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(intent).toHaveProperty("ok", true);
+      if (!intent.ok) return;
+      // The member stays: only the capacity slot is given back.
+      expect(intent.intent?.taskIds).toEqual(["bd-12", "bd-15"]);
+      expect(intent.intent?.released).toEqual([
+        expect.objectContaining({ taskId: "bd-12", reason: "operator-release" }),
+      ]);
+      const audit = auditEntries("member-released");
+      expect(audit).toHaveLength(1);
+      expect(audit[0]?.taskIds).toEqual(["bd-12"]);
+
+      // Idempotent: a second release is a successful no-op.
+      const again = await tool.execute("release-2", { taskId: "bd-12" }, undefined, undefined, ctx);
+      expect(again.details).toHaveProperty("exitCode", 0);
+      expect(textOf(again as ToolResult)).toContain("already released");
+      const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(after).toHaveProperty("ok", true);
+      if (!after.ok) return;
+      expect(after.intent?.released).toHaveLength(1);
+      expect(auditEntries("member-released")).toHaveLength(1);
+    });
+
+    it("refuses an id that is not a member of this fleet", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+
+      const tool = mock.tools.get("belayd_fleet_release");
+      if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
+      const refused = await tool.execute(
+        "release-1",
+        { taskId: "bd-99" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused as ToolResult)).toContain("not a member");
+    });
+
+    it("refuses to release a member whose orchestrator is live", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      liveness.memberTaskIds = ["bd-12"];
+
+      const tool = mock.tools.get("belayd_fleet_release");
+      if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
+      const refused = await tool.execute(
+        "release-1",
+        { taskId: "bd-12" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused as ToolResult)).toContain("orchestrator is live");
+      const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(intent).toHaveProperty("ok", true);
+      if (!intent.ok) return;
+      expect(intent.intent?.released).toBeUndefined();
+    });
+  });
+
+  describe("cross-fleet reconcile (bd-166)", () => {
+    /** A second fleet whose own supervisor is long gone. */
+    function writeDeadFleet(): void {
+      mkdirSync(join(commonDir, "belayd", "fleet", "wave1"), { recursive: true });
+      writeFileSync(
+        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: "wave1",
+          taskIds: ["bd-31"],
+          createdAt: 1,
+          updatedAt: 1,
+          supervisor: { sessionId: "dead-wave1-session", pid: 999_999 },
+        }),
+      );
+    }
+
+    it("repairs a named fleet's queue/park and audits the target", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      expect(textOf(result as ToolResult)).toContain("Fleet `wave1` reconcile");
+
+      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
+      expect(existsSync(auditPath)).toBe(true);
+      const entries = readFileSync(auditPath, "utf8")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as { action: string; detail?: string });
+      const crossFleet = entries.find((entry) => entry.action === "reconcile-cross-fleet");
+      expect(crossFleet?.detail).toContain("default");
+      // Repair does not touch the record: pruning another fleet needs its own
+      // supervisor (bd-166).
+      const repaired = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(repaired).toHaveProperty("ok", true);
+      if (!repaired.ok) return;
+      expect(repaired.intent?.taskIds).toEqual(["bd-31"]);
+    });
+
+    it("refuses pruneDeadMembers for a fleet this session does not supervise", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const refused = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused as ToolResult)).toContain("only allowed on this session's own fleet");
+      const untouched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(untouched).toHaveProperty("ok", true);
+      if (!untouched.ok) return;
+      expect(untouched.intent?.taskIds).toEqual(["bd-31"]);
+    });
+
+    it("prunes its own fleet when the id is named explicitly", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+
+      const pruned = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(pruned).toHaveProperty("ok", true);
+      if (!pruned.ok) return;
+      expect(pruned.intent?.taskIds).toEqual([]);
+      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
+      const actions = existsSync(auditPath)
+        ? readFileSync(auditPath, "utf8")
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => (JSON.parse(line) as { action: string }).action)
+        : [];
+      // Naming the session's own fleet is not a cross-fleet operation.
+      expect(actions).not.toContain("reconcile-cross-fleet");
+    });
+
+    it("refuses a named fleet from a session that supervises none", async () => {
+      const mock = await loadFleetExtension();
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const refused = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1" },
+        undefined,
+        undefined,
+        makeCtx(cwd, "unarmed-session"),
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused as ToolResult)).toContain("supervises no fleet in this repository");
+    });
+
+    it("refuses cross-fleet repair from a resumed session whose anchors no longer match", async () => {
+      const mock = await loadFleetExtension();
+      writeDeadFleet();
+      // The record names this session id, but the process and token are stale: a
+      // resumed session must not inherit cross-fleet authority from it.
+      writeIntent({
+        taskIds: ["bd-12"],
+        supervisor: { sessionId: "supervisor-session", pid: 999_999, armToken: "stale-token" },
+      });
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const refused = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1" },
+        undefined,
+        undefined,
+        makeCtx(cwd, "supervisor-session"),
+      );
+
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused)).toContain("supervises no fleet in this repository");
+    });
+
+    it("still allows cross-fleet repair from a legacy record with no anchors", async () => {
+      const mock = await loadFleetExtension();
+      writeDeadFleet();
+      // A record written before pidStartTime/armToken existed has only the session id;
+      // the documented fallback keeps it repairable.
+      writeIntent({
+        taskIds: ["bd-12"],
+        supervisor: { sessionId: "supervisor-session", pid: 999_999 },
+      });
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1" },
+        undefined,
+        undefined,
+        makeCtx(cwd, "supervisor-session"),
+      );
+
+      expect(result.details).toHaveProperty("exitCode", 0);
+    });
+  });
 
   describe("mailbox", () => {
     it("writes a supervisor note into events/ and audits it", async () => {
@@ -2151,6 +2642,7 @@ describe("fleet run mode", () => {
   });
 
   afterEach(() => {
+    liveness.memberTaskIds = [];
     vi.useRealTimers();
     childProcess.bdStdout = undefined;
     afterLaunchHook = undefined;
@@ -2302,6 +2794,9 @@ describe("fleet run mode", () => {
 
   it("waits on a capacity-blocked advance, then halts as stalled at the idle cap", async () => {
     await stopEveryMemberInRun();
+    // bd-166: a stopped member holds its slot only while it is actually running; this
+    // test is about the capacity path, so the member is reported live.
+    liveness.memberTaskIds = ["bd-12"];
 
     // One slot, already held by the stopped-but-still-a-member bd-12, so the wave is
     // capacity-blocked. The idle count is seeded one tick below the cap: the first
@@ -2346,6 +2841,8 @@ describe("fleet run mode", () => {
 
   it("halts when the fleet record disappears while an advance is in flight", async () => {
     await stopEveryMemberInRun();
+    // Capacity-blocked needs a live holder (bd-166 counts liveness, not records).
+    liveness.memberTaskIds = ["bd-12"];
 
     editIntent((intent) => ({
       ...intent,
@@ -2687,6 +3184,174 @@ describe("fleet run mode", () => {
     );
     expect(result.details.exitCode).toBe(0);
     expect(intentRun()).toBeUndefined();
+  });
+
+  it("lands a member whose bead is closed and whose branch is already on the base (bd-166)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // A human merged with `wt merge` and closed the bead: the member's worktree and
+    // branch still resolve, bd reports it closed, and the git probe answers that the
+    // branch is an ancestor of the base (the stubbed git runner exits 0).
+    const memberPath = join(worktree.path, "feat-bd-12");
+    mkdirSync(memberPath, { recursive: true });
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    worktree.branch = "feat/bd-12";
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") return "null";
+      if (args[0] !== "show") return undefined;
+      return JSON.stringify([{ id: "bd-12", status: "closed" }]);
+    };
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    // Landed and pruned: no merge ran, the branch was already on the base.
+    expect(intent.intent?.taskIds).toEqual([]);
+    expect(intent.intent?.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject({
+      landedAt: expect.any(Number),
+    });
+    const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
+    const entries = readFileSync(auditPath, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { action: string; detail?: string });
+    const landed = entries.find((entry) => entry.action === "fleet-landed");
+    expect(landed?.detail).toContain("already on main");
+    expect(entries.some((entry) => entry.action === "merge-enqueued")).toBe(false);
+  });
+
+  it("sweeps one member bead per tick, rotating with the run ticks (bd-166)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13 bd-14", ctx);
+    const launched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(launched).toHaveProperty("ok", true);
+    if (!launched.ok) return;
+    expect(launched.intent?.run?.members?.map((member) => member.taskId)).toEqual([
+      "bd-12",
+      "bd-13",
+      "bd-14",
+    ]);
+
+    const probedBeads = (): string[] =>
+      childProcess.execFileCalls
+        .filter((call) => call.file === "bd" && call.args[0] === "show")
+        .flatMap((call) => call.args.filter((arg) => /^bd-\d+$/u.test(arg)));
+
+    childProcess.execFileCalls.length = 0;
+    await vi.advanceTimersByTimeAsync(0);
+    const firstTick = probedBeads();
+    childProcess.execFileCalls.length = 0;
+    await vi.advanceTimersByTimeAsync(15_000);
+    const secondTick = probedBeads();
+
+    // A regression to one batched `bd show` would probe all three in a single tick.
+    expect(firstTick).toHaveLength(1);
+    expect(secondTick).toHaveLength(1);
+    expect(firstTick[0]).not.toBe(secondTick[0]);
+  });
+  it("releases a finished run's unlanded member without pruning it (bd-166)", async () => {
+    await stopEveryMemberInRun();
+
+    // The stop tick reschedules at the action interval; the next tick finds nothing
+    // to land or stop and finishes the run as partial.
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.run?.outcome).toBe("partial");
+    // The member keeps its record (bead, worktree, transcript) but stops holding a
+    // capacity slot: the finished run can never land it.
+    expect(intent.intent?.taskIds).toEqual(["bd-12"]);
+    expect(intent.intent?.released).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "run-complete" }),
+    ]);
+    const released = auditEntries("members-released");
+    expect(released).toHaveLength(1);
+    expect(released[0]?.taskIds).toEqual(["bd-12"]);
+  });
+
+  it("releases a halted run's unlanded members (bd-166)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // Park the fleet: the next tick halts the run with a haltedReason (terminal, not
+    // resumable), so its members can never be landed by this run.
+    editIntent((intent) => ({
+      ...intent,
+      park: { reason: "root checkout is dirty", recordedAt: 1 },
+    }));
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.run?.haltedReason).toContain("parked");
+    expect(intent.intent?.released).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "run-halted" }),
+    ]);
+    expect(auditEntries("members-released")[0]?.taskIds).toEqual(["bd-12"]);
+  });
+
+  it("does not release members when a run merely pauses (bd-166)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // A pause stops the ticker but leaves the run resumable: releasing its members
+    // would free slots for work that a resume continues.
+    editIntent((intent) => ({ ...intent, paused: true }));
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.run?.finishedAt).toBeUndefined();
+    expect(intent.intent?.run?.haltedReason).toBeUndefined();
+    expect(intent.intent?.released).toBeUndefined();
+    expect(auditEntries("members-released")).toHaveLength(0);
+  });
+
+  it("records an advance-launched member in the live run and beats the heartbeat (bd-166)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // A second wave waits on capacity that has since freed.
+    editIntent((intent) => ({
+      ...intent,
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+    }));
+
+    const tool = mock.tools.get("belayd_fleet_advance");
+    if (tool === undefined) throw new Error("belayd_fleet_advance was not registered");
+    const advanced = await tool.execute("advance-1", {}, undefined, undefined, ctx);
+    expect(advanced.details).toHaveProperty("exitCode", 0);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    // The advance is a step of the live run, so its member must be in run.members:
+    // wave2's record named only the first member while two more were in flight.
+    expect(intent.intent?.run?.members?.map((member) => member.taskId)).toEqual(["bd-12", "bd-19"]);
+    expect(readSupervisorHeartbeat({ gitCommonDir: commonDir, fleetId: "default" })).toMatchObject({
+      sessionId: "supervisor-session",
+    });
   });
 });
 

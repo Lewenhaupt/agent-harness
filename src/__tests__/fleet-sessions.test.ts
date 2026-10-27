@@ -15,8 +15,10 @@ import type {
   FleetProcessSnapshot,
 } from "../fleet-sessions.js";
 import {
+  classifyMemberLease,
   classifyMemberLiveness,
   classifyMemberLivenessFromScan,
+  classifyMemberLivenessInWorktree,
   FLEET_PROC_SCAN_MAX_ENTRIES,
   isMemberOrchestratorArgv,
   memberSessionToken,
@@ -24,6 +26,7 @@ import {
   scanProcesses,
   stopMemberSession,
 } from "../fleet-sessions.js";
+import { ORCHESTRATOR_CLAIM_STALE_MS } from "../orchestrator-claim.js";
 
 function snapshot(pid: number, argv: readonly string[]): FleetProcessSnapshot {
   return { pid, argv };
@@ -100,6 +103,146 @@ describe("classifyMemberLiveness", () => {
   });
 });
 
+describe("classifyMemberLivenessInWorktree (bd-166)", () => {
+  const emptyScan: FleetProcessScan = { ok: true, processes: [] };
+
+  it("treats a member with no worktree yet as unknown, not absent", () => {
+    // The first half of the spawn window: the intent is written before the worktree
+    // exists, so "nothing to probe" must never free the slot a launch is about to fill.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        scan: emptyScan,
+      }),
+    ).toMatchObject({ kind: "unknown" });
+  });
+
+  it("still reports a matching process as live when the worktree cannot be resolved", () => {
+    // A CLI-spawned orchestrator has no lease, so its argv token is the evidence.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        scan: { ok: true, processes: [snapshot(700, orchestratorArgv("bd-12"))] },
+      }),
+    ).toEqual({ kind: "live", pids: [700] });
+  });
+
+  it("treats a bare worktree as a spawn in flight, not an absent member", () => {
+    // The second half of the window: ensureWorktree + awaitWorktreeReady can take up
+    // to a minute before the pending spawn lease is written, so a worktree with no
+    // evidence its session ever ran (no state file, no run manifest of this task)
+    // proves nothing about the member being gone.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: false,
+        scan: emptyScan,
+      }),
+    ).toMatchObject({ kind: "unknown" });
+    // A process token is still positive evidence while the worktree is bare.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: false,
+        scan: { ok: true, processes: [snapshot(700, orchestratorArgv("bd-12"))] },
+      }),
+    ).toEqual({ kind: "live", pids: [700] });
+  });
+
+  it("keeps the real absence signal for a member that provably ran", () => {
+    // The evidence is injected: the launch and status call sites derive it from a
+    // workflow state file *or* a same-task run manifest, because completion deletes
+    // the state file (`memberRanEvidence`, `fleet-run.ts`). Either way the member's
+    // session existed, so no lease and no process means gone.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: true,
+        scan: emptyScan,
+      }),
+    ).toEqual({ kind: "absent" });
+  });
+
+  it("never turns an unreadable or corrupt lease into absence", () => {
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: true,
+        scan: emptyScan,
+        lease: { state: "corrupt", error: "not a lease" },
+      }),
+    ).toMatchObject({ kind: "unknown" });
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: true,
+        scan: { ok: false, reason: "no procfs" },
+      }),
+    ).toMatchObject({ kind: "unknown" });
+  });
+
+  it("reports a live worktree lease as live even without a process", () => {
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: false,
+        scan: emptyScan,
+        lease: { state: "live", heartbeatAt: 1_000 },
+      }),
+    ).toEqual({ kind: "live", pids: [], leaseHeartbeatAt: 1_000 });
+  });
+});
+
+describe("classifyMemberLease (bd-166)", () => {
+  const pending = (heartbeatAt: number) => ({
+    kind: "ok" as const,
+    claim: {
+      schemaVersion: 1 as const,
+      taskId: "bd-12",
+      branch: "feat/bd-12",
+      sessionId: "pending:spawn-token",
+      pid: 42,
+      claimedAt: heartbeatAt,
+      heartbeatAt,
+    },
+  });
+
+  it("treats a fresh pending spawn claim as live", () => {
+    expect(classifyMemberLease({ read: pending(1_000), now: 1_500 })).toEqual({
+      state: "live",
+      heartbeatAt: 1_000,
+    });
+  });
+
+  it("treats a stale pending spawn claim as unclassifiable, never absent", () => {
+    const stale = classifyMemberLease({
+      read: pending(1_000),
+      now: 1_000 + ORCHESTRATOR_CLAIM_STALE_MS + 1,
+    });
+    expect(stale.state).toBe("corrupt");
+    // Through the member classifier it is `unknown` (counted), matching the
+    // launch/reconcile probe and the status view.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: "/repo.feat-bd-12",
+        memberRanEvidence: true,
+        scan: { ok: true, processes: [] },
+        lease: stale,
+      }),
+    ).toMatchObject({ kind: "unknown" });
+  });
+});
 describe("scanProcesses", () => {
   function fakeProc(entries: Record<string, string>): FleetProcessFs {
     return {

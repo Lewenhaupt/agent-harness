@@ -207,6 +207,43 @@ a stopped member after a halt or a finish, re-arm the fleet (`/fleet <ids> --fle
 <id>`, which starts a new run and keeps the members as the fleet's `taskIds`) or
 land the bead explicitly.
 
+**A finish and a terminal halt release the members they can no longer land
+(bd-166).** Without that, a run that ended 0-for-N kept N of the repository's 3
+capacity slots forever, and the fleet that owned them had no live supervisor left
+to repair them. On `finishFleetRun`, and on a halt that records `haltedReason`
+(parked or stalled — a *paused* run is resumable and is never swept), every member
+the run can no longer land gets a `released: { taskId, reason, at }` entry on the
+intent: reason `run-complete` or `run-halted`. A member whose work is `complete`
+stays landable and is **not** released, a member whose worktree lease is live is
+never released out from under itself, and a member still observably running stays
+counted. The sweep is idempotent and audited as `members-released`; nothing is
+removed from `taskIds`, so status, mail, and a later landing still see every
+member.
+
+**An advance extends the run it advances.** `belayd_fleet_advance` records the
+members it launches in `run.members` and beats the supervisor heartbeat, so a
+wave-2 member is not in `taskIds` while missing from the run record (the bd-166
+wave2 symptom: `ticks: 3`, the advance launched two members, neither was in
+`run.members`). `idleTicks`, stall accounting, and status all read the same list.
+
+**A landing can happen outside the fleet.** The tick's bead sweep treats a member
+as landed when bd reports its bead `closed`/`done` **and**
+`git merge-base --is-ancestor <branch> <base>` proves its branch is on the base
+branch — the shape `wt merge` + `bd close` leaves behind. It records `landedAt`,
+prunes the member, resolves its ordering gates, and audits `fleet-landed`.
+Bead status alone is not proof of merging, and a failed or missing git answer
+means "not landed": never prune on a probe that did not answer. If the branch was
+deleted after the merge the probe cannot answer, so such a member still needs
+`belayd_fleet_release` or reconcile.
+
+The bead evidence uses the tick's existing budget: **one member bead per tick**,
+rotating by `run.ticks` (the same rotation the ordering-gate sweep uses), and
+exactly one `git merge-base --is-ancestor` probe per closed candidate. A member
+whose bead closes outside the fleet is therefore noticed within a fleet-sized
+cycle (minutes), not on one 15 s tick, and a 20-member fleet does not become a
+full-fleet `bd show` every tick. A failed bd or git probe skips the sweep for that
+tick and never counts as a landing.
+
 ### The run record
 
 `fleet.json` gains one optional field:

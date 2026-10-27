@@ -237,7 +237,7 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | **P0** | `belayd_fleet_status` — read-only aggregation of every worktree's workflow (state file + run manifests + optional intent + one batched read-only `bd show`) into one derived view. No new authority. | **Implemented** (`src/fleet-status.ts`) |
 | **P1** | `belayd_fleet_launch` on explicit instruction + file mailbox (`inbox/`, `events/`) for notes and rebase hints, delivered to members at turn start. | **Implemented** (`src/fleet-launch.ts`, `src/fleet-mode.ts`, `src/fleet-mailbox.ts`, `extensions/index.ts`) |
 | **P2** | Single-flight merge queue + base-moved propagation (`merge-queue.json`, `merge.lock.d`, `src/fleet-merge.ts`, `belayd_fleet_merge`): atomic acquire + renewable lease, rebase → gates → merge → broadcast in the operator's root checkout, root stash/restore with parking on a conflicting restore. | **Implemented** (`src/fleet-merge.ts`, `belayd_fleet_merge`; explicit enqueue/drain only) |
-| **P3** | Automatic ordering/parallelism + capacity-aware concurrency (ceiling 3 orchestrators): bd blocking edges → waves, cycle refusal, launch only the free capacity, record deferred members in `fleet.json` `deferred` with their reasons. The ceiling counts **every** recorded member of **every** fleet (a dead supervisor's detached members still run); an unreadable fleet intent refuses the launch instead of assuming zero. | **Implemented** (`src/fleet-schedule.ts`, `src/fleet-beads.ts`, `src/fleet-launch.ts`; wave 2+ is advanced explicitly by `belayd_fleet_advance`) |
+| **P3** | Automatic ordering/parallelism + capacity-aware concurrency (ceiling 3 orchestrators): bd blocking edges → waves, cycle refusal, launch only the free capacity, record deferred members in `fleet.json` `deferred` with their reasons. The ceiling counts **live or unknown** members of **every** fleet (a dead supervisor's detached members still run; an absent or released one does not — bd-166); an unreadable fleet intent refuses the launch instead of assuming zero. | **Implemented** (`src/fleet-schedule.ts`, `src/fleet-beads.ts`, `src/fleet-launch.ts`; wave 2+ is advanced explicitly by `belayd_fleet_advance`) |
 | **P4** | Cooperative/forceful pause + fleet-level crash reconcile: `belayd_fleet_pause`/`belayd_fleet_resume` (CAS intent writes, audited), `belayd_fleet_advance` (explicit wave advance over the persisted deferred plan), `belayd_fleet_reconcile` (merge-queue repair under the existing lock primitive, parked-root restore from the recorded stash sha, member liveness from the lease + process table). | **Implemented** (`src/fleet-pause.ts`, `src/fleet-reconcile.ts`, `src/fleet-sessions.ts`, `extensions/index.ts`; see `docs/fleet-reconcile.md`) |
 | **P5** | Run to completion: a durable `run` record in `fleet.json`, one deterministic tick per action (land → stop → advance → complete), accepting a landed member (worktree removal on every landing; `bd close` when accepted), the one-orchestrator-per-worktree lease, and the run-mode supervisor heartbeat that makes a re-arm possible. | **Implemented** (`src/fleet-run.ts`, `src/fleet-accept.ts`, `src/orchestrator-claim.ts`, `src/fleet-heartbeat.ts`, `extensions/index.ts`; see `docs/fleet-run.md`) |
 
@@ -695,11 +695,13 @@ the rest waiting forever.
 
 The locked ceiling is **3 concurrent orchestrators**, and the ceiling counts
 orchestrators, not sub-agents. `slots = max(0, capacity - activeCount)`, where
-`activeCount` counts the recorded members of **every** fleet — whatever its
-supervisor's liveness — because a detached member orchestrator keeps running after
-the supervisor that launched it dies, and members are disjoint across fleets, so
-the count is a sum. The target fleet's own preserved (re-armed) members count too.
-Supervisor liveness only changes the wording of refusals. An unreadable fleet
+`activeCount` counts the recorded members of **every** fleet whose orchestrator
+liveness is `live` or `unknown` (bd-166); an `absent` member or one in `released`
+does not hold a slot, though it stays in `taskIds`. Members are disjoint across
+fleets, so the count is a sum, and a detached member of a dead-supervisor fleet
+still counts while its orchestrator is alive. The target fleet's own preserved
+(re-armed) members count too. Supervisor liveness only changes the wording of
+refusals. An unreadable fleet
 intent makes the count unknowable, so the whole launch is refused rather than
 assuming those members are gone (under-counting is the unsafe direction). Wave 0
 up to `slots` is launched; the rest of wave 0 is deferred `capacity`, and later
@@ -722,6 +724,32 @@ does not add. An observed count above 3 is corrected the normal way:
 `belayd_fleet_status` shows it, and the next launch refuses until a member exits
 or is pruned.
 
+**One more window, and how it is closed: a member mid-spawn.** A launch writes the
+intent (the id is now in `taskIds`) *before* it creates the worktree, waits for the
+worktree to become ready (up to a minute of `pnpm install`-class setup), and only
+*then* takes the spawner's `pending:` lease. For that whole span the member has no
+lease, no `belayd-<taskId>` process, and — before the worktree exists — nothing to
+probe at all, so a naive probe would call it `absent` and a concurrent launch's
+recount would start work past the ceiling. Two rules close it:
+
+- **no worktree** (or an unresolvable one) is `unknown` (counted), never `absent`;
+- an existing worktree **with no evidence its session ever ran and no lease** is also
+  `unknown`: it is a bare spawn tree. The evidence is a `.belayd/workflow.json`
+  **or a run manifest this execution wrote**, because completion deletes the state
+  file (`clearWorkflowState`) while the manifests stay. "This execution" is the
+  cutoff: a manifest is evidence only when it postdates the worktree's own creation
+  instant (and the run's recorded `launchedAt`, when that is later), so an inherited
+  same-task manifest copied in by `wt step copy-ignored` never frees a slot for the
+  spawn that is still creating the tree. With no cutoff at all, no manifest is
+  evidence — the member stays counted.
+
+A fresh `pending:` spawn claim is **live** (the child exists in a moment), and a
+stale one is unclassifiable — never `absent`. The `absent` verdict is kept for the
+case it exists for: a member whose session provably existed (state file or a
+same-task run manifest this execution wrote), with no lease and no process — a
+hand-merged bead, a member stopped awaiting a human, or a workflow that ran to
+completion.
+
 Reconcile narrows that count through a real observation rather than a guess:
 `belayd_fleet_reconcile` with `pruneDeadMembers: true` removes members whose
 orchestrator is proven absent — no fresh worktree lease **and** no process carrying
@@ -729,12 +757,14 @@ the exact `belayd-<taskId>` token. The lease is primary because a pi-web
 orchestrator is a session inside the daemon and never appears in the process table
 (`docs/fleet-reconcile.md`). A live supervisor may prune — its liveness is not a
 precondition — while `unknown` liveness (unreadable `/proc`, unreadable lease) is
-never treated as gone. The conservative sum then simply has fewer members — no
-liveness heuristic is wired into the launch path itself. A run also narrows the
-count the honest way: landing a member prunes it. A **stopped** member keeps
-counting (bd-156: its worktree, branch, and bead are still live), and a member
-whose retry session is alive is never prunable, so a fleet whose members all stop
-can hold the ceiling until those retries end, land, or the sessions are gone.
+never treated as gone. Pruning does not change the arithmetic: the launch count
+reads each member's liveness on every launch (bd-166), so an `absent` member is
+already free and pruning only removes its record. A run narrows the count the same
+way: landing a member prunes it. A **stopped** member is still recorded and is
+counted only while its evidence says `live` or `unknown`: stopped with workflow
+state and no lease/process is `absent` and gives its slot back (bd-166), stopped
+with a live retry session keeps it, and a stopped member that never started (a bare
+worktree) is `unknown` until `belayd_fleet_release <taskId>` gives the slot back.
 
 ### What is deferred vs automatic
 

@@ -25,15 +25,20 @@ import {
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
+  memberEvidenceCutoff,
+  memberRanEvidence,
   planFleetTick,
   planGateNotices,
+  planOutsideFleetLandings,
   recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
   recordRunTick,
+  releaseRunMembers,
   runsBelongingToMember,
   startFleetRun,
+  worktreeCreatedAtFromStat,
 } from "../fleet-run.js";
 import type { FleetIntent } from "../fleet-status.js";
 import type { RunManifest } from "../run-manifest.js";
@@ -380,6 +385,125 @@ describe("runsBelongingToMember", () => {
     expect(
       runsBelongingToMember({ taskId: MEMBER, runs: [preLaunch], failuresRequireLaunch: false }),
     ).toEqual([preLaunch]);
+  });
+});
+
+describe("memberRanEvidence (bd-166)", () => {
+  it("counts a workflow state file as proof the member ran", () => {
+    // A live member: the launch persisted state, so absence means gone.
+    expect(memberRanEvidence({ taskId: MEMBER, workflowStatePresent: true, runs: [] })).toBe(true);
+  });
+
+  it("counts a same-task manifest this execution wrote, with no state file", () => {
+    // The completion shape: `clearWorkflowState` deletes the state file, and the
+    // manifests stay. Keying on the state file alone counted a finished member
+    // forever, which is the leak this test pins.
+    expect(
+      memberRanEvidence({
+        taskId: MEMBER,
+        workflowStatePresent: false,
+        runs: [run({ taskId: MEMBER, status: RunStatus.Completed, startedAt: 2_000 })],
+        since: 1_000,
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a same-task manifest older than the cutoff (the inherited case)", () => {
+    // `.belayd/` is copied into a new worktree, so a re-launched bd-12 inherits its
+    // own earlier run from the primary checkout. It names the task but predates the
+    // tree that holds it, so it proves nothing about the spawn in flight.
+    expect(
+      memberRanEvidence({
+        taskId: MEMBER,
+        workflowStatePresent: false,
+        runs: [run({ taskId: MEMBER, status: RunStatus.Completed, startedAt: 999 })],
+        since: 1_000,
+      }),
+    ).toBe(false);
+  });
+
+  it("never guesses when no cutoff is available", () => {
+    // A manifest that only names the task cannot be attributed to this execution.
+    expect(
+      memberRanEvidence({
+        taskId: MEMBER,
+        workflowStatePresent: false,
+        runs: [run({ taskId: MEMBER, status: RunStatus.Completed })],
+      }),
+    ).toBe(false);
+  });
+
+  it("counts a running same-task manifest even before the cutoff", () => {
+    // `runsBelongingToMember` keeps a live run regardless of the launch cut: an
+    // execution is happening now, so the member is real whatever the clock says.
+    expect(
+      memberRanEvidence({
+        taskId: MEMBER,
+        workflowStatePresent: false,
+        runs: [run({ taskId: MEMBER, status: RunStatus.Running, startedAt: 999 })],
+        since: 1_000,
+      }),
+    ).toBe(true);
+  });
+
+  it("reports no evidence for a bare worktree with no manifests", () => {
+    // The spawn-in-flight shape: the worktree exists, nothing has run in it yet.
+    expect(memberRanEvidence({ taskId: MEMBER, workflowStatePresent: false, runs: [] })).toBe(
+      false,
+    );
+  });
+
+  it("does not treat an inherited manifest of another task as this member's evidence", () => {
+    // bd-161: `.belayd/` is copied into a new worktree, so another bead's run is
+    // present from the first second. It must not free this member's slot.
+    expect(
+      memberRanEvidence({
+        taskId: MEMBER,
+        workflowStatePresent: false,
+        runs: [run({ taskId: "bd-37", status: RunStatus.Completed })],
+        since: 1_000,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("memberEvidenceCutoff (bd-166)", () => {
+  it("takes the later of the worktree creation instant and the recorded launch", () => {
+    expect(memberEvidenceCutoff({ worktreeCreatedAt: 1_000, launchedAt: 3_000 })).toBe(3_000);
+    expect(memberEvidenceCutoff({ worktreeCreatedAt: 3_000, launchedAt: 1_000 })).toBe(3_000);
+  });
+
+  it("falls back to whichever instant exists", () => {
+    expect(memberEvidenceCutoff({ worktreeCreatedAt: 1_000 })).toBe(1_000);
+    expect(memberEvidenceCutoff({ launchedAt: 2_000 })).toBe(2_000);
+  });
+
+  it("returns no cutoff when nothing is known", () => {
+    // No cutoff means manifests are not evidence: the conservative direction.
+    expect(memberEvidenceCutoff({})).toBeUndefined();
+  });
+});
+
+describe("worktreeCreatedAtFromStat (bd-166)", () => {
+  it("prefers the birth time when it is the earlier one", () => {
+    expect(worktreeCreatedAtFromStat({ birthtimeMs: 1_000, mtimeMs: 2_000 })).toBe(1_000);
+  });
+
+  it("takes the earlier time, because a directory's mtime only moves later", () => {
+    // A restored/rewritten tree can report a birth time after its mtime; using the
+    // earlier one keeps the cutoff from sliding past this member's own manifests.
+    expect(worktreeCreatedAtFromStat({ birthtimeMs: 2_000, mtimeMs: 1_000 })).toBe(1_000);
+  });
+
+  it("falls back to the mtime when the filesystem cannot report a birth time", () => {
+    // Some filesystems report birthtimeMs 0; a directory's mtime never moves
+    // backwards, so it still cannot postdate an inherited manifest into evidence.
+    expect(worktreeCreatedAtFromStat({ birthtimeMs: 0, mtimeMs: 2_000 })).toBe(2_000);
+  });
+
+  it("returns undefined when neither time is usable", () => {
+    expect(worktreeCreatedAtFromStat({ birthtimeMs: 0, mtimeMs: 0 })).toBeUndefined();
+    expect(worktreeCreatedAtFromStat({})).toBeUndefined();
   });
 });
 
@@ -1116,5 +1240,168 @@ describe("gate notices", () => {
     const recorded = recordFleetGateNotices(started, ["bd-960"]);
     expect(recorded.gateNoticeIds).toEqual(["bd-960"]);
     expect(recordFleetGateNotices(recorded, []).gateNoticeIds).toBeUndefined();
+  });
+});
+
+describe("releaseRunMembers (bd-166)", () => {
+  /** bd-12 landed, bd-15 stopped, bd-19 complete, bd-22 never started. */
+  function terminalRun(): FleetRun {
+    const started = startFleetRun({
+      now: 1_000,
+      accept: true,
+      members: [{ taskId: "bd-12" }, { taskId: "bd-15" }, { taskId: "bd-19" }, { taskId: "bd-22" }],
+    });
+    const landed = recordRunMemberLanded({ run: started, taskId: "bd-12", now: 1_100 });
+    return recordRunMemberStopped({
+      run: landed,
+      taskId: "bd-15",
+      reason: "phase-failed",
+      detail: "gate failed",
+      now: 1_200,
+    });
+  }
+
+  function observations(): FleetMemberObservation[] {
+    return [
+      observation("bd-12", { kind: "complete" }, "absent"),
+      observation("bd-15", { kind: "phase-failed", detail: "gate failed" }, "absent"),
+      observation("bd-19", { kind: "complete" }, "absent"),
+      observation("bd-22", { kind: "missing", detail: "never started" }, "absent"),
+    ];
+  }
+
+  it("releases stopped and never-started members and keeps completed ones landable", () => {
+    const current = intent({ taskIds: ["bd-12", "bd-15", "bd-19", "bd-22"] });
+    const plan = releaseRunMembers({
+      intent: current,
+      run: terminalRun(),
+      observations: observations(),
+      reason: "run-complete",
+      now: 2_000,
+    });
+
+    // bd-15 stopped, bd-22 never started; bd-12 already landed; bd-19 is done and
+    // still landable, so it keeps its slot until the landing path finishes it.
+    expect(plan.released).toEqual(["bd-15", "bd-22"]);
+    expect(plan.intent.released).toEqual([
+      { taskId: "bd-15", reason: "run-complete", at: 2_000 },
+      { taskId: "bd-22", reason: "run-complete", at: 2_000 },
+    ]);
+    expect(plan.intent.taskIds).toEqual(["bd-12", "bd-15", "bd-19", "bd-22"]);
+    expect(plan.intent.updatedAt).toBe(2_000);
+  });
+
+  it("is idempotent: the same reason twice releases nothing new", () => {
+    const current = intent({ taskIds: ["bd-15", "bd-22"] });
+    const first = releaseRunMembers({
+      intent: current,
+      run: terminalRun(),
+      observations: observations(),
+      reason: "run-halted",
+      now: 2_000,
+    });
+    const second = releaseRunMembers({
+      intent: first.intent,
+      run: terminalRun(),
+      observations: observations(),
+      reason: "run-halted",
+      now: 3_000,
+    });
+
+    expect(second.released).toEqual([]);
+    expect(second.intent.released).toEqual(first.intent.released);
+  });
+
+  it("keeps a stopped member's slot while its orchestrator is live", () => {
+    const plan = releaseRunMembers({
+      intent: intent({ taskIds: ["bd-15"] }),
+      run: terminalRun(),
+      observations: [observation("bd-15", { kind: "running", detail: "2/5" }, "live", 1_000)],
+      reason: "run-halted",
+      now: 2_000,
+    });
+
+    // A live lease means something is still driving the worktree; releasing it would
+    // let the next fleet start work past the ceiling.
+    expect(plan.released).toEqual([]);
+    expect(plan.intent).toEqual(intent({ taskIds: ["bd-15"] }));
+  });
+
+  it("never releases a member this tick did not observe (bd-166)", () => {
+    const running = startFleetRun({
+      now: 1_000,
+      accept: true,
+      members: [{ taskId: "bd-12" }, { taskId: "bd-15" }],
+    });
+    const plan = releaseRunMembers({
+      intent: intent({ taskIds: ["bd-12", "bd-15"] }),
+      run: running,
+      // bd-15 was added to `taskIds` by a concurrent writer after the tick read: no
+      // observation is "no evidence", not "no work".
+      observations: [observation("bd-12", { kind: "complete" }, "absent")],
+      reason: "run-halted",
+      now: 2_000,
+    });
+
+    expect(plan.released).toEqual([]);
+  });
+
+  it("keeps counting a running member the terminal run did not stop", () => {
+    const running = startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-15" }] });
+    const plan = releaseRunMembers({
+      intent: intent({ taskIds: ["bd-15"] }),
+      run: running,
+      observations: [observation("bd-15", { kind: "running", detail: "3/5" }, "absent", 1_000)],
+      reason: "run-halted",
+      now: 2_000,
+    });
+
+    expect(plan.released).toEqual([]);
+  });
+});
+
+describe("planOutsideFleetLandings (bd-166)", () => {
+  it("lands a member whose bead is closed and whose branch git proves is on the base", async () => {
+    const landed = await planOutsideFleetLandings({
+      intent: intent({ taskIds: ["bd-12", "bd-15"] }),
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      closedBeadIds: new Set(["bd-12"]),
+      branchOnBase: async () => true,
+    });
+    expect(landed).toEqual(["bd-12"]);
+  });
+
+  it("requires both facts: a closed bead alone or an ancestor alone is not a landing", async () => {
+    const run = startFleetRun({ now: 1_000, accept: false, members: [] });
+    expect(
+      await planOutsideFleetLandings({
+        intent: intent({ taskIds: ["bd-12", "bd-15"] }),
+        run,
+        closedBeadIds: new Set(["bd-12"]),
+        branchOnBase: async () => false,
+      }),
+    ).toEqual([]);
+    expect(
+      await planOutsideFleetLandings({
+        intent: intent({ taskIds: ["bd-12", "bd-15"] }),
+        run,
+        closedBeadIds: new Set([]),
+        branchOnBase: async () => true,
+      }),
+    ).toEqual([]);
+  });
+
+  it("skips a member this run already landed, so a landing is recorded once", async () => {
+    const started = startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] });
+    const already = recordRunMemberLanded({ run: started, taskId: "bd-12", now: 2_000 });
+
+    expect(
+      await planOutsideFleetLandings({
+        intent: intent({ taskIds: ["bd-12"] }),
+        run: already,
+        closedBeadIds: new Set(["bd-12"]),
+        branchOnBase: async () => true,
+      }),
+    ).toEqual([]);
   });
 });

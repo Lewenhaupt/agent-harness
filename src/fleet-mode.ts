@@ -215,6 +215,47 @@ export interface FleetSupervisorMatchOptions {
 }
 
 /**
+ * Whether a recorded supervisor grants this session authority over that fleet.
+ *
+ * Deliberately split from {@link matchesFleetSupervisor}, which owns the *own-fleet*
+ * mode decision: a session may be allowed to repair another fleet without holding
+ * its mode. The anchors are the same where the record carries them (session id,
+ * live process identity, arm token); only a legacy record written before
+ * `pidStartTime`/`armToken` existed falls back to a session-id match, because it
+ * has nothing stronger to offer.
+ */
+export function sessionSupervisesFleetRecord(options: {
+  supervisor: FleetIntent["supervisor"];
+  sessionId: string;
+  /** The arm token this session minted, if it armed a fleet. */
+  armToken?: { fleetId: string; token: string };
+  liveness: FleetSupervisorLiveness;
+  /** Sanitized id of the fleet the record belongs to, for the token match. */
+  fleetId: string;
+}): boolean {
+  const supervisor = options.supervisor;
+  if (supervisor === undefined || options.sessionId === "") return false;
+  if (supervisor.sessionId !== options.sessionId) return false;
+  const legacy = supervisor.pidStartTime === undefined && supervisor.armToken === undefined;
+  if (legacy) return true;
+  if (supervisor.armToken !== undefined) {
+    return matchesFleetSupervisor({
+      supervisor,
+      sessionId: options.sessionId,
+      isPidAlive: options.liveness.isPidAlive,
+      ...(options.liveness.pidStartTime === undefined
+        ? {}
+        : { pidStartTime: options.liveness.pidStartTime }),
+      ...(options.armToken?.fleetId === options.fleetId
+        ? { armToken: options.armToken.token }
+        : {}),
+    });
+  }
+  // A partial legacy record (start time, no token) still gets the process check.
+  return isSupervisorProcessAlive({ supervisor, liveness: options.liveness });
+}
+
+/**
  * Whether the stored supervisor record belongs to the live session asking.
  *
  * All anchors are required: the session id tells "my fleet" from another
@@ -353,6 +394,29 @@ export function resolveFleetMode(options: ResolveFleetModeOptions): FleetMode | 
 
 export interface ResolveMemberFleetOptions extends FleetLookupOptions {
   taskId: string;
+}
+
+/** One named fleet's state, for a caller that already knows which fleet it targets. */
+export interface FleetModeByIdOptions extends FleetLookupOptions {
+  fleetId: string;
+}
+
+/**
+ * The named fleet's state, or undefined when it has no readable intent.
+ *
+ * Unlike {@link resolveFleetMode} this asserts no authority: it is the lookup a
+ * cross-fleet repair uses *after* its own authority check, so naming a fleet must
+ * not by itself make the caller its supervisor.
+ */
+export function fleetModeForId(options: FleetModeByIdOptions): FleetMode | undefined {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const loaded = readFleetIntent({
+    gitCommonDir: options.gitCommonDir,
+    fleetId,
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
+  });
+  if (!loaded.ok || loaded.intent === undefined) return undefined;
+  return toFleetMode(options.gitCommonDir, fleetId, loaded.intent);
 }
 
 /**
