@@ -233,6 +233,12 @@ describe("isHumanComment", () => {
 });
 
 describe("excerptComment", () => {
+  /** An unpaired UTF-16 surrogate, i.e. an astral character sliced in half. */
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+  function codePointLength(value: string): number {
+    return Array.from(value).length;
+  }
   it("collapses whitespace and newlines into one line", () => {
     expect(excerptComment("yes\n\n  option   b\r\n")).toBe("yes option b");
   });
@@ -260,6 +266,60 @@ describe("excerptComment", () => {
     expect(excerptComment("short", 10)).toBe("short");
     expect(excerptComment("abcdef", 4)).toBe("abc…");
     expect(excerptComment("abcdef", 1)).toBe("…");
+  });
+
+  it("caps by code point so an astral boundary never emits a lone surrogate", () => {
+    const excerpt = excerptComment("😀".repeat(130), 120);
+
+    // The cap is a character budget: 119 emoji + the ellipsis.
+    expect(codePointLength(excerpt)).toBe(120);
+    expect(LONE_SURROGATE.test(excerpt)).toBe(false);
+    expect(excerpt).not.toContain("\uFFFD");
+    expect(excerpt.endsWith("…")).toBe(true);
+  });
+
+  it.each([2, 3, 5])("cuts an astral string cleanly at cap %i", (cap) => {
+    const excerpt = excerptComment("😀".repeat(10), cap);
+
+    expect(codePointLength(excerpt)).toBe(cap);
+    expect(LONE_SURROGATE.test(excerpt)).toBe(false);
+    expect(excerpt).toBe(`${"😀".repeat(cap - 1)}…`);
+  });
+
+  it("keeps mixed BMP and astral text intact up to the cap", () => {
+    const input = "a😀b😀c😀d😀";
+
+    // Fits the cap in characters, so nothing is dropped despite 12 code units.
+    expect(excerptComment(input, codePointLength(input))).toBe(input);
+
+    const excerpt = excerptComment(input, 4);
+    expect(excerpt).toBe("a😀b…");
+    expect(codePointLength(excerpt)).toBe(4);
+    expect(LONE_SURROGATE.test(excerpt)).toBe(false);
+  });
+
+  it("holds the cap and the no-lone-surrogate invariant across caps and inputs", () => {
+    const inputs = [
+      "😀".repeat(130),
+      "a😀b".repeat(40),
+      "漢".repeat(400),
+      "😀 漢 a ".repeat(50),
+      "\n\n😀  \t",
+    ];
+
+    for (const cap of [1, 2, 3, 4, 5, 7, 10, 64, 120]) {
+      for (const input of inputs) {
+        const excerpt = excerptComment(input, cap);
+
+        expect(codePointLength(excerpt)).toBeLessThanOrEqual(cap);
+        expect(LONE_SURROGATE.test(excerpt)).toBe(false);
+        expect(excerpt).not.toContain("\uFFFD");
+        expect(excerpt).not.toBe("");
+      }
+    }
+
+    // The pre-existing CJK (BMP, multi-byte in UTF-8) case is unchanged.
+    expect(excerptComment("漢".repeat(400), 10)).toBe(`${"漢".repeat(9)}…`);
   });
 });
 

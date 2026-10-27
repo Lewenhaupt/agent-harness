@@ -2,9 +2,12 @@
 
 One read-only tool that answers: **what is every Belayd workflow in this
 repository doing right now?** It walks every git worktree, reads each one's
-`.belayd/workflow.json` and `.belayd/runs/` manifests, adds the bead title and
-status from one batched read-only `bd show <ids> --json`, and renders a single
-plain-text view with a derived state per worktree plus fleet-level warnings.
+`.belayd/workflow.json` and `.belayd/runs/` manifests, adds the bead title,
+status, owner, assignee, human flag, newest comment and human-gate wait from
+read-only `bd` calls (`bd show <ids> --json`, then `bd comments <id> --json` and
+`bd gate list <id> --json` per member), and renders a single plain-text view
+with a derived state per worktree, a "Needs you" block, plus fleet-level
+warnings.
 
 This is milestone **P0** of `docs/fleet-orchestrator.md`, and the read-only half of
 the fleet surface whose operator entry point is **`docs/fleet.md`**. It is
@@ -146,6 +149,11 @@ That run is worth reading closely:
   member with readable workflow state in a beads repository shows
   `bead: <title> (<status>)`; a fleet whose members hold no workflow state
   (like the current branch) makes **no** `bd` call at all.
+- A member with a bead record also carries `owner:`, `assignee:`, `human:`,
+  `bead updated:`, `comment count:`, `awaiting human:` and `newest comment:`
+  lines, and a bead that needs a person is named in the `Needs you` block below
+  the `states:` line. That transcript predates all of them, so those lines are
+  absent from it.
 
 ### Reading the output
 
@@ -161,6 +169,7 @@ Header lines:
 | `- stopped <taskId> (<reason>): <detail>` | One per member the run gave up on (needs a human); renders from `fleet.json` `run.stopped` |
 | `members:` | Number of worktrees in the view (the main checkout counts only when it holds workflow state). Deferred members are *not* counted here: they have no worktree yet |
 | `states:` | Count per derived state, printed in the fixed order `active blocked awaiting-human interrupted idle missing-state` |
+| `Needs you (<n>): <ids>` | Present only when at least one member carries the bd `human` label or has an **open** human gate. Names every waiting task id together (up to 10, then `…and N more`), one line per bead with its assignee and newest comment. This is the block to read first when a fleet looks stuck |
 
 Per member (blocks are separated by a blank line and sorted by task id, code
 unit order):
@@ -170,6 +179,13 @@ unit order):
 | `Member <taskId> — <state>` | Task id recorded in `workflow.json`, or `(no task id)` when there is no readable state |
 | `worktree: <path> (branch <branch>)` | Path from `git worktree list`, and the checked-out branch (`detached HEAD` when there is none) |
 | `bead: <title> (<status>)` | Bead title and status from one batched read-only `bd show <ids> --json`. Omitted when bd is unavailable or has no record for that task id; `(no title)` / `(status unknown)` when bd returns the record without those fields |
+| `owner: <owner>` | `owner` from `bd show --json`; `(unknown)` when bd reports none or the field was renamed/absent. A renamed field degrades this column only |
+| `assignee: <assignee>` | bd assignee (`belayd:<task>:<phase>` or a person); `(unassigned)` when the record has none. A genuinely unassigned bead is never confused with a failed read — a failed read omits the bead line entirely |
+| `human: yes\|no` | The bead carries bd's `human` label: a person has to look at it |
+| `bead updated: <ISO>` | `updated_at` from `bd show --json`, printed as bd gave it (no clock of our own). Omitted when bd did not report it |
+| `comment count: <n>` | `comment_count` from `bd show --json`. Omitted when bd did not report it; never a fabricated `0` |
+| `awaiting human: yes\|no\|unknown` | `yes` = a parsed open `human` gate blocks the bead; `no` = bd explicitly reported no gates; `unknown` = the gate record did not parse or the read failed (fail closed: never `no` on a malformed record) |
+| `newest comment: <author> <ISO>: "<excerpt>"` | Newest comment (`bd comments <id> --json`), collapsed to one line and capped at 120 chars, with control characters and ANSI sequences stripped and embedded double quotes replaced by apostrophes so the quoting survives. `(none)` only when the read succeeded and the thread is genuinely empty; `(unknown)` when the read failed, timed out, was not attempted, or bd returned records that the parser could not use (a renamed/malformed comment schema — a partially malformed thread still shows its newest usable comment). The line is omitted entirely when no engagement read happened |
 | `workflow: <type> <n>/<m> phases complete` | Workflow sub-type and completed-in-order phase count |
 | `pending: <phases>` | Phase order minus completed, or `none` |
 | `awaiting review response: yes\|no` | The workflow is parked waiting for the operator |
@@ -200,6 +216,7 @@ Warnings (absent when there are none):
 | `<taskId> is claimed by <n> worktrees: <paths>` | Two worktrees record the same `taskId` | Exactly one is real. Do not run phases in either until you know which; `bd show <taskId>` plus the branches tell you which tree owns the bead. |
 | `git worktree list entry "<path>" was skipped: non-key line(s) "…" mean the path does not round-trip through line-oriented porcelain (…git >= 2.36 `-z` is required)` | `git worktree list --porcelain -z` failed (git < 2.36 has no `-z`), so the line-oriented fallback ran and a path containing a newline cannot round-trip; the NUL form never produces this warning | Upgrade git. A skipped entry is *not reported at all*, so never read its absence as "that worktree is clean". |
 | `bead metadata unavailable (bd read failed): …` | The single batched `bd show <ids> --json` could not be read: no beads database, `bd` not on `PATH`, a timeout, or non-JSON output | Nothing about the workflow view is affected — states, phases, and runs are still derived correctly. Fix beads access only if you need titles/statuses. The warning appears **once per fleet**, never once per member, and never appears when no member has a task id (bd is not called at all then). |
+| `bead engagement unavailable (bd read failed): …` | **Every** member's `bd comments` **and** `bd gate list` reads failed (bd missing, wrong database, total outage) | The derived view is intact, only the owner/assignee/human/comment columns are missing. Appears **once per fleet**, bounded to a single line. A mixed result (some beads readable) is not a warning: the unreadable beads simply render `unknown` |
 
 The tool exits `0` on a successful read and `1` on a reader failure (not a git
 repository, git missing). A failure prints the git error instead of a view:
@@ -218,11 +235,20 @@ fatal: not a git repository (or any of the parent directories): .git
 - It does **not** write anything: no `fleet.json`, no `audit.log`, no run
   manifest, no `.belayd` state. It does not even create
   `<git-common-dir>/belayd/fleet/`.
-- It does **not** change bead status. It runs exactly one read-only
-  `bd show <ids> --json` for bead titles/statuses — never `bd update`, `close`,
-  `label`, `comment`, or `sync` — and skips that call entirely when no member
-  has a task id. If bd is missing or fails, the view still renders (with one
-  `bead metadata unavailable` warning).
+- It does **not** change bead status. It runs read-only `bd` calls only: one
+  batched `bd show <ids> --json` for titles/statuses/owner/assignee/labels, then
+  `bd comments <id> --json` and `bd gate list <id> --json` per member — never
+  `bd update`, `close`, `label`, `comment`, `gate create`, `gate resolve`, or
+  `sync` — and skips all of them when no member has a task id. The per-member
+  reads run with a small bounded concurrency (4 beads at a time), so a wide
+  fleet does not fork 2×N `bd` processes at once, and each read is also bounded
+  by a watchdog. If bd is missing or fails, the view still renders; a total
+  outage of both reads becomes one `bead engagement unavailable` warning, while
+  a per-bead failure renders that bead's columns as `unknown` and never fails
+  the fleet read.
+- It does **not** deliver a human answer or touch a gate. It only *reports* the
+  open `human` gate and the newest comment; answering happens in bd/Scotty, and
+  the member's own session polls and resolves the gate (bd-152).
 - It does **not** touch another worktree's files: every read is a plain fs read
   of that worktree's own `.belayd/` records.
 - It has **no** cross-tree authority. The bd-119 preflight still governs phase,
@@ -291,26 +317,31 @@ pnpm build             # tsc to dist/ (no output)
 ```
 
 The fleet-specific suites are `src/__tests__/fleet-status.test.ts` (pure view
-builder, formatter, derivation, warnings, bead enrichment), `src/__tests__/fleet-state.test.ts`
+builder, formatter, derivation, warnings, bead enrichment, ownership/human
+surfaces), `src/__tests__/fleet-state.test.ts`
 (shared-state paths, intent, audit log, mailbox, merge-queue schema),
 `src/__tests__/fleet-beads.test.ts` (the batched read-only bead lookup and its
-non-read-argv refusal), `src/__tests__/bd-command.test.ts` (the read-only bd
-argv),
+non-read-argv refusal), `src/__tests__/fleet-bead-engagement.test.ts` (the
+per-bead comments/gate reader: two read-only calls per bead, bounded
+concurrency, per-bead degradation), `src/__tests__/bd-command.test.ts` (the
+read-only bd argv),
 `src/__tests__/extension-fleet-status-tool.test.ts` (registration, fleet-id
-defaulting/sanitizing, bd enrichment/degrades, error exit code, gate membership)
+defaulting/sanitizing, bd enrichment/degrades, ownership/human rendering in both
+`belayd_fleet_status` and `belayd_status`, error exit code, gate membership)
 and `test/fleet-status.integration.test.ts` (real git). Run just those:
 
 ```bash
 pnpm vitest run src/__tests__/fleet-status.test.ts \
   src/__tests__/fleet-state.test.ts \
   src/__tests__/fleet-beads.test.ts \
+  src/__tests__/fleet-bead-engagement.test.ts \
   src/__tests__/bd-command.test.ts \
   src/__tests__/extension-fleet-status-tool.test.ts
 pnpm vitest run --config vitest.integration.config.ts test/fleet-status.integration.test.ts
 ```
 
-Expected: `Test Files 5 passed (5)`, `Tests 179 passed (179)` for the unit set,
-and `Test Files 1 passed (1)`, `Tests 5 passed (5)` for the integration file.
+Expected: every file and test passes (the unit set is 6 files now), and the
+integration file passes unchanged.
 
 ### 2. Install the driver
 

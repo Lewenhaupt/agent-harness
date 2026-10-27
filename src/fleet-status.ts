@@ -13,6 +13,7 @@
 
 import { basename, join } from "node:path";
 import { z } from "zod";
+import { excerptComment } from "./bead-comments.js";
 import { FleetRunSchema, formatFleetRunLine, formatFleetRunStops } from "./fleet-run.js";
 import { FLEET_SCHEDULE_DEFERRAL_REASONS } from "./fleet-schedule.js";
 import { taskIdFromBranch } from "./handoff.js";
@@ -320,6 +321,8 @@ export interface FleetMemberView {
   lease: FleetLeaseView;
   /** Read-only `bd show` metadata, when a lookup succeeded for this task id. */
   bead?: FleetBead;
+  /** Ownership/human columns read on top of the bead record; absent when unread. */
+  engagement?: FleetBeadEngagement;
   state: FleetMemberState;
 }
 
@@ -331,6 +334,7 @@ export const FLEET_WARNING_KINDS = [
   "task-id-mismatch",
   "bead-metadata-unavailable",
   "bead-metadata-missing",
+  "bead-engagement-unavailable",
 ] as const;
 
 export type FleetWarningKind = (typeof FLEET_WARNING_KINDS)[number];
@@ -400,7 +404,7 @@ function lastRunTimestamp(runs: readonly RunManifest[]): number | undefined {
  * Locale-independent string order. `localeCompare` changes with the host ICU
  * locale, which would make the "deterministic" view locale-dependent.
  */
-function compareCodeUnits(a: string, b: string): number {
+export function compareCodeUnits(a: string, b: string): number {
   if (a === b) return 0;
   return a < b ? -1 : 1;
 }
@@ -673,6 +677,46 @@ export interface FleetBead {
   status: string | undefined;
   priority: number | undefined;
   labels: readonly string[];
+  /** bd's assignee (`belayd:<task>:<phase>` or a person); absent when unassigned. */
+  assignee?: string;
+  /** bd's owner (`owner` in `bd show --json`); absent on older records. */
+  owner?: string;
+  /** Size of the comment thread, when bd reports it. */
+  commentCount?: number;
+  /** bd's last-update timestamp, as printed (ISO string). */
+  updatedAt?: string;
+}
+
+/** Newest comment on a bead: display only, one capped line. */
+export interface FleetBeadComment {
+  author: string;
+  text: string;
+  createdAt: string;
+}
+
+/**
+ * Comment column: read or unknown.
+ *
+ * An absent `newestComment` used to mean both "empty thread" and "the read
+ * failed", so a bd outage rendered `(none)` — a false claim. Only a successful
+ * read (`state: "read"`) may say `(none)`; every other case is `(unknown)`.
+ */
+export type FleetBeadCommentRead =
+  | { state: "read"; newest?: FleetBeadComment }
+  | { state: "unknown" };
+
+/**
+ * What a bead is waiting on, as far as a read-only view can tell.
+ *
+ * `awaitingHuman` is deliberately tri-state. bd-152 replaced the old
+ * `.belayd/human-question.json` marker with a `human` bd gate, and a gate record
+ * that does not parse (renamed `status`/`await_type`, malformed JSON, a failed
+ * read) must never render as "not waiting": undefined means unknown.
+ */
+export interface FleetBeadEngagement {
+  comments: FleetBeadCommentRead;
+  /** open = a human gate blocks it; none = resolved; undefined = unknown (read failed/malformed). */
+  awaitingHuman?: boolean;
 }
 
 /**
@@ -688,6 +732,10 @@ const BeadRecordSchema = z.object({
   status: z.string().optional().catch(undefined),
   priority: z.number().finite().optional().catch(undefined),
   labels: z.array(z.string()).optional().catch(undefined),
+  assignee: z.string().optional().catch(undefined),
+  owner: z.string().optional().catch(undefined),
+  comment_count: z.number().int().nonnegative().optional().catch(undefined),
+  updated_at: z.string().optional().catch(undefined),
 });
 
 /** Parse one bead record; anything without a usable `id` yields undefined. */
@@ -700,6 +748,10 @@ export function parseBeadView(raw: unknown): FleetBead | undefined {
     status: result.data.status,
     priority: result.data.priority,
     labels: result.data.labels ?? [],
+    assignee: result.data.assignee,
+    owner: result.data.owner,
+    commentCount: result.data.comment_count,
+    updatedAt: result.data.updated_at,
   };
 }
 
@@ -747,6 +799,12 @@ function boundLookupError(error: string): string {
   if (singleLine.length <= BEAD_LOOKUP_ERROR_MAX_LENGTH) return singleLine;
   return `${singleLine.slice(0, BEAD_LOOKUP_ERROR_MAX_LENGTH - 1)}…`;
 }
+
+/** Cap on the newest-comment excerpt in a status line; this is a view, not a thread. */
+export const NEEDS_YOU_EXCERPT_MAX_CHARS = 120;
+
+/** Human-relevant members listed in the "Needs you" block before it is elided. */
+export const NEEDS_YOU_LIST_MAX = 10;
 
 /** Missing ids named in one warning before the count alone carries the rest. */
 const BEAD_MISSING_IDS_MAX = 5;
@@ -809,6 +867,61 @@ export function applyFleetBeadLookup(status: FleetStatus, lookup: FleetBeadLooku
   };
 }
 
+/**
+ * Engagement as handed back to the pure layer, keyed by task id.
+ *
+ * Mirrors {@link FleetBeadLookup}: `ok: false` is one fleet-wide fact that
+ * degrades every member's ownership columns at once, never a warning per member.
+ */
+export type FleetEngagementLookup =
+  | { ok: true; entries: readonly { taskId: string; engagement: FleetBeadEngagement }[] }
+  | { ok: false; error: string };
+
+/** Whether a bead carries the `human` label (the bd-side "needs a person" marker). */
+export function beadNeedsHuman(bead: FleetBead | undefined): boolean {
+  return bead?.labels.includes("human") === true;
+}
+
+/**
+ * Attach ownership/human engagement to the derived view.
+ *
+ * Same contract as {@link applyFleetBeadLookup}: a failed read leaves every
+ * member with no `engagement` and records exactly **one** warning. A missing
+ * entry for one member is "unknown", not a failure of the fleet-wide read, so
+ * it stays silent — a member may legitimately have no bead record to read.
+ */
+export function applyFleetBeadEngagement(
+  status: FleetStatus,
+  lookup: FleetEngagementLookup,
+): FleetStatus {
+  if (!lookup.ok) {
+    return {
+      ...status,
+      warnings: [
+        ...status.warnings,
+        {
+          kind: "bead-engagement-unavailable",
+          message: `bead engagement unavailable (bd read failed): ${boundLookupError(lookup.error)}`,
+        },
+      ],
+    };
+  }
+
+  const byTaskId = new Map<string, FleetBeadEngagement>();
+  for (const entry of lookup.entries) {
+    byTaskId.set(entry.taskId.toLowerCase(), entry.engagement);
+  }
+
+  return {
+    ...status,
+    members: status.members.map((member) => {
+      if (member.taskId === undefined) return member;
+      const engagement = byTaskId.get(member.taskId.toLowerCase());
+      return engagement === undefined ? member : { ...member, engagement };
+    }),
+  };
+}
+
 // ── Plain-text formatter ──────────────────────────────────────────────
 
 function formatIntent(intent: FleetIntent | undefined): string {
@@ -859,6 +972,174 @@ function formatBeadLine(bead: FleetBead): string {
   return `  bead: ${title} (${status})`;
 }
 
+/** Owner text: absent means bd did not report one, which is not "nobody". */
+function ownerText(bead: FleetBead): string {
+  return bead.owner ?? "(unknown)";
+}
+
+/**
+ * Assignee text: absent in bd means genuinely unassigned, so it says so.
+ *
+ * A failed read cannot reach this helper (the member keeps no `bead` then), so
+ * `(unassigned)` never disguises bd being unavailable.
+ */
+function assigneeText(bead: FleetBead): string {
+  return bead.assignee ?? "(unassigned)";
+}
+
+/** Tri-state human wait: an unread or unrecognized gate is `unknown`, never `no`. */
+function awaitingHumanText(engagement: FleetBeadEngagement): string {
+  switch (engagement.awaitingHuman) {
+    case true:
+      return "yes";
+    case false:
+      return "no";
+    case undefined:
+      return "unknown";
+  }
+}
+
+function commentAuthorText(author: string): string {
+  return author === "" ? "(unattributed)" : author;
+}
+
+/**
+ * `author createdAt: "excerpt"`, one capped line; the whole thread is never printed.
+ *
+ * `(none)` is reachable only from a successful read, so a failed `bd comments`
+ * read can never look like an empty thread.
+ */
+function newestCommentText(engagement: FleetBeadEngagement): string {
+  if (engagement.comments.state === "unknown") return "(unknown)";
+  const comment = engagement.comments.newest;
+  if (comment === undefined) return "(none)";
+  const excerpt = excerptComment(comment.text, NEEDS_YOU_EXCERPT_MAX_CHARS);
+  return `${commentAuthorText(comment.author)} ${comment.createdAt}: "${excerpt}"`;
+}
+
+/**
+ * Ownership columns shared by the fleet member block and `belayd_status`.
+ *
+ * `bead updated` and `comment count` render only when bd reported them: an
+ * older bd that omits the field must not print a fabricated timestamp or a fake
+ * zero count.
+ */
+function beadDetailLines(bead: FleetBead, prefix: string): string[] {
+  const lines = [
+    `${prefix}owner: ${ownerText(bead)}`,
+    `${prefix}assignee: ${assigneeText(bead)}`,
+    `${prefix}human: ${beadNeedsHuman(bead) ? "yes" : "no"}`,
+  ];
+  if (bead.updatedAt !== undefined) lines.push(`${prefix}bead updated: ${bead.updatedAt}`);
+  if (bead.commentCount !== undefined) lines.push(`${prefix}comment count: ${bead.commentCount}`);
+  return lines;
+}
+
+/** The ownership lines that follow a member's `bead:` line. */
+function formatOwnershipLines(member: FleetMemberView): string[] {
+  const lines: string[] = [];
+  if (member.bead !== undefined) lines.push(...beadDetailLines(member.bead, "  "));
+  // No engagement read (no bd, or the batched read failed) adds no lines at all:
+  // the regression contract is that a view without engagement data is unchanged.
+  if (member.engagement !== undefined) {
+    lines.push(`  awaiting human: ${awaitingHumanText(member.engagement)}`);
+    lines.push(`  newest comment: ${newestCommentText(member.engagement)}`);
+  }
+  return lines;
+}
+
+/**
+ * "Needs you": every bead that a human has to look at, named in one place.
+ *
+ * A supervisor's whole value here is aggregation: "bd-19 and bd-22 are both
+ * waiting on you" is actionable, one member block at a time is not. Undefined
+ * when nothing needs a human, so the fleet view omits the block entirely.
+ */
+export function formatNeedsYou(status: FleetStatus): string | undefined {
+  const needy: Array<{ taskId: string; member: FleetMemberView }> = [];
+  for (const member of status.members) {
+    const taskId = member.taskId;
+    if (taskId === undefined) continue;
+    if (!beadNeedsHuman(member.bead) && member.engagement?.awaitingHuman !== true) continue;
+    needy.push({ taskId, member });
+  }
+  if (needy.length === 0) return undefined;
+
+  const shown = needy.slice(0, NEEDS_YOU_LIST_MAX);
+  const hidden = needy.length - shown.length;
+  const lines = [`Needs you (${needy.length}): ${shown.map((entry) => entry.taskId).join(", ")}`];
+  for (const entry of shown) lines.push(formatNeedsYouEntry(entry));
+  if (hidden > 0) lines.push(`  …and ${hidden} more`);
+  return lines.join("\n");
+}
+
+function formatNeedsYouEntry(entry: { taskId: string; member: FleetMemberView }): string {
+  const { member } = entry;
+  // A member can be here on the gate alone when its bead record failed to read;
+  // that is "unknown", not the fact "unassigned".
+  const assignee =
+    member.bead === undefined ? "(unknown)" : (member.bead.assignee ?? "(unassigned)");
+  const parts = [`assignee ${assignee}`];
+  if (member.engagement?.awaitingHuman === true) parts.push("awaiting human");
+  return `  - ${entry.taskId} (${parts.join(", ")}) — ${needsYouCommentText(member.engagement)}`;
+}
+
+function needsYouCommentText(engagement: FleetBeadEngagement | undefined): string {
+  if (engagement === undefined || engagement.comments.state === "unknown") {
+    return "(comments unknown)";
+  }
+  if (engagement.comments.newest === undefined) return "(no comments yet)";
+  return newestCommentText(engagement);
+}
+
+/** Input to {@link formatBeadOwnership}; every field is already-read data. */
+export interface BeadOwnershipInput {
+  /** Task id the session's workflow records; empty means "no bead to show". */
+  cwdTaskId: string;
+  bead?: FleetBead;
+  engagement?: FleetBeadEngagement;
+  /** Bounded read failure, rendered instead of the ownership columns. */
+  error?: string;
+}
+
+/**
+ * Ownership/human section for `belayd_status` (one bead, markdown).
+ *
+ * Undefined when there is nothing to say — no task id, or no bead/engagement was
+ * read — so a session whose bd is absent prints no new section rather than a
+ * block of "unknown" lines. A read failure is the one case that prints, because
+ * silence there would look like "not waiting on a human". When only the
+ * engagement read failed, the already-read bead columns are kept and the error
+ * is appended, so a partial read is not thrown away.
+ */
+export function formatBeadOwnership(input: BeadOwnershipInput): string | undefined {
+  if (input.cwdTaskId === "") return undefined;
+  const hasData = input.bead !== undefined || input.engagement !== undefined;
+  if (!hasData) {
+    return input.error === undefined
+      ? undefined
+      : `bead detail unavailable (bd read failed): ${boundLookupError(input.error)}`;
+  }
+
+  const lines = [`**Bead ${input.cwdTaskId}**`];
+  if (input.bead !== undefined) {
+    lines.push(`- title: ${input.bead.title ?? "(no title)"}`);
+    lines.push(`- status: ${input.bead.status ?? "status unknown"}`);
+    lines.push(...beadDetailLines(input.bead, "- "));
+  }
+  if (input.engagement !== undefined) {
+    lines.push(`- awaiting human: ${awaitingHumanText(input.engagement)}`);
+    lines.push(`- newest comment: ${newestCommentText(input.engagement)}`);
+  }
+  if (input.error !== undefined) {
+    lines.push(`bead engagement unavailable (bd read failed): ${boundLookupError(input.error)}`);
+  }
+  if (beadNeedsHuman(input.bead) || input.engagement?.awaitingHuman === true) {
+    lines.push(`**Needs you** — ${input.cwdTaskId} is waiting on a human.`);
+  }
+  return lines.join("\n");
+}
+
 /**
  * The orchestrator lease line.
  *
@@ -890,6 +1171,7 @@ function formatMember(member: FleetMemberView): string[] {
   ];
 
   if (member.bead !== undefined) lines.push(formatBeadLine(member.bead));
+  lines.push(...formatOwnershipLines(member));
 
   if (member.workflowFile === "ok") {
     const completedInOrder = member.phaseOrder.filter((phase) =>
@@ -943,6 +1225,14 @@ export function formatFleetStatus(status: FleetStatus): string {
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
   ];
+
+  // After the header lines so "who is waiting on me" is the first thing read,
+  // and before the member blocks so it is never buried in a long fleet.
+  const needsYou = formatNeedsYou(status);
+  if (needsYou !== undefined) {
+    lines.push("");
+    lines.push(needsYou);
+  }
 
   if (status.members.length === 0) {
     lines.push("");

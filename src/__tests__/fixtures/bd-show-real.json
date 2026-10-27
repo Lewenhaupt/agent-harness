@@ -1,0 +1,45 @@
+[
+  {
+    "id": "bd-26",
+    "title": "Investigate moving proof-of-work artifacts out of the git worktree",
+    "description": "Proof artifacts are currently written to proof-of-work/\u003ctask-id\u003e/ inside the worktree and get committed to git. On public projects this leaks terminal recordings (asciinema casts), which can contain secrets, env vars, or internal paths. Investigate a new setup that stores proof-of-work outside the repo worktree (e.g. a per-host external dir, ~/.local/state, a store keyed by task id, or a separate artifact repo). Deliverables: survey current writers (belayd-proof-generator prompt, quality-gates gateProofContent, any docs referencing proof-of-work/), identify all consumers of those paths, and propose a concrete relocation design including gitignore/hook implications and how the quality gate validates artifacts at their new location.",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "assignee": "Hugo Lewenhaupt",
+    "owner": "hugo.lewenhaupt@gmail.com",
+    "created_at": "2026-08-30T12:47:52Z",
+    "created_by": "Hugo Lewenhaupt",
+    "updated_at": "2026-08-31T19:53:54Z",
+    "started_at": "2026-08-30T13:58:11Z",
+    "dependencies": [
+      {
+        "id": "bd-111",
+        "title": "fix(proof): align gateProofContent artifact refs with the proof-generator contract",
+        "status": "closed",
+        "priority": 1,
+        "issue_type": "bug",
+        "created_at": "0001-01-01T00:00:00Z",
+        "updated_at": "0001-01-01T00:00:00Z",
+        "close_reason": "merged via wt",
+        "dependency_type": "relates-to"
+      },
+      {
+        "id": "bd-37",
+        "title": "Implement proof-of-work relocation out of the git worktree",
+        "status": "closed",
+        "priority": 2,
+        "issue_type": "task",
+        "created_at": "0001-01-01T00:00:00Z",
+        "updated_at": "0001-01-01T00:00:00Z",
+        "close_reason": "merged via wt",
+        "dependency_type": "related"
+      }
+    ],
+    "dependent_count": 1,
+    "dependency_count": 2,
+    "comment_count": 2,
+    "comments_omitted": true,
+    "revision": "184602108839472840"
+  }
+]

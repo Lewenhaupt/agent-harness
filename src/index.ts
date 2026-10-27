@@ -122,6 +122,7 @@ export {
   lookupBeadComments,
   PHASE_COMMENT_PREFIX,
   parseBeadComments,
+  parseBeadCommentsWithDropped,
   phaseCommentBody,
   phaseCommentHeader,
   stripBdShowComments,
@@ -193,6 +194,12 @@ export type {
   FleetAcceptRunner,
 } from "./fleet-accept.js";
 export { acceptLandedMember } from "./fleet-accept.js";
+// Per-bead ownership/human engagement for the fleet view (bd-153)
+export type { LookupFleetBeadEngagementOptions } from "./fleet-bead-engagement.js";
+export {
+  ENGAGEMENT_CONCURRENCY,
+  lookupFleetBeadEngagement,
+} from "./fleet-bead-engagement.js";
 // Shared fleet state substrate (bd-126 P1–P4): paths, intent, audit, mailbox, queue
 export type {
   BeadShowArgvBuilder,
@@ -521,10 +528,15 @@ export {
   writeFleetMergeQueue,
 } from "./fleet-state.js";
 export type {
+  BeadOwnershipInput,
   BuildFleetStatusOptions,
   DeriveFleetMemberStateInput,
   FleetBead,
+  FleetBeadComment,
+  FleetBeadCommentRead,
+  FleetBeadEngagement,
   FleetBeadLookup,
+  FleetEngagementLookup,
   FleetIntent,
   FleetLeaseSnapshot,
   FleetLeaseView,
@@ -544,7 +556,9 @@ export type {
   ReadFleetStatusResult,
 } from "./fleet-status.js";
 export {
+  applyFleetBeadEngagement,
   applyFleetBeadLookup,
+  beadNeedsHuman,
   buildFleetStatus,
   DEFAULT_FLEET_ID,
   deriveFleetMemberState,
@@ -562,7 +576,11 @@ export {
   fleetLeaseView,
   fleetMergeQueueFilePath,
   fleetStateDir,
+  formatBeadOwnership,
   formatFleetStatus,
+  formatNeedsYou,
+  NEEDS_YOU_EXCERPT_MAX_CHARS,
+  NEEDS_YOU_LIST_MAX,
   parseBeadView,
   parseBeadViews,
   parseFleetIntent,

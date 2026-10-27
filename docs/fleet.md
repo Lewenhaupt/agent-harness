@@ -128,7 +128,18 @@ what is the fleet doing?
 ```
 
 `belayd_fleet_status` (read-only, P0) renders every worktree's derived state,
-persisted deferrals, and a `parked:` line when the fleet is parked. Real output
+persisted deferrals, and a `parked:` line when the fleet is parked. On a
+beads-backed repo each member also carries `owner:`, `assignee:`, `human:`,
+`bead updated:`, `comment count:`, `awaiting human:` (yes/no/**unknown**) and
+`newest comment:` lines, and any bead that needs a person is named together in
+a `Needs you (<n>): <ids>` block under the `states:` line. Those columns cost two
+extra read-only `bd` calls per member (`bd comments <id> --json`,
+`bd gate list <id> --json`), bounded to 4 beads at a time and each read watched
+for a deadline; a malformed gate record renders `unknown`, never `no`, and a
+failed or entirely unparseable comment read renders `(unknown)`, never the
+empty-thread `(none)`. A
+total outage of both reads for every member becomes one `bead engagement
+unavailable` warning; a per-bead failure only degrades that bead. Real output
 from this repository is in [How to Verify](#how-to-verify). Reading guide:
 
 | State | Meaning |
@@ -379,6 +390,8 @@ left by a dead process does not count — re-arm with `/fleet` first.
 | `Scheduling: 0 member(s) now, N deferred (capacity 3, 3 already active, 0 free slot(s))` | The ceiling is full — normally because members of another fleet (or a dead supervisor's fleet) are still recorded | Not an error (exit 0). `belayd_fleet_status` shows who is active; let a member finish, or `belayd_fleet_reconcile` `pruneDeadMembers` (positive `absent` evidence only — never `unknown`), then `belayd_fleet_advance`. Do not edit `fleet.json` by hand to drop ids. **A stopped member holds its slot until it lands or is pruned**, and a member whose retry session is still alive is never prunable, so an all-stopped fleet can pin the ceiling of 3 until those retries end, land, or the supervisor prunes them after the sessions are gone |
 | `<n> fleet intent(s) under this repository's fleet root cannot be read (<ids>). Counting only the readable fleets could exceed the ceiling of 3 …` | `fleet.json` does not parse (hand edit, truncation, newer schema). Writers refuse to replace a present-but-unparsable record, and an unreadable intent refuses a launch rather than assuming zero active members | Inspect `fleet.json`; restore a valid record (or move it aside if the fleet is really finished). Reconcile and launch both refuse until it parses — this is deliberate, because guessing the member count can overshoot the ceiling |
 | `bead metadata unavailable (bd read failed): …` in the status view | `bd show` failed, timed out, is not installed, or the checkout has no beads database | Nothing about the workflow view is wrong; states, phases, and runs still derive. Ignore unless you need titles/statuses |
+| `bead engagement unavailable (bd read failed): …` in the status view | **Every** member's `bd comments` **and** `bd gate list` reads failed (bd missing, wrong database, total outage) | Same: the derived view is intact, only owner/assignee/human/comment columns are missing. Reported once per fleet, not once per member. A mixed result (some beads readable) is not a warning: those beads render `unknown` columns |
+| `Needs you (n): …` names a bead but the bead looks idle | The bead carries bd's `human` label or has an open `human` gate | Answer in bd/Scotty (the member's session polls the comment thread and resolves the gate). `belayd_fleet_status` only reports the wait; it never resolves it |
 
 ## How to Verify
 
@@ -478,8 +491,9 @@ Warnings (2):
 ```
 
 Read it as: both linked worktrees finished their workflow (state cleared, manifests
-kept), so no member has a task id, so **no** `bd show` call happened at all and
-there are no `bead:` lines. The main checkout is absent because it holds no
+kept), so no member has a task id, so **no** `bd show`, `bd comments`, or
+`bd gate list` call happened at all and there are no `bead:`/ownership lines.
+The main checkout is absent because it holds no
 workflow state. `latest runs` is alphabetical here only because `phaseOrder` is
 unknown without `workflow.json`.
 
