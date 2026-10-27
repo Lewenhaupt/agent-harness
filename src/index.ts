@@ -387,7 +387,9 @@ export type {
 } from "./fleet-run.js";
 export {
   deriveFleetMemberProgress,
+  emptyAdvanceAction,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
+  FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_MEMBERS_MAX,
   FLEET_RUN_MODES,

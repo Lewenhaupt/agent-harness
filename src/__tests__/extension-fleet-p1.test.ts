@@ -32,6 +32,7 @@ import {
   drainNotes,
   enqueueNote,
   FLEET_NOTE_BODY_MAX_LENGTH,
+  FLEET_RUN_MAX_IDLE_TICKS,
   fleetEventsDir,
   fleetInboxDir,
   fleetNoteFileName,
@@ -142,6 +143,11 @@ const childProcess = vi.hoisted(() => ({
   execFileCalls: [] as Array<{ file: string; args: readonly string[]; stdin: string }>,
   /** Fail every `bd comment` write, to pin the mirror's best-effort behaviour. */
   failBdComment: false,
+  /**
+   * Stdout for one `bd` call, so a test can give the scheduler a real dependency
+   * edge; every other call keeps the empty-output default.
+   */
+  bdStdout: undefined as ((args: readonly string[]) => string | undefined) | undefined,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -164,7 +170,7 @@ vi.mock("node:child_process", async (importOriginal) => {
         // closes it right after, so the recorded body is still set before the
         // awaiting test resumes — and a failing comment rejects on that close,
         // where the real child would have failed.
-        if (!fails) done(null, "", "");
+        if (!fails) done(null, childProcess.bdStdout?.(args) ?? "", "");
         const childStdin = {
           on: () => {},
           end: (chunk?: string) => {
@@ -293,10 +299,23 @@ function makeCtx(dir: string, sessionId: string) {
     ui: {
       notify: (message: string, level: string) => {
         ctxNotifications.push({ message, level });
+        // One-shot hook for the window between the launch engine writing the new
+        // plan (its warnings are notified right there) and the tick re-reading it.
+        const hook = afterLaunchHook;
+        afterLaunchHook = undefined;
+        hook?.();
       },
     },
   };
 }
+
+/**
+ * Runs inside a tick's first notification, i.e. after the launch engine returned.
+ *
+ * A test uses it to remove `fleet.json` in the same window a reconcile or an
+ * operator cleanup would, which no filesystem seam of the engine can reach.
+ */
+let afterLaunchHook: (() => void) | undefined;
 
 // Notifications are asserted per test; the mock pi and the ctx both expose the
 // same sink so a refusal can be checked from either side.
@@ -366,12 +385,14 @@ describe("fleet supervisor mode", () => {
     daemon.failWith = undefined;
     childProcess.failBdComment = false;
     ctxNotifications = [];
+    afterLaunchHook = undefined;
   });
 
   afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
     git.commonDir = "";
     git.failWith = undefined;
+    afterLaunchHook = undefined;
   });
 
   function writeIntent(options: {
@@ -1960,11 +1981,15 @@ describe("fleet run mode", () => {
     mkdirSync(worktree.path, { recursive: true });
     daemon.calls = [];
     daemon.failWith = undefined;
+    childProcess.bdStdout = undefined;
     ctxNotifications = [];
+    afterLaunchHook = undefined;
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    childProcess.bdStdout = undefined;
+    afterLaunchHook = undefined;
     rmSync(cwd, { recursive: true, force: true });
     git.commonDir = "";
   });
@@ -1974,6 +1999,213 @@ describe("fleet run mode", () => {
     if (!intent.ok) return undefined;
     return intent.intent?.run;
   }
+
+  /** Every audit entry of one action, with the ids and detail it recorded. */
+  function auditEntries(action: string): Array<{ taskIds: readonly string[]; detail: string }> {
+    const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
+      .filter((entry) => entry.action === action)
+      .map((entry) => ({ taskIds: entry.taskIds ?? [], detail: entry.detail ?? "" }));
+  }
+
+  /** Rewrite the armed fleet record, the way a rival fleet or an operator would. */
+  function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
+    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify(mutate(intent)));
+  }
+
+  /**
+   * Start a run whose only member then stops itself, ready for the advance cases.
+   *
+   * No worktree is resolvable for the member, so once the start grace passes the
+   * tick reads `orchestrator-missing` and stops it — the state the bd-157 report
+   * observed, with the member still in `taskIds` (bd-156).
+   */
+  async function stopEveryMemberInRun(): Promise<void> {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // Ticks land at 15 s while the member is only `starting`; the stop tick is the
+    // one at the 120 s grace boundary, and nothing is scheduled before 121 s.
+    await vi.advanceTimersByTimeAsync(121_000);
+    const stopped = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(stopped).toHaveProperty("ok", true);
+    if (!stopped.ok) return;
+    expect(stopped.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "orchestrator-missing" }),
+    ]);
+  }
+
+  it("ends a stopped-everything run as partial on the next tick, not after 240", async () => {
+    // The bd-157 report: nothing working, the deferred wave unplannable, and the loop
+    // re-planning it every 15 s until the idle cap halted the run as stalled.
+    await stopEveryMemberInRun();
+
+    // bd reports bd-19 blocked by the stopped (still-a-member) bd-12, so the advance
+    // is a dependency wave it can only re-defer.
+    childProcess.bdStdout = (args) =>
+      args[0] === "show" && args.includes("bd-19")
+        ? JSON.stringify([
+            {
+              id: "bd-19",
+              dependencies: [{ id: "bd-12", dependency_type: "blocks", status: "in_progress" }],
+            },
+          ])
+        : undefined;
+    editIntent((intent) => ({
+      ...intent,
+      deferred: [
+        {
+          taskId: "bd-19",
+          reason: "dependency",
+          blockers: ["bd-12"],
+          detail: "wave 1: waits for bd-12 to land",
+        },
+      ],
+    }));
+
+    // The stop tick reschedules at the 2 s action interval; that next tick is the
+    // empty advance, and it must also be the last one.
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const finished = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(finished).toHaveProperty("ok", true);
+    if (!finished.ok) return;
+    expect(finished.intent?.run?.finishedAt).toEqual(expect.any(Number));
+    expect(finished.intent?.run?.outcome).toBe("partial");
+    expect(finished.intent?.run?.idleTicks).toBe(0);
+    expect(finished.intent?.run?.haltedReason).toBeUndefined();
+
+    const plannedForWave = auditEntries("schedule-planned").filter((entry) =>
+      entry.taskIds.includes("bd-19"),
+    );
+    expect(plannedForWave).toHaveLength(1);
+    expect(
+      auditEntries("member-deferred").filter((entry) => entry.taskIds.includes("bd-19")),
+    ).toHaveLength(1);
+    const completed = auditEntries("fleet-run-complete");
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.detail).toContain("bd-19 (dependency)");
+
+    // The loop is over: minutes of would-be ticks add nothing.
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(
+      auditEntries("schedule-planned").filter((entry) => entry.taskIds.includes("bd-19")),
+    ).toHaveLength(1);
+    expect(auditEntries("fleet-run-complete")).toHaveLength(1);
+  });
+
+  it("completes on a hard launch refusal instead of waiting out a capacity block", async () => {
+    await stopEveryMemberInRun();
+
+    // A corrupt sibling intent makes the orchestrator count unknowable, so the launch
+    // engine refuses hard (`ok: false`). Capacity deferrals must not turn that into a
+    // wait: the engine would refuse identically on every tick.
+    mkdirSync(join(commonDir, "belayd", "fleet", "other"), { recursive: true });
+    writeFileSync(join(commonDir, "belayd", "fleet", "other", "fleet.json"), "{not json");
+    editIntent((intent) => ({
+      ...intent,
+      maxConcurrent: 1,
+      deferred: [{ taskId: "bd-19", reason: "capacity", blockers: [], detail: "no free slot" }],
+    }));
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const finished = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(finished).toHaveProperty("ok", true);
+    if (!finished.ok) return;
+    expect(finished.intent?.run?.outcome).toBe("partial");
+    const completed = auditEntries("fleet-run-complete");
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.detail).toContain("orchestrator count is unknown");
+  });
+
+  it("waits on a capacity-blocked advance, then halts as stalled at the idle cap", async () => {
+    await stopEveryMemberInRun();
+
+    // One slot, already held by the stopped-but-still-a-member bd-12, so the wave is
+    // capacity-blocked. The idle count is seeded one tick below the cap: the first
+    // empty advance waits (a slot elsewhere can still free), the next halts.
+    editIntent((intent) => {
+      const run = intent.run as Record<string, unknown>;
+      return {
+        ...intent,
+        maxConcurrent: 1,
+        deferred: [{ taskId: "bd-19", reason: "capacity", blockers: [], detail: "no free slot" }],
+        run: { ...run, idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 },
+      };
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    const waiting = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(waiting).toHaveProperty("ok", true);
+    if (!waiting.ok) return;
+    expect(waiting.intent?.run?.finishedAt).toBeUndefined();
+    expect(waiting.intent?.run?.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    const halted = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(halted).toHaveProperty("ok", true);
+    if (!halted.ok) return;
+    // Still not finished: a halt is terminal for the run record, not a completion.
+    expect(halted.intent?.run?.finishedAt).toBeUndefined();
+    expect(halted.intent?.run?.haltedReason).toContain("stalled");
+    expect(halted.intent?.run?.haltedReason).toContain("bd-19 (capacity)");
+    // The tick that gives up must not reset the count that justified it: like the
+    // plan's own `idleOrWait` halt, it counts as one more idle tick (never `0`).
+    expect(halted.intent?.run?.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS + 1);
+    expect(auditEntries("fleet-run-halted")).toHaveLength(1);
+
+    // The timer is stopped: the cap costs one last re-plan (the halt is decided after
+    // the advance), and further minutes add neither a plan nor a second halt.
+    const plannedBefore = auditEntries("capacity-blocked").length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(auditEntries("capacity-blocked")).toHaveLength(plannedBefore);
+    expect(auditEntries("fleet-run-halted")).toHaveLength(1);
+  });
+
+  it("halts when the fleet record disappears while an advance is in flight", async () => {
+    await stopEveryMemberInRun();
+
+    editIntent((intent) => ({
+      ...intent,
+      maxConcurrent: 1,
+      deferred: [{ taskId: "bd-19", reason: "capacity", blockers: [], detail: "no free slot" }],
+    }));
+    const plannedBefore = auditEntries("schedule-planned").length;
+    // An unreadable dependency graph is a warning the launch engine reports after it
+    // has written the plan, which is the hook point below.
+    childProcess.bdStdout = (args) => (args[0] === "show" ? "{not json" : undefined);
+    const fleetFile = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    // The engine's own warnings are notified after it wrote the re-planned intent and
+    // before the tick re-reads it: the window a reconcile or an operator cleanup can
+    // empty, which would otherwise let the tick classify from the pre-launch plan.
+    afterLaunchHook = () => rmSync(fleetFile, { force: true });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(existsSync(fleetFile)).toBe(false);
+    const lines = ctxNotifications.map((entry) => entry.message).join("\n");
+    // The advance's own report is kept as the leading line, then the run stops
+    // instead of classifying from the plan the advance just replaced.
+    expect(lines).toContain("Scheduling: 0 member(s) now, 1 deferred");
+    expect(lines).toContain("run halted — the fleet intent for `default` is gone");
+    // A halt is not a completion: nothing was classified, nothing was written.
+    expect(auditEntries("fleet-run-complete")).toHaveLength(0);
+    expect(auditEntries("fleet-run-halted")).toHaveLength(0);
+
+    // `stop: true` means the timer is gone, so minutes of would-be ticks add nothing.
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(auditEntries("schedule-planned")).toHaveLength(plannedBefore + 1);
+    expect(auditEntries("fleet-run-complete")).toHaveLength(0);
+  });
 
   it("records a run for the members it launched and starts the loop", async () => {
     const mock = await loadFleetExtension();
