@@ -314,6 +314,7 @@ orchestrator is a session inside the daemon, so no process carries a
 |---|---|
 | A second launch into a worktree with a live lease | Refused before any session is created (`Refusing to launch … live orchestrator lease`) |
 | A session starting in a worktree another live session owns | Gate not armed (`Refusing to drive …`), so it cannot run phases or write the ledger |
+| A session whose `session_start` finds only an inert persisted workflow (complete, handed off, or invalid task id) | No lease claimed and no heartbeat started; the dead `workflow.json` is archived as `workflow.stale-<epoch-ms>-<hex>.json` (bd-165; see `docs/bd-165-userguide.md`) |
 | A session whose `session_start` finds a pending lease | Adopts it (the spawner's session) |
 | A cold or unreadable lease | Taken over, archived, audited, and reported |
 | Losing the lease (taken over, deleted, or unwritable) | The session stops renewing, **disarms its process gate**, and reports it: phase tools refuse rather than race the session that now owns the worktree |

@@ -10,7 +10,8 @@ import { randomBytes } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import type { PhaseSessionRecord } from "./session-naming.js";
+import { isWorkflowComplete } from "./process-gate.js";
+import { isValidTaskId, type PhaseSessionRecord } from "./session-naming.js";
 
 const SCHEMA_VERSION = 1;
 
@@ -247,6 +248,36 @@ export function readWorkflowState(options: ReadWorkflowStateOptions): WorkflowSt
 }
 
 /**
+ * Whether a persisted workflow may produce a worktree-lease claim (bd-165).
+ *
+ * A completed or handed-off `workflow.json` is a record of a workflow that is
+ * over. Claiming the one-orchestrator-per-worktree lease from it names the dead
+ * task and then holds the lease for the life of the new session, so every later
+ * session in that worktree is refused.
+ */
+export type WorkflowClaimability =
+  | { kind: "claimable" }
+  | { kind: "inert"; reason: "handed-off" | "complete" | "invalid-task-id" };
+
+/**
+ * Classify a persisted workflow as claimable or inert. Pure: no I/O, so the
+ * session-start ordering decision is unit-testable without a worktree.
+ */
+export function classifyWorkflowClaimability(state: WorkflowState): WorkflowClaimability {
+  // The handoff marker wins over the phase ledger: a terminal handed-off state
+  // still has to reach settleHandoffPendingItems, so it is reported as handed
+  // off even when every phase is complete.
+  if (state.handedOffTo !== undefined) return { kind: "inert", reason: "handed-off" };
+  if (isWorkflowComplete(state.completedPhaseNames, state.phaseOrder)) {
+    return { kind: "inert", reason: "complete" };
+  }
+  // A crafted/corrupt task id must never reach the `bd show ${taskId}` sink or
+  // a lease naming it.
+  if (!isValidTaskId(state.taskId)) return { kind: "inert", reason: "invalid-task-id" };
+  return { kind: "claimable" };
+}
+
+/**
  * Atomically write any JSON value: temp file in the target directory, then
  * rename over the target. Shared by workflow state and run manifests so both
  * get identical crash-safety semantics.
@@ -477,5 +508,51 @@ export function clearWorkflowState(options: ClearWorkflowStateOptions): void {
     fs.unlinkSync(workflowStateFilePath(options.cwd));
   } catch {
     // Missing files are the expected success case.
+  }
+}
+
+/** Prefix of an archived (inert) workflow state, kept for diagnosis. */
+export const WORKFLOW_STATE_ARCHIVE_PREFIX = "workflow.stale-";
+
+export interface ArchiveWorkflowStateOptions {
+  cwd: string;
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+export type ArchiveWorkflowStateResult =
+  | { ok: true; archived: false }
+  | { ok: true; archived: true; archivedPath: string }
+  | { ok: false; error: string };
+
+/**
+ * Archive an inert workflow state file instead of deleting it (bd-165).
+ *
+ * Renaming keeps the record diagnosable after the fact — the same convention
+ * `orchestrator.stale-<ts>.json` uses for a displaced lease — while still
+ * removing the poison file so the next session starts lease-free. A missing
+ * state file is a reported no-op (`archived: false`); a rename failure is
+ * returned, never thrown.
+ *
+ * The archive name carries a random discriminator: two archives in the same
+ * worktree within one millisecond would otherwise collide, and `rename`
+ * silently replaces the first record on POSIX, destroying the diagnosis.
+ */
+export function archiveWorkflowState(
+  options: ArchiveWorkflowStateOptions,
+): ArchiveWorkflowStateResult {
+  const fs = options.fs ?? nodeFsSeam;
+  const filePath = workflowStateFilePath(options.cwd);
+  if (!fs.existsSync(filePath)) return { ok: true, archived: false };
+  const archivedPath = join(
+    workflowStateDir(options.cwd),
+    `${WORKFLOW_STATE_ARCHIVE_PREFIX}${nowMs(options.now)}-${randomBytes(4).toString("hex")}.json`,
+  );
+  try {
+    fs.mkdirSync(workflowStateDir(options.cwd), { recursive: true });
+    fs.renameSync(filePath, archivedPath);
+    return { ok: true, archived: true, archivedPath };
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) };
   }
 }

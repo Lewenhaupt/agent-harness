@@ -209,8 +209,10 @@ running (the child orchestrator is created through the session daemon).
 
    Expected: **no** `BELAYD WORKFLOW ACTIVE` gate message on the next turn,
    full tool set restored, and `belayd_status` still starts with `**Handed off**`.
-   The handed-off workflow does not resurrect, even though
-   `.belayd/workflow.json` still exists.
+   The handed-off workflow does not resurrect, and the dead record no longer
+   stays claimable: `.belayd/workflow.json` is renamed to
+   `.belayd/workflow.stale-<epoch-ms>-<hex>.json` once the pending items are settled, so the
+   next session in that worktree starts lease-free (bd-165).
 
 5. Control: in a worktree whose `.belayd/workflow.json` has no `handedOffTo`
    field and no `.belayd/handoff-*.json` file, restarting the same way **does**
@@ -229,6 +231,9 @@ ls .belayd/handoff-*.json
 
 jq . .belayd/handoff-<caller-session-id>.json
 # { "taskId": "bd-121", "branch": "feat/bd-121", "sessionId": "<child-daemon-id>" }
+
+ls .belayd/workflow.stale-*.json
+# .belayd/workflow.stale-<epoch-ms>-<hex>.json  (a dead record a session declined to drive)
 ```
 
 The caller-scoped file is authoritative on `session_start`; `handedOffTo` in
@@ -444,7 +449,7 @@ label write, and the caller stays armed.
 
 | File | Written by | Read by | Cleared by |
 | --- | --- | --- | --- |
-| `.belayd/workflow.json` → `handedOffTo: { taskId, branch, sessionId }` | `launchWorktreeWorkflow` via `saveHandedOffMarker` (skipped for a same-directory child, which owns this file) | `resumeWorkflowFromDisk` on `session_start` | `activateGate` (new task), `belayd_stop_task`, workflow completion |
+| `.belayd/workflow.json` → `handedOffTo: { taskId, branch, sessionId }` | `launchWorktreeWorkflow` via `saveHandedOffMarker` (skipped for a same-directory child, which owns this file) | `resumeWorkflowFromDisk` on `session_start` | `activateGate` (new task), `belayd_stop_task`, workflow completion, or archived to `workflow.stale-<epoch-ms>-<hex>.json` when a session finds the workflow inert (bd-165) |
 | `.belayd/handoff-<callerSessionId>.json` → `{ taskId, branch, sessionId }` | `writeCallerHandoff` (authoritative; sanitized session id) | `resumeWorkflowFromDisk`, consulted **before** `workflow.json` | `activateGate` (new task), `belayd_stop_task` |
 
 `sessionId` is the daemon session id of the child (the id pi-web shows), not the
@@ -486,6 +491,25 @@ readable name `belayd-bd-121`. Both files are optional to parse: a
   (`rm .belayd/handoff-<your-session-id>.json`). A failed clear during
   `activateGate`/`belayd_stop_task` is surfaced as a `belayd-error` message
   naming the file, so it is not silent.
+
+#### Stale workflow state must not hold the worktree lease (bd-165)
+
+A `.belayd/workflow.json` left behind by a finished or handed-off workflow is
+**inert**: it cannot drive anything, and its bead may already be closed. Only a
+*claimable* state — not handed off, not all phases complete, and carrying a
+valid task id — may produce the one-orchestrator-per-worktree lease on
+`session_start`. An inert state is never claimed (no `.belayd/orchestrator.json`,
+no heartbeat, no `Refusing to drive …` notification) and is renamed to
+`.belayd/workflow.stale-<epoch-ms>-<hex>.json` instead of being deleted, so the record stays
+diagnosable. The archive runs unconditionally on the handed-off branch (after
+`settleHandoffPendingItems`, which still needs the marker): a same-directory
+child's `workflow.json` needs no exemption because `persistHandoffMarkers`
+writes `handedOffTo` only onto the caller's own cross-worktree state, so the
+child's file never carries a marker and never reaches that branch.
+
+Symptom this prevents: a worktree whose lease names a *closed* bead, renewing
+every 20 s, refusing every later session — including `/belayd <new bead>`.
+Step-by-step verification and recovery: `docs/bd-165-userguide.md`.
 
 ### Workflow type resolution (explicit signals only, bd-106)
 

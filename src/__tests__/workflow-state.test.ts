@@ -2,7 +2,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  archiveWorkflowState,
   callerHandoffFilePath,
+  classifyWorkflowClaimability,
   clearCallerHandoff,
   clearHandedOffMarker,
   clearWorkflowState,
@@ -16,6 +18,7 @@ import {
   saveReviewedSha,
   type WorkflowFs,
   type WorkflowState,
+  workflowStateDir,
   workflowStateFilePath,
   writeCallerHandoff,
   writeWorkflowState,
@@ -432,6 +435,133 @@ describe("workflow state", () => {
         phaseSessions: { implement: { base: "impl", invocations: 0 } },
       }),
     ).toBe(undefined);
+  });
+});
+
+describe("classifyWorkflowClaimability (bd-165)", () => {
+  const marker = { taskId: "bd-101", branch: "feat/bd-101", sessionId: "sess-child" };
+
+  it("is claimable for a genuine in-progress workflow", () => {
+    const state = sampleState({ completedPhaseNames: ["scout"] });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "claimable" });
+  });
+
+  it("is inert when every phase in its own order is complete", () => {
+    const state = sampleState({
+      completedPhaseNames: ["scout", "plan", "implement", "commit"],
+    });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "complete" });
+  });
+
+  it("is inert for a handed-off workflow", () => {
+    const state = sampleState({ completedPhaseNames: ["scout"], handedOffTo: marker });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "handed-off" });
+  });
+
+  it("reports handed-off ahead of complete so the marker still reaches settlement", () => {
+    const state = sampleState({
+      completedPhaseNames: ["scout", "plan", "implement", "commit"],
+      handedOffTo: marker,
+    });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "handed-off" });
+  });
+
+  it("is inert for a task id that cannot name a bead", () => {
+    const state = sampleState({ taskId: "bd-42;rm -rf /" });
+    expect(classifyWorkflowClaimability(state)).toEqual({
+      kind: "inert",
+      reason: "invalid-task-id",
+    });
+  });
+
+  it("reports handed-off ahead of an invalid task id so the marker still reaches settlement", () => {
+    const state = sampleState({ taskId: "bd-42;rm -rf /", handedOffTo: marker });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "handed-off" });
+  });
+
+  it("reports complete ahead of an invalid task id", () => {
+    // Ordering, not preference: a finished workflow is inert whichever check
+    // fires first, and both reasons skip the claim and archive the file.
+    const state = sampleState({
+      taskId: "bd-42;rm -rf /",
+      completedPhaseNames: ["scout", "plan", "implement", "commit"],
+    });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "complete" });
+  });
+
+  it("treats an empty phase order as complete because isWorkflowComplete is vacuous", () => {
+    // Deliberate consequence of reusing `isWorkflowComplete`: no phases to
+    // finish means nothing left to drive, so the state must not claim a lease
+    // even though it still has a valid task id.
+    const state = sampleState({ completedPhaseNames: [], phaseOrder: [] });
+    expect(classifyWorkflowClaimability(state)).toEqual({ kind: "inert", reason: "complete" });
+  });
+
+  it("does not mutate the state it classifies", () => {
+    const state = sampleState({ completedPhaseNames: ["scout"] });
+    const snapshot = structuredClone(state);
+    classifyWorkflowClaimability(state);
+    expect(state).toEqual(snapshot);
+  });
+});
+
+describe("archiveWorkflowState (bd-165)", () => {
+  it("renames the state to a timestamped archive instead of deleting it", () => {
+    const original = { ...sampleState(), completedPhaseNames: ["scout", "plan"] };
+    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: JSON.stringify(original) });
+
+    const result = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || !result.archived) throw new Error("expected an archived result");
+    expect(result.archivedPath).toMatch(/workflow\.stale-7654-[0-9a-f]{8}\.json$/);
+    expect(result.archivedPath.startsWith(workflowStateDir(cwd))).toBe(true);
+    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(false);
+    expect(fs.files.get(result.archivedPath)).toBe(JSON.stringify(original));
+  });
+
+  it("keeps both records when two archives land in the same millisecond", () => {
+    const fs = createFakeFs();
+    const first = { ...sampleState(), completedPhaseNames: ["scout"] };
+    const second = { ...sampleState(), completedPhaseNames: ["scout", "plan"] };
+
+    writeWorkflowState({ cwd, state: first, fs });
+    const firstResult = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
+    writeWorkflowState({ cwd, state: second, fs });
+    const secondResult = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
+
+    if (!firstResult.ok || !firstResult.archived) throw new Error("first archive failed");
+    if (!secondResult.ok || !secondResult.archived) throw new Error("second archive failed");
+    expect(firstResult.archivedPath).not.toBe(secondResult.archivedPath);
+    expect(JSON.parse(fs.files.get(firstResult.archivedPath) ?? "")).toHaveProperty(
+      "completedPhaseNames",
+      ["scout"],
+    );
+    expect(JSON.parse(fs.files.get(secondResult.archivedPath) ?? "")).toHaveProperty(
+      "completedPhaseNames",
+      ["scout", "plan"],
+    );
+  });
+
+  it("reports the missing-file no-op explicitly", () => {
+    const fs = createFakeFs();
+    expect(archiveWorkflowState({ cwd, fs, now: () => 7_654 })).toEqual({
+      ok: true,
+      archived: false,
+    });
+    expect(fs.files.size).toBe(0);
+  });
+
+  it("returns a rename failure as a value and leaves the state in place", () => {
+    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: JSON.stringify(sampleState()) });
+    fs.renameSync = () => {
+      throw new Error("disk full");
+    };
+
+    const result = archiveWorkflowState({ cwd, fs });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toBe("disk full");
+    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(true);
   });
 });
 
