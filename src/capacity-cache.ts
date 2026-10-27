@@ -8,11 +8,13 @@
  * window `parseQuotaResetSeconds` extracted from the 429 body (bd-38).
  *
  * Windows come from a probe. By default the probe reads the persisted cooldown
- * store's provider entries; when `BELAYD_CAPACITY_PROBE_URL` is set the
- * extension instead probes that usage/reset endpoint. Probe results are cached
- * for `ttlInMs` (default {@link DEFAULT_CAPACITY_TTL_MS}) so a 6-phase workflow
- * re-probes at most once per TTL rather than once per phase. Mid-workflow 429s
- * are fed back in via `record`, so the cache stays fresh within the TTL too.
+ * store's provider entries (re-reading the shared file first, so cooldowns
+ * written by other processes are visible); when `BELAYD_CAPACITY_PROBE_URL` is
+ * set the extension instead probes that usage/reset endpoint. Probe results are
+ * cached for `ttlInMs` (default {@link DEFAULT_CAPACITY_TTL_MS}) so a 6-phase
+ * workflow re-probes at most once per TTL rather than once per phase.
+ * Mid-workflow 429s are fed back in via `record`, so the cache stays fresh
+ * within the TTL too.
  *
  * A probe failure is never fatal to a spawn: `refreshIfStale` catches probe
  * errors/timeouts, drops the failed attempt (so the next call re-probes), and
@@ -80,13 +82,20 @@ export const CAPACITY_PROBE_URL_ENV = "BELAYD_CAPACITY_PROBE_URL";
 
 /** Default probe: treat persisted provider cooldowns as capacity windows. */
 export function probeFromCooldownStore(store: ModelCooldownStore): CapacityProbe {
-  return () => ({
-    windows: [...store.providerEntries()].map(([provider, entry]) => ({
-      provider,
-      resetAt: entry.until,
-      reason: entry.reason,
-    })),
-  });
+  return () => {
+    // The store loads its file once at creation, and every fleet member owns its
+    // own store: without a re-read the probe would serve a creation-time
+    // snapshot and miss a provider cooldown another member just persisted. The
+    // refresh is a no-op for an in-memory store and never throws.
+    store.refresh();
+    return {
+      windows: [...store.providerEntries()].map(([provider, entry]) => ({
+        provider,
+        resetAt: entry.until,
+        reason: entry.reason,
+      })),
+    };
+  };
 }
 
 /** Reject after `timeoutMs` if `promise` has not settled; clears the timer either way. */

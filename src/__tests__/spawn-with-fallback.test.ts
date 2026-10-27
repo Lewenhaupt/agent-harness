@@ -4,7 +4,12 @@ import type { SpawnResult, SpawnUsage } from "../agent-registry.js";
 import { createCapacityCache } from "../capacity-cache.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
 import { createModelTelemetryStore } from "../model-telemetry.js";
-import type { classifySpawnFailure, FailureClassification } from "../quota-failure.js";
+import {
+  type classifySpawnFailure,
+  DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
+  DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+  type FailureClassification,
+} from "../quota-failure.js";
 import { spawnAgentWithFallback } from "../spawn-with-fallback.js";
 
 const mockSpawnAgentProcess = vi.hoisted(() => vi.fn());
@@ -797,5 +802,196 @@ describe("spawnAgentWithFallback", () => {
     expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
     expect(attempts).toEqual([]);
     expect(result.details.exitCode).toBe(1);
+  });
+});
+
+describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
+  /** The live opencode-go exhaustion body: no reset hint, weekly bucket. */
+  const GO_USAGE_LIMIT_DETAILS = {
+    messages: [
+      {
+        role: "assistant",
+        content: [],
+        model: "opencode-go/mimo-v2.6-flash",
+        stopReason: "error",
+        errorMessage: '429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}',
+      },
+    ],
+    usage: zeroUsage(),
+    exitCode: 0,
+  };
+
+  function goLimitResult(): SpawnResult {
+    return {
+      ...makeResult("opencode-go/mimo-v2.6-flash"),
+      details: { ...GO_USAGE_LIMIT_DETAILS, usage: zeroUsage() },
+    };
+  }
+
+  const candidates = ["opencode-go/mimo-v2.6-flash", "llmgateway/mimo-v2.6-flash"];
+
+  it("cools the provider for hours, so 15 minutes later it is still skipped", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(goLimitResult())
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const first = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+
+    expect(first.attempts.map((a) => a.classification.kind)).toEqual(["quota", "success"]);
+    // The old 15-minute default expired long before the real weekly reset and
+    // re-probed the exhausted provider; the provider window does not.
+    expect(store.cooldownScope("opencode-go/mimo-v2.6-flash", 15 * 60 * 1000 + 1)).toBe("provider");
+    expect(store.providerEntries().get("opencode-go")).toHaveProperty(
+      "until",
+      DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS * 1000,
+    );
+
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+    const second = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+
+    // No spawn on the exhausted provider: the first candidate is a skip row.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(mockSpawnAgentProcess.mock.calls[0]?.[0]).toHaveProperty(
+      "model",
+      "llmgateway/mimo-v2.6-flash",
+    );
+    expect(second.attempts[0]).toHaveProperty("skippedProvider", "opencode-go");
+  });
+
+  it("does not apply the long provider window on a model-scoped failure", async () => {
+    // A 5xx that happens to mention the usage limit is still endpoint health, not
+    // an exhausted subscription bucket: cooling the whole provider for hours
+    // would hide its healthy sibling models from the very next spawn.
+    const transientDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "opencode-go/mimo-v2.6-flash",
+          stopReason: "error",
+          errorMessage: '503: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}',
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("opencode-go/mimo-v2.6-flash"),
+        details: transientDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["transient", "success"]);
+    expect(store.cooldownScope("opencode-go/mimo-v2.6-flash")).toBe("model");
+    expect(store.entries().get("opencode-go/mimo-v2.6-flash")).toHaveProperty(
+      "until",
+      DEFAULT_TRANSIENT_COOLDOWN_SECONDS * 1000,
+    );
+    expect(store.providerEntries().size).toBe(0);
+    // The provider's other models stay usable, and 5xx noise never escalates.
+    expect(store.isCoolingDown("opencode-go/deepseek-v4.1-flash")).toBe(false);
+    expect(store.entries().get("opencode-go/mimo-v2.6-flash")).not.toHaveProperty("escalations");
+  });
+
+  it("escalates the provider window on a repeated unhinted 429", async () => {
+    let now = 0;
+    const store = createModelCooldownStore(() => now);
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(goLimitResult())
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+
+    await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+    const firstUntil = store.providerEntries().get("opencode-go")?.until ?? 0;
+    expect(firstUntil).toBe(DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS * 1000);
+
+    // The window expired and the provider is still exhausted: the next unhinted
+    // 429 must cost double instead of re-guessing the same span.
+    now = firstUntil + 60_000;
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(goLimitResult())
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+    await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+    expect(store.providerEntries().get("opencode-go")).toHaveProperty(
+      "until",
+      now + 2 * DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS * 1000,
+    );
+
+    // A body that states its reset is authoritative: exact window, ladder reset.
+    now = (store.providerEntries().get("opencode-go")?.until ?? 0) + 60_000;
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("opencode-go/mimo-v2.6-flash"),
+        details: {
+          messages: [
+            {
+              role: "assistant",
+              content: [],
+              model: "opencode-go/mimo-v2.6-flash",
+              stopReason: "error",
+              errorMessage:
+                '429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 7hr 57min."}',
+            },
+          ],
+          usage: zeroUsage(),
+          exitCode: 0,
+        },
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
+    await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates,
+      cooldownStore: store,
+    });
+    expect(store.providerEntries().get("opencode-go")).toHaveProperty(
+      "until",
+      now + (7 * 3600 + 57 * 60) * 1000,
+    );
+    expect(store.providerEntries().get("opencode-go")).not.toHaveProperty("escalations");
   });
 });

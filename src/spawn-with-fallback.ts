@@ -281,7 +281,13 @@ function recordCooldown(
   // served by another provider, so cooling the provider instead would discard
   // healthy candidates.
   if (classification.kind === "quota" && provider !== "") {
-    store.markProviderCooldown(provider, seconds, reason);
+    // A parsed reset hint is authoritative; an unhinted quota window is a guess,
+    // so the store escalates it when this provider was already cooling instead
+    // of re-guessing the same span (bd-38: a weekly limit re-probed every
+    // 15 minutes, each probe burning a real fallback session).
+    store.markProviderCooldown(provider, seconds, reason, {
+      hinted: classification.cooldownHinted === true,
+    });
   } else {
     store.markCooldown(candidate, seconds, reason);
   }
