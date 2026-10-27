@@ -44,6 +44,13 @@ export type FleetRunMode = (typeof FLEET_RUN_MODES)[number];
  * Every entry is a case where a human decision is needed; none of them are
  * retried automatically, because retrying a failed gate or a conflicting rebase
  * with no new information just burns the same minutes again.
+ *
+ * A failed bd ordering-gate resolve is deliberately *not* on this list (bd-158).
+ * The merge has already happened and cannot be undone, so stopping the member
+ * would record a human-relevant failure while leaving the completed work
+ * unlanded in the record — and holding its capacity slot. Instead the landing is
+ * recorded and the still-open gate stays in `fleet.json`, where the tick reaper
+ * retries the resolve and `belayd_fleet_status` shows the wedge.
  */
 export const FLEET_RUN_STOP_REASONS = [
   "awaiting-human",
@@ -64,6 +71,15 @@ export type FleetRunOutcome = (typeof FLEET_RUN_OUTCOMES)[number];
 
 /** Bound on the per-member records a run keeps (same ceiling as the intent). */
 export const FLEET_RUN_MEMBERS_MAX = 256;
+
+/**
+ * Bound on the ordering-gate notices one run remembers having reported.
+ *
+ * Same order as the intent's gate bound: at most one *recorded* gate per edge, so a
+ * healthy fleet never approaches it. A crash window can leave more gates in bd than
+ * the intent holds; past this bound the ledger stops growing and stays quiet.
+ */
+export const FLEET_RUN_GATE_NOTICE_IDS_MAX = 256;
 
 /**
  * How long a just-launched member may show no state and no runs before the loop
@@ -146,12 +162,73 @@ export const FleetRunSchema = z.object({
   outcome: z.enum(FLEET_RUN_OUTCOMES).optional(),
   /** Why a run stopped without finishing (paused, stalled, authority lost). */
   haltedReason: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH).optional(),
+  /**
+   * Ordering-gate ids whose warning this run already showed (bd-158).
+   *
+   * The tick sweeps one member bead per tick, so a gate bd reports with a drifted
+   * reason keeps being rediscovered as the rotation comes back around. Without this
+   * ledger the same warning repeats every tick — every 15 s on a one-member fleet,
+   * which is exactly the fleet that rotates fastest. The ledger lives on the run
+   * rather than in memory so a supervisor restart does not re-warn either, and it is
+   * pruned when bd confirms a gate resolved (see `planGateNotices`).
+   */
+  gateNoticeIds: z.array(z.string().min(1).max(128)).max(FLEET_RUN_GATE_NOTICE_IDS_MAX).optional(),
 });
 
 export type FleetRun = z.infer<typeof FleetRunSchema>;
 
 export type FleetRunMember = z.infer<typeof FleetRunMemberSchema>;
 export type FleetRunStop = z.infer<typeof FleetRunStopSchema>;
+
+/** One gate warning, keyed so the run can show it exactly once. */
+export interface FleetGateNotice {
+  gateId: string;
+  message: string;
+}
+
+export interface FleetGateNoticePlan {
+  /** Notices this run has not reported yet: the ones to show now. */
+  fresh: readonly FleetGateNotice[];
+  /** The run's ledger after this pass (empty when nothing is remembered). */
+  noticeIds: readonly string[];
+}
+
+/**
+ * Decide which gate notices to show and what the run should remember.
+ *
+ * Bounded on purpose: once the ledger is full, further notices are dropped
+ * silently instead of being re-warned every sweep. The ledger exists to bound
+ * notification volume, so its overflow must be quiet rather than a storm; a fleet
+ * that churns that many gates has a bigger problem than a missing warning.
+ * `releasedGateIds` is what keeps the bound recoverable — a gate bd confirmed
+ * resolved no longer needs remembering.
+ */
+export function planGateNotices(input: {
+  existing?: readonly string[];
+  notices: readonly FleetGateNotice[];
+  releasedGateIds?: readonly string[];
+}): FleetGateNoticePlan {
+  const released = new Set(input.releasedGateIds ?? []);
+  const noticeIds = (input.existing ?? []).filter((gateId) => !released.has(gateId));
+  const seen = new Set(noticeIds);
+  const fresh: FleetGateNotice[] = [];
+  for (const notice of input.notices) {
+    if (seen.has(notice.gateId)) continue;
+    if (noticeIds.length >= FLEET_RUN_GATE_NOTICE_IDS_MAX) break;
+    seen.add(notice.gateId);
+    noticeIds.push(notice.gateId);
+    fresh.push(notice);
+  }
+  return { fresh, noticeIds };
+}
+
+/** The run with its gate-notice ledger replaced (field removed when empty). */
+export function recordFleetGateNotices(run: FleetRun, noticeIds: readonly string[]): FleetRun {
+  const next: FleetRun = { ...run };
+  if (noticeIds.length === 0) delete next.gateNoticeIds;
+  else next.gateNoticeIds = [...noticeIds];
+  return next;
+}
 
 // ── Observation → progress (pure) ─────────────────────────────────────
 

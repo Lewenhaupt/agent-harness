@@ -27,7 +27,11 @@ import {
 } from "../fleet-launch.js";
 import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { fleetDir, formatAuditEntry } from "../fleet-state.js";
-import { FLEET_INTENT_DEFERRED_MAX, type FleetIntent } from "../fleet-status.js";
+import {
+  FLEET_INTENT_DEFERRED_MAX,
+  FLEET_INTENT_ORDERING_GATES_MAX,
+  type FleetIntent,
+} from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
 
 const commonDir = "/repo/.git";
@@ -1184,6 +1188,212 @@ describe("runFleetLaunch: P3 ordering and capacity", () => {
     expect(result.schedule).toHaveProperty("slots", 0);
     expect(result.text).toContain("deferred bd-12 (capacity)");
     expect(intentOf(fs).taskIds).toEqual([]);
+  });
+});
+
+/**
+ * Fleet ordering gates created by the launch (bd-158).
+ *
+ * The engine decides *when* and *which edges*; the bd lifecycle lives behind the
+ * injected seam, so these cases assert the seam's input and what landed in
+ * `fleet.json` — never a spawned process.
+ */
+describe("runFleetLaunch ordering gates", () => {
+  const base = {
+    gitCommonDir: commonDir,
+    fleetId,
+    sessionId: "supervisor-session",
+    pid: 4242,
+    armToken: "arm-token",
+    liveness: { isPidAlive: (pid: number) => pid === 4242 },
+    now: 1_700_000_000_000,
+    baseBranch: "main",
+  };
+
+  function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
+    return JSON.parse(
+      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
+    ) as FleetIntent;
+  }
+
+  /** A seam that records what the engine asked for and mints deterministic ids. */
+  function recordingSeam(): {
+    seam: NonNullable<Parameters<typeof runFleetLaunch>[0]["orderingGates"]>;
+    created: Parameters<
+      NonNullable<Parameters<typeof runFleetLaunch>[0]["orderingGates"]>["create"]
+    >[0][];
+    reaped: { fleetId: string; beadIds: readonly string[] }[];
+  } {
+    const created: Parameters<
+      NonNullable<Parameters<typeof runFleetLaunch>[0]["orderingGates"]>["create"]
+    >[0][] = [];
+    const reaped: { fleetId: string; beadIds: readonly string[] }[] = [];
+    let next = 0;
+    return {
+      created,
+      reaped,
+      seam: {
+        create: async (input) => {
+          created.push(input);
+          const planned = input.edges
+            .filter(
+              (edge) =>
+                input.taskIds.includes(edge.blocker) && input.taskIds.includes(edge.blocked),
+            )
+            .map((edge) => {
+              next += 1;
+              return { ...edge, gateId: `bd-90${next}` };
+            });
+          return { ok: true, gates: planned, created: planned, adopted: [], warnings: [] };
+        },
+        resolve: async (input) => ({
+          ok: true,
+          resolved: [...input.gates],
+          remaining: [],
+        }),
+        reapByPrefix: async (input) => {
+          reaped.push(input);
+          return { ok: true, resolved: [], warnings: [] };
+        },
+      },
+    };
+  }
+
+  it("gates an advance-added member against an already-live member", async () => {
+    // W6: the new member is blocked by a member launched in an earlier wave. The
+    // gate plan must include that live member, or bd reports the new member blocked
+    // for the whole run while the fleet believes its ordering is complete.
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, fleetId, ["bd-12"], {});
+    const recorder = recordingSeam();
+
+    await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-13"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({ taskId, ok: true, detail: "launched" }),
+      lookupDependencies: async () => ({
+        edges: [{ blocker: "bd-12", blocked: "bd-13" }],
+        warnings: [],
+      }),
+      orderingGates: recorder.seam,
+      fs,
+    });
+
+    expect(recorder.created).toHaveLength(1);
+    expect(recorder.created[0]?.taskIds).toEqual(expect.arrayContaining(["bd-12", "bd-13"]));
+    expect(intentOf(fs).orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-901" },
+    ]);
+  });
+
+  it("rolls back only the gates its own attempt created, named with their dependents", async () => {
+    // W1: a refusal must never resolve ordering that predates it. The seam refuses
+    // after minting one gate (the second edge fails), so the rollback resolves that
+    // one id and by-prefix only the edge it belongs to; the pre-existing record for
+    // a different edge survives and is named as still bd-blocking its dependent.
+    const fs = createFakeFleetFs();
+    const atBound = Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX }, (_, index) => ({
+      blocker: `bd-${1000 + index}`,
+      blocked: `bd-${2000 + index}`,
+      gateId: `bd-${3000 + index}`,
+    }));
+    writeIntentFile(fs, fleetId, ["bd-12", "bd-14"], { orderingGates: atBound });
+    const minted = [{ blocker: "bd-12", blocked: "bd-14", gateId: "bd-950" }];
+    const resolved: string[] = [];
+    const reaped: {
+      beadIds: readonly string[];
+      scope: string;
+      edges?: readonly unknown[];
+    }[] = [];
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-14"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({ taskId, ok: true, detail: "launched" }),
+      lookupDependencies: async () => ({
+        edges: [{ blocker: "bd-12", blocked: "bd-14" }],
+        warnings: [],
+      }),
+      orderingGates: {
+        create: async () => ({
+          ok: false,
+          error: "bd gate create failed on the second edge",
+          // What this attempt minted before failing; the adopted list is empty.
+          created: minted,
+          adopted: [],
+          warnings: [],
+        }),
+        resolve: async (input) => {
+          resolved.push(...input.gates.map((gate) => gate.gateId));
+          return { ok: true, resolved: [...input.gates], remaining: [] };
+        },
+        reapByPrefix: async (input) => {
+          reaped.push({
+            beadIds: input.beadIds,
+            scope: input.scope,
+            ...(input.scope === "created-edges" ? { edges: input.edges } : {}),
+          });
+          return { ok: true, resolved: [], warnings: [] };
+        },
+      },
+      fs,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("Could not create the bd ordering gates");
+    // Exactly the one gate this attempt created was resolved…
+    expect(resolved).toEqual(["bd-950"]);
+    // …and the by-prefix sweep was scoped to its edge, not the whole worklist.
+    expect(reaped).toEqual([
+      {
+        beadIds: ["bd-14"],
+        scope: "created-edges",
+        edges: [{ blocker: "bd-12", blocked: "bd-14" }],
+      },
+    ]);
+    // The pre-existing records are untouched: a refusal never rewrites the fleet.
+    expect(intentOf(fs).orderingGates).toEqual(atBound);
+  });
+
+  it("names a dependent left bd-blocked by an adopted gate that stays open", async () => {
+    // A gate adopted from bd predates the attempt, so a refusal leaves it open. The
+    // operator has to be told which bead stays out of `bd ready` and under which
+    // gate, because nothing in the fleet records it yet.
+    const fs = createFakeFleetFs();
+    writeIntentFile(fs, fleetId, ["bd-12", "bd-14"], {});
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-14"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({ taskId, ok: true, detail: "launched" }),
+      lookupDependencies: async () => ({
+        edges: [{ blocker: "bd-12", blocked: "bd-14" }],
+        warnings: [],
+      }),
+      orderingGates: {
+        create: async (input) => ({
+          ok: false,
+          error: "could not write the intent",
+          created: [],
+          adopted: [{ blocker: "bd-12", blocked: input.taskIds[1] ?? "bd-14", gateId: "bd-940" }],
+          warnings: [],
+        }),
+        resolve: async (input) => ({
+          ok: true,
+          resolved: [...input.gates],
+          remaining: [],
+        }),
+        reapByPrefix: async () => ({ ok: true, resolved: [], warnings: [] }),
+      },
+      fs,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("bd-14 (gate bd-940) stays bd-blocked");
+    expect(result.text).toContain("bd gate list bd-14");
   });
 });
 

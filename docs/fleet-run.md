@@ -1,8 +1,9 @@
 # Fleet run loop — `/fleet` to completion (bd-126 P5)
 
 `/fleet bd-12 bd-15 bd-19` no longer stops after the first wave. The supervisor
-lands every member as it finishes, accepts it (closes the bead and removes the
-worktree), starts the next wave as dependencies clear, and keeps going until the
+lands every member as it finishes — merging the branch and removing the merged
+worktree and branch — closes the bead only when acceptance was asked for
+(`--accept`), starts the next wave as dependencies clear, and keeps going until the
 whole request is landed — or until a member needs a human.
 
 Two things changed, and they are coupled:
@@ -16,7 +17,7 @@ Two things changed, and they are coupled:
 | Piece | Module |
 |---|---|
 | Tick decisions, run record, rendering | `src/fleet-run.ts` |
-| Accepting a landed member (close + remove) | `src/fleet-accept.ts` |
+| Accepting a landed member (worktree removal, optional close) | `src/fleet-accept.ts` |
 | Supervisor heartbeat + re-arm eligibility | `src/fleet-heartbeat.ts` |
 | Worktree orchestrator lease | `src/orchestrator-claim.ts` |
 | Wiring (ticker, launch, tools, `/fleet`) | `extensions/index.ts` |
@@ -26,8 +27,9 @@ Two things changed, and they are coupled:
 ### Start a run
 
 ```text
-/fleet bd-12 bd-15 bd-19                 # run to completion, accepting each member
-/fleet bd-12 bd-15 --no-accept           # land, but leave the beads for you to close
+/fleet bd-12 bd-15 bd-19                 # run to completion, leaving each bead for you
+/fleet bd-12 bd-15 --accept              # also close each landed bead; the merged
+                                         # worktree is removed on landing either way
 /fleet bd-12 bd-15 --manual              # the old explicit surface: nothing merges or advances on its own
 /fleet bd-12 bd-15 --fleet night          # name the fleet (or re-arm one)
 ```
@@ -35,7 +37,7 @@ Two things changed, and they are coupled:
 Tool form:
 
 ```json
-{ "tasks": ["bd-12", "bd-15"], "untilComplete": true, "accept": true }
+{ "tasks": ["bd-12", "bd-15"], "untilComplete": true, "accept": false }
 ```
 
 The launch itself is unchanged (validate → write intent → launch wave 0 →
@@ -45,11 +47,14 @@ record into `fleet.json` and starts the ticker.
 ### What "complete" means
 
 A run is complete when every member is **landed** (its branch is on the base
-branch) and out of the fleet's member list. With `accept: true` (the default)
-"landed" also means the bead is closed and the worktree is gone. With
-`accept: false` the bead stays `in_progress` + `human` for you, and the worktree
-stays on disk — the run still finishes, because a member the fleet landed
-satisfies its dependents' dependency edges (see below).
+branch) and out of the fleet's member list. A landing removes the member's
+worktree and merged branch **either way**: the branch is already on the base
+branch, so the worktree has no remaining purpose and keeping it would only grow the
+disk. With `accept: false` (the default) the **bead** stays `in_progress` + `human`
+— the run still finishes, because a member the fleet landed satisfies its
+dependents' dependency edges and its bd ordering gates are resolved (see below).
+With `accept: true` the landing also closes the bead (`bd close`): acceptance is
+the bead, never the worktree.
 
 If a member stops for a reason the loop must not retry, the run ends as
 `partial` and `belayd_fleet_status` lists each stopped member with its reason.
@@ -238,23 +243,28 @@ land the bead explicitly.
 member's branch, acquire `merge.lock.d`, stash a dirty root, rebase, run the
 project gates, `git merge --ff-only`, restore the root, notify members.
 
-Then acceptance (`src/fleet-accept.ts`), only when `accept` is true:
+Then the accept step (`src/fleet-accept.ts`) finishes the landing:
 
-1. `bd close <id> --reason "merged into <base> via belayd_fleet_merge"`. A bead that
-   is already closed is accepted with a warning, not an error.
+1. When acceptance was asked for (`accept: true` / `--accept`), `bd close <id>
+   --reason "merged into <base> via belayd_fleet_merge"`. A bead that is already
+   closed is accepted with a warning, not an error.
 2. `git worktree remove <path>` — **without `--force`**, so a dirty worktree is left
-   alone and reported; the accepting step never deletes uncommitted work.
+   alone and reported; this step never deletes uncommitted work. It runs on
+   **every** landing, with or without acceptance: the branch is already on the base
+   branch, so a merged worktree has no remaining purpose.
 3. `git branch -d <branch>` — `-d`, not `-D`, so an unmerged branch is never
    deleted.
 
 A failure to close the bead stops the member with `accept-failed` but keeps the
 landing: the branch is on the base branch, the member is out of the member list,
-and the residue is the bead (or the worktree) you have to finish by hand.
+and the close failure returns before the removal half runs — so the bead **and** its
+worktree are left for you to finish by hand.
 
-**Bead status after a run.** `belayd_fleet_merge` still never touches a bead.
-Closing is the *run's* acceptance step, requested by the launch (`accept: true`),
-and it is audited as `fleet-landed`. Use `--no-accept` to keep the documented
-human-accept step.
+**Bead status after a run.** `belayd_fleet_merge` never touches a bead, and neither
+does the merge half of a landing: the landing resolves the bd ordering gates the
+merge satisfied and leaves the bead `in_progress` + `human`. Closing is acceptance,
+requested by the launch (`accept: true` / `--accept`) and audited as `fleet-landed`;
+without it the close stays the documented human step (`wt merge` / `bd close`).
 
 ### Dependency edges vs. landed members
 
@@ -338,8 +348,29 @@ for a human instead of silently relaunched.
 - **Gates are not retried.** A gate/rebase/merge refusal stops the member with
   `land-failed`. Retrying with no new information would burn the same minutes again.
 - **`accept` is the run's decision, not the merge engine's.** `belayd_fleet_merge`
-  keeps "merging is not closing"; only a run with `accept: true` closes beads, and
-  every close is audited.
+  keeps "merging is not closing"; only a run with `accept: true` (opt-in, bd-158)
+  closes beads, and every close is audited. The merged worktree is removed on every
+  landing either way, because that removal is hygiene, not acceptance.
+- **A failed ordering-gate resolve does not stop a landing.** The merge happened,
+  so `landedAt` is recorded and the member is pruned; the still-open gate stays in
+  `fleet.json`, shows up as `ordering gates open: …` in `belayd_fleet_status`, and
+  the next tick retries the resolve (re-running only the resolve — the merge queue
+  entry is already `merged`, so a second merge is impossible). Treating a transient
+  bd failure as a stop would end the run `partial` and wedge a merged member.
+- **Gate warnings are shown once per gate per run, up to a bound.** The rotating
+  sweep rediscovers a drifted reason (bd truncated the gate `--reason`) and an
+  adoption it had to refuse on every pass, and the tick loop notifies every line it
+  returns. The reported gate ids are remembered on the run record (`gateNoticeIds`),
+  so a 15-second loop warns once instead of on every tick; a reconcile pass — an
+  explicit repair by a human — sweeps all members and reports every finding it makes.
+  The ledger holds at most `FLEET_RUN_GATE_NOTICE_IDS_MAX` (256) ids. A run that has
+  already reported 256 distinct gate ids stops warning about **new** gates for the
+  rest of that run: the code stays silent instead of re-warning (and instead of
+  letting one run's record grow without bound). Those findings are not hidden —
+  `belayd_fleet_status` keeps listing every open ordering gate, and
+  `belayd_fleet_reconcile` re-reports every finding fresh — so a human sees the
+  drift there and resolves it by gate id. A single run that churns that many gates
+  has a larger problem than a missing warning.
 - **A stopped member stays a fleet member.** `fleet.json` `taskIds` still names it,
   `run.stopped` carries its reason, and `belayd_fleet_status` renders both the
   `stopped …` line and its live worktree. Its deferred plan entry is retired, so an

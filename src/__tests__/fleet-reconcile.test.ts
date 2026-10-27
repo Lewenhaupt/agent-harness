@@ -30,6 +30,7 @@ import { FLEET_MERGE_ORPHAN_LOCK_GRACE_MS } from "../fleet-merge.js";
 import {
   diagnoseMergeQueue,
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
+  type RunFleetReconcileOptions,
   runFleetReconcile,
 } from "../fleet-reconcile.js";
 import type { FleetMemberLeaseProbe, FleetProcessScan } from "../fleet-sessions.js";
@@ -245,6 +246,8 @@ async function reconcile(
     leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
     pruneDeadMembers?: boolean;
     supervisorAlive?: boolean;
+    /** bd ordering-gate seam (bd-158): a prune must resolve the removed member's gates. */
+    orderingGates?: RunFleetReconcileOptions["orderingGates"];
     fs?: FleetStateFs;
   } = {},
 ) {
@@ -261,6 +264,7 @@ async function reconcile(
     selfPid: process.pid,
     ...(options.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
     ...(options.leaseFor === undefined ? {} : { leaseFor: options.leaseFor }),
+    ...(options.orderingGates === undefined ? {} : { orderingGates: options.orderingGates }),
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
 }
@@ -916,6 +920,82 @@ describe("runFleetReconcile: supervision", () => {
     expect(result.repairs).toEqual([]);
     expect(result.text).toContain("nothing to prune");
     expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12", "bd-15"]);
+  });
+
+  it("resolves and forgets a pruned member's ordering gates", async () => {
+    // W5: a pruned member can never land, so its open gate would be an orphan.
+    // The prune path owns that resolve — the extension's post-tool reap is not a
+    // guarantee a direct reconcile caller gets.
+    const fixture = tempCommonDir("prune-gates");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      supervisor: { sessionId: "supervisor-session", pid: 4242 },
+      orderingGates: [
+        { blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" },
+        { blocker: "bd-15", blocked: "bd-16", gateId: "bd-902" },
+      ],
+    });
+    const resolved: { blocker: string; blocked: string; gateId: string }[][] = [];
+    const reaped: string[][] = [];
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      supervisorAlive: true,
+      orderingGates: {
+        resolve: async (gates) => {
+          resolved.push([...gates]);
+          return { ok: true, resolved: [...gates], remaining: [] };
+        },
+        reapByPrefix: async (input) => {
+          reaped.push([...input.beadIds]);
+          return { ok: true, resolved: [], warnings: [] };
+        },
+      },
+    });
+
+    expect(result.repairs).toEqual(["member-pruned:bd-12", "member-pruned:bd-15"]);
+    // Both gates touch a dead member (either side), so both are resolved first.
+    expect(resolved.flat().map((gate) => gate.gateId)).toEqual(["bd-901", "bd-902"]);
+    // And the unrecorded half: bd is asked about the dead beads themselves.
+    expect(reaped).toEqual([["bd-12", "bd-15"]]);
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual([]);
+    expect(readIntent(fixture.commonDir, fixture.fleetId).orderingGates).toBeUndefined();
+  });
+
+  it("keeps a pruned member's gate recorded when bd does not confirm the resolve", async () => {
+    const fixture = tempCommonDir("prune-gates-fail");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      supervisor: { sessionId: "supervisor-session", pid: 4242 },
+      orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" }],
+    });
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      supervisorAlive: true,
+      orderingGates: {
+        resolve: async () => ({
+          ok: false,
+          error: "bd: database is locked",
+          resolved: [],
+          remaining: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" }],
+        }),
+        reapByPrefix: async () => ({
+          ok: false,
+          error: "bd: database is locked",
+          resolved: [],
+          warnings: [],
+        }),
+      },
+    });
+
+    expect(result.warnings.join("\n")).toContain("could not resolve the ordering gate(s)");
+    // The member is still pruned, but the record stays so a later tick can retry
+    // instead of forgetting an open gate.
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual([]);
+    expect(readIntent(fixture.commonDir, fixture.fleetId).orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" },
+    ]);
   });
 
   it("reads liveness from the worktree lease, not only the process table", async () => {

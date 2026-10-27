@@ -136,9 +136,18 @@ export {
   buildGateCreateArgv,
   buildGateListArgv,
   buildGateResolveArgv,
+  FLEET_ORDERING_GATE_PREFIX,
+  fleetOrderingGateDriftWarning,
+  fleetOrderingGateMarkerOf,
+  isFleetOrderingGateRecord,
   lookupOpenHumanGate,
   parseCreatedGateId,
+  parseFleetOrderingGateMarkerLine,
+  parseOpenFleetOrderingGates,
   parseOpenHumanGate,
+  parseOpenOrderingGateBlocker,
+  readOpenFleetOrderingGates,
+  renderFleetOrderingGateMarker,
 } from "./bead-gates.js";
 export {
   BELAYD_ACTOR_PREFIX,
@@ -349,6 +358,29 @@ export {
   resolveFleetMode,
   resolveMemberFleet,
 } from "./fleet-mode.js";
+// Fleet ordering as bd gates, so landing never closes a bead (bd-158)
+export type {
+  CreateFleetOrderingGatesOptions,
+  CreateFleetOrderingGatesResult,
+  FleetOrderingGate,
+  FleetOrderingGateListResult,
+  FleetOrderingGateReapScope,
+  ReapFleetOrderingGatesResult,
+  ResolveFleetOrderingGatesOptions,
+  ResolveFleetOrderingGatesResult,
+} from "./fleet-ordering-gates.js";
+export {
+  buildFleetOrderingGateArgv,
+  createFleetOrderingGates,
+  fleetOrderingGateReason,
+  fleetOrderingGateTitle,
+  listFleetOrderingGatesForBead,
+  orderingGateBudgetRefusal,
+  planFleetOrderingGates,
+  reapFleetOrderingGatesByPrefix,
+  resolveFleetOrderingGates,
+  resolveFleetOrderingGatesForBead,
+} from "./fleet-ordering-gates.js";
 export type {
   PauseFleetInput,
   PauseFleetResult,
@@ -358,6 +390,7 @@ export type {
 export { pauseFleet, resumeFleet } from "./fleet-pause.js";
 export type {
   DiagnoseMergeQueueInput,
+  FleetOrderingGateSeam,
   MemberLivenessReport,
   ParkRepairResult,
   RunFleetReconcileOptions,
@@ -372,6 +405,8 @@ export {
 // Autonomous fleet run loop (P5)
 export type {
   DeriveFleetMemberProgressOptions,
+  FleetGateNotice,
+  FleetGateNoticePlan,
   FleetMemberClaim,
   FleetMemberObservation,
   FleetMemberProgress,
@@ -390,6 +425,7 @@ export {
   emptyAdvanceAction,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
   FLEET_RUN_DETAIL_MAX_LENGTH,
+  FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_MEMBERS_MAX,
   FLEET_RUN_MODES,
@@ -404,6 +440,8 @@ export {
   formatFleetRunStops,
   isFleetRunActive,
   planFleetTick,
+  planGateNotices,
+  recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
@@ -456,6 +494,7 @@ export {
 export type {
   AckNotesOptions,
   AckNotesResult,
+  AddFleetOrderingGatesResult,
   AppendFleetAuditEntryOptions,
   CreateFleetIntentInput,
   DrainNotesOptions,
@@ -480,6 +519,7 @@ export type {
   FleetNoteKind,
   FleetStateFs,
   FleetStateWriteResult,
+  RefusedFleetOrderingGate,
   UpdateFleetIntentOptions,
   UpdateFleetIntentResult,
   UpdateFleetMergeQueueOptions,
@@ -489,12 +529,14 @@ export type {
 } from "./fleet-state.js";
 export {
   ackNotes,
+  addFleetOrderingGates,
   appendFleetAuditEntry,
   canAcquireFleetMerge,
   createFleetIntent,
   createFleetMergeLock,
   createFleetMergeQueue,
   drainNotes,
+  dropFleetOrderingGates,
   enqueueNote,
   enqueueNoteFanout,
   FLEET_AUDIT_ACTION_MAX_LENGTH,
@@ -566,6 +608,7 @@ export {
   deriveFleetMemberState,
   FLEET_INTENT_DEFERRED_MAX,
   FLEET_INTENT_MEMBERS_MAX,
+  FLEET_INTENT_ORDERING_GATES_MAX,
   FLEET_INTENT_SUMMARY_MAX,
   FLEET_MEMBER_STATES,
   FLEET_SCHEMA_VERSION,
@@ -584,6 +627,7 @@ export {
   NEEDS_YOU_EXCERPT_MAX_CHARS,
   NEEDS_YOU_LIST_MAX,
   parseBeadView,
+  parseBeadViewPayload,
   parseBeadViews,
   parseFleetIntent,
   readFleetStatus,

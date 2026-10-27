@@ -4,16 +4,19 @@
 Belayd workflow in its own worktree and its own detached orchestrator session,
 orders them by bd's blocking dependencies inside a ceiling of **3 concurrent
 orchestrators**, carries notes between you and the members, and then **runs to
-completion**: it lands each finished branch on the base branch, accepts it (closes
-the bead, removes the worktree), and starts the next wave until every member is
-done.
+completion**: it lands each finished branch on the base branch, releases the bd
+ordering gates that landing satisfied, removes the worktree, and starts the next
+wave until every member is done. Landing does **not** close the bead: each one is
+left `in_progress` + `human` for you to accept with `wt merge` / `bd close`.
 
 All six milestones are implemented: **P0** status, **P1** launch + mailbox,
 **P2** merge queue, **P3** ordering/capacity, **P4** pause/advance/reconcile,
 **P5** the run loop and the one-orchestrator-per-worktree lease.
 
 `--manual` restores the older explicit surface (launch, land, and advance only when
-you call a tool); `--no-accept` lands without closing beads.
+you call a tool); `--accept` additionally closes each landed bead (a landing
+removes the merged worktree either way). A bare `/fleet` never closes a bead
+(bd-158).
 
 This page is the map: the end-to-end run, which tool for which situation, how to
 get out of each failure, and how to verify the surface. Detail stays in the
@@ -39,7 +42,7 @@ process gate, worktree, and `.belayd/` directory. Cross-tree state lives in
 `<git-common-dir>/belayd/fleet/<fleetId>/`:
 
 ```text
-fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, run record, supervisor record
+fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, orderingGates, run record, supervisor record
 supervisor.json    run-mode supervisor heartbeat (re-arm eligibility)
 orchestrator.json  in each member worktree: the one-orchestrator lease
 audit.log          append-only: every cross-tree action
@@ -52,6 +55,134 @@ Nothing in that directory is written by `belayd_fleet_status`; it is written by
 launch, note, merge, pause/resume, and reconcile, and only from a session that is
 the fleet's live supervisor.
 
+### Ordering vs. acceptance (bd-158)
+
+Two objects, two verbs — the fleet never expresses two facts with one bd bit:
+
+| Fact | bd object | Verb | When |
+|------|-----------|------|------|
+| Nothing depends on this member any more | an ordering **gate** blocking the dependent's bead | `bd gate resolve` | the blocker **lands** (merge succeeded) |
+| A human accepted this work | the member's **bead** | `bd close` / `wt merge` | the human decides (or `--accept`) |
+
+Before bd-158 `accept` defaulted to true, so a run closed a landed member's bead
+just to unblock its dependents — closing dragged acceptance along with ordering.
+Now:
+
+- **A bare `/fleet` never closes a bead.** Every landed bead is left
+  `in_progress` + `human`; acceptance is `--accept` (or your own `wt merge`).
+- **Ordering is fleet-owned.** For every dependency edge between two *members* the
+  launch creates one `bd gate create --blocks <dependent>`, recorded in
+  `fleet.json` under `orderingGates` as `{ blocker, blocked, gateId }`. The set is
+  *all fleet members*, not just the wave being launched: a member added by an
+  advance can be blocked by one that started earlier, and that edge needs a gate
+  too. Landing resolves the gates its merge satisfied. What bd reports afterwards
+  depends on which relationship the dependent's bead carries:
+
+  - **gate-only ordering** (the fleet's gate is the dependent's only blocker — the
+    shape `test/fleet-ordering-gate.integration.test.ts` builds): `bd blocked`
+    stops naming the dependent at that instant and `bd ready` includes it, while
+    `bd show <blocker>` is still `open`/`in_progress`.
+  - **a plain `blocks` edge** (what a real `/fleet` needs to plan the wave order —
+    see the trade-off at the end of this section): that edge is bd's own, so it
+    keeps bd's close-to-unblock rule and `bd blocked` still names the dependent
+    until a human closes the blocker's bead. The fleet does not wait for that:
+    `fleetLandedTaskIds()` drops a landed member's edge, so the wave advances on
+    the landing.
+
+  External blockers get no gate: bd's ordinary dependency edge already blocks the
+  member bead for them.
+- **Gate shape.** bd 1.3.0 accepts only `human`, `timer`, `gh:run`, and `gh:pr`, and
+  a `timer` gate would auto-resolve — wrong, the gate must be resolved by a
+  *landing*. Ordering gates are therefore typed `human` and carry a **structured**
+  marker in title and reason:
+
+  ```text
+  title:  belayd-fleet-ordering: fleet:<fleetId> bd-12 -> bd-13
+  reason: belayd-fleet-ordering: fleet:<fleetId> bd-12 -> bd-13: bd-12 must land …
+  ```
+
+  Classification requires that whole shape (prefix *and* a fleet id *and* both
+  bead ids), never the bare prefix, and it is fail-closed in both directions: a
+  record that merely starts with the prefix stays a human gate (the wait stays
+  armed), and an ordering gate never looks like a question. The **title decides**;
+  when bd truncates or re-folds the reason so its marker no longer parses, the gate
+  is still ordering (a warning names the drift once per gate per run — the sweep
+  rediscovers it every rotation, so the ledger lives on the run record), because
+  classifying the fleet's
+  own gate as a human gate would leave `belayd_ask_human`'s poll waiting for a
+  comment answer no human will give. Only a reason that parses to a *different*
+  edge fails closed to a human gate. So the poll never treats an ordering gate as a
+  question, and the status view renders it as `waiting on: bd-12 (fleet ordering
+  gate)` instead of `awaiting-human`.
+- **Orphan gates are reaped, and only by gate id.** A gate exists only while both
+  its beads are live members. The supervisor's tick resolves, in this order:
+  gates naming a non-member (removed/pruned/failed launch), gates whose beads bd
+  reports `closed`/`done`, and — one member bead per tick, rotating — gates bd
+  reports that `fleet.json` does not name at all. A landing resolves the gates
+  it satisfied, a `bd close` by a human (or `--accept`) resolves every gate
+  touching that bead, and a removed/pruned member is resolved by the repair that
+  removes it (`belayd_fleet_reconcile --prune-dead-members`, or the launch's own
+  failed-member prune).
+
+  A bead-status read only counts when it is **complete**: bd answering for some of
+  the gated beads (payload drift) is ambiguous, and the tick warns instead of
+  reaping them. The bookkeeping unit is the **gate id**: one blocker can order two
+  dependents, and resolving one says nothing about the other, so records are
+  dropped exactly for the gates bd confirmed resolved. A resolve failure keeps the
+  record so the next tick retries it.
+- **The crash window is closed from both ends.** A gate can exist in bd with no
+  record (the process died between `bd gate create` and the intent write). A
+  relaunch asks bd (`bd gate list <dependent>`) before creating anything and
+  *adopts* the gate it finds (resolving a duplicate for the same edge). The tick's
+  rotating sweep does the same for a gate it discovers:
+
+  - blocker landed, or either bead no longer a member → **resolve** (nothing is
+    left to wait for);
+  - both beads are members and the blocker is still working → **adopt**, i.e.
+    write the record, so the blocker's landing resolves it like any other gate.
+    Resolving it instead would release the dependent early. An adoption that would
+    take the record set past its bound is **refused**, not truncated: the gate stays
+    open in bd (resolving it would release the dependent early) and a warning names
+    the dependent and gate id so a human can inspect it. The warning is shown once
+    per gate per run, since every sweep rediscovers it.
+
+  A `belayd_fleet_reconcile` pass sweeps *every* member (one member bead per tick
+  rotates instead, and would take a full cycle). A launch that fails after creating
+  gates resolves exactly the gates **it** created, scoped to their edges, and names
+  any dependent it leaves bd-blocked together with the gate id to inspect — it
+  never resolves ordering that predates it.
+- **A failed gate resolve never wedges a landed member.** The merge is recorded
+  (`landedAt`), the member is pruned, and the still-open gate stays in
+  `fleet.json` — visible in `belayd_fleet_status` as
+  `ordering gates open: bd-12 -> bd-13 (gate bd-155)` — while the next tick retries
+  the resolve. Retrying re-runs only the resolve: the merge queue entry is already
+  `merged`, so a second merge of the same member is impossible.
+- **Fleet-side advance is unchanged.** `fleetLandedTaskIds()` in
+  `extensions/index.ts` drops the edges of members this fleet already landed, so
+  the scheduler advances a wave at the same moment the gate is resolved, without a
+  close. The two mechanisms are the two halves of one event.
+- **The record set is bounded but never truncated.** `fleet.json` holds at most
+  256 gate records, and the bound is checked against the **post-adoption** set: a
+  gate adopted from bd is a record but not a creation, so a fleet already at the
+  bound that relaunches with every edge gated in bd succeeds and creates nothing.
+  Only a record this launch would genuinely add can push it over, and that launch
+  is refused before anything is created. Nothing is silently dropped, because a cut
+  record is an open gate nobody can resolve again. The same bound is enforced on
+  the sweep's adoptions (above) and, as a backstop, on the write itself: the
+  `fleet.json` writer validates the record against the reader's schema and refuses
+  an over-bound one, since a written record its own reader rejects would make the
+  intent permanently unreadable for status, launch, tick, and reconcile.
+
+The trade-off, explicitly: the object that **releases** a dependent is the gate, so
+the release does not appear in `bd dep list` / `bd graph` — it lives in the gate
+title/reason and in `fleet.json`. The `blocks` edge the scheduler read is still
+there and is still bd's own: bd keeps its close-to-unblock rule for that edge, which
+is why `bd blocked` keeps naming the dependent after the landing until a human
+closes the blocker's bead. The fleet does not wait for that (`fleetLandedTaskIds`),
+so merged work never stalls on a close — but bd's own views only agree once the
+bead is closed. Gate-only ordering (no plain edge) is the one shape where `bd
+blocked` releases at the landing; see the two cases above.
+
 ### The run, step by step
 
 #### 1. Launch
@@ -59,8 +190,15 @@ the fleet's live supervisor.
 ```text
 /fleet bd-12 bd-15 bd-19            # run to completion (the default)
 /fleet bd-12 bd-15 --manual         # explicit surface: nothing lands or advances on its own
-/fleet bd-12 bd-15 --no-accept      # land, but leave the beads for you to close
+/fleet bd-12 bd-15 --accept         # also close each landed bead; the merged worktree
+                                    # is removed on landing either way
 ```
+
+A bare `/fleet` leaves every landed bead `in_progress` + `human`; you accept with
+`wt merge` / `bd close`. Dependents still advance: the fleet owns its wave
+ordering through bd gates (see [Ordering vs. acceptance](#ordering-vs-acceptance-bd-158)),
+not through the blocker's bead status. `--no-accept` is still parsed (it restates
+the default).
 
 or the tool form:
 
@@ -70,7 +208,7 @@ or the tool form:
   "fleetId": "default",
   "concurrency": 3,
   "untilComplete": true,
-  "accept": true
+  "accept": false
 }
 ```
 
@@ -225,8 +363,9 @@ sha) → rebase the member onto the base → the target's own gates
   `fleet.json` `park.stashRef`. See [step 7](#7-reconcile-after-a-crash).
 - **Merging is not closing.** `src/fleet-merge.ts` has no bd seam at all. After a
   successful drain the bead is still `in_progress` + `human`; the report says so.
-  You accept it with `wt merge` / `bd close` — or let a run accept it (step 8),
-  which closes the bead and removes the worktree.
+  You accept it with `wt merge` / `bd close` — or let a run land it (step 8): the
+  landing removes the merged worktree either way, and `--accept` closes the bead
+  too.
 
 #### 5. Advance the next wave
 
@@ -340,15 +479,16 @@ Every tick does exactly one thing, in this order — land the first finished mem
 stop the first member that needs a human, advance the deferred wave, or finish:
 
 ```text
-1  land     bd-12: merged into main, bead closed, worktree removed
+1  land     bd-12: merged into main, ordering gates released, worktree removed
 2  advance  bd-19 launched (bd-12 landed, so its edge is satisfied)
 …
    run: until-complete — complete (11 tick(s))
 ```
 
-- **Accepting is the run's landing step**: `bd close` + `git worktree remove` +
-  `git branch -d`, all conservative (no `--force`, no `-D`). `--no-accept` skips
-  the close and leaves the beads for you.
+- **Landing is the merge step**: `git worktree remove` + `git branch -d`, all
+  conservative (no `--force`, no `-D`), plus the bd ordering gates the merge
+  satisfied. The bead is left `in_progress` + `human` — merging is not closing.
+  `--accept` additionally closes the bead (`bd close`).
 - **A member that needs a human is stopped, never relaunched.** `awaiting-human`,
   failed phase, interrupted run, unreadable state, or a vanished orchestrator all
   end that member's part of the run with a reason in `belayd_fleet_status`.
@@ -377,7 +517,7 @@ worktree lease — is in `docs/fleet-run.md`.
 | Tell every member | `belayd_fleet_note` `to: "all"` | one file per member in `events/` |
 | Did a member report? | `belayd_fleet_inbox` | drains + acks `inbox/`, `inbox-drain` audit |
 | Land a finished member (manual fleet) | `belayd_fleet_merge` `enqueue` then `drain` | `merge-queue.json`, the base branch, `base-moved` notes |
-| Land + accept, automatically | the run loop (default) | the base branch, bead status, worktree removal, `fleet-landed` audit |
+| Land + release ordering gates, automatically | the run loop (default) | the base branch, bd gates, worktree removal, `fleet-landed` audit; the bead stays `in_progress` + `human` |
 | What is queued / is a merge in flight? | `belayd_fleet_merge` `list` | nothing |
 | Start the deferred members | `belayd_fleet_advance` | new members, updated `deferred` |
 | Stop starting new work | `belayd_fleet_pause` | `paused`, `pause` notes, `fleet-paused` audit |
@@ -385,7 +525,7 @@ worktree lease — is in `docs/fleet-run.md`.
 | Come back | `belayd_fleet_resume` | clears `paused`/`park`, `resume` notes |
 | Repair after a crash | `belayd_fleet_reconcile` | queue/park repair, liveness report |
 | Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease and no process from `taskIds` (never `unknown`) |
-| Accept one member's work + worktree | a run with `accept: true` | bead status + worktree removal, audited |
+| Accept one member's work (close its bead) | a run with `accept: true` (or `/fleet … --accept`) | bead status, audited; the merged worktree is removed on landing either way |
 | Accept the work without the loop | `wt merge`, `bd close` | bead status — `belayd_fleet_merge` itself never touches a bead |
 
 `belayd_fleet_status` and `belayd_fleet_note` work in any session that is inside a
@@ -403,7 +543,8 @@ left by a dead process does not count — re-arm with `/fleet` first.
 | `merge lock is held by … until …` | Another drain (or a dead supervisor's lease) owns the queue | Wait, or let the lease expire — the expiry is the only takeover authority, the recorded pid is diagnostic. `belayd_fleet_reconcile` takes over an expired lease for you |
 | `<lockDir> exists without a lock record (acquisition in progress, or a holder crashed before writing its lease); retry after 30s or remove the directory by hand` | A holder crashed between `mkdir` and writing its lease, or is inside that window | Retry after ~30 s (grace window); reconcile reclaims it past the grace. Removing `merge.lock.d` by hand is safe only when no drain is running |
 | Supervisor is gone; every fleet tool says `supervisor-only` | The supervisor session died. Its lease and run record survive on disk, and a run-mode fleet's recorded pid is the shared daemon, so only the supervisor heartbeat can say it is gone | `/fleet <its ids> --fleet <id>` in a new session: re-arm rewrites the supervisor record, preserves the members, and (because the intent has a `run`) starts the loop again — a new run record when the old one finished or halted. Then `belayd_fleet_status`; `belayd_fleet_reconcile` if the queue or root was left mid-flight |
-| A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause. The member stays in the fleet (`taskIds` plus `run.stopped`), so `belayd_fleet_status` still shows it with its worktree; the loop never relaunches it by itself, but it does land it if its own retry finished the work. The run waits for that retry only while it is observably alive (live lease) — if the run has already finished or halted, relaunch (re-arm) or land the bead explicitly. `belayd_fleet_reconcile` `pruneDeadMembers` forgets a provably-dead member's capacity slot (removes its id from `taskIds`); its `run.stopped` line and the run outcome stay, because a prune does not rewrite history |
+| A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause. The member stays in the fleet (`taskIds` plus `run.stopped`), so `belayd_fleet_status` still shows it with its worktree; the loop never relaunches it by itself, but it does land it if its own retry finished the work. The run waits for that retry only while it is observably alive (live lease) — if the run has already finished or halted, relaunch (re-arm) or land the bead explicitly. `belayd_fleet_reconcile` `pruneDeadMembers` forgets a provably-dead member's capacity slot (removes its id from `taskIds`) and resolves its ordering gates; its `run.stopped` line and the run outcome stay, because a prune does not rewrite history |
+| `ordering gates open: …` in the status header | This fleet still holds ordering-gate records: **normal** while the blocker has not landed, since an open gate is exactly what is holding the dependent back. When the blocker *has* landed the records should be gone, so it then names a landing whose resolve hit a transient bd failure | Nothing while the blocker is still working: the gate is doing its job. After the blocker landed, nothing either — the next tick retries the resolve and drops the record. If it stays, `bd gate resolve <gate-id>` and the record goes on the following tick |
 | `Refusing to launch … live orchestrator lease` | The worktree already has a live orchestrator session (its lease is fresh) | One orchestrator per worktree: finish or stop that session. If it is really gone, the lease goes cold after ~3 min and the next launch takes it over (the old record is archived, and the takeover is reported) |
 | Launch refused with `dependency-cycle` and a closed path (`bd-12 → bd-15 → bd-12`) | bd's `blocks` edges form a cycle; no valid order exists | `bd dep remove`, then relaunch. Nothing was created, so there is nothing to clean up |
 | `Scheduling: 0 member(s) now, N deferred (capacity 3, 3 already active, 0 free slot(s))` | The ceiling is full — normally because members of another fleet (or a dead supervisor's fleet) are still recorded | Not an error (exit 0). `belayd_fleet_status` shows who is active; let a member finish, or `belayd_fleet_reconcile` `pruneDeadMembers` (positive `absent` evidence only — never `unknown`), then `belayd_fleet_advance`. Do not edit `fleet.json` by hand to drop ids. **A stopped member holds its slot until it lands or is pruned**, and a member whose retry session is still alive is never prunable, so an all-stopped fleet can pin the ceiling of 3 until those retries end, land, or the supervisor prunes them after the sessions are gone |

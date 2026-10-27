@@ -579,9 +579,12 @@ type DependencyParse =
 /**
  * One `dependencies[]` entry → an ordering blocker, a deliberate skip, or noise.
  *
- * Only `blocks` orders work; a blocker that already finished has landed and is a
- * skip; anything without a usable id/type is malformed (reported, never turned
- * into a fabricated edge).
+ * Only `blocks` orders work. A *finished* blocker is satisfied — it cannot be a
+ * reason to wait — but "finished" is not the same as "landed": landing (the merge
+ * into the base branch) is recorded in `fleet.json` (`run.members[].landedAt`), and
+ * the fleet resolves that member's bd ordering gate at the same moment (bd-158).
+ * This module stays pure, so it can only see bd's status; everything without a
+ * usable id/type is malformed (reported, never turned into a fabricated edge).
  */
 function parseDependency(dependency: unknown): DependencyParse {
   if (!isRecord(dependency) || typeof dependency.id !== "string") {
@@ -628,8 +631,10 @@ function recordEdges(
  * link types say nothing about order, so inventing an edge from them would stall
  * work that could start.
  *
- * An already-finished blocker is dropped: it has landed, so it cannot be a
- * reason to wait. Everything unreadable degrades to "no known edges" plus a
+ * An already-finished blocker is dropped: its bead is closed/done, so it cannot be
+ * a reason to wait. A blocker that merely landed keeps its edge here and is dropped
+ * by the caller against `fleet.json` (`fleetLandedTaskIds`), because "landed" is the
+ * fleet's fact, not bd's. Everything unreadable degrades to "no known edges" plus a
  * warning — never a crash, never a fabricated edge.
  */
 export function parseFleetDependencyEdges(

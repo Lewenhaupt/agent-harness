@@ -14,7 +14,7 @@
 
 import { buildBeadShowArgv, isBdReadSubcommand } from "./bd-command.js";
 import { type FleetDependencyGraph, parseFleetDependencyEdges } from "./fleet-schedule.js";
-import { type FleetBeadLookup, parseBeadViews } from "./fleet-status.js";
+import { type FleetBeadLookup, parseBeadViewPayload } from "./fleet-status.js";
 
 /** Longest a fleet-wide bead lookup may take before it degrades to no metadata. */
 export const FLEET_BEAD_LOOKUP_TIMEOUT_MS = 15_000;
@@ -55,6 +55,11 @@ export interface LookupFleetBeadsOptions {
  * against the builder's source: a future edit (or an injected builder) that
  * yields a mutating subcommand is refused before any process is spawned, so the
  * observer can never become a writer.
+ *
+ * A payload whose *shape* this version cannot read is a failed read, not an empty
+ * answer. Callers act on "these beads are gone" (resolving gates, dropping
+ * metadata), and bd wrapping its records differently must never look like every
+ * bead in the fleet having vanished.
  */
 export async function lookupFleetBeads(options: LookupFleetBeadsOptions): Promise<FleetBeadLookup> {
   if (options.taskIds.length === 0) return { ok: true, beads: [] };
@@ -73,7 +78,15 @@ export async function lookupFleetBeads(options: LookupFleetBeadsOptions): Promis
       timeoutInMs: FLEET_BEAD_LOOKUP_TIMEOUT_MS,
       maxBufferInBytes: FLEET_BEAD_LOOKUP_MAX_BUFFER_BYTES,
     });
-    return { ok: true, beads: parseBeadViews(JSON.parse(stdout)) };
+    const parsed = parseBeadViewPayload(JSON.parse(stdout) as unknown);
+    return parsed.ok
+      ? { ok: true, beads: parsed.beads }
+      : {
+          ok: false,
+          error:
+            "unrecognized `bd show` payload (bd changed its JSON shape); refusing to read " +
+            "this as an empty bead set",
+        };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

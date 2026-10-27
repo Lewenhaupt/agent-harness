@@ -259,7 +259,7 @@ With the intent, `latest runs` are the branch's `bd-12` manifests
 failure never parks it. Without the intent, the same worktree is attributed to
 `workflow.json`'s `bd-16`, adopts `bd16-commit=failed`, and reads `blocked`. The
 header says `bd-16` in both runs because it mirrors `workflow.json`, while
-authentication follows the resolution order; the `task-id-mismatch` warning is
+attribution follows the resolution order; the `task-id-mismatch` warning is
 what tells you the two disagree. Rendered text can be ambiguous on its own —
 that is why the tests pin `runId` identity.
 

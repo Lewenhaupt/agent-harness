@@ -18,6 +18,7 @@ import type {
 import {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
+  FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
   finishFleetRun,
@@ -25,6 +26,8 @@ import {
   formatFleetRunStops,
   isFleetRunActive,
   planFleetTick,
+  planGateNotices,
+  recordFleetGateNotices,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
@@ -1051,5 +1054,67 @@ describe("rendering", () => {
     expect(formatFleetRunStops(stopped)).toEqual([
       "stopped bd-12 (orchestrator-missing): no lease",
     ]);
+  });
+});
+
+describe("gate notices", () => {
+  it("shows a gate's warning once and remembers that it did", () => {
+    // W1: the tick sweep rediscovers a drifted gate on every rotation, and the loop
+    // notifies every line it returns. Without a ledger the same warning would repeat
+    // every tick — every 15 s on a one-member fleet.
+    const first = planGateNotices({
+      notices: [{ gateId: "bd-960", message: "gate bd-960 drifted" }],
+    });
+    expect(first.fresh.map((notice) => notice.gateId)).toEqual(["bd-960"]);
+    expect(first.noticeIds).toEqual(["bd-960"]);
+
+    const second = planGateNotices({
+      existing: first.noticeIds,
+      notices: [{ gateId: "bd-960", message: "gate bd-960 drifted" }],
+    });
+    expect(second.fresh).toEqual([]);
+    expect(second.noticeIds).toEqual(["bd-960"]);
+  });
+
+  it("warns separately about a different gate", () => {
+    const planned = planGateNotices({
+      existing: ["bd-960"],
+      notices: [
+        { gateId: "bd-960", message: "already shown" },
+        { gateId: "bd-961", message: "new drift" },
+      ],
+    });
+    expect(planned.fresh.map((notice) => notice.gateId)).toEqual(["bd-961"]);
+    expect(planned.noticeIds).toEqual(["bd-960", "bd-961"]);
+  });
+
+  it("forgets a gate once bd confirms it resolved", () => {
+    const planned = planGateNotices({
+      existing: ["bd-960", "bd-961"],
+      notices: [],
+      releasedGateIds: ["bd-960"],
+    });
+    expect(planned.noticeIds).toEqual(["bd-961"]);
+  });
+
+  it("stays quiet instead of growing past its bound", () => {
+    const existing = Array.from(
+      { length: FLEET_RUN_GATE_NOTICE_IDS_MAX },
+      (_, index) => `bd-${5000 + index}`,
+    );
+    const planned = planGateNotices({
+      existing,
+      notices: [{ gateId: "bd-970", message: "one more drift" }],
+    });
+    // Refusing to remember would re-warn forever, so the overflow is suppressed.
+    expect(planned.fresh).toEqual([]);
+    expect(planned.noticeIds).toHaveLength(FLEET_RUN_GATE_NOTICE_IDS_MAX);
+  });
+
+  it("keeps the ledger on the run and drops the field when it empties", () => {
+    const started = startFleetRun({ now: 1_000, accept: true, members: [] });
+    const recorded = recordFleetGateNotices(started, ["bd-960"]);
+    expect(recorded.gateNoticeIds).toEqual(["bd-960"]);
+    expect(recordFleetGateNotices(recorded, []).gateNoticeIds).toBeUndefined();
   });
 });

@@ -28,12 +28,21 @@ import {
   createFleetSupervisorRecord,
   listFleetIds,
 } from "./fleet-mode.js";
+import type {
+  CreateFleetOrderingGatesResult,
+  FleetOrderingGate,
+  FleetOrderingGateReapScope,
+  ReapFleetOrderingGatesResult,
+  ResolveFleetOrderingGatesResult,
+} from "./fleet-ordering-gates.js";
+import { orderingGateBudgetRefusal } from "./fleet-ordering-gates.js";
 import type { FleetDependencyGraph, FleetSchedule, FleetScheduleResult } from "./fleet-schedule.js";
 import { planFleetSchedule } from "./fleet-schedule.js";
 import type { FleetStateFs } from "./fleet-state.js";
 import {
   appendFleetAuditEntry,
   createFleetIntent,
+  dropFleetOrderingGates,
   readFleetIntent,
   updateFleetIntent,
 } from "./fleet-state.js";
@@ -476,6 +485,14 @@ export interface MergeFleetIntentInput {
    * session ids are known.
    */
   run?: FleetIntent["run"];
+  /**
+   * Fleet ordering gates this launch created (bd-158).
+   *
+   * Omitted by a re-arm, exactly like `deferred`: the gates already recorded for
+   * the fleet are still live (some block members that have not started), and
+   * dropping them would leave open bd gates nobody could resolve.
+   */
+  orderingGates?: FleetIntent["orderingGates"];
 }
 
 /**
@@ -512,25 +529,73 @@ export function mergeFleetIntent(input: MergeFleetIntentInput): FleetIntent {
           launched: input.taskIds,
           planned: input.deferred,
         });
-  if (current === undefined) {
-    return deferred === undefined ? created : { ...created, deferred };
-  }
-  return {
+  const orderingGates = mergeOrderingGateRecords(current?.orderingGates, input.orderingGates);
+  const merged: FleetIntent = {
     ...created,
+    ...(deferred === undefined ? {} : { deferred }),
+    ...(orderingGates === undefined ? {} : { orderingGates }),
+  };
+  return current === undefined ? merged : inheritFleetFacts(merged, current, input.run);
+}
+
+/**
+ * Carry the facts a launch does not restate (and must not overwrite).
+ *
+ * A launch is additive: the members it did not mention, the operator's note, a
+ * pause, and an active run all survive it. An active run is the one case with a
+ * restated value: a launch that starts a new run replaces it, while an advance or
+ * a re-arm keeps the one on disk.
+ */
+function inheritFleetFacts(
+  merged: FleetIntent,
+  current: FleetIntent,
+  run: FleetIntent["run"],
+): FleetIntent {
+  return {
+    ...merged,
     createdAt: current.createdAt,
     ...(current.paused === undefined ? {} : { paused: current.paused }),
     ...(current.park === undefined ? {} : { park: current.park }),
     ...(current.note === undefined ? {} : { note: current.note }),
-    ...(deferred === undefined ? {} : { deferred }),
-    // An active run survives a launch that does not restate it: dropping it here
-    // would silently stop the loop (`/fleet` advance) or forget what it landed.
-    ...(input.run !== undefined
-      ? { run: input.run }
-      : current.run === undefined
-        ? {}
-        : { run: current.run }),
+    ...(run !== undefined ? { run } : current.run === undefined ? {} : { run: current.run }),
   };
 }
+
+/**
+ * Append the gates this launch created, one per (blocker, blocked) pair.
+ *
+ * A pair is the gate's identity, so a relaunch that reads the same edge again
+ * cannot create a second gate for it (which bd would happily do), and the
+ * recorded list stays exactly the set of gates the fleet is responsible for
+ * resolving. Merging an over-bound set is refused by the caller that writes it
+ * ({@link orderingGateBudgetRefusal}) — never truncated: a cut record is an
+ * open gate nobody can resolve again.
+ */
+function mergeOrderingGateRecords(
+  current: FleetIntent["orderingGates"],
+  added: FleetIntent["orderingGates"],
+): FleetIntent["orderingGates"] {
+  if (added === undefined || added.length === 0) return current;
+  const merged: FleetOrderingGate[] = [...(current ?? [])];
+  const seen = new Set(merged.map((gate) => `${gate.blocker}\u0000${gate.blocked}`));
+  for (const gate of added) {
+    const key = `${gate.blocker}\u0000${gate.blocked}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(gate);
+  }
+  return merged;
+}
+
+/**
+ * The gate-record bound is enforced in two places, and this module owns one of them.
+ *
+ * The rule itself lives with the create driver (`fleet-ordering-gates.ts`), which is
+ * the only place that knows how many planned edges are already gated in bd: adoption
+ * adds a record without creating one, so the bound must be applied after adoption.
+ * The second check is the CAS write below, which catches a concurrent writer that
+ * grew the set between this launch's read and its merge of the intent.
+ */
 
 /**
  * The new plan first, then the earlier entries it did not schedule.
@@ -567,10 +632,14 @@ export interface FleetCommandArgs {
    */
   untilComplete?: boolean;
   /**
-   * False when `--no-accept` asked to leave beads for the human.
+   * True only when `--accept` asked for acceptance — i.e. closing the bead.
    *
-   * Accepting (close the bead, remove the worktree) is the default for a run,
-   * because a bead that stays open keeps blocking its dependents in bd.
+   * False is the default, for every caller: a fleet *lands* members and leaves each
+   * bead `in_progress` + `human`, because closing is the human's acceptance signal
+   * (`wt merge` / `bd close`) and ordering no longer needs a close to unblock a
+   * dependent — the fleet's own bd ordering gates handle that (bd-158). The merged
+   * worktree and branch are removed on every landing regardless: the merge left them
+   * with no remaining purpose, so removal is hygiene, not acceptance.
    */
   accept?: boolean;
 }
@@ -580,16 +649,24 @@ export type FleetCommandParse = { ok: true; args: FleetCommandArgs } | { ok: fal
 /** Usage line shown for a bare or malformed `/fleet`. */
 export function fleetUsageText(): string {
   return [
-    "Usage: /fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--no-accept]",
+    "Usage: /fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--accept]",
     "  task ids: beads to run as members, each in its own worktree (1 or more)",
     `  --fleet <id>: fleet directory name (default: ${DEFAULT_FLEET_ID})`,
     `  --concurrency <n>: concurrent orchestrators, capped at ${FLEET_MAX_CONCURRENT_ORCHESTRATORS}`,
     "  --manual: launch only; land and advance on explicit calls (no run loop)",
-    "  --no-accept: land without closing beads (leaves them in_progress + human)",
+    "  --accept: also close each landed bead (its merged worktree is removed on landing",
+    "            either way); default: land only, leaving every bead in_progress + human",
+    "            for you to accept",
   ].join("\n");
 }
 
-const FLEET_FLAG_NAMES: readonly string[] = ["--fleet", "--concurrency", "--manual", "--no-accept"];
+const FLEET_FLAG_NAMES: readonly string[] = [
+  "--fleet",
+  "--concurrency",
+  "--manual",
+  "--accept",
+  "--no-accept",
+];
 
 /**
  * Parse `/fleet` arguments.
@@ -606,6 +683,9 @@ function parseFleetFlagToken(tokens: readonly string[], index: number): FleetFla
   // Boolean flags take no value: `--manual --fleet night` must not read "--fleet"
   // as the manual value.
   if (token === "--manual") return { ok: true, consumed: 1, untilComplete: false };
+  // `--accept` is opt-in (bd-158); `--no-accept` stays valid as an explicit
+  // restatement of the default, so an older muscle memory is not a parse error.
+  if (token === "--accept") return { ok: true, consumed: 1, accept: true };
   if (token === "--no-accept") return { ok: true, consumed: 1, accept: false };
 
   const value = tokens[index + 1];
@@ -930,6 +1010,38 @@ export function collectFleetLaunchContext(
   return { fleets, targetIntent, targetFleetId, unknownFleets: unknownFleets.sort() };
 }
 
+/**
+ * bd gate lifecycle seam (bd-158), injected exactly like `lookupDependencies`.
+ *
+ * The engine must not spawn anything, so creating and rolling back the fleet's
+ * ordering gates is the caller's job; the engine decides *when* (before the intent
+ * write, so a refused launch leaves no half-gated fleet) and *which edges*.
+ */
+export interface FleetOrderingGateSeam {
+  create: (input: {
+    fleetId: string;
+    taskIds: readonly string[];
+    edges: FleetDependencyGraph["edges"];
+    existing: readonly FleetOrderingGate[];
+  }) => Promise<CreateFleetOrderingGatesResult>;
+  resolve: (input: {
+    gates: readonly FleetOrderingGate[];
+    beadId?: string;
+    blocker?: string;
+  }) => Promise<ResolveFleetOrderingGatesResult>;
+  /**
+   * Resolve ordering gates bd reports for these beads, record or not (bd-158).
+   *
+   * The crash-window path: a gate can exist in bd while `fleet.json` never got its
+   * record, so a rollback that only knows the ids it recorded cannot see it.
+   * `scope` is the caller's statement of what it owns: a rollback passes the edges
+   * it created (never another edge's ordering), a gone member passes `whole-bead`.
+   */
+  reapByPrefix: (
+    input: { fleetId: string; beadIds: readonly string[] } & FleetOrderingGateReapScope,
+  ) => Promise<ReapFleetOrderingGatesResult>;
+}
+
 export interface RunFleetLaunchOptions {
   /** `<git-common-dir>`, resolved by the caller (the shell-out stays there). */
   gitCommonDir: string;
@@ -984,6 +1096,14 @@ export interface RunFleetLaunchOptions {
   probeOwnership: (taskId: string) => string | undefined;
   /** The existing single-bead launch path, injected so this engine stays testable. */
   launchMember: (taskId: string) => Promise<FleetMemberLaunchOutcome>;
+  /**
+   * bd ordering gates for this fleet's internal dependency edges.
+   *
+   * Absent means "this caller does not own ordering gates" (unit tests that do not
+   * exercise them); production always supplies it, because without gates a landed
+   * member's bead would have to be closed to unblock its dependents.
+   */
+  orderingGates?: FleetOrderingGateSeam;
   fs?: FleetStateFs;
 }
 
@@ -1417,10 +1537,15 @@ function recountLaunchCapacity(
  * The read-back is the second half of W6: `atomicWriteJson` guarantees the write
  * was not torn, but not that it survived a concurrent writer. A supervisor that
  * cannot verify its own record is not the supervisor, so it must not claim to be.
+ *
+ * `orderingGates` are the gates created moments earlier for this plan; they are
+ * written in the same merge so a gate can never exist without the record that
+ * says which member it orders and how to resolve it later.
  */
 function writeLaunchIntent(
   options: RunFleetLaunchOptions,
   plan: FleetLaunchPlan,
+  orderingGates: FleetIntent["orderingGates"],
 ): { ok: true } | { ok: false; text: string } {
   const written = updateFleetIntent({
     gitCommonDir: options.gitCommonDir,
@@ -1429,7 +1554,7 @@ function writeLaunchIntent(
     update: (current) => {
       const recount = recountLaunchCapacity(options, plan);
       if (!recount.ok) return { refuse: recount.text };
-      return mergeFleetIntent({
+      const merged = mergeFleetIntent({
         current,
         fleetId: plan.fleetId,
         taskIds: plan.taskIds,
@@ -1443,7 +1568,12 @@ function writeLaunchIntent(
         // no plan at all (`undefined`) and keeps the one it inherited.
         ...(plan.deferred === undefined ? {} : { deferred: plan.deferred }),
         ...(plan.run === undefined ? {} : { run: plan.run }),
+        ...(orderingGates === undefined ? {} : { orderingGates }),
       });
+      // A concurrent writer can have added gates since this launch read them, so
+      // the bound is re-checked on the set that would actually be written.
+      const budget = orderingGateBudgetRefusal(merged.orderingGates?.length ?? 0);
+      return budget === undefined ? merged : { refuse: budget };
     },
   });
   if (!written.ok) {
@@ -1518,35 +1648,86 @@ async function launchAllMembers(
  * The rewrite is a cross-tree mutation, so it is audited (`member-pruned`) like
  * every other one; the audit failure is returned as a warning instead of being
  * swallowed.
+ *
+ * A failed member never became a member, so its ordering gates are resolved here
+ * (bd-158): an open gate whose member is gone would block a bead no fleet is
+ * working on. A resolve failure keeps the records so the tick reaper can retry,
+ * and is reported rather than hidden.
  */
-function pruneFailedMembers(
+async function pruneFailedMembers(
   options: RunFleetLaunchOptions,
   plan: FleetLaunchPlan,
   failed: readonly string[],
-): string[] {
+): Promise<string[]> {
   if (failed.length === 0) return [];
+  const warnings: string[] = [];
+  const gateRecords = readFleetIntent({
+    gitCommonDir: options.gitCommonDir,
+    fleetId: plan.fleetId,
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
+  });
+  const failedSet = new Set(failed);
+  const touching = (gateRecords.ok ? (gateRecords.intent?.orderingGates ?? []) : []).filter(
+    (gate) => failedSet.has(gate.blocker) || failedSet.has(gate.blocked),
+  );
+  let resolvedGateIds: readonly string[] = [];
+  if (touching.length > 0 && options.orderingGates !== undefined) {
+    const result = await options.orderingGates.resolve({ gates: touching });
+    resolvedGateIds = result.resolved.map((gate) => gate.gateId);
+    if (!result.ok) {
+      warnings.push(
+        `fleet ${plan.fleetId}: could not resolve the ordering gate(s) of the failed ` +
+          `member(s): ${result.error}`,
+      );
+    }
+  }
+  // A launch that never recorded its gates can still have created them (a crash
+  // between `bd gate create` and the intent write); the failed members' beads are
+  // asked directly so those gates cannot stay open with nothing to resolve them.
+  // No edge filter: the member itself is gone, so any of its gates is an orphan.
+  if (options.orderingGates !== undefined) {
+    const prefix = await options.orderingGates.reapByPrefix({
+      fleetId: plan.fleetId,
+      beadIds: [...failed],
+      scope: "whole-bead",
+    });
+    resolvedGateIds = [...resolvedGateIds, ...prefix.resolved.map((gate) => gate.gateId)];
+    warnings.push(...prefix.warnings);
+    if (!prefix.ok) {
+      warnings.push(
+        `fleet ${plan.fleetId}: could not reap every ordering gate of the failed ` +
+          `member(s): ${prefix.error}`,
+      );
+    }
+  }
   const pruned = updateFleetIntent({
     gitCommonDir: options.gitCommonDir,
     fleetId: plan.fleetId,
     ...(options.fs === undefined ? {} : { fs: options.fs }),
-    update: (current) =>
-      current === undefined
-        ? mergeFleetIntent({
-            current: undefined,
-            fleetId: plan.fleetId,
-            taskIds: [],
-            now: options.now,
-            maxConcurrent: plan.maxConcurrent,
-            supervisor: plan.supervisor,
-          })
-        : {
-            ...current,
-            taskIds: current.taskIds.filter((taskId) => !failed.includes(taskId)),
-            updatedAt: options.now,
-          },
+    update: (current) => {
+      if (current === undefined) {
+        return mergeFleetIntent({
+          current: undefined,
+          fleetId: plan.fleetId,
+          taskIds: [],
+          now: options.now,
+          maxConcurrent: plan.maxConcurrent,
+          supervisor: plan.supervisor,
+        });
+      }
+      const kept: FleetIntent = {
+        ...current,
+        taskIds: current.taskIds.filter((taskId) => !failedSet.has(taskId)),
+        updatedAt: options.now,
+      };
+      // Drop only the records bd confirmed resolved, by gate id: another gate of
+      // the same member may still be open (and must stay recorded).
+      return resolvedGateIds.length > 0
+        ? dropFleetOrderingGates(kept, resolvedGateIds, options.now)
+        : kept;
+    },
   });
 
-  const warnings: string[] = [];
   if (!pruned.ok) {
     warnings.push(
       `fleet ${plan.fleetId}: could not clear failed members from the intent (${pruned.error}); ` +
@@ -1566,6 +1747,195 @@ function pruneFailedMembers(
   });
   if (prunedAudit !== undefined) warnings.push(prunedAudit);
   return warnings;
+}
+
+/** The member ids this plan covers: wave 0 now, plus everything deferred. */
+function plannedMemberIds(plan: FleetLaunchPlan): string[] {
+  return [...plan.taskIds, ...(plan.deferred ?? []).map((entry) => entry.taskId)].filter(
+    (taskId, index, ids) => ids.indexOf(taskId) === index,
+  );
+}
+
+/**
+ * Create the bd ordering gates for this launch's internal edges (bd-158).
+ *
+ * Refusal is deliberate: a launch that silently proceeded without its gates would
+ * report a fleet whose ordering bd does not know about, and the first landing would
+ * then close a bead to unblock a dependent — the exact habit this design removes.
+ * The gates this attempt *created* are resolved on the way out; a gate adopted from
+ * bd (a record lost earlier) is left alone, because resolving it would delete the
+ * fleet's ordering for that edge instead of restoring its record.
+ *
+ * The member set is *every* fleet member, not just the wave being launched: a
+ * member added by an advance can be blocked by a member that started earlier, and
+ * that edge needs a gate too, or bd reports the new member blocked for the whole
+ * run while the fleet believes its ordering is complete.
+ *
+ * The record budget lives inside the seam (`createFleetOrderingGates`), because only
+ * bd knows which planned edges are already gated there: an adopted gate is a record
+ * but not a creation, so counting it here would refuse a fleet that is already at
+ * the bound and would create nothing.
+ */
+async function createLaunchOrderingGates(
+  options: RunFleetLaunchOptions,
+  plan: FleetLaunchPlan,
+  dependencyGraph: FleetDependencyGraph,
+): Promise<
+  | {
+      ok: true;
+      gates: FleetIntent["orderingGates"];
+      /** What a later refusal may roll back, and what must be left alone. */
+      state: RefusedGateState;
+      warnings: readonly string[];
+    }
+  | { ok: false; text: string; warnings: readonly string[] }
+> {
+  const seam = options.orderingGates;
+  if (seam === undefined)
+    return { ok: true, gates: undefined, state: EMPTY_GATE_STATE, warnings: [] };
+
+  const loaded = readFleetIntent({
+    gitCommonDir: options.gitCommonDir,
+    fleetId: plan.fleetId,
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
+  });
+  const existing = loaded.ok ? (loaded.intent?.orderingGates ?? []) : [];
+  const taskIds = uniqueIds([
+    ...(loaded.ok ? (loaded.intent?.taskIds ?? []) : []),
+    ...plannedMemberIds(plan),
+  ]);
+  if (taskIds.length === 0) {
+    return { ok: true, gates: undefined, state: EMPTY_GATE_STATE, warnings: [] };
+  }
+
+  const created = await seam.create({
+    fleetId: plan.fleetId,
+    taskIds,
+    edges: dependencyGraph.edges,
+    existing,
+  });
+  if (created.ok) {
+    return {
+      ok: true,
+      gates: [...created.gates],
+      state: { created: created.created, adopted: created.adopted },
+      warnings: [...created.warnings],
+    };
+  }
+
+  const detail = await orderGatesRollbackText(
+    options,
+    { created: created.created, adopted: created.adopted },
+    created.error,
+  );
+  return {
+    ok: false,
+    text:
+      `Fleet launch refused; nothing was launched. Could not create the bd ordering gates this ` +
+      `fleet needs: ${detail}`,
+    warnings: [...created.warnings],
+  };
+}
+
+/** Nothing to roll back and nothing adopted: the state of a launch with no gates. */
+const EMPTY_GATE_STATE: RefusedGateState = { created: [], adopted: [] };
+
+function uniqueIds(ids: readonly string[]): string[] {
+  return ids.filter((id, index) => ids.indexOf(id) === index);
+}
+
+/** What a refused launch's gate lifecycle left behind. */
+interface RefusedGateState {
+  /** Gates this attempt minted: the only ones a rollback may resolve. */
+  created: readonly FleetOrderingGate[];
+  /**
+   * Gates this attempt adopted from bd (their record had been lost). They predate
+   * the attempt, so they stay open — and they keep their dependent bd-blocked until
+   * a relaunch records them or a repair reaps them. Named in the refusal text.
+   */
+  adopted: readonly FleetOrderingGate[];
+}
+
+/**
+ * Resolve the gates a refused/aborted launch created, returning text that says what
+ * is left open.
+ *
+ * Scope is deliberate twice over. Only gates **this attempt created** are resolved
+ * (by id), so a refusal can never delete ordering that predates it, and the
+ * by-prefix sweep is filtered to the edges those gates belong to: an unrecorded
+ * duplicate for one of those edges is a crash-window orphan this attempt owns, while
+ * a gate for any other edge is not. Anything still open is named with its dependent
+ * and gate id, because that dependent stays out of `bd ready` until someone looks.
+ */
+async function orderGatesRollbackText(
+  options: RunFleetLaunchOptions,
+  state: RefusedGateState,
+  failure: string,
+): Promise<string> {
+  const seam = options.orderingGates;
+  if (seam === undefined) return failure;
+  const errors: string[] = [];
+  let resolved = 0;
+  if (state.created.length > 0) {
+    const rolledBack = await seam.resolve({ gates: state.created });
+    resolved += rolledBack.resolved.length;
+    if (!rolledBack.ok) errors.push(rolledBack.error);
+  }
+  const edges = state.created.map((gate) => ({ blocker: gate.blocker, blocked: gate.blocked }));
+  const beadIds = uniqueIds(edges.map((edge) => edge.blocked));
+  if (beadIds.length > 0) {
+    const prefix = await seam.reapByPrefix({
+      fleetId: options.fleetId,
+      beadIds,
+      scope: "created-edges",
+      edges,
+    });
+    resolved += prefix.resolved.length;
+    if (!prefix.ok) errors.push(prefix.error);
+  }
+  const clauses = [
+    resolved === 0 ? "" : `resolved the ${resolved} gate(s) it created`,
+    ...blockedClauses(state.adopted),
+    ...errors.map((error) => `still open after a failed resolve: ${error}`),
+  ].filter((clause) => clause !== "");
+  return clauses.length === 0 ? failure : `${failure} (${clauses.join("; ")})`;
+}
+
+/**
+ * One clause naming each dependent a refused launch leaves bd-blocked.
+ *
+ * Only adopted gates qualify: this attempt's own gates were resolved above, while an
+ * adopted one predates the attempt and stays open by design. The operator needs the
+ * dependent and the gate id, because `bd ready` will not show that bead again until
+ * the gate is resolved.
+ */
+function blockedClauses(gates: readonly FleetOrderingGate[]): readonly string[] {
+  if (gates.length === 0) return [];
+  const named = gates.map((gate) => `${gate.blocked} (gate ${gate.gateId})`).join(", ");
+  const first = gates[0]?.blocked ?? "<bead>";
+  return [
+    `${gates.length} pre-existing ordering gate(s) left open, so ${named} stays bd-blocked` +
+      ` — inspect with \`bd gate list ${first}\``,
+  ];
+}
+
+/** Audit the ordering gates a launch created (a cross-tree bd write). */
+function auditOrderingGates(
+  options: RunFleetLaunchOptions,
+  plan: FleetLaunchPlan,
+  gates: FleetIntent["orderingGates"],
+): string | undefined {
+  if (gates === undefined || gates.length === 0) return undefined;
+  return audit({
+    gitCommonDir: options.gitCommonDir,
+    fleetId: plan.fleetId,
+    sessionId: options.sessionId,
+    now: options.now,
+    action: "ordering-gates",
+    taskIds: gates.map((gate) => gate.blocked),
+    detail: gates.map((gate) => `${gate.blocker}->${gate.blocked} (${gate.gateId})`).join(", "),
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
+  });
 }
 
 /** Audit the re-arm of an existing fleet (a cross-tree intent write). */
@@ -1708,18 +2078,25 @@ async function readDependencyGraph(options: RunFleetLaunchOptions): Promise<Flee
  *    the free capacity (`capacity - already active`). Wave 0 up to that limit
  *    launches now; the rest is recorded in the intent as deferred, with the
  *    reason, and reported. A dependency cycle refuses the launch outright.
+ * 2b. **Gate the internal edges (bd-158).** With the schedule decided, one
+ *    `bd gate` per edge between two members blocks each dependent until its
+ *    blocker *lands*. Created before the intent write, so a failure here refuses
+ *    the launch with nothing written (and the gates it did create are resolved).
  * 3. **Write the intent, then read it back.** A member finds its mailbox by task
  *    id, so the record must exist before the first member session starts — and a
  *    record that did not survive a concurrent writer is not a supervision claim.
+ *    The gate ids are written here: a gate with no record would be an orphan.
  * 4. **Launch.** Each new member goes through the existing single-bead path; a
  *    failure is caught per member so the rest still proceed.
  * 5. **Prune.** A member that failed is removed from the intent — reported and
  *    audited, never silently dropped, and still retryable — so
- *    \`belayd_fleet_status\` does not report a phantom member forever.
+ *    \`belayd_fleet_status\` does not report a phantom member forever, and its
+ *    ordering gates are resolved so no orphan gate blocks a non-member bead.
  *
- * Every cross-tree action (the intent write, a re-arm, the schedule, each launch
- * attempt, each deferral, the prune) is appended to \`audit.log\`. Nothing here
- * merges, pauses, or mutates a bead, and no wave is advanced automatically.
+ * Every cross-tree action (the intent write, a re-arm, the schedule, the ordering
+ * gates, each launch attempt, each deferral, the prune) is appended to
+ * \`audit.log\`. Nothing here merges, pauses, closes, or streams a bead, and no
+ * wave is advanced automatically.
  */
 export async function runFleetLaunch(
   options: RunFleetLaunchOptions,
@@ -1740,23 +2117,37 @@ export async function runFleetLaunch(
   }
   const plan = planned.plan;
 
-  const written = writeLaunchIntent(options, plan);
-  if (!written.ok) {
+  const gated = await createLaunchOrderingGates(options, plan, dependencyGraph);
+  if (!gated.ok) {
     return {
       ok: false,
-      text: written.text,
+      text: gated.text,
       outcomes: [],
-      warnings: [],
+      warnings: [...dependencyGraph.warnings, ...gated.warnings],
       rearmed: false,
       fleetId: plan.fleetId,
       armed: false,
     };
   }
 
-  const warnings: string[] = [...plan.warnings];
+  const written = writeLaunchIntent(options, plan, gated.gates);
+  if (!written.ok) {
+    return {
+      ok: false,
+      text: await orderGatesRollbackText(options, gated.state, written.text),
+      outcomes: [],
+      warnings: [...gated.warnings],
+      rearmed: false,
+      fleetId: plan.fleetId,
+      armed: false,
+    };
+  }
+
+  const warnings: string[] = [...plan.warnings, ...gated.warnings];
   for (const auditWarning of [
     auditReArm(options, plan),
     ...auditSchedule(options, plan),
+    auditOrderingGates(options, plan, gated.gates),
     auditLaunchRequest(options, plan),
   ]) {
     if (auditWarning !== undefined) warnings.push(auditWarning);
@@ -1765,11 +2156,11 @@ export async function runFleetLaunch(
   const launched = await launchAllMembers(options, plan);
   warnings.push(...launched.warnings);
   warnings.push(
-    ...pruneFailedMembers(
+    ...(await pruneFailedMembers(
       options,
       plan,
       launched.outcomes.filter((outcome) => !outcome.ok).map((outcome) => outcome.taskId),
-    ),
+    )),
   );
 
   const launchedAnything = launched.outcomes.some((outcome) => outcome.ok);

@@ -86,7 +86,11 @@ describe("acceptLandedMember", () => {
     ]);
   });
 
-  it("leaves the bead alone when acceptance is disabled", async () => {
+  it("leaves the bead alone when acceptance is disabled (the fleet default)", async () => {
+    // bd-158: a landing is not an acceptance, so the run passes closeBead=false
+    // unless --accept asked for it. Nothing may be written to the bead at all —
+    // no close, no label change, no assignee clear — because ordering is handled
+    // by the bd gate the landing resolves.
     const calls: Call[] = [];
     const bdCalls: Call[] = [];
 
