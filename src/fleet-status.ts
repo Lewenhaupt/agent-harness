@@ -427,6 +427,10 @@ function launchedAtFor(
  * `.belayd/` is copied into a new worktree, so an unfiltered list reports an
  * inherited failure as this member's (bd-161) and `belayd_fleet_status` would
  * contradict the loop's own `starting`/`missing` verdict for the same worktree.
+ *
+ * The same filter is what keeps `latest runs` and the interrupted count honest
+ * when a consumer repository commits `.belayd/runs` (bd-146): a fresh worktree
+ * would otherwise check out another bead's phase runs and report them as its own.
  */
 function memberRuns(
   snapshot: FleetMemberSnapshot,
