@@ -78,6 +78,16 @@ export const FLEET_RUN_START_GRACE_MS = 120_000;
 /** Consecutive no-progress ticks before the loop stops with `stalled`. */
 export const FLEET_RUN_MAX_IDLE_TICKS = 240;
 
+/** Characters of free text kept in one run record field or terminal detail line. */
+export const FLEET_RUN_DETAIL_MAX_LENGTH = 400;
+
+/** Members named in one detail line before the rest collapse into `+N more`. */
+const FLEET_RUN_DETAIL_NAMED_MAX = 8;
+
+/** Appended to a refused advance's terminal line, which is all a human sees later. */
+const REFUSED_WAVE_RECOVERY =
+  " — the wave stays deferred until an explicit belayd_fleet_advance or a fresh launch";
+
 /**
  * Delay between loop ticks while members are working.
  *
@@ -103,7 +113,7 @@ const FleetRunMemberSchema = z.object({
 const FleetRunStopSchema = z.object({
   taskId: z.string().min(1).max(128),
   reason: z.enum(FLEET_RUN_STOP_REASONS),
-  detail: z.string().max(400),
+  detail: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH),
   at: z.number().finite(),
 });
 
@@ -135,7 +145,7 @@ export const FleetRunSchema = z.object({
   finishedAt: z.number().finite().optional(),
   outcome: z.enum(FLEET_RUN_OUTCOMES).optional(),
   /** Why a run stopped without finishing (paused, stalled, authority lost). */
-  haltedReason: z.string().max(400).optional(),
+  haltedReason: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH).optional(),
 });
 
 export type FleetRun = z.infer<typeof FleetRunSchema>;
@@ -549,6 +559,126 @@ function completionAction(intent: FleetIntent): FleetTickAction {
   };
 }
 
+/**
+ * The action for an advance that launched nothing.
+ *
+ * `planFleetTick` reaches `advance` whenever deferred work remains, and an advance
+ * re-plans that same deferred worklist — when every member is still deferred,
+ * retrying it changes nothing and repeats the identical audit lines every tick
+ * until the idle cap stalls the run. The executor therefore degrades an empty
+ * advance into the action the plan would otherwise have reached.
+ *
+ * Capacity is the one deferral reason that frees itself (another fleet's slot), so
+ * a capacity-blocked wave waits instead of ending the run; every other reason
+ * needs a member to land, a bead to close, or an operator's advance. That wait is
+ * bounded here rather than in `idleOrWait`: this path only runs with no member in
+ * flight, so the plan's own stall cap can never fire, and an unbounded wait would
+ * re-run the whole launch engine every tick forever.
+ */
+export function emptyAdvanceAction(options: {
+  intent: FleetIntent;
+  /** The deferrals the advance left behind (fresh read; falls back to intent.deferred). */
+  deferred?: FleetIntent["deferred"];
+  /** The advance's own failure text, when the plan itself refused to advance. */
+  reason?: string;
+  /** The plan itself refused, so no deferral can free itself later. */
+  refused?: boolean;
+  /** Consecutive no-progress ticks, threaded in from the run record. */
+  idleTicks?: number;
+  /** Cap on those ticks; defaults to `FLEET_RUN_MAX_IDLE_TICKS`. */
+  maxIdleTicks?: number;
+}): FleetTickAction {
+  const deferrals = options.deferred ?? options.intent.deferred ?? [];
+  const capacity = deferrals.filter((entry) => entry.reason === "capacity");
+  if (capacity.length > 0 && options.refused !== true) {
+    const maxIdle = options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS;
+    const idleTicks = options.idleTicks ?? 0;
+    if (idleTicks >= maxIdle) {
+      // Nothing is ever in flight on this path, so `idleOrWait` -- the plan's only
+      // stall cap -- is unreachable; without this bound the run would re-plan the
+      // same capacity-blocked wave every tick forever, worse than the stall it fixes.
+      return {
+        kind: "halt",
+        reason: "stalled",
+        detail: boundRunDetail(
+          `no capacity slot freed in ${maxIdle} ticks; ${formatDeferralList(capacity)} still blocked on capacity held by another fleet`,
+        ),
+      };
+    }
+    return {
+      kind: "wait",
+      detail: boundRunDetail(
+        `advance launched nothing: ${formatDeferralList(capacity)} blocked on capacity held by another fleet; the wave launches when a slot frees`,
+      ),
+    };
+  }
+
+  const terminal = emptyAdvanceTerminal({
+    deferrals,
+    stoppedTaskIds: (options.intent.run?.stopped ?? []).map((entry) => entry.taskId),
+    reason: options.reason,
+    refused: options.refused === true,
+  });
+  return { kind: "complete", ...terminal };
+}
+
+/**
+ * The terminal line for an advance that launched nothing.
+ *
+ * Split out of `emptyAdvanceAction` so the two shapes it can take — a plain
+ * deferral report and a refusal that names a viable retry — stay readable.
+ */
+function emptyAdvanceTerminal(options: {
+  deferrals: NonNullable<FleetIntent["deferred"]>;
+  stoppedTaskIds: readonly string[];
+  reason: string | undefined;
+  refused: boolean;
+}): { outcome: FleetRunOutcome; detail: string } {
+  const { deferrals, stoppedTaskIds: stopped } = options;
+  const parts: string[] = [];
+  // Deferrals lead: they are the members the bug's one audit line must name, and
+  // each list is capped on its own so a long stop list cannot crowd them out.
+  if (deferrals.length > 0) parts.push(`${formatDeferralList(deferrals)} still deferred`);
+  if (stopped.length > 0) {
+    parts.push(`${stopped.length} member(s) need a human: ${formatTaskIdList(stopped)}`);
+  }
+  if (options.reason !== undefined && options.reason.length > 0) parts.push(options.reason);
+  // A refusal is the engine's own failure, not proof the wave is unplannable: the
+  // recount race it reports frees itself once another fleet's slot frees, so the
+  // durable line must say a retry is viable. The clause is appended after the
+  // reason is bounded, so truncation can never eat the actionable half.
+  const recovery = options.refused ? REFUSED_WAVE_RECOVERY : "";
+  const base = parts.length > 0 ? `nothing launched: ${parts.join("; ")}` : "nothing launched";
+  return {
+    outcome: deferrals.length > 0 || stopped.length > 0 ? "partial" : "complete",
+    detail: `${boundRunDetail(base, FLEET_RUN_DETAIL_MAX_LENGTH - recovery.length)}${recovery}`,
+  };
+}
+
+function formatDeferralList(deferrals: NonNullable<FleetIntent["deferred"]>): string {
+  return formatTaskIdList(deferrals.map((entry) => `${entry.taskId} (${entry.reason})`));
+}
+
+/** Name the first few ids, then `+N more`, so a 1000-entry list cannot overflow. */
+function formatTaskIdList(labels: readonly string[]): string {
+  const named = labels.slice(0, FLEET_RUN_DETAIL_NAMED_MAX);
+  const more = labels.length - named.length;
+  return more > 0 ? `${named.join(", ")}, +${more} more` : named.join(", ");
+}
+
+/**
+ * Fit free text into the audit field without cutting a member id in half.
+ *
+ * The durable line is all a human sees later, so a hard slice that ends mid-token
+ * (or on a separator) is worse than dropping the tail of the line.
+ */
+function boundRunDetail(detail: string, maxLength: number = FLEET_RUN_DETAIL_MAX_LENGTH): string {
+  if (detail.length <= maxLength) return detail;
+  const head = detail.slice(0, maxLength);
+  const boundary = Math.max(head.lastIndexOf("; "), head.lastIndexOf(", "));
+  return boundary > 0 ? head.slice(0, boundary) : head;
+}
+
 /** Members still working: wait, unless the run has made no progress for too long. */
 function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): FleetTickAction {
   const maxIdle = options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS;
@@ -727,7 +857,7 @@ export function recordRunMemberStopped(options: {
       {
         taskId: options.taskId,
         reason: options.reason,
-        detail: options.detail.slice(0, 400),
+        detail: options.detail.slice(0, FLEET_RUN_DETAIL_MAX_LENGTH),
         at: options.now,
       },
     ],

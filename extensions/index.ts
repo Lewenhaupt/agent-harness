@@ -149,6 +149,7 @@ import {
   deriveFleetMemberProgress,
   drainFleetMerge,
   drainNotes,
+  emptyAdvanceAction,
   enqueueFleetMerge,
   enqueueNoteFanout,
   excerptComment,
@@ -158,6 +159,7 @@ import {
   FLEET_NOTE_KINDS,
   FLEET_NOTE_SUPERVISOR,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
+  FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_TICK_INTERVAL_MS,
   findWorkspaceRoot,
   finishFleetRun,
@@ -7403,7 +7405,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     const { ctx, mode, run, now } = options;
     const planned = planFleetAdvance({ fleetId: mode.fleetId, intent: options.intent });
     if (!planned.ok) {
-      return { run, lines: [`Fleet ${mode.fleetId}: ${planned.text}`], stop: false, acted: false };
+      // `planFleetTick` halts a paused fleet before it can reach advance, so this is
+      // unreachable today; completing instead of retrying keeps a refusal from
+      // becoming the same per-tick churn if that invariant ever changes.
+      return emptyAdvanceOutcome({ context: options, reason: planned.text, refused: true });
     }
     const advanced = await runFleetLaunch({
       ctx,
@@ -7412,12 +7417,124 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       origin: "advance",
     });
     const outcomes = advanced.outcomes ?? [];
+    // `outcomes.length` is not progress: an advance that only re-deferred the same
+    // members produces outcomes too, and retrying that every tick re-plans the same
+    // wave until the idle cap stalls the run an hour later. A real launch is what
+    // resets idleTicks and schedules the next tick at the action interval.
+    // A capacity-blocked advance reports `ok: true` with no outcomes (a plan that
+    // was to wait is a success, W6), so `refused` only catches a genuine engine
+    // refusal — which re-asking every tick would never fix either.
+    if (!outcomes.some((outcome) => outcome.ok)) {
+      return emptyAdvanceOutcome({
+        context: options,
+        text: advanced.text,
+        refused: advanced.ok === false,
+        // A hard refusal is the advance's own failure: it belongs in the durable line,
+        // not only in the tick notification. A capacity-blocked advance is `ok: true`.
+        ...(advanced.ok ? {} : { reason: advanced.text }),
+      });
+    }
     return {
       run: extendRunWithLaunches({ run, outcomes, now }),
       lines: outcomes.length === 0 ? [] : [`Fleet ${mode.fleetId}: ${advanced.text}`],
       stop: false,
-      acted: outcomes.some((outcome) => outcome.ok),
+      acted: true,
     };
+  }
+
+  /**
+   * Map an advance that launched nothing onto the action the plan would have reached.
+   *
+   * The deferrals are re-read because `runFleetLaunch` has already written the new
+   * plan by the time it returns; the old intent would describe the wave before it
+   * was re-planned. Capacity is not terminal (another fleet's slot frees itself),
+   * so it waits, bounded by the same idle cap; every other reason ends the run as
+   * `partial`.
+   */
+  function emptyAdvanceOutcome(options: {
+    context: FleetTickContext;
+    /** What the advance re-planned, kept as a leading line when non-empty. */
+    text?: string;
+    /** The advance's own failure text, when it refused to run at all. */
+    reason?: string;
+    /** The plan refused to advance, so capacity cannot free the wave either. */
+    refused?: boolean;
+  }): FleetTickOutcome {
+    const { context } = options;
+    const { mode } = context;
+    const text = options.text ?? "";
+    const lines = text.length > 0 ? [`Fleet ${mode.fleetId}: ${text}`] : [];
+    const refreshed = readFleetIntent({
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+    });
+    if (!refreshed.ok || refreshed.intent === undefined) {
+      // Classifying from the pre-launch deferrals would read stale reasons (a
+      // dependency that just became capacity, or the reverse), so the loop stops
+      // instead of guessing — the same call `fleetTick` makes on an unreadable
+      // intent. A read that succeeds with no record is that same hazard: the
+      // launch engine has just written `fleet.json`, so an absent one was removed
+      // mid-tick (reconcile, manual cleanup) and the pre-launch deferrals are the
+      // plan the advance just replaced.
+      return {
+        run: context.run,
+        lines: [
+          ...lines,
+          refreshed.ok
+            ? `Fleet ${mode.fleetId}: run halted — the fleet intent for \`${mode.fleetId}\` is gone; nothing to advance`
+            : `Fleet ${mode.fleetId}: run halted — could not re-read the fleet intent: ${refreshed.error}`,
+        ],
+        stop: true,
+        acted: false,
+      };
+    }
+    const action = emptyAdvanceAction({
+      intent: context.intent,
+      // The fresh record is authoritative: an absent `deferred` means nothing is
+      // deferred, not "fall back to the plan the advance just replaced".
+      deferred: refreshed.intent.deferred ?? [],
+      reason: options.reason,
+      refused: options.refused,
+      // The run record is the only idle counter; a second one would drift from it.
+      idleTicks: context.run.idleTicks ?? 0,
+    });
+    switch (action.kind) {
+      case "wait":
+        // Capacity frees itself, so the run stays alive and keeps counting idle
+        // ticks. `emptyAdvanceAction` turns that wait into `halt`/`stalled` at the
+        // cap, because `planFleetTick` never reaches `idleOrWait` on this path.
+        return {
+          run: context.run,
+          lines: [...lines, `Fleet ${mode.fleetId}: ${action.detail}`],
+          stop: false,
+          acted: false,
+        };
+      case "complete": {
+        const completed = completeTickAction(context, action);
+        return { ...completed, lines: [...lines, ...completed.lines] };
+      }
+      case "halt": {
+        const halted = haltTickAction(context, action);
+        // `acted: false` keeps the tick that gives up from resetting the idle count
+        // that justified it; `fleetTick` then records `progressed: false` and stops.
+        return { ...halted, lines: [...lines, ...halted.lines], acted: false };
+      }
+      default:
+        return unreachableEmptyAdvance(action);
+    }
+  }
+
+  /**
+   * Compile-time guard for the kinds `emptyAdvanceAction` can return.
+   *
+   * It is typed against the full plan union, so a new action kind must be handled
+   * here or fail this build; falling through silently would recreate the per-tick
+   * loop this degrade exists to remove.
+   */
+  function unreachableEmptyAdvance(
+    action: Exclude<FleetTickAction, { kind: "wait" | "complete" | "halt" }>,
+  ): never {
+    throw new Error(`unexpected action for an advance that launched nothing: ${action.kind}`);
   }
 
   function completeTickAction(
@@ -7451,7 +7568,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     // "pause, step away, resume" a lie. Every other halt (parked, stalled) needs a
     // human and is recorded on the run.
     const resumable = action.reason === "paused";
-    const haltedReason = resumable ? undefined : `${action.reason}: ${action.detail}`.slice(0, 400);
+    const haltedReason = resumable
+      ? undefined
+      : `${action.reason}: ${action.detail}`.slice(0, FLEET_RUN_DETAIL_MAX_LENGTH);
     auditFleetAction({
       ctx,
       gitCommonDir: mode.gitCommonDir,

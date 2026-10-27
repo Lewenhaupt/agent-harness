@@ -10,7 +10,7 @@ member within milliseconds of launch while its orchestrator was still scouting.
 
 bd-161 makes the fleet trust only runs that belong to the member. Three rules
 plus one policy switch, implemented once in `runsBelongingToMember`
-(`src/fleet-run.ts:252`):
+(`src/fleet-run.ts:262`):
 
 | Rule | Effect |
 |---|---|
@@ -23,14 +23,14 @@ Both readers use that one function:
 
 | Reader | Entry point |
 |---|---|
-| the stop path (`planFleetTick` → member observations) | `deriveFleetMemberProgress` (`src/fleet-run.ts:277`), always `failuresRequireLaunch: true` |
+| the stop path (`planFleetTick` → member observations) | `deriveFleetMemberProgress` (`src/fleet-run.ts:287`), always `failuresRequireLaunch: true` |
 | the read-only view (`belayd_fleet_status`) | `memberRuns` (`src/fleet-status.ts:431`) |
 
 `belayd_fleet_status` also resolves the worktree's task id the way the loop does
 (`runLoopTaskId`, `src/fleet-status.ts:403`: the branch's task id when the intent
 owns it, else `workflow.json`'s) and takes `launchedAt` from
 `fleet.json` `run.members` (`launchedAtFor`, `src/fleet-status.ts:416`).
-Separately, `stopDecision`'s `missing` branch (`src/fleet-run.ts:602`) now
+Separately, `stopDecision`'s `missing` branch (`src/fleet-run.ts:732`) now
 consults the live lease: a member whose state file is gone but whose worktree
 still carries a live orchestrator claim is **not** stopped.
 
@@ -394,7 +394,7 @@ Nothing to enable — the filter is always on. What changes for a fleet operator
   from a previous *crashed* execution still counts as `running` evidence — the
   in-flight bypass deliberately ignores the launch cutoff, because a live run
   must never fall through to `missing` and stop a healthy member. Two bounds
-  apply: `runningMemberStop` (`src/fleet-run.ts:619`) never stops such a member
+  apply: `runningMemberStop` (`src/fleet-run.ts:749`) never stops such a member
   while its orchestrator lease is `live`, and it *also* never stops a member
   whose launch time is unknown — so a stale `running` copy in an inherited
   worktree is only cleared by the run's stall halt

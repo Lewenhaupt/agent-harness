@@ -12,10 +12,12 @@ import type {
   FleetMemberObservation,
   FleetMemberProgress,
   FleetRun,
+  FleetTickAction,
   FleetWorkflowProgressSnapshot,
 } from "../fleet-run.js";
 import {
   deriveFleetMemberProgress,
+  emptyAdvanceAction,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
   finishFleetRun,
@@ -386,6 +388,30 @@ function stopRun(options: { taskId: string }): FleetRun {
   });
 }
 
+/** A run that already stopped every member for a failed phase. */
+function stoppedRun(taskIds: readonly string[]): FleetRun {
+  return taskIds.reduce<FleetRun>(
+    (acc, taskId) =>
+      recordRunMemberStopped({
+        run: acc,
+        taskId,
+        reason: "phase-failed",
+        detail: "gate failed",
+        now: 2_000,
+      }),
+    startFleetRun({
+      now: 1_000,
+      accept: true,
+      members: taskIds.map((taskId) => ({ taskId })),
+    }),
+  );
+}
+
+/** The detail line of an action; empty when it carries none (land/advance). */
+function detailOf(action: FleetTickAction): string {
+  return "detail" in action ? action.detail : "";
+}
+
 describe("planFleetTick", () => {
   it("halts a paused or parked fleet instead of starting work", () => {
     expect(
@@ -673,6 +699,232 @@ describe("planFleetTick", () => {
       now: 7_000,
     });
     expect(after).toMatchObject({ kind: "complete", outcome: "complete" });
+  });
+});
+
+describe("emptyAdvanceAction", () => {
+  const deferred: NonNullable<FleetIntent["deferred"]> = [
+    { taskId: "bd-152", reason: "external-blocker", detail: "waits on bd-100" },
+    { taskId: "bd-153", reason: "dependency", detail: "waits on bd-152" },
+  ];
+
+  it("completes partial and names every deferred member with its reason", () => {
+    const stopped = stoppedRun(["bd-148", "bd-149"]);
+    const action = emptyAdvanceAction({
+      intent: intent({ taskIds: ["bd-148", "bd-149"], run: stopped, deferred }),
+    });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+    expect(detailOf(action)).toContain("bd-152 (external-blocker)");
+    expect(detailOf(action)).toContain("bd-153 (dependency)");
+    expect(detailOf(action)).toContain("2 member(s) need a human: bd-148, bd-149");
+  });
+
+  it("waits when capacity is what re-deferred the wave", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        deferred: [
+          { taskId: "bd-152", reason: "capacity", detail: "4/4 slots are busy" },
+          { taskId: "bd-153", reason: "capacity", detail: "4/4 slots are busy" },
+        ],
+      }),
+    });
+    // Capacity is held by another fleet and frees itself, so this must not end the run.
+    expect(action.kind).toBe("wait");
+    expect(detailOf(action)).toContain("bd-152 (capacity)");
+    expect(detailOf(action)).toContain("bd-153 (capacity)");
+    expect(detailOf(action)).toContain("capacity");
+  });
+
+  it("waits on a mixed list, because capacity can still free", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        deferred: [
+          { taskId: "bd-152", reason: "capacity", detail: "4/4 slots are busy" },
+          { taskId: "bd-153", reason: "dependency", detail: "waits for bd-152" },
+        ],
+      }),
+    });
+    expect(action.kind).toBe("wait");
+  });
+
+  it("completes a run with nothing deferred and nothing stopped", () => {
+    const action = emptyAdvanceAction({ intent: intent({ taskIds: [] }) });
+    expect(action).toMatchObject({
+      kind: "complete",
+      outcome: "complete",
+      detail: "nothing launched",
+    });
+  });
+
+  it("includes the plan's refusal text in the terminal line", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({ taskIds: [], deferred }),
+      reason: "the fleet is paused",
+    });
+    expect(action.kind).toBe("complete");
+    expect(detailOf(action)).toContain("the fleet is paused");
+  });
+
+  it("completes after a refusal, even when the deferrals name capacity", () => {
+    // A refusal means the plan will not advance at all, so capacity freed elsewhere
+    // cannot help; waiting would re-ask the same refused plan every tick.
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        deferred: [{ taskId: "bd-152", reason: "capacity", detail: "4/4 slots are busy" }],
+      }),
+      reason: "no deferred work",
+      refused: true,
+    });
+    expect(action.kind).toBe("complete");
+  });
+
+  it("tells the operator that a refused wave is still recoverable", () => {
+    // The recount race the engine reports frees itself once another fleet's slot
+    // frees, so the terminal line must not read like an unplannable wave.
+    const action = emptyAdvanceAction({
+      intent: intent({ taskIds: [], deferred }),
+      reason: "no free slot; re-run it once a slot frees",
+      refused: true,
+    });
+    const detail = detailOf(action);
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+    expect(detail).toContain("no free slot; re-run it once a slot frees");
+    expect(detail).toContain("belayd_fleet_advance or a fresh launch");
+    expect(detail.endsWith("or a fresh launch")).toBe(true);
+  });
+
+  it("keeps the recoverable clause inside the bound for a long refusal", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({ taskIds: [], deferred }),
+      reason:
+        "Fleet launch refused; nothing was launched. The orchestrator count changed while " +
+        "launching: 3 orchestrator(s) are active and this launch would start 1 more, above the " +
+        "ceiling of 3. The slots this launch planned were taken by a concurrent launch from " +
+        "another fleet; re-run it (or belayd_fleet_advance) once a slot frees.",
+      refused: true,
+    });
+    const detail = detailOf(action);
+    expect(detail.length).toBeLessThanOrEqual(400);
+    // Truncation eats the engine's tail first, never the actionable clause.
+    expect(detail.endsWith("or a fresh launch")).toBe(true);
+    expect(detail).toContain("Fleet launch refused");
+  });
+
+  it("classifies from the fresh deferrals the advance left behind", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        deferred: [{ taskId: "bd-152", reason: "dependency", detail: "stale plan" }],
+      }),
+      deferred: [{ taskId: "bd-152", reason: "capacity", detail: "4/4 slots are busy" }],
+    });
+    expect(action.kind).toBe("wait");
+  });
+
+  it("bounds a long deferred list to one audit-sized line", () => {
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        deferred: Array.from({ length: 20 }, (_, index) => ({
+          taskId: `bd-${200 + index}`,
+          reason: "dependency" as const,
+          detail: "waits for a sibling",
+        })),
+      }),
+    });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+    expect(detailOf(action).length).toBeLessThanOrEqual(400);
+    expect(detailOf(action)).toContain("+12 more");
+  });
+
+  it("keeps the deferred member names when both lists are long", () => {
+    // The durable record is the 400-char detail, so a long stop list must not eat
+    // the deferral names the bug's single audit line has to name.
+    const action = emptyAdvanceAction({
+      intent: intent({
+        taskIds: [],
+        run: stoppedRun(Array.from({ length: 20 }, (_, index) => `bd-${100 + index}`)),
+        deferred: Array.from({ length: 20 }, (_, index) => ({
+          taskId: `bd-${index}`,
+          reason: "dependency" as const,
+          detail: "waits for a sibling",
+        })),
+      }),
+      reason:
+        "the advance refused the whole wave after re-reading the dependency graph: " +
+        "every blocker of every deferred member is still open and none of them is a member " +
+        "of this fleet, so no wave can be planned until an operator closes one of those beads",
+    });
+    const detail = detailOf(action);
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+    expect(detail.length).toBeLessThanOrEqual(400);
+    expect(detail).toContain("bd-0 (dependency)");
+    expect(detail).toContain("+12 more");
+    // Cuts land on a part boundary, so no id or reason is left half-written.
+    expect(detail).toMatch(/more$|\)$/u);
+    expect((detail.match(/\(/gu) ?? []).length).toBe((detail.match(/\)/gu) ?? []).length);
+  });
+
+  it("halts a capacity wait at the idle cap instead of re-planning forever", () => {
+    // Nothing is in flight on this path, so the plan's own stall cap can never fire:
+    // the capacity wait must carry the cap itself or it loops until the process dies.
+    const capacity = [
+      { taskId: "bd-152", reason: "capacity" as const, detail: "4/4 slots are busy" },
+      { taskId: "bd-153", reason: "capacity" as const, detail: "4/4 slots are busy" },
+    ];
+    const belowCap = emptyAdvanceAction({
+      intent: intent({ taskIds: [], deferred: capacity }),
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1,
+    });
+    expect(belowCap.kind).toBe("wait");
+
+    const atCap = emptyAdvanceAction({
+      intent: intent({ taskIds: [], deferred: capacity }),
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+    });
+    expect(atCap).toMatchObject({ kind: "halt", reason: "stalled" });
+    expect(detailOf(atCap)).toContain("bd-152 (capacity)");
+    expect(detailOf(atCap)).toContain("bd-153 (capacity)");
+    expect(detailOf(atCap)).toContain(`${FLEET_RUN_MAX_IDLE_TICKS} ticks`);
+  });
+
+  it("ends a stopped-everything run on the second tick, not the 240th", () => {
+    // The observed bug: every member stopped, the deferred wave unplannable, and
+    // planFleetTick advancing on every tick until the idle cap stalled the run.
+    const stopped = stoppedRun(["bd-148", "bd-149"]);
+    const base = intent({ taskIds: ["bd-148", "bd-149"], run: stopped, deferred });
+    expect(planFleetTick({ intent: base, observations: [], now: 5_000 })).toEqual({
+      kind: "advance",
+    });
+
+    const action = emptyAdvanceAction({ intent: base });
+    expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+
+    // What the executor does with that action: finish the run, then tick it once.
+    const finished = finishFleetRun({ run: stopped, now: 5_000, outcome: "partial" });
+    const ticked = recordRunTick({ run: finished, now: 5_000, progressed: true });
+    expect(ticked.idleTicks).toBe(0);
+    expect(isFleetRunActive(ticked)).toBe(false);
+  });
+
+  it("keeps a real launch as progress and waits on the member afterwards", () => {
+    const launched = recordRunMemberLaunched({
+      run: startFleetRun({ now: 1_000, accept: true, members: [] }),
+      taskId: "bd-12",
+      launchedAt: 2_000,
+    });
+    const ticked = recordRunTick({ run: launched, now: 2_500, progressed: true });
+    expect(ticked.idleTicks).toBe(0);
+
+    const next = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: ticked }),
+      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live", 2_000)],
+      now: 3_000,
+    });
+    expect(next).toMatchObject({ kind: "wait" });
   });
 });
 

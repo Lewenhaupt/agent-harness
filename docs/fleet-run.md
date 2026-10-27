@@ -97,7 +97,10 @@ recorded (`haltedReason`), because both need a human:
   then re-arm).
 - `stalled` — `FLEET_RUN_MAX_IDLE_TICKS` ticks with no progress (240 at the 15 s
   interval). The run stops instead of spinning; the record names the members still
-  in flight.
+  in flight — or, when the wave is capacity-blocked, the members waiting for a
+  slot. An advance that launches nothing because of a `dependency` or
+  `external-blocker` — and no `capacity` entry — does not wait for this cap at
+  all: it ends the run as `partial` on that tick.
 
 A halt is terminal **for that run record**: `haltedReason` is never cleared, and
 both the ticker (`fleetTick`) and `resumeFleetRunLoop` only act on an active run
@@ -143,7 +146,7 @@ One action per tick, in this order (`src/fleet-run.ts`):
 | 1 | `land` | the first landable member whose workflow is complete (all phases done, or a completed final-phase run with no state file), including one the run stopped earlier and whose retry finished |
 | 2 | `stop` | the first member that needs a human: `awaiting-human`, `phase-failed`, `phase-interrupted`, `state-corrupt`, or `orchestrator-missing` |
 | 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached, then `halt`/`stalled` |
-| 4 | `advance` | nothing is working and the deferred list is non-empty |
+| 4 | `advance` | nothing is working and the deferred list is non-empty; an advance that launches nothing degrades to `complete`/`partial` — or to `wait` when **any** deferral names `capacity` (a mixed `capacity` + `dependency` list included), bounded by the same idle cap (then `halt`/`stalled`) |
 | 5 | `complete` | nothing is working and no deferred work remains (`partial` when something stopped) |
 
 Landing first is deliberate: it frees a capacity slot and unblocks dependents in
@@ -153,6 +156,31 @@ not retried, because the retry is exactly what started a second orchestrator on
 one worktree before the lease existed. Waiting third keeps the run alive while
 anything can still deliver work; `advance` and `complete` only run once nothing
 is working at all.
+
+**An advance that launches nothing ends the run** (`src/fleet-run.ts`
+`emptyAdvanceAction`). The executor degrades that no-launch advance into the
+action the plan would otherwise have reached, instead of re-planning the same
+worklist every tick. With `dependency` or `external-blocker` deferrals — and no
+`capacity` entry — the run completes as `partial` in that same tick, with one
+line naming the deferred members and their reasons plus the stopped members
+(`nothing launched: bd-152 (external-blocker), bd-153 (dependency) still
+deferred; 2 member(s) need a human: bd-148, bd-149`). A wave carrying **any**
+`capacity` deferral **waits** instead — a mixed `capacity` + `dependency` list
+included, because `capacity` is the one reason that frees itself: slots held by
+another fleet free themselves, so the run stays alive and launches the wave when
+a slot frees. That wait is bounded by the same `FLEET_RUN_MAX_IDLE_TICKS` stall
+cap — the plan's own cap cannot fire on this path, because no member is ever in
+flight — and halts the run as `stalled` (naming the capacity-blocked members)
+when no slot frees within it. Retrying a still-deferred wave needs an input to
+change — a member landing, a bead closing, or an explicit `belayd_fleet_advance`
+— or a fresh launch. A hard launch refusal is not a transient wait: the run
+completes (`partial` whenever anything remains deferred or stopped) with the
+refusal text and says the wave stays deferred until an explicit
+`belayd_fleet_advance` or a fresh launch (the recount race frees itself, so the
+line names a viable retry). An unreadable **or vanished** fleet intent after the
+advance halts the loop instead of classifying from the stale deferrals. A real
+launch still counts as progress: it resets `idleTicks` and reschedules the next
+tick at the 2 s action interval.
 
 A stop takes the member *out of the plan*, never out of the fleet: `taskIds` keeps
 it (its worktree, branch, and bead are still live), `run.stopped` says why it needs
