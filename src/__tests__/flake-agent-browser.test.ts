@@ -132,15 +132,26 @@ describe("bd-83: pi-web embeds pi-coding-agent >= 1.0 for agent-browser", () => 
     // intentionally version-pinned: a future pi-web bump must update flake.nix's
     // tag+rev and this test in lockstep, so a half-updated bump (new tag, stale
     // rev) fails here.
-    expect(flakeContents).toContain('version = "1.202610.6";');
-    expect(flakeContents).toContain('rev = "5b30d2ede183cfee4fd66ae9d22dab318b066c09"');
+    expect(flakeContents).toContain('version = "1.202610.8";');
+    expect(flakeContents).toContain('rev = "5ebda4decf14d759f4ee099e0ce03ddd8d64d85c"');
   });
 
-  it("no longer patches the lockfile because 1.202610.6 ships SDK 1.3.0 with integrity", () => {
+  it("leaves the transcript poll interval to upstream (bd-123)", () => {
     if (flakeContents === null) {
       throw new Error(`could not read flake.nix at ${flakePath}`);
     }
-    // pi-web 1.202610.6 resolves pi-coding-agent 1.3.0, whose nested
+    // bd-123 patched upstream's 5s selected-session poll down to 20s. Upstream
+    // v1.202610.8 polls every 30s (SELECTED_SESSION_REFRESH_MS), so the patch was
+    // dropped rather than retargeted: re-adding a substituteInPlace of this
+    // literal here would mean a later bump regressed the interval unnoticed.
+    expect(flakeContents).not.toContain('"const SELECTED_SESSION_REFRESH_MS = 5_000;"');
+  });
+
+  it("no longer patches the lockfile because 1.202610.8 ships SDK 1.3.0 with integrity", () => {
+    if (flakeContents === null) {
+      throw new Error(`could not read flake.nix at ${flakePath}`);
+    }
+    // pi-web 1.202610.8 resolves pi-coding-agent 1.3.0, whose nested
     // @earendil-works deps all carry registry integrity values, so the patch
     // that 1.202610.1 needed must not be applied (a stale reference would fail
     // the build at patch time) and the file itself should be gone.

@@ -484,38 +484,38 @@ sudo systemctl restart pi-web pi-web-sessiond
 before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
 wrapper is unaffected — it reloads extensions on every launch.)
 
-### Transcript poll interval (local patch, bd-123)
+### Transcript poll interval (upstream default, bd-123)
 
-`flake.nix` patches one upstream client constant before `npm run build`:
+No local client patch is applied any more. bd-123 used to rewrite
+`SELECTED_SESSION_REFRESH_MS` from 5 s to 20 s in the pi-web derivation; upstream
+v1.202610.8 polls every **30 s** by itself, which is gentler than the patch was,
+so the `postPatch` was deleted at the 1.202610.6 -> 1.202610.8 bump.
 
-```
-const SELECTED_SESSION_REFRESH_MS = 5_000;   ->  20_000
-```
-
-Why: the selected session is refreshed by polling
+Why the interval matters: the selected session is refreshed by polling
 `GET /api/machines/local/sessions/<id>/transcript-snapshot`, which returns the
 **whole transcript** (1.4 MB for a 270-message session) and carries no
 `ETag`/`Last-Modified`, so every tick re-transfers and re-parses it even when
-nothing changed. On a tab left open all day that is continuous CPU and
-allocation churn that grows with transcript size. Live updates arrive on the
-session socket; this poll is only a backstop. Measured on this host, one idle
-tab on the 270-message session: 11 snapshot polls / 3.5 MB per minute before,
-3 polls / 0.95 MB after (the `notifications` poll rides the same cycle, 11 -> 3).
+nothing changed. Live updates arrive on the session socket; this poll is only a
+backstop. Measured on this host before the patch, one idle tab on the
+270-message session: 11 snapshot polls / 3.5 MB per minute at 5 s; the
+`notifications` poll rides the same cycle.
 
-`substituteInPlace` uses `--replace-fail`, so an upstream rename breaks the
-build loudly instead of silently reverting to 5 s. Remove the patch once
-upstream honours conditional requests or exposes the interval as config.
+If a future bump drops the interval again, patch it here rather than in
+`node_modules`, and remove the patch once upstream exposes it as config or
+honours conditional requests.
 
 ```bash
-nix build .#pi-web --no-link --print-out-paths
-# then inspect the bundle: the constant compiles to `2e4`
-grep -o 'mK=2e4' $(nix build .#pi-web --no-link --print-out-paths)/lib/node_modules/pi-web/dist/client/assets/index-*.js
+# 30 s compiles to `3e4`; the bd-123 patch would print `=2e4` instead.
+bundle=$(nix build .#pi-web --no-link --print-out-paths)/lib/node_modules/pi-web/dist/client/assets
+if grep -o '[A-Za-z_$]\{1,4\}=3e4' $bundle/index-*.js >/dev/null && ! grep -q 'mK=2e4' $bundle/index-*.js; then
+  echo "upstream 30s interval, no local patch"
+fi
 ```
 
 ### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
-pi-web is now pinned to upstream tag v1.202610.6, whose embedded
+pi-web is now pinned to upstream tag v1.202610.8, whose embedded
 `@earendil-works/pi-coding-agent` resolves to 1.3.0 — meeting the
 `agent_browser` extension's declared Pi `>= 1.0.0` floor, so registering it is
 supported. The 1.202610.1 → 1.202610.4 bump (bd-123) carried upstream's
@@ -530,7 +530,16 @@ naming controls, a configurable session-archive directory
 v5 with scoped backends. Browser plugin API v4 and server v3 stay supported
 with a once-per-plugin deprecation diagnostic, so the in-repo `proof-of-work`
 plugin (browser `apiVersion: 4`, no server entry) needs no change; migrating it
-to v5 is follow-up work.
+to v5 is follow-up work. The 1.202610.6 → 1.202610.8 bump carries the
+configuration-defaults release (`PI_WEB_DEFAULTS_CONFIG`, environment overrides,
+source indicators in Settings), plugin media/range previews and scoped plugin
+resource URLs, git status icons, and a quiet conversation view. Two upgrade
+notes from that release are worth knowing: boolean `PI_WEB_*` environment values
+must now be `true`/`false`/`1`/`0` (an empty or other value fails startup — the
+units below set none of them), and previously ignored unknown fields in
+`pathAccess`/`uploads`/`attachments` are rejected. No data migration is needed,
+and the navigation/session-pin routes the harness uses (`session-pins`) are
+unchanged.
 
 The nix-tmp `belayd-pi-web` home-manager module adds the symlink
 (patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):

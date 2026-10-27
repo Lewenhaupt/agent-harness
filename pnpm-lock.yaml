@@ -25,8 +25,8 @@ importers:
         specifier: 2.2.0
         version: 2.2.0
       '@jmfederico/pi-web':
-        specifier: 1.202610.6
-        version: 1.202610.6(@earendil-works/pi-agent-core@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-ai@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-coding-agent@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4))
+        specifier: 1.202610.8
+        version: 1.202610.8(@earendil-works/pi-agent-core@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-ai@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-coding-agent@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4))
       '@types/node':
         specifier: ^26.1.2
         version: 26.2.0
@@ -469,6 +469,15 @@ packages:
   '@fastify/websocket@11.3.4':
     resolution: {integrity: sha512-firnJtEOv6pfdoXIzFDMbd+omgWwFNfLtdM8JejNFr/9lT/9DHkEhjTShuRFeE4phqrevD2B3JRW0v6uyzWhHQ==}
 
+  '@formatjs/fast-memoize@3.1.7':
+    resolution: {integrity: sha512-zXfhLpvA6T7+efdt9JLbBwZ00tT7NsBMDVnDu8rpHeNNv8KfRZAMo2gkG0k9lK/Nzc//3kJ9pImsfuJxk3KhUA==}
+
+  '@formatjs/icu-messageformat-parser@3.5.22':
+    resolution: {integrity: sha512-YuwN+dDKgssfuYwtOyGQD0CSn7K46g9cv1Fp0VgKpjZDDFvv8b8crzP990IcJhRPWHhKzCGsbUSJVIguyyFA5A==}
+
+  '@formatjs/icu-skeleton-parser@2.1.12':
+    resolution: {integrity: sha512-ca7tZMLpfHX3sUD7hP6gE/qr6Iq89EDd3ZLeRhbsB7r0UD55DGJq+tmFLzrGrnx5StahUevQmQQVtbDRHsfDHA==}
+
   '@google/genai@2.21.0':
     resolution: {integrity: sha512-+PDtco2/Z0ONdzCGekCoCT+O1VJS9xJQNN4XzQpXG/t3El/SWWMkCWlFRO1KmivOHPa4Q0VjUYu1HBKCZ/v33Q==}
     engines: {node: '>=20.0.0'}
@@ -478,14 +487,21 @@ packages:
       '@modelcontextprotocol/sdk':
         optional: true
 
-  '@jmfederico/pi-web@1.202610.6':
-    resolution: {integrity: sha512-l0EfpzJA9rbx0FfZ9JSCFfQQtVtPnnru/ZndMCOxUWN1OtzY1gR4c+YYkQqWQb6kgET5poGF0jzYP3GCIIu1CQ==}
+  '@jmfederico/pi-web@1.202610.8':
+    resolution: {integrity: sha512-dJeA7aToL2/8mtIeY02Z0K55Z5Mvl10mS+uUtCWlQWHjqNNkEGwINnCNr4fuS5TxsmTe2IfrBPXGm+QkhtB7iA==}
     engines: {node: '>=22.19.0'}
     hasBin: true
     peerDependencies:
-      '@earendil-works/pi-agent-core': ^1.0.0
-      '@earendil-works/pi-ai': ^1.0.0
-      '@earendil-works/pi-coding-agent': ^1.0.0
+      '@earendil-works/pi-agent-core': '*'
+      '@earendil-works/pi-ai': '*'
+      '@earendil-works/pi-coding-agent': '*'
+    peerDependenciesMeta:
+      '@earendil-works/pi-agent-core':
+        optional: true
+      '@earendil-works/pi-ai':
+        optional: true
+      '@earendil-works/pi-coding-agent':
+        optional: true
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
@@ -1081,8 +1097,14 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  import-meta-resolve@4.2.0:
+    resolution: {integrity: sha512-Iqv2fzaTQN28s/FwZAoFq0ZSs/7hMAHJVX+w8PZl3cY19Pxk6jFFalxQoIfW2826i/fDLXv8IiEZRIT0lDuWcg==}
+
   inherits@2.0.4:
     resolution: {integrity: sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==}
+
+  intl-messageformat@12.1.4:
+    resolution: {integrity: sha512-JUkmv3cAEyijN3oiRiV3ctel7yVMuUCgfh7Pu8pj1/z6L1DSEPRyhuMaLjVw3pGmGJ5RDH54WVFxfMHZWTwyHw==}
 
   ipaddr.js@2.5.0:
     resolution: {integrity: sha512-aq+t5NAc+cS6rZQQVWC2x98CPqGtKKTMDd4Gaodv0wShnItdKg/51djkGJ1hqH+Oy0ivDftCbSLCQob8zso01w==}
@@ -2230,6 +2252,14 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
+  '@formatjs/fast-memoize@3.1.7': {}
+
+  '@formatjs/icu-messageformat-parser@3.5.22':
+    dependencies:
+      '@formatjs/icu-skeleton-parser': 2.1.12
+
+  '@formatjs/icu-skeleton-parser@2.1.12': {}
+
   '@google/genai@2.21.0':
     dependencies:
       google-auth-library: 10.9.1
@@ -2241,19 +2271,17 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@jmfederico/pi-web@1.202610.6(@earendil-works/pi-agent-core@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-ai@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-coding-agent@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4))':
+  '@jmfederico/pi-web@1.202610.8(@earendil-works/pi-agent-core@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-ai@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4))(@earendil-works/pi-coding-agent@1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4))':
     dependencies:
       '@codemirror/commands': 6.11.1
       '@codemirror/lang-markdown': 6.5.2
       '@codemirror/language': 6.13.1
       '@codemirror/state': 6.7.6
       '@codemirror/view': 6.43.13
-      '@earendil-works/pi-agent-core': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4)
-      '@earendil-works/pi-ai': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4)
-      '@earendil-works/pi-coding-agent': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4)
       '@fastify/compress': 9.2.2
       '@fastify/static': 10.1.6
       '@fastify/websocket': 11.3.4
+      '@formatjs/icu-messageformat-parser': 3.5.22
       '@xterm/addon-fit': 0.11.0
       '@xterm/xterm': 6.0.0
       css-tree: 3.2.1
@@ -2261,12 +2289,18 @@ snapshots:
       fastify: 5.12.7
       highlight.js: 11.12.0
       image-size: 2.0.4
+      import-meta-resolve: 4.2.0
+      intl-messageformat: 12.1.4
       lit: 3.3.3
       marked: 18.1.1
-      node-pty: 1.1.0
       pi-web-typebox: typebox@1.3.37
       undici: 8.12.2
       ws: 8.22.0
+    optionalDependencies:
+      '@earendil-works/pi-agent-core': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4)
+      '@earendil-works/pi-ai': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.10.2)(ws@8.22.0)(zod@4.5.4)
+      '@earendil-works/pi-coding-agent': 1.0.2(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(ws@8.22.0)(zod@4.5.4)
+      node-pty: 1.1.0
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
@@ -2843,7 +2877,14 @@ snapshots:
 
   image-size@2.0.4: {}
 
+  import-meta-resolve@4.2.0: {}
+
   inherits@2.0.4: {}
+
+  intl-messageformat@12.1.4:
+    dependencies:
+      '@formatjs/fast-memoize': 3.1.7
+      '@formatjs/icu-messageformat-parser': 3.5.22
 
   ipaddr.js@2.5.0: {}
 
@@ -2977,7 +3018,8 @@ snapshots:
 
   nanoid@3.3.18: {}
 
-  node-addon-api@7.1.1: {}
+  node-addon-api@7.1.1:
+    optional: true
 
   node-domexception@1.0.0: {}
 
@@ -2992,6 +3034,7 @@ snapshots:
   node-pty@1.1.0:
     dependencies:
       node-addon-api: 7.1.1
+    optional: true
 
   on-exit-leak-free@2.1.2: {}
 
