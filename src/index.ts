@@ -587,6 +587,14 @@ export {
   readFleetStatus,
   sanitizeFleetId,
 } from "./fleet-status.js";
+export type { FleetSupervisorNameInput } from "./fleet-supervisor-name.js";
+export {
+  collectSupervisorTaskIds,
+  computeFleetSupervisorName,
+  FLEET_SUPERVISOR_NAME_MAX_LENGTH,
+  FLEET_SUPERVISOR_NAME_PREFIX,
+  supervisorRunStatus,
+} from "./fleet-supervisor-name.js";
 // Handoff packets carried into a spawned orchestrator
 export type {
   BuildHandoffInput,
@@ -892,6 +900,27 @@ export {
   resolvePiBinaryPath,
   SYSTEM_PI_BINARY,
 } from "./pi-binary.js";
+export type {
+  MutateSessionPinsResult,
+  PiWebHttpRequest,
+  PiWebHttpResponse,
+  PiWebHttpTransport,
+  SessionPinsSnapshot,
+} from "./pi-web-navigation.js";
+export {
+  matchProjectId,
+  matchWorkspaceId,
+  mutateSessionPins,
+  normalizeWorkspacePath,
+  PI_WEB_LOCAL_MACHINE_ID,
+  PI_WEB_PROJECTS_PATH,
+  parseSessionPins,
+  projectWorkspacesPath,
+  SESSION_PINS_MAX_ATTEMPTS,
+  sessionPinsPath,
+  withoutSessionPin,
+  withSessionPin,
+} from "./pi-web-navigation.js";
 export type { AwaitingHuman, Phase } from "./process-gate.js";
 export {
   ALL_PHASE_NAMES,

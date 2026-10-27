@@ -221,6 +221,8 @@ interface MockPi {
   toolCall: ToolCallHandler[];
   activeTools: () => string[];
   notifications: Array<{ message: string; level: string }>;
+  /** Every name the extension applied to this session, in order. */
+  sessionNames: string[];
 }
 
 function createMockPi(): MockPi {
@@ -230,6 +232,7 @@ function createMockPi(): MockPi {
   const agentEnd: AgentStartHandler[] = [];
   const toolCall: ToolCallHandler[] = [];
   const notifications: Array<{ message: string; level: string }> = [];
+  const sessionNames: string[] = [];
   let active: string[] = [];
   const api = {
     registerTool: (def: RegisteredTool) => {
@@ -245,6 +248,9 @@ function createMockPi(): MockPi {
     },
     sendMessage: () => {},
     appendEntry: () => {},
+    setSessionName: (name: string) => {
+      sessionNames.push(name);
+    },
     getActiveTools: () => active,
     setActiveTools: (list: string[]) => {
       active = list;
@@ -260,6 +266,7 @@ function createMockPi(): MockPi {
     toolCall,
     activeTools: () => active,
     notifications,
+    sessionNames,
   };
 }
 
@@ -1985,6 +1992,50 @@ describe("fleet run mode", () => {
     // The supervisor beat is what lets a later session tell a dead run-mode
     // supervisor from a live one (the recorded pid is the shared daemon).
     expect(existsSync(join(commonDir, "belayd", "fleet", "default", "supervisor.json"))).toBe(true);
+  });
+
+  it("names the supervisor session after the members it supervises", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-name-launch");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12", ctx);
+
+    // The supervisor is an ordinary session whose work happens in a timer, so the
+    // name is the only thing that says which beads it is driving.
+    expect(mock.sessionNames).toEqual(["Fleet supervisor: bd-12"]);
+  });
+
+  it("does not re-apply the same supervisor name on every tick", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-name-idle");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    await command.handler("bd-12", ctx);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // Each rename appends a `session_info` entry to the transcript; an idle run
+    // must not grow the session just to restate its name.
+    expect(mock.sessionNames).toEqual(["Fleet supervisor: bd-12"]);
+  });
+
+  it("keeps the supervisor name when the run is only paused", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-name-paused");
+    const command = mock.commands.get("fleet");
+    const pause = mock.tools.get("belayd_fleet_pause");
+    if (command === undefined || pause === undefined) {
+      throw new Error("/fleet and belayd_fleet_pause must be registered");
+    }
+
+    await command.handler("bd-12", ctx);
+    await pause.execute("pause-1", { reason: "stepping away" }, undefined, undefined, ctx);
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    // A pause resumes the same run, so a "(paused)" suffix would outlive the pause.
+    expect(mock.sessionNames).toEqual(["Fleet supervisor: bd-12"]);
   });
 
   it("keeps a stopped member in the fleet, and still lands it once its retry finishes", async () => {

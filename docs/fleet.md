@@ -156,6 +156,25 @@ A finished workflow therefore shows `missing-state` with
 line. A worktree with neither state nor manifests is the case the
 `no .belayd/workflow.json …` warning is for.
 
+**Which session is the supervisor.** The supervisor is an ordinary chat session
+whose run loop is a background timer, so nothing used to mark it. On launch,
+advance and re-arm it is renamed to `Fleet supervisor: bd-150, bd-151, …`, with
+the fleet id in parentheses for a non-default fleet, after the members it
+supervises — launched members first, then still-deferred ones — capped at 60
+characters (overflow becomes `+N more`). When the run ends the name keeps the
+members and gains the status (`(complete)`, `(partial)`, `(halted)`), so a
+finished supervisor still says what it drove. A pause keeps the bare name, because `belayd_fleet_resume`
+resumes the same run.
+
+In pi-web the supervisor also pins itself, so the session stays in the sidebar's
+pinned group while its members launch, land and stop. The pin is one-shot: it is
+written when a run starts from `belayd_fleet_launch`, never re-added by an advance
+or a re-arm (so a pin you removed by hand stays removed for that run), and removed
+when the run finishes. It is best-effort — no `PI_WEB_PORT` (a plain `pi` CLI run)
+or an older pi-web without the navigation API costs a `console.warn`, never the
+run — and it only pins the *root* session in its own workspace, which is why
+member orchestrators (different worktree workspaces) are not pinned.
+
 #### 3. Answer notes
 
 Members report up; you reply down. Both directions are files, drained at the

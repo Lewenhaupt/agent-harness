@@ -78,6 +78,8 @@ import type {
   OwnedWorktreeResult,
   Phase,
   PhaseCommentAuthor,
+  PiWebHttpRequest,
+  PiWebHttpResponse,
   QualityGate,
   RunDelivery,
   RunHandle,
@@ -135,6 +137,7 @@ import {
   collectHandoffDefault,
   collectReviewDiff,
   commentTimeInMs,
+  computeFleetSupervisorName,
   countReviewFindings,
   createInstructionGroupCollector,
   currentBranch,
@@ -213,10 +216,13 @@ import {
   manageInstructionGroupsWarning,
   markPhaseCompleted,
   matchOwnedWorktree,
+  matchProjectId,
   matchSessionOwnedWorktree,
+  matchWorkspaceId,
   memberSessionToken,
   metricsHostname,
   mirrorAssignee,
+  mutateSessionPins,
   NO_GROUP_REGISTERED_WARNING,
   narrowTranscriptEntries,
   ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
@@ -225,6 +231,7 @@ import {
   OUTLINE_KINDS,
   orchestratorActor,
   outlineFiles,
+  PI_WEB_PROJECTS_PATH,
   PLANNING_MODE_SYSTEM_PROMPT,
   PLANNING_TOOL_SET,
   PROOF_VERIFIER_AGENT,
@@ -239,6 +246,7 @@ import {
   phaseCommentBody,
   planFleetAdvance,
   planFleetTick,
+  projectWorkspacesPath,
   pruneLandedFleetMember,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
@@ -293,6 +301,7 @@ import {
   startFleetRun,
   stopMemberSession,
   stripBdShowComments,
+  supervisorRunStatus,
   taskIdFromBranch,
   updateFleetIntent,
   userGuideDocPath,
@@ -302,6 +311,8 @@ import {
   WORKFLOW_SUB_TYPES,
   watchRunCompletion,
   withActorArgv,
+  withoutSessionPin,
+  withSessionPin,
   workflowGateToolSet,
   writeHandoff,
   writePhaseArtifact,
@@ -608,6 +619,20 @@ type SessionState = {
   fleetRunTimer?: ReturnType<typeof setInterval>;
   /** One tick at a time: a landing tick runs the project gates for minutes. */
   fleetTickInFlight?: boolean;
+  /**
+   * The supervisor name this session last applied, so a tick that changes nothing
+   * does not append another `session_info` entry to the transcript.
+   */
+  supervisorName?: string;
+  /**
+   * The session pin this session wrote for itself as fleet supervisor.
+   *
+   * Absent when the pin already existed (the operator's own pin stays theirs) or
+   * when pinning was not attempted. Only a pin recorded here is released when the
+   * run finishes; because pinning happens only when a run starts, a pin the
+   * operator removed by hand is never re-added by a later advance or re-arm.
+   */
+  supervisorPin?: { projectId: string; workspaceId: string; sessionId: string };
   /**
    * Set while the workflow waits on a human answer (bd-152): the open `human` bd
    * gate, mirrored in memory so the tool gate can refuse synchronously.
@@ -2732,6 +2757,72 @@ export default function belaydAgentHarness(
     }
   }
 
+  /**
+   * HTTP to the pi-web *web* server (not the session daemon).
+   *
+   * Session pins live in the web server's navigation preferences, so there is no
+   * sessiond route for them. Returns undefined outside pi-web (a plain `pi` CLI run
+   * has no web server to pin into), which turns pinning into a no-op instead of an
+   * error.
+   */
+  function piWebEndpoint(): { host: string; port: string } | undefined {
+    const port = process.env.PI_WEB_PORT;
+    if (port === undefined || port === "") return undefined;
+    const configured = process.env.PI_WEB_HOST;
+    // 0.0.0.0/:: are bind addresses, not connect addresses.
+    const host =
+      configured === undefined ||
+      configured === "" ||
+      configured === "0.0.0.0" ||
+      configured === "::"
+        ? "127.0.0.1"
+        : configured;
+    return { host, port };
+  }
+
+  /** Run one request against the pi-web web server; status is data, not an error. */
+  function piWebRequest(
+    endpoint: { host: string; port: string },
+    options: PiWebHttpRequest,
+  ): Promise<PiWebHttpResponse> {
+    return new Promise((resolve, reject) => {
+      const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+      const req = request(
+        {
+          host: endpoint.host,
+          port: endpoint.port,
+          method: options.method,
+          path: options.path,
+          headers: body === undefined ? {} : { "Content-Type": "application/json" },
+          timeout: 5_000,
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (chunk: Buffer) => {
+            data += chunk.toString();
+          });
+          res.on("end", () => {
+            let parsed: unknown = data;
+            if (data !== "") {
+              try {
+                parsed = JSON.parse(data) as unknown;
+              } catch {
+                parsed = data;
+              }
+            }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("timeout", () => {
+        req.destroy(new Error(`pi-web request timed out: ${options.method} ${options.path}`));
+      });
+      req.on("error", reject);
+      if (body !== undefined) req.write(body);
+      req.end();
+    });
+  }
+
   /** Compact completed subagent sessions for a task. */
   async function compactTaskSessions(taskId: string, completedPhases: string[]): Promise<void> {
     for (const phase of completedPhases) {
@@ -4040,6 +4131,9 @@ export default function belaydAgentHarness(
     const run = mode.intent.run;
     if (run === undefined || !isFleetRunActive(run)) return;
     startFleetRunLoop({ ctx, state, mode });
+    // A restarted supervisor must look like one again; `pin: false` keeps a pin the
+    // operator removed from coming back after a daemon restart.
+    adoptFleetSupervisorIdentity({ ctx, state, pin: false });
     ctx.ui.notify(`Fleet ${mode.fleetId}: resumed the run loop for the active run.`, "info");
   }
 
@@ -7476,6 +7570,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       for (const line of outcome.lines) options.ctx.ui.notify(line, "info");
       if (outcome.stop) {
         stopFleetRunTimer(options.state);
+        // The run is over: the name keeps the members and gains the run status, so
+        // the session still says what it supervised afterwards.
+        finishFleetSupervisorIdentity({ ctx: options.ctx, state: options.state });
         return;
       }
       scheduleFleetTick({
@@ -7501,6 +7598,162 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }): void {
     stopFleetRunTimer(options.state);
     scheduleFleetTick({ ...options, delayInMs: 0 });
+  }
+
+  // ── Supervisor identity: session name + sidebar pin ────────────────
+  //
+  // A supervisor is a plain chat session whose work happens in a background timer,
+  // so nothing in the UI marks it. Two cheap signals fix that: the session name
+  // says which beads it supervises, and a pin keeps it visible in the workspace's
+  // session list while members are being launched, landed and stopped.
+
+  /** The name this fleet's supervisor session should carry right now. */
+  function supervisorNameFor(mode: FleetMode): string {
+    const status = supervisorRunStatus(mode.intent.run);
+    return computeFleetSupervisorName({
+      fleetId: mode.fleetId,
+      taskIds: mode.intent.taskIds,
+      memberTaskIds: (mode.intent.run?.members ?? []).map((member) => member.taskId),
+      deferredTaskIds: (mode.intent.deferred ?? []).map((entry) => entry.taskId),
+      ...(status === undefined ? {} : { status }),
+    });
+  }
+
+  /**
+   * Rename this session to the supervisor name, if it is not already that name.
+   *
+   * The in-extension API is used deliberately: the name is persisted in the session
+   * file (latest `session_info` entry), which is what pi-web and `pi --resume` read,
+   * so no second code path can disagree about who supervises what.
+   */
+  function applySupervisorSessionName(
+    ctx: ExtensionContext,
+    state: SessionState,
+    name: string,
+  ): void {
+    if (state.supervisorName === name) return;
+    if (ctx.sessionManager.getSessionName() === name) {
+      state.supervisorName = name;
+      return;
+    }
+    try {
+      pi.setSessionName(name);
+    } catch (error) {
+      // A rename is cosmetic: never let it break supervision.
+      console.warn(`[belayd-harness] could not rename the supervisor session: ${errorText(error)}`);
+      return;
+    }
+    state.supervisorName = name;
+    ctx.ui.notify(`This session supervises a fleet — renamed to "${name}".`, "info");
+  }
+
+  /** Project + workspace the current session is listed under in pi-web. */
+  async function supervisorPinTarget(
+    ctx: ExtensionContext,
+  ): Promise<{ projectId: string; workspaceId: string } | undefined> {
+    const endpoint = piWebEndpoint();
+    if (endpoint === undefined) return undefined;
+    const projects = await piWebRequest(endpoint, { method: "GET", path: PI_WEB_PROJECTS_PATH });
+    if (projects.status < 200 || projects.status > 299) return undefined;
+    const projectId = matchProjectId(projects.body, ctx.cwd);
+    if (projectId === undefined) return undefined;
+    const workspaces = await piWebRequest(endpoint, {
+      method: "GET",
+      path: projectWorkspacesPath(projectId),
+    });
+    if (workspaces.status < 200 || workspaces.status > 299) return undefined;
+    const workspaceId = matchWorkspaceId(workspaces.body, ctx.cwd);
+    return workspaceId === undefined ? undefined : { projectId, workspaceId };
+  }
+
+  /**
+   * Pin this session in its workspace's session list, once per supervised run.
+   *
+   * Best-effort by design: a pi-web that is unreachable, older than the navigation
+   * API, or does not list this cwd costs a log line, never the run.
+   */
+  async function pinSupervisorSession(ctx: ExtensionContext, state: SessionState): Promise<void> {
+    if (state.supervisorPin !== undefined) return;
+    const endpoint = piWebEndpoint();
+    if (endpoint === undefined) return;
+    const target = await supervisorPinTarget(ctx);
+    if (target === undefined) return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const pinned = await mutateSessionPins({
+      request: (request) => piWebRequest(endpoint, request),
+      projectId: target.projectId,
+      workspaceId: target.workspaceId,
+      update: (ids) => withSessionPin(ids, sessionId),
+    });
+    if (!pinned.ok) {
+      console.warn(`[belayd-harness] could not pin the fleet supervisor session: ${pinned.error}`);
+      return;
+    }
+    // Only a pin this session created is recorded, so completion removes exactly
+    // what the harness added. A session the operator already pinned stays theirs:
+    // `changed: false` means the entry was there before this run started.
+    if (!pinned.changed) return;
+    state.supervisorPin = { ...target, sessionId };
+    ctx.ui.notify("Pinned this session in the sidebar for the fleet run.", "info");
+  }
+
+  /** Remove the pin this session added, leaving every other pin untouched. */
+  async function releaseSupervisorPin(state: SessionState): Promise<void> {
+    const pin = state.supervisorPin;
+    if (pin === undefined) return;
+    state.supervisorPin = undefined;
+    const endpoint = piWebEndpoint();
+    if (endpoint === undefined) return;
+    const removed = await mutateSessionPins({
+      request: (request) => piWebRequest(endpoint, request),
+      projectId: pin.projectId,
+      workspaceId: pin.workspaceId,
+      update: (ids) => withoutSessionPin(ids, pin.sessionId),
+    });
+    if (!removed.ok) {
+      console.warn(
+        `[belayd-harness] could not unpin the fleet supervisor session: ${removed.error}`,
+      );
+    }
+  }
+
+  /**
+   * Become the fleet's supervisor in the UI: name always, pin when a run starts.
+   *
+   * `pin` is false for an advance/resume. A pin the operator removed by hand stays
+   * removed for the rest of that run instead of being re-added on every tick.
+   */
+  function adoptFleetSupervisorIdentity(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    pin: boolean;
+  }): void {
+    const mode = fleetModeFor(options.ctx);
+    if (mode === undefined) return;
+    applySupervisorSessionName(options.ctx, options.state, supervisorNameFor(mode));
+    if (!options.pin || options.state.supervisorPin !== undefined) return;
+    void pinSupervisorSession(options.ctx, options.state).catch((error: unknown) => {
+      console.warn(`[belayd-harness] fleet supervisor pin failed: ${errorText(error)}`);
+    });
+  }
+
+  /**
+   * Mark supervision as over: the name keeps the members plus the run status, and
+   * the pin is released (unless the run is only paused, which resumes the same run).
+   */
+  function finishFleetSupervisorIdentity(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+  }): void {
+    const mode = fleetModeFor(options.ctx);
+    if (mode !== undefined) {
+      applySupervisorSessionName(options.ctx, options.state, supervisorNameFor(mode));
+      const run = mode.intent.run;
+      if (run !== undefined && isFleetRunActive(run)) return;
+    }
+    void releaseSupervisorPin(options.state).catch((error: unknown) => {
+      console.warn(`[belayd-harness] fleet supervisor unpin failed: ${errorText(error)}`);
+    });
   }
 
   /**
@@ -7629,6 +7882,8 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   function applyFleetLaunchResult(options: {
     ctx: ExtensionContext;
     state: SessionState;
+    /** False for an advance: its run is already pinned and named. */
+    pinSupervisor: boolean;
     result: {
       ok: boolean;
       text: string;
@@ -7645,6 +7900,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
     if (options.result.armed) {
       options.state.fleetArm = { fleetId: options.result.fleetId, token: options.armToken };
+      if (options.result.ok) {
+        adoptFleetSupervisorIdentity({
+          ctx: options.ctx,
+          state: options.state,
+          pin: options.pinSupervisor,
+        });
+      }
     }
     return {
       ok: options.result.ok,
@@ -7701,7 +7963,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       }),
     );
 
-    const applied = applyFleetLaunchResult({ ctx, state, result, armToken });
+    const applied = applyFleetLaunchResult({
+      ctx,
+      state,
+      result,
+      armToken,
+      pinSupervisor: options.origin !== "advance",
+    });
     if (options.runMode !== undefined && options.origin !== "advance" && applied.ok) {
       startFleetRunAfterLaunch({
         ctx,
