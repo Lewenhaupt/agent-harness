@@ -7,6 +7,7 @@ import {
   appendMetricsEvent,
   buildGateResultEvent,
   buildPhaseAdvanceEvent,
+  buildReviewFindingsEvent,
   buildRunEndEvent,
   buildRunStartEvent,
   METRICS_DIR_ENV,
@@ -83,6 +84,7 @@ describe("appendMetricsEvent", () => {
       host: "h",
       task: "bd-1",
       phase: "implement",
+      runId: "r1",
       attempt: 1,
       passed: false,
       durationMs: 1200,
@@ -183,12 +185,89 @@ describe("event builders", () => {
       host: "h",
       task: "t",
       phase: "test",
+      runId: "r1",
       attempt: 1,
       passed: true,
       durationMs: 5,
     });
     expect(gate).not.toHaveProperty("failureKind");
     expect(JSON.stringify(gate)).not.toContain("undefined");
+  });
+
+  it("matches the bead-140 event schema for every event kind", () => {
+    const now = Date.UTC(2026, 4, 2, 10, 0);
+    const base = { now, host: "h", task: "bd-1" };
+
+    const start = buildRunStartEvent({
+      ...base,
+      phase: "implement",
+      runId: "r1",
+      workflowType: "feature",
+      model: "m",
+      session: "s",
+    });
+    expect(Object.keys(start).sort()).toEqual(
+      ["event", "host", "model", "phase", "runId", "session", "task", "ts", "workflowType"].sort(),
+    );
+
+    const gate = buildGateResultEvent({
+      ...base,
+      phase: "implement",
+      runId: "r1",
+      attempt: 1,
+      passed: true,
+      durationMs: 10,
+      failureKind: "test",
+    });
+    expect(Object.keys(gate).sort()).toEqual(
+      [
+        "attempt",
+        "durationMs",
+        "event",
+        "failureKind",
+        "host",
+        "passed",
+        "phase",
+        "runId",
+        "task",
+        "ts",
+      ].sort(),
+    );
+
+    const end = buildRunEndEvent({
+      ...base,
+      phase: "implement",
+      runId: "r1",
+      status: "completed",
+      exitCode: 0,
+      toolCalls: 1,
+      cost: 0.01,
+      tokensIn: 1,
+      tokensOut: 2,
+      tokensCacheRead: 3,
+      wallMs: 4,
+    });
+    // The bead writes tokens{in,out,cacheRead}; the flat keys are the same
+    // three numbers without a nested object DuckDB would have to unnest.
+    expect(end).toHaveProperty("tokensIn", 1);
+    expect(end).toHaveProperty("tokensOut", 2);
+    expect(end).toHaveProperty("tokensCacheRead", 3);
+    expect(end).toHaveProperty("exitCode");
+    expect(end).toHaveProperty("cost");
+    expect(end).toHaveProperty("wallMs");
+
+    const advance = buildPhaseAdvanceEvent({ ...base, phase: "implement", nextPhase: "review" });
+    expect(advance).toHaveProperty("nextPhase", "review");
+
+    const review = buildReviewFindingsEvent({
+      ...base,
+      critical: 1,
+      warnings: 2,
+      suggestions: 3,
+    });
+    expect(Object.keys(review).sort()).toEqual(
+      ["critical", "event", "host", "suggestions", "task", "ts", "warnings"].sort(),
+    );
   });
 });
 

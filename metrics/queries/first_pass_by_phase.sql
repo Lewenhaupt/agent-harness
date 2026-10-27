@@ -11,9 +11,25 @@ FROM (
     task,
     phase,
     bool_or(passed) FILTER (WHERE attempt = 1) AS first_passed
-  FROM read_json_auto(:metrics_glob:, union_by_name = true)
+  FROM read_json(
+    :metrics_glob:,
+    columns = {
+      event: 'VARCHAR',
+      task: 'VARCHAR',
+      phase: 'VARCHAR',
+      attempt: 'BIGINT',
+      passed: 'BOOLEAN'
+    },
+    format = 'newline_delimited',
+    union_by_name = true
+  )
   WHERE event = 'gate_result'
   GROUP BY task, phase
 )
 GROUP BY phase
 ORDER BY first_pass_pct ASC, phase;
+
+-- Columns are declared explicitly instead of inferred: a backfill-only host has no
+-- live file to supply `attempt`/`passed`, and read_json_auto's union_by_name would
+-- then fail to bind them. A declared column reads as NULL where a file omits the
+-- key, so the gate_result filter yields zero rows instead of a binder error.

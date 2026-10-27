@@ -175,6 +175,8 @@ import {
   formatFleetRefusal,
   formatFleetStatus,
   formatHandoffBlock,
+  formatMetricsFailures,
+  formatMetricsHeader,
   formatOutline,
   formatProcessState,
   formatReviewTask,
@@ -403,6 +405,8 @@ export interface RunQualityGateOptions {
   telemetry?: ModelTelemetryStore;
   /** Task id for the metrics log; omitted for gate checks outside a workflow. */
   taskId?: string;
+  /** Run id the gate verdict belongs to; emitted as `gate_result.runId`. */
+  runId: string;
 }
 
 // ── Metrics log (bd-140) ───────────────────────────────────────────────
@@ -436,6 +440,7 @@ function gateFailureKind(feedback: string | undefined): string | undefined {
 function recordGateAttemptMetric(options: {
   taskId: string | undefined;
   phase: string;
+  runId: string;
   attempt: number;
   passed: boolean;
   durationMs: number;
@@ -448,6 +453,7 @@ function recordGateAttemptMetric(options: {
       host: METRICS_HOST,
       task: options.taskId,
       phase: options.phase,
+      runId: options.runId,
       attempt: options.attempt,
       passed: options.passed,
       durationMs: options.durationMs,
@@ -2584,6 +2590,7 @@ export default function belaydAgentHarness(
       recordGateAttemptMetric({
         taskId: options.taskId,
         phase: phaseName,
+        runId: options.runId,
         attempt,
         passed: verdict.passed,
         durationMs: verdict.durationMs,
@@ -5324,6 +5331,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         telemetry: runTelemetrySink,
         // Emitted as gate_result; undefined outside a gate-owned workflow.
         taskId: state.currentTaskId === "" ? undefined : state.currentTaskId,
+        runId,
       }).then((gateResult) => gateResult ?? result);
 
     const handle = spawnDetachedRun({
@@ -6318,16 +6326,19 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
             });
           }),
       });
-      const failures =
-        report.failures.length === 0
-          ? ""
-          : `\n\n**Failed queries**\n${report.failures
-              .map((failure) => `- ${failure.query}: ${failure.error}`)
-              .join("\n")}`;
-      const header = `Metrics log: \`${dir}\` — ${report.queriesRun} quer${
-        report.queriesRun === 1 ? "y" : "ies"
-      }\n\n`;
-      return textToolResult(`${header}${report.markdown}${failures}`, 0);
+      const failures = formatMetricsFailures({
+        failures: report.failures,
+        requested: selected.length,
+      });
+      const header = formatMetricsHeader({
+        dir,
+        queriesRun: report.queriesRun,
+        requested: selected.length,
+      });
+      // A partial report is readable, but the outcome must not look successful:
+      // a script or downstream consumer has to be able to detect that a query
+      // failed, so the non-zero exit code carries the failure.
+      return textToolResult(`${header}${report.markdown}${failures}`, report.ok ? 0 : 1);
     },
   });
 

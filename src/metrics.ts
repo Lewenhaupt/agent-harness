@@ -58,6 +58,8 @@ export interface GateResultEvent extends MetricsEventBase {
   event: "gate_result";
   task: string;
   phase: string;
+  /** Ties a verdict to the spawn that produced the output being judged. */
+  runId: string;
   /** 1-based gate attempt; attempt 1 is the first-pass signal. */
   attempt: number;
   passed: boolean;
@@ -208,6 +210,7 @@ export interface GateResultInput {
   host: string;
   task: string;
   phase: string;
+  runId: string;
   attempt: number;
   passed: boolean;
   durationMs: number;
@@ -222,6 +225,7 @@ export function buildGateResultEvent(input: GateResultInput): GateResultEvent {
     host: input.host,
     task: input.task,
     phase: input.phase,
+    runId: input.runId,
     attempt: input.attempt,
     passed: input.passed,
     durationMs: input.durationMs,

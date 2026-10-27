@@ -38,6 +38,12 @@ export interface MetricsQueryResult {
   durationMs?: number;
 }
 
+/** One query that failed, named so a caller can say exactly which ones broke. */
+export interface MetricsQueryFailure {
+  query: string;
+  error: string;
+}
+
 /**
  * Replace the glob token with a quoted SQL string literal.
  *
@@ -141,12 +147,56 @@ export function formatMetricsResults(results: readonly MetricsQueryResult[]): st
   return results.map(formatMetricsTable).join("\n\n");
 }
 
-/** What the metrics tool returns to the model. */
-export interface MetricsReport {
-  markdown: string;
+/**
+ * Render the report header.
+ *
+ * `queriesRun` is how many queries produced a table, so on a partial failure it
+ * is smaller than what the caller asked for. The header has to say both numbers
+ * or a failed run reads like a successful short one; when nothing failed it stays
+ * the plain count so existing output does not churn.
+ */
+export function formatMetricsHeader(options: {
+  dir: string;
   queriesRun: number;
-  failures: Array<{ query: string; error: string }>;
+  requested: number;
+}): string {
+  const succeeded = `${options.queriesRun} ${options.queriesRun === 1 ? "query" : "queries"}`;
+  const count =
+    options.queriesRun === options.requested
+      ? succeeded
+      : `${options.queriesRun} of ${options.requested} queries`;
+  return `Metrics log: \`${options.dir}\` — ${count}\n\n`;
 }
+
+/**
+ * Render the failures footnote, naming exactly which queries broke and why.
+ *
+ * Kept out of the tool so the report text is a pure function of the outcome, and
+ * so a partial report never hides a failure behind a "successful" tool call.
+ */
+export function formatMetricsFailures(options: {
+  failures: readonly MetricsQueryFailure[];
+  requested: number;
+}): string {
+  if (options.failures.length === 0) return "";
+  const items = options.failures.map((failure) => `- ${failure.query}: ${failure.error}`);
+  return (
+    `\n\n**Failed queries** (${options.failures.length} of ${options.requested})` +
+    `\n${items.join("\n")}`
+  );
+}
+
+/**
+ * What the metrics tool returns to the model.
+ *
+ * `ok` is false when any requested query failed: a partial report is still
+ * useful to read, but the outcome must not look successful to a caller (the tool
+ * maps `ok` onto its exit code). The success branch carries an empty failure
+ * list so `ok` and `failures` cannot disagree.
+ */
+export type MetricsReport =
+  | { ok: true; markdown: string; queriesRun: number; failures: readonly [] }
+  | { ok: false; markdown: string; queriesRun: number; failures: readonly MetricsQueryFailure[] };
 
 /**
  * Run a set of queries through an injected DuckDB runner.
@@ -161,7 +211,7 @@ export async function runMetricsQueries(options: {
   run: (args: string[]) => Promise<{ ok: true; stdout: string } | { ok: false; error: string }>;
 }): Promise<MetricsReport> {
   const results: MetricsQueryResult[] = [];
-  const failures: Array<{ query: string; error: string }> = [];
+  const failures: MetricsQueryFailure[] = [];
   for (const query of options.queries) {
     const startedAt = Date.now();
     const outcome = await options.run(
@@ -177,11 +227,11 @@ export async function runMetricsQueries(options: {
       durationMs: Date.now() - startedAt,
     });
   }
-  return {
-    markdown: formatMetricsResults(results),
-    queriesRun: results.length,
-    failures,
-  };
+  const markdown = formatMetricsResults(results);
+  if (failures.length === 0) {
+    return { ok: true, markdown, queriesRun: results.length, failures: [] };
+  }
+  return { ok: false, markdown, queriesRun: results.length, failures };
 }
 
 /** Event names a query may filter on; used to validate the catalogue in tests. */
