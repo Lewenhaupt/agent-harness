@@ -807,7 +807,9 @@ function isUsableBelaydInvocation(args: BelaydCommandArgs): boolean {
   );
 }
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
-// Persisted to disk so cooldowns survive orchestrator restarts.
+// Persisted to disk so cooldowns survive orchestrator restarts; the file is
+// shared with other fleet members, so the capacity probe re-reads it (refresh)
+// and an unhinted quota window escalates on repeat instead of re-probing.
 // Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
 const modelCooldown = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
 // Pre-dispatch capacity signal. When a usage/reset endpoint is configured it
