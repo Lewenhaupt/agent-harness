@@ -7045,6 +7045,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
             awaitingReviewResponse: state.awaitingReviewResponse === true,
           };
     const progress = deriveFleetMemberProgress({
+      taskId: options.taskId,
       workflow,
       runs,
       now: options.now,

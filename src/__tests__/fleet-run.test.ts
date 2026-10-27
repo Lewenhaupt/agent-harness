@@ -27,6 +27,7 @@ import {
   recordRunMemberLaunched,
   recordRunMemberStopped,
   recordRunTick,
+  runsBelongingToMember,
   startFleetRun,
 } from "../fleet-run.js";
 import type { FleetIntent } from "../fleet-status.js";
@@ -34,6 +35,9 @@ import type { RunManifest } from "../run-manifest.js";
 import { RunStatus } from "../run-manifest.js";
 
 const PHASES = ["plan", "implement", "review", "test", "commit"];
+
+/** The fleet member these cases observe; run manifests of other tasks are not its evidence. */
+const MEMBER = "bd-12";
 
 function run(overrides: Partial<RunManifest> = {}): RunManifest {
   return {
@@ -64,6 +68,7 @@ function workflow(
 describe("deriveFleetMemberProgress", () => {
   it("reports a run in flight before anything the state file says", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: workflow({ completedPhaseNames: [...PHASES] }),
       runs: [run({ status: RunStatus.Running, runId: "live" })],
       now: 5_000,
@@ -73,15 +78,20 @@ describe("deriveFleetMemberProgress", () => {
 
   it("reports an interrupted run as needing a human", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: workflow(),
       runs: [run({ status: RunStatus.Interrupted })],
       now: 5_000,
+      // A launch the run cannot predate is what attributes this failure to this
+      // execution; without it the same-task manifest may be a copied older run.
+      launchedAt: 900,
     });
     expect(progress.kind).toBe("phase-interrupted");
   });
 
   it("is complete when every phase in the phase order finished", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: workflow({ completedPhaseNames: [...PHASES] }),
       runs: [],
       now: 5_000,
@@ -91,6 +101,7 @@ describe("deriveFleetMemberProgress", () => {
 
   it("is awaiting-human while a review response is pending", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: workflow({ awaitingReviewResponse: true }),
       runs: [],
       now: 5_000,
@@ -100,9 +111,11 @@ describe("deriveFleetMemberProgress", () => {
 
   it("reports a failed pending phase", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: workflow({ completedPhaseNames: ["plan", "implement"] }),
       runs: [run({ phase: "review", status: RunStatus.Failed, failureReason: "gate failed" })],
       now: 5_000,
+      launchedAt: 900,
     });
     expect(progress).toMatchObject({
       kind: "phase-failed",
@@ -112,6 +125,7 @@ describe("deriveFleetMemberProgress", () => {
 
   it("treats a missing state file plus a completed final phase as finished work", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: { kind: "missing" },
       runs: [run({ phase: "commit", status: RunStatus.Completed })],
       now: 5_000,
@@ -121,6 +135,7 @@ describe("deriveFleetMemberProgress", () => {
 
   it("reports a missing member only after the start grace", () => {
     const withinGrace = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: { kind: "missing" },
       runs: [],
       now: 1_500,
@@ -129,6 +144,7 @@ describe("deriveFleetMemberProgress", () => {
     expect(withinGrace.kind).toBe("starting");
 
     const pastGrace = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: { kind: "missing" },
       runs: [],
       now: 1_000 + FLEET_RUN_START_GRACE_MS + 1,
@@ -139,11 +155,203 @@ describe("deriveFleetMemberProgress", () => {
 
   it("reports unreadable state as corrupt, not as missing", () => {
     const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
       workflow: { kind: "corrupt" },
       runs: [],
       now: 5_000,
     });
     expect(progress.kind).toBe("state-corrupt");
+  });
+
+  // bd-161: `.belayd/` is gitignored and copied into every new worktree, so the
+  // primary checkout's failed bd-37 implement run (no failureReason) appeared in
+  // each fresh member worktree (bd-12 here) and stopped it as `phase implement
+  // failed` while it was still scouting.
+  describe("run manifests inherited from the primary checkout", () => {
+    const inherited: RunManifest = {
+      schemaVersion: 1,
+      runId: "mthosemh",
+      taskId: "bd-37",
+      phase: "implement",
+      sessionName: "belayd-bd-37-sub-implement-mthosemh",
+      status: RunStatus.Failed,
+      startedAt: 1_788_207_858_953,
+      completedAt: 1_788_208_222_826,
+      exitCode: 143,
+    };
+
+    it("ignores another task's failed run and keeps the member starting", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [inherited],
+        now: 1_000 + 1,
+        launchedAt: 1_000,
+      });
+      expect(progress.kind).toBe("starting");
+    });
+
+    it("does not revive another task's failed run after the start grace", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [inherited],
+        now: 1_000 + FLEET_RUN_START_GRACE_MS + 1,
+        launchedAt: 1_000,
+      });
+      // No own run exists yet, so the honest reading is "nothing here", never a
+      // failure borrowed from another bead.
+      expect(progress).toMatchObject({ kind: "missing" });
+    });
+
+    it("ignores another task's failed run when no launch time is known", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [inherited],
+        now: 1_788_208_222_826 + 1,
+      });
+      // This branch rests on the task id alone, so it has to be enough on its own.
+      expect(progress).toMatchObject({ kind: "missing" });
+    });
+
+    it("ignores this task's own manifest that predates the launch", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [run({ status: RunStatus.Failed, startedAt: 500, completedAt: 600 })],
+        now: 1_500,
+        launchedAt: 1_000,
+      });
+      expect(progress.kind).toBe("starting");
+    });
+
+    it("does not borrow a same-task failure when no launch time is known", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [run({ status: RunStatus.Failed, startedAt: 500, completedAt: 600 })],
+        now: 5_000,
+      });
+      // The operator ran the task in the primary checkout before fleeting it into
+      // this worktree. With no launch time the failure cannot be attributed to
+      // this execution, so the non-fatal verdict wins instead of a false stop.
+      expect(progress).toMatchObject({ kind: "missing" });
+    });
+
+    it("does not borrow a same-task interrupted run when no launch time is known", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: workflow(),
+        runs: [run({ status: RunStatus.Interrupted, startedAt: 500, completedAt: 600 })],
+        now: 5_000,
+      });
+      // An interrupted copy is the same shape as a failed one: without a launch
+      // time it may be the previous execution, so it cannot demand a human.
+      expect(progress).toMatchObject({ kind: "running" });
+    });
+
+    it("keeps a same-task run in flight even when it predates the launch", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [run({ status: RunStatus.Running, startedAt: 500 })],
+        now: 1_500,
+        launchedAt: 1_000,
+      });
+      // A live run proves an execution is happening now; dropping it would make
+      // the member `missing` and stop a healthy one as orchestrator-missing.
+      expect(progress).toMatchObject({
+        kind: "running",
+        detail: "phase run in flight: implement",
+      });
+    });
+
+    it("still reports the member's own failed run", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [run({ status: RunStatus.Failed, startedAt: 1_200 })],
+        now: 1_500,
+        launchedAt: 1_000,
+      });
+      expect(progress).toMatchObject({
+        kind: "phase-failed",
+        detail: "phase implement failed",
+      });
+    });
+
+    it("ignores another task's run that is still in flight", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: { kind: "missing" },
+        runs: [run({ taskId: "bd-37", status: RunStatus.Running, startedAt: 1_200 })],
+        now: 1_000 + FLEET_RUN_START_GRACE_MS + 1,
+        launchedAt: 1_000,
+      });
+      // The in-flight bypass is scoped to this member's own runs: another bead's
+      // live manifest would otherwise read as this worktree's execution.
+      expect(progress).toMatchObject({ kind: "missing" });
+    });
+
+    it("still reports the member's own failed pending phase next to an inherited run", () => {
+      const progress = deriveFleetMemberProgress({
+        taskId: MEMBER,
+        workflow: workflow({ completedPhaseNames: ["plan"] }),
+        runs: [inherited, run({ phase: "implement", status: RunStatus.Failed, startedAt: 1_200 })],
+        now: 1_500,
+        launchedAt: 1_000,
+      });
+      expect(progress).toMatchObject({
+        kind: "phase-failed",
+        detail: "phase implement failed",
+      });
+    });
+  });
+});
+
+describe("runsBelongingToMember", () => {
+  it("drops every manifest of another task, whatever its status", () => {
+    const foreign = [
+      run({ taskId: "bd-37", status: RunStatus.Running }),
+      run({ taskId: "bd-37", status: RunStatus.Failed }),
+      run({ taskId: "bd-37", status: RunStatus.Completed }),
+    ];
+    expect(runsBelongingToMember({ taskId: MEMBER, runs: foreign, launchedAt: 1_000 })).toEqual([]);
+  });
+
+  it("keeps a run that started exactly at the launch instant", () => {
+    const atLaunch = run({ status: RunStatus.Completed, startedAt: 1_000 });
+    // The boundary matters: the supervisor and the member read the clock
+    // independently, so equality has to count as the member's own work.
+    expect(runsBelongingToMember({ taskId: MEMBER, runs: [atLaunch], launchedAt: 1_000 })).toEqual([
+      atLaunch,
+    ]);
+  });
+
+  it("drops this task's own completed run from before the launch", () => {
+    const preLaunch = run({ status: RunStatus.Completed, startedAt: 999 });
+    // A copied final-phase completion would otherwise mark a fresh execution as
+    // finished the moment it starts.
+    expect(runsBelongingToMember({ taskId: MEMBER, runs: [preLaunch], launchedAt: 1_000 })).toEqual(
+      [],
+    );
+  });
+
+  it("keeps a pre-launch completed run when no launch time is known", () => {
+    const preLaunch = run({ status: RunStatus.Completed, startedAt: 999 });
+    // Only terminal failures need launch proof. Completion carries no stop
+    // verdict, so with no launch time it stays visible (matching the file truth).
+    expect(runsBelongingToMember({ taskId: MEMBER, runs: [preLaunch] })).toEqual([preLaunch]);
+  });
+
+  it("keeps a pre-launch failure when the caller does not require a launch", () => {
+    const preLaunch = run({ status: RunStatus.Failed, startedAt: 999 });
+    // The policy is opt-in: `fleet-status` without a run record reports files as
+    // read, and only the stop decision refuses unattributed failures.
+    expect(
+      runsBelongingToMember({ taskId: MEMBER, runs: [preLaunch], failuresRequireLaunch: false }),
+    ).toEqual([preLaunch]);
   });
 });
 
@@ -256,6 +464,31 @@ describe("planFleetTick", () => {
       now: 1_500,
     });
     expect(action.kind).toBe("wait");
+  });
+
+  it("waits on a missing member while a live lease holds its worktree", () => {
+    // Phase files are copies that can be stale or inherited (bd-161); only the
+    // lease proves an execution owns the worktree, so a wrong `missing` must not
+    // stop a healthy member.
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"] }),
+      observations: [observation("bd-12", { kind: "missing", detail: "no state" }, "live")],
+      now: 5_000,
+    });
+    expect(action.kind).toBe("wait");
+  });
+
+  it("stops a missing member once no lease holds it", () => {
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"] }),
+      observations: [observation("bd-12", { kind: "missing", detail: "no state" }, "absent")],
+      now: 5_000,
+    });
+    expect(action).toMatchObject({
+      kind: "stop",
+      taskId: "bd-12",
+      reason: "orchestrator-missing",
+    });
   });
 
   it("advances when nothing is left to land or stop and members are deferred", () => {

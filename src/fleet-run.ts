@@ -172,11 +172,20 @@ export type FleetMemberProgress =
   | { kind: "missing"; detail: string };
 
 export interface DeriveFleetMemberProgressOptions {
+  /** The member these runs must belong to; another task's manifests are not its evidence. */
+  taskId: string;
   workflow: FleetWorkflowProgressSnapshot;
   runs: readonly RunManifest[];
   /** Phase order from the workflow state; used only for the completion fallback. */
   phaseOrder?: readonly string[];
   now: number;
+  /**
+   * When the fleet launched this member.
+   *
+   * Also the only proof that a failed run belongs to this execution: re-launching
+   * the same task inherits the previous run's manifest, so without a launch time a
+   * terminal failure is not trusted (see {@link runsBelongingToMember}).
+   */
   launchedAt?: number;
   startGraceInMs?: number;
 }
@@ -199,6 +208,64 @@ function latestPerPhase(runs: readonly RunManifest[]): RunManifest[] {
   return [...byPhase.values()];
 }
 
+/** Everything needed to tell a member's own run manifests from inherited ones. */
+export interface MemberRunsOptions {
+  taskId: string;
+  runs: readonly RunManifest[];
+  /** When the fleet launched this member; absent for a member it did not launch. */
+  launchedAt?: number;
+  /**
+   * Whether a terminal failure needs a known launch time to count as evidence.
+   *
+   * The stop decision must not attribute a failure to this execution without
+   * proof, and a manifest carries no execution identity — so only a launch time
+   * the run cannot predate proves it (bd-161: a copied same-task manifest). The
+   * read-only view keeps such a failure visible while the fleet has no run
+   * record, because then no loop is deciding this worktree and `blocked` is just
+   * what the files say.
+   */
+  failuresRequireLaunch?: boolean;
+}
+
+/**
+ * Runs that are evidence about *this* member.
+ *
+ * `.belayd/` is gitignored and `.config/wt.toml` copies ignored files into a new
+ * worktree, so a fresh member inherits the primary checkout's `.belayd/runs` —
+ * including a failed run of another task (bd-161: an old bd-37 manifest made
+ * bd-150/151/152/153 look `phase implement failed` while they were still
+ * scouting). Three rules close that:
+ *
+ * - The task id, because another task's manifest is never about this member.
+ * - The launch time, because re-launching the *same* task into a fresh worktree
+ *   also inherits its own earlier manifests, and a manifest is written when its
+ *   phase starts, so every run the member created itself starts after the launch.
+ * - Never the launch time for a run still in flight: a live same-task run proves
+ *   an execution is happening now, while the launch cutoff only drops manifests
+ *   of *previous* executions. Dropping it would fall through to `missing` and
+ *   stop a healthy member as `orchestrator-missing` (the supervisor and the
+ *   member can disagree by more than the launch instant).
+ *
+ * Exported so the read-only fleet view filters identically instead of keeping a
+ * second copy that can drift from the stop decision.
+ */
+export function runsBelongingToMember(options: MemberRunsOptions): readonly RunManifest[] {
+  return options.runs.filter((run) => runBelongsToMember(run, options));
+}
+
+function runBelongsToMember(run: RunManifest, options: MemberRunsOptions): boolean {
+  if (run.taskId !== options.taskId) return false;
+  if (run.status === RunStatus.Running) return true;
+  if (options.launchedAt === undefined) {
+    // No launch time: the task id is the only evidence of ownership. A failure
+    // beyond that would let the previous execution in the primary checkout stop
+    // this one, so it only counts as evidence when the caller asked for that.
+    const terminalFailure = run.status === RunStatus.Failed || run.status === RunStatus.Interrupted;
+    return !(options.failuresRequireLaunch === true && terminalFailure);
+  }
+  return run.startedAt >= options.launchedAt;
+}
+
 /**
  * Derive a member's workflow progress from files that already exist.
  *
@@ -210,15 +277,23 @@ function latestPerPhase(runs: readonly RunManifest[]): RunManifest[] {
 export function deriveFleetMemberProgress(
   options: DeriveFleetMemberProgressOptions,
 ): FleetMemberProgress {
-  const active = progressFromActiveRuns(options.runs);
+  const runs = runsBelongingToMember({
+    runs: options.runs,
+    taskId: options.taskId,
+    ...(options.launchedAt === undefined ? {} : { launchedAt: options.launchedAt }),
+    // This derivation feeds the stop decision, so a failure no launch can be
+    // credited with must not become a `phase-failed` stop (bd-161).
+    failuresRequireLaunch: true,
+  });
+  const active = progressFromActiveRuns(runs);
   if (active !== undefined) return active;
   switch (options.workflow.kind) {
     case "corrupt":
       return { kind: "state-corrupt", detail: "unreadable .belayd/workflow.json" };
     case "ok":
-      return progressFromWorkflow(options.workflow, options.runs);
+      return progressFromWorkflow(options.workflow, runs);
     case "missing":
-      return progressFromMissingState(options);
+      return progressFromMissingState({ ...options, runs });
   }
 }
 
@@ -525,7 +600,12 @@ function stopDecision(options: {
     case "running":
       return runningMemberStop(observation, progress.detail, inGrace);
     case "missing":
-      return inGrace ? undefined : stopAction(observation, "orchestrator-missing", progress.detail);
+      // Phase files are copies that can be stale or inherited; a live lease is the
+      // one thing that proves an execution still owns this worktree, so a member
+      // that lost its state file must not be stopped while something holds it.
+      return inGrace || observation.claim === "live"
+        ? undefined
+        : stopAction(observation, "orchestrator-missing", progress.detail);
   }
 }
 

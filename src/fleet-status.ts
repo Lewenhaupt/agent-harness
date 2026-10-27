@@ -14,7 +14,12 @@
 import { basename, join } from "node:path";
 import { z } from "zod";
 import { excerptComment } from "./bead-comments.js";
-import { FleetRunSchema, formatFleetRunLine, formatFleetRunStops } from "./fleet-run.js";
+import {
+  FleetRunSchema,
+  formatFleetRunLine,
+  formatFleetRunStops,
+  runsBelongingToMember,
+} from "./fleet-run.js";
 import { FLEET_SCHEDULE_DEFERRAL_REASONS } from "./fleet-schedule.js";
 import { taskIdFromBranch } from "./handoff.js";
 import type { OrchestratorClaim } from "./orchestrator-claim.js";
@@ -387,6 +392,62 @@ function expectedTaskIdFor(snapshot: FleetMemberSnapshot): string | undefined {
   return TASK_ID_SUFFIX.exec(basename(snapshot.worktreePath))?.[1];
 }
 
+/**
+ * Task id the run loop keys this worktree by.
+ *
+ * The loop finds a member by the task id its intent launched and the branch the
+ * worktree checks out. When the branch names a fleet member, that id — not a
+ * possibly stale `workflow.json` task id — decides which manifests are its
+ * evidence, so both readers look at the same runs (bd-161).
+ */
+function runLoopTaskId(input: {
+  expectedTaskId: string | undefined;
+  workflowTaskId: string | undefined;
+  intent: FleetIntent | undefined;
+}): string | undefined {
+  const fleetTaskIds = input.intent?.taskIds ?? [];
+  if (input.expectedTaskId !== undefined && fleetTaskIds.includes(input.expectedTaskId)) {
+    return input.expectedTaskId;
+  }
+  return input.workflowTaskId ?? input.expectedTaskId;
+}
+
+/** When the run record launched this member; absent for a member it did not launch. */
+function launchedAtFor(
+  intent: FleetIntent | undefined,
+  taskId: string | undefined,
+): number | undefined {
+  if (taskId === undefined) return undefined;
+  return (intent?.run?.members ?? []).find((member) => member.taskId === taskId)?.launchedAt;
+}
+
+/**
+ * Run manifests this worktree's member owns, filtered exactly like the run loop.
+ *
+ * `.belayd/` is copied into a new worktree, so an unfiltered list reports an
+ * inherited failure as this member's (bd-161) and `belayd_fleet_status` would
+ * contradict the loop's own `starting`/`missing` verdict for the same worktree.
+ */
+function memberRuns(
+  snapshot: FleetMemberSnapshot,
+  taskId: string | undefined,
+  intent: FleetIntent | undefined,
+): readonly RunManifest[] {
+  // With no member id there is nothing to attribute runs to, so the view reports
+  // them as read rather than hiding every manifest behind a missing key.
+  if (taskId === undefined) return snapshot.runs;
+  const launchedAt = launchedAtFor(intent, taskId);
+  return runsBelongingToMember({
+    runs: snapshot.runs,
+    taskId,
+    ...(launchedAt === undefined ? {} : { launchedAt }),
+    // With a run record the loop is deciding this worktree, and it refuses a
+    // failure it cannot attribute to the launch; without one this view only
+    // reports the files it read, so a failure stays visible.
+    failuresRequireLaunch: intent?.run !== undefined,
+  });
+}
+
 function countInterrupted(runs: readonly RunManifest[]): number {
   return runs.filter((run) => run.status === RunStatus.Interrupted).length;
 }
@@ -499,10 +560,19 @@ export function deriveFleetMemberState(input: DeriveFleetMemberStateInput): Flee
   return "active";
 }
 
-function memberView(snapshot: FleetMemberSnapshot): FleetMemberView {
+function memberView(
+  snapshot: FleetMemberSnapshot,
+  intent: FleetIntent | undefined,
+): FleetMemberView {
   const expectedTaskId = expectedTaskIdFor(snapshot);
-  const interruptedRunCount = countInterrupted(snapshot.runs);
-  const runTimestamp = lastRunTimestamp(snapshot.runs);
+  const taskId = runLoopTaskId({
+    expectedTaskId,
+    workflowTaskId: snapshot.workflow.kind === "ok" ? snapshot.workflow.state.taskId : undefined,
+    intent,
+  });
+  const runs = memberRuns(snapshot, taskId, intent);
+  const interruptedRunCount = countInterrupted(runs);
+  const runTimestamp = lastRunTimestamp(runs);
 
   if (snapshot.workflow.kind !== "ok") {
     return {
@@ -516,7 +586,7 @@ function memberView(snapshot: FleetMemberSnapshot): FleetMemberView {
       completedPhases: [],
       pendingPhases: [],
       awaitingReviewResponse: false,
-      latestRuns: latestRunPerPhase(snapshot.runs, []),
+      latestRuns: latestRunPerPhase(runs, []),
       interruptedRunCount,
       updatedAt: runTimestamp,
       lease: fleetLeaseView(snapshot.lease),
@@ -542,14 +612,14 @@ function memberView(snapshot: FleetMemberSnapshot): FleetMemberView {
     completedPhases,
     pendingPhases,
     awaitingReviewResponse,
-    latestRuns: latestRunPerPhase(snapshot.runs, state.phaseOrder),
+    latestRuns: latestRunPerPhase(runs, state.phaseOrder),
     interruptedRunCount,
     updatedAt:
       runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
     lease: fleetLeaseView(snapshot.lease),
     state: deriveFleetMemberState({
       workflow: snapshot.workflow,
-      runs: snapshot.runs,
+      runs,
       completedPhases,
       pendingPhases,
       awaitingReviewResponse,
@@ -650,7 +720,7 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
     // The main checkout is the supervisor's merge target, not a fleet member,
     // unless an in-place workflow gave it workflow state.
     if (snapshot.isMainWorktree && snapshot.workflow.kind === "missing") continue;
-    members.push(memberView(snapshot));
+    members.push(memberView(snapshot, options.intent));
   }
   members.sort(compareMembers);
 

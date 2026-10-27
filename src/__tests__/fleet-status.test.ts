@@ -544,6 +544,191 @@ describe("buildFleetStatus", () => {
     expect(status.counts.active).toBe(1);
   });
 
+  it("ignores run manifests inherited from the primary checkout (bd-161)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [
+        sampleMember({
+          runs: [
+            sampleRun({
+              runId: "mthosemh",
+              taskId: "bd-37",
+              phase: "implement",
+              sessionName: "belayd-bd-37-sub-implement-mthosemh",
+              status: RunStatus.Failed,
+              startedAt: 1_100,
+            }),
+          ],
+        }),
+      ],
+    });
+
+    // The run loop reads this worktree as `starting`; the read-only view must not
+    // contradict it with another bead's failure.
+    expect(status.members[0]).toHaveProperty("state", "active");
+    expect(status.members[0]).toHaveProperty("interruptedRunCount", 0);
+    expect(status.members[0]?.latestRuns).toEqual([]);
+  });
+
+  it("ignores this member's own manifests that predate its launch", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [
+        sampleMember({
+          runs: [
+            sampleRun({ phase: "implement", status: RunStatus.Failed, startedAt: 900 }),
+            sampleRun({ phase: "test", status: RunStatus.Interrupted, startedAt: 950 }),
+          ],
+        }),
+      ],
+    });
+
+    // Same cutoff as the loop: a previous execution copied into this worktree is
+    // not a stop verdict for the new one.
+    expect(status.members[0]).toHaveProperty("state", "active");
+    expect(status.members[0]).toHaveProperty("interruptedRunCount", 0);
+    expect(status.members[0]?.latestRuns).toEqual([]);
+  });
+
+  it("does not attribute a same-task failure when the run records no launch", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [] }),
+      }),
+      members: [
+        sampleMember({
+          runs: [sampleRun({ phase: "implement", status: RunStatus.Failed, startedAt: 1_100 })],
+        }),
+      ],
+    });
+
+    // A legacy run record with no member launch cannot prove the failure is this
+    // execution's, so the view follows the loop's non-fatal reading.
+    expect(status.members[0]).toHaveProperty("state", "active");
+    expect(status.members[0]?.latestRuns).toEqual([]);
+  });
+
+  it("filters another task's interrupted run out of the interrupted count", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [
+        sampleMember({
+          runs: [
+            sampleRun({
+              taskId: "bd-37",
+              phase: "implement",
+              status: RunStatus.Interrupted,
+              startedAt: 1_100,
+            }),
+          ],
+        }),
+      ],
+    });
+
+    // `interrupted` is the one run status that reorders the whole member list, so
+    // an inherited crash must not promote this member to the top of the view.
+    expect(status.members[0]).toHaveProperty("state", "active");
+    expect(status.members[0]).toHaveProperty("interruptedRunCount", 0);
+    expect(status.counts.interrupted).toBe(0);
+  });
+
+  it("keeps a live same-task run that predates the recorded launch", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [
+        sampleMember({
+          runs: [sampleRun({ phase: "implement", status: RunStatus.Running, startedAt: 900 })],
+        }),
+      ],
+    });
+
+    // The launch cutoff drops previous executions, never an execution still
+    // running: dropping it would hide a live member from the view entirely.
+    expect(status.members[0]?.latestRuns[0]).toHaveProperty("status", RunStatus.Running);
+    expect(status.members[0]).toHaveProperty("state", "active");
+  });
+
+  it("keys the worktree by the branch's task id, not a stale workflow task id", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [
+        sampleMember({
+          // The worktree moved on to bd-12 but `.belayd/` still holds the previous
+          // occupant's state; the branch is what the loop keys the member by.
+          workflow: okWorkflow({ taskId: "bd-99" }),
+          runs: [
+            sampleRun({ taskId: "bd-12", phase: "implement", startedAt: 1_100 }),
+            sampleRun({ taskId: "bd-99", phase: "test", startedAt: 1_200, runId: "stale" }),
+          ],
+        }),
+      ],
+    });
+
+    expect(status.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["run-1"]);
+  });
+
+  it("uses the workflow task id when the branch names no fleet member", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-15"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-15" }] }),
+      }),
+      members: [
+        sampleMember({
+          branch: "feat/bd-12",
+          workflow: okWorkflow({ taskId: "bd-99" }),
+          runs: [sampleRun({ taskId: "bd-12", phase: "implement", startedAt: 1_100 })],
+        }),
+      ],
+    });
+
+    // bd-12 is not in the fleet here, so the view follows `workflow.json` — which
+    // is also what keeps it from reporting runs the loop would not own.
+    expect(status.members[0]?.latestRuns).toEqual([]);
+  });
+
+  it("reports runs as read when no task id can be derived", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: undefined,
+      members: [
+        sampleMember({
+          worktreePath: "/repo.plain",
+          branch: undefined,
+          workflow: { kind: "missing" },
+          runs: [sampleRun({ taskId: "bd-12", phase: "implement", startedAt: 1_100 })],
+        }),
+      ],
+    });
+
+    // Without a member id there is nothing to attribute the manifest to, so the
+    // view stays file-truth instead of hiding every run behind a missing key.
+    expect(status.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["run-1"]);
+  });
+
   it("distinguishes a running run from an interrupted one", () => {
     const running = buildFleetStatus({
       fleetId: "fleet-1",
