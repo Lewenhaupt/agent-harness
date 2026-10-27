@@ -376,6 +376,8 @@ import {
 } from "../src/session-naming.js";
 import type { SpawnAttempt } from "../src/spawn-with-fallback.js";
 import {
+  archiveWorkflowState,
+  classifyWorkflowClaimability,
   clearCallerHandoff,
   clearHandedOffMarker,
   clearWorkflowState,
@@ -4057,24 +4059,57 @@ export default function belaydAgentHarness(
     // A handed-off workflow belongs to the child orchestrator. Re-arming this
     // session's gate would put two orchestrators on the same bead again — the
     // exact failure bd-120 fixes — so the marker wins over the phase ledger.
-    if (persisted.handedOffTo !== undefined) {
-      settleHandoffPendingItems({ state, cwd, marker: persisted.handedOffTo });
+    const marker = persisted.handedOffTo;
+    if (marker !== undefined) {
+      settleHandoffPendingItems({ state, cwd, marker });
+      // bd-165: a handed-off workflow is terminal, so leaving its state file
+      // behind makes every later session in this worktree look like an
+      // orchestrator for a bead that is already closed. Archive it (never
+      // delete — the record must stay diagnosable) after settling the caller's
+      // leftovers, which need the marker this file carries.
+      //
+      // No same-directory-child exemption is needed here: `persistHandoffMarkers`
+      // writes `handedOffTo` only onto the caller's own cross-worktree state and
+      // skips `saveHandedOffMarker` when the child shares this directory, so a
+      // live child's workflow.json never carries this marker at all.
+      archiveInertWorkflow(cwd, persisted.taskId);
       return;
     }
 
-    if (!isValidTaskId(persisted.taskId)) {
-      // A crafted/corrupt workflow.json must not reach the `bd show ${taskId}` shell sink.
-      clearWorkflowState({ cwd });
-      return;
-    }
-
-    // A stale workflow.json that already finished must not resurrect the gate.
-    if (isWorkflowComplete(persisted.completedPhaseNames, persisted.phaseOrder)) {
-      clearWorkflowState({ cwd });
+    // A valid record that this session cannot drive (every phase done, or a task
+    // id that cannot name a bead) must not resurrect the gate, and its file is
+    // the poison bd-165 removes. Corrupt JSON never reaches here: the reader
+    // returns undefined for it.
+    if (classifyWorkflowClaimability(persisted).kind === "inert") {
+      archiveInertWorkflow(cwd, persisted.taskId);
       return;
     }
 
     armFromPersistedWorkflow(state, cwd, persisted);
+  }
+
+  /**
+   * Archive a persisted workflow this session will not drive (bd-165).
+   *
+   * Renaming keeps the dead record diagnosable while freeing the worktree, so
+   * the next session neither claims a lease from it nor re-arms its gate.
+   */
+  function archiveInertWorkflow(cwd: string, taskId: string): void {
+    const archived = archiveWorkflowState({ cwd });
+    if (!archived.ok) {
+      console.warn(
+        `[belayd-harness] could not archive the stale workflow state in ${cwd}: ${archived.error}`,
+      );
+      return;
+    }
+    // A no-op means the file is already gone, so there is nothing to report.
+    if (!archived.archived) return;
+    // Name the archive path so the operator can find the diagnosis record
+    // without listing `.belayd/`. This runs once per inert file: the rename
+    // removes the source, so a later session cannot log it again.
+    console.warn(
+      `[belayd-harness] archived the inert workflow state for ${taskId} at ${archived.archivedPath}`,
+    );
   }
 
   pi.on("session_start", (_event, ctx) => {
@@ -4121,7 +4156,15 @@ export default function belaydAgentHarness(
     });
     const persistedForClaim =
       handedOffHere === undefined ? readWorkflowState({ cwd: ctx.cwd }) : undefined;
-    if (persistedForClaim !== undefined && isValidTaskId(persistedForClaim.taskId)) {
+    // bd-165: only a workflow this session can still drive may produce a lease.
+    // A completed or handed-off state names a dead task, and a lease claimed
+    // from it is renewed for the whole life of this session, locking every
+    // later session out of the worktree. `resumeWorkflowFromDisk` archives it
+    // instead.
+    if (
+      persistedForClaim !== undefined &&
+      classifyWorkflowClaimability(persistedForClaim).kind === "claimable"
+    ) {
       const branch =
         persistedForClaim.branch === "" ? (currentBranch(ctx.cwd) ?? "") : persistedForClaim.branch;
       const owned = claimWorktreeOrchestrator({

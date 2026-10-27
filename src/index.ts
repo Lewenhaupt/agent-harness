@@ -1198,18 +1198,23 @@ export {
   WORKFLOW_SUB_TYPES,
 } from "./workflow-registry.js";
 export type {
+  ArchiveWorkflowStateOptions,
+  ArchiveWorkflowStateResult,
   CallerHandoffOptions,
   HandedOffMarker,
   SaveHandedOffMarkerOptions,
   SavePhaseSessionOptions,
   SaveReviewedShaOptions,
   SaveReviewedShaResult,
+  WorkflowClaimability,
   WorkflowFs,
   WorkflowState,
   WriteCallerHandoffOptions,
 } from "./workflow-state.js";
 export {
+  archiveWorkflowState,
   callerHandoffFilePath,
+  classifyWorkflowClaimability,
   clearCallerHandoff,
   clearHandedOffMarker,
   clearWorkflowState,
@@ -1220,6 +1225,7 @@ export {
   saveHandedOffMarker,
   savePhaseSession,
   saveReviewedSha,
+  WORKFLOW_STATE_ARCHIVE_PREFIX,
   workflowStateDir,
   workflowStateFilePath,
   writeCallerHandoff,
