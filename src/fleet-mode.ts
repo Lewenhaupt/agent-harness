@@ -361,25 +361,64 @@ export interface ResolveFleetModeOptions extends FleetLookupOptions {
 }
 
 /**
+ * Fleet ids in scan order: the fleet this session armed first, then the rest.
+ *
+ * Directory order alone would let a stale sibling (a fleet this session supervised
+ * earlier) win the scan, which made the live run loop bail every tick with "no
+ * longer the live supervisor" (bd-169).
+ */
+function preferredFleetScanOrder(
+  fleetIds: readonly string[],
+  armedFleetId: string | undefined,
+): readonly string[] {
+  if (armedFleetId === undefined) return fleetIds;
+  return [
+    ...fleetIds.filter((fleetId) => sanitizeFleetId(fleetId) === armedFleetId),
+    ...fleetIds.filter((fleetId) => sanitizeFleetId(fleetId) !== armedFleetId),
+  ];
+}
+
+/**
+ * The arm token this session may present for one fleet.
+ *
+ * The token is minted per arming and scoped to the fleet it armed, so naming another
+ * fleet id never borrows it (W6).
+ */
+function armTokenForFleet(options: {
+  armToken: { fleetId: string; token: string } | undefined;
+  fleetId: string;
+}): string | undefined {
+  if (options.armToken === undefined) return undefined;
+  return sanitizeFleetId(options.armToken.fleetId) === sanitizeFleetId(options.fleetId)
+    ? options.armToken.token
+    : undefined;
+}
+
+/**
  * The fleet this session supervises, or undefined.
  *
  * Scans every fleet directory (sorted) so a repository can hold more than one
  * fleet; the id also comes from the directory name, so a record whose `fleetId`
  * disagrees with its directory cannot hijack another fleet's mailbox.
+ *
+ * The fleet this session minted a token for is scanned **first**. Only one record can
+ * hold the token that matches, so the order is a belt for the cases where more than
+ * one record could match (a copied record, a legacy record without anchors): a
+ * session that supervised two fleets (wave1, then wave2) must never resolve to the
+ * stale one because its directory sorts earlier. The token requirement itself is
+ * untouched (W6).
  */
 export function resolveFleetMode(options: ResolveFleetModeOptions): FleetMode | undefined {
-  for (const fleetId of listFleetIds(options)) {
+  const armedFleetId =
+    options.armToken === undefined ? undefined : sanitizeFleetId(options.armToken.fleetId);
+  for (const fleetId of preferredFleetScanOrder(listFleetIds(options), armedFleetId)) {
     const loaded = readFleetIntent({
       gitCommonDir: options.gitCommonDir,
       fleetId,
       ...(options.fs === undefined ? {} : { fs: options.fs }),
     });
     if (!loaded.ok || loaded.intent === undefined) continue;
-    const armToken =
-      options.armToken !== undefined &&
-      sanitizeFleetId(options.armToken.fleetId) === sanitizeFleetId(fleetId)
-        ? options.armToken.token
-        : undefined;
+    const armToken = armTokenForFleet({ armToken: options.armToken, fleetId });
     const matches = matchesFleetSupervisor({
       supervisor: loaded.intent.supervisor,
       sessionId: options.sessionId,

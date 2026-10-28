@@ -7,6 +7,8 @@
  * contract as `node:fs`.
  */
 
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -25,6 +27,7 @@ import {
   FLEET_AUDIT_ACTION_MAX_LENGTH,
   FLEET_AUDIT_ACTOR_MAX_LENGTH,
   FLEET_AUDIT_DETAIL_MAX_LENGTH,
+  FLEET_AUDIT_TAIL_BYTES,
   FLEET_AUDIT_TASK_ID_MAX_LENGTH,
   FLEET_AUDIT_TASK_IDS_MAX,
   FLEET_MERGE_ENTRY_STATES,
@@ -51,6 +54,7 @@ import {
   pruneLandedFleetMember,
   readFleetIntent,
   readFleetMergeQueue,
+  readRecentFleetAuditEntries,
   retireFleetDeferral,
   updateFleetIntent,
   updateFleetMergeQueue,
@@ -739,6 +743,159 @@ describe("audit.log", () => {
 
     const record = JSON.parse(fs.files.get(fleetAuditLogPath(commonDir, "../evil")) ?? "{}");
     expect(record.fleetId).toBe(".._evil");
+  });
+
+  it("reads recent entries from the tail, filtered by window and action", () => {
+    const fs = createFakeFs();
+    for (const [timestamp, action] of [
+      [900, "supervisor-readopt-refused"],
+      [1_500, "merge"],
+      [2_000, "supervisor-readopt-refused"],
+    ] as const) {
+      appendFleetAuditEntry({
+        gitCommonDir: commonDir,
+        fleetId,
+        entry: entry({ timestamp, action }),
+        fs,
+      });
+    }
+
+    const recent = readRecentFleetAuditEntries({
+      gitCommonDir: commonDir,
+      fleetId,
+      since: 1_000,
+      action: "supervisor-readopt-refused",
+      fs,
+    });
+
+    expect(recent.map((record) => record.timestamp)).toEqual([2_000]);
+    // Without an action filter the window decides.
+    expect(
+      readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 1_000, fs }).map(
+        (record) => record.action,
+      ),
+    ).toEqual(["merge", "supervisor-readopt-refused"]);
+  });
+
+  it("tolerates a torn or missing log instead of failing the read", () => {
+    const fs = createFakeFs({
+      [path]: `${formatAuditEntry(entry({ timestamp: 9_000 }))}\n{"timestamp": 1,"action":"torn"\n`,
+    });
+    expect(
+      readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0, fs }),
+    ).toHaveLength(1);
+    expect(
+      readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId: "absent", since: 0, fs }),
+    ).toEqual([]);
+  });
+
+  it("uses the bounded tail read when the seam offers one", () => {
+    const fs = createFakeFs({ [path]: "ignored\n" });
+    let requested: { path: string; bytes: number } | undefined;
+    fs.readTailSync = (tailPath, bytes) => {
+      requested = { path: tailPath, bytes };
+      return `${formatAuditEntry(entry({ timestamp: 5_000, action: "supervisor-readopt-refused" }))}\n`;
+    };
+
+    const recent = readRecentFleetAuditEntries({
+      gitCommonDir: commonDir,
+      fleetId,
+      since: 0,
+      action: "supervisor-readopt-refused",
+      fs,
+    });
+
+    expect(requested).toEqual({ path, bytes: FLEET_AUDIT_TAIL_BYTES });
+    expect(recent).toHaveLength(1);
+  });
+});
+
+/**
+ * The fake fs above has no `readTailSync`, so the bounded tail read was only ever
+ * exercised through injected seams. These tests run the production reader (no `fs`
+ * option) against a real temp file, covering the node seam itself: the short-tail
+ * case, the tail boundary of a log longer than the limit, and descriptor hygiene.
+ */
+describe("audit.log tail read (real node seam)", () => {
+  const procFdDir = "/proc/self/fd";
+
+  function tempCommonDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), "belayd-audit-tail-"));
+    mkdirSync(dirname(fleetAuditLogPath(dir, fleetId)), { recursive: true });
+    return dir;
+  }
+
+  function writeLog(dir: string, content: string): void {
+    writeFileSync(fleetAuditLogPath(dir, fleetId), content);
+  }
+
+  function line(overrides: Partial<Parameters<typeof formatAuditEntry>[0]> = {}): string {
+    return formatAuditEntry({
+      timestamp: 1_000,
+      fleetId,
+      actor: "session-1",
+      action: "dispatch",
+      taskIds: ["bd-12"],
+      detail: "launched bd-12",
+      ...overrides,
+    });
+  }
+
+  it("reads a log shorter than the tail limit", () => {
+    const dir = tempCommonDir();
+    try {
+      writeLog(
+        dir,
+        `${line({ action: "early" })}\n${line({ timestamp: 2_000, action: "supervisor-readopt-refused" })}\n`,
+      );
+
+      const recent = readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 });
+
+      expect(recent.map((record) => record.action)).toEqual([
+        "early",
+        "supervisor-readopt-refused",
+      ]);
+      expect(recent.map((record) => record.detail)).not.toContain("\u0000");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads only the tail of a log longer than the limit", () => {
+    const dir = tempCommonDir();
+    try {
+      // The early entry sits outside the window even for `since: 0`, so its absence
+      // proves the read started at the tail rather than at the head.
+      writeLog(
+        dir,
+        `${line({ action: "outside-the-tail" })}\n${"x".repeat(FLEET_AUDIT_TAIL_BYTES + 1_024)}\n` +
+          `${line({ timestamp: 2_000, action: "supervisor-readopt-refused" })}\n`,
+      );
+
+      const recent = readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 });
+
+      expect(recent.map((record) => record.action)).toEqual(["supervisor-readopt-refused"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!existsSync(procFdDir))("closes the tail descriptor after each read", () => {
+    const dir = tempCommonDir();
+    try {
+      writeLog(dir, `${line()}\n`);
+      const before = readdirSync(procFdDir).length;
+
+      for (let index = 0; index < 32; index += 1) {
+        expect(readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 })).toHaveLength(
+          1,
+        );
+      }
+
+      expect(readdirSync(procFdDir).length).toBe(before);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

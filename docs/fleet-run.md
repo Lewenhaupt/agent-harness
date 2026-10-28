@@ -141,6 +141,76 @@ supervisor holds this fleet") and nothing would tick. The beat only applies to
 fleets that have a run record, so an explicit (`--manual`) fleet keeps the old
 pid rule and an upgrade cannot steal it.
 
+**A restarted supervisor re-adopts its own run automatically (bd-169).** The run
+loop's authority includes an arm token that lives only in the arming process's
+memory, so a session/daemon restart ends the loop; before this repair it ended it
+permanently and silently (wave2 ran three beads to completion and sat unlanded for
+nine hours). On `session_start` the extension now sweeps every fleet id and
+re-adopts a fleet when *all three* hold:
+
+- the fleet's run record names **this** session (`supervisor.sessionId`);
+- the run is still **active** (no `finishedAt`, no `haltedReason`);
+- the beat is **cold** (older than 10 minutes, names another session, or is
+  missing) — the same documented re-arm rule, applied automatically.
+
+Adoption mints a fresh arm token, rewrites the supervisor record and the beat,
+starts the tick loop, notifies, and appends `supervisor-readopted` to `audit.log`.
+The write re-checks the anchors it read (run still active, record still names this
+session, and the recorded pid, process start time and arm token are **exactly**
+unchanged — a field present on one side and absent on the other counts as changed),
+so an operator who re-armed the fleet in between keeps it: the adoption refuses,
+says so with the recovery command, audits `supervisor-readopt-failed`, and the skip
+notices for the other candidates are only written after a successful adoption. The
+arm token is never persisted outside the record it belongs to (W6), so the
+heuristic anchors are the session id, the cold beat, and an existing active run.
+
+Residual risk, stated not hidden: a session id is public, so a record planted by
+another writer that names this session and carries an active run makes this
+session adopt on its next start. Because the token cannot be persisted to close
+that, adoption is loud and audited, and requires a cold beat on an existing run.
+
+**One fleet per session.** A session that has supervised two fleets (wave1, then
+wave2) re-adopts exactly one: the newest `run.updatedAt`, tie-broken by fleet id.
+Every other candidate is reported with its own
+`/fleet <ids> --fleet <id>` recovery command, and `resolveFleetMode` prefers the
+fleet this session holds a token for over directory order, so the stale sibling
+can never make the live loop bail.
+
+**A dead loop is reported, not silently healthy.** Nothing ends the timer silently
+any more: a tick that loses authority (another session re-armed), finds the fleet
+record gone, or cannot read it notifies with the fleet id and the exact recovery
+command (`/fleet <ids> --fleet <id>`, or `belayd_fleet_advance` while the run is
+still active), writes `supervisor-lost` / `supervisor-intent-lost` to `audit.log`,
+and logs to the console. The same stop inside an advance's mid-flight re-read is
+reported identically. An active run whose record names **no** usable supervisor is
+reported by the next session that starts (any session, since no session is named) —
+but only when the loop is provably dead: no beat at all, or a beat older than the
+10-minute window. A **fresh** beat means some session is ticking that run, the
+record just does not say which, so that case stays quiet and `belayd_fleet_status`
+remains the surface. The leaderless report is a wedge alarm, not a per-start pulse:
+it is written at most once per fleet per beat-stale window (deduped against the
+fleet's own `audit.log`), and the anchor is the **last report**, not the beat's
+age: a wedge that disappears (someone beats it once) and reappears inside that
+window stays suppressed, so `belayd_fleet_status` is the surface until the window
+lapses. A fleet with no run record stays quiet, because an
+explicit `--manual` fleet is legitimately leaderless.
+
+Where that report lands is bounded by who returns: it reaches the session the
+record names on its next `session_start`, and when that session never comes back,
+the operator still sees the run as **not ticking** — `belayd_fleet_status` keeps the
+run-not-ticking warning (bd-166) as the after-the-fact backstop, and no fleet with
+a dead or missing supervisor is ever presented as healthy. It is not a push alert
+to a human who never opens the status view. The stop deliberately does **not**
+write a `haltedReason` onto the run: another session may have re-armed, and marking
+that record halted would kill its loop. A finished or halted run stays quiet — the
+tick that produced it already recorded and announced the terminal result.
+
+`belayd_fleet_advance` restarts a timer that is missing while its run is active
+(`fleet-run-restarted`), so the natural "looks dead, poke it" call revives the
+loop. A paused fleet's loop comes back through `belayd_fleet_resume`, which resumes
+the run and restarts the loop with `resumeFleetRunLoop`; resuming a fleet that is
+already running is a successful no-op and does not touch its timer.
+
 ## How the tick decides
 
 One action per tick, in this order (`src/fleet-run.ts`):
@@ -378,8 +448,11 @@ for a human instead of silently relaunched.
 ## Operational limits
 
 - **The ticker lives in the supervisor session.** It stops if that session or the
-  daemon exits; the run record is durable, and a re-arm resumes it. Members are
-  sessions in the same daemon, so nothing outlives the daemon anyway.
+  daemon exits; the run record is durable. A restarted supervisor re-adopts its
+  own active run automatically when the record names it and the beat is cold
+  (bd-169), and a session that cannot re-adopt says so instead of going quiet —
+  with the `/fleet <ids> --fleet <id>` recovery command. Members are sessions in
+  the same daemon, so nothing outlives the daemon anyway.
 - **One landing per tick.** A tick that lands runs the project gates for minutes; a
   second tick is skipped while one is in flight (`fleetTickInFlight`). Three
   finished members land on three ticks.

@@ -98,6 +98,15 @@ export interface FleetStateFs extends WorkflowFs {
   statSync(path: string): { size: number; mtimeMs?: number };
   /** Remove an empty directory: the merge lock's `mkdir` primitive, released. */
   rmdirSync(path: string): void;
+  /**
+   * The last `bytes` of one file, for the append-only audit log.
+   *
+   * Optional so every existing seam keeps working (the reader then falls back to a
+   * whole-file read, which is correct but unbounded); the node seam and any
+   * production seam read only the tail, so a long-lived fleet's audit log costs a
+   * bounded read per session start.
+   */
+  readTailSync?(path: string, bytes: number): string;
 }
 
 const nodeFsSeam: FleetStateFs = {
@@ -116,6 +125,29 @@ const nodeFsSeam: FleetStateFs = {
   unlinkSync: (path) => nodeFs.unlinkSync(path),
   readdirSync: (path) => nodeFs.readdirSync(path),
   rmdirSync: (path) => nodeFs.rmdirSync(path),
+  readTailSync: (path, bytes) => {
+    const fd = nodeFs.openSync(path, "r");
+    try {
+      const size = nodeFs.fstatSync(fd).size;
+      const length = Math.min(bytes, size);
+      const buffer = Buffer.alloc(length);
+      // One `readSync` may satisfy fewer bytes than requested (a signal-interrupted
+      // read, or a file that shrank under us). Decoding a partially filled buffer
+      // would turn the unfilled remainder into NUL padding, so keep reading until the
+      // window is full or the file ends, then decode only the bytes actually read.
+      let filled = 0;
+      let offset = size - length;
+      while (filled < length) {
+        const read = nodeFs.readSync(fd, buffer, filled, length - filled, offset);
+        if (read === 0) break;
+        filled += read;
+        offset += read;
+      }
+      return buffer.subarray(0, filled).toString("utf8");
+    } finally {
+      nodeFs.closeSync(fd);
+    }
+  },
 };
 
 function errorMessage(error: unknown): string {
@@ -647,6 +679,82 @@ export function appendFleetAuditEntry(
   } catch (error) {
     return { ok: false, error: errorMessage(error) };
   }
+}
+
+/**
+ * Bytes of `audit.log` read from the tail for a "did we already say this?" check.
+ *
+ * An audit line is at most a few hundred bytes (every field is bounded by the
+ * constants above), so 64 KiB holds hundreds of recent entries — far more than a
+ * cooldown needs — while keeping a long-lived fleet's log off the read path.
+ */
+export const FLEET_AUDIT_TAIL_BYTES = 64 * 1024;
+
+/** One parsed audit line, or undefined when the line is not an entry. */
+function parseAuditLine(raw: string): FleetAuditEntry | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // A tail read starts mid-line, and a torn append can end mid-line: neither is
+    // an entry, and neither is a reason to fail a diagnostic read.
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  const { timestamp, fleetId: entryFleetId, actor, action, taskIds, detail } = parsed;
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return undefined;
+  if (typeof action !== "string" || typeof detail !== "string") return undefined;
+  return {
+    timestamp,
+    fleetId: typeof entryFleetId === "string" ? entryFleetId : "",
+    actor: typeof actor === "string" ? actor : "",
+    action,
+    taskIds: Array.isArray(taskIds)
+      ? taskIds.filter((taskId): taskId is string => typeof taskId === "string")
+      : [],
+    detail,
+  };
+}
+
+export interface RecentFleetAuditOptions extends FleetIntentOptions {
+  /** Only entries with `timestamp >= since` are returned. */
+  since: number;
+  /** Restrict to one action; absent means any action. */
+  action?: string;
+}
+
+/**
+ * Recent audit entries, read from a bounded tail of `audit.log`.
+ *
+ * Exists so a caller can ask "was this already reported recently?" (the leaderless
+ * wedge alarm, bd-169) without turning the append-only log into a per-start cost.
+ * Only the last {@link FLEET_AUDIT_TAIL_BYTES} are read and every unparsable line is
+ * skipped, so a truncated first line or a torn append is harmless. A missing or
+ * unreadable log is **no entries**: this is a dedup signal, never authority, and it
+ * must not be able to break a session start.
+ */
+export function readRecentFleetAuditEntries(
+  options: RecentFleetAuditOptions,
+): readonly FleetAuditEntry[] {
+  const fs = options.fs ?? nodeFsSeam;
+  const path = fleetAuditLogPath(options.gitCommonDir, options.fleetId);
+  let raw: string;
+  try {
+    if (!fs.existsSync(path)) return [];
+    raw = fs.readTailSync?.(path, FLEET_AUDIT_TAIL_BYTES) ?? fs.readFileSync(path);
+  } catch {
+    return [];
+  }
+  const entries: FleetAuditEntry[] = [];
+  for (const line of raw.split("\n")) {
+    if (line === "") continue;
+    const entry = parseAuditLine(line);
+    if (entry === undefined) continue;
+    if (entry.timestamp < options.since) continue;
+    if (options.action !== undefined && entry.action !== options.action) continue;
+    entries.push(entry);
+  }
+  return entries;
 }
 
 // ── Mailbox (inbox/ and events/) ──────────────────────────────────────

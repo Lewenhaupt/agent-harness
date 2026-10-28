@@ -25,8 +25,15 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import type { FleetSupervisorState } from "./fleet-mode.js";
+import type {
+  FleetSupervisorLiveness,
+  FleetSupervisorRecord,
+  FleetSupervisorState,
+} from "./fleet-mode.js";
+import { classifyFleetSupervisor } from "./fleet-mode.js";
+import { isFleetRunActive } from "./fleet-run.js";
 import type { FleetStateFs } from "./fleet-state.js";
+import type { FleetIntent } from "./fleet-status.js";
 import { fleetStateDir } from "./fleet-status.js";
 
 /** File name inside the fleet directory. */
@@ -125,6 +132,27 @@ export function writeSupervisorHeartbeat(options: {
 }
 
 /**
+ * Whether a run-mode loop is provably not ticking, judged by beat recency alone.
+ *
+ * The recorded supervisor id is deliberately not consulted: this is the question a
+ * **leaderless** record (no usable supervisor, or an empty session id) asks, where
+ * nobody is named and only recency can distinguish "some session is beating this
+ * run" from "nobody is ticking it". A fresh beat is therefore *not* provably dead,
+ * even though it names a session the record does not — reporting it as dead would
+ * call a healthy fleet unticked. `belayd_fleet_status` remains the surface for that
+ * case.
+ */
+export function isFleetLoopProvablyDead(options: {
+  beat: SupervisorHeartbeat | undefined;
+  now: number;
+  staleAfterInMs?: number;
+}): boolean {
+  if (options.beat === undefined) return true;
+  const staleAfter = options.staleAfterInMs ?? FLEET_SUPERVISOR_HEARTBEAT_STALE_MS;
+  return options.now - options.beat.heartbeatAt >= staleAfter;
+}
+
+/**
  * Whether a beat proves the recorded supervisor is still alive.
  *
  * Three outcomes, and the difference matters:
@@ -150,8 +178,13 @@ export function classifySupervisorBeat(options: {
   const beat = options.beat;
   if (beat === undefined) return "dead";
   if (beat.sessionId !== options.supervisorSessionId) return "dead";
-  const staleAfter = options.staleAfterInMs ?? FLEET_SUPERVISOR_HEARTBEAT_STALE_MS;
-  return options.now - beat.heartbeatAt < staleAfter ? "live" : "dead";
+  return isFleetLoopProvablyDead({
+    beat,
+    now: options.now,
+    ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
+  })
+    ? "dead"
+    : "live";
 }
 
 /**
@@ -179,4 +212,90 @@ export function effectiveSupervisorState(options: {
   return verdict === "live"
     ? { kind: "live", sessionId: options.state.sessionId }
     : { kind: "dead", sessionId: options.state.sessionId };
+}
+
+/** Why a fleet that names this session is still not re-adopted. */
+export type SupervisorReadoptionRefusal =
+  | "no-active-run"
+  | "no-supervisor-record"
+  | "other-session"
+  | "beat-live";
+
+/** What proved the dead loop may be re-adopted. */
+export type SupervisorReadoptionReason = "cold-beat" | "missing-beat" | "pid-dead";
+
+/** The readoption decision for one fleet, as seen by a starting session. */
+export type SupervisorReadoptionPlan =
+  | { adopt: false; reason: SupervisorReadoptionRefusal }
+  | {
+      adopt: true;
+      reason: SupervisorReadoptionReason;
+      /**
+       * The supervisor record the decision was based on.
+       *
+       * Returned so the writer can compare-and-swap against exactly what it saw
+       * (bd-169): the adopt arm is the only one where a usable record exists, so the
+       * type — not a runtime branch — carries that invariant.
+       */
+      supervisor: FleetSupervisorRecord;
+    };
+
+/**
+ * Whether a starting session may take over the run of a fleet its record names.
+ *
+ * The run loop's authority normally includes the arm token, which lives only in
+ * the arming process's memory (W6): a restart therefore loses the loop for good,
+ * silently, until an operator types `/fleet <ids> --fleet <id>`. This decision is
+ * the automatic repair, and it is deliberately weaker than the token so it can
+ * never *invent* authority:
+ *
+ * - the record must name this session (`sessionId`), so no session adopts a
+ *   fleet belonging to another one;
+ * - the intent must carry an **active** run, so only work that was supposed to be
+ *   ticking is revived — a finished or halted run stays finished;
+ * - the beat, not the recorded pid, must say the loop is gone
+ *   ({@link classifySupervisorBeat}). That is already the documented re-arm rule
+ *   for run-mode fleets, applied automatically instead of by hand.
+ *
+ * Residual risk, stated rather than hidden: the session id is public, so a record
+ * planted by another writer that names this session and carries an active run
+ * makes this session adopt on its next start. Persisting the arm token to close
+ * that hole would defeat W6 (a planted record could then copy it), so instead the
+ * adoption is *loud* (notify + audit) and needs a cold beat on an existing run:
+ * a forged record cannot keep a live loop's beat fresh, and the audited
+ * `supervisor-readopted` entry preserves the previous supervisor's identity.
+ */
+export function planSupervisorReadoption(options: {
+  intent: FleetIntent;
+  /** The session that is starting now. */
+  sessionId: string;
+  beat: SupervisorHeartbeat | undefined;
+  now: number;
+  staleAfterInMs?: number;
+  /** Process probe for the missing-beat case; no probe keeps the beat verdict. */
+  liveness?: FleetSupervisorLiveness;
+}): SupervisorReadoptionPlan {
+  if (!isFleetRunActive(options.intent.run)) return { adopt: false, reason: "no-active-run" };
+  const supervisor = options.intent.supervisor;
+  if (supervisor === undefined) return { adopt: false, reason: "no-supervisor-record" };
+  // An empty session id names no session, so it can never be this one.
+  if (options.sessionId === "" || supervisor.sessionId !== options.sessionId) {
+    return { adopt: false, reason: "other-session" };
+  }
+  const verdict = classifySupervisorBeat({
+    runMode: true,
+    supervisorSessionId: supervisor.sessionId,
+    beat: options.beat,
+    now: options.now,
+    ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
+  });
+  if (verdict === "live") return { adopt: false, reason: "beat-live" };
+  if (options.beat !== undefined) return { adopt: true, reason: "cold-beat", supervisor };
+  // No beat at all: either the loop never wrote one or the beat file is gone. A
+  // provably dead supervisor process is the stronger evidence, so name it; without
+  // a probe the absence is still the documented dead-loop signal (`classifySupervisorBeat`).
+  const deadProcess =
+    options.liveness !== undefined &&
+    classifyFleetSupervisor({ supervisor, liveness: options.liveness }).kind === "dead";
+  return { adopt: true, reason: deadProcess ? "pid-dead" : "missing-beat", supervisor };
 }

@@ -72,6 +72,7 @@ import type {
   FleetProcessScan,
   FleetRun,
   FleetStatus,
+  FleetSupervisorLiveness,
   FleetTickAction,
   FleetWorkflowProgressSnapshot,
   HandedOffMarker,
@@ -92,6 +93,9 @@ import type {
   SpawnResult,
   StackNode,
   SubagentSessionRef,
+  SupervisorHeartbeat,
+  SupervisorReadoptionReason,
+  SupervisorReadoptionRefusal,
   TranscriptEntry,
   WorkflowResolution,
   WorkflowResolutionSource,
@@ -147,6 +151,7 @@ import {
   computeFleetSupervisorName,
   countReviewFindings,
   createFleetOrderingGates,
+  createFleetSupervisorRecord,
   createInstructionGroupCollector,
   currentBranch,
   DEFAULT_AGENTS,
@@ -170,6 +175,7 @@ import {
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
   FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_TICK_INTERVAL_MS,
+  FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
   findWorkspaceRoot,
   finishFleetRun,
   fleetBeadTaskIds,
@@ -202,6 +208,7 @@ import {
   isArchifyDiagramType,
   isArchifyQuality,
   isArchifyToolCommand,
+  isFleetLoopProvablyDead,
   isFleetNoteKind,
   isFleetRefusedTool,
   isFleetRunActive,
@@ -266,6 +273,7 @@ import {
   planFleetTick,
   planGateNotices,
   planOutsideFleetLandings,
+  planSupervisorReadoption,
   projectWorkspacesPath,
   pruneLandedFleetMember,
   RESEARCHER_SYSTEM_PROMPT,
@@ -278,6 +286,7 @@ import {
   readHandoffFileArg,
   readOrchestratorClaim,
   readProcessStartTime,
+  readRecentFleetAuditEntries,
   readStackNode,
   readSupervisorHeartbeat,
   readWorktreeBranch,
@@ -4202,8 +4211,18 @@ export default function belaydAgentHarness(
     // The open human gate (bd-152) is the durable "waiting on a human" state: a
     // restart mid-wait re-discovers it here and re-arms the poll.
     discoverHumanAnswerWait({ ctx, state });
-    resumeFleetRunLoop(ctx, state);
+    // Two ways a restarted session re-establishes its run loop, and they must stay
+    // separate: `resumeFleetRunLoop` is the strict same-process case (the arm token
+    // is still in memory), `readoptFleetRuns` repairs a loop whose process died and
+    // is loud either way (bd-169).
+    const resumed = resumeFleetRunLoop(ctx, state);
+    readoptFleetRuns({ ctx, state, resumed });
   });
+
+  /** What one session_start's strict resume managed to do. */
+  type FleetResumeOutcome =
+    | { resumed: true; fleetId: string }
+    | { resumed: false; reason: "no-fleet-mode" | "no-active-run" };
 
   /**
    * Restart the run loop if this session still holds the fleet it supervises.
@@ -4211,18 +4230,506 @@ export default function belaydAgentHarness(
    * Authority is the in-memory arm token, so this only succeeds for a session that
    * reloaded in the same process. After a restart the operator re-arms with
    * `/fleet <ids> --fleet <id>`, which starts the loop again from the persisted run
-   * record.
+   * record; a session whose *own* record still names it is repaired automatically by
+   * {@link readoptFleetRuns}, which must be loud where this function can only
+   * decline (bd-169).
    */
-  function resumeFleetRunLoop(ctx: ExtensionContext, state: SessionState): void {
+  function resumeFleetRunLoop(ctx: ExtensionContext, state: SessionState): FleetResumeOutcome {
     const mode = fleetModeFor(ctx);
-    if (mode === undefined) return;
+    if (mode === undefined) return { resumed: false, reason: "no-fleet-mode" };
     const run = mode.intent.run;
-    if (run === undefined || !isFleetRunActive(run)) return;
+    if (run === undefined || !isFleetRunActive(run)) {
+      return { resumed: false, reason: "no-active-run" };
+    }
     startFleetRunLoop({ ctx, state, mode });
     // A restarted supervisor must look like one again; `pin: false` keeps a pin the
     // operator removed from coming back after a daemon restart.
     adoptFleetSupervisorIdentity({ ctx, state, pin: false });
     ctx.ui.notify(`Fleet ${mode.fleetId}: resumed the run loop for the active run.`, "info");
+    return { resumed: true, fleetId: mode.fleetId };
+  }
+
+  /** One fleet this starting session may re-adopt. */
+  interface FleetReadoptionCandidate {
+    mode: FleetMode;
+    /** What proved the old loop is gone (`cold-beat` / `missing-beat` / `pid-dead`). */
+    reason: SupervisorReadoptionReason;
+    /** The supervisor record the plan decided on, for the compare-and-swap. */
+    supervisor: NonNullable<FleetIntent["supervisor"]>;
+    beat: SupervisorHeartbeat | undefined;
+    now: number;
+  }
+
+  /** A candidate fleet plus the id it lives under (named once, not three times). */
+  interface FleetReadoptionEntry {
+    fleetId: string;
+    candidate: FleetReadoptionCandidate;
+  }
+
+  /** What the per-fleet scan decided for one fleet id. */
+  type FleetReadoptionScan =
+    | { kind: "candidate"; entry: FleetReadoptionEntry }
+    | { kind: "skip" }
+    | {
+        kind: "refused";
+        fleetId: string;
+        intent: FleetIntent;
+        reason: SupervisorReadoptionRefusal;
+        beat: SupervisorHeartbeat | undefined;
+      };
+
+  /**
+   * Re-adopt the active run of a fleet whose supervisor session restarted (bd-169).
+   *
+   * The wave2 failure: the run loop's authority is an in-memory arm token plus the
+   * arming process's identity, so a session/daemon restart ended the loop
+   * permanently and silently — nothing landed, nothing warned, and
+   * `belayd_fleet_status` still called the run active. This sweep applies the
+   * documented re-arm rule ("the heartbeat, not the recorded pid, decides")
+   * automatically, once per starting session:
+   *
+   * - per fleet **id** (never via `resolveFleetMode`, whose multi-fleet scan could
+   *   pick the stale sibling), read the intent and the beat and ask
+   *   {@link planSupervisorReadoption};
+   * - a fleet the strict same-process resume already restarted is left alone;
+   * - a session supervises **one** fleet, so at most one candidate is adopted (the
+   *   newest run) and every other one is reported with its own recovery command;
+   * - any decision that concerns this session is said out loud: silence is what made
+   *   the original bug cost nine hours.
+   */
+  function readoptFleetRuns(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    /** What the strict same-process resume already handled. */
+    resumed: FleetResumeOutcome;
+  }): void {
+    const common = gitCommonDirFor(options.ctx.cwd);
+    if (!common.ok) return;
+    const gitCommonDir = common.gitCommonDir;
+    const sessionId = options.ctx.sessionManager.getSessionId();
+    const now = Date.now();
+    const pidStartTime = readProcessStartTime(process.pid);
+    const candidates = collectReadoptionCandidates({
+      ctx: options.ctx,
+      gitCommonDir,
+      sessionId,
+      now,
+      resumedFleetId: options.resumed.resumed ? options.resumed.fleetId : undefined,
+      liveness: {
+        isPidAlive: isProcessAlive,
+        ...(pidStartTime === undefined ? {} : { pidStartTime: readProcessStartTime }),
+      },
+    });
+    const newest = pickNewestReadoption(candidates);
+    if (newest === undefined) return;
+    const adopted = adoptFleetRun({
+      ctx: options.ctx,
+      state: options.state,
+      gitCommonDir,
+      sessionId,
+      pidStartTime,
+      adoption: newest,
+    });
+    // Only report the other candidates once the write landed: a failed adoption
+    // (another session re-armed, the run finished, the CAS lost) has already been
+    // reported loudly, and a skip notice claiming "this session re-adopted `<id>`"
+    // would then be false (bd-169 review W3).
+    if (!adopted.adopted) return;
+    reportUnadoptedReadoptions({ ctx: options.ctx, gitCommonDir, chosen: newest, candidates });
+  }
+
+  /**
+   * Sweep every fleet id once, reporting each refusal this session cares about.
+   *
+   * Explicitly per fleet id: `resolveFleetMode` answers "which fleet is mine", which
+   * is the wrong question for a sweep that must look at all of them (bd-169).
+   */
+  function collectReadoptionCandidates(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    sessionId: string;
+    now: number;
+    resumedFleetId: string | undefined;
+    liveness: FleetSupervisorLiveness;
+  }): FleetReadoptionEntry[] {
+    const candidates: FleetReadoptionEntry[] = [];
+    for (const directoryId of listFleetIds({ gitCommonDir: options.gitCommonDir })) {
+      const fleetId = sanitizeFleetId(directoryId);
+      const scan = scanFleetReadoption({
+        gitCommonDir: options.gitCommonDir,
+        fleetId,
+        resumedFleetId: options.resumedFleetId,
+        sessionId: options.sessionId,
+        now: options.now,
+        liveness: options.liveness,
+      });
+      if (scan.kind === "candidate") {
+        candidates.push(scan.entry);
+        continue;
+      }
+      if (scan.kind === "refused") {
+        warnSkippedReadoption({
+          ctx: options.ctx,
+          gitCommonDir: options.gitCommonDir,
+          fleetId: scan.fleetId,
+          intent: scan.intent,
+          reason: scan.reason,
+          beat: scan.beat,
+          now: options.now,
+        });
+      }
+    }
+    return candidates;
+  }
+
+  /** One fleet's readoption decision, without any side effect. */
+  function scanFleetReadoption(options: {
+    gitCommonDir: string;
+    fleetId: string;
+    /** Fleet the strict same-process resume already restarted; undefined when none. */
+    resumedFleetId: string | undefined;
+    sessionId: string;
+    now: number;
+    liveness: FleetSupervisorLiveness;
+  }): FleetReadoptionScan {
+    // The strict path already owns this fleet: rewriting its record would invalidate
+    // the live loop's own anchors. A fleet whose timer is gone is a different case
+    // and is evaluated below, so a stale arm token cannot hide a dead loop.
+    if (options.resumedFleetId === options.fleetId) return { kind: "skip" };
+    const loaded = readFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) return { kind: "skip" };
+    const beat = readSupervisorHeartbeat({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    const plan = planSupervisorReadoption({
+      intent: loaded.intent,
+      sessionId: options.sessionId,
+      beat,
+      now: options.now,
+      liveness: options.liveness,
+    });
+    if (!plan.adopt) {
+      return {
+        kind: "refused",
+        fleetId: options.fleetId,
+        intent: loaded.intent,
+        reason: plan.reason,
+        beat,
+      };
+    }
+    const mode = fleetModeForId({ gitCommonDir: options.gitCommonDir, fleetId: options.fleetId });
+    if (mode === undefined) return { kind: "skip" };
+    return {
+      kind: "candidate",
+      entry: {
+        fleetId: options.fleetId,
+        candidate: {
+          mode,
+          reason: plan.reason,
+          supervisor: plan.supervisor,
+          beat,
+          now: options.now,
+        },
+      },
+    };
+  }
+
+  /** The candidate to adopt when several fleets name this session: newest run wins. */
+  function pickNewestReadoption(
+    candidates: readonly FleetReadoptionEntry[],
+  ): FleetReadoptionEntry | undefined {
+    return [...candidates].sort((left, right) => {
+      const leftAt = left.candidate.mode.intent.run?.updatedAt ?? 0;
+      const rightAt = right.candidate.mode.intent.run?.updatedAt ?? 0;
+      if (rightAt !== leftAt) return rightAt - leftAt;
+      return left.fleetId < right.fleetId ? -1 : left.fleetId > right.fleetId ? 1 : 0;
+    })[0];
+  }
+
+  /** Name every fleet this session could have adopted but did not (bd-169). */
+  function reportUnadoptedReadoptions(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    chosen: FleetReadoptionEntry;
+    candidates: readonly FleetReadoptionEntry[];
+  }): void {
+    for (const other of options.candidates) {
+      if (other.fleetId === options.chosen.fleetId) continue;
+      const line =
+        `Fleet ${other.fleetId}: not re-adopted — this session supervises one fleet, and ` +
+        `\`${options.chosen.fleetId}\` holds the newer active run. If its run should continue, ` +
+        `re-arm it from another session with \`/fleet ` +
+        `${other.candidate.mode.intent.taskIds.join(" ")} --fleet ${other.fleetId}\`.`;
+      options.ctx.ui.notify(line, "warning");
+      console.warn(`[belayd-harness] ${line}`);
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.gitCommonDir,
+        fleetId: other.fleetId,
+        action: "supervisor-readopt-skipped",
+        taskIds: other.candidate.mode.intent.taskIds,
+        detail: `this session re-adopted \`${options.chosen.fleetId}\` instead (one fleet per session)`,
+      });
+    }
+  }
+
+  /**
+   * Report an active run that **no session can be expected to pick up** (bd-169).
+   *
+   * Only a leaderless record qualifies (no supervisor, or an empty session id): a
+   * record that names a real session is either that session's own — where a dead loop
+   * is *adopted*, not refused, so a refusal means a live beat — or another session's
+   * business. Reporting either as "nothing is ticking it" would be false.
+   */
+  function warnSkippedReadoption(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    fleetId: string;
+    intent: FleetIntent;
+    reason: SupervisorReadoptionRefusal;
+    beat: SupervisorHeartbeat | undefined;
+    now: number;
+  }): void {
+    // A finished or halted run is a terminal state the tick already announced and
+    // recorded (`fleet-run-complete` / `fleet-run-halted`); re-warning on every
+    // session start would be noise, not information. An explicit `--manual` fleet has
+    // no run record at all, so it stays legitimately leaderless and quiet.
+    if (options.reason === "no-active-run") return;
+    const recordedSessionId = options.intent.supervisor?.sessionId ?? "";
+    if (recordedSessionId !== "") return;
+    // Recency is the only signal a leaderless record has: a fresh beat proves some
+    // session *is* ticking the run, the record just does not say which. Reporting that
+    // as dead would call a healthy fleet unticked (bd-169 W1); status is the surface.
+    if (!isFleetLoopProvablyDead({ beat: options.beat, now: options.now })) return;
+    // A wedge alarm, not a per-start pulse (bd-169 W2): every session start would
+    // otherwise re-notify and re-audit for as long as the record stays leaderless. The
+    // fleet's own append-only audit log is the durable dedup store — no new file, no
+    // global state — and the window is the beat-stale constant because that is how
+    // long a "dead loop" verdict is allowed to stay true. The status warning (bd-166)
+    // still covers the silent case, so a suppressed repeat hides nothing.
+    if (leaderlessReportedRecently(options)) return;
+    const beatAge =
+      options.beat === undefined
+        ? "no heartbeat"
+        : `beat ${options.now - options.beat.heartbeatAt} ms old`;
+    // The refusal alone does not say what the record looks like: a missing record and a
+    // record whose session id is empty both refuse as "leaderless", but only the first
+    // can be repaired by writing a supervisor. Carry that distinction into the audit so
+    // a reader can tell them apart.
+    const recordState =
+      options.intent.supervisor === undefined
+        ? "no supervisor record"
+        : "supervisor record carries an empty session id";
+    const line =
+      `Fleet ${options.fleetId}: the active run has no usable supervisor record ` +
+      `(${options.reason}; ${beatAge}), so nothing is ticking it. Recover with ` +
+      `\`/fleet ${options.intent.taskIds.join(" ")} --fleet ${options.fleetId}\`.`;
+    options.ctx.ui.notify(line, "warning");
+    console.warn(`[belayd-harness] ${line}`);
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      action: "supervisor-readopt-refused",
+      taskIds: options.intent.taskIds,
+      detail: `${options.reason}; ${beatAge}; ${recordState}`,
+    });
+  }
+
+  /** Whether this fleet already had a leaderless report inside the cooldown window. */
+  function leaderlessReportedRecently(options: {
+    gitCommonDir: string;
+    fleetId: string;
+    now: number;
+  }): boolean {
+    return (
+      readRecentFleetAuditEntries({
+        gitCommonDir: options.gitCommonDir,
+        fleetId: options.fleetId,
+        since: options.now - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
+        action: "supervisor-readopt-refused",
+      }).length > 0
+    );
+  }
+
+  /**
+   * The anchors that authorised the adoption, re-checked under the compare-and-swap.
+   *
+   * The sweep decided from a snapshot; between that read and this write an operator
+   * may have re-armed the fleet from another session — a legitimate
+   * `/fleet <ids> --fleet <id>`. Overwriting that fresh record with a token minted
+   * here would leave a live supervisor whose next tick dies with "no longer the live
+   * supervisor", so the run must still be active, the record must still name this
+   * session, and the supervisor identity the scan saw must be unchanged.
+   *
+   * `expected` is required because only the plan's adopt arm (which carries the record
+   * it decided on) reaches here: the type states that invariant instead of a runtime
+   * branch that could mask a future caller's mistake.
+   */
+  function readoptionWriteRefusal(options: {
+    intent: FleetIntent;
+    expected: NonNullable<FleetIntent["supervisor"]>;
+    sessionId: string;
+  }): string | undefined {
+    if (!isFleetRunActive(options.intent.run)) {
+      return `the run of \`${options.intent.fleetId}\` is no longer active`;
+    }
+    const current = options.intent.supervisor;
+    if (current === undefined || current.sessionId !== options.sessionId) {
+      return (
+        "another session re-armed the fleet (the supervisor record now names " +
+        `\`${current?.sessionId ?? "nobody"}\`)`
+      );
+    }
+    return readoptionIdentityDrift({ expected: options.expected, current });
+  }
+
+  /**
+   * Which supervisor identity field changed between the sweep's read and the write.
+   *
+   * Every comparison is exact, including a field absent on both sides: an arming
+   * writes `pidStartTime` and `armToken` when it has them, so a record that *gains*
+   * one has been re-armed even though the field the scan saw was `undefined`. Skipping
+   * the check for an absent expected value would let exactly that re-arm through.
+   */
+  function readoptionIdentityDrift(options: {
+    expected: NonNullable<FleetIntent["supervisor"]>;
+    current: NonNullable<FleetIntent["supervisor"]>;
+  }): string | undefined {
+    if (options.current.pid !== options.expected.pid) {
+      return `the recorded supervisor pid changed (${options.expected.pid} -> ${options.current.pid})`;
+    }
+    if (options.current.pidStartTime !== options.expected.pidStartTime) {
+      return "the recorded supervisor process start time changed";
+    }
+    if (options.current.armToken !== options.expected.armToken) {
+      return "the recorded arm token changed (another arming wrote this fleet)";
+    }
+    return undefined;
+  }
+
+  /** Outcome of an adoption attempt: skips are only reported when this succeeded. */
+  type FleetReadoptionResult = { adopted: true; intent: FleetIntent } | { adopted: false };
+
+  /**
+   * Take over one fleet's active run: rewrite the supervisor record with a fresh arm
+   * token, then start the loop (bd-169).
+   *
+   * The token is minted here and kept in memory only (W6): persisting it would let a
+   * planted record impersonate a supervisor. The re-check inside the mutation makes
+   * the write refuse a run that finished — or a fleet another session re-armed —
+   * between the sweep's read and this update, and a refusal is reported with the
+   * recovery command rather than returning quietly (review W2/W3).
+   */
+  function adoptFleetRun(options: {
+    ctx: ExtensionContext;
+    state: SessionState;
+    gitCommonDir: string;
+    sessionId: string;
+    pidStartTime: string | undefined;
+    adoption: FleetReadoptionEntry;
+  }): FleetReadoptionResult {
+    const { ctx, state, adoption } = options;
+    const fleetId = adoption.fleetId;
+    const armToken = randomUUID();
+    const written = mutateFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId,
+      mutate: (intent) => {
+        const refusal = readoptionWriteRefusal({
+          intent,
+          expected: adoption.candidate.supervisor,
+          sessionId: options.sessionId,
+        });
+        if (refusal !== undefined) return { refuse: refusal };
+        return {
+          ...intent,
+          supervisor: createFleetSupervisorRecord({
+            sessionId: options.sessionId,
+            pid: process.pid,
+            ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
+            armToken,
+          }),
+          updatedAt: adoption.candidate.now,
+        };
+      },
+    });
+    if (!written.ok) {
+      warnReadoptionFailed({
+        ctx,
+        gitCommonDir: options.gitCommonDir,
+        entry: adoption,
+        error: written.error,
+      });
+      return { adopted: false };
+    }
+    state.fleetArm = { fleetId, token: armToken };
+    const beat = writeSupervisorHeartbeat({
+      gitCommonDir: options.gitCommonDir,
+      fleetId,
+      sessionId: options.sessionId,
+      pid: process.pid,
+      now: adoption.candidate.now,
+    });
+    if (!beat.ok) {
+      ctx.ui.notify(
+        `Fleet ${fleetId}: could not write the supervisor heartbeat: ${beat.error}`,
+        "warning",
+      );
+    }
+    startFleetRunLoop({ ctx, state, mode: adoption.candidate.mode });
+    adoptFleetSupervisorIdentity({ ctx, state, pin: false });
+    // The audit describes the record that was actually written, not the scan
+    // snapshot: a CAS retry can move the tick count (review S1).
+    const adoptedIntent = written.intent;
+    const previousBeat =
+      adoption.candidate.beat === undefined
+        ? "no previous heartbeat"
+        : `previous heartbeat ${adoption.candidate.now - adoption.candidate.beat.heartbeatAt} ms old`;
+    auditFleetAction({
+      ctx,
+      gitCommonDir: options.gitCommonDir,
+      fleetId,
+      action: "supervisor-readopted",
+      taskIds: adoptedIntent.taskIds,
+      detail:
+        `${adoption.candidate.reason}; ${previousBeat}; ` +
+        `run at tick ${adoptedIntent.run?.ticks ?? 0}`,
+    });
+    ctx.ui.notify(
+      `Fleet ${fleetId}: re-adopted the active run after a restart (${adoption.candidate.reason}); ` +
+        "the loop is ticking again.",
+      "info",
+    );
+    return { adopted: true, intent: adoptedIntent };
+  }
+
+  /** Say that an adoption write was refused and the run is still unticked (bd-169). */
+  function warnReadoptionFailed(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    entry: FleetReadoptionEntry;
+    error: string;
+  }): void {
+    const taskIds = options.entry.candidate.mode.intent.taskIds;
+    const line =
+      `Fleet ${options.entry.fleetId}: could not re-adopt the active run ` +
+      `(${options.error}), so nothing is ticking it. Recover with \`/fleet ` +
+      `${taskIds.join(" ")} --fleet ${options.entry.fleetId}\`.`;
+    options.ctx.ui.notify(line, "warning");
+    console.warn(`[belayd-harness] ${line}`);
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.entry.fleetId,
+      action: "supervisor-readopt-failed",
+      taskIds,
+      detail: options.error,
+    });
   }
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -7192,12 +7699,18 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
   }
 
-  /** One compare-and-replace intent update, with a single retry on a lost race. */
+  /**
+   * One compare-and-replace intent update, with a single retry on a lost race.
+   *
+   * Returns the record that was written, so a caller whose audit entry describes the
+   * result (the readoption sweep, bd-169) reports the post-CAS values rather than the
+   * snapshot it decided from.
+   */
   function mutateFleetIntent(options: {
     gitCommonDir: string;
     fleetId: string;
     mutate: (intent: FleetIntent) => FleetIntent | { refuse: string };
-  }): { ok: true } | { ok: false; error: string } {
+  }): { ok: true; intent: FleetIntent } | { ok: false; error: string } {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const result = updateFleetIntent({
         gitCommonDir: options.gitCommonDir,
@@ -7207,7 +7720,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
             ? { refuse: `no fleet intent for \`${options.fleetId}\`` }
             : options.mutate(current),
       });
-      if (result.ok) return { ok: true };
+      if (result.ok) return { ok: true, intent: result.intent };
       if (result.reason !== "conflict") return { ok: false, error: result.error };
     }
     return { ok: false, error: "the fleet intent changed twice while updating it" };
@@ -7633,13 +8146,17 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     return { ok: accepted.ok, text: accepted.text };
   }
 
-  /** Apply one tick action, returning the next run record and what to report. */
+  /** Why a tick ended the run loop, so the caller can tell terminal from lost. */
+  type FleetTickStopReason = "terminal" | "authority-lost" | "intent-lost";
+
   /** What one executed action produced, plus whether the loop must stop. */
   interface FleetTickOutcome {
     run: FleetRun;
     lines: readonly string[];
     stop: boolean;
     acted: boolean;
+    /** Set when this action stopped the loop for a non-terminal reason (bd-169). */
+    stopReason?: FleetTickStopReason;
   }
 
   interface FleetTickContext {
@@ -7855,6 +8372,46 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }
 
   /**
+   * The advance's stop when the record it must re-read is gone or unreadable.
+   *
+   * A lost record, not a halt: it gets the tick's own loud treatment (bd-169) — audit
+   * + console + a recovery command — and a `stopReason` so the caller reports it as a
+   * warning instead of an info line. Extracted so `emptyAdvanceOutcome` stays a plan
+   * mapper rather than a second stop reporter.
+   */
+  function emptyAdvanceLostRecordOutcome(options: {
+    context: FleetTickContext;
+    lines: readonly string[];
+    lost: { kind: "gone" } | { kind: "unreadable"; error: string };
+  }): FleetTickOutcome {
+    const { mode } = options.context;
+    const recovery = `\`/fleet ${mode.intent.taskIds.join(" ")} --fleet ${mode.fleetId}\``;
+    const line = reportIntentLost({
+      ctx: options.context.ctx,
+      mode,
+      fleetId: mode.fleetId,
+      detail:
+        options.lost.kind === "gone"
+          ? "fleet.json vanished while the advance re-planned it"
+          : `fleet.json could not be read: ${options.lost.error}`,
+      line:
+        options.lost.kind === "gone"
+          ? `Fleet ${mode.fleetId}: run loop stopped — the fleet intent for \`${mode.fleetId}\` is ` +
+            `gone, so nothing can advance this run. Re-arm with ${recovery}.`
+          : `Fleet ${mode.fleetId}: run loop stopped — could not re-read the fleet intent ` +
+            `(${options.lost.error}), so nothing is ticking this run. Recover the record, then ` +
+            `re-arm with ${recovery}.`,
+    });
+    return {
+      run: options.context.run,
+      lines: [...options.lines, line],
+      stop: true,
+      acted: false,
+      stopReason: "intent-lost",
+    };
+  }
+
+  /**
    * Map an advance that launched nothing onto the action the plan would have reached.
    *
    * The deferrals are re-read because `runFleetLaunch` has already written the new
@@ -7888,17 +8445,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       // launch engine has just written `fleet.json`, so an absent one was removed
       // mid-tick (reconcile, manual cleanup) and the pre-launch deferrals are the
       // plan the advance just replaced.
-      return {
-        run: context.run,
-        lines: [
-          ...lines,
-          refreshed.ok
-            ? `Fleet ${mode.fleetId}: run halted — the fleet intent for \`${mode.fleetId}\` is gone; nothing to advance`
-            : `Fleet ${mode.fleetId}: run halted — could not re-read the fleet intent: ${refreshed.error}`,
-        ],
-        stop: true,
-        acted: false,
-      };
+      return emptyAdvanceLostRecordOutcome({
+        context,
+        lines,
+        lost: refreshed.ok ? { kind: "gone" } : { kind: "unreadable", error: refreshed.error },
+      });
     }
     const action = emptyAdvanceAction({
       intent: context.intent,
@@ -8658,24 +9209,150 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     return { intent, run, lines };
   }
 
-  /** One deterministic tick: observe, decide, act, persist. */
-  async function fleetTick(options: {
+  /** What one tick did, and why it stopped the loop when it did. */
+  interface FleetTickLoopOutcome {
+    lines: readonly string[];
+    stop: boolean;
+    acted: boolean;
+    stopReason?: FleetTickStopReason;
+  }
+
+  /**
+   * Report a stop caused by a fleet record the loop can no longer read (bd-169).
+   *
+   * Shared by every branch that stops because the record is gone or unreadable — the
+   * tick's own re-read and the advance's mid-flight re-read — so the operator gets the
+   * same warning, console line, and `supervisor-intent-lost` audit entry whichever one
+   * fired. Returns the line to notify.
+   */
+  function reportIntentLost(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
-  }): Promise<{ lines: readonly string[]; stop: boolean; acted: boolean }> {
-    const { ctx, mode } = options;
-    const now = Date.now();
+    fleetId: string;
+    detail: string;
+    line: string;
+  }): string {
+    console.warn(`[belayd-harness] ${options.line}`);
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.fleetId,
+      action: "supervisor-intent-lost",
+      taskIds: options.mode.intent.taskIds,
+      detail: options.detail,
+    });
+    return options.line;
+  }
+
+  /**
+   * Stop the loop because this session no longer owns the fleet (bd-169).
+   *
+   * Deliberately NOT recorded as `haltedReason` on the run: another session may have
+   * re-armed and its loop now owns that record, so marking the run halted here would
+   * kill work that is actually being driven. The loss is reported instead (audit +
+   * notify + console), which is what status and the operator can see without racing
+   * the new supervisor.
+   */
+  function stopTickForLostAuthority(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    current: FleetMode | undefined;
+  }): FleetTickLoopOutcome {
+    const cause =
+      options.current === undefined
+        ? "no fleet record grants this session supervisor authority"
+        : `the session now resolves to fleet \`${options.current.fleetId}\``;
+    const line =
+      `Fleet ${options.mode.fleetId}: run loop stopped — this session is no longer the live ` +
+      `supervisor (${cause}). Nothing lands or advances until a session ticks it: re-arm ` +
+      `with \`/fleet ${options.mode.intent.taskIds.join(" ")} --fleet ${options.mode.fleetId}\` ` +
+      "or call `belayd_fleet_advance` from the supervisor session.";
+    console.warn(`[belayd-harness] ${line}`);
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      action: "supervisor-lost",
+      taskIds: options.mode.intent.taskIds,
+      detail: cause,
+    });
+    return { lines: [line], stop: true, acted: false, stopReason: "authority-lost" };
+  }
+
+  /**
+   * Stop the loop because the fleet record is gone (bd-169).
+   *
+   * Not a terminal run: something outside the fleet removed or emptied the record,
+   * so the loop must say so instead of dying quietly.
+   */
+  function stopTickForMissingIntent(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    fleetId: string;
+  }): FleetTickLoopOutcome {
+    const line = reportIntentLost({
+      ctx: options.ctx,
+      mode: options.mode,
+      fleetId: options.fleetId,
+      detail: "fleet.json is gone; the run loop stopped",
+      line:
+        `Fleet ${options.fleetId}: run loop stopped — the fleet record is gone, so nothing ` +
+        "is ticking this run. Recover it from a session that can read the repository's " +
+        `fleet directory, or re-arm with \`/fleet ${options.mode.intent.taskIds.join(" ")} ` +
+        `--fleet ${options.fleetId}\`.`,
+    });
+    return { lines: [line], stop: true, acted: false, stopReason: "intent-lost" };
+  }
+
+  /**
+   * Stop the loop because the fleet record cannot be read (bd-169).
+   *
+   * The sibling of {@link stopTickForMissingIntent}: a corrupt or unreadable
+   * `fleet.json` is the same lost loop, so it gets the same audit and recovery line.
+   */
+  function stopTickForUnreadableIntent(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    fleetId: string;
+    error: string;
+  }): FleetTickLoopOutcome {
+    const line = reportIntentLost({
+      ctx: options.ctx,
+      mode: options.mode,
+      fleetId: options.fleetId,
+      detail: `fleet.json could not be read: ${options.error}`,
+      line:
+        `Fleet ${options.fleetId}: run loop stopped — the fleet record could not be read ` +
+        `(${options.error}), so nothing is ticking this run. Recover the record, then ` +
+        `re-arm with \`/fleet ${options.mode.intent.taskIds.join(" ")} --fleet ` +
+        `${options.fleetId}\`.`,
+    });
+    return { lines: [line], stop: true, acted: false, stopReason: "intent-lost" };
+  }
+
+  /** What a tick needs before it can act: live authority, the record, an active run. */
+  type FleetTickPreflight =
+    | { kind: "stop"; outcome: FleetTickLoopOutcome }
+    | { kind: "go"; current: FleetMode; intent: FleetIntent; run: FleetRun };
+
+  /**
+   * Re-derive authority, beat the heartbeat, and read the record this tick acts on.
+   *
+   * Every refusal returns a loud stop (bd-169), so the tick body itself only runs when
+   * the loop genuinely still owns an active run. A finished or halted run is the one
+   * quiet stop: the tick that produced it already recorded and announced it.
+   */
+  function fleetTickPreflight(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    now: number;
+  }): FleetTickPreflight {
+    const { ctx, mode, now } = options;
     // Authority is re-derived every tick: a re-arm by another session must stop
     // this loop instead of letting two supervisors act on one fleet.
     const current = fleetModeFor(ctx);
     if (current === undefined || current.fleetId !== mode.fleetId) {
-      return {
-        lines: [
-          `Fleet ${mode.fleetId}: run stopped — this session is no longer the live supervisor.`,
-        ],
-        stop: true,
-        acted: false,
-      };
+      return { kind: "stop", outcome: stopTickForLostAuthority({ ctx, mode, current }) };
     }
     const beat = writeSupervisorHeartbeat({
       gitCommonDir: current.gitCommonDir,
@@ -8698,16 +9375,50 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     });
     if (!loaded.ok) {
       return {
-        lines: [`Fleet ${current.fleetId}: run halted — ${loaded.error}`],
-        stop: true,
-        acted: false,
+        kind: "stop",
+        outcome: stopTickForUnreadableIntent({
+          ctx,
+          mode,
+          fleetId: current.fleetId,
+          error: loaded.error,
+        }),
       };
     }
+    // A missing record is not a terminal run: the loop was stopped by something
+    // outside the fleet (a cleanup, a hand edit), so say so instead of dying quietly.
     const intent = loaded.intent;
-    const run = intent?.run;
-    if (intent === undefined || run === undefined || !isFleetRunActive(run)) {
-      return { lines: [], stop: true, acted: false };
+    if (intent === undefined) {
+      return {
+        kind: "stop",
+        outcome: stopTickForMissingIntent({ ctx, mode, fleetId: current.fleetId }),
+      };
     }
+    const run = intent.run;
+    if (run === undefined || !isFleetRunActive(run)) {
+      return {
+        kind: "stop",
+        outcome: { lines: [], stop: true, acted: false, stopReason: "terminal" },
+      };
+    }
+    return { kind: "go", current, intent, run };
+  }
+
+  /**
+   * One deterministic tick: observe, decide, act, persist.
+   *
+   * Every `stop` says *why* (`stopReason`) and a non-terminal stop is loud: bd-169
+   * was a loop that died without a trace, and `belayd_fleet_status` kept calling the
+   * run active because nothing recorded that the ticker was gone.
+   */
+  async function fleetTick(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+  }): Promise<FleetTickLoopOutcome> {
+    const { ctx } = options;
+    const now = Date.now();
+    const preflight = fleetTickPreflight({ ctx, mode: options.mode, now });
+    if (preflight.kind === "stop") return preflight.outcome;
+    const { current, intent, run } = preflight;
 
     // A member whose bead was closed and whose work is already on the base branch has
     // landed outside the fleet; landing it first keeps the observations and the plan
@@ -8766,6 +9477,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       lines: [...swept.lines, ...reaped.warnings, ...result.lines],
       stop: result.stop,
       acted: result.acted,
+      ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
     };
   }
 
@@ -8791,6 +9503,20 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     options.state.fleetRunTimer = timer;
   }
 
+  /** A lost loop is a warning, not an info line: nothing lands until someone acts. */
+  function fleetTickNotifyLevel(stopReason: FleetTickStopReason | undefined): "info" | "warning" {
+    return stopReason === "authority-lost" || stopReason === "intent-lost" ? "warning" : "info";
+  }
+
+  /** Keep a reason on record for every stop that was not a terminal run (bd-169). */
+  function warnNonTerminalLoopStop(
+    fleetId: string,
+    stopReason: FleetTickStopReason | undefined,
+  ): void {
+    if (stopReason === undefined || stopReason === "terminal") return;
+    console.warn(`[belayd-harness] fleet ${fleetId}: run loop stopped (${stopReason})`);
+  }
+
   /** Run one tick without ever letting it kill the loop. */
   async function runFleetTickSafely(options: {
     ctx: ExtensionContext;
@@ -8804,8 +9530,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     options.state.fleetTickInFlight = true;
     try {
       const outcome = await fleetTick({ ctx: options.ctx, mode: options.mode });
-      for (const line of outcome.lines) options.ctx.ui.notify(line, "info");
+      const level = fleetTickNotifyLevel(outcome.stopReason);
+      for (const line of outcome.lines) options.ctx.ui.notify(line, level);
       if (outcome.stop) {
+        // Nothing may end the timer without a trace (bd-169): the tick notified its
+        // own line for a lost authority or a missing record, and the console keeps
+        // the reason even if the UI is closed.
+        warnNonTerminalLoopStop(options.mode.fleetId, outcome.stopReason);
         stopFleetRunTimer(options.state);
         // The run is over: the name keeps the members and gains the run status, so
         // the session still says what it supervised afterwards.
@@ -8835,6 +9566,35 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }): void {
     stopFleetRunTimer(options.state);
     scheduleFleetTick({ ...options, delayInMs: 0 });
+  }
+
+  /**
+   * Make sure this session's active run actually has a timer (bd-169).
+   *
+   * `belayd_fleet_advance` and `belayd_fleet_resume` are the natural "the loop looks
+   * dead" surfaces, and the advance used to succeed without reviving anything. An
+   * already-scheduled loop is left alone: restarting it would reset its cadence and
+   * chain a second timer onto the same run.
+   */
+  function ensureFleetRunTimer(options: { ctx: ExtensionContext; state: SessionState }): void {
+    const mode = fleetModeFor(options.ctx);
+    if (mode === undefined) return;
+    const run = mode.intent.run;
+    if (run === undefined || !isFleetRunActive(run)) return;
+    if (options.state.fleetRunTimer !== undefined) return;
+    startFleetRunLoop({ ctx: options.ctx, state: options.state, mode });
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+      action: "fleet-run-restarted",
+      taskIds: mode.intent.taskIds,
+      detail: `no timer was scheduled for the active run (tick ${run.ticks})`,
+    });
+    options.ctx.ui.notify(
+      `Fleet ${mode.fleetId}: run loop restarted — this session is ticking the active run again.`,
+      "info",
+    );
   }
 
   // ── Supervisor identity: session name + sidebar pin ────────────────
@@ -10310,8 +11070,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       if (resumed.alreadyResumed) return textToolResult(resumed.text, 0);
 
       // A paused run stopped its timer without finishing the run; resuming is what
-      // starts it ticking again.
+      // starts it ticking again. `ensureFleetRunTimer` covers the case where the
+      // strict resume path declines (no arm token) but the run is still active.
       resumeFleetRunLoop(extensionCtx, getSessionState(extensionCtx));
+      ensureFleetRunTimer({ ctx: extensionCtx, state: getSessionState(extensionCtx) });
 
       const notified = announceToMembers({
         ctx: extensionCtx,
@@ -10364,6 +11126,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         fleetId: mode.fleetId,
         origin: "advance",
       });
+      // An advance used to record nothing but its launches: a session whose loop had
+      // died could "advance" a run forever without anything ticking it (bd-169).
+      ensureFleetRunTimer({ ctx: extensionCtx, state: getSessionState(extensionCtx) });
       const header =
         `Advancing fleet \`${mode.fleetId}\`: ${planned.worklist.length} deferred member(s) ` +
         `(${planned.worklist.join(", ")}) re-scheduled; ${planned.members.length} already ` +

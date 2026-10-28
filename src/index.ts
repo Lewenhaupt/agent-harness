@@ -234,13 +234,21 @@ export type {
 } from "./fleet-capacity.js";
 export { describeFleetCapacity, memberHoldsCapacity } from "./fleet-capacity.js";
 // Supervisor heartbeat for a run-mode fleet (P5)
-export type { SupervisorBeatVerdict, SupervisorHeartbeat } from "./fleet-heartbeat.js";
+export type {
+  SupervisorBeatVerdict,
+  SupervisorHeartbeat,
+  SupervisorReadoptionPlan,
+  SupervisorReadoptionReason,
+  SupervisorReadoptionRefusal,
+} from "./fleet-heartbeat.js";
 export {
   classifySupervisorBeat,
   FLEET_SUPERVISOR_HEARTBEAT_FILE,
   FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION,
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
+  isFleetLoopProvablyDead,
   parseSupervisorHeartbeat,
+  planSupervisorReadoption,
   readSupervisorHeartbeat,
   supervisorHeartbeatPath,
   writeSupervisorHeartbeat,
@@ -569,6 +577,7 @@ export {
   FLEET_AUDIT_ACTION_MAX_LENGTH,
   FLEET_AUDIT_ACTOR_MAX_LENGTH,
   FLEET_AUDIT_DETAIL_MAX_LENGTH,
+  FLEET_AUDIT_TAIL_BYTES,
   FLEET_AUDIT_TASK_ID_MAX_LENGTH,
   FLEET_AUDIT_TASK_IDS_MAX,
   FLEET_MERGE_ENTRY_STATES,
@@ -592,6 +601,7 @@ export {
   pruneLandedFleetMember,
   readFleetIntent,
   readFleetMergeQueue,
+  readRecentFleetAuditEntries,
   retireFleetDeferral,
   updateFleetIntent,
   updateFleetMergeQueue,

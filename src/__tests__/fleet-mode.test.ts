@@ -439,6 +439,21 @@ describe("resolveFleetMode", () => {
     });
     expect(resolveFleetMode(options(fs))).toBe(undefined);
   });
+
+  it("prefers the armed fleet when two records name this session (bd-169)", () => {
+    // A session that supervised wave1 and then wave2 has two records naming it. The
+    // stale one sorts first, so directory order alone would resolve to it and the
+    // live run loop would bail every tick with "no longer the live supervisor".
+    const fs = createFakeFleetFs({
+      [intentFile("alpha")]: intentJson({ fleetId: "alpha" }),
+      [intentFile("zulu")]: intentJson({ fleetId: "zulu" }),
+    });
+    const mode = resolveFleetMode({
+      ...options(fs),
+      armToken: { fleetId: "zulu", token: TOKEN },
+    });
+    expect(mode?.fleetId).toBe("zulu");
+  });
 });
 
 describe("resolveMemberFleet", () => {

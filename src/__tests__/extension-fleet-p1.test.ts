@@ -34,6 +34,8 @@ import {
   FLEET_INTENT_ORDERING_GATES_MAX,
   FLEET_NOTE_BODY_MAX_LENGTH,
   FLEET_RUN_MAX_IDLE_TICKS,
+  FLEET_RUN_TICK_INTERVAL_MS,
+  FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
   fleetEventsDir,
   fleetInboxDir,
   fleetNoteFileName,
@@ -45,6 +47,7 @@ import {
   startFleetRun,
   updateFleetIntent,
   writeFleetMergeQueue,
+  writeSupervisorHeartbeat,
 } from "../index.js";
 import { RunStatus, writeRunManifest } from "../run-manifest.js";
 import { writeWorkflowState } from "../workflow-state.js";
@@ -79,7 +82,17 @@ const worktree = vi.hoisted(() => ({
 }));
 
 /** Force the next N intent writes to lose their CAS race (a two-attempt failure). */
-const intentCas = vi.hoisted(() => ({ conflictsRemaining: 0 }));
+const intentCas = vi.hoisted(() => ({
+  conflictsRemaining: 0,
+  /**
+   * Runs once before the next real intent update.
+   *
+   * The only seam between a readoption scan and its compare-and-swap: a test uses it
+   * to rewrite the record the way another session's arming would, which is exactly
+   * the race the adoption CAS has to refuse (bd-169).
+   */
+  beforeUpdate: undefined as (() => void) | undefined,
+}));
 
 /**
  * Member orchestrators the stubbed process scan reports as running (bd-166).
@@ -140,6 +153,9 @@ vi.mock("../../src/index.js", async (importOriginal) => {
         intentCas.conflictsRemaining -= 1;
         return { ok: false as const, reason: "conflict" as const, error: "stub conflict" };
       }
+      const hook = intentCas.beforeUpdate;
+      intentCas.beforeUpdate = undefined;
+      hook?.();
       return actual.updateFleetIntent(options);
     },
   };
@@ -270,6 +286,9 @@ type AgentStartHandler = (
 
 type ToolCallHandler = (event: { toolName: string }, ctx: unknown) => unknown;
 
+/** The `session_start` handler this extension registers (bd-169 restart cases). */
+type SessionStartHandler = (event: unknown, ctx: unknown) => Promise<unknown> | unknown;
+
 interface MockPi {
   api: ExtensionAPI;
   tools: Map<string, RegisteredTool>;
@@ -277,6 +296,7 @@ interface MockPi {
   agentStart: AgentStartHandler[];
   agentEnd: AgentStartHandler[];
   toolCall: ToolCallHandler[];
+  sessionStart: SessionStartHandler[];
   activeTools: () => string[];
   notifications: Array<{ message: string; level: string }>;
   /** Every name the extension applied to this session, in order. */
@@ -289,6 +309,7 @@ function createMockPi(): MockPi {
   const agentStart: AgentStartHandler[] = [];
   const agentEnd: AgentStartHandler[] = [];
   const toolCall: ToolCallHandler[] = [];
+  const sessionStart: SessionStartHandler[] = [];
   const notifications: Array<{ message: string; level: string }> = [];
   const sessionNames: string[] = [];
   let active: string[] = [];
@@ -303,6 +324,7 @@ function createMockPi(): MockPi {
       if (event === "before_agent_start") agentStart.push(handler as AgentStartHandler);
       if (event === "agent_end") agentEnd.push(handler as AgentStartHandler);
       if (event === "tool_call") toolCall.push(handler as ToolCallHandler);
+      if (event === "session_start") sessionStart.push(handler as SessionStartHandler);
     },
     sendMessage: () => {},
     appendEntry: () => {},
@@ -322,6 +344,7 @@ function createMockPi(): MockPi {
     agentStart,
     agentEnd,
     toolCall,
+    sessionStart,
     activeTools: () => active,
     notifications,
     sessionNames,
@@ -2866,7 +2889,16 @@ describe("fleet run mode", () => {
     // The advance's own report is kept as the leading line, then the run stops
     // instead of classifying from the plan the advance just replaced.
     expect(lines).toContain("Scheduling: 0 member(s) now, 1 deferred");
-    expect(lines).toContain("run halted — the fleet intent for `default` is gone");
+    expect(lines).toContain(
+      "run loop stopped — the fleet intent for `default` is gone, so nothing can advance this run",
+    );
+    // bd-169 review W1: the lost record inside an advance is a lost loop, not a halt,
+    // so it is audited and reported like the tick's own re-read — never a silent stop.
+    expect(lines).toContain("/fleet bd-12 --fleet default");
+    expect(auditEntries("supervisor-intent-lost")).toHaveLength(1);
+    expect(ctxNotifications.filter((entry) => entry.message.includes("run loop stopped"))).toEqual([
+      expect.objectContaining({ level: "warning" }),
+    ]);
     // A halt is not a completion: nothing was classified, nothing was written.
     expect(auditEntries("fleet-run-complete")).toHaveLength(0);
     expect(auditEntries("fleet-run-halted")).toHaveLength(0);
@@ -3352,6 +3384,801 @@ describe("fleet run mode", () => {
     expect(readSupervisorHeartbeat({ gitCommonDir: commonDir, fleetId: "default" })).toMatchObject({
       sessionId: "supervisor-session",
     });
+  });
+});
+
+/**
+ * A run loop whose supervisor session restarted (bd-169).
+ *
+ * The wave2 incident: the daemon restarted, the loop's in-memory arm token died
+ * with it, and nothing landed or warned for nine hours while status called the run
+ * active. These cases pin the repair and its boundaries: a session_start re-adopts
+ * the active run its own record names when the beat is cold, never adopts another
+ * session's fleet, reports a tick that loses authority with the recovery command,
+ * and an advance restarts a dead timer.
+ */
+describe("supervisor restart re-adoption (bd-169)", () => {
+  let cwd: string;
+  let commonDir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-readopt-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", "default"), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.byBranch = undefined;
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    childProcess.bdStdout = undefined;
+    childProcess.bdFailure = undefined;
+    childProcess.failBdComment = false;
+    ctxNotifications = [];
+    afterLaunchHook = undefined;
+  });
+
+  afterEach(() => {
+    liveness.memberTaskIds = [];
+    intentCas.beforeUpdate = undefined;
+    vi.useRealTimers();
+    childProcess.bdStdout = undefined;
+    afterLaunchHook = undefined;
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+  });
+
+  function fleetFile(fleetId = "default"): string {
+    return join(commonDir, "belayd", "fleet", fleetId, "fleet.json");
+  }
+
+  function runTicks(fleetId = "default"): number | undefined {
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId });
+    return intent.ok ? intent.intent?.run?.ticks : undefined;
+  }
+
+  function auditActions(fleetId = "default"): string[] {
+    const path = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => (JSON.parse(line) as { action: string }).action);
+  }
+
+  /** The detail of every audit entry of one action, in append order. */
+  function auditDetails(action: string, fleetId = "default"): string[] {
+    const path = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { action: string; detail?: string })
+      .filter((entry) => entry.action === action)
+      .map((entry) => entry.detail ?? "");
+  }
+
+  /** The persisted shape the wave2 incident left: an active run with a dead beat. */
+  function seedActiveRun(options: {
+    supervisorSessionId: string;
+    ticks?: number;
+    /** `/proc/<pid>/stat` field 22 at arm time, when the arming could read it. */
+    pidStartTime?: string;
+  }): void {
+    seedFleetRun({ fleetId: "default", ...options });
+  }
+
+  /** The same shape under any fleet id, for the multi-fleet cases. */
+  function seedFleetRun(options: {
+    fleetId: string;
+    supervisorSessionId: string;
+    ticks?: number;
+    /** `run.updatedAt`: the tie-break between two adoptable fleets. */
+    runUpdatedAt?: number;
+    pidStartTime?: string;
+  }): void {
+    mkdirSync(join(commonDir, "belayd", "fleet", options.fleetId), { recursive: true });
+    writeFileSync(
+      join(commonDir, "belayd", "fleet", options.fleetId, "fleet.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: options.fleetId,
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: {
+          sessionId: options.supervisorSessionId,
+          pid: process.pid,
+          ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
+          armToken: "stale-arm-token",
+        },
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 1,
+          updatedAt: options.runUpdatedAt ?? 1,
+          ticks: options.ticks ?? 3,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 1 }],
+        },
+      }),
+    );
+    writeSupervisorHeartbeat({
+      gitCommonDir: commonDir,
+      fleetId: options.fleetId,
+      sessionId: options.supervisorSessionId,
+      pid: process.pid,
+      now: Date.now() - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS - 1_000,
+    });
+  }
+
+  /** Rewrite one fleet's record, the way an operator or a rival writer would. */
+  function editFleetIntent(
+    fleetId: string,
+    mutate: (intent: Record<string, unknown>) => Record<string, unknown>,
+  ): void {
+    const path = join(commonDir, "belayd", "fleet", fleetId, "fleet.json");
+    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify(mutate(intent)));
+  }
+
+  /** An active run whose record names nobody: no supervisor record at all. */
+  function seedLeaderlessRun(options: { beatAt?: number } = {}): void {
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 1,
+          updatedAt: 1,
+          ticks: 3,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 1 }],
+        },
+      }),
+    );
+    if (options.beatAt === undefined) return;
+    writeSupervisorHeartbeat({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      sessionId: "unnamed-supervisor",
+      pid: process.pid,
+      now: options.beatAt,
+    });
+  }
+
+  function leaderlessReports(): Array<{ message: string; level: string }> {
+    return ctxNotifications.filter((entry) =>
+      entry.message.includes("no usable supervisor record"),
+    );
+  }
+
+  async function fireSessionStart(mock: MockPi, ctx: ReturnType<typeof makeCtx>): Promise<void> {
+    expect(mock.sessionStart.length).toBeGreaterThan(0);
+    for (const handler of mock.sessionStart) await handler({}, ctx);
+  }
+
+  it("re-adopts the active run of a restarted supervisor and ticks it", async () => {
+    seedActiveRun({ supervisorSessionId: "restarted-session", ticks: 3 });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+
+    await fireSessionStart(mock, ctx);
+
+    const rewritten = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(rewritten).toHaveProperty("ok", true);
+    if (!rewritten.ok) return;
+    expect(rewritten.intent?.supervisor?.sessionId).toBe("restarted-session");
+    // The record now carries a token this process minted, and the beat names it.
+    const token = rewritten.intent?.supervisor?.armToken;
+    expect(token).toBeDefined();
+    expect(token).not.toBe("stale-arm-token");
+    expect(readSupervisorHeartbeat({ gitCommonDir: commonDir, fleetId: "default" })).toMatchObject({
+      sessionId: "restarted-session",
+    });
+    // W6: the token is never persisted outside the record it belongs to, and the
+    // beat file in particular stays token-free.
+    const beat = readFileSync(
+      join(commonDir, "belayd", "fleet", "default", "supervisor.json"),
+      "utf8",
+    );
+    expect(beat).not.toContain("armToken");
+    expect(beat).not.toContain(token ?? "");
+    expect(auditActions()).toContain("supervisor-readopted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "re-adopted the active run",
+    );
+
+    // The loop is really scheduled: the persisted run record ticks.
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(runTicks()).toBeGreaterThan(3);
+  });
+
+  it("reports a tick that lost its authority with the re-arm command", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // Another session re-armed: the record's token no longer matches this session.
+    const parsed = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+      supervisor?: Record<string, unknown>;
+    };
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        ...parsed,
+        supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(16_000);
+
+    const lost = ctxNotifications.filter((entry) =>
+      entry.message.includes("no longer the live supervisor"),
+    );
+    expect(lost).toHaveLength(1);
+    expect(lost[0]?.level).toBe("warning");
+    expect(lost[0]?.message).toContain("/fleet bd-12 --fleet default");
+    expect(auditActions()).toContain("supervisor-lost");
+    // The run is left alone: another session's loop may own that record now.
+    expect(runTicks()).toBe(0);
+  });
+
+  it("restarts the timer when an advance finds an active run with no loop", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    const armed = readFileSync(fleetFile(), "utf8");
+
+    // Rotate the record's token so the next tick loses authority and the loop dies;
+    // this session still holds its own token and the active run survives.
+    const parsed = JSON.parse(armed) as { supervisor?: Record<string, unknown> };
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        ...parsed,
+        supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "no longer the live supervisor",
+    );
+
+    // The record comes back (reconcile, or an operator restore) and is advanced.
+    const restored = {
+      ...(JSON.parse(armed) as Record<string, unknown>),
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+    };
+    writeFileSync(fleetFile(), JSON.stringify(restored));
+    const ticksBefore = runTicks() ?? 0;
+    const tool = mock.tools.get("belayd_fleet_advance");
+    if (tool === undefined) throw new Error("belayd_fleet_advance was not registered");
+    await tool.execute("advance-1", {}, undefined, undefined, ctx);
+
+    expect(auditActions()).toContain("fleet-run-restarted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "run loop restarted",
+    );
+
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(runTicks()).toBeGreaterThan(ticksBefore);
+  });
+
+  it("never adopts another session's fleet, even with a cold beat", async () => {
+    seedActiveRun({ supervisorSessionId: "someone-else", ticks: 3 });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+
+    await fireSessionStart(mock, ctx);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.supervisor?.sessionId).toBe("someone-else");
+    expect(intent.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain("re-adopted");
+    // No timer was started for it: the run record does not move.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("reports an active run whose record has no usable supervisor (bd-169 W5)", async () => {
+    // No session is named, so "wait for the supervisor's next start" never happens:
+    // without this report the run stays unticked and silent forever.
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 1,
+          updatedAt: 1,
+          ticks: 3,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 1 }],
+        },
+      }),
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "some-session");
+
+    await fireSessionStart(mock, ctx);
+
+    const warning = ctxNotifications.find((entry) =>
+      entry.message.includes("no usable supervisor record"),
+    );
+    expect(warning?.level).toBe("warning");
+    expect(warning?.message).toContain("/fleet bd-12 --fleet default");
+    expect(auditActions()).toContain("supervisor-readopt-refused");
+    expect(auditDetails("supervisor-readopt-refused")[0]).toContain("no supervisor record");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("distinguishes an empty supervisor session id from a missing record (bd-169)", async () => {
+    // A record that exists but names no session is a different state from an intent
+    // with no record at all: the audit must let a reader tell which one it saw.
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "", pid: process.pid, armToken: "stale-arm-token" },
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 1,
+          updatedAt: 1,
+          ticks: 3,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 1 }],
+        },
+      }),
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "some-session");
+
+    await fireSessionStart(mock, ctx);
+
+    expect(leaderlessReports()).toHaveLength(1);
+    const [detail] = auditDetails("supervisor-readopt-refused");
+    expect(detail).toContain("other-session");
+    expect(detail).toContain("empty session id");
+    expect(detail).not.toContain("no supervisor record");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("stays quiet about an explicit fleet that has no run record (bd-169 W5)", async () => {
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "some-session");
+
+    await fireSessionStart(mock, ctx);
+
+    // An `--manual` fleet is legitimately leaderless: nothing ticks, nothing warns.
+    const reported = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(reported).not.toContain("no usable supervisor record");
+    expect(reported).not.toContain("not re-adopted");
+    expect(reported).not.toContain("re-adopted the active run");
+    expect(reported).not.toContain("run loop restarted");
+    expect(auditActions()).not.toContain("supervisor-readopt-refused");
+    // Nothing was adopted either: a fleet with no run has no loop to repair, so the
+    // record must stay exactly as the operator wrote it and no timer may appear.
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    expect(auditActions()).not.toContain("supervisor-readopt-skipped");
+    const untouched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(untouched).toHaveProperty("ok", true);
+    if (!untouched.ok) return;
+    expect(untouched.intent).toMatchObject({ taskIds: ["bd-12"] });
+    expect(untouched.intent?.supervisor).toBeUndefined();
+    expect(untouched.intent?.run).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(60_000);
+    const stillUntouched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(stillUntouched).toHaveProperty("ok", true);
+    if (!stillUntouched.ok) return;
+    expect(stillUntouched.intent?.run).toBeUndefined();
+  });
+
+  it("stays quiet about a leaderless run whose beat is fresh (bd-169 W1)", async () => {
+    // The record names nobody, but some session is beating the run right now: calling
+    // that "nothing is ticking it" would be false, so status remains the surface.
+    seedLeaderlessRun({ beatAt: Date.now() - 1_000 });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "some-session");
+
+    await fireSessionStart(mock, ctx);
+
+    expect(leaderlessReports()).toHaveLength(0);
+    expect(auditActions()).not.toContain("supervisor-readopt-refused");
+  });
+
+  it("reports a leaderless run once its beat is cold (bd-169 W1)", async () => {
+    seedLeaderlessRun({ beatAt: Date.now() - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS - 1_000 });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "some-session");
+
+    await fireSessionStart(mock, ctx);
+
+    const reports = leaderlessReports();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.level).toBe("warning");
+    // The stale beat is named, so the operator can tell a wedge from a missing record.
+    expect(reports[0]?.message).toContain("beat ");
+    expect(reports[0]?.message).toContain("/fleet bd-12 --fleet default");
+  });
+
+  it("reports a leaderless run once per cooldown window (bd-169 W2)", async () => {
+    seedLeaderlessRun();
+    const mock = await loadFleetExtension();
+
+    await fireSessionStart(mock, makeCtx(cwd, "session-one"));
+    expect(leaderlessReports()).toHaveLength(1);
+    expect(auditActions()).toEqual(["supervisor-readopt-refused"]);
+
+    // Another session starting inside the window must not repeat the same alarm, and
+    // must not append a second audit entry for it.
+    await vi.advanceTimersByTimeAsync(60_000);
+    await fireSessionStart(mock, makeCtx(cwd, "session-two"));
+    expect(leaderlessReports()).toHaveLength(1);
+    expect(auditActions()).toHaveLength(1);
+
+    // After the window the alarm repeats: the wedge may still be there, and a
+    // suppressed report is not a resolution.
+    await vi.advanceTimersByTimeAsync(FLEET_SUPERVISOR_HEARTBEAT_STALE_MS);
+    await fireSessionStart(mock, makeCtx(cwd, "session-three"));
+    expect(leaderlessReports()).toHaveLength(2);
+    expect(auditActions()).toHaveLength(2);
+  });
+
+  it("refuses to adopt when the record gains a token between scan and write (bd-169 W4)", async () => {
+    // A legacy record with no `armToken` is adoptable; the strict comparison must still
+    // reject the write when another arming adds one in the window before the CAS.
+    writeFileSync(
+      fleetFile(),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "restarted-session", pid: process.pid },
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 1,
+          updatedAt: 1,
+          ticks: 3,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 1 }],
+        },
+      }),
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+    intentCas.beforeUpdate = () => {
+      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+        supervisor: Record<string, unknown>;
+      };
+      writeFileSync(
+        fleetFile(),
+        JSON.stringify({
+          ...current,
+          supervisor: { ...current.supervisor, armToken: "another-arm" },
+        }),
+      );
+    };
+
+    await fireSessionStart(mock, ctx);
+
+    // The other arming keeps the record; this session did not take it over.
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.supervisor?.armToken).toBe("another-arm");
+    expect(auditActions()).toContain("supervisor-readopt-failed");
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    const failure = ctxNotifications.find((entry) =>
+      entry.message.includes("could not re-adopt the active run"),
+    );
+    expect(failure?.level).toBe("warning");
+    expect(failure?.message).toContain("/fleet bd-12 --fleet default");
+    expect(failure?.message).toContain("arm token");
+    // No loop was started for a fleet this session does not hold.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("refuses the adoption when only the recorded pid drifted (bd-169 W2)", async () => {
+    // The CAS re-checks every anchor, not just the token: a re-arm that keeps the
+    // session id and token but points at another process is still a different
+    // supervisor, and overwriting it would strand the record on the wrong pid.
+    seedActiveRun({ supervisorSessionId: "restarted-session" });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+    intentCas.beforeUpdate = () => {
+      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+        supervisor: Record<string, unknown>;
+      };
+      writeFileSync(
+        fleetFile(),
+        JSON.stringify({ ...current, supervisor: { ...current.supervisor, pid: process.pid + 1 } }),
+      );
+    };
+
+    await fireSessionStart(mock, ctx);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.supervisor?.pid).toBe(process.pid + 1);
+    expect(intent.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    expect(auditActions()).toContain("supervisor-readopt-failed");
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    expect(auditDetails("supervisor-readopt-failed")[0]).toContain("pid changed");
+    // Nothing adopted it, so no loop ticks the run.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("refuses the adoption when only the recorded process start time drifted (bd-169 W2)", async () => {
+    // A reused pid is the case the start time exists for: same pid, different process.
+    seedActiveRun({ supervisorSessionId: "restarted-session", pidStartTime: "1111" });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+    intentCas.beforeUpdate = () => {
+      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+        supervisor: Record<string, unknown>;
+      };
+      writeFileSync(
+        fleetFile(),
+        JSON.stringify({
+          ...current,
+          supervisor: { ...current.supervisor, pidStartTime: "2222" },
+        }),
+      );
+    };
+
+    await fireSessionStart(mock, ctx);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.supervisor?.pidStartTime).toBe("2222");
+    expect(intent.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    expect(auditActions()).toContain("supervisor-readopt-failed");
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    expect(auditDetails("supervisor-readopt-failed")[0]).toContain("process start time changed");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("adopts only the newest of two fleets that name this session (bd-169)", async () => {
+    seedFleetRun({
+      fleetId: "alpha",
+      supervisorSessionId: "restarted-session",
+      runUpdatedAt: 10,
+      ticks: 3,
+    });
+    seedFleetRun({
+      fleetId: "zulu",
+      supervisorSessionId: "restarted-session",
+      runUpdatedAt: 20,
+      ticks: 7,
+    });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+
+    await fireSessionStart(mock, ctx);
+
+    // One session supervises one fleet: `zulu` has the newer run, so it wins even
+    // though `alpha` sorts first in the directory scan.
+    const adopted = readFleetIntent({ gitCommonDir: commonDir, fleetId: "zulu" });
+    expect(adopted).toHaveProperty("ok", true);
+    if (!adopted.ok) return;
+    expect(adopted.intent?.supervisor?.sessionId).toBe("restarted-session");
+    expect(adopted.intent?.supervisor?.armToken).not.toBe("stale-arm-token");
+    expect(auditActions("zulu")).toContain("supervisor-readopted");
+
+    // The other candidate is left exactly as it was, and reported with its own
+    // recovery command — silence there would be the original bug again.
+    const skipped = readFleetIntent({ gitCommonDir: commonDir, fleetId: "alpha" });
+    expect(skipped).toHaveProperty("ok", true);
+    if (!skipped.ok) return;
+    expect(skipped.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    expect(auditActions("alpha")).toContain("supervisor-readopt-skipped");
+    const report = ctxNotifications.find((entry) =>
+      entry.message.includes("Fleet alpha: not re-adopted"),
+    );
+    expect(report?.level).toBe("warning");
+    expect(report?.message).toContain("`zulu` holds the newer active run");
+    expect(report?.message).toContain("/fleet bd-12 --fleet alpha");
+
+    // Only the adopted fleet ticks; the skipped one is not driven by this session.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks("zulu")).toBeGreaterThan(7);
+    expect(runTicks("alpha")).toBe(3);
+  });
+
+  it("breaks a tie between equally new runs by fleet id (bd-169)", async () => {
+    seedFleetRun({
+      fleetId: "alpha",
+      supervisorSessionId: "restarted-session",
+      runUpdatedAt: 20,
+      ticks: 3,
+    });
+    seedFleetRun({
+      fleetId: "zulu",
+      supervisorSessionId: "restarted-session",
+      runUpdatedAt: 20,
+      ticks: 7,
+    });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "restarted-session");
+
+    await fireSessionStart(mock, ctx);
+
+    // Equal `run.updatedAt`: the tie-break is the fleet id, ascending, so the choice
+    // is deterministic across two runs of the same sweep.
+    const adopted = readFleetIntent({ gitCommonDir: commonDir, fleetId: "alpha" });
+    expect(adopted).toHaveProperty("ok", true);
+    if (!adopted.ok) return;
+    expect(adopted.intent?.supervisor?.armToken).not.toBe("stale-arm-token");
+    expect(auditActions("alpha")).toContain("supervisor-readopted");
+    expect(auditActions("zulu")).toContain("supervisor-readopt-skipped");
+    const report = ctxNotifications.find((entry) =>
+      entry.message.includes("Fleet zulu: not re-adopted"),
+    );
+    expect(report?.message).toContain("`alpha` holds the newer active run");
+    const skipped = readFleetIntent({ gitCommonDir: commonDir, fleetId: "zulu" });
+    expect(skipped).toHaveProperty("ok", true);
+    if (!skipped.ok) return;
+    expect(skipped.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks("alpha")).toBeGreaterThan(3);
+    expect(runTicks("zulu")).toBe(7);
+  });
+
+  it("never adopts from a sub-agent session (bd-169)", async () => {
+    // Sub-agents share the orchestrator's worktree and bead but must never act for
+    // it: session_start returns before the sweep for them, so a `-sub-` session
+    // starts no ticker and leaves the record to its orchestrator.
+    seedActiveRun({ supervisorSessionId: "restarted-session" });
+    const mock = await loadFleetExtension();
+    const orchestrator = makeCtx(cwd, "restarted-session");
+    const subAgent: ReturnType<typeof makeCtx> = {
+      ...orchestrator,
+      sessionManager: {
+        ...orchestrator.sessionManager,
+        getSessionName: () => "belayd-bd-169-implement-sub-1",
+      },
+    };
+
+    await fireSessionStart(mock, subAgent);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.supervisor?.armToken).toBe("stale-arm-token");
+    expect(auditActions()).not.toContain("supervisor-readopted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain("re-adopted");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runTicks()).toBe(3);
+  });
+
+  it("does not chain a second timer when ensure runs twice in a row (bd-169)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // Settle one cadence: the launch tick runs at 0 ms, the next is one interval
+    // later. While the member is only `starting`, every tick is idle, so that
+    // interval is the 15 s one.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS);
+    const settled = runTicks() ?? 0;
+    expect(settled).toBeGreaterThanOrEqual(1);
+
+    const addDeferred = (intent: Record<string, unknown>): Record<string, unknown> => ({
+      ...intent,
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+    });
+    editFleetIntent("default", addDeferred);
+    const tool = mock.tools.get("belayd_fleet_advance");
+    if (tool === undefined) throw new Error("belayd_fleet_advance was not registered");
+    const timersBefore = vi.getTimerCount();
+    await tool.execute("advance-1", {}, undefined, undefined, ctx);
+    // The first advance may consume the deferral; re-add it so the second call takes
+    // the same path instead of refusing before `ensureFleetRunTimer`.
+    editFleetIntent("default", addDeferred);
+    await tool.execute("advance-2", {}, undefined, undefined, ctx);
+
+    // Neither call restarted the loop, and no second timer chain appeared.
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    expect(auditActions()).not.toContain("fleet-run-restarted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "run loop restarted",
+    );
+    // A reset cadence would tick immediately (restart schedules at 0 ms); the real
+    // loop waits out the interval it already had, then ticks exactly once.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runTicks()).toBe(settled);
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS);
+    expect(runTicks()).toBe(settled + 1);
+  });
+
+  it("keeps the cadence when an advance runs inside a tick that is in flight (bd-169)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // A capacity-blocked wave makes the next tick an acting tick that reports after
+    // the launch engine wrote its plan: `afterLaunchHook` therefore runs inside that
+    // tick, while `fleetTickInFlight` is still true, which is the window a second
+    // `ensureFleetRunTimer` must leave alone.
+    liveness.memberTaskIds = ["bd-12"];
+    editFleetIntent("default", (intent) => ({
+      ...intent,
+      maxConcurrent: 1,
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+    }));
+    const tool = mock.tools.get("belayd_fleet_advance");
+    if (tool === undefined) throw new Error("belayd_fleet_advance was not registered");
+    let invoked = false;
+    afterLaunchHook = () => {
+      invoked = true;
+      void tool.execute("advance-in-tick", {}, undefined, undefined, ctx);
+    };
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(invoked).toBe(true);
+    // Let the mid-tick advance finish its awaits.
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(auditActions()).not.toContain("fleet-run-restarted");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "run loop restarted",
+    );
+    const settled = runTicks() ?? 0;
+    // Still the loop's own cadence: nothing was rescheduled at 0 ms.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runTicks()).toBe(settled);
   });
 });
 
