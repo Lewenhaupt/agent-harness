@@ -12,6 +12,10 @@
  * provider — identical behavior, different credential/quota bucket.
  * `opencode-go` is the exception preferred provider for `deepseek-v4.1-flash`,
  * whose subscription bucket is far cheaper than per-token for that one model.
+ * That model's wire id differs per provider too: opencode-go serves the bare
+ * gateway slug, while the per-token gateways serve the pinned `-1017` build, so
+ * the same canonical id never sends a retired slug to a provider that dropped
+ * it (`PROVIDER_MODEL_IDS`).
  * `openrouter` carries the same models as a last-resort quota bucket, but under
  * vendor-qualified ids (e.g. `z-ai/glm-5.2`), mapped in `PROVIDER_MODEL_IDS`.
  */
@@ -54,6 +58,15 @@ export const PROVIDER_PREFERENCE: readonly string[] = DEFAULT_PROVIDER_PREFERENC
 const SUBSCRIPTION_PREFERRED_MODEL = "deepseek-v4.1-flash";
 
 /**
+ * The pinned DeepSeek V4.1 Flash build the per-token gateways serve. The
+ * unversioned slug above is deprecated on llmgateway, while opencode-go's catalog
+ * lists only that bare slug (it does not serve the pinned build) — so the build id
+ * is remapped per provider below instead of renaming the canonical id the
+ * subscription preference keys off.
+ */
+const DEEPSEEK_FLASH_PINNED_BUILD = "deepseek-v4.1-flash-1017";
+
+/**
  * Per-model provider overrides. opencode-go's plan gives that subscription-
  * preferred model generous headroom, so the subscription bucket is reserved for
  * it; every other model bills per-token and stays on llmgateway. Values must
@@ -67,25 +80,34 @@ export const MODEL_PROVIDER_PREFERENCE: Readonly<Record<string, readonly string[
 };
 
 /**
- * Provider-specific model ids. Most providers accept the canonical bare id,
- * but OpenRouter only serves vendor-qualified ids, so its entries map a
- * canonical id to the id pi must send (`provider/<suffix>`).
+ * Provider-specific model ids. Most providers accept the canonical bare id.
+ * OpenRouter only serves vendor-qualified ids (`provider/<suffix>`), and
+ * llmgateway serves a pinned build for DeepSeek's flash model. The first entry
+ * is the id pi must send; trailing entries are other wire ids the provider has
+ * served for the same model, kept in the reverse direction so a marker written
+ * before a build swap (`canonicalModelId`) still resolves to its class.
  */
-const PROVIDER_MODEL_IDS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+const PROVIDER_MODEL_IDS: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+  llmgateway: {
+    [SUBSCRIPTION_PREFERRED_MODEL]: [DEEPSEEK_FLASH_PINNED_BUILD],
+  },
   openrouter: {
-    "deepseek-v4-flash": "deepseek/deepseek-v4-flash",
-    [SUBSCRIPTION_PREFERRED_MODEL]: `deepseek/${SUBSCRIPTION_PREFERRED_MODEL}`,
-    "gpt-5.6-luna": "openai/gpt-5.6-luna",
-    "glm-5.2": "z-ai/glm-5.2",
-    "glm-5.3": "z-ai/glm-5.3",
-    "glm-5.3-flash": "z-ai/glm-5.3-flash",
-    "mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
+    "deepseek-v4-flash": ["deepseek/deepseek-v4-flash"],
+    [SUBSCRIPTION_PREFERRED_MODEL]: [
+      `deepseek/${DEEPSEEK_FLASH_PINNED_BUILD}`,
+      `deepseek/${SUBSCRIPTION_PREFERRED_MODEL}`,
+    ],
+    "gpt-5.6-luna": ["openai/gpt-5.6-luna"],
+    "glm-5.2": ["z-ai/glm-5.2"],
+    "glm-5.3": ["z-ai/glm-5.3"],
+    "glm-5.3-flash": ["z-ai/glm-5.3-flash"],
+    "mimo-v2.6-flash": ["xiaomi/mimo-v2.6-flash"],
   },
 };
 
 /** The model-id suffix pi expects for `canonicalId` on `provider`. */
 function providerModelId(provider: string, canonicalId: string): string {
-  return PROVIDER_MODEL_IDS[provider]?.[canonicalId] ?? canonicalId;
+  return PROVIDER_MODEL_IDS[provider]?.[canonicalId]?.[0] ?? canonicalId;
 }
 
 interface ModelClassSpec {
@@ -159,8 +181,8 @@ export function canonicalModelId(model: string): string {
   const suffix = bareModelId(model);
   const aliases = PROVIDER_MODEL_IDS[provider];
   if (aliases === undefined) return suffix;
-  for (const [canonical, qualified] of Object.entries(aliases)) {
-    if (qualified === suffix) return canonical;
+  for (const [canonical, wireIds] of Object.entries(aliases)) {
+    if (wireIds.includes(suffix)) return canonical;
   }
   return suffix;
 }

@@ -24,6 +24,18 @@ is cheaper. Today the only override is `deepseek-v4.1-flash`, which prefers
 `llmgateway`. `providerPreferenceFor(modelId)` resolves the effective order
 (canonicalizing provider-qualified ids first).
 
+That canonical id is also the one whose wire id differs per provider: `llmgateway`
+deprecated the unversioned `deepseek-v4.1-flash` slug in favour of the pinned
+`deepseek-v4.1-flash-1017` build, and `opencode-go`'s catalog lists only the bare
+slug (it does not serve the pinned build). `PROVIDER_MODEL_IDS` remaps it per
+provider — `opencode-go` gets the bare slug, `llmgateway` gets
+`deepseek-v4.1-flash-1017`, `openrouter` gets
+`deepseek/deepseek-v4.1-flash-1017` — so a frontier candidate list reads
+`opencode-go/deepseek-v4.1-flash`, `llmgateway/deepseek-v4.1-flash-1017`,
+`openrouter/deepseek/deepseek-v4.1-flash-1017`. Canonicalization
+(`canonicalModelId`) maps both spellings back to `deepseek-v4.1-flash` so class
+lookup and same-model failover partitioning are unaffected.
+
 ## How to Verify
 
 Run these commands from the repository root. Run each command to completion:
@@ -31,17 +43,20 @@ Run these commands from the repository root. Run each command to completion:
 1. ```bash
    pnpm test
    ```
-   Expected: 2650 unit tests in 114 files pass; Vitest exits with status 0.
+   Expected: 3251 unit tests in 124 files pass; Vitest exits with status 0.
    This includes
    the model-class, agent-registry, spawn-fallback, and extension
    phase-threading tests, plus the bd-142 classification cases
    (`classifies the live 410 deactivated-model error as unavailable`,
    `falls back on a deactivated model (410) and cools only that endpoint`).
+   The model-class suite also pins the per-provider wire id split: opencode-go
+   keeps `deepseek-v4.1-flash` while llmgateway/openrouter send the pinned
+   `deepseek-v4.1-flash-1017` build.
 
 2. ```bash
    pnpm test:integration
    ```
-   Expected: 90 integration tests in 11 files pass and Vitest exits with
+   Expected: 106 integration tests in 14 files pass and Vitest exits with
    status 0.
 
 3. ```bash
@@ -121,8 +136,8 @@ candidate list.
   another model in the class. OpenRouter
   serves the same models under vendor-qualified ids (`glm-5.3-flash` →
   `z-ai/glm-5.3-flash`, `mimo-v2.6-flash` → `xiaomi/mimo-v2.6-flash`,
-  `gpt-5.6-luna` → `openai/gpt-5.6-luna`, `deepseek-*` →
-  `deepseek/deepseek-*`), so a candidate looks like
+  `gpt-5.6-luna` → `openai/gpt-5.6-luna`, `deepseek-v4.1-flash` →
+  `deepseek/deepseek-v4.1-flash-1017`), so a candidate looks like
   `openrouter/z-ai/glm-5.3-flash`. A successful result may include a trailing
   `[belayd model fallback] ...` note showing the attempted models. With no
   failure, no fallback note is added.

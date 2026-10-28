@@ -56,6 +56,15 @@ describe("canonicalModelId", () => {
     expect(canonicalModelId("openrouter/deepseek/deepseek-v4.1-flash")).toBe("deepseek-v4.1-flash");
   });
 
+  it("maps a provider's pinned build back to the canonical model id", () => {
+    // llmgateway serves `deepseek-v4.1-flash-1017` for the model opencode-go
+    // calls `deepseek-v4.1-flash`; both must resolve to the same class.
+    expect(canonicalModelId("llmgateway/deepseek-v4.1-flash-1017")).toBe("deepseek-v4.1-flash");
+    expect(canonicalModelId("openrouter/deepseek/deepseek-v4.1-flash-1017")).toBe(
+      "deepseek-v4.1-flash",
+    );
+  });
+
   it("behaves like bareModelId for providers without aliases", () => {
     expect(canonicalModelId("opencode-go/mimo-v2.6-flash")).toBe("mimo-v2.6-flash");
     expect(canonicalModelId("llmgateway/glm-5.2")).toBe("glm-5.2");
@@ -119,8 +128,8 @@ describe("resolveModelCandidates", () => {
       "opencode-go/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
       "opencode-go/deepseek-v4.1-flash",
-      "llmgateway/deepseek-v4.1-flash",
-      "openrouter/deepseek/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash-1017",
+      "openrouter/deepseek/deepseek-v4.1-flash-1017",
     ]);
   });
 
@@ -154,8 +163,10 @@ describe("resolveModelCandidates", () => {
   it("keeps the same model id adjacent across providers", () => {
     const candidates = resolveModelCandidates("frontier");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
-    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+    // The subscription provider keeps the bare slug; the per-token gateways
+    // send the pinned build the deprecated slug routes to.
+    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash-1017");
+    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
     // The non-DeepSeek frontier models flip to the llmgateway-first default.
     expect(candidates[3]).toBe("llmgateway/glm-5.3");
     expect(candidates[4]).toBe("opencode-go/glm-5.3");
@@ -227,8 +238,8 @@ describe("candidatesForModel", () => {
   it("puts the requested model first, then class alternates", () => {
     const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash");
-    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash");
+    expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash-1017");
+    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
   });
 
   it("groups OpenRouter's vendor-qualified id with the same model", () => {
@@ -284,8 +295,8 @@ describe("candidatesForModel", () => {
       "opencode-go/glm-5.3",
       "openrouter/z-ai/glm-5.3",
       "opencode-go/deepseek-v4.1-flash",
-      "llmgateway/deepseek-v4.1-flash",
-      "openrouter/deepseek/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash-1017",
+      "openrouter/deepseek/deepseek-v4.1-flash-1017",
       "llmgateway/gpt-5.6-luna",
       "opencode-go/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
@@ -301,8 +312,8 @@ describe("candidatesForModel", () => {
       "opencode-go/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
       "opencode-go/deepseek-v4.1-flash",
-      "llmgateway/deepseek-v4.1-flash",
-      "openrouter/deepseek/deepseek-v4.1-flash",
+      "llmgateway/deepseek-v4.1-flash-1017",
+      "openrouter/deepseek/deepseek-v4.1-flash-1017",
     ]);
   });
 

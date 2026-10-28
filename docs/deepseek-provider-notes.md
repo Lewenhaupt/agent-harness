@@ -38,11 +38,19 @@ test — not the request shape.
 | `deepseek-v4-pro` | **official** API id |
 | `deepseek-v4-flash` | **retired**; still accepted and legacy-routed to V4.1-Flash-1017 |
 | `deepseek-v4.1-flash` | **not** an official DeepSeek id — the provider slug gateways serve |
+| `deepseek-v4.1-flash-1017` | pinned build of the same model; `llmgateway` deprecated the unversioned slug (and prices the pinned build at $0.15/$0.60 per M against $0.10/$0.30), `openrouter` serves it as `deepseek/deepseek-v4.1-flash-1017`, `opencode-go` does not list it |
 
 `src/model-classes.ts` lists the *gateway* ids on purpose: the default provider
 preference tries `llmgateway`, then `opencode-go`, then `openrouter`, except for
 `deepseek-v4.1-flash`, whose `MODEL_PROVIDER_PREFERENCE` entry puts `opencode-go`
 first (the subscription bucket is cheaper than per-token for that one model).
+That canonical id stays `deepseek-v4.1-flash` because opencode-go serves it under
+that slug; `PROVIDER_MODEL_IDS` maps the per-token providers to the pinned
+`deepseek-v4.1-flash-1017` build instead of renaming the canonical id, so the
+subscription preference keeps keying off the model it was written for while
+llmgateway/openrouter never receive a slug llmgateway has deprecated. The
+trailing `deepseek/deepseek-v4.1-flash` openrouter entry is only a reverse alias,
+so markers written before the build swap still canonicalize.
 Those orders resolve `deepseek-v4.1-flash` / `deepseek-v4-flash` as shipped. Note
 that `opencode-go`'s live catalog does not serve `deepseek-v4-flash` at all, so
 the pins that use it (`documentation` / `hotfix` implement) point at
