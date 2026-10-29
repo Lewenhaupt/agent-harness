@@ -13,6 +13,7 @@ import type {
   FleetMemberProgress,
   FleetRun,
   FleetTickAction,
+  FleetTickProgress,
   FleetWorkflowProgressSnapshot,
 } from "../fleet-run.js";
 import {
@@ -21,7 +22,12 @@ import {
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
+  FLEET_RUN_TICK_INTERVAL_MS,
   finishFleetRun,
+  fleetMemberSignature,
+  fleetMemberSignatures,
+  fleetProgressChanged,
+  fleetTickProgress,
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
@@ -31,6 +37,7 @@ import {
   planGateNotices,
   planOutsideFleetLandings,
   recordFleetGateNotices,
+  recordFleetTickProgress,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
@@ -596,7 +603,13 @@ describe("planFleetTick", () => {
   it("stops a member that needs a human, with the reason carried through", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"] }),
-      observations: [observation("bd-12", { kind: "phase-failed", detail: "gate failed" })],
+      observations: [
+        observation("bd-12", {
+          kind: "phase-failed",
+          detail: "gate failed",
+          key: "failed:implement",
+        }),
+      ],
       now: 5_000,
     });
     expect(action).toEqual({
@@ -610,7 +623,9 @@ describe("planFleetTick", () => {
   it("waits while a member is working under a live lease", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"] }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live", 1_000)],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live", 1_000),
+      ],
       now: 5_000,
     });
     expect(action.kind).toBe("wait");
@@ -620,7 +635,12 @@ describe("planFleetTick", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"] }),
       observations: [
-        observation("bd-12", { kind: "running", detail: "2/5 phases complete" }, "absent", 1_000),
+        observation(
+          "bd-12",
+          { kind: "running", detail: "2/5 phases complete", key: "phases:2/5" },
+          "absent",
+          1_000,
+        ),
       ],
       now: 1_000 + FLEET_RUN_START_GRACE_MS + 1,
     });
@@ -703,7 +723,7 @@ describe("planFleetTick", () => {
   it("stops the loop when nothing has progressed for too long", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"] }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" })],
+      observations: [observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" })],
       now: 5_000,
       idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
     });
@@ -725,7 +745,11 @@ describe("planFleetTick", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12", "bd-15"], run: run0 }),
       observations: [
-        observation("bd-12", { kind: "phase-failed", detail: "gate failed" }),
+        observation("bd-12", {
+          kind: "phase-failed",
+          detail: "gate failed",
+          key: "failed:implement",
+        }),
         observation("bd-15", { kind: "complete" }),
       ],
       now: 5_000,
@@ -787,7 +811,9 @@ describe("planFleetTick", () => {
     const stopped = stopRun({ taskId: "bd-12" });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: stopped }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live"),
+      ],
       now: 5_000,
     });
     expect(action).toMatchObject({ kind: "wait" });
@@ -799,7 +825,9 @@ describe("planFleetTick", () => {
     const stopped = stopRun({ taskId: "bd-12" });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: stopped }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "absent")],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "absent"),
+      ],
       now: 5_000,
     });
     expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
@@ -809,7 +837,9 @@ describe("planFleetTick", () => {
     const stopped = stopRun({ taskId: "bd-12" });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: stopped }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live"),
+      ],
       now: 5_000,
       idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
     });
@@ -826,7 +856,9 @@ describe("planFleetTick", () => {
     });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: stopped }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live")],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live"),
+      ],
       now: 5_000,
     });
     expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
@@ -1071,7 +1103,9 @@ describe("emptyAdvanceAction", () => {
 
     const next = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: ticked }),
-      observations: [observation("bd-12", { kind: "running", detail: "2/5" }, "live", 2_000)],
+      observations: [
+        observation("bd-12", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live", 2_000),
+      ],
       now: 3_000,
     });
     expect(next).toMatchObject({ kind: "wait" });
@@ -1264,7 +1298,11 @@ describe("releaseRunMembers (bd-166)", () => {
   function observations(): FleetMemberObservation[] {
     return [
       observation("bd-12", { kind: "complete" }, "absent"),
-      observation("bd-15", { kind: "phase-failed", detail: "gate failed" }, "absent"),
+      observation(
+        "bd-15",
+        { kind: "phase-failed", detail: "gate failed", key: "failed:implement" },
+        "absent",
+      ),
       observation("bd-19", { kind: "complete" }, "absent"),
       observation("bd-22", { kind: "missing", detail: "never started" }, "absent"),
     ];
@@ -1316,7 +1354,9 @@ describe("releaseRunMembers (bd-166)", () => {
     const plan = releaseRunMembers({
       intent: intent({ taskIds: ["bd-15"] }),
       run: terminalRun(),
-      observations: [observation("bd-15", { kind: "running", detail: "2/5" }, "live", 1_000)],
+      observations: [
+        observation("bd-15", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live", 1_000),
+      ],
       reason: "run-halted",
       now: 2_000,
     });
@@ -1351,7 +1391,14 @@ describe("releaseRunMembers (bd-166)", () => {
     const plan = releaseRunMembers({
       intent: intent({ taskIds: ["bd-15"] }),
       run: running,
-      observations: [observation("bd-15", { kind: "running", detail: "3/5" }, "absent", 1_000)],
+      observations: [
+        observation(
+          "bd-15",
+          { kind: "running", detail: "3/5", key: "phases:3/5" },
+          "absent",
+          1_000,
+        ),
+      ],
       reason: "run-halted",
       now: 2_000,
     });
@@ -1403,5 +1450,403 @@ describe("planOutsideFleetLandings (bd-166)", () => {
         branchOnBase: async () => true,
       }),
     ).toEqual([]);
+  });
+});
+
+/**
+ * Idle accounting by member progress (bd-172).
+ *
+ * `idleTicks` used to count only ticks that *acted*, so a single-member wave whose
+ * phase took longer than `FLEET_RUN_MAX_IDLE_TICKS` halted as `stalled` by
+ * construction — the tick that observes work in flight only ever waits. These cases
+ * drive the loop's own accounting (`fleetTickProgress` → `planFleetTick` →
+ * `recordFleetTickProgress`, the order `fleetTick` runs it in) without timers.
+ */
+describe("idle accounting by member progress", () => {
+  /** One tick of the loop, exactly as `fleetTick` wires it (observe → plan → record). */
+  function tick(options: {
+    run: FleetRun;
+    observations: readonly FleetMemberObservation[];
+    now: number;
+  }): { run: FleetRun; action: FleetTickAction; progress: FleetTickProgress } {
+    const progress = fleetTickProgress({ run: options.run, observations: options.observations });
+    const action = planFleetTick({
+      intent: intent({
+        taskIds: options.observations.map((entry) => entry.taskId),
+        run: options.run,
+      }),
+      observations: options.observations,
+      now: options.now,
+      idleTicks: progress.idleTicks,
+      maxIdleTicks: progress.maxIdleTicks,
+    });
+    const run = recordFleetTickProgress({
+      run: options.run,
+      now: options.now,
+      acted: action.kind === "land" || action.kind === "stop" || action.kind === "advance",
+      // The loop's own exit, mirroring the extension: a halt or completion ends the
+      // ticker (a pause leaves the run active so a resume re-baselines).
+      stopped: action.kind === "halt" || action.kind === "complete",
+      progress,
+    });
+    return { run, action, progress };
+  }
+
+  const IMPLEMENT: FleetMemberProgress = {
+    kind: "running",
+    detail: "phase run in flight: implement",
+    key: "in-flight:implement",
+  };
+
+  function memberRun(): FleetRun {
+    return startFleetRun({ now: 0, accept: true, members: [{ taskId: MEMBER }] });
+  }
+
+  it("resets the idle counter on an observed phase change, even though the tick waits", () => {
+    // Baseline tick: the first sighting of a member establishes what "unchanged"
+    // means, so it is not itself progress.
+    const baseline = tick({
+      run: memberRun(),
+      observations: [observation(MEMBER, IMPLEMENT)],
+      now: 1,
+    });
+    expect(baseline.run.idleTicks).toBe(1);
+
+    // One tick below the cap, the member finishes phase 2 of 5: nothing acted, and
+    // that is exactly the tick the old accounting counted as idle.
+    const nearCap: FleetRun = { ...baseline.run, idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 };
+    const advanced = tick({
+      run: nearCap,
+      observations: [
+        observation(MEMBER, { kind: "running", detail: "2/5 phases complete", key: "phases:2/5" }),
+      ],
+      now: 2,
+    });
+    expect(advanced.progress.changed).toBe(true);
+    expect(advanced.progress.idleTicks).toBe(0);
+    expect(advanced.action).toMatchObject({ kind: "wait" });
+    expect(advanced.run.idleTicks).toBe(0);
+    expect(advanced.run.ticks).toBe(nearCap.ticks + 1);
+  });
+
+  it("still halts a genuinely frozen member at the cap, naming it and the counters", () => {
+    const frozen = [observation(MEMBER, IMPLEMENT)];
+    const baseline = tick({ run: memberRun(), observations: frozen, now: 1 });
+    const nearCap: FleetRun = { ...baseline.run, idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 };
+
+    const waiting = tick({ run: nearCap, observations: frozen, now: 2 });
+    expect(waiting.progress.changed).toBe(false);
+    expect(waiting.action).toMatchObject({ kind: "wait" });
+    expect(waiting.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+
+    const halted = tick({ run: waiting.run, observations: frozen, now: 3 });
+    expect(halted.action).toMatchObject({ kind: "halt", reason: "stalled" });
+    const detail = detailOf(halted.action);
+    expect(detail).toContain(MEMBER);
+    expect(detail).toContain(`${FLEET_RUN_MAX_IDLE_TICKS} ticks`);
+    expect(detail).toContain("still in flight");
+    // The tick that gives up must not reset the count that justified it, and the
+    // recorded counter is clamped so it agrees with the `(cap 240)` audit line.
+    expect(halted.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+    // The baseline dies with the loop: only a pause can be resumed, and its next
+    // tick must re-establish what "unchanged" means.
+    expect(halted.run).not.toHaveProperty("memberSignatures");
+  });
+
+  it("runs a wave whose individual phases stay under the cap without stalling", () => {
+    // Five phases, each observed for 150 ticks (37.5 min at the 15 s cadence): every
+    // phase is shorter than the 240-tick cap, and each start and completion is
+    // progress, so the 600+ tick wave runs through. This is the observed bug's shape
+    // (implement 47 min, review 18 min) — no single phase run outlasted the cap, and
+    // the run still halted as stalled. A single phase *longer* than the cap is the
+    // documented boundary, pinned by the test below.
+    const phases = ["plan", "implement", "review", "test", "commit"];
+    const ticksPerPhase = 150;
+    expect(ticksPerPhase).toBeLessThan(FLEET_RUN_MAX_IDLE_TICKS);
+    let clock = 1;
+    let state = tick({
+      run: memberRun(),
+      observations: [observation(MEMBER, { kind: "starting", detail: "launched, no state yet" })],
+      now: clock,
+    });
+    const halts: FleetTickAction[] = [];
+    for (const [index, phase] of phases.entries()) {
+      const inFlight: FleetMemberProgress = {
+        kind: "running",
+        detail: `phase run in flight: ${phase}`,
+        key: `in-flight:${phase}`,
+      };
+      for (let observed = 0; observed < ticksPerPhase; observed += 1) {
+        clock += FLEET_RUN_TICK_INTERVAL_MS;
+        state = tick({ run: state.run, observations: [observation(MEMBER, inFlight)], now: clock });
+        if (state.action.kind === "halt") halts.push(state.action);
+      }
+      // The phase completes: the member's workflow state moves on.
+      clock += FLEET_RUN_TICK_INTERVAL_MS;
+      state = tick({
+        run: state.run,
+        observations: [
+          observation(MEMBER, {
+            kind: "running",
+            detail: `${index + 1}/5 phases complete`,
+            key: `phases:${index + 1}/5`,
+          }),
+        ],
+        now: clock,
+      });
+      if (state.action.kind === "halt") halts.push(state.action);
+    }
+
+    expect(halts).toEqual([]);
+    expect(isFleetRunActive(state.run)).toBe(true);
+    expect(state.run.ticks).toBeGreaterThan(FLEET_RUN_MAX_IDLE_TICKS);
+    expect(state.run.idleTicks ?? 0).toBeLessThan(FLEET_RUN_MAX_IDLE_TICKS);
+
+    // A finished workflow is landed on the next tick as usual.
+    clock += FLEET_RUN_TICK_INTERVAL_MS;
+    const landed = tick({
+      run: state.run,
+      observations: [observation(MEMBER, { kind: "complete" })],
+      now: clock,
+    });
+    expect(landed.action).toEqual({ kind: "land", taskId: MEMBER });
+  });
+
+  it("halts a single phase run that outlasts the cap and waits through one that does not", () => {
+    // Nothing in the member worktree changes meaningfully *during* a phase run (the
+    // manifest is written when the phase starts, the workflow state when it ends), so
+    // the in-flight signature is constant for the run's whole duration. A phase that
+    // outlasts the cap is therefore a real stall for a human — that is the documented
+    // boundary, not an accident of the accounting.
+    const steadyPhase = (ticks: number): { run: FleetRun; halts: FleetTickAction[] } => {
+      let state = tick({
+        run: memberRun(),
+        observations: [observation(MEMBER, IMPLEMENT)],
+        now: 1,
+      });
+      const halts: FleetTickAction[] = [];
+      for (let observed = 1; observed < ticks; observed += 1) {
+        state = tick({
+          run: state.run,
+          observations: [observation(MEMBER, IMPLEMENT)],
+          now: observed + 1,
+        });
+        if (state.action.kind === "halt") halts.push(state.action);
+      }
+      return { run: state.run, halts };
+    };
+
+    const underCap = steadyPhase(FLEET_RUN_MAX_IDLE_TICKS - 1);
+    expect(underCap.halts).toEqual([]);
+    expect(underCap.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS - 1);
+    expect(isFleetRunActive(underCap.run)).toBe(true);
+
+    const atCap = steadyPhase(FLEET_RUN_MAX_IDLE_TICKS);
+    expect(atCap.halts).toEqual([]);
+    expect(atCap.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+
+    const overCap = steadyPhase(FLEET_RUN_MAX_IDLE_TICKS + 1);
+    expect(overCap.halts).toHaveLength(1);
+    expect(overCap.halts[0]).toMatchObject({ kind: "halt", reason: "stalled" });
+    // The recorded counter agrees with the audit line the halt carries.
+    expect(overCap.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+  });
+
+  it("counts a first sighting as a baseline, not as progress", () => {
+    const running = [observation(MEMBER, IMPLEMENT)];
+    // A member the previous tick never saw has no signature to differ from: the tick
+    // that launched it already reset the counter, and crediting the first sighting
+    // would let a frozen run reset itself forever.
+    expect(fleetProgressChanged({ previous: [], current: fleetMemberSignatures(running) })).toBe(
+      false,
+    );
+    expect(
+      fleetProgressChanged({
+        previous: fleetMemberSignatures(running),
+        current: fleetMemberSignatures(running),
+      }),
+    ).toBe(false);
+    // A member that left the observation set did move.
+    expect(fleetProgressChanged({ previous: fleetMemberSignatures(running), current: [] })).toBe(
+      true,
+    );
+  });
+
+  it("keys the signature on stable identity, never on volatile detail", () => {
+    // A retried phase rewrites its failure reason on every attempt: same phase, same
+    // progress. Free text must never reach the comparison key.
+    expect(
+      fleetMemberSignature({
+        kind: "phase-failed",
+        detail: "phase implement failed: model timed out",
+        key: "failed:implement",
+      }),
+    ).toBe(
+      fleetMemberSignature({
+        kind: "phase-failed",
+        detail: "phase implement failed: gate exited 1",
+        key: "failed:implement",
+      }),
+    );
+    // The phase identity itself is progress.
+    expect(
+      fleetMemberSignature({ kind: "running", detail: "2/5 phases complete", key: "phases:2/5" }),
+    ).not.toBe(
+      fleetMemberSignature({ kind: "running", detail: "3/5 phases complete", key: "phases:3/5" }),
+    );
+    expect(
+      fleetMemberSignature({ kind: "running", detail: "in flight", key: "in-flight:review" }),
+    ).not.toBe(
+      fleetMemberSignature({ kind: "running", detail: "in flight", key: "in-flight:test" }),
+    );
+    expect(fleetMemberSignature({ kind: "complete" })).toBe("complete");
+  });
+
+  it("still halts when only the free-text detail changes, so a crash loop cannot reset the cap", () => {
+    // The review case: a member re-reports the same failed phase with new model text
+    // on every attempt. Comparing details would call each re-report progress and the
+    // stall cap could never fire for the loop it exists to catch.
+    const volatile = (text: string): FleetMemberObservation =>
+      observation(
+        MEMBER,
+        {
+          kind: "running",
+          detail: `phase run in flight: implement (${text})`,
+          key: "in-flight:implement",
+        },
+        "live",
+        0,
+      );
+    const baseline = tick({ run: memberRun(), observations: [volatile("first")], now: 1 });
+    const nearCap: FleetRun = { ...baseline.run, idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 };
+
+    const waiting = tick({ run: nearCap, observations: [volatile("attempt 2")], now: 2 });
+    expect(waiting.progress.changed).toBe(false);
+    expect(waiting.action).toMatchObject({ kind: "wait" });
+    expect(waiting.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+
+    const halted = tick({ run: waiting.run, observations: [volatile("attempt 3")], now: 3 });
+    expect(halted.progress.changed).toBe(false);
+    expect(halted.action).toMatchObject({ kind: "halt", reason: "stalled" });
+    expect(detailOf(halted.action)).toContain(MEMBER);
+  });
+
+  it("does not carry the progress baseline across a pause", () => {
+    // A pause is a wall-clock gap the loop is not watching. If the baseline survived
+    // it, the first tick after resume would compare across that gap; clearing it (as
+    // the pause tick does) makes the next tick re-baseline while the idle counter
+    // keeps its budget instead of restarting.
+    const frozen = [observation(MEMBER, IMPLEMENT)];
+    const beforePause: FleetRun = {
+      ...memberRun(),
+      idleTicks: 3,
+      memberSignatures: [{ taskId: MEMBER, signature: fleetMemberSignature(IMPLEMENT) }],
+    };
+    const paused = recordFleetTickProgress({
+      run: beforePause,
+      now: 4,
+      acted: true,
+      stopped: true,
+      progress: fleetTickProgress({ run: beforePause, observations: frozen }),
+    });
+    expect(paused).not.toHaveProperty("memberSignatures");
+    // The pause tick is not progress, so the counter continues.
+    expect(paused.idleTicks).toBe(4);
+
+    // The member moves *while* the loop is paused: a retained baseline would read
+    // that as a change on the resume tick and hand the run a fresh 240-tick window.
+    const advanced: FleetMemberProgress = {
+      kind: "running",
+      detail: "1/2 phases complete",
+      key: "phases:1/2",
+    };
+    const resumed = tick({ run: paused, observations: [observation(MEMBER, advanced)], now: 5 });
+    expect(resumed.progress.changed).toBe(false);
+    expect(resumed.run.idleTicks).toBe(5);
+    // ... and it establishes the baseline the following ticks compare against.
+    expect(resumed.run.memberSignatures).toEqual([
+      { taskId: MEMBER, signature: fleetMemberSignature(advanced) },
+    ]);
+    // The tick after that does see the change and resets, as progress should.
+    const next = tick({
+      run: resumed.run,
+      observations: [
+        observation(MEMBER, { kind: "running", detail: "2/2 phases complete", key: "phases:2/2" }),
+      ],
+      now: 6,
+    });
+    expect(next.progress.changed).toBe(true);
+    expect(next.run.idleTicks).toBe(0);
+  });
+
+  it("resets the counter the capacity wait reads, so a moved member does not halt the wave", () => {
+    // `emptyAdvanceAction` halts on its own idle counter because no member is in
+    // flight; that counter must be the one the tick's observations just reset.
+    const capacity = {
+      taskId: "bd-19",
+      reason: "capacity" as const,
+      detail: "4/4 slots are busy",
+    };
+    const waveIntent = intent({ taskIds: [MEMBER], deferred: [capacity] });
+    const baseline = fleetTickProgress({
+      run: { ...memberRun(), idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 },
+      observations: [observation(MEMBER, IMPLEMENT)],
+    });
+    // No baseline yet, so nothing moved: the cap is still one tick away.
+    expect(baseline.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS - 1);
+    expect(
+      emptyAdvanceAction({
+        intent: waveIntent,
+        idleTicks: baseline.idleTicks,
+        maxIdleTicks: baseline.maxIdleTicks,
+      }),
+    ).toMatchObject({
+      kind: "wait",
+    });
+
+    const moved = fleetTickProgress({
+      run: {
+        ...memberRun(),
+        idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1,
+        memberSignatures: fleetMemberSignatures([observation(MEMBER, IMPLEMENT)]),
+      },
+      observations: [observation(MEMBER, { kind: "complete" })],
+    });
+    expect(moved.changed).toBe(true);
+    expect(moved.idleTicks).toBe(0);
+    expect(
+      emptyAdvanceAction({
+        intent: waveIntent,
+        idleTicks: moved.idleTicks,
+        maxIdleTicks: moved.maxIdleTicks,
+      }),
+    ).toMatchObject({
+      kind: "wait",
+    });
+  });
+
+  it("treats a legacy run record without signatures as a safe baseline", () => {
+    // A record written before this field existed has no baseline. It must not read as
+    // progress (no spurious reset) and must not halt early (the counter is preserved).
+    const legacy: FleetRun = { ...memberRun(), idleTicks: FLEET_RUN_MAX_IDLE_TICKS - 1 };
+    expect(legacy).not.toHaveProperty("memberSignatures");
+    const progress = fleetTickProgress({
+      run: legacy,
+      observations: [observation(MEMBER, IMPLEMENT)],
+    });
+    expect(progress.changed).toBe(false);
+    expect(progress.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS - 1);
+
+    const waiting = tick({ run: legacy, observations: [observation(MEMBER, IMPLEMENT)], now: 2 });
+    expect(waiting.action).toMatchObject({ kind: "wait" });
+    expect(waiting.run.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
+    expect(waiting.run.memberSignatures).toHaveLength(1);
+
+    const halted = tick({
+      run: waiting.run,
+      observations: [observation(MEMBER, IMPLEMENT)],
+      now: 3,
+    });
+    expect(halted.action).toMatchObject({ kind: "halt", reason: "stalled" });
   });
 });

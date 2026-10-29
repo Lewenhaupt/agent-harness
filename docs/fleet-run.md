@@ -100,12 +100,30 @@ recorded (`haltedReason`), because both need a human:
 
 - `parked` — the root checkout could not be restored after a merge (reconcile,
   then re-arm).
-- `stalled` — `FLEET_RUN_MAX_IDLE_TICKS` ticks with no progress (240 at the 15 s
-  interval). The run stops instead of spinning; the record names the members still
-  in flight — or, when the wave is capacity-blocked, the members waiting for a
-  slot. An advance that launches nothing because of a `dependency` or
-  `external-blocker` — and no `capacity` entry — does not wait for this cap at
-  all: it ends the run as `partial` on that tick.
+- `stalled` — `FLEET_RUN_MAX_IDLE_TICKS` ticks with no **member progress** (240 at
+  the 15 s interval, i.e. ~60 min). Progress is what the tick *observes*, not only
+  what it does: each member has a progress signature — its workflow state kind plus a
+  **stable** identity for that kind (the phase run in flight, the completed-phase
+  count, the failed phase, or just the kind when it is the whole identity) — and any
+  signature that differs from the previous tick's snapshot resets the counter, even
+  though that tick's action was a plain wait. The free-text `detail` (a failure
+  reason is model text) is **never** part of that comparison: a crash-looping member
+  re-reports the same failed phase with new text on every attempt, and treating that
+  as progress would disable the cap. So a member that starts and finishes phases
+  keeps the run alive wave after wave — **as long as no single phase run outlasts
+  the cap**. The in-flight signature is the phase run itself, and the member's
+  worktree has nothing that changes meaningfully *during* one (the run manifest is
+  written when the phase starts, the workflow state when it ends), so a phase that
+  takes longer than 240 ticks (~60 min) halts the run as `stalled` for a human
+  instead of being waited on forever. A member whose workflow says the same thing
+  for the whole window hits the cap the same way — that is the case the cap exists
+  for. The run stops instead of spinning; the record keeps the counter
+  at the cap (the giving-up tick does not add a 241st idle tick) and names the
+  members still in flight with the counters that justified the halt (`no member
+  progressed for 240 ticks (cap 240); bd-143 still in flight`) — or, when the wave is
+  capacity-blocked, the members waiting for a slot. An advance that launches nothing
+  because of a `dependency` or `external-blocker` — and no `capacity` entry — does
+  not wait for this cap at all: it ends the run as `partial` on that tick.
 
 A halt is terminal **for that run record**: `haltedReason` is never cleared, and
 both the ticker (`fleetTick`) and `resumeFleetRunLoop` only act on an active run
@@ -220,7 +238,7 @@ One action per tick, in this order (`src/fleet-run.ts`):
 | 0 | `halt` | the fleet is paused (`resume` restarts) or parked (needs a human) |
 | 1 | `land` | the first landable member whose workflow is complete (all phases done, or a completed final-phase run with no state file), including one the run stopped earlier and whose retry finished |
 | 2 | `stop` | the first member that needs a human: `awaiting-human`, `phase-failed`, `phase-interrupted`, `state-corrupt`, or `orchestrator-missing` |
-| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached, then `halt`/`stalled` |
+| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached (no member's progress signature changed for `FLEET_RUN_MAX_IDLE_TICKS` ticks), then `halt`/`stalled` |
 | 4 | `advance` | nothing is working and the deferred list is non-empty; an advance that launches nothing degrades to `complete`/`partial` — or to `wait` when **any** deferral names `capacity` (a mixed `capacity` + `dependency` list included), bounded by the same idle cap (then `halt`/`stalled`) |
 | 5 | `complete` | nothing is working and no deferred work remains (`partial` when something stopped) |
 
@@ -256,6 +274,29 @@ line names a viable retry). An unreadable **or vanished** fleet intent after the
 advance halts the loop instead of classifying from the stale deferrals. A real
 launch still counts as progress: it resets `idleTicks` and reschedules the next
 tick at the 2 s action interval.
+
+**Progress is observed, not only acted on (bd-172).** Each tick reduces every
+member's progress to a signature (`kind` plus the progress's stable `key`) and
+compares it with the snapshot the previous tick stored on the run
+(`memberSignatures`). Any change — a phase run starting or finishing, the
+completed-phase count advancing, a member becoming `complete`, failing on a *new*
+phase, or awaiting a human — resets `idleTicks` before the plan runs, so the plan
+and the capacity wait read the same reset counter. A changed failure *text* is not
+progress: two attempts at the same failed phase carry the same key. Without the
+observation rule, only a landing, stop, or launch reset the counter, and any
+single-member wave whose *phases together* outlasted the cap halted as `stalled`
+by construction while its member was healthy — the observed bug was a 47-minute
+implement followed by an 18-minute review: 65 minutes of healthy work, no single
+phase over the cap. The bound is one phase run: the signature cannot see inside a
+run, so a single phase longer than ~60 minutes is reported as stalled on purpose,
+and `belayd_fleet_status` names the member so a human can decide. An action that
+did something still counts as progress; a `halt` or `pause` never does.
+
+**A pause drops the baseline.** Only a paused run is ticked again, and the resume can
+come an arbitrary wall-clock time later. So the tick that ends the loop deletes
+`memberSignatures`: the first tick after a resume establishes a fresh baseline
+without counting a reset, while `idleTicks` keeps the budget it had — a frozen
+member cannot buy a new stall window by being paused and resumed.
 
 A stop takes the member *out of the plan*, never out of the fleet: `taskIds` keeps
 it (its worktree, branch, and bead are still live), `run.stopped` says why it needs
@@ -331,6 +372,9 @@ tick and never counts as a landing.
   ],
   "stopped": [{ "taskId": "bd-15", "reason": "phase-failed", "detail": "…", "at": 1792947309781 }],
   "idleTicks": 0,
+  "memberSignatures": [
+    { "taskId": "bd-36", "signature": "running:phases:3/5" }
+  ],
   "finishedAt": 1792947400000,
   "outcome": "complete"
 }
@@ -341,6 +385,21 @@ tick and never counts as a landing.
   rather than waited on forever.
 - `landedAt` is what makes landing idempotent across ticks and supervisor restarts,
   and what satisfies dependents' edges before the bead is closed.
+- `memberSignatures` is the previous tick's view of each member (`kind` plus the
+  progress's stable `key`, e.g. `running:phases:3/5`, `running:in-flight:review`,
+  `phase-failed:failed:implement`), which is what makes `idleTicks` mean *fleet*
+  progress: a tick that observes a changed signature resets the counter even when
+  its action is a wait, so a wave that keeps moving through phases cannot stall
+  mid-wave (bd-172). The granularity is one phase run — the in-flight key changes
+  only when a different phase starts — so a single phase longer than the cap is
+  still a stall (see the `stalled` halt above). The free-text `detail` is
+  display-only and never compared, so re-reported model text cannot reset the cap. A
+  member seen for the first time has no baseline and is not counted as progress —
+  the launch tick already reset the counter — and a genuinely frozen member never
+  changes it, so the 240-tick cap still halts. The field lives on the run record so a
+  supervisor restart keeps the baseline, and it is dropped on every tick that ends
+  the loop (a pause included), so a resume re-baselines instead of comparing across
+  the operator's gap.
 - A new launch on a fleet with a live run adds members to it instead of starting a
   second run.
 

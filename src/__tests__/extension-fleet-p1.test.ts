@@ -38,6 +38,7 @@ import {
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
   fleetEventsDir,
   fleetInboxDir,
+  fleetMemberSignature,
   fleetNoteFileName,
   formatFleetRefusal,
   readFleetIntent,
@@ -2849,9 +2850,9 @@ describe("fleet run mode", () => {
     expect(halted.intent?.run?.finishedAt).toBeUndefined();
     expect(halted.intent?.run?.haltedReason).toContain("stalled");
     expect(halted.intent?.run?.haltedReason).toContain("bd-19 (capacity)");
-    // The tick that gives up must not reset the count that justified it: like the
-    // plan's own `idleOrWait` halt, it counts as one more idle tick (never `0`).
-    expect(halted.intent?.run?.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS + 1);
+    // The tick that gives up must not reset the count that justified it, and the
+    // recorded counter is clamped to the cap so the record agrees with the audit line.
+    expect(halted.intent?.run?.idleTicks).toBe(FLEET_RUN_MAX_IDLE_TICKS);
     expect(auditEntries("fleet-run-halted")).toHaveLength(1);
 
     // The timer is stopped: the cap costs one last re-plan (the halt is decided after
@@ -2860,6 +2861,218 @@ describe("fleet run mode", () => {
     await vi.advanceTimersByTimeAsync(300_000);
     expect(auditEntries("capacity-blocked")).toHaveLength(plannedBefore);
     expect(auditEntries("fleet-run-halted")).toHaveLength(1);
+  });
+
+  it("does not stall a healthy member whose phase advanced since the last tick (bd-172)", async () => {
+    // The observed bug: a single-member wave whose phase takes longer than the cap
+    // halted as stalled while the member was working, because only a landing, stop,
+    // or launch reset the counter. The tick's own observation is progress.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // The member's worktree is running its implement phase, so this tick observes
+    // `phase run in flight: implement` where the previous tick saw `starting`.
+    const memberPath = join(worktree.path, "feat-bd-12");
+    // The probe is stubbed: without this the tick would read the member as missing.
+    worktree.branchPath = memberPath;
+    const written = writeWorkflowState({
+      cwd: memberPath,
+      state: {
+        schemaVersion: 1,
+        taskId: "bd-12",
+        workflowType: "feature",
+        resolutionSource: "default",
+        branch: "feat/bd-12",
+        originalCwd: memberPath,
+        phaseOrder: ["plan", "implement"],
+        completedPhaseNames: [],
+        startedAt: 1,
+        updatedAt: 1,
+      },
+    });
+    if (!written.ok) throw new Error(`could not write workflow state: ${written.error}`);
+    const manifest = writeRunManifest({
+      cwd: memberPath,
+      manifest: {
+        schemaVersion: 1,
+        runId: "run-implement",
+        taskId: "bd-12",
+        phase: "implement",
+        sessionName: "belayd-bd-12-implement",
+        status: RunStatus.Running,
+        startedAt: Date.now(),
+      },
+    });
+    if (!manifest.ok) throw new Error(`could not write run manifest: ${manifest.error}`);
+
+    // Seeded *at* the cap: this is the tick the old accounting halted on, so a plan
+    // that reads the record's counter instead of the tick's would give up here. The
+    // baseline is the one the previous tick would have stored. Built through the
+    // persisted type (not a raw cast): the record is the contract.
+    const seeded = updateFleetIntent({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      update: (current) => {
+        if (current?.run === undefined) return { refuse: "the run record is missing" };
+        return {
+          ...current,
+          run: {
+            ...current.run,
+            idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+            memberSignatures: [
+              {
+                taskId: "bd-12",
+                // What production would have stored on the tick that saw the member
+                // before its phase run started.
+                signature: fleetMemberSignature({
+                  kind: "starting",
+                  detail: "launched, no phase has started yet",
+                }),
+              },
+            ],
+          },
+        };
+      },
+    });
+    expect(seeded).toHaveProperty("ok", true);
+
+    await vi.advanceTimersByTimeAsync(1);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.haltedReason).toBeUndefined();
+    expect(after.intent?.run?.finishedAt).toBeUndefined();
+    expect(after.intent?.run?.idleTicks).toBe(0);
+    expect(after.intent?.run?.memberSignatures).toEqual([
+      { taskId: "bd-12", signature: "running:in-flight:implement" },
+    ]);
+    expect(auditEntries("fleet-run-halted")).toHaveLength(0);
+  });
+
+  it("keeps the capacity wait alive on a tick whose member moved (bd-172)", async () => {
+    // The capacity wait halts on its own counter because it only runs with no member
+    // in flight, so it must read the same tick value the plan did: a stale record
+    // counter here would give up on the very tick a member advanced.
+    await stopEveryMemberInRun();
+    liveness.memberTaskIds = ["bd-12"];
+
+    // What moves this tick is the stopped member's retry: its implement phase failed
+    // where the previous tick's baseline saw the phase run in flight. A failed phase
+    // is not "a live retry" (`stoppedMembersRetrying` only credits `starting` and a
+    // live-lease `running`), so with every member stopped the tick reaches the
+    // capacity-blocked advance instead of the in-flight wait.
+    const memberPath = join(worktree.path, "feat-bd-12");
+    // Per-branch: only bd-12 has a worktree, so the wave's bd-19 is not mistaken for
+    // a second orchestrator in the member's tree.
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    const written = writeWorkflowState({
+      cwd: memberPath,
+      state: {
+        schemaVersion: 1,
+        taskId: "bd-12",
+        workflowType: "feature",
+        resolutionSource: "default",
+        branch: "feat/bd-12",
+        originalCwd: memberPath,
+        phaseOrder: ["plan", "implement"],
+        completedPhaseNames: [],
+        startedAt: 1,
+        updatedAt: 1,
+      },
+    });
+    if (!written.ok) throw new Error(`could not write workflow state: ${written.error}`);
+    const manifest = writeRunManifest({
+      cwd: memberPath,
+      manifest: {
+        schemaVersion: 1,
+        runId: "run-implement",
+        taskId: "bd-12",
+        phase: "implement",
+        sessionName: "belayd-bd-12-implement",
+        status: RunStatus.Failed,
+        failureReason: "gate exited 1",
+        startedAt: Date.now(),
+      },
+    });
+    if (!manifest.ok) throw new Error(`could not write run manifest: ${manifest.error}`);
+
+    // One slot, already held by the live bd-12, so the wave is capacity-blocked. The
+    // counter is seeded at the cap and the baseline one signature behind (the phase
+    // run the failure ended), exactly as a run that reached the cap just before that
+    // phase failed would look.
+    editIntent((intent) => {
+      const run = intent.run as Record<string, unknown>;
+      return {
+        ...intent,
+        maxConcurrent: 1,
+        deferred: [{ taskId: "bd-19", reason: "capacity", blockers: [], detail: "no free slot" }],
+        run: {
+          ...run,
+          idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+          memberSignatures: [
+            {
+              taskId: "bd-12",
+              signature: fleetMemberSignature({
+                kind: "running",
+                detail: "phase run in flight: implement",
+                key: "in-flight:implement",
+              }),
+            },
+          ],
+        },
+      };
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.haltedReason).toBeUndefined();
+    expect(after.intent?.run?.idleTicks).toBe(0);
+    expect(auditEntries("capacity-blocked").length).toBeGreaterThan(0);
+    expect(auditEntries("fleet-run-halted")).toHaveLength(0);
+  });
+
+  it("drops the progress baseline when a pause halts the loop (bd-172 review)", async () => {
+    // A paused run is resumable, so its baseline would otherwise be compared across
+    // the operator's wall-clock gap. The pause tick must leave no baseline behind.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // The first tick establishes the baseline the pause tick must drop.
+    await vi.advanceTimersByTimeAsync(1);
+    const baselined = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(baselined).toHaveProperty("ok", true);
+    if (!baselined.ok) return;
+    expect(baselined.intent?.run?.memberSignatures).toHaveLength(1);
+
+    const pause = mock.tools.get("belayd_fleet_pause");
+    if (pause === undefined) throw new Error("belayd_fleet_pause was not registered");
+    const paused = await pause.execute(
+      "pause-1",
+      { reason: "stepping away" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(paused.details).toHaveProperty("exitCode", 0);
+    // The ticker stops at its next tick, which is the pause halt.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    // Paused, not halted: the run is still active so a resume can tick it again.
+    expect(after.intent?.run?.haltedReason).toBeUndefined();
+    expect(after.intent?.run?.finishedAt).toBeUndefined();
+    expect(after.intent?.run).not.toHaveProperty("memberSignatures");
   });
 
   it("halts when the fleet record disappears while an advance is in flight", async () => {

@@ -498,7 +498,13 @@ stop the first member that needs a human, advance the deferred wave, or finish:
   it again. A parked or stalled run is halted and recorded (`haltedReason`), and a
   halt is terminal for that run record: `resume` only restarts a *paused* run, so a
   halted one continues only through a re-arm (after `belayd_fleet_reconcile` for a
-  parked fleet).
+  parked fleet). A run stalls only when **no member's progress changed** for
+  `FLEET_RUN_MAX_IDLE_TICKS` ticks — a member moving through phases keeps the run
+  alive wave after wave, though the cap still applies to a *single* phase run: no
+  field in the member's worktree changes while one phase works, so a phase longer
+  than 60 minutes is reported as stalled (bd-172). The comparison uses each member's
+  stable progress identity (phase, phase count), never free-text output such as a
+  failure reason, and the recorded counter stops at the cap.
 - **A re-arm restarts the loop.** After a supervisor restart (or a halt), `/fleet
   <ids> --fleet <id>` preserves the members and starts a new run record in place of
   the old one. The run-mode supervisor heartbeat is what makes that re-arm

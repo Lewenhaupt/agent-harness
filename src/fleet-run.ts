@@ -162,6 +162,19 @@ const FleetRunStopSchema = z.object({
 });
 
 /**
+ * One member's progress signature, as the run record remembers it (bd-172).
+ *
+ * The signature is the member's {@link FleetMemberProgress} reduced to the facts a
+ * tick may compare: its `kind` plus its stable `key` (never free text), so a member
+ * that starts or finishes a phase changes its signature even while the tick's action
+ * is a plain wait, and a member that only re-reports a failure message does not.
+ */
+const FleetMemberSignatureSchema = z.object({
+  taskId: z.string().min(1).max(128),
+  signature: z.string().min(1).max(FLEET_RUN_DETAIL_MAX_LENGTH),
+});
+
+/**
  * The persisted record of one "run until complete" loop.
  *
  * It lives inside `fleet.json` (`run`) because the loop must survive a supervisor
@@ -186,6 +199,24 @@ export const FleetRunSchema = z.object({
   stopped: z.array(FleetRunStopSchema).max(FLEET_RUN_MEMBERS_MAX).optional(),
   /** Consecutive ticks in which no member progressed. */
   idleTicks: z.number().int().nonnegative().optional(),
+  /**
+   * Each member's progress signature at the previous tick (bd-172).
+   *
+   * `idleTicks` used to count only ticks that *acted*, so a single-member wave whose
+   * phase took longer than the stall cap halted as `stalled` while the member was
+   * healthy — by construction, since a tick that observes work in flight always
+   * waits. Keeping the previous signature lets the next tick ask the question the
+   * cap is meant to ask: did any member's workflow state actually change? It lives
+   * on the run record (not in memory) so a supervisor restart cannot lose the
+   * baseline and reset a genuinely frozen run's counter.
+   *
+   * The signature is `kind` plus the progress's stable `key` — never its free-text
+   * `detail`, which carries volatile model text (a failure reason) that would look
+   * like progress on every retry. It is dropped on every tick that ends the loop, so
+   * a resume after a pause re-establishes its baseline instead of comparing across
+   * the gap (bd-172 review).
+   */
+  memberSignatures: z.array(FleetMemberSignatureSchema).max(FLEET_RUN_MEMBERS_MAX).optional(),
   finishedAt: z.number().finite().optional(),
   outcome: z.enum(FLEET_RUN_OUTCOMES).optional(),
   /** Why a run stopped without finishing (paused, stalled, authority lost). */
@@ -275,13 +306,20 @@ export type FleetWorkflowProgressSnapshot =
  * Coarse progress of one member. Deliberately about *workflow* progress, not
  * liveness: liveness is the orchestrator lease, and the two are combined by
  * {@link planFleetTick} so neither can stand in for the other.
+ *
+ * `detail` is **display only**. The kinds whose identity can move while the member
+ * sits in the same `kind` (a phase run starting or finishing, a failure landing in a
+ * new phase) also carry a `key`: the stable, non-volatile token the stall accounting
+ * compares. Free text must never reach that comparison — a crash-looping member
+ * retries with a different `failureReason` every attempt, and treating that as
+ * progress would disable the cap (bd-172 review).
  */
 export type FleetMemberProgress =
-  | { kind: "running"; detail: string }
+  | { kind: "running"; detail: string; key: string }
   | { kind: "complete" }
   | { kind: "awaiting-human"; detail: string }
-  | { kind: "phase-failed"; detail: string }
-  | { kind: "phase-interrupted"; detail: string }
+  | { kind: "phase-failed"; detail: string; key: string }
+  | { kind: "phase-interrupted"; detail: string; key: string }
   | { kind: "state-corrupt"; detail: string }
   | { kind: "starting"; detail: string }
   | { kind: "missing"; detail: string };
@@ -497,17 +535,31 @@ export function deriveFleetMemberProgress(
 function progressFromActiveRuns(runs: readonly RunManifest[]): FleetMemberProgress | undefined {
   const running = runs.filter((run) => run.status === RunStatus.Running);
   if (running.length > 0) {
-    const phases = [...new Set(running.map((run) => run.phase))].join(", ");
-    return { kind: "running", detail: `phase run in flight: ${phases}` };
+    // Sorted so the directory read order cannot look like progress on the next tick.
+    const phaseNames = [...new Set(running.map((run) => run.phase))].sort();
+    return {
+      kind: "running",
+      detail: `phase run in flight: ${phaseNames.join(", ")}`,
+      key: `in-flight:${phaseNames.join(",")}`,
+    };
   }
   const interrupted = runs.filter((run) => run.status === RunStatus.Interrupted);
   if (interrupted.length > 0) {
-    const phases = [...new Set(interrupted.map((run) => run.phase))].join(", ");
-    return { kind: "phase-interrupted", detail: `interrupted phase run: ${phases}` };
+    const phaseNames = [...new Set(interrupted.map((run) => run.phase))].sort();
+    return {
+      kind: "phase-interrupted",
+      detail: `interrupted phase run: ${phaseNames.join(", ")}`,
+      key: `interrupted:${phaseNames.join(",")}`,
+    };
   }
   return undefined;
 }
 
+/**
+ * The failure reason is model text, so it may be displayed but never compared: two
+ * attempts at the same failed phase would otherwise look like progress on every
+ * retry, and the stall cap could never fire for the crash loop it exists to catch.
+ */
 function describeFailure(run: RunManifest): string {
   return `phase ${run.phase} failed${run.failureReason === undefined ? "" : `: ${run.failureReason}`}`;
 }
@@ -527,10 +579,13 @@ function progressFromWorkflow(
   const failed = latestPerPhase(runs).find(
     (run) => run.status === RunStatus.Failed && !completed.has(run.phase),
   );
-  if (failed !== undefined) return { kind: "phase-failed", detail: describeFailure(failed) };
+  if (failed !== undefined) {
+    return { kind: "phase-failed", detail: describeFailure(failed), key: `failed:${failed.phase}` };
+  }
   return {
     kind: "running",
     detail: `${workflow.completedPhaseNames.length}/${workflow.phaseOrder.length} phases complete`,
+    key: `phases:${workflow.completedPhaseNames.length}/${workflow.phaseOrder.length}`,
   };
 }
 
@@ -556,11 +611,12 @@ function progressFromMissingState(options: DeriveFleetMemberProgressOptions): Fl
     return { kind: "complete" };
   }
   if (newest.status === RunStatus.Failed) {
-    return { kind: "phase-failed", detail: describeFailure(newest) };
+    return { kind: "phase-failed", detail: describeFailure(newest), key: `failed:${newest.phase}` };
   }
   return {
     kind: "running",
     detail: `no workflow state; newest run is ${newest.phase} (${newest.status})`,
+    key: `newest:${newest.phase}:${newest.status}`,
   };
 }
 
@@ -868,11 +924,17 @@ function boundRunDetail(detail: string, maxLength: number = FLEET_RUN_DETAIL_MAX
 /** Members still working: wait, unless the run has made no progress for too long. */
 function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): FleetTickAction {
   const maxIdle = options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS;
-  if ((options.idleTicks ?? 0) >= maxIdle) {
+  const idleTicks = options.idleTicks ?? 0;
+  if (idleTicks >= maxIdle) {
+    // Both counters and the stuck members, because the durable line is all a human
+    // sees later: it must say how long nothing moved, and on whom.
     return {
       kind: "halt",
       reason: "stalled",
-      detail: `no member progressed for ${maxIdle} ticks; ${members.join(", ")} still in flight`,
+      detail: boundRunDetail(
+        `no member progressed for ${idleTicks} ticks (cap ${maxIdle}); ` +
+          `${formatTaskIdList(members)} still in flight`,
+      ),
     };
   }
   return { kind: "wait", detail: `${members.length} member(s) in flight: ${members.join(", ")}` };
@@ -1062,6 +1124,163 @@ export function recordRunTick(options: {
     ticks: options.run.ticks + 1,
     idleTicks: options.progressed ? 0 : (options.run.idleTicks ?? 0) + 1,
   };
+}
+
+// ── Progress accounting (pure) ───────────────────────────────────────
+
+/** One member's progress signature, keyed so a later tick can compare it. */
+export interface FleetMemberSignature {
+  taskId: string;
+  signature: string;
+}
+
+/**
+ * Reduce a member's progress to the string the run record compares.
+ *
+ * `kind` alone is not enough: a member that finishes phase 2 of 5 is still
+ * `running`, and that transition is exactly the progress a stall must not miss. The
+ * `key` carries that identity structurally (phase run in flight, completed-phase
+ * count, failed phase), never the free-text `detail` — see
+ * {@link FleetMemberProgress}. Kinds whose detail is a fixed sentence have no key,
+ * because their `kind` is the whole identity.
+ */
+export function fleetMemberSignature(progress: FleetMemberProgress): string {
+  // Bounded so a pathological phase name can never fail the run record's schema on
+  // the next read: the signature is persisted and re-validated.
+  return ("key" in progress ? `${progress.kind}:${progress.key}` : progress.kind).slice(
+    0,
+    FLEET_RUN_DETAIL_MAX_LENGTH,
+  );
+}
+
+/** The signatures of one tick's observations, in observation order. */
+export function fleetMemberSignatures(
+  observations: readonly FleetMemberObservation[],
+): FleetMemberSignature[] {
+  return observations.map((observation) => ({
+    taskId: observation.taskId,
+    signature: fleetMemberSignature(observation.progress),
+  }));
+}
+
+/**
+ * Whether any member's workflow state moved since the previous tick.
+ *
+ * A member the previous tick never saw has no baseline and is **not** progress: the
+ * tick that launched it already reset the counter, and crediting the first sighting
+ * would let a run whose members never move keep resetting itself forever — the same
+ * false negative as the bug this replaces, in the other direction. A member that
+ * disappears from the observation set *is* progress (it landed, or the intent
+ * changed underneath the loop).
+ */
+export function fleetProgressChanged(options: {
+  previous: readonly FleetMemberSignature[] | undefined;
+  current: readonly FleetMemberSignature[];
+}): boolean {
+  const previous = new Map(
+    (options.previous ?? []).map((entry) => [entry.taskId, entry.signature]),
+  );
+  for (const entry of options.current) {
+    const before = previous.get(entry.taskId);
+    if (before !== undefined && before !== entry.signature) return true;
+  }
+  const current = new Set(options.current.map((entry) => entry.taskId));
+  // Unreachable from the wired loop today: `readFleetMemberObservations` emits one
+  // observation per `taskIds` entry, so the observed set can only shrink when the
+  // operator removes an id. The branch guards the *shape*: a future observation
+  // source that filters members (say, one that skips a worktree it cannot read) must
+  // not let silence look like a frozen member, so losing a member counts as a change.
+  // It cannot become a perpetual-reset hole: the recorder stores the current set, so
+  // the reset happens exactly once and the next tick compares against the shrunk set.
+  return [...previous.keys()].some((taskId) => !current.has(taskId));
+}
+
+/** What one tick's observations say about fleet progress, and the plan's idle cap. */
+export interface FleetTickProgress {
+  /** The idle count the plan must decide on: `0` when any member's signature moved. */
+  idleTicks: number;
+  /**
+   * The cap this tick measures `idleTicks` against.
+   *
+   * Carried on the tick's own progress so the plan, the capacity wait and the
+   * recorded clamp read one value instead of each defaulting separately.
+   */
+  maxIdleTicks: number;
+  /** This tick's signatures; the run record keeps them as the next tick's baseline. */
+  signatures: readonly FleetMemberSignature[];
+  /** Whether any member's progress signature differed from the previous tick's. */
+  changed: boolean;
+}
+
+/**
+ * Decide what one tick's observations mean for the idle counter.
+ *
+ * This is the half of the tick that must happen *before* planning: `planFleetTick`
+ * and `emptyAdvanceAction` halt on the counter, so a tick that observed progress
+ * has to hand them a reset counter — otherwise a member that advances on the very
+ * tick the counter reaches the cap would still be declared stalled.
+ */
+export function fleetTickProgress(options: {
+  run: FleetRun;
+  observations: readonly FleetMemberObservation[];
+  /** Cap override; the loop never sets one, so production has exactly one cap. */
+  maxIdleTicks?: number;
+}): FleetTickProgress {
+  const signatures = fleetMemberSignatures(options.observations);
+  const changed = fleetProgressChanged({
+    previous: options.run.memberSignatures,
+    current: signatures,
+  });
+  return {
+    idleTicks: changed ? 0 : (options.run.idleTicks ?? 0),
+    maxIdleTicks: options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS,
+    signatures,
+    changed,
+  };
+}
+
+/**
+ * Record a tick's counters, progress, and the signatures the next tick compares.
+ *
+ * Progress is either an observation change or an action that did something (a land,
+ * a stop, a real launch, a completion). A *halt* (or a pause) is never progress: the
+ * tick that gives up must not reset the count that justified it, and the recorded
+ * counter is clamped to the cap so the record agrees with the audit line naming it.
+ *
+ * A tick that ended the loop also drops the signature baseline. Only a *paused* run
+ * is ever ticked again, and a resume is an arbitrarily long wall-clock gap: the next
+ * tick must re-establish its baseline instead of claiming the member changed (or did
+ * not) across a time the loop was not watching (bd-172 review). For a terminal halt
+ * or finish the baseline is dead weight anyway.
+ */
+export function recordFleetTickProgress(options: {
+  run: FleetRun;
+  now: number;
+  /** Whether the executed action did something (landed, stopped, launched). */
+  acted: boolean;
+  /** Whether this tick ended the run loop: a halt, a pause, a completion, a lost record. */
+  stopped: boolean;
+  progress: FleetTickProgress;
+}): FleetRun {
+  // A completion is progress; a halt or a pause is not (`finishedAt` is what tells
+  // the terminal finish from every other way the loop stops).
+  const halted = options.stopped && options.run.finishedAt === undefined;
+  const ticked = recordRunTick({
+    run: options.run,
+    now: options.now,
+    progressed: options.progress.changed || (options.acted && !halted),
+  });
+  const next: FleetRun = { ...ticked };
+  if (options.stopped) {
+    delete next.memberSignatures;
+    // The tick's own cap: the same value the plan and capacity wait decided on.
+    next.idleTicks = Math.min(next.idleTicks ?? 0, options.progress.maxIdleTicks);
+    return next;
+  }
+  const signatures = options.progress.signatures;
+  if (signatures.length === 0) delete next.memberSignatures;
+  else next.memberSignatures = [...signatures];
+  return next;
 }
 
 /** Close a run so no later tick resumes it. */

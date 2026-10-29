@@ -181,6 +181,7 @@ import {
   fleetBeadTaskIds,
   fleetMemberTaskIds,
   fleetModeForId,
+  fleetTickProgress,
   formatArchifyIgnoredParamsNote,
   formatArchifyResult,
   formatArtifactIndex,
@@ -293,10 +294,10 @@ import {
   reapFleetOrderingGatesByPrefix,
   reconcileAuthority,
   recordFleetGateNotices,
+  recordFleetTickProgress,
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
-  recordRunTick,
   releaseOrchestratorClaim,
   releaseRunMembers,
   replaceOrchestratorClaim,
@@ -8167,6 +8168,14 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     now: number;
     /** What this tick observed, for the terminal release sweep (bd-166). */
     observations: readonly FleetMemberObservation[];
+    /**
+     * The idle counter the plan decided on (bd-172): 0 when a member's progress
+     * signature moved. Every idempotence guard on this path must read the same value,
+     * or the capacity wait would halt on a counter the plan just reset.
+     */
+    idleTicks: number;
+    /** The cap that counter is measured against, from the same `FleetTickProgress`. */
+    maxIdleTicks: number;
   }
 
   /**
@@ -8458,8 +8467,12 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       deferred: refreshed.intent.deferred ?? [],
       reason: options.reason,
       refused: options.refused,
-      // The run record is the only idle counter; a second one would drift from it.
-      idleTicks: context.run.idleTicks ?? 0,
+      // The tick's own counter, already reset when an observation moved this tick
+      // (bd-172): the run record is the only durable one, and re-reading it here
+      // would hash a decision the plan just made against stale evidence. The cap is
+      // the same one the plan used, so no two guards can diverge.
+      idleTicks: context.idleTicks,
+      maxIdleTicks: context.maxIdleTicks,
     });
     switch (action.kind) {
       case "wait":
@@ -9438,6 +9451,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       run: tickRun,
       now,
     });
+    // Progress is observed, not merely acted on (bd-172): a tick whose members moved
+    // through their phases is progress even though the action it takes is a wait, and
+    // the plan below must see the reset counter so it cannot declare a healthy member
+    // stalled on the tick it advanced.
+    const progress = fleetTickProgress({ run: tickRun, observations });
     // Reap before planning: a gate whose member is gone must not outlive the tick
     // that could have noticed, and a closed blocker bead means its dependent is no
     // longer waiting on the fleet.
@@ -9452,7 +9470,8 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       intent: tickIntent,
       observations,
       now,
-      idleTicks: tickRun.idleTicks ?? 0,
+      idleTicks: progress.idleTicks,
+      maxIdleTicks: progress.maxIdleTicks,
     });
     const result = await executeFleetTickAction({
       ctx,
@@ -9462,9 +9481,18 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       action,
       now,
       observations,
+      idleTicks: progress.idleTicks,
+      maxIdleTicks: progress.maxIdleTicks,
     });
-    const progressed = result.acted && action.kind !== "halt";
-    const ticked = recordRunTick({ run: result.run, now, progressed });
+    const ticked = recordFleetTickProgress({
+      run: result.run,
+      now,
+      acted: result.acted,
+      // The loop's own stop is the fact that matters: a pause/halt must not count as
+      // progress or keep its baseline, a completion must (bd-172 review).
+      stopped: result.stop,
+      progress,
+    });
     // The gate-notice ledger rides on the run this tick persists, so the next
     // rotation does not re-notify the same drifted or unrecordable gate.
     persistFleetRun({
