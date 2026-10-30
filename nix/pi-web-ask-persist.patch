@@ -1,0 +1,127 @@
+--- a/src/client/src/chatQuestions.ts
++++ b/src/client/src/chatQuestions.ts
+@@ -8,11 +8,41 @@
+   writable: boolean;
+ }
+ 
+-/** The last visible page is not necessarily the active conversation's tail. */
++/**
++ * The newest question set that no answer or skip has resolved yet.
++ *
++ * Deliberately not "the question at the tail": anything appended after a set —
++ * the human's own next message, a phase-completion follow-up, a subsession
++ * notice, a tool boundary — would otherwise collapse the form into a card with
++ * no controls, record no outcome, and tell the model nothing, silently dropping
++ * questions the human never answered. The backend already resolves an ask from
++ * anywhere on the branch (`submitAsk`: "Reply to a durable question entry, even
++ * after later conversation or replies"), so keeping the newest unresolved set
++ * live at its own transcript position uses the durability the protocol has.
++ *
++ * Only the newest set opens, so a conversation never shows two live forms, and an
++ * older unanswered set is not resurrected once a newer one was answered.
++ *
++ * The page gates stay: the question must be reachable from the loaded tail of the
++ * active conversation (not a page that stops short of it) and the session must be
++ * writable.
++ */
+ export function openTranscriptQuestion(messages: readonly ChatLine[], context: QuestionTailContext): AskUserRequest | undefined {
+   if (!context.historyReady || !context.writable || context.messageEnd < context.messageTotal) return undefined;
+-  const last = messages.at(-1)?.parts.at(-1);
+-  return last?.type === "askUserQuestion" ? last.ask : undefined;
++  const newest = newestQuestion(messages);
++  if (newest === undefined) return undefined;
++  return transcriptQuestionOutcomes(messages).has(newest.askId) ? undefined : newest;
++}
++
++function newestQuestion(messages: readonly ChatLine[]): AskUserRequest | undefined {
++  for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
++    const parts = messages[messageIndex]?.parts ?? [];
++    for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
++      const part = parts[partIndex];
++      if (part?.type === "askUserQuestion") return part.ask;
++    }
++  }
++  return undefined;
+ }
+ 
+ /** Responses remain separate transcript facts; none is treated as stale. */
+--- a/src/client/src/chatQuestions.test.ts
++++ b/src/client/src/chatQuestions.test.ts
+@@ -10,6 +10,16 @@
+ const question: ChatLine = { role: "tool", parts: [{ type: "askUserQuestion", ask }] };
+ const tail = { historyReady: true, writable: true, messageEnd: 2, messageTotal: 2 };
+ 
++const reply = (outcomeOf: AskUserRequest, reason: AskUserOutcome["reason"] = "submitted"): AskUserOutcome => ({
++  ...outcomeOf,
++  closedAt: "2026-07-20T10:05:00.000Z",
++  reason,
++  questions: outcomeOf.questions.map((one) => ({ question: one, answered: false, values: [] })),
++  answeredCount: 0,
++  unansweredIds: outcomeOf.questions.map((one) => one.id),
++  summary: "Answered 0 of 1; unanswered: q",
++});
++
+ it("opens a rehydrated question only on the writable, ready current tail", () => {
+   expect(openTranscriptQuestion([question], tail)).toBe(ask);
+   expect(openTranscriptQuestion([question], { ...tail, messageEnd: 1 })).toBeUndefined();
+@@ -17,33 +27,49 @@
+   expect(openTranscriptQuestion([question], { ...tail, writable: false })).toBeUndefined();
+ });
+ 
+-describe("later conversation entries close the question without needing an outcome", () => {
++describe("later conversation entries keep the newest question open", () => {
++  // Anything appended after a question set used to collapse its form into a card
++  // with no controls (and no outcome delivered). Only an answer or a skip closes
++  // it now, so the human keeps the chance to answer.
+   it.each<ChatLine>([
+     { role: "user", parts: [{ type: "text", text: "Continue without answers" }] },
+     { role: "assistant", parts: [{ type: "thinking", text: "plan" }] },
+     { role: "assistant", parts: [{ type: "text", text: "streamed reply" }] },
+     { role: "system", parts: [{ type: "text", text: "Child session completed" }] },
+     { role: "tool", parts: [{ type: "toolResultBoundary", toolCallId: "earlier-call" }] },
+-  ])("closes on $role/$parts.0.type", (later) => {
+-    expect(openTranscriptQuestion([question, later], tail)).toBeUndefined();
++  ])("stays open across a later $role/$parts.0.type", (later) => {
++    expect(openTranscriptQuestion([question, later], tail)).toBe(ask);
+   });
+ 
+   it("opens only the newer question", () => {
+     const newer = { ...ask, askId: "ask-2" };
+     expect(openTranscriptQuestion([question, { role: "tool", parts: [{ type: "askUserQuestion", ask: newer }] }], tail)).toBe(newer);
+   });
++
++  it("closes on a recorded answer wherever the reply sits in the transcript", () => {
++    const messages: ChatLine[] = [question, { role: "assistant", parts: [{ type: "text", text: "thanks" }] },
++      { role: "system", parts: [{ type: "askUserRecord", outcome: reply(ask) }] }];
++    expect(openTranscriptQuestion(messages, tail)).toBeUndefined();
++  });
++
++  it("does not resurrect an older unanswered question once a newer one was answered", () => {
++    const older = { ...ask, askId: "ask-0" };
++    const newer = { ...ask, askId: "ask-2" };
++    const messages: ChatLine[] = [
++      { role: "tool", parts: [{ type: "askUserQuestion", ask: older }] },
++      { role: "tool", parts: [{ type: "askUserQuestion", ask: newer }] },
++      { role: "system", parts: [{ type: "askUserRecord", outcome: reply(newer, "cancelled") }] },
++    ];
++    expect(openTranscriptQuestion(messages, tail)).toBeUndefined();
++  });
+ });
+ 
+ it("projects every response, including a partial answer and skip, without stale protection", () => {
+-  const reply: AskUserOutcome = {
+-    ...ask, closedAt: "2026-07-20T10:05:00.000Z", reason: "submitted",
+-    questions: ask.questions.map((question) => ({ question, answered: false, values: [] })),
+-    answeredCount: 0, unansweredIds: ["q"], summary: "Answered 0 of 1; unanswered: q",
+-  };
++  const submitted = reply(ask);
+   const messages: ChatLine[] = [question,
+-    { role: "system", parts: [{ type: "askUserRecord", outcome: reply }] },
+-    { role: "system", parts: [{ type: "askUserRecord", outcome: { ...reply, closedAt: "2026-07-20T10:06:00.000Z" } }] },
++    { role: "system", parts: [{ type: "askUserRecord", outcome: submitted }] },
++    { role: "system", parts: [{ type: "askUserRecord", outcome: { ...submitted, closedAt: "2026-07-20T10:06:00.000Z" } }] },
+   ];
+-  expect(transcriptQuestionOutcomes(messages).get(ask.askId)).toEqual([reply, { ...reply, closedAt: "2026-07-20T10:06:00.000Z" }]);
++  expect(transcriptQuestionOutcomes(messages).get(ask.askId)).toEqual([submitted, { ...submitted, closedAt: "2026-07-20T10:06:00.000Z" }]);
+   expect(openTranscriptQuestion(messages, tail)).toBeUndefined();
+ });

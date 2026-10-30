@@ -33,6 +33,7 @@ import type {
   ToolCallEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { ASK_HOLD_MAX_MS, askTail } from "../src/ask-hold.js";
 import {
   CAPACITY_PROBE_URL_ENV,
   createCapacityCache,
@@ -699,7 +700,27 @@ type SessionState = {
   humanAnswerClaimed?: boolean;
   /** The unrecognized-gate warning was already logged for the current wait. */
   humanAnswerWarned?: boolean;
+  /**
+   * Completion follow-ups held because an unanswered `ask_user` question set is
+   * open (bd-177).
+   *
+   * PI WEB renders a question set as a form only while it is the tail of the
+   * transcript; any appended entry closes the card with no controls and records
+   * no outcome. Delivering a completion then both destroys the human's chance to
+   * answer and wakes the model to proceed without it, so the follow-up waits for
+   * the next turn start, which is where an answer, a skip, or the human's own
+   * message arrives.
+   */
+  heldFollowUps?: HeldFollowUp[];
+  /** Bounded release for {@link heldFollowUps}; see {@link ASK_HOLD_MAX_MS}. */
+  heldFollowUpTimer?: ReturnType<typeof setTimeout>;
 };
+
+/** A completion follow-up waiting for the open question set to be resolved. */
+interface HeldFollowUp {
+  label: string;
+  send: () => void;
+}
 
 const sessionStates = new Map<string, SessionState>();
 
@@ -904,6 +925,83 @@ function getSessionState(ctx: { sessionManager: { getSessionId: () => string } }
     sessionStates.set(id, state);
   }
   return state;
+}
+
+/** The slice of a pi session context the follow-up hold reads. */
+type AskHoldContext = { sessionManager: { getBranch?: () => readonly unknown[] } };
+
+/**
+ * Read the active branch defensively.
+ *
+ * `getBranch` is the only accurate view of "what the human sees last", which is
+ * what decides whether a PI WEB question form is still open. A manager without
+ * it (a narrower test double, an older runtime) yields no entries, and the hold
+ * then declines to hold rather than suspending every follow-up.
+ */
+function askHoldBranch(ctx: AskHoldContext): readonly unknown[] {
+  const branch = ctx.sessionManager.getBranch?.();
+  return Array.isArray(branch) ? branch : [];
+}
+
+/**
+ * Send a completion follow-up now, or hold it while a `ask_user` question set is
+ * still unanswered (bd-177).
+ *
+ * Holding is deliberately scoped to the follow-up path: an answer, a skip, and a
+ * user message each arrive as the next turn start, so {@link releaseHeldFollowUps}
+ * runs from `before_agent_start`/`input` rather than from a poll. The timers only
+ * bound the wait for a question set nobody touches.
+ */
+function deliverFollowUp(
+  state: SessionState,
+  ctx: AskHoldContext,
+  label: string,
+  send: () => void,
+): void {
+  if (askTail(askHoldBranch(ctx)).kind === "open") {
+    const held = state.heldFollowUps ?? [];
+    state.heldFollowUps = held;
+    if (held.length === 0) {
+      console.warn(
+        `[belayd-harness] holding the ${label} follow-up: an ask_user question set is still unanswered, and PI WEB closes its form as soon as another message lands (bd-177)`,
+      );
+      const timer = setTimeout(() => {
+        releaseHeldFollowUps(
+          state,
+          `no answer arrived within ${(ASK_HOLD_MAX_MS / 60_000).toString()} minutes`,
+        );
+      }, ASK_HOLD_MAX_MS);
+      timer.unref();
+      state.heldFollowUpTimer = timer;
+    }
+    held.push({ label, send });
+    return;
+  }
+  releaseHeldFollowUps(state);
+  send();
+}
+
+/**
+ * Release held follow-ups in transcript order.
+ *
+ * Safe to call when nothing is held, so every turn start can call it
+ * unconditionally: a wake means something was appended, which means the question
+ * form the hold was protecting is already gone.
+ */
+function releaseHeldFollowUps(state: SessionState, reason?: string): void {
+  if (state.heldFollowUpTimer !== undefined) {
+    clearTimeout(state.heldFollowUpTimer);
+    state.heldFollowUpTimer = undefined;
+  }
+  const held = state.heldFollowUps;
+  state.heldFollowUps = undefined;
+  if (held === undefined || held.length === 0) return;
+  if (reason !== undefined) {
+    console.warn(
+      `[belayd-harness] releasing ${held.length.toString()} held follow-up(s) unanswered: ${reason}`,
+    );
+  }
+  for (const followUp of held) followUp.send();
 }
 
 /** The subset of pi's session manager the bd actor resolution needs. */
@@ -3911,6 +4009,7 @@ export default function belaydAgentHarness(
    */
   function reconcileUserCompletions(options: {
     state: SessionState;
+    ctx: AskHoldContext;
     cwd: string;
     runId?: string;
   }): void {
@@ -3941,22 +4040,27 @@ export default function belaydAgentHarness(
         completedPhaseNames: state.completedPhaseNames,
         awaitingReviewResponse: state.awaitingReviewResponse,
       });
-      pi.sendMessage(
-        {
-          customType: "belayd-run-complete",
-          content: buildUserCompletionContent(run),
-          display: true,
-          details: {
-            runId: run.runId,
-            phaseName: run.phase,
-            taskId: run.taskId,
-            exitCode: 0,
-            completedBy: "user",
+      // Delivery and the delivered-once marker move together: a held follow-up
+      // marks the manifest delivered only when it actually reaches the
+      // transcript, so a crash while holding cannot drop the completion.
+      deliverFollowUp(state, options.ctx, `user completion ${run.runId}`, () => {
+        pi.sendMessage(
+          {
+            customType: "belayd-run-complete",
+            content: buildUserCompletionContent(run),
+            display: true,
+            details: {
+              runId: run.runId,
+              phaseName: run.phase,
+              taskId: run.taskId,
+              exitCode: 0,
+              completedBy: "user",
+            },
           },
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-      markDeliveredOnce(run.runId);
+          { deliverAs: "followUp", triggerTurn: true },
+        );
+        markDeliveredOnce(run.runId);
+      });
     }
   }
 
@@ -3970,12 +4074,18 @@ export default function belaydAgentHarness(
   // never leak to the model.
   pi.on("input", (event, ctx) => {
     const match = /^\[belayd-complete:([^\]]+)\]$/.exec(event.text.trim());
-    if (match === null) return { action: "continue" };
+    if (match === null || match[1] === undefined) {
+      // Ordinary user input closes any PI WEB question set that was open, so a
+      // completion held behind it can go out now (bd-177). The daemon sentinel
+      // below is swallowed and appends nothing, so it must NOT release: the
+      // question form would still be open and the delivery would kill it.
+      releaseHeldFollowUps(getSessionState(ctx));
+      return { action: "continue" };
+    }
     const runId = match[1];
-    if (runId === undefined) return { action: "continue" };
     const state = getSessionState(ctx);
     if (state.gateActive && state.currentTaskId !== "") {
-      reconcileUserCompletions({ state, cwd: ctx.cwd, runId });
+      reconcileUserCompletions({ state, ctx, cwd: ctx.cwd, runId });
     }
     return { action: "handled" };
   });
@@ -4208,7 +4318,7 @@ export default function belaydAgentHarness(
     resumeWorkflowFromDisk(state, ctx.cwd, ctx.sessionManager.getSessionId());
     // A user completion persisted before an orchestrator restart is recovered
     // from disk; the in-memory delivery marker was lost with the process.
-    reconcileUserCompletions({ state, cwd: ctx.cwd });
+    reconcileUserCompletions({ state, ctx, cwd: ctx.cwd });
     // The open human gate (bd-152) is the durable "waiting on a human" state: a
     // restart mid-wait re-discovers it here and re-arms the poll.
     discoverHumanAnswerWait({ ctx, state });
@@ -4749,6 +4859,9 @@ export default function belaydAgentHarness(
       // spawning bd reads — and could `sendUserMessage` into a dead session — so
       // shutdown drops the wait without delivering anything.
       clearHumanAnswerWait(state);
+      // A held follow-up belongs to this session only; its timer must not keep
+      // the process alive or fire into a dead transcript (bd-177).
+      releaseHeldFollowUps(state, "the session shut down");
       releaseSessionOrchestratorLease(state, id, ctx.cwd);
     }
     sessionStates.delete(id);
@@ -5331,7 +5444,7 @@ export default function belaydAgentHarness(
     const state = getSessionState(ctx);
     // File-only fallback: if the daemon wake path never fired (e.g. restart),
     // a pending user completion is still recovered on the next turn.
-    if (state.gateActive) reconcileUserCompletions({ state, cwd: ctx.cwd });
+    if (state.gateActive) reconcileUserCompletions({ state, ctx, cwd: ctx.cwd });
     return planningContextMessage(state) ?? gateContextMessage(state);
   });
 
@@ -5346,6 +5459,10 @@ export default function belaydAgentHarness(
   // paths funnel through `claimHumanAnswer`, which clears the wait before it
   // delivers, so the answer is never injected twice.
   pi.on("before_agent_start", async (_event, ctx) => {
+    // Any turn start means something was appended after a question set, so a
+    // completion held for it is released here (bd-177): an answer, a skip, and
+    // the human's own message all wake the session this way.
+    releaseHeldFollowUps(getSessionState(ctx));
     try {
       const fleet = drainFleetEventsMessage(ctx);
       if (fleet !== undefined) return fleet;
@@ -5419,6 +5536,8 @@ export default function belaydAgentHarness(
     cwd: string;
     worktreeBranch: string | undefined;
     runId: string;
+    /** The orchestrator's context: the follow-up hold reads its live branch (bd-177). */
+    ctx: AskHoldContext;
   }
 
   /** Persist the "running" manifest so a mid-phase crash is resumable. */
@@ -5802,27 +5921,29 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           delivery,
           taskId: state.currentTaskId,
         });
-        pi.sendMessage(
-          {
-            customType: "belayd-run-complete",
-            content: buildRunCompleteContent(
-              delivered,
-              reviewLoopHintFor(delivered, state),
-              userGuideArtifactLine(delivered, { cwd, taskId: state.currentTaskId }),
-            ),
-            display: true,
-            details: {
-              runId: delivery.runId,
-              phaseName: delivery.phaseName,
-              taskId: state.currentTaskId,
-              exitCode: delivery.result.details.exitCode,
-              ...(delivery.failureReason !== undefined
-                ? { failureReason: delivery.failureReason }
-                : {}),
+        deliverFollowUp(state, options.ctx, `${delivery.phaseName} run ${delivery.runId}`, () => {
+          pi.sendMessage(
+            {
+              customType: "belayd-run-complete",
+              content: buildRunCompleteContent(
+                delivered,
+                reviewLoopHintFor(delivered, state),
+                userGuideArtifactLine(delivered, { cwd, taskId: state.currentTaskId }),
+              ),
+              display: true,
+              details: {
+                runId: delivery.runId,
+                phaseName: delivery.phaseName,
+                taskId: state.currentTaskId,
+                exitCode: delivery.result.details.exitCode,
+                ...(delivery.failureReason !== undefined
+                  ? { failureReason: delivery.failureReason }
+                  : {}),
+              },
             },
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+        });
       } catch (error) {
         console.warn(`[belayd-harness] failed to deliver run ${delivery.runId}`, error);
       }
@@ -6012,6 +6133,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     state: SessionState,
     effectiveCwd: string,
     runId: string,
+    ctx: AskHoldContext,
   ): { handle: RunHandle; sessionName: string } {
     const sessionName = computePlanningSubagentSessionName(phaseName, runId);
     const abortController = new AbortController();
@@ -6063,14 +6185,16 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         const header = delivery.success
           ? `✅ **planning ${delivery.phaseName} complete** (run \`${delivery.runId}\`)`
           : `❌ **planning ${delivery.phaseName} failed** (run \`${delivery.runId}\`)`;
-        pi.sendMessage(
-          {
-            customType: "belayd-planning-run-complete",
-            content: `${header}\n\n${text}`,
-            display: true,
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
+        deliverFollowUp(state, ctx, `planning ${delivery.phaseName} run ${delivery.runId}`, () => {
+          pi.sendMessage(
+            {
+              customType: "belayd-planning-run-complete",
+              content: `${header}\n\n${text}`,
+              display: true,
+            },
+            { deliverAs: "followUp", triggerTurn: true },
+          );
+        });
         persistModelTelemetry(effectiveCwd);
       },
       isDelivered: (id) => state.deliveredRunIds.has(id),
@@ -6271,6 +6395,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           cwd,
           worktreeBranch: ownership.branch,
           runId,
+          ctx,
         });
         const ledgerNotice = ledgerWarning === undefined ? "" : `\n\n⚠️ ${ledgerWarning}`;
         return {
@@ -6327,6 +6452,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         state,
         cwd,
         runId,
+        ctx,
       );
       return {
         content: [
@@ -6372,6 +6498,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         state,
         cwd,
         runId,
+        ctx,
       );
       return {
         content: [

@@ -247,6 +247,35 @@ alone (`persistStatus` skips a `completedBy: "user"` manifest). On delivery the
 phase is marked complete in the in-memory and persisted gate state, so the
 process gate lets the next phase run.
 
+## Holding a completion behind an open question (`ask_user`)
+
+A phase or planning completion is delivered as a `belayd-run-complete` /
+`belayd-planning-run-complete` follow-up. PI WEB renders an `ask_user` question
+set as an interactive form only while it is the tail of the transcript, so
+appending that follow-up at the wrong moment used to collapse the form into a
+card with **no controls**, record no outcome, and tell the model nothing — the
+human's questions were silently dropped and the agent was woken to proceed
+without the answers (bd-177).
+
+The harness now holds those follow-ups while the newest `ask_user` result on the
+session branch has no `pi-web.ask.answers` outcome (`src/ask-hold.ts`,
+`deliverFollowUp` in `extensions/index.ts`). Held follow-ups keep their order and
+are released by the next turn start — an answer, a skip, and the human's own
+message all wake the session that way — or by a 10-minute cap
+(`ASK_HOLD_MAX_MS`) so a question set nobody touches cannot stall a workflow. The
+daemon's `[belayd-complete:<runId>]` sentinel appends nothing to the transcript,
+so it deliberately does **not** release a hold.
+
+Verify:
+
+```bash
+pnpm vitest run src/__tests__/ask-hold.test.ts src/__tests__/extension-ask-hold.test.ts
+```
+
+The client half of the fix (a question set stays interactive wherever it sits,
+not only at the tail) is a pi-web patch — see
+[pi-web-service.md](pi-web-service.md#unanswered-question-sets-stay-interactive-bd-177).
+
 ## Implementation Details
 
 Session naming is implemented purely in `src/session-naming.ts`:

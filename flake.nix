@@ -427,6 +427,15 @@
             rev = "5ebda4decf14d759f4ee099e0ce03ddd8d64d85c";
             hash = "sha256-UuULxPfMl6zq5paeJB2lJ2loXe4bldfygXS+nF4izZY=";
           };
+          # bd-177: a question set is interactive only while it is the transcript
+          # tail upstream, so any later entry (the human's own message, a phase
+          # completion, a subsession notice) collapsed the form into a card with
+          # no controls and recorded no outcome — the model was never told its
+          # questions were dropped. The patch opens the newest *unresolved* set
+          # wherever it sits, which is the durability `submitAsk` already has.
+          # Re-check on every pi-web bump: drop it once upstream keeps an
+          # unanswered question set open by itself (`src/client/src/chatQuestions.ts`).
+          patches = [ ./nix/pi-web-ask-persist.patch ];
           npmDepsHash = "sha256-LISPv0qeHS6aRvBvlUBpBOvAOf5zyWpw0hVRG4+WVBs=";
           npmFlags = [
             "--no-audit"

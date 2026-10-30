@@ -56,7 +56,11 @@ Confirm:
   `belayd_plan_research` spawns background sessions named
   `belayd-planning-sub-scout-<runId>` / `belayd-planning-sub-research-<runId>`
   (`computePlanningSubagentSessionName` in `src/session-naming.ts`); their
-  results arrive as `belayd-planning-run-complete` follow-ups.
+  results arrive as `belayd-planning-run-complete` follow-ups. A follow-up that
+  settles while an `ask_user` question set is still unanswered is held until the
+  question is answered or skipped, so the questions are never closed by the
+  completion (bd-177; see
+  [subagent-sessions.md](subagent-sessions.md#holding-a-completion-behind-an-open-question-ask_user)).
 - **New top-level bead created open/backlog**: after the orchestrator
   synthesizes, `bd list --status=open` shows the new bead. `bd show <id>` shows
   `## Overview / ## Steps / ## Test Strategy / ## Risks` in the description/

@@ -512,6 +512,43 @@ if grep -o '[A-Za-z_$]\{1,4\}=3e4' $bundle/index-*.js >/dev/null && ! grep -q 'm
 fi
 ```
 
+### Unanswered question sets stay interactive (bd-177)
+
+Upstream opens an `ask_user` question set only while it is the literal tail of
+the transcript (`src/client/src/chatQuestions.ts`): any appended entry — the
+human's own next message, a phase completion, a subsession notice, a tool
+boundary — turns the card into a `closed-question-card` with no answer or skip
+control, records no outcome, and tells the model nothing. Measured on this host:
+of 105 asks, 9 were closed by a background follow-up (five of them **2 ms** after
+the question was posted) and 9 by the human's own next message, none of them
+reported to the agent.
+
+`nix/pi-web-ask-persist.patch` opens the newest **unresolved** question set
+wherever it sits, which is the durability `submitAsk` already documents ("Reply
+to a durable question entry, even after later conversation or replies"). Only the
+newest set opens, so a conversation never shows two live forms. The harness half
+(holding completions while a question is open) is described in
+[subagent-sessions.md](subagent-sessions.md#holding-a-completion-behind-an-open-question-ask_user).
+
+**Re-check on every pi-web bump**: drop the patch once upstream keeps an
+unanswered question set open by itself. Verify the patch is applied and its
+client tests pass:
+
+```bash
+nix log "$(nix path-info --derivation .#pi-web)" | grep 'applying patch'
+# Runs the patched chatQuestions tests inside the real build environment:
+nix build --impure --no-link --print-out-paths --expr '
+let f = builtins.getFlake "git+file://'"$PWD"'";
+    p = f.packages.${builtins.currentSystem}.pi-web;
+in p.overrideAttrs (old: {
+  buildPhase = "runHook preBuild\nnpx vitest run --config vitest.config.ts src/client/src/chatQuestions.test.ts | tee vitest.log\nrunHook postBuild";
+  installPhase = "mkdir -p $out && cp vitest.log $out/vitest.log";
+})' | xargs -I{} cat {}/vitest.log
+```
+
+A pi-web restart is required for the client half to reach the browser — see the
+restart note above.
+
 ### agent-browser extension (wired in working tree; blocked before rebuild)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
