@@ -120,6 +120,39 @@ DuckDB's message, while the result carries `ok: false` (`details.exitCode` 1).
 code to read — an agent or a driver inspecting the tool result is what detects
 the failure.
 
+## Per-turn cache report (transcripts)
+
+`run_end` is one row per spawned session, so `cache_hit_pct` is a session-level
+average that hides mid-session prompt-cache misses. The session transcripts carry
+a `usage` object on every assistant message, so this report reads them directly
+and needs no new event fields:
+
+```bash
+node scripts/belayd-cache-bust-report.ts [--top N] [--json]
+```
+
+`PI_CODING_AGENT_DIR` (or `--agent-dir`) selects the agent directory, matching the
+backfill. The report prints overall and per-phase hit rates, then the largest
+misses and the sessions with the most misses.
+
+Definitions:
+
+- **miss** — a turn after the first whose `cacheRead` is zero while the provider
+  has served cache hits elsewhere in the session. Sessions with no hits at all
+  are counted as `uncached-sessions`, not as misses.
+- **shrink** — a `cacheRead` drop larger than 5k tokens between turns, which
+  usually means compaction rather than a cache miss.
+- **gap** — wall time since the previous assistant turn. A miss under 60s cannot
+  be cache TTL expiry; the report also counts misses whose provider and model did
+  not change and whose total tokens stayed within 30% of the previous turn, which
+  is the provider-eviction / cache-key-instability signal.
+
+Caveats: the report is transcript-derived, so it covers phase sub-agent sessions
+only (planning and interactive sessions are skipped), and a miss proves the
+provider returned no cached tokens — not why. Some providers report
+`cacheWrite = 0` even when they cache, which is why the write side is reported
+separately rather than folded into the hit rate.
+
 ## Test isolation
 
 The extension tests drive the real extension code, so the metrics append would
