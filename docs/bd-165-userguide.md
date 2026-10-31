@@ -17,8 +17,8 @@ bd-165 classifies a persisted state **before** any lease is claimed:
 | Entry point | File | What it decides |
 |---|---|---|
 | `classifyWorkflowClaimability` | `src/workflow-state.ts:266` | `claimable`, or `inert` with reason `handed-off` / `complete` / `invalid-task-id` |
-| `session_start` | `extensions/index.ts:4115` | claims the lease only from a `claimable` state |
-| `resumeWorkflowFromDisk` | `extensions/index.ts:4046` | archives an `inert` state instead of arming the gate |
+| `session_start` | `extensions/capabilities/workflow-commands.ts` | claims the lease only from a `claimable` state |
+| `resumeWorkflowFromDisk` | `extensions/capabilities/workflow-core.ts` | archives an `inert` state instead of arming the gate |
 | `archiveWorkflowState` | `src/workflow-state.ts:541` | renames `workflow.json` → `workflow.stale-<epoch-ms>-<hex>.json` |
 
 Nothing is deleted: the dead record (including its `handedOffTo` marker) is kept
@@ -145,6 +145,9 @@ commit:
 ```bash
 git worktree add --detach /tmp/bd-165-prefix HEAD
 # after bd-165 lands:
+# branch point: the pre-split path below is what the pickaxe searches for the
+# introducing commit; the current definition lives in
+# extensions/capabilities/workflow-core.ts
 # fix=$(git log --format=%H -n1 -S'archiveInertWorkflow' -- extensions/index.ts)
 # git worktree add --detach /tmp/bd-165-prefix "$fix^"
 

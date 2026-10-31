@@ -158,9 +158,9 @@ Now:
   the resolve. Retrying re-runs only the resolve: the merge queue entry is already
   `merged`, so a second merge of the same member is impossible.
 - **Fleet-side advance is unchanged.** `fleetLandedTaskIds()` in
-  `extensions/index.ts` drops the edges of members this fleet already landed, so
-  the scheduler advances a wave at the same moment the gate is resolved, without a
-  close. The two mechanisms are the two halves of one event.
+  `extensions/capabilities/fleet.ts` drops the edges of members this fleet already
+  landed, so the scheduler advances a wave at the same moment the gate is
+  resolved, without a close. The two mechanisms are the two halves of one event.
 - **The record set is bounded but never truncated.** `fleet.json` holds at most
   256 gate records, and the bound is checked against the **post-adoption** set: a
   gate adopted from bd is a record but not a creation, so a fleet already at the

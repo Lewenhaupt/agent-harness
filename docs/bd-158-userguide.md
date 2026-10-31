@@ -25,7 +25,7 @@ satisfied, and leaves every bead `in_progress` + `human`.
 | Marker render/parse, human-vs-ordering classification, block-list read | `src/bead-gates.ts` |
 | `fleet.json` `orderingGates` schema, `addFleetOrderingGates`, `dropFleetOrderingGates` | `src/fleet-status.ts`, `src/fleet-state.ts` |
 | Launch wiring: create before the intent write, rollback, failed-member prune, `accept` parsing | `src/fleet-launch.ts` |
-| Tick reap, landing resolve, `fleetLandedTaskIds`, `/fleet` and tool handlers | `extensions/index.ts` |
+| Tick reap, landing resolve, `fleetLandedTaskIds`, `/fleet` and tool handlers | `extensions/capabilities/fleet.ts` |
 | Prune reap in a repair | `src/fleet-reconcile.ts` |
 | Gate-notice ledger (`run.gateNoticeIds`) | `src/fleet-run.ts` |
 | `ordering gates open:` / `waiting on:` rendering | `src/fleet-status.ts` |

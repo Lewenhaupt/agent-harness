@@ -40,7 +40,7 @@ import type { FleetStateFs } from "./fleet-state.js";
 import { fleetRoot, readFleetIntent } from "./fleet-state.js";
 import type { FleetIntent } from "./fleet-status.js";
 import { fleetEventsDir, fleetInboxDir, fleetStateDir, sanitizeFleetId } from "./fleet-status.js";
-import { ALL_PHASE_TOOLS } from "./process-gate.js";
+import { ALL_PHASE_TOOLS } from "./workflow-phases.js";
 
 /** The supervisor record stored in `fleet.json`. */
 export type FleetSupervisorRecord = NonNullable<FleetIntent["supervisor"]>;

@@ -40,10 +40,12 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/role-tools.ts` | Per-role tool surfaces |
 | `src/tool-audit.ts` | Tool-surface auditing for the harness |
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
+| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers |
 | `src/workflow-registry.ts` | Workflow sub-type registry — defines 7 workflow types with phase sequences, |
 | `src/workflow-state.ts` | Belayd workflow state persistence |
 | `src/handoff.ts` | Handoff packets carried from a parent session into a spawned orchestrator |
 | `src/quality-gates.ts` | Deterministic quality gates for Belayd agents |
+| `src/quality-gate-run.ts` | Quality-gate runner — the retry loop around a phase's deterministic gates |
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
@@ -61,6 +63,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/bead-comments.ts` | Phase-deliverable bead comments: `[belayd:<phase>]` body header and `bd show` comment stripping |
 | `src/belayd-command-args.ts` | `/belayd` argument parsing |
 | `src/bash-timeout.ts` | Enforce a bounded timeout on every agent bash call |
+| `src/capability-import-boundary.ts` | Capability import boundary (bd-179) |
 | `src/instruction-groups.ts` | Managed instruction groups for the pi system prompt |
 | `src/cast-utils.ts` | Terminal-output cleaning and asciicast parsing utilities |
 
@@ -144,10 +147,99 @@ barrel — a module whose symbols are not re-exported there is internal.
 |---|---|
 | `extensions/bootstrap.ts` | `/bootstrap` pi extension — scaffold a new pnpm + turbo repo in place |
 | `extensions/honcho-memory.ts` | Honcho memory pi extension — standalone entry point for bundling |
-| `extensions/index.ts` | Belayd agent harness — pi project-level extension |
+| `extensions/index.ts` | Belayd agent harness — pi project-level extension **composer** (see below) |
 | `extensions/llmgateway-refresh.ts` | LLM Gateway models refresh — pi project-level extension |
 | `extensions/stale-file-guard.ts` | Stale-file guard pi extension — standalone entry point for bundling |
 | `extensions/worktree-guard.ts` | Worktree file guard — pi project-level extension |
+| `extensions/capabilities/*.ts` | One module per harness capability; not pi entry points (see below) |
+
+#### Capability modules (bd-179)
+
+`extensions/index.ts` used to carry every capability, so every change landed in
+one 13k-line file. It is now the **composer**: it owns the entry point (the
+`harnessAlreadyLoaded` claim, `FleetForceStopSeams` normalization, the
+`registered from <module>` log line, and the `default export
+belaydAgentHarness(pi, seamOverrides)` signature), and it calls one
+`register<Capability>(pi, deps)` per capability in the original registration
+order so pi hook/tool order is unchanged.
+
+| Module | Capability |
+|---|---|
+| `context.ts` | Shared plumbing: exec helpers, tool-result shaping, metrics recording, phase-name constants, `CoreSessionState` |
+| `fleet.ts` | The allowlisted fleet slice of the session state (`FleetSessionState`) |
+| `archify.ts` | `belayd_archify` diagram tool |
+| `bd.ts` | `bd` CLI proxy tool |
+| `commit.ts` | `belayd_commit` + `belayd_stack_rebase`, commit preflight/runners, commit-body helpers |
+| `doctor.ts` | `belayd_doctor` packaging/tool-surface report |
+| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping |
+| `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
+| `outline.ts` | `belayd_outline` symbol map |
+| `proof.ts` | Proof dirs, receipt resolution, `belayd_proof_verifier` |
+| `review.ts` | Review scoping/build (`buildReviewTask`), bounded review delivery, review↔fix guidance |
+| `session-state.ts` | Per-session state store (generic over the composed type), ask-hold, beads-actor attribution, run tracking, status formatting |
+| `model.ts` | Model-routing state (bd-116): capacity cache, per-workflow telemetry store, cooldown store, flush/reset rules |
+| `daemon.ts` | pi-web session-daemon socket API and web-server HTTP helpers |
+| `hooks.ts` | Bash timeout, process-gate `tool_call` refusal, uncommitted-files notice, workflow-completion teardown |
+| `workflow-core.ts` | Gate lifecycle (`activateGate`, `applyToolGate`, `evaluateToolCallGate`), workflow messaging, phase ledger, handoff disarm, resume-from-disk, user-completion reconcile, worktree ownership |
+| `phase-run.ts` | `startPhaseRun`/`startPlanningRun` background launcher, run manifest + telemetry persistence, completion delivery |
+| `launch.ts` | Worktree/task helpers, handoff packet, child orchestrator session, marker persistence, lease transfer |
+| `workflow-commands.ts` | `/belayd`, `/belayd-complete`, daemon wake sentinel, `input`/`session_start`/`session_shutdown` hooks |
+| `workflow-context.ts` | Per-turn gate/planning context injection and the three `before_agent_start` hooks |
+| `planning.ts` | `/plan` command, `belayd_plan_scout`, `belayd_plan_research` |
+| `phase-tools.ts` | Per-agent phase tools and `belayd_status` |
+| `task-control.ts` | `belayd_start_task`, `belayd_start_followup`, `belayd_stop_task`, `belayd_stop_planning` |
+
+The session state is split in two halves but stays **one runtime object**:
+`CoreSessionState` (fleet-free, in `context.ts`) and `FleetSessionState`
+(fleet fields, in the allowlisted `fleet.ts`) are composed by the composer into
+one `SessionState` intersection. `getSessionState` is unchanged in shape, so
+there is no second store and no drift-prone view; a non-fleet capability takes
+`CoreSessionState` and the composer passes the full object.
+
+The fleet supervisor block (4,615 composer lines) moved out first, then the
+workflow capabilities followed through the `workflow-core` / `phase-run` /
+`launch` factories, so nothing in the staged split is left in the composer.
+
+The process core is callable without the extension too: `src/quality-gate-run.ts`
+(`createQualityGateRunner`), `src/review-context.ts` (via `capabilities/review.ts`)
+and `src/workflow-phases.ts` take their spawn/model/metric/phase seams as
+parameters instead of closing over harness globals. The same holds for
+`capabilities/workflow-core.ts` (state store + gate primitives injected) and
+`capabilities/phase-run.ts` (spawn, gate runner and task reader injected).
+
+Capability modules are **not** pi entry points: `package.json`'s
+`pi.extensions` must keep listing exactly the top-level `extensions/*.ts` files
+(`src/__tests__/pi-manifest.test.ts`).
+
+**Import rules.** Two independent rules, enforced by
+`src/__tests__/capability-import-boundary.test.ts` through
+`src/capability-import-boundary.ts`:
+
+1. `src/process-gate.ts` is forbidden for **every** capability module, with no
+   exemption list. Gate primitives (`checkToolAllowed`, `ALL_PHASE_NAMES`,
+   `markPhaseCompleted`, …) arrive as explicitly typed dependency objects
+   supplied by the composer.
+2. `src/fleet-*.ts` / `src/fleet-state.ts` are forbidden except for the files
+   named in the test's explicit `FLEET_IMPORT_ALLOWLIST` (today only
+   `capabilities/fleet.ts`). Allowlisting never permits the process gate.
+
+The checker resolves relative specifiers to files and walks the **whole
+transitive module graph** — plain imports, re-exports and literal
+`await import("…")` — so a capability cannot reach a forbidden module through an
+intermediate (`doctor.ts → tool-audit.ts → process-gate.ts` was the real bug it
+caught). Type-only imports of intermediates are erased at runtime and are not
+edges. It **fails closed**: an unreadable module, an unresolvable relative
+specifier or a non-literal dynamic import fails with the file, specifier and
+import chain. This is why `src/tool-audit.ts`, `src/workflow-state.ts`,
+`src/fleet-mode.ts` and `src/fleet-run.ts` take phase names and
+`isWorkflowComplete` from the dependency-free `src/workflow-phases.ts` instead
+of `src/process-gate.ts`.
+
+The same test carries a **size ratchet** for `extensions/index.ts` (today
+415 lines; the composer is 365 and is wiring only — entry point, state store,
+seam normalisation, the ordered `register<Capability>` calls and the default
+export). New capability code belongs in a module; if the composer must grow,
+raise the ceiling deliberately and say why.
 
 ### Tests
 

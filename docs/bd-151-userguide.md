@@ -11,7 +11,7 @@ body for the plan:
 
 | Slot | Holds | Written by |
 |---|---|---|
-| `COMMENTS` | Phase deliverables, one authored + timestamped entry each, tagged `[belayd:<phase>]` | `bd comment --stdin` (`appendPhaseDeliverables` in `extensions/index.ts`) or the researcher itself |
+| `COMMENTS` | Phase deliverables, one authored + timestamped entry each, tagged `[belayd:<phase>]` | `bd comment --stdin` (`appendPhaseDeliverables` in `extensions/capabilities/commit.ts`) or the researcher itself |
 | `DESCRIPTION` / `DESIGN` / `NOTES` | The PLAN only — what `bd show` feeds into implement prompts and the handoff packet | humans / planning phases |
 
 Deliverables are recorded **only** when a phase actually produced content: no
@@ -63,8 +63,9 @@ in this worktree.
    - `bounds the implement prompt by the plan, not the comment thread` — two
      `bd show` outputs differing only by a 2000-line / >100 KB `COMMENTS` thread
      produce prompts within 1 KB of each other, and neither contains the thread.
-   - `keeps no phase deliverable on the bd note path` — source scan:
-     `extensions/index.ts` has no `["note","--stdin"` write, and
+   - `keeps no phase deliverable on the bd note path` — source scan of the whole
+     extension tree (`extensions/index.ts` plus `extensions/capabilities/`) has no
+     `["note","--stdin"` write, and
      `RESEARCHER_SYSTEM_PROMPT` says `comment <task-id> --stdin` with the
      `[belayd:research]` header.
 
@@ -161,9 +162,9 @@ The two slots answer two different questions:
 
 - **`bd show <id>` — what is the plan?** `DESCRIPTION`, `DESIGN` and `NOTES` are
   the plan only. That is also what a later implement prompt and the `/belayd`
-  handoff packet see: `readTaskPlan` (`extensions/index.ts`) runs `bd show <id>`
-  and pipes it through `stripBdShowComments`, so the `COMMENTS` thread is never
-  injected. This is deliberate — prompt budget, and proof artifacts may contain
+  handoff packet see: `readTaskPlan` (`extensions/capabilities/launch.ts`) runs
+  `bd show <id>` and pipes it through `stripBdShowComments`, so the `COMMENTS`
+  thread is never injected. This is deliberate — prompt budget, and proof artifacts may contain
   secrets. The handoff packet (`src/handoff.ts`, fed by the same `readTaskPlan`)
   is likewise plan-only.
 

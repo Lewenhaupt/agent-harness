@@ -8,8 +8,9 @@ tools. The worst offender is `pi-agent-browser-native`: its browser prompt is
 measured at **34,769 chars (~8.7k tokens)** per turn (the `agent_browser`
 section in a real sub-agent session).
 
-The harness closes the gap. `extensions/index.ts` registers a dedicated
-`before_agent_start` handler that emits `pi:instruction-groups` itself, and
+The harness closes the gap. `extensions/capabilities/workflow-context.ts`
+registers a dedicated `before_agent_start` handler (wired from the composer,
+`extensions/index.ts`) that emits `pi:instruction-groups` itself, and
 `src/instruction-groups.ts` owns the gate: a managed group's section is written
 under its **group name** (`browser`) only when at least one of the group's
 tools is in the session's `selectedTools` allowlist. The legacy `agent_browser`
@@ -282,5 +283,5 @@ All lines are prefixed `[belayd-harness] `:
 - [Subagent session management](subagent-sessions.md) — session naming,
   listing, and inspection.
 - [Bash timeout enforcement](bash-timeout.md) — the other dedicated
-  `tool_call` handler in `extensions/index.ts`, which mutates the bash timeout
-  rather than gating a prompt section, for comparison.
+  `tool_call` handler (`extensions/capabilities/hooks.ts`), which mutates the bash
+  timeout rather than gating a prompt section, for comparison.

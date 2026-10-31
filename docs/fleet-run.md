@@ -20,7 +20,7 @@ Two things changed, and they are coupled:
 | Accepting a landed member (worktree removal, optional close) | `src/fleet-accept.ts` |
 | Supervisor heartbeat + re-arm eligibility | `src/fleet-heartbeat.ts` |
 | Worktree orchestrator lease | `src/orchestrator-claim.ts` |
-| Wiring (ticker, launch, tools, `/fleet`) | `extensions/index.ts` |
+| Wiring (ticker, launch, tools, `/fleet`) | `extensions/capabilities/fleet.ts` (`createFleet`, wired from the composer) |
 
 ## How to Use
 

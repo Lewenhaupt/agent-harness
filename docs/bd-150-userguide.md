@@ -195,8 +195,8 @@ grep -rn -- "--claim" src extensions
 
 Expected: exactly nine lines, none of them a harness argv builder — the guard
 (`src/bd-command.ts`), its rejection message, the agent prompt text
-(`src/agent-registry.ts`), one comment in `extensions/index.ts`, and the test
-cases that pin the rejection.
+(`src/agent-registry.ts`), one comment in `extensions/capabilities/bd.ts`, and the
+test cases that pin the rejection.
 
 ```bash
 node --input-type=module -e '

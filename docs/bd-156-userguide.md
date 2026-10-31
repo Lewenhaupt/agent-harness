@@ -18,7 +18,7 @@ bd-156 splits the two operations:
 | Member **stops** (phase failure, land refusal, operator stop) | `retireFleetDeferral` | kept in `taskIds`; only its `deferred` plan entry is retired |
 
 Both live in `src/fleet-state.ts` and are exported from `belayd-agent-harness`
-(`src/index.ts`). The wiring is in `extensions/index.ts`
+(`src/index.ts`). The wiring is in `extensions/capabilities/fleet.ts`
 (`stopTickAction` / `landTickAction`) and the tick in `src/fleet-run.ts`.
 
 ## How to Verify
@@ -295,7 +295,8 @@ const afterStop = retireFleetDeferral(intent, "bd-12", Date.now());
 
 Both take `(intent, taskId, now)` and return a new `FleetIntent`; the
 extension-level writers that persist them are `pruneLandedMember` and
-`retireDeferredMember` in `extensions/index.ts` (intent CAS + `updatedAt`).
+`retireDeferredMember` in `extensions/capabilities/fleet.ts` (intent CAS +
+`updatedAt`).
 
 ### Related documentation
 

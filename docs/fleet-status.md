@@ -45,9 +45,9 @@ current directory owns. `belayd_fleet_status` is cross-worktree: it is the only
 surface that shows two members side by side, and the only one that flags a
 duplicate task id or a `workflow.json` that disagrees with its branch.
 
-It is available at any time, including mid-workflow (it is in `GATED_TOOLS`), but
-it is not a workflow step and it is absent from planning mode
-(`PLANNING_GATED_TOOLS`).
+It is available at any time, including mid-workflow (it is in `CONSULT_TOOLS`, so
+`workflowGateToolSet` keeps it callable), but it is not a workflow step and it is
+absent from planning mode (`PLANNING_TOOL_SET`, both in `src/role-tools.ts`).
 
 ### How to invoke it
 
@@ -422,9 +422,9 @@ Member (no task id) — missing-state
 
 Both members are `missing-state` because both worktrees have **finished** their
 workflow: completion clears `.belayd/workflow.json` and keeps the run manifests
-(`extensions/index.ts`, the workflow-complete path), so there is no task id to
-report. That is also why no `bd show` call happens at all here and every member
-prints `(no task id)`. A fleet with live workflows looks like the worked example
+(`extensions/capabilities/hooks.ts`, the workflow-complete path), so there is
+no task id to report. That is also why no `bd show` call happens at all here and
+every member prints `(no task id)`. A fleet with live workflows looks like the worked example
 above and like the scratch view in `docs/fleet.md`.
 
 The fleet id is the driver's first argument (a JSON params object); a

@@ -36,8 +36,9 @@ bd-119 makes that identity a hard precondition:
 
 Every refusal is a text tool result with `details.exitCode: 1`. The strings come
 from `src/owned-worktree.ts` (`matchOwnedWorktree`,
-`matchSessionOwnedWorktree`, `formatWorktreePreamble`) and `extensions/index.ts`
-(`commitOwnershipError`, `missingWorkingDirectoryError`).
+`matchSessionOwnedWorktree`, `formatWorktreePreamble`),
+`extensions/capabilities/commit.ts` (`commitOwnershipError`) and
+`extensions/capabilities/context.ts` (`missingWorkingDirectoryError`).
 
 ### Phase tools and `belayd_proof_verifier`
 

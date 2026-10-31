@@ -72,8 +72,9 @@ Proof verifier skipped: no proof artifacts referenced and no change context avai
 ```
 
 with `exitCode 0` and **no sub-agent spawn** (this is the skip condition in
-`buildProofVerifierPrompt` in `extensions/index.ts` — no artifact refs and no
-git change context). You should see no `belayd-proof-verifier-<runId>` session.
+`buildProofVerifierPrompt` in `extensions/capabilities/proof.ts` — no artifact
+refs and no git change context). You should see no `belayd-proof-verifier-<runId>`
+session.
 
 ### 4. Exercise the advisory verdict path
 
@@ -107,7 +108,7 @@ evidence: ...
 
 After `belayd_commit` with a `taskId`, the verifier verdict is recorded as a
 `[belayd:proof-verifier]` bead comment (`appendPhaseDeliverables` in
-`extensions/index.ts`). Run:
+`extensions/capabilities/commit.ts`). Run:
 
 ```bash
 bd comments <task-id>
@@ -159,7 +160,7 @@ re-running the proof phase and never blocks commit.
 ### Tool parameters
 
 `belayd_proof_verifier` accepts two **optional** string parameters
-(`extensions/index.ts`):
+(`extensions/capabilities/proof.ts`):
 
 | Param   | Purpose                                                        |
 |---------|----------------------------------------------------------------|

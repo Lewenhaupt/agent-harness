@@ -355,10 +355,11 @@ None
   path segment with no extension
 - `src/review-context.ts:260` — doc comment on `boundDiff` does not mention the
   byte cap
-- `extensions/index.ts:2880` — the reviewed sha is persisted before delivery
-  succeeds, so a delivery failure still narrows the next review
-- `extensions/index.ts:2928` — the `needsFullTask` predicate hardcodes the
-  `"proof"` phase name instead of the shared constant
+- `extensions/capabilities/phase-run.ts` (`persistReviewedSha`) — the reviewed sha
+  is persisted before delivery succeeds, so a delivery failure still narrows the
+  next review
+- `extensions/capabilities/phase-run.ts` (`needsFullTask`) — the predicate
+  hardcodes the `"proof"` phase name instead of the shared constant
 - (+1 more omitted; see the full findings in the review transcript)
 
 ## Summary

@@ -11,7 +11,7 @@
  * `belayd_doctor` adapts pi's `getAllTools()` output into them.
  */
 
-import { ALL_PHASE_TOOLS } from "./process-gate.js";
+import { ALL_PHASE_TOOLS } from "./workflow-phases.js";
 
 /** The part of an agent definition the audit needs. */
 export interface AgentToolSpec {

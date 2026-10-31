@@ -23,7 +23,7 @@ restart re-discovers the wait from `bd gate list` (that is why
 
 | Piece | Where |
 | --- | --- |
-| `belayd_ask_human` tool, poll, delivery, gate reap | `extensions/index.ts` (`askHuman`, `observeHumanAnswer`, `pollHumanAnswerOnce`) |
+| `belayd_ask_human` tool, poll, delivery, gate reap | `extensions/capabilities/human-gate.ts` (`askHuman`, `observeHumanAnswer`, `pollHumanAnswerOnce`) |
 | Gate argv + `bd gate list` parsing | `src/bead-gates.ts` (exported from the `belayd-agent-harness` barrel) |
 | Comment read + `isHumanComment` + excerpt cap | `src/bead-comments.ts` |
 | Phase refusal while waiting | `src/process-gate.ts` (`AwaitingHuman`, `awaitingHumanRefusal`) |

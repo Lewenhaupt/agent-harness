@@ -3,8 +3,9 @@
 bd-140 turned the metrics log from a design note into a working subsystem: the five
 event builders plus the best-effort appender in `src/metrics.ts`, `gate_result.runId`
 (the field that ties a verdict to the spawn it judged), six git-tracked SQL files in
-`metrics/queries/`, the read-only `belayd_metrics` tool (`extensions/index.ts`) that
-runs them through DuckDB and renders markdown, and the session-corpus backfill
+`metrics/queries/`, the read-only `belayd_metrics` tool
+(`extensions/capabilities/metrics.ts`) that runs them through DuckDB and renders
+markdown, and the session-corpus backfill
 (`scripts/belayd-metrics-backfill.ts`).
 
 Why a file, where it lives, what each event carries, the first-pass definition and

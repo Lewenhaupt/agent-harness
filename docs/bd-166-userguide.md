@@ -22,11 +22,11 @@ the three loops (terminal runs, outside-fleet landings, named-fleet reconcile).
 | The repository arithmetic and per-fleet rollup (`describeFleetCapacity`) | `src/fleet-capacity.ts` |
 | Which liveness a member gets (mid-spawn ⇒ `unknown`) | `src/fleet-sessions.ts` `classifyMemberLivenessInWorktree` |
 | The evidence cutoff for "this execution ran" | `src/fleet-run.ts` `memberRanEvidence`, `memberEvidenceCutoff`, `worktreeCreatedAtFromStat` |
-| Terminal-run release sweep | `src/fleet-run.ts` `releaseRunMembers`, `extensions/index.ts` `releaseTerminalMembers` |
-| Outside-fleet landing | `src/fleet-run.ts` `planOutsideFleetLandings`, `extensions/index.ts` `landMembersMergedOutsideFleet` |
+| Terminal-run release sweep | `src/fleet-run.ts` `releaseRunMembers`, `extensions/capabilities/fleet.ts` `releaseTerminalMembers` |
+| Outside-fleet landing | `src/fleet-run.ts` `planOutsideFleetLandings`, `extensions/capabilities/fleet.ts` `landMembersMergedOutsideFleet` |
 | `capacity:` block and the three new warnings | `src/fleet-status.ts` `formatCapacity`, `staleMemberWarnings`, `capacityHeldWarnings`, `runNotTickingWarnings` |
 | Named-fleet reconcile authority | `src/fleet-reconcile.ts` `reconcileAuthority` |
-| `belayd_fleet_release` | `extensions/index.ts` |
+| `belayd_fleet_release` | `extensions/capabilities/fleet.ts` |
 
 None of this removes anything. An `absent` member, a released member, and a
 landed member differ only in **what the ceiling subtracts**: a release and an

@@ -23,8 +23,9 @@ verifier moved from the `standard` to the `fast` capability class.
 
 This document covers user-visible behaviour only. Internals:
 `src/capacity-cache.ts`, `src/model-telemetry.ts`, `src/model-session-state.ts`,
-`src/spawn-with-fallback.ts`, `src/run-manifest.ts`, and the wiring in
-`extensions/index.ts`.
+`src/spawn-with-fallback.ts`, `src/run-manifest.ts`, and the capability wiring in
+`extensions/capabilities/model.ts` (routing state) and
+`extensions/capabilities/phase-run.ts` (per-run telemetry attach).
 
 ## How to Verify
 

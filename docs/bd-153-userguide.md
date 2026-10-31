@@ -34,7 +34,7 @@ below is a command and its real output, run in this worktree with
 | Pure types, `applyFleetBeadEngagement`, `beadNeedsHuman`, `formatNeedsYou`, `formatBeadOwnership` | `src/fleet-status.ts` |
 | The reader: `lookupFleetBeadEngagement`, `ENGAGEMENT_CONCURRENCY` | `src/fleet-bead-engagement.ts` |
 | Comment parsing with a dropped-record count, code-point excerpt cap | `src/bead-comments.ts` |
-| Tool wiring for both tools | `extensions/index.ts` (`readFleetEngagement`, `readBeadOwnership`) |
+| Tool wiring for both tools | `extensions/capabilities/fleet.ts` (`readFleetEngagement`, `readBeadOwnership`) |
 | Reading guides | `docs/fleet-status.md`, `docs/fleet.md` |
 
 ## How to Verify
@@ -161,9 +161,10 @@ git worktree list
 
 ### 3. Render the view through the compiled surface
 
-This is the composition `belayd_fleet_status` performs (`extensions/index.ts`,
-`readFleetBeads` → `readFleetEngagement` → `applyFleetBeadLookup` +
-`applyFleetBeadEngagement` → `formatFleetStatus`). Save it as
+This is the composition `belayd_fleet_status` performs
+(`extensions/capabilities/fleet.ts`: `readFleetBeads` → `readFleetEngagement` →
+`applyFleetBeadLookup` + `applyFleetBeadEngagement` → `formatFleetStatus`). Save
+it as
 `/tmp/bd153-render.mjs` (`dist/` must be current — `pnpm build`).
 
 ```javascript

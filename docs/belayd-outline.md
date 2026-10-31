@@ -1,17 +1,20 @@
 # Read-only symbol outline (`belayd_outline`, bd-115 / bd-118)
 
 Sub-agents used to locate an edit anchor by re-reading a file in `read` offset
-windows. Pi's `read` truncates at 2000 lines / 50 KB, so one full pass over
-`extensions/index.ts` (~5 k lines, ~198 KB) costs about four calls, and every
-"where is the next thing?" question restarts the loop: bd-115's evidence shows
-421 `read` calls over that one file across 75 sub-agent sessions, with a 47%
-same-path repeat rate in implement sessions.
+windows. Pi's `read` truncates at 2000 lines / 50 KB, so one full pass over the
+pre-bd-179 monolith `extensions/index.ts` (~5 k lines, ~198 KB, now a 365-line
+composer) cost about four calls, and every "where is the next thing?" question
+restarted the loop: bd-115's evidence shows 421 `read` calls over that one file
+across 75 sub-agent sessions, with a 47% same-path repeat rate in implement
+sessions. The same cost applies to the largest capability module today
+(`extensions/capabilities/fleet.ts`, ~5.5 k lines), which is why the tool is not
+scoped to the composer.
 
 `belayd_outline` replaces the loop with one call. It is a **read-only,
 consult-callable, multi-language** pi tool that returns a compact symbol map
 with line ranges for a file, directory, or glob, in line order. It is
-registered in `extensions/index.ts` and exported for library consumers from
-`src/index.ts`.
+registered in `extensions/capabilities/outline.ts` (wired from the composer,
+`extensions/index.ts`) and exported for library consumers from `src/index.ts`.
 
 bd-115 shipped it on a hand-rolled TypeScript state-machine lexer. bd-118
 deleted that lexer and moved extraction onto two real parsers — universal-ctags
@@ -233,8 +236,7 @@ fixture.
 ## Prompt guidance
 
 Two bullets shipped with the tool (`CODE_EXPLORATION_GUIDANCE` in
-`src/agent-registry.ts`; `AGENTS.md` mirrors them and adds a note that editing
-this tool shifts `extensions/index.ts` line anchors):
+`src/agent-registry.ts`; `AGENTS.md` mirrors them):
 
 - "Your working directory is already the worktree root — run commands directly,
   never prefix `cd <absolute worktree path> &&`."
@@ -358,18 +360,18 @@ T=/tmp/belayd-outline-tool.ts
 ### 3. Outline a real file
 
 ```bash
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\"}'" | head -6
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'" | head -6
 ```
 
 Observed head on this branch (line numbers drift as the file grows):
 
 ```text
-/home/…/extensions/index.ts (5041 lines)
-  157-157  type          ModelTelemetryStore
-  158-158  type          ModelTelemetryTotals
-  199-217  interface     RunQualityGateOptions [exported]
-  200-200  property      agent
-  201-201  property      result
+/home/…/extensions/capabilities/fleet.ts (5524 lines)
+  27-27  type          SupervisorHeartbeat
+  28-28  type          SupervisorReadoptionReason
+  29-29  type          SupervisorReadoptionRefusal
+  33-33  type          FleetMemberLaunchOutcome
+  44-44  type          FleetEventBatch
 ```
 
 Assert the structure, not the counts: one header `<absolute path> (<N> lines)`,
@@ -378,23 +380,22 @@ then rows ascending by start line formatted
 the source:
 
 ```bash
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\"}'" 2>/dev/null | wc -c   # 11242
-wc -c extensions/index.ts                                                                  # 198351
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'" 2>/dev/null | wc -c   # 15051
+wc -c extensions/capabilities/fleet.ts                                                                  # 224692
 ```
 
-`belaydAgentHarness` is one `function` row spanning to the end of the file, with
-the registrations resolving inside its body:
+`createFleet` is one `function` row spanning to the end of the file, with the
+tool registrations resolving inside its body:
 
 ```bash
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\"}'" 2>/dev/null \
-  | grep -E "belaydAgentHarness|registerTool  belayd_(outline|status|commit)"
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'" 2>/dev/null \
+  | grep -E "createFleet|registerTool  belayd_fleet_(status|launch)"
 ```
 
 ```text
-  1101-5040  function      belaydAgentHarness [exported]
-  3850-3894  registerTool  belayd_status
-  4070-4115  registerTool  belayd_outline
-  4869-4953  registerTool  belayd_commit
+  311-5523  function      createFleet [exported]
+  4848-4888  registerTool  belayd_fleet_status
+  4890-4958  registerTool  belayd_fleet_launch
 ```
 
 Their ranges come from ast-grep, not ctags, so they move with every edit above
@@ -518,15 +519,15 @@ Observed — one tag, no `end`, no `registerTool`/`on` rows:
 
 Through the tool the same file yields `1-4 function belaydAgentHarness
 [exported]`, `2-2 registerTool belayd_outline`, `3-3 on tool_call` (step 4), and
-on `extensions/index.ts` every `belayd_*` tool surfaces as a `registerTool` row
-(step 3).
+on `extensions/capabilities/fleet.ts` every `belayd_fleet_*` tool surfaces as a
+`registerTool` row (step 3).
 
 ### 6. Filters and the output budget
 
 ```bash
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\",\"kind\":[\"registerTool\"]}'" | tail -1
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\",\"name\":\"belayd_\"}'" | tail -1
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\",\"maxSymbols\":3}'" | tail -1
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\",\"kind\":[\"registerTool\"]}'" | tail -1
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\",\"name\":\"belayd_\"}'" | tail -1
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\",\"maxSymbols\":3}'" | tail -1
 ```
 
 ```text
@@ -674,8 +675,8 @@ With the real cap the text reads `timed out after 15000 ms.`
 **Missing binaries.**
 
 ```bash
-nix develop -c bash -lc "BELAYD_CTAGS_BIN=/nonexistent/ctags $J $T '{\"path\":\"extensions/index.ts\"}'"
-nix develop -c bash -lc "BELAYD_AST_GREP_BIN=/nonexistent/ast-grep $J $T '{\"path\":\"extensions/index.ts\"}'"
+nix develop -c bash -lc "BELAYD_CTAGS_BIN=/nonexistent/ctags $J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'"
+nix develop -c bash -lc "BELAYD_AST_GREP_BIN=/nonexistent/ast-grep $J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'"
 ```
 
 ```text
@@ -690,7 +691,7 @@ controlled; re-run `pnpm build` first if `dist/` is stale:
 ```bash
 nix develop -c bash -lc 'node --input-type=module -e "
 const { extractOutlineSymbols } = await import(\"file://'$(pwd)'/dist/src/outline-extract.js\");
-const r = await extractOutlineSymbols([\"extensions/index.ts\"], { env: { PATH: \"/nonexistent\" } });
+const r = await extractOutlineSymbols([\"extensions/capabilities/fleet.ts\"], { env: { PATH: \"/nonexistent\" } });
 console.log(JSON.stringify(r));
 "'
 ```
@@ -712,8 +713,8 @@ Observed: the `ok` row and `[exitCode=0]`.
 
 ```bash
 nix develop -c bash -lc "$J $T '{}'"                                        # path is required (…)
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\",\"kind\":[\"export\"]}'"
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\",\"maxSymbols\":0}'"
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\",\"kind\":[\"export\"]}'"
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\",\"maxSymbols\":0}'"
 nix develop -c bash -lc "$J $T '{\"path\":\"AGENTS.md\"}'"
 nix develop -c bash -lc "$J $T '{\"path\":\"src/*.zzz\"}'"
 nix develop -c bash -lc "$J $T '{\"path\":\"nope.ts\"}'"
@@ -781,17 +782,18 @@ note: walk stopped at the entry cap; results may be incomplete.
 ### 9. Read-only and gate wiring
 
 ```bash
-sha256sum extensions/index.ts > /tmp/outline-before.sha
-nix develop -c bash -lc "$J $T '{\"path\":\"extensions/index.ts\"}'" > /dev/null
+sha256sum extensions/capabilities/fleet.ts > /tmp/outline-before.sha
+nix develop -c bash -lc "$J $T '{\"path\":\"extensions/capabilities/fleet.ts\"}'" > /dev/null
 sha256sum -c /tmp/outline-before.sha
 ```
 
-Expected: `extensions/index.ts: OK`.
+Expected: `extensions/capabilities/fleet.ts: OK`.
 
 ```bash
-grep -n "const GATED_TOOLS" -A 16 extensions/index.ts          # "belayd_outline" present
-grep -n "const PLANNING_GATED_TOOLS" -A 6 extensions/index.ts  # absent
-grep -c '"belayd_outline"' src/agent-registry.ts               # 9 (one per default agent)
+grep -n "belayd_outline" src/role-tools.ts                          # CONSULT_TOOLS — present
+sed -n '/^export const PLANNING_TOOL_SET/,/^];/p' src/role-tools.ts \
+  | grep -c belayd_outline                                         # 0 — absent
+grep -c '"belayd_outline"' src/agent-registry.ts                   # 9 (one per default agent)
 ```
 
 Live equivalent: start a task and call `belayd_outline` — no process-gate
@@ -800,9 +802,11 @@ rejection. Start planning mode and the tool is not in the active set.
 ## How to Use
 
 Inside a pi session the tool is available in all 9 default agents and in
-`GATED_TOOLS`, so it stays callable while a workflow phase gate is active. It is
-**not** in `PLANNING_GATED_TOOLS`, so it is unavailable in planning mode. It is
-consult-callable and never required by a phase ordering.
+`CONSULT_TOOLS` (which `workflowGateToolSet` adds to every gated surface), so it
+stays callable while a workflow phase gate is active. It is **not** in
+`PLANNING_TOOL_SET`, so it is unavailable in planning mode (both sets live in
+`src/role-tools.ts`). It is consult-callable and never required by a phase
+ordering.
 
 ### Tool parameters
 
@@ -815,7 +819,7 @@ consult-callable and never required by a phase ordering.
 
 ```json
 {
-  "path": "extensions/index.ts",
+  "path": "extensions/capabilities/fleet.ts",
   "kind": ["function", "method"],
   "name": "belayd_",
   "maxSymbols": 40
@@ -824,7 +828,7 @@ consult-callable and never required by a phase ordering.
 
 Typical calls:
 
-- `{"path": "extensions/index.ts"}` — full map of one file.
+- `{"path": "extensions/capabilities/fleet.ts"}` — full map of one file.
 - `{"path": "src/**/*.ts", "kind": ["class"]}` — every class in the tree.
 - `{"path": "src", "name": "outline", "maxSymbols": 20}` — walk a directory and
   keep the first 20 name matches.

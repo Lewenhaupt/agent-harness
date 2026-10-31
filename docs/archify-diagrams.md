@@ -51,8 +51,10 @@ bd-87 makes the upstream agent material discoverable:
 Generated diagrams are committed under `docs/diagrams/` (see
 `docs/diagrams/README.md`). The tool is consult-callable and is **not** part of
 any workflow phase: it is never required by a phase ordering, and the process
-gate does not demand it. It is listed in `GATED_TOOLS` only so it stays callable
-while a gate is active; it is deliberately **not** in `PLANNING_GATED_TOOLS`.
+gate does not demand it. It is listed in `CONSULT_TOOLS` (so
+`workflowGateToolSet` keeps it callable) only so it stays callable while a gate
+is active; it is deliberately **not** in `PLANNING_TOOL_SET` (both in
+`src/role-tools.ts`).
 
 `visual-check` (needs Chrome via `$ARCHIFY_CHROME`) and `preview` (opens a
 loopback HTTP server) are intentionally outside the tool surface.

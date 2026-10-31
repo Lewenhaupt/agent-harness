@@ -51,7 +51,8 @@ Confirm:
 - **Tools are restricted**: the orchestrator's active tool set contains
   `belayd_plan_scout`, `belayd_plan_research`, `bd`, `read`, `grep`, `find`,
   `ls`, `ast_grep`, and the web tools — but **no `edit`, `write`, or `bash`**.
-  (This is `PLANNING_GATED_TOOLS` in `extensions/index.ts`.)
+  (This is `PLANNING_TOOL_SET` in `src/role-tools.ts`, applied by
+  `extensions/capabilities/workflow-core.ts`.)
 - **Investigation runs read-only**: calling `belayd_plan_scout` /
   `belayd_plan_research` spawns background sessions named
   `belayd-planning-sub-scout-<runId>` / `belayd-planning-sub-research-<runId>`
@@ -116,7 +117,8 @@ setup.) Confirm:
 To confirm the implementer actually sees the bead plan, put recognizable text
 in the bead's description, run the implement phase, and inspect the spawned
 sub-agent's task: it must be prefixed with `## Bead plan (bd-42)` followed by
-the `bd show` output (the `readTaskPlan` prepend in `extensions/index.ts`).
+the `bd show` output (the `readTaskPlan` prepend in
+`extensions/capabilities/launch.ts`).
 
 ### 6. Verify `bd` tool hardening
 

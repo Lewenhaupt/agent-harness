@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_AGENTS, PROOF_VERIFIER_AGENT } from "../agent-registry.js";
@@ -12,12 +9,11 @@ import {
   WORKFLOW_CONTROL_TOOLS,
 } from "../role-tools.js";
 import { EXTERNAL_TOOL_NAMES, HARNESS_TOOL_NAMES } from "../tool-audit.js";
+import { readExtensionSource } from "./extension-source.js";
 
-// Resolve the repo root from this test file's location (src/__tests__ -> repo root)
-// so the guard is invariant to the Vitest working directory.
-const testDir = dirname(fileURLToPath(import.meta.url));
-const repoRoot = join(testDir, "..", "..");
-const extensionSource = readFileSync(join(repoRoot, "extensions/index.ts"), "utf8");
+// The whole extension source (composer + capability modules), so a tool
+// registered from a capability module is still seen by this guard.
+const extensionSource = readExtensionSource();
 
 /** Tool names registered literally in the extension (`name: "belayd_x"`). */
 const literalRegistrations = new Set(

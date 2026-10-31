@@ -64,7 +64,7 @@ and plain labels are ignored and default to `feature`.
 ### Functional programming
 
 - **Pure functions preferred.** Side effects (git, spawning, filesystem I/O) are confined to documented functions.
-- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary) and `model-session-state.ts`.
+- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary), `model-session-state.ts`, and the two capability modules that own the model-routing state and the per-session state map: `extensions/capabilities/model.ts` and `extensions/capabilities/session-state.ts`.
 - **Immutable data.** `const`, spread, `structuredClone`. No class mutation patterns.
 - **Discriminated unions for multi-outcome functions**, `{ allowed: boolean; reason?: string }` rather than a boolean with an optional string.
 - **Errors as values.** Return `{ ok: true; value } | { ok: false; error }`. Reserve `throw` for non-recoverable conditions.

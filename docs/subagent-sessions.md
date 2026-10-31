@@ -259,9 +259,9 @@ without the answers (bd-177).
 
 The harness now holds those follow-ups while the newest `ask_user` result on the
 session branch has no `pi-web.ask.answers` outcome (`src/ask-hold.ts`,
-`deliverFollowUp` in `extensions/index.ts`). Held follow-ups keep their order and
-are released by the next turn start — an answer, a skip, and the human's own
-message all wake the session that way — or by a 10-minute cap
+`deliverFollowUp` in `extensions/capabilities/session-state.ts`). Held follow-ups
+keep their order and are released by the next turn start — an answer, a skip, and
+the human's own message all wake the session that way — or by a 10-minute cap
 (`ASK_HOLD_MAX_MS`) so a question set nobody touches cannot stall a workflow. The
 daemon's `[belayd-complete:<runId>]` sentinel appends nothing to the transcript,
 so it deliberately does **not** release a hold.

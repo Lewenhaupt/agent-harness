@@ -485,4 +485,4 @@ Related: `docs/fleet-run.md` (the tick, the run record, the readoption rule),
 `docs/fleet-status.md` (warnings), `docs/fleet.md` (operator map),
 `src/fleet-heartbeat.ts` (`FLEET_SUPERVISOR_HEARTBEAT_STALE_MS`,
 `planSupervisorReadoption`), `src/fleet-run.ts` (tick cadence, run record),
-`extensions/index.ts` (`readoptFleetRuns`, `ensureFleetRunTimer`).
+`extensions/capabilities/fleet.ts` (`readoptFleetRuns`, `ensureFleetRunTimer`).

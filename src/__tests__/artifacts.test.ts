@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,6 +11,7 @@ import {
   readPhaseArtifact,
   writePhaseArtifact,
 } from "../artifacts.js";
+import { readExtensionSource } from "./extension-source.js";
 
 const dirs: string[] = [];
 function tempRepo(): string {
@@ -142,7 +143,9 @@ describe("orchestrator wiring", () => {
   // completion AND names the files in the next phase's prompt. A refactor that
   // drops either half would leave every unit test above passing and the feature
   // silently gone.
-  const source = readFileSync(new URL("../../extensions/index.ts", import.meta.url), "utf8");
+  // The whole extension source (composer + capability modules): the artifact
+  // writes may live in a capability module now (bd-179).
+  const source = readExtensionSource();
 
   it("writes an artifact for a successful delivery, before the follow-up", () => {
     expect(source).toContain("recordPhaseArtifact({");

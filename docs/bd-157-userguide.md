@@ -29,8 +29,8 @@ the plan would otherwise have reached. Everything lives in two places:
 |---|---|
 | `emptyAdvanceAction` (the decision) | `src/fleet-run.ts:578` |
 | `emptyAdvanceTerminal` (the terminal line, bounded to 400 chars) | `src/fleet-run.ts:631` |
-| `advanceTickAction` (the tick's advance branch) | `extensions/index.ts:7404` |
-| `emptyAdvanceOutcome` (re-reads the intent, then applies the decision) | `extensions/index.ts:7454` |
+| `advanceTickAction` (the tick's advance branch) | `extensions/capabilities/fleet.ts` |
+| `emptyAdvanceOutcome` (re-reads the intent, then applies the decision) | `extensions/capabilities/fleet.ts` |
 | Constants | `FLEET_RUN_MAX_IDLE_TICKS = 240`, `FLEET_RUN_TICK_INTERVAL_MS = 15_000`, `FLEET_RUN_ACTION_TICK_INTERVAL_MS = 2_000` (`src/fleet-run.ts:79`, `:98`, `:101`) |
 
 What the advance leaves behind now decides the tick:

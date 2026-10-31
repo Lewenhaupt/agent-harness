@@ -27,9 +27,9 @@
 
 import { z } from "zod";
 import type { FleetIntent } from "./fleet-status.js";
-import { isWorkflowComplete } from "./process-gate.js";
 import type { RunManifest } from "./run-manifest.js";
 import { RunStatus } from "./run-manifest.js";
+import { isWorkflowComplete } from "./workflow-phases.js";
 
 export const FLEET_RUN_SCHEMA_VERSION = 1;
 

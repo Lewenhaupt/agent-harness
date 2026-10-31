@@ -76,7 +76,8 @@ ORDER BY pct;
 All three phases are in place: the event log plus the DuckDB binary (this page),
 the versioned queries and their loader/runner (`metrics/queries/*.sql`,
 `src/metrics-query.ts`) exposed through the `belayd_metrics` tool registered in
-`extensions/index.ts`, and the session-corpus backfill below. See bd-140.
+`extensions/capabilities/metrics.ts`, and the session-corpus backfill below. See
+bd-140.
 
 ## Backfill (recorded sessions)
 

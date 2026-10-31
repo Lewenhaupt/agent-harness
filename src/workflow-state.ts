@@ -10,8 +10,8 @@ import { randomBytes } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
-import { isWorkflowComplete } from "./process-gate.js";
 import { isValidTaskId, type PhaseSessionRecord } from "./session-naming.js";
+import { isWorkflowComplete } from "./workflow-phases.js";
 
 const SCHEMA_VERSION = 1;
 

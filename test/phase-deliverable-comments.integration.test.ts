@@ -13,18 +13,17 @@
  * records.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readExtensionSource } from "../src/__tests__/extension-source.js";
 import { RESEARCHER_SYSTEM_PROMPT } from "../src/agent-registry.js";
 import { phaseCommentBody, phaseCommentHeader } from "../src/bead-comments.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 process.env.BELAYD_PROOF_DIR = join(tmpdir(), "belayd-test-deliverable-proof");
-
-const REPO_ROOT = resolve(import.meta.dirname, "..");
 
 const VERDICT = "## Verdict\nreasonable: true\nreason: ok\nevidence: cast";
 const USERGUIDE_REPORT = "## How to Verify\n1. Run pnpm test\n\n## How to Use\nSee the doc.\n";
@@ -494,7 +493,9 @@ describe("phase deliverables are authored bead comments (integration)", () => {
   });
 
   it("keeps no phase deliverable on the bd note path", () => {
-    const extensionSource = readFileSync(join(REPO_ROOT, "extensions", "index.ts"), "utf8");
+    // The whole extension source (composer + capability modules), so moving the
+    // deliverable writer into a capability keeps this guard meaningful.
+    const extensionSource = readExtensionSource();
 
     // The only deliverable writer is appendPhaseDeliverables -> bd comment.
     expect(extensionSource).not.toContain('["note", "--stdin"');
