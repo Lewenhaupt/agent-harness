@@ -67,7 +67,11 @@ import { registerDoctor } from "./capabilities/doctor.js";
 import type { FleetSessionState } from "./capabilities/fleet.js";
 import { createFleet, type FleetApi, type FleetForceStopSeams } from "./capabilities/fleet.js";
 import { registerHooks } from "./capabilities/hooks.js";
-import { type HumanGateDeps, registerHumanGate } from "./capabilities/human-gate.js";
+import {
+  type HumanGateDeps,
+  openReviewHumanGate,
+  registerHumanGate,
+} from "./capabilities/human-gate.js";
 import { createLaunch } from "./capabilities/launch.js";
 import { registerMetrics } from "./capabilities/metrics.js";
 import { modelCooldown, modelFallbackEnabled, modelState } from "./capabilities/model.js";
@@ -245,6 +249,7 @@ export default function belaydAgentHarness(
     spawnAgentWithFallback,
     runQualityGate,
     workflowRegistry: WORKFLOW_REGISTRY,
+    reviewGate: (options) => openReviewHumanGate({ ...options, deps: humanGateDeps }),
   });
 
   // ── Registration order is load-bearing; do not reorder these calls ──

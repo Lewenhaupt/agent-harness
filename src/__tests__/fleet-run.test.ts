@@ -20,6 +20,7 @@ import {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
+  FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
@@ -48,6 +49,7 @@ import {
   worktreeCreatedAtFromStat,
 } from "../fleet-run.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { REVIEW_HUMAN_GATE_REASON } from "../review-findings.js";
 import type { RunManifest } from "../run-manifest.js";
 import { RunStatus } from "../run-manifest.js";
 
@@ -831,6 +833,200 @@ describe("planFleetTick", () => {
       now: 5_000,
     });
     expect(action).toMatchObject({ kind: "complete", outcome: "partial" });
+  });
+
+  it("holds the run for any awaiting-human stop with a live lease, regardless of detail (bd-175)", () => {
+    // A review gate leaves the member stopped as `awaiting-human`, but its own
+    // session keeps polling the bd gate under a live lease. The run must wait for
+    // that answer: concluding now would leave the resumed, committed work unlanded.
+    // The predicate is the progress kind plus the lease, never the detail text.
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "awaiting-human",
+      detail: "a different human wait",
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [
+        observation("bd-12", { kind: "awaiting-human", detail: "a different human wait" }, "live"),
+      ],
+      now: 5_000,
+    });
+    expect(action.kind).toBe("wait");
+    expect(detailOf(action)).toContain("awaiting a human response");
+
+    // No lease means no poll; the run concludes instead of waiting forever.
+    expect(
+      planFleetTick({
+        intent: intent({ taskIds: ["bd-12"], run: stopped }),
+        observations: [
+          observation(
+            "bd-12",
+            { kind: "awaiting-human", detail: "a different human wait" },
+            "absent",
+          ),
+        ],
+        now: 5_000,
+      }),
+    ).toMatchObject({ kind: "complete", outcome: "partial" });
+  });
+
+  it("exempts an awaiting-human live wait from the idle cap (bd-175)", () => {
+    // A human owns the clock: reaching the stall cap must not halt the run on the
+    // very member it must still land, and the stable human-wait detail must never
+    // read as a stalled phase.
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "awaiting-human",
+      detail: REVIEW_HUMAN_GATE_REASON,
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: stopped }),
+      observations: [
+        observation("bd-12", { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON }, "live"),
+      ],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS + 1,
+    });
+    expect(action.kind).toBe("wait");
+    expect(detailOf(action)).toContain("awaiting a human response");
+    expect(detailOf(action)).not.toContain("still in flight");
+
+    // Past the much larger human cap the wait halts under its own reason, so a
+    // neglected gate stays distinguishable from a healthy wait.
+    expect(
+      planFleetTick({
+        intent: intent({ taskIds: ["bd-12"], run: stopped }),
+        observations: [
+          observation(
+            "bd-12",
+            { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON },
+            "live",
+          ),
+        ],
+        now: 5_000,
+        idleTicks: FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
+      }),
+    ).toMatchObject({ kind: "halt", reason: "awaiting-human" });
+  });
+
+  it("prefers the idle-cap stalled halt over a live human wait when a sibling is hung (bd-175)", () => {
+    // Both members are stopped: bd-12 waits on a review gate under a live lease,
+    // bd-15 retries under a live lease and makes no progress. The hung non-human
+    // member is a fault, so its 1h idle cap outranks the human's 12h window; the
+    // stalled detail still names the human wait so the halt does not hide it.
+    const stopped = recordRunMemberStopped({
+      run: recordRunMemberStopped({
+        run: startFleetRun({
+          now: 1_000,
+          accept: true,
+          members: [{ taskId: "bd-12" }, { taskId: "bd-15" }],
+        }),
+        taskId: "bd-12",
+        reason: "awaiting-human",
+        detail: REVIEW_HUMAN_GATE_REASON,
+        now: 2_000,
+      }),
+      taskId: "bd-15",
+      reason: "phase-failed",
+      detail: "gate failed",
+      now: 2_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12", "bd-15"], run: stopped }),
+      observations: [
+        observation("bd-12", { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON }, "live"),
+        observation("bd-15", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live"),
+      ],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+    });
+    expect(action).toMatchObject({ kind: "halt", reason: "stalled" });
+    expect(detailOf(action)).toContain("bd-15 still in flight");
+    // The human wait is named, and it is not described as the stall itself.
+    expect(detailOf(action)).toContain("bd-12 awaiting a human response");
+  });
+
+  it("reaches the 12h awaiting-human halt when the human wait is the only work (bd-175)", () => {
+    // With no hung sibling the human owns the clock: below the human cap the run
+    // waits, and at the cap it halts under its own reason rather than `stalled`.
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "awaiting-human",
+      detail: REVIEW_HUMAN_GATE_REASON,
+      now: 2_000,
+    });
+    const plan = (idleTicks: number) =>
+      planFleetTick({
+        intent: intent({ taskIds: ["bd-12"], run: stopped }),
+        observations: [
+          observation(
+            "bd-12",
+            { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON },
+            "live",
+          ),
+        ],
+        now: 5_000,
+        idleTicks,
+      });
+    expect(plan(FLEET_RUN_MAX_HUMAN_WAIT_TICKS - 1)).toMatchObject({ kind: "wait" });
+    expect(plan(FLEET_RUN_MAX_HUMAN_WAIT_TICKS)).toMatchObject({
+      kind: "halt",
+      reason: "awaiting-human",
+    });
+  });
+
+  it("produces the review stop detail from the shared reason constant (bd-175)", () => {
+    // The producer end of the agreement: the `awaiting-human` detail the tick
+    // records in `run.stopped[]` is the same constant the bd gate carries, so the
+    // two surfaces cannot drift. The workflow snapshot is the real input shape.
+    const progress = deriveFleetMemberProgress({
+      taskId: "bd-12",
+      workflow: {
+        kind: "ok",
+        completedPhaseNames: ["review"],
+        phaseOrder: PHASES,
+        awaitingReviewResponse: true,
+      },
+      runs: [],
+      now: 5_000,
+    });
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"] }),
+      observations: [observation("bd-12", progress, "live")],
+      now: 5_000,
+    });
+    expect(action).toEqual({
+      kind: "stop",
+      taskId: "bd-12",
+      reason: "awaiting-human",
+      detail: REVIEW_HUMAN_GATE_REASON,
+    });
+  });
+
+  it("records the shared review reason verbatim in run.stopped[] (bd-175)", () => {
+    // The consumer end: the tick writes the plan's detail straight into the run
+    // record, so the entry a human or a `needs-you` view reads is byte-identical
+    // to the constant the bd gate and the findings comment carry. Asserting the
+    // stored entry (not just the plan) is what makes "identical" testable, and
+    // the round-trip also proves the detail fits FLEET_RUN_DETAIL_MAX_LENGTH.
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "awaiting-human",
+      detail: REVIEW_HUMAN_GATE_REASON,
+      now: 2_000,
+    });
+    expect(stopped.stopped).toHaveLength(1);
+    expect(stopped.stopped?.[0]).toMatchObject({
+      reason: "awaiting-human",
+      detail: REVIEW_HUMAN_GATE_REASON,
+    });
   });
 
   it("bounds the wait for a stopped retry with the idle cap", () => {

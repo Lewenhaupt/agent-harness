@@ -27,6 +27,7 @@
 
 import { z } from "zod";
 import type { FleetIntent } from "./fleet-status.js";
+import { REVIEW_HUMAN_GATE_REASON } from "./review-findings.js";
 import type { RunManifest } from "./run-manifest.js";
 import { RunStatus } from "./run-manifest.js";
 import { isWorkflowComplete } from "./workflow-phases.js";
@@ -107,6 +108,17 @@ export const FLEET_RUN_START_GRACE_MS = 120_000;
 
 /** Consecutive no-progress ticks before the loop stops with `stalled`. */
 export const FLEET_RUN_MAX_IDLE_TICKS = 240;
+
+/**
+ * Consecutive no-progress ticks a live human wait may hold the run before it
+ * halts as `awaiting-human`.
+ *
+ * Much larger than {@link FLEET_RUN_MAX_IDLE_TICKS} because the human owns the
+ * clock (an overnight answer is normal), but not unbounded: a run whose human
+ * never answers must eventually end rather than be indistinguishable from a
+ * healthy wait forever. 2880 ticks × 15 s ≈ 12 h (bd-175 review).
+ */
+export const FLEET_RUN_MAX_HUMAN_WAIT_TICKS = 2880;
 
 /** Characters of free text kept in one run record field or terminal detail line. */
 export const FLEET_RUN_DETAIL_MAX_LENGTH = 400;
@@ -570,7 +582,7 @@ function progressFromWorkflow(
   runs: readonly RunManifest[],
 ): FleetMemberProgress {
   if (workflow.awaitingReviewResponse) {
-    return { kind: "awaiting-human", detail: "workflow is waiting for a review response" };
+    return { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON };
   }
   const completed = new Set(workflow.completedPhaseNames);
   if (isWorkflowComplete([...workflow.completedPhaseNames], workflow.phaseOrder)) {
@@ -644,7 +656,7 @@ export type FleetTickAction =
   | { kind: "advance" }
   | { kind: "wait"; detail: string }
   | { kind: "complete"; outcome: FleetRunOutcome; detail: string }
-  | { kind: "halt"; reason: "paused" | "parked" | "stalled"; detail: string };
+  | { kind: "halt"; reason: "paused" | "parked" | "stalled" | "awaiting-human"; detail: string };
 
 export interface PlanFleetTickOptions {
   intent: FleetIntent;
@@ -653,6 +665,8 @@ export interface PlanFleetTickOptions {
   /** Consecutive ticks without progress (from the run record). */
   idleTicks?: number;
   maxIdleTicks?: number;
+  /** Cap for a live human wait; defaults to `FLEET_RUN_MAX_HUMAN_WAIT_TICKS`. */
+  maxHumanIdleTicks?: number;
   startGraceInMs?: number;
 }
 
@@ -714,6 +728,12 @@ function retryIsAlive(observation: FleetMemberObservation | undefined): boolean 
       return true;
     case "running":
       // Without a live lease nothing is running the work, only writing files about it.
+      return observation.claim === "live";
+    case "awaiting-human":
+      // A member waiting on an open human gate keeps its orchestrator lease
+      // while the answer poll watches the gate (bd-152). The run must stay open
+      // for it: the member resumes when the human answers, and a concluded run
+      // could neither land that work nor be resumed (bd-175).
       return observation.claim === "live";
     default:
       return false;
@@ -921,10 +941,84 @@ function boundRunDetail(detail: string, maxLength: number = FLEET_RUN_DETAIL_MAX
   return boundary > 0 ? head.slice(0, boundary) : head;
 }
 
-/** Members still working: wait, unless the run has made no progress for too long. */
+/**
+ * The members in `members` that are stopped awaiting a human and still hold a
+ * live orchestrator lease.
+ *
+ * The answer poll runs inside that session, so the wait is bounded by the human,
+ * not by the idle cap: halting as `stalled` after an hour would leave the
+ * resumed, committed work unlanded — the failure bd-175 exists to fix.
+ */
+function awaitingHumanLiveMembers(
+  options: PlanFleetTickOptions,
+  members: readonly string[],
+): readonly string[] {
+  const byTask = new Map(options.observations.map((entry) => [entry.taskId, entry]));
+  return members.filter((taskId) => {
+    const observation = byTask.get(taskId);
+    return (
+      observation !== undefined &&
+      observation.progress.kind === "awaiting-human" &&
+      observation.claim === "live"
+    );
+  });
+}
+
+/**
+ * Members still working: wait, unless the run has made no progress for too long.
+ *
+ * Precedence is deliberate (bd-175 review): a *hung non-human* member is a
+ * fault and its normal idle cap **outranks** a live human wait elsewhere in the
+ * run; the human exemption is scoped to the human-wait members only, so it
+ * cannot mask a stuck phase behind an unrelated human decision. A run whose only
+ * in-flight work is a live human wait gets the much larger human cap and its own
+ * `awaiting-human` halt reason instead of `stalled`.
+ */
 function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): FleetTickAction {
+  const humanWait = awaitingHumanLiveMembers(options, members);
+  const humanWaitIds = new Set(humanWait);
+  const otherMembers = members.filter((taskId) => !humanWaitIds.has(taskId));
+
   const maxIdle = options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS;
+  const maxHumanIdle = options.maxHumanIdleTicks ?? FLEET_RUN_MAX_HUMAN_WAIT_TICKS;
   const idleTicks = options.idleTicks ?? 0;
+
+  // A hung running member must still stall even while a sibling waits on a human:
+  // exempting the whole run would hide a stuck phase behind an unrelated decision.
+  if (otherMembers.length > 0 && idleTicks >= maxIdle) {
+    const humanClause =
+      humanWait.length === 0 ? "" : `; ${formatTaskIdList(humanWait)} awaiting a human response`;
+    return {
+      kind: "halt",
+      reason: "stalled",
+      detail: boundRunDetail(
+        `no member progressed for ${idleTicks} ticks (cap ${maxIdle}); ` +
+          `${formatTaskIdList(otherMembers)} still in flight${humanClause}`,
+      ),
+    };
+  }
+
+  if (humanWait.length > 0) {
+    // The human owns the clock up to a much larger cap, then the run halts with a
+    // distinct reason so status can tell a neglected wait from a dead member.
+    if (idleTicks >= maxHumanIdle) {
+      return {
+        kind: "halt",
+        reason: "awaiting-human",
+        detail: boundRunDetail(
+          `${formatTaskIdList(humanWait)} awaited a human response for ${idleTicks} ticks ` +
+            `(cap ${maxHumanIdle}); re-arm the fleet after answering`,
+        ),
+      };
+    }
+    return {
+      kind: "wait",
+      detail: boundRunDetail(
+        `${formatTaskIdList(humanWait)} awaiting a human response; the run waits for the answer`,
+      ),
+    };
+  }
+
   if (idleTicks >= maxIdle) {
     // Both counters and the stuck members, because the durable line is all a human
     // sees later: it must say how long nothing moved, and on whom.

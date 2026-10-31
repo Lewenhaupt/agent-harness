@@ -38,7 +38,7 @@ import type { FleetBeadRunner } from "./fleet-beads.js";
  * phase starts writing comments; the prompt-only research writer
  * (`src/agent-registry.ts`) must emit the member name verbatim.
  */
-export type PhaseCommentAuthor = "proof-verifier" | "research" | "userguide";
+export type PhaseCommentAuthor = "proof-verifier" | "research" | "review" | "userguide";
 
 /** Prefix of the phase header line on every harness-authored bead comment. */
 export const PHASE_COMMENT_PREFIX = "[belayd:";

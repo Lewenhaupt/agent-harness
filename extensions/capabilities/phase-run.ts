@@ -9,7 +9,7 @@
  * from `src/quality-gate-run.ts` seams. Nothing here imports a fleet module or
  * `src/process-gate.ts`.
  */
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   type AgentDefinition,
   getPhaseToolName,
@@ -27,6 +27,7 @@ import { formatWorktreePreamble } from "../../src/owned-worktree.js";
 import { collectChangeContext } from "../../src/proof-verification.js";
 import { type RunQualityGateOptions, withFallbackNote } from "../../src/quality-gate-run.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
+import { hasReviewFindings } from "../../src/review-findings.js";
 import {
   type RunDelivery,
   type RunHandle,
@@ -82,7 +83,7 @@ export interface StartPhaseRunOptions {
   worktreeBranch: string | undefined;
   runId: string;
   /** The orchestrator's context: the follow-up hold reads its live branch (bd-177). */
-  ctx: { sessionManager: { getBranch?: () => readonly unknown[] } };
+  ctx: ExtensionContext;
 }
 
 /** Everything the phase runner needs from its host. */
@@ -108,6 +109,85 @@ export interface PhaseRunnerDeps {
     options: SpawnWithFallbackOptions,
   ) => Promise<{ result: SpawnResult; attempts: SpawnAttempt[] }>;
   runQualityGate: (options: RunQualityGateOptions) => Promise<SpawnResult | null | undefined>;
+  /**
+   * Open a human gate for a review that reported findings (bd-175). Injected so
+   * this module never reaches the human-gate capability directly; the composer
+   * wires it to `openReviewHumanGate`. Absent in narrower hosts, where a review
+   * delivery keeps the pre-bd-175 behaviour.
+   */
+  reviewGate?: ReviewGateSeam;
+}
+
+/** The injected review-gate opener (bd-175); see `reviewGate` above. */
+export type ReviewGateSeam = (options: {
+  state: CoreSessionState;
+  ctx: ExtensionContext;
+  taskId: string;
+  reviewText: string;
+}) => Promise<{ opened: boolean; reason: string }>;
+
+/**
+ * Call the injected review-gate opener without ever letting it fail the review
+ * delivery. Extracted so the catch path is unit-testable without a live run.
+ */
+export async function tryOpenReviewGate(options: {
+  open: ReviewGateSeam;
+  state: CoreSessionState;
+  ctx: ExtensionContext;
+  taskId: string;
+  reviewText: string;
+}): Promise<boolean> {
+  try {
+    const outcome = await options.open({
+      state: options.state,
+      ctx: options.ctx,
+      taskId: options.taskId,
+      reviewText: options.reviewText,
+    });
+    return outcome.opened;
+  } catch (error) {
+    console.warn("[belayd-harness] could not open the review human gate", error);
+    return false;
+  }
+}
+
+/**
+ * The review loop directive appended to a successful review delivery, or "" for
+ * any other delivery. Extracted so the `deliver` watcher callback stays within
+ * the cognitive-complexity budget.
+ */
+function reviewLoopHintFor(delivery: RunDelivery, state: CoreSessionState): string {
+  if (!delivery.success || delivery.phaseName !== REVIEW_PHASE) return "";
+  // Outside an active workflow there is no next phase to advance to, so the
+  // loop directive would name a phase tool the gate is not driving.
+  if (!state.gateActive) return "";
+  // The "advance" tool is the next incomplete phase, not just review's
+  // successor, so a late re-review after test points at the right phase.
+  const nextIncompletePhase =
+    getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? COMMIT_PHASE;
+  return (
+    `\n\n---\n**When review findings remain:** ` +
+    reviewLoopDirective(getPhaseToolName(nextIncompletePhase))
+  );
+}
+
+/**
+ * The loop hint a run-complete delivery carries, withheld when this delivery
+ * opened a human gate (bd-175).
+ *
+ * A member blocked by that gate cannot call the next phase tool the hint names,
+ * so offering it would only invite a refused call. Pure so all three inputs are
+ * pinned directly: opening the gate is the only thing that withholds the hint —
+ * a clean review and a host with no gate seam both arrive here as
+ * `reviewGateOpened: false` and keep the pre-bd-175 delivery.
+ */
+export function runCompleteLoopHint(options: {
+  delivered: RunDelivery;
+  state: CoreSessionState;
+  reviewGateOpened: boolean;
+}): string {
+  if (options.reviewGateOpened) return "";
+  return reviewLoopHintFor(options.delivered, options.state);
 }
 
 /** The background-run surface the phase and planning tools drive. */
@@ -301,23 +381,30 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }
 
   /**
-   * The review loop directive appended to a successful review delivery, or ""
-   * for any other delivery. Extracted so the `deliver` watcher callback stays
-   * within the cognitive-complexity budget.
+   * A phase run is complete. Turn a review that reported findings into a human
+   * gate through the injected seam (bd-175).
+   *
+   * Best-effort: the gate is the visible record, but a bd failure must never
+   * fail an otherwise delivered review. Returns whether the gate actually
+   * opened, so the caller can withhold the resumable-fix directive that a
+   * blocked workflow could not act on.
    */
-  function reviewLoopHintFor(delivery: RunDelivery, state: CoreSessionState): string {
-    if (!delivery.success || delivery.phaseName !== REVIEW_PHASE) return "";
-    // Outside an active workflow there is no next phase to advance to, so the
-    // loop directive would name a phase tool the gate is not driving.
-    if (!state.gateActive) return "";
-    // The "advance" tool is the next incomplete phase, not just review's
-    // successor, so a late re-review after test points at the right phase.
-    const nextIncompletePhase =
-      getNextPhase(state.completedPhaseNames, state.phaseOrder) ?? COMMIT_PHASE;
-    return (
-      `\n\n---\n**When review findings remain:** ` +
-      reviewLoopDirective(getPhaseToolName(nextIncompletePhase))
-    );
+  async function openReviewGateIfFound(options: {
+    delivered: RunDelivery;
+    state: CoreSessionState;
+    ctx: ExtensionContext;
+  }): Promise<boolean> {
+    const openGate = deps.reviewGate;
+    if (openGate === undefined) return false;
+    const reviewText = options.delivered.result.content?.[0]?.text ?? "";
+    if (!hasReviewFindings(reviewText)) return false;
+    return tryOpenReviewGate({
+      open: openGate,
+      state: options.state,
+      ctx: options.ctx,
+      taskId: options.state.currentTaskId,
+      reviewText,
+    });
   }
 
   /**
@@ -516,12 +603,20 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       // The watcher does not await this callback, so any throw would become an
       // unhandled rejection instead of reaching the watcher's own catch.
       try {
+        const delivered = boundReviewDelivery(delivery);
         // Only a gate-owned, successful review records the reviewed sha — a
         // post-completion rework run must not scope the next task's review.
+        // A review that reported findings opens a human gate here (bd-175), so
+        // the stop is findable in bd instead of only inside the worktree.
+        let reviewGateOpened = false;
         if (gateOwnsRun() && delivery.success && delivery.phaseName === REVIEW_PHASE) {
           await persistReviewedSha({ cwd, taskId: state.currentTaskId });
+          reviewGateOpened = await openReviewGateIfFound({
+            delivered,
+            state,
+            ctx: options.ctx,
+          });
         }
-        const delivered = boundReviewDelivery(delivery);
         recordRunEndMetrics({
           taskId: state.currentTaskId,
           delivery,
@@ -539,7 +634,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
               customType: "belayd-run-complete",
               content: core.buildRunCompleteContent(
                 delivered,
-                reviewLoopHintFor(delivered, state),
+                runCompleteLoopHint({ delivered, state, reviewGateOpened }),
                 core.userGuideArtifactLine(delivered, { cwd, taskId: state.currentTaskId }),
               ),
               display: true,

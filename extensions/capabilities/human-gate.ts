@@ -14,6 +14,7 @@ import {
   excerptComment,
   isHumanComment,
   lookupBeadComments,
+  phaseCommentBody,
 } from "../../src/bead-comments.js";
 import {
   buildGateCreateArgv,
@@ -22,6 +23,13 @@ import {
   parseCreatedGateId,
 } from "../../src/bead-gates.js";
 import { orchestratorActor, withActorArgv } from "../../src/beads-actor.js";
+import {
+  buildReviewFindingsRecord,
+  formatReviewFindingsComment,
+  nextReviewRound,
+  reviewFindingsGateTitle,
+  writeReviewFindingsRecord,
+} from "../../src/review-findings.js";
 import { isValidTaskId } from "../../src/session-naming.js";
 import type { AwaitingHuman } from "../../src/workflow-phases.js";
 import { type CoreSessionState, errorText, runBdCommand, textToolResult } from "./context.js";
@@ -568,11 +576,20 @@ async function createHumanGate(options: {
   taskId: string;
   question: string;
   actor: string;
-  ctx: ExtensionContext;
+  /** Custom gate title; bd's default says nothing about which wait this is. */
+  title?: string;
+  ctx: { cwd: string };
 }): Promise<{ ok: true; gateId?: string } | { ok: false; error: string }> {
   const created = await runBdResult(
     withActorArgv(
-      [...buildGateCreateArgv({ beadId: options.taskId, reason: options.question }), "--json"],
+      [
+        ...buildGateCreateArgv({
+          beadId: options.taskId,
+          reason: options.question,
+          ...(options.title === undefined ? {} : { title: options.title }),
+        }),
+        "--json",
+      ],
       options.actor,
     ),
     { cwd: options.ctx.cwd, stdin: undefined },
@@ -594,6 +611,109 @@ function askResultText(options: { taskId: string; gateId?: string }): string {
     lines.push("Note: bd did not report the gate id; the poll re-reads the gate from the bead.");
   }
   return lines.join("\n");
+}
+
+/**
+ * Turn a review that reported findings into the same human wait `belayd_ask_human`
+ * opens (bd-175).
+ *
+ * Three writes, in this order: the gate first (so the wait is visible in
+ * bd/Scotty even if a later write fails), then the durable disposition record
+ * (only once the gate exists — a record with no gate would claim a wait bd and
+ * the fix loop cannot see), then the findings comment authored by the workflow
+ * actor (so it can never count as the human's answer).
+ *
+ * The wait is reserved synchronously before the first `await` via
+ * `state.reviewGatePending`, so two review deliveries settling concurrently
+ * cannot both pass the check and open two gates. The pending marker is never
+ * exposed as `awaitingHuman`: the gate does not exist yet, and the answer poll
+ * would read the empty gate list as "the human resolved it". The marker is
+ * released in a `finally` that touches nothing else, so even a throw inside the
+ * gated section cannot strand it — nor can it unblock a gate that already exists.
+ *
+ * Called from the review phase's completion delivery, so a non-empty review
+ * stops the member on a *findable* wait: the gate blocks the bead, `needs-you`
+ * views list it, and resolving it (or answering in a comment) resumes the
+ * member through the existing answer poll.
+ */
+export async function openReviewHumanGate(options: {
+  state: CoreSessionState;
+  ctx: ExtensionContext;
+  deps: HumanGateDeps;
+  taskId: string;
+  reviewText: string;
+}): Promise<{ opened: boolean; reason: string }> {
+  const { state } = options;
+  if (state.awaitingHuman !== undefined) {
+    return { opened: false, reason: `already waiting on ${state.awaitingHuman.beadId}` };
+  }
+  if (state.reviewGatePending === true) {
+    return { opened: false, reason: "a review gate is already being opened" };
+  }
+  // Same guard `resolveAskTarget` applies to the ask path: a crafted task id must
+  // never reach `orchestratorActor` or a bd argv.
+  if (!isValidTaskId(options.taskId)) {
+    return { opened: false, reason: `invalid task id "${options.taskId}"` };
+  }
+  const record = buildReviewFindingsRecord({
+    taskId: options.taskId,
+    text: options.reviewText,
+    round: nextReviewRound({ cwd: options.ctx.cwd }),
+  });
+  if (record === undefined) {
+    return { opened: false, reason: "the review reported no findings" };
+  }
+
+  const actor =
+    options.deps.resolveSessionBdActor(options.ctx) ?? orchestratorActor(options.taskId);
+  // Reserve synchronously so a concurrent delivery bails at the check above
+  // instead of racing this one to a second gate. `reviewGatePending`, not
+  // `awaitingHuman`, because the gate does not exist yet.
+  const askedAt = Date.now();
+  state.reviewGatePending = true;
+  try {
+    const created = await createHumanGate({
+      taskId: options.taskId,
+      question: record.reason,
+      actor,
+      title: reviewFindingsGateTitle({ taskId: options.taskId, round: record.round }),
+      ctx: options.ctx,
+    });
+    if (!created.ok) {
+      return { opened: false, reason: `could not open a human gate: ${created.error}` };
+    }
+    state.awaitingHuman = {
+      beadId: options.taskId,
+      askedAt,
+      ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
+    };
+
+    const written = writeReviewFindingsRecord({ cwd: options.ctx.cwd, record });
+    if (!written.ok) {
+      console.warn(`[belayd-harness] could not record the review findings: ${written.error}`);
+    }
+
+    // A failed comment must not remove the gate: the gate's reason is itself the
+    // visible wait, so the member stays stopped on a findable record either way.
+    const posted = await runBdResult(
+      withActorArgv(["comment", "--stdin", "--", options.taskId], actor),
+      {
+        cwd: options.ctx.cwd,
+        stdin: phaseCommentBody("review", formatReviewFindingsComment(record)),
+      },
+    );
+    if (!posted.ok) {
+      console.warn(`[belayd-harness] could not post the review findings comment: ${posted.error}`);
+    }
+
+    startHumanAnswerPoll(state, options.ctx, options.deps);
+    return { opened: true, reason: record.reason };
+  } finally {
+    // Only the reservation is released here. `awaitingHuman` is the wait itself
+    // and must survive a throw: clearing it in `finally` would silently unblock a
+    // member whose gate is already open and visible in bd.
+    state.reviewGatePending = undefined;
+  }
 }
 
 /** `runBdCommand` as an error value, so tool handlers never throw on bd. */

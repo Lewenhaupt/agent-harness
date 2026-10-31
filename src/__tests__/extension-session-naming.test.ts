@@ -2980,6 +2980,13 @@ describe("session_start resume from disk (bd-40)", () => {
     await runPhase("implement", "implement");
     await runPhase("review", "first review");
 
+    // The mock review text is clean, so no gate opens and the resumable-fix
+    // directive stays in the delivery (bd-175).
+    const cleanReviewDelivery = messages
+      .filter((message) => message.customType === "belayd-run-complete")
+      .at(-1)?.content;
+    expect(cleanReviewDelivery).toContain("**When review findings remain:**");
+
     const reviewCalls = (): Array<Record<string, unknown>> =>
       mockSpawnAgentProcess.mock.calls
         .map((call) => call[0] as Record<string, unknown>)
@@ -3077,6 +3084,9 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(delivered).not.toContain(`defect ${REVIEW_SECTION_LIMITS.critical + 1}`);
     expect(delivered).not.toContain("✓ All error paths look correct");
     expect(delivered).toContain("## Warnings (should fix)\n- None");
+    // The findings opened a human gate through the real seam, so the delivery must
+    // not tell the blocked member to advance to the next phase (bd-175).
+    expect(delivered).not.toContain("**When review findings remain:**");
   });
 
   it("discloses an unavailable diff instead of silently sending the bare task (W3)", async () => {

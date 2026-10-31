@@ -93,18 +93,137 @@ function looksLikeFilePathToken(token: string): boolean {
 }
 
 /**
+ * Markers that make a bullet verification narration, not a defect.
+ *
+ * A reviewer's "Checked `src/a.ts` and it is fine" and "✓ src/b.ts:3 handles
+ * null" bullets are not findings. The gate path needs a negative signal that is
+ * *lexical* rather than positional: requiring the location to lead the bullet
+ * (the previous approach) dropped real prose-first findings such as "Missing
+ * null check in src/b.ts:5" and silently returned to the invisible-halt failure
+ * mode this bead exists to fix (bd-175 review).
+ *
+ * The set is split by how a real finding can open, because a missed finding is
+ * the invisible-halt failure and therefore the worse error:
+ *
+ * 1. {@link NARRATION_LEAD_SYMBOLS} — a check mark can never introduce a defect.
+ * 2. {@link NARRATION_LEAD_VERBS} — a *past-tense* verification verb describes a
+ *    check already run; defects are stated in the present tense or as a noun
+ *    phrase ("Test coverage missing in src/x.ts:5" stays a finding because the
+ *    noun forms "test"/"review" are deliberately absent from both sets).
+ * 3. {@link NARRATION_AFFIRMATIONS} — words that are also how a real finding
+ *    opens ("Correct the bounds…", "Passed, though…", "All good, but…"), so
+ *    they only count when the bullet is that affirmation *and nothing else*
+ *    (optionally with punctuation: "All good.", "Looks good:").
+ */
+const NARRATION_LEAD_SYMBOLS = /^[✓✔✅]/u;
+
+/** Past-tense check verbs: narration wherever the prose continues afterwards. */
+const NARRATION_LEAD_VERBS: readonly string[] = [
+  "checked",
+  "verified",
+  "confirmed",
+  "tested",
+  "reviewed",
+];
+
+/** Affirmations that are narration only when the bullet is nothing else. */
+const NARRATION_AFFIRMATIONS: readonly string[] = [
+  "none",
+  "no findings",
+  "all good",
+  "lgtm",
+  "looks good",
+  "looked good",
+  "looks fine",
+  "looked fine",
+  "looks ok",
+  "looked ok",
+  "looks okay",
+  "looked okay",
+  "fine",
+  "good",
+  "ok",
+  "okay",
+  "correct",
+  "pass",
+  "passed",
+  "passing",
+];
+
+/**
+ * A word boundary in a normalized lead: end, whitespace, clause punctuation, or
+ * a closing markdown/quote mark. Emphasis markers are not listed because
+ * {@link normalizeBulletLead} strips them from the leading token first.
+ */
+const LEAD_BOUNDARY = /^(?:[\s:,;.!?`]|[-—–])/u;
+
+/**
+ * Lower-case the bullet, drop leading markup, and strip emphasis around the
+ * first word so `**Verified**`/`__Checked__` classify exactly like
+ * `Verified`/`Checked`: emphasis is styling on the marker, not a different
+ * marker. The closing run is stripped only when a word boundary follows it, so
+ * an underscore inside an identifier (`checkout_service`) is left alone.
+ */
+function normalizeBulletLead(text: string): string {
+  const lowered = text
+    .toLowerCase()
+    .replace(/^[^a-z0-9]+/u, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return lowered.replace(/^([a-z0-9]+)[*_~`]+(?=$|[\s:,;.!?`]|[-—–])/u, "$1");
+}
+
+/** `true` when `lead` opens `normalized` and ends on a word boundary. */
+function leadsWithWord(normalized: string, lead: string): boolean {
+  if (!normalized.startsWith(lead)) return false;
+  const rest = normalized.slice(lead.length);
+  return rest === "" || LEAD_BOUNDARY.test(rest);
+}
+
+/**
+ * `true` when the bullet is the affirmation alone, punctuation aside. Prose
+ * after the affirmation ("All good, but `src/a.ts:5` races") is a finding.
+ */
+function isBareAffirmation(normalized: string, affirmation: string): boolean {
+  const withoutTrailingPunctuation = normalized.replace(/[^a-z0-9]+$/u, "");
+  return withoutTrailingPunctuation === affirmation;
+}
+
+/** True when a bullet opens with a verification/affirmation marker. */
+function leadsWithNarration(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed === "") return true;
+  if (NARRATION_LEAD_SYMBOLS.test(trimmed)) return true;
+  const normalized = normalizeBulletLead(trimmed);
+  if (NARRATION_LEAD_VERBS.some((lead) => leadsWithWord(normalized, lead))) return true;
+  return NARRATION_AFFIRMATIONS.some((affirmation) => isBareAffirmation(normalized, affirmation));
+}
+
+/**
  * A bullet is a finding when it points at a location. "None" marks an
  * intentionally empty section. A path-only bullet (no `:LINE`) is accepted
  * because a real finding may not have a line number yet; narration bullets
  * (leading ✓ or prose) are dropped and disclosed by the caller.
+ *
+ * `strict` is for the gate path (bd-175): broad match **minus a narration lead**.
+ * A real finding may put the location mid-sentence ("Missing null check in
+ * src/b.ts:5"), so the location may appear anywhere; a narration bullet may
+ * mention a location ("verified `src/x.ts:10` handles null"), so a leading
+ * affirmation marker disqualifies it. The metrics count keeps the unchanged
+ * broad match so its historical series does not shift.
  */
-function isFindingBullet(line: string): boolean {
+function isFindingBullet(line: string, strict: boolean): boolean {
   const text = bulletText(line);
   if (text.toLowerCase() === "none") return true;
   const [firstToken] = text.split(/\s+/);
-  if (firstToken !== undefined && looksLikeFilePathToken(firstToken)) return true;
-  // A `file:line` anywhere still counts: the contract's canonical shape.
-  return FILE_LOCATION_PATTERN.test(text);
+  const leadsWithPath = firstToken !== undefined && looksLikeFilePathToken(firstToken);
+  const mentionsLocation = FILE_LOCATION_PATTERN.test(text);
+  if (!strict) {
+    // Historical metrics match: a path-only lead or a `file:line` anywhere.
+    return leadsWithPath || mentionsLocation;
+  }
+  if (!leadsWithPath && !mentionsLocation) return false;
+  return !leadsWithNarration(text);
 }
 
 function truncationNote(omitted: number): string {
@@ -152,7 +271,7 @@ function partitionSectionBody(
       kept.push(line);
       continue;
     }
-    if (!isFindingBullet(line)) {
+    if (!isFindingBullet(line, false)) {
       malformed += 1;
       continue;
     }
@@ -700,16 +819,45 @@ export interface ReviewFindingCounts {
   suggestions: number;
 }
 
+export interface ParsedReviewFinding {
+  severity: ReviewSeverity;
+  /** The bullet body with its marker stripped, e.g. `src/a.ts:12` — the defect. */
+  text: string;
+}
+
+export interface ParseReviewFindingsOptions {
+  /**
+   * Accept a `file:line` anywhere in the bullet (so a prose-first finding still
+   * counts) but drop bullets that open with a verification/affirmation marker
+   * ("verified `src/x.ts:10` handles null"). The gate path (bd-175) sets this; the
+   * metrics count keeps the historical anywhere-in-text behaviour.
+   *
+   * Known limitation: a past-tense check verb drops the whole bullet even when a
+   * `:`/`—` clause after it restates a present-tense defect ("Checked: race in
+   * src/a.ts:5"). Separating that clause from an affirmation ("Checked: all fine")
+   * needs a defect lexicon, and guessing wrong opens a human gate for nothing —
+   * the failure the narration rule exists to prevent — so the tradeoff is
+   * documented (docs/fleet-run.md) instead of heuristically guessed.
+   */
+  strict?: boolean;
+}
+
 /**
- * Count the findings bullets a review reported, per severity section.
+ * Extract the findings bullets from a review delivery, per severity section.
  *
- * Used by the metrics log (bd-140): "did this review find anything, and how
- * serious was it" is the signal that tells us whether the review phase earns its
- * keep. A `None` body counts as zero, and the bounding markers this module
- * appends are not findings.
+ * One parser behind both {@link countReviewFindings} and the durable
+ * review-findings record (bd-175): a `None` body, bounding markers
+ * (`+N more omitted`), and narration bullets are not findings. The gate path
+ * passes `strict` (see {@link ParseReviewFindingsOptions}) because a false
+ * positive there opens a human wait with no findings; the metrics count keeps
+ * the original broader match.
  */
-export function countReviewFindings(text: string): ReviewFindingCounts {
-  const counts: ReviewFindingCounts = { critical: 0, warnings: 0, suggestions: 0 };
+export function parseReviewFindings(
+  text: string,
+  options: ParseReviewFindingsOptions = {},
+): ParsedReviewFinding[] {
+  const strict = options.strict === true;
+  const findings: ParsedReviewFinding[] = [];
   let current: ReviewSeverity | undefined;
   for (const line of text.split("\n")) {
     const severity = severityOfHeading(line);
@@ -724,7 +872,25 @@ export function countReviewFindings(text: string): ReviewFindingCounts {
     }
     if (!isBullet(line)) continue;
     if (isBoundMarkerNote(line)) continue;
-    counts[current] += 1;
+    if (!isFindingBullet(line, strict)) continue;
+    const body = bulletText(line);
+    if (body.toLowerCase() === "none") continue;
+    findings.push({ severity: current, text: body });
   }
+  return findings;
+}
+
+/**
+ * Count the findings bullets a review reported, per severity section.
+ *
+ * Used by the metrics log (bd-140): "did this review find anything, and how
+ * serious was it" is the signal that tells us whether the review phase earns its
+ * keep. Delegates to {@link parseReviewFindings} in its non-strict mode, which
+ * keeps the historical anywhere-in-text match; the gate path uses strict mode
+ * (bd-175), so the two can differ on a narration bullet that names a location.
+ */
+export function countReviewFindings(text: string): ReviewFindingCounts {
+  const counts: ReviewFindingCounts = { critical: 0, warnings: 0, suggestions: 0 };
+  for (const finding of parseReviewFindings(text)) counts[finding.severity] += 1;
   return counts;
 }

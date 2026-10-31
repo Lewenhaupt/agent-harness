@@ -385,6 +385,14 @@ export interface CoreSessionState {
    */
   awaitingHuman?: AwaitingHuman & { gateId?: string };
   /**
+   * Set synchronously while a review gate is being opened, before its bd writes
+   * complete (bd-175). It reserves the wait so a second concurrent delivery
+   * cannot open a duplicate gate, but — unlike `awaitingHuman` — it must not be
+   * visible to the answer poll, because the gate does not exist yet and an empty
+   * gate list would read as "the human resolved it".
+   */
+  reviewGatePending?: boolean;
+  /**
    * Interval polling the open human gate and its comment thread. Armed only for
    * an orchestrator session that asked a question, so an idle fleet of members
    * with nothing outstanding spawns no `bd` at all.

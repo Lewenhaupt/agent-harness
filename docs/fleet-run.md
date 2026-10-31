@@ -95,8 +95,8 @@ belayd_fleet_resume { }                            # restarts a paused run's tic
 ```
 
 A **paused** run is not finished: the ticker stops, the run record stays live, and
-`resume` starts the ticker again. A **parked** or **stalled** run is halted and
-recorded (`haltedReason`), because both need a human:
+`resume` starts the ticker again. A **parked**, **stalled**, or **awaiting-human**
+run is halted and recorded (`haltedReason`), because each needs a human:
 
 - `parked` — the root checkout could not be restored after a merge (reconcile,
   then re-arm).
@@ -124,16 +124,23 @@ recorded (`haltedReason`), because both need a human:
   capacity-blocked, the members waiting for a slot. An advance that launches nothing
   because of a `dependency` or `external-blocker` — and no `capacity` entry — does
   not wait for this cap at all: it ends the run as `partial` on that tick.
+- `awaiting-human` — `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` ticks (2880 at the 15 s
+  interval, i.e. ~12 h) while the **only** work in flight is a live human wait
+  (see the landing window below). It is a distinct reason so a neglected gate
+  never looks like a dead member, and its detail names the members that waited
+  (`bd-143 awaited a human response for 2880 ticks (cap 2880); re-arm the fleet
+  after answering`). A hung non-human member in the same run still halts
+  `stalled` at the much smaller idle cap first.
 
 A halt is terminal **for that run record**: `haltedReason` is never cleared, and
 both the ticker (`fleetTick`) and `resumeFleetRunLoop` only act on an active run
 (`isFleetRunActive` requires `haltedReason === undefined`). So `belayd_fleet_resume`
 restarts the ticker only for a *paused* run. After a `parked` halt it clears the
 pause and park flags (refusing while a recorded stash is still unrestored), but
-nothing ticks again because the run is no longer active; after a `stalled` halt no
-pause flag is set (a paused fleet halts as `paused` instead), so resume is an
-`alreadyResumed` no-op that changes nothing at all. Either way, continuing needs a
-re-arm — `/fleet <ids> --fleet <id>`
+nothing ticks again because the run is no longer active; after a `stalled` or
+`awaiting-human` halt no pause flag is set (a paused fleet halts as `paused`
+instead), so resume is an `alreadyResumed` no-op that changes nothing at all.
+Either way, continuing needs a re-arm — `/fleet <ids> --fleet <id>`
 (for a parked fleet, run `belayd_fleet_reconcile` first to unpark) — which
 preserves the members and starts a **new** run record in place of the halted one.
 
@@ -238,7 +245,7 @@ One action per tick, in this order (`src/fleet-run.ts`):
 | 0 | `halt` | the fleet is paused (`resume` restarts) or parked (needs a human) |
 | 1 | `land` | the first landable member whose workflow is complete (all phases done, or a completed final-phase run with no state file), including one the run stopped earlier and whose retry finished |
 | 2 | `stop` | the first member that needs a human: `awaiting-human`, `phase-failed`, `phase-interrupted`, `state-corrupt`, or `orchestrator-missing` |
-| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached (no member's progress signature changed for `FLEET_RUN_MAX_IDLE_TICKS` ticks), then `halt`/`stalled` |
+| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached (no member's progress signature changed for `FLEET_RUN_MAX_IDLE_TICKS` ticks), then `halt`/`stalled`; when the only in-flight work is a live human wait the larger `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` cap applies instead and the halt reason is `awaiting-human` |
 | 4 | `advance` | nothing is working and the deferred list is non-empty; an advance that launches nothing degrades to `complete`/`partial` — or to `wait` when **any** deferral names `capacity` (a mixed `capacity` + `dependency` list included), bounded by the same idle cap (then `halt`/`stalled`) |
 | 5 | `complete` | nothing is working and no deferred work remains (`partial` when something stopped) |
 
@@ -249,6 +256,28 @@ not retried, because the retry is exactly what started a second orchestrator on
 one worktree before the lease existed. Waiting third keeps the run alive while
 anything can still deliver work; `advance` and `complete` only run once nothing
 is working at all.
+
+**An `awaiting-human` stop is findable (bd-175).** A review that reports findings
+is a human decision, so the member opens a real bd `human` gate — the same
+channel as `belayd_ask_human` — with the findings posted as an authored comment
+(summary, severity, disposition, and the artifact path) and the reason string
+`workflow is waiting for a review response` in both the gate and the run's
+`run.stopped[]` detail. The member's own answer poll watches the gate, so
+resolving it (or answering in a comment) resumes the member and the loop lands
+its work. `bd show`, `needs-you` views, and `bd ready` therefore agree with the
+fleet's own view; a clean review writes nothing and stays on the fast path.
+
+**Known gate limitation: a verb-lead bullet with a defect clause.** The gate
+trigger is lexical: a bullet that opens with a past-tense check verb
+(`checked`/`verified`/`tested`/`reviewed`) is narration and does not gate, even
+when a `:`/`—` clause after it restates a present-tense defect (`- Checked: race
+in src/a.ts:5`). Separating that clause from an affirmation (`- Checked: all
+fine`) needs a defect lexicon, and a wrong guess *opens a human gate for nothing*
+— the failure the narration rule exists to prevent. The tradeoff is deliberate
+and pinned by tests (`parseReviewFindings` strict cases, `hasReviewFindings`); a
+defect should be written without the check-verb prefix. A narration bullet that
+cites a location still does not gate, whether its marker is bare, backticked, or
+markdown-emphasized (`**Verified**`, `__Checked__`).
 
 **An advance that launches nothing ends the run** (`src/fleet-run.ts`
 `emptyAdvanceAction`). The executor degrades that no-launch advance into the
@@ -307,11 +336,30 @@ blocking a sibling stays a fleet dependency — `dependency`, not
 
 **The landing window is the run's lifetime.** Because a finished or halted run is
 not ticked again, the tick keeps the run open (a `wait`) while a stopped member's
-retry is observably alive: a live orchestrator lease for a `running` member, or
-the start grace for a member that has not written state yet. Nothing else keeps it
+retry is observably alive: a live orchestrator lease for a `running` member, a
+live orchestrator lease for an `awaiting-human` member whose answer poll is still
+watching its gate (bd-175), or the start grace for a member that has not written
+state yet. Nothing else keeps it
 open — a stopped member with no lease is only *described* as running by stale
-files, and waiting on it would hold the run and its capacity slots forever. The
-wait is also bounded by the idle cap, so a silent retry halts the run as `stalled`.
+files, and waiting on it would hold the run and its capacity slots forever.
+
+A live human wait is bounded by a much larger cap than a stalled member: the
+answer poll is alive and the decision is the human's, so the run waits (with its
+own `awaiting a human response` line, never `still in flight`) instead of halting
+`stalled` on the very member it must still land. That wait lasts
+`FLEET_RUN_MAX_HUMAN_WAIT_TICKS` — 2880 ticks × 15 s ≈ 12 h — and then halts
+with reason `awaiting-human` (not `stalled`), so a neglected gate stays
+distinguishable from a healthy wait and from a dead member. If the lease dies
+before either cap, the run concludes `partial` as usual.
+
+The two caps have a deliberate precedence: a hung **non-human** member's normal
+idle cap (`FLEET_RUN_MAX_IDLE_TICKS`, ≈ 1 h) outranks a live human wait
+elsewhere in the run. Exempting the whole run would hide a stuck phase behind an
+unrelated decision, so a tick with both a hung retry and a human wait halts
+`stalled`, and its detail names the human-wait member in a trailing clause. The
+12 h `awaiting-human` cap only applies when the human wait is the only work still
+in flight. Every other wait is bounded by the idle cap, so a silent retry halts
+the run as `stalled`.
 A halt is not a *finish* (the record keeps the members and the stop reasons), but
 it does end the run's ticking, so the landing window is closed either way: to land
 a stopped member after a halt or a finish, re-arm the fleet (`/fleet <ids> --fleet
@@ -322,7 +370,8 @@ land the bead explicitly.
 (bd-166).** Without that, a run that ended 0-for-N kept N of the repository's 3
 capacity slots forever, and the fleet that owned them had no live supervisor left
 to repair them. On `finishFleetRun`, and on a halt that records `haltedReason`
-(parked or stalled — a *paused* run is resumable and is never swept), every member
+(parked, stalled, or awaiting-human — a *paused* run is resumable and is never
+swept), every member
 the run can no longer land gets a `released: { taskId, reason, at }` entry on the
 intent: reason `run-complete` or `run-halted`. A member whose work is `complete`
 stays landable and is **not** released, a member whose worktree lease is live is

@@ -49,6 +49,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
+| `src/review-findings.ts` | Durable review findings: severity/disposition record, gate reason, and the human-gate comment body (bd-175) |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
 | `src/run-detached.ts` | Detached background run orchestration |
 | `src/session-naming.ts` | Session naming utilities for subagent session management |

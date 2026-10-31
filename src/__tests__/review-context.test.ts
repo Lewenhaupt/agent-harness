@@ -12,7 +12,9 @@ import {
   boundReviewOutput,
   classifyDiffScope,
   collectReviewDiff,
+  countReviewFindings,
   formatReviewTask,
+  parseReviewFindings,
   REVIEW_LINE_NUMBER_INSTRUCTION,
   REVIEW_OUTPUT_CONTRACT,
   REVIEW_PROCESS_INSTRUCTION,
@@ -680,5 +682,147 @@ describe("formatReviewTask", () => {
     expect(text).toContain("## Prior findings to verify");
     expect(text).toContain("- `src/a.ts:12` — swallowed error");
     expect(text).toContain("## Task\nVerify the fix round.");
+  });
+});
+
+describe("parseReviewFindings", () => {
+  const review = [
+    "## Critical (must fix)",
+    "- `src/a.ts:12` — off-by-one",
+    "- (+3 more omitted; see the full findings in the review transcript)",
+    "",
+    "## Warnings (should fix)",
+    "- Checked the call sites, all fine",
+    "- `src/b.ts:5` — missing null check",
+    "",
+    "## Suggestions (consider)",
+    "None",
+  ].join("\n");
+
+  it("keeps location findings and drops None, markers, and narration", () => {
+    expect(parseReviewFindings(review)).toEqual([
+      { severity: "critical", text: "`src/a.ts:12` — off-by-one" },
+      { severity: "warnings", text: "`src/b.ts:5` — missing null check" },
+    ]);
+    expect(countReviewFindings(review)).toEqual({ critical: 1, warnings: 1, suggestions: 0 });
+  });
+
+  it("reports zero for a clean review", () => {
+    const clean = ["## Critical (must fix)", "None", "## Warnings (should fix)", "None"].join("\n");
+    expect(parseReviewFindings(clean)).toEqual([]);
+    expect(countReviewFindings(clean)).toEqual({ critical: 0, warnings: 0, suggestions: 0 });
+  });
+
+  it("strict mode drops a narration bullet that mentions a file:line", () => {
+    // The anywhere-in-text match is what the metrics series expects; the gate path
+    // must not inherit it (bd-175 review).
+    const text = "## Warnings (should fix)\n- verified `src/x.ts:10` handles null correctly";
+    expect(parseReviewFindings(text)).toEqual([
+      { severity: "warnings", text: "verified `src/x.ts:10` handles null correctly" },
+    ]);
+    expect(parseReviewFindings(text, { strict: true })).toEqual([]);
+  });
+
+  it("strict mode keeps a prose-first finding whose location is mid-sentence", () => {
+    // The reason the rule is lexical and not positional: a real finding may name
+    // the file after the defect, and lead-only strict mode dropped it silently.
+    const text = "## Critical (must fix)\n- Missing null check in src/b.ts:5";
+    expect(parseReviewFindings(text, { strict: true })).toEqual([
+      { severity: "critical", text: "Missing null check in src/b.ts:5" },
+    ]);
+  });
+
+  it("strict mode treats an affirmation symbol as narration even when prose follows", () => {
+    // A check mark cannot introduce a defect, so the whole bullet is narration.
+    // Every symbol in NARRATION_LEAD_SYMBOLS is pinned, not just `✓`.
+    for (const bullet of ["- ✓ src/x.ts:10 ok", "- ✔ src/x.ts:10 ok", "- ✅ src/x.ts:10"]) {
+      expect(parseReviewFindings(`## Warnings (should fix)\n${bullet}`, { strict: true })).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("strict mode strips emphasis around a past-tense check verb", () => {
+    // `**Verified**`/`__Checked__` is the same narration marker as the bare word:
+    // emphasis is styling, not a scope change. Before this, a clean review whose
+    // narration cited a file:line still opened a human gate (bd-175 review).
+    for (const bullet of [
+      "- **Verified** `src/x.ts:10` handles null correctly",
+      "- __Checked__ `src/a.ts:5`",
+      "- *Reviewed* `src/a.ts:5`, all fine",
+    ]) {
+      expect(parseReviewFindings(`## Warnings (should fix)\n${bullet}`, { strict: true })).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("strict mode accepts an emphasized marker before a colon as narration", () => {
+    // Pinned on purpose: `- Verified: race in src/a.ts:5` already drops without
+    // emphasis, and emphasis must not change the classification. The documented
+    // tradeoff (ParseReviewFindingsOptions.strict, docs/fleet-run.md) is that a
+    // past-tense verb lead drops the whole bullet, so this shape is a known
+    // false negative rather than an inconsistency between styled and plain leads.
+    const text = "## Critical (must fix)\n- **Verified**: race in src/a.ts:5";
+    expect(parseReviewFindings(text, { strict: true })).toEqual([]);
+  });
+
+  it("strict mode keeps an emphasized finding and an emphasized non-marker word", () => {
+    // Emphasis around a defect noun or a word that merely starts like a verb must
+    // not turn the bullet into narration.
+    const bullets = [
+      "- **Missing** null check in src/b.ts:5",
+      "- **Checkouts** are broken in src/a.ts:5",
+      "- **Correctness** is wrong in src/a.ts:5",
+      "- __Testable__ is false in src/a.ts:5",
+      "- **Correct** the bounds in src/a.ts:12",
+    ];
+    const reviewText = ["## Critical (must fix)", ...bullets].join("\n");
+    expect(parseReviewFindings(reviewText, { strict: true })).toEqual(
+      bullets.map((bullet) => ({ severity: "critical", text: bullet.slice(2) })),
+    );
+  });
+
+  it("strict mode strips punctuation before matching a past-tense check verb", () => {
+    // `Checked` in backticks is still the same verbal narration marker.
+    const text = "## Warnings (should fix)\n- `Checked` `src/a.ts:5` handles null";
+    expect(parseReviewFindings(text, { strict: true })).toEqual([]);
+  });
+
+  it("strict mode drops a clause after a check verb even when it names a defect", () => {
+    // Pins the documented limitation (ParseReviewFindingsOptions.strict and
+    // docs/fleet-run.md): telling "Checked: race in src/a.ts:5" from "Checked: all
+    // fine" needs a defect lexicon, and guessing wrong opens a gate for nothing.
+    // This is the known false negative the docs disclose.
+    for (const bullet of ["- Checked: race in src/a.ts:5", "- Reviewed — race in src/a.ts:5"]) {
+      expect(parseReviewFindings(`## Critical (must fix)\n${bullet}`, { strict: true })).toEqual(
+        [],
+      );
+    }
+  });
+
+  it("strict mode keeps findings that open with an ambiguous affirmation word", () => {
+    // Each of these was dropped by a lead-only narration set: `correct` and
+    // `pass`/`passed` are imperatives, and `looks`/`all good` can front a real
+    // defect. A missed finding is the invisible halt this bead exists to fix.
+    const bullets = [
+      "- Correct the bounds in src/a.ts:12",
+      "- Passed, though src/c.ts:9 crashes on retries",
+      "- Looks good except `src/a.ts:5` — race",
+      "- All good, but src/a.ts:5 races",
+    ];
+    const reviewText = ["## Critical (must fix)", ...bullets].join("\n");
+    expect(parseReviewFindings(reviewText, { strict: true })).toEqual(
+      bullets.map((bullet) => ({ severity: "critical", text: bullet.slice(2) })),
+    );
+
+    // The same words are narration only when they are the whole bullet.
+    const affirmationOnly = [
+      "## Critical (must fix)",
+      "- All good.",
+      "- Looks good:",
+      "- Passed.",
+    ].join("\n");
+    expect(parseReviewFindings(affirmationOnly, { strict: true })).toEqual([]);
   });
 });
