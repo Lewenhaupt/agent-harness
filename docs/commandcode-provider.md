@@ -29,9 +29,10 @@ chain keeps its per-token and OpenRouter hops.
 ## The extension
 
 `nix/pi-extensions/package.json` pins `pi-commandcode-provider@^0.7.11`
-(patlux, MIT, unofficial) and its `piExtensions` entry (`index.ts`). `bin/pi`
-and `flake.nix` derive their `-e` list from that manifest, so this is the whole
-wiring.
+(patlux, MIT, unofficial) and its `piExtensions` entry (`index.ts`) plus its
+`piWebDirs` name (`pi-commandcode-provider`). `bin/pi`, `flake.nix` and
+`nix-tmp` derive their `-e` list and their `~/.pi/agent/extensions/` symlinks
+from that manifest, so this is the whole wiring.
 
 What the extension provides:
 
@@ -291,6 +292,41 @@ real failure (exit 1) with the whole trail, e.g.
    `.belayd/telemetry.json`; without a key the same run records one
    `unconfigured` attempt and the reviewer succeeds on
    `llmgateway/glm-5.3-flash`.
+
+## pi-web: discovery, then a daemon restart
+
+Two independent things decide whether `commandcode` is selectable in the pi-web
+model picker, and both failed before bd-205:
+
+1. **Discovery.** pi-web does not run the `pi` binary: its session daemon
+   imports the bundled SDK in-process and discovers extensions from
+   `$PI_CODING_AGENT_DIR/extensions/<name>/package.json` `pi.extensions`. An
+   extension that only appears in `-e` (as bd-178 shipped it) exists for the
+   terminal binary and every spawned sub-agent, and not for the orchestrator.
+   Symptom: `pi --list-models` lists 95 `commandcode` models, `/model` in
+   pi-web lists none, and `belayd_doctor` reports `ast_grep`/`web_search_exa`/
+   `describe_image` as unknown names — the same cause for all of them.
+2. **Startup-frozen provider registry.** pi-web bootstraps global providers
+   when `pi-web-sessiond` starts and rejects later registrations:
+
+   ```json
+   {"context":"global-provider-bootstrap","code":"PROVIDER_MUTATION_IGNORED",
+    "operation":"registerProvider","providerId":"commandcode",
+    "reason":"not-in-startup-baseline"}
+   ```
+
+   "Provider registrations are shared across sessions and fixed at daemon
+   startup." So the symlink is necessary but not sufficient for a *provider*:
+   `pi-web-sessiond` must be restarted (`/reload` and a web/API restart do not
+   rebuild the baseline). Tool-only extensions load per session with no restart.
+
+`flake.nix` exports the directory form for every manifest entry
+(`packages.<system>.pi-extension-pi-commandcode-provider`, and the whole set as
+`legacyPackages.<system>.pi-web-extension-dirs`); nix-tmp symlinks that set into
+`~/.pi/agent/extensions/`. Ordering for a host: push the harness rev →
+`nix flake lock --update-input agent-harness` → `nixos-rebuild` → restart
+`pi-web-sessiond` (not just `pi-web`). The manual equivalent, without a rebuild,
+is one `ln -s` of the artifact into `~/.pi/agent/extensions/` plus the restart.
 
 ## Risks
 

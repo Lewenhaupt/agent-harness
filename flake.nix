@@ -870,30 +870,73 @@
           name: entryPath: "${thirdPartyExtensionsDir}/${name}/${entryPath}"
         ) (piExtensionManifest.piExtensions or { });
 
-        # Directory artifact for the pi-web orchestrator, which discovers
-        # extensions from ~/.pi/agent/extensions/ instead of taking explicit
-        # --extension flags. pi's discovery reads package.json `pi.extensions`
-        # at the directory root, so this exposes the whole
-        # pi-agent-browser-native package: the entry
-        # (dist/extensions/agent-browser/index.js) has relative imports into
-        # dist/scripts and its own lib/, and resolves its runtime deps
-        # (cross-spawn, which, …) from the sibling node_modules tree. NixOS
-        # symlinks ~/.pi/agent/extensions/pi-agent-browser at this store path.
-        pi-agent-browser-extension = pkgs.runCommand "pi-agent-browser-extension" { } ''
-          pkg="${pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native"
-          mkdir -p "$out"
-          # Fail loudly if a future version drops an expected path, instead of
-          # leaving a dangling symlink in the store.
-          test -f "$pkg/package.json" || { echo "pi-agent-browser-extension: missing file $pkg/package.json" >&2; exit 1; }
-          test -d "$pkg/dist" || { echo "pi-agent-browser-extension: missing dir $pkg/dist" >&2; exit 1; }
-          test -d "$pkg/scripts" || { echo "pi-agent-browser-extension: missing dir $pkg/scripts" >&2; exit 1; }
-          ln -s "$pkg/package.json" "$out/package.json"
-          ln -s "$pkg/dist" "$out/dist"
-          ln -s "$pkg/scripts" "$out/scripts"
-          # Preserve dependency resolution if a loader follows the symlink
-          # (preserveSymlinks) rather than the realpath into pi-extensions.
-          ln -s "${pi-extensions}/lib/node_modules/pi-extensions/node_modules" "$out/node_modules"
-        '';
+        # Directory artifacts for the pi-web orchestrator. It takes no
+        # --extension flags: pi-web's embedded SDK loads resources by
+        # discovery, reading $PI_CODING_AGENT_DIR/extensions/<name>/package.json
+        # `pi.extensions`. The -ne/-e wiring below therefore reaches only the
+        # configured `pi` binary (and the agents it spawns), so every manifest
+        # entry needs a directory form too — otherwise an extension is present
+        # when pi runs in a terminal and invisible in pi-web. bd-178's
+        # `commandcode` provider was exactly that: 95 models in the terminal,
+        # 0 rows in pi-web's model registry.
+        #
+        # A symlink to the package itself would break resolution for a loader
+        # that follows the symlink (preserveSymlinks) rather than the realpath:
+        # the entry imports relative files (dist/, src/, scripts/) and its
+        # runtime deps from the hoisted pi-extensions tree, so the artifact is
+        # a real store dir of symlinks with a node_modules link beside them.
+        mkPiExtensionArtifact =
+          {
+            name,
+            entryPath,
+            dirName,
+          }:
+          pkgs.runCommand "pi-extension-${dirName}" { } ''
+            pkg="${thirdPartyExtensionsDir}/${name}"
+            # Fail loudly if a future version drops an expected path, instead of
+            # leaving a dangling symlink in the store.
+            test -f "$pkg/package.json" || {
+              echo "pi-extension-${dirName}: missing $pkg/package.json" >&2
+              exit 1
+            }
+            test -e "$pkg/${entryPath}" || {
+              echo "pi-extension-${dirName}: manifest entry ${entryPath} is missing from $pkg" >&2
+              exit 1
+            }
+            mkdir -p "$out"
+            for item in "$pkg"/*; do
+              base="$(basename "$item")"
+              [ "$base" = node_modules ] && continue
+              ln -s "$item" "$out/$base"
+            done
+            ln -s "${thirdPartyExtensionsDir}" "$out/node_modules"
+          '';
+
+        # package name -> directory name under ~/.pi/agent/extensions/. A new
+        # manifest entry with no name here fails evaluation, instead of silently
+        # staying invisible in pi-web the way bd-178's provider did.
+        piWebDirFor =
+          name:
+          (piExtensionManifest.piWebDirs or { }).${name}
+            or (throw "nix/pi-extensions/package.json piWebDirs has no directory name for ${name}");
+
+        piExtensionArtifacts = pkgs.lib.mapAttrs' (
+          name: entryPath:
+          let
+            dirName = piWebDirFor name;
+          in
+          pkgs.lib.nameValuePair dirName (mkPiExtensionArtifact {
+            inherit name entryPath dirName;
+          })
+        ) (piExtensionManifest.piExtensions or { });
+
+        # Everything the orchestrator must discover, keyed by its directory name:
+        # the harness package (its own package.json `pi.extensions` carries the
+        # entry list) plus one artifact per third-party extension. A set, not a
+        # derivation, so it is exported through `legacyPackages`.
+        pi-web-extension-dirs = piExtensionArtifacts // {
+          belayd-harness = belayd-harness;
+        };
 
         # pi configured via pi.nix's mkCodingAgent: harness + npm extensions,
         # skills, and the LLM Gateway models all baked into one binary. The only
@@ -1064,14 +1107,19 @@
             pi
             pi-bare
             pi-extensions
-            pi-agent-browser-extension
             belayd-pi
             belayd-skills
             belayd-harness
             belayd-shell
             archify
             ;
-        };
+        }
+        // pkgs.lib.mapAttrs' (
+          dirName: artifact: pkgs.lib.nameValuePair "pi-extension-${dirName}" artifact
+        ) piExtensionArtifacts;
+
+        # Setted outputs (flake `packages` only takes derivations).
+        legacyPackages = { inherit pi-web-extension-dirs; };
 
         # Default runnable: `nix run ~/git/belayd-agent-harness` (no `#pi`
         # fragment needed) launches the configured pi. This also makes the

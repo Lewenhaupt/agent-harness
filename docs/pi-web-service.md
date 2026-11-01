@@ -487,21 +487,49 @@ BELAYD_REAL_SHELL="$(command -v bash)" \
 - `BELAYD_SHELL_ACTIVE=1` — force the no-recursion short-circuit (pass-through)
   without entering a devShell.
 
-## Extension loading: rebuild → restart
+## Extension loading: discovery → restart
 
-pi-web sessions run **in-process** inside `pi-web-sessiond` — the daemon loads
-pi's extension modules once at startup and keeps that module graph for its
-whole lifetime. `nixos-rebuild switch` (or `home-manager switch`) only replaces
-files on disk; a running daemon keeps the old extensions until restarted. That
-includes the belayd harness (`~/.pi/agent/extensions/belayd-harness.ts` and its
-`src/` tree), so any change to `extensions/` or `src/` needs:
+pi-web sessions run **in-process** inside `pi-web-sessiond`, and the daemon does
+not run the `pi` binary: it imports the bundled pi SDK (`PI_WEB_PI_PACKAGE_DIR`)
+and discovers extensions from `$PI_CODING_AGENT_DIR/extensions/<name>/package.json`
+`pi.extensions`. The `-e`/`-ne` list derived from `nix/pi-extensions/package.json`
+reaches only `bin/pi`, `belayd-pi`, and spawned sub-agents, so an extension that
+is missing from `~/.pi/agent/extensions/` is invisible in a pi-web session while
+working in a terminal (bd-205).
+
+`nixos-rebuild switch` (or `home-manager switch`) only replaces files on disk, so
+a running daemon keeps seeing the old symlinks until it is restarted. What a
+restart is *required* for:
+
+- **Provider extensions** (`openrouter`, `pi-commandcode-provider`). pi-web
+  bootstraps the global provider registry when `pi-web-sessiond` starts and logs
+  later registrations as ignored:
+
+  ```json
+  {"context":"global-provider-bootstrap","code":"PROVIDER_MUTATION_IGNORED",
+   "operation":"registerProvider","providerId":"commandcode",
+   "reason":"not-in-startup-baseline"}
+  ```
+
+  "Provider registrations are shared across sessions and fixed at daemon
+  startup." Restarting only `pi-web` (the web/API process) does not rebuild that
+  baseline, and neither does `/reload`.
+- **The belayd harness** (`~/.pi/agent/extensions/belayd-harness/` and its
+  `src/` tree), so any change to `extensions/` or `src/` needs a restart before
+  it takes effect in pi-web sessions.
+
+**Tool-only** extensions (exa, ast-grep, vision, plannotator, agent-browser) need
+no restart: the next session discovers them.
+
+In practice, after a harness or pi-web rebuild:
 
 ```bash
-sudo systemctl restart pi-web pi-web-sessiond
+sudo systemctl restart pi-web-sessiond   # the unit that spawns sessions
+sudo systemctl restart pi-web            # only if the web/API process itself changed
 ```
 
-before it takes effect in pi-web sessions. (The interactive `bin/pi` dev
-wrapper is unaffected — it reloads extensions on every launch.)
+(The interactive `bin/pi` dev wrapper is unaffected — it reloads extensions on
+every launch.)
 
 ### Transcript poll interval (upstream default, bd-123)
 
@@ -568,7 +596,7 @@ in p.overrideAttrs (old: {
 A pi-web restart is required for the client half to reach the browser — see the
 restart note above.
 
-### agent-browser extension (wired in working tree; blocked before rebuild)
+### agent-browser extension (wired and live)
 
 The pi-web orchestrator discovers extensions from `~/.pi/agent/extensions/`.
 pi-web is now pinned to upstream tag v1.202610.8, whose embedded
@@ -597,32 +625,48 @@ units below set none of them), and previously ignored unknown fields in
 and the navigation/session-pin routes the harness uses (`session-pins`) are
 unchanged.
 
-The nix-tmp `belayd-pi-web` home-manager module adds the symlink
-(patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):
+The nix-tmp `belayd-pi-web` home-manager module derives every symlink from that
+set (patch recorded at `nix/nix-tmp-belayd-pi-web.patch`):
 
 ```nix
-home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
+belaydLegacyPackages = inputs.agent-harness.legacyPackages.${system};
+...
+home.file = {
+  ".agents/skills/beads"…;
+  ".agents/skills/backlog"…;
+}
+// lib.mapAttrs' (name: source: lib.nameValuePair ".pi/agent/extensions/${name}" { inherit source; force = true; })
+  belaydLegacyPackages.pi-web-extension-dirs;
 ```
 
-A rebuild **today errors**: nix-tmp's `flake.lock` still pins `belayd` at a rev
-older than the flake that exports `pi-agent-browser-extension`, so
-`belaydPkgs.pi-agent-browser-extension` is undefined. The prerequisite chain is:
+`//` rather than a second `home.file."<path>"` entry, because Nix cannot
+statically merge `home.file` with `home.file.<path>` inside the dynamically-keyed
+`home-manager.users.${username}` attrset. The set comes from the harness flake's
+`legacyPackages.<system>.pi-web-extension-dirs` — one `pi-extension-<dirName>`
+artifact per third-party package (agent-browser, exa, ast-grep, vision,
+plannotator, openrouter, commandcode) plus `belayd-harness`, keyed by directory
+name and derived from the same manifest that feeds `-e`. Adding an extension
+needs no edit here; `piWebDirFor` in the harness `flake.nix` fails evaluation
+when a manifest entry has no `piWebDirs` name. The two old hand-listed symlinks
+(`belayd-harness`, `pi-agent-browser`) are subsumed by the set.
 
-1. commit + push the belayd flake (bd-68/bd-81/bd-83);
-2. in nix-tmp: `nix flake lock --update-input belayd` (or equivalent flake.lock
-   bump);
-3. `nixos-rebuild` + `sudo systemctl restart pi-web pi-web-sessiond`;
-4. verify `readlink -f ~/.pi/agent/extensions/pi-agent-browser` and a real
-   `agent_browser` navigate/screenshot in an orchestrator session (bd-83).
+`~/.pi/agent/extensions/` is home-manager-managed from that set on this host and
+`agent_browser` is live in pi-web sessions — the earlier "blocked on the belayd
+push + `flake.lock` bump" state is history. A future bump keeps the same
+ordering: push the harness rev → `nix flake lock --update-input agent-harness` in
+nix-tmp → `nixos-rebuild switch` → restart `pi-web-sessiond` (and `pi-web` only
+if the web/API process itself changed). agent-browser is tool-only, so it needs
+no restart at all; provider extensions in that set do (see
+[Extension loading](#extension-loading-discovery--restart)).
 
-The step-by-step runbook — pre-rebuild checks that pass today, the expected
-blocked rebuild error, and the post-rebuild live checks — is in
+The step-by-step runbook — artifact shape, the discovery set, the host symlinks,
+a live `agent_browser` navigate/screenshot, and the failure-mode table — is in
 [`agent_browser` in pi-web orchestrator sessions](pi-web-agent-browser.md).
 
 ### How the belayd harness dedupes duplicate copies
 
 The harness ships in two places that can load together: globally
-(`~/.pi/agent/extensions/belayd-harness.ts`) and project-locally (a
+(`~/.pi/agent/extensions/belayd-harness/`) and project-locally (a
 `.pi/settings.json` `packages` entry). Registering the same `belayd_*` tools
 twice is reported as `Tool "belayd_*" conflicts with ...`. Dedup must be scoped
 to a single load batch, not the whole process:
@@ -653,7 +697,7 @@ journalctl -u pi-web-sessiond | grep "belayd-harness.*registering"
 Compare the `<hash>` against the current symlink target:
 
 ```bash
-readlink -f ~/.pi/agent/extensions/belayd-harness.ts
+readlink -f ~/.pi/agent/extensions/belayd-harness
 ```
 
 If they differ, the daemon is still running a pre-rebuild copy — restart it.

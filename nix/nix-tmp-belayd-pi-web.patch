@@ -1,18 +1,78 @@
 diff --git a/modules/core/belayd-pi-web.nix b/modules/core/belayd-pi-web.nix
-index e30ec82..c118f61 100644
+index e5cb87e..7b0d89c 100644
 --- a/modules/core/belayd-pi-web.nix
 +++ b/modules/core/belayd-pi-web.nix
-@@ -47,5 +47,13 @@ in
-     home.file.".pi/agent/extensions/belayd-stale-file-guard.ts".source = "${belaydPkgs.belayd-harness}/extensions/stale-file-guard.ts";
-     home.file.".pi/agent/extensions/belayd-worktree-guard.ts".source = "${belaydPkgs.belayd-harness}/extensions/worktree-guard.ts";
-     home.file.".pi/agent/src".source = "${belaydPkgs.belayd-harness}/src";
-+
-+    # pi-agent-browser-native exposes agent_browser + agent_browser_code (and
-+    # the agent_browser_tools/agent_browser_action family). It declares a Pi
-+    # >= 1.0.0 floor, satisfied by pi-web's embedded pi-coding-agent 1.0.0 as of
-+    # the v1.202610.1 bump (see the belayd flake, bd-83). pi discovers the
-+    # extension from its package.json `pi.extensions` entry and resolves its
-+    # own node_modules from the exported pi-agent-browser-extension artifact.
-+    home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension}";
+@@ -5,6 +5,7 @@
+ # and does not run pi-web or the harness.
+ {
+   inputs,
++  lib,
+   username,
+   pkgs,
+   ...
+@@ -12,6 +13,7 @@
+ let
+   system = pkgs.stdenv.hostPlatform.system;
+   belaydPkgs = inputs.agent-harness.packages.${system};
++  belaydLegacyPackages = inputs.agent-harness.legacyPackages.${system};
+ in
+ {
+   imports = [ inputs.agent-harness.nixosModules.pi-web ];
+@@ -35,31 +37,32 @@ in
+   # via `-ne`. They are Nix-managed (point at store paths), so they are not
+   # user-curated global config.
+   home-manager.users.${username} = {
+-    # Global agent skills (beads, backlog), discovered from ~/.agents/skills/.
+-    home.file.".agents/skills/beads".source = "${belaydPkgs.belayd-skills}/beads";
+-    home.file.".agents/skills/backlog".source = "${belaydPkgs.belayd-skills}/backlog";
+-
+-    # Global pi extensions. One directory symlink, not three loose files: the
+-    # store path carries extensions/, src/, node_modules/ and package.json, so
+-    # pi reads the entry list from the manifest (package.json `pi.extensions`)
+-    # and the extensions' `../src/*.js` imports resolve inside the same path.
+-    # The former `~/.pi/agent/src` sibling symlink is therefore gone.
++    # REQUIRES the harness revision that exports `legacyPackages.<system>.
++    # pi-web-extension-dirs`: bump the agent-harness input in flake.lock before
++    # rebuilding, or this block fails to evaluate.
+     #
+-    # REQUIRES the harness revision that installs package.json into $out: pi does
+-    # not descend into extensions/<dir>/ looking for loose files, so at an older
+-    # rev this symlink yields zero harness tools. Bump the agent-harness input in
+-    # flake.lock before rebuilding (harness commit `fix(packaging): install
+-    # package.json into the belayd-harness output`).
+-    home.file.".pi/agent/extensions/belayd-harness".source =
+-      "${belaydPkgs.belayd-harness}";
+-
+-    # pi-agent-browser-native exposes agent_browser + agent_browser_code (and
+-    # the agent_browser_tools/agent_browser_action family). It declares a Pi
+-    # >= 1.0.0 floor, satisfied by pi-web's embedded pi-coding-agent 1.0.0 as of
+-    # the v1.202610.1 bump (see the belayd flake, bd-83). pi discovers the
+-    # extension from its package.json `pi.extensions` entry and resolves its
+-    # own node_modules from the exported pi-agent-browser-extension artifact.
+-    home.file.".pi/agent/extensions/pi-agent-browser".source = "${belaydPkgs.pi-agent-browser-extension
+-    }";
++    # `//` (not a second `home.file."…"` entry): Nix cannot statically merge
++    # `home.file` with `home.file.<path>` inside this dynamically-keyed attrset.
++    home.file = {
++      # Global agent skills (beads, backlog), discovered from ~/.agents/skills/.
++      ".agents/skills/beads".source = "${belaydPkgs.belayd-skills}/beads";
++      ".agents/skills/backlog".source = "${belaydPkgs.belayd-skills}/backlog";
++    }
++    # Every extension the configured `pi` binary loads through `-e`, in the
++    # directory form pi-web's embedded orchestrator discovers. The configured
++    # binary runs `-ne`, so these symlinks never reach it; conversely pi-web
++    # takes no `-e` flags, so an extension missing here is invisible in a
++    # pi-web session while working in a terminal (that is how the Command Code
++    # provider's 95 models stayed unpickable in pi-web).
++    #
++    # The set comes from the harness flake's `pi-web-extension-dirs`, derived
++    # from the same manifest that feeds `-e`, so adding a third-party extension
++    # needs no edit here. A store-path symlink is Nix-managed, not user config.
++    #
++    # `force` replaces an existing link instead of refusing: a hand-made symlink
++    # (the documented no-rebuild workaround) must not block the rebuild.
++    // lib.mapAttrs' (
++      name: source: lib.nameValuePair ".pi/agent/extensions/${name}" { inherit source; force = true; }
++    ) belaydLegacyPackages.pi-web-extension-dirs;
    };
  }

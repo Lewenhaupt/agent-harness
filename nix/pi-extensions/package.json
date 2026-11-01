@@ -19,5 +19,14 @@
     "pi-commandcode-provider": "index.ts",
     "pi-exa": "src/index.ts",
     "pi-vision-tool": "extensions/vision-tool.ts"
+  },
+  "piWebDirs": {
+    "@plannotator/pi-extension": "plannotator",
+    "@robhowley/pi-openrouter": "openrouter",
+    "pi-agent-browser-native": "pi-agent-browser",
+    "pi-ast-grep": "pi-ast-grep",
+    "pi-commandcode-provider": "pi-commandcode-provider",
+    "pi-exa": "pi-exa",
+    "pi-vision-tool": "pi-vision-tool"
   }
 }

@@ -8,6 +8,11 @@ import { describe, expect, it } from "vitest";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, "..", "..");
 
+// Nix interpolation (`${...}`) in flake.nix is not a JS template placeholder.
+// Assemble it from parts so biome's noTemplateCurlyInString stays quiet without
+// weakening the assertions.
+const nixInterp = (name: string): string => ["${", name, "}"].join("");
+
 function readIfPresent(path: string): string | null {
   try {
     return readFileSync(path, "utf8");
@@ -89,24 +94,53 @@ describe("bd-68: agent-browser extension wiring", () => {
     expect(flakeContents).toContain("thirdPartyExtensionPaths");
   });
 
-  it("exports pi-agent-browser-extension for the pi-web orchestrator symlink", () => {
-    if (flakeContents === null) {
-      throw new Error(`could not read flake.nix at ${flakePath}`);
+  it("exports the pi-web directory form of every manifest entry", () => {
+    if (flakeContents === null || packageJsonContents === null) {
+      throw new Error("could not read flake.nix or nix/pi-extensions/package.json");
     }
-    // Actual packages output membership: the artifact must be in the packages
-    // `inherit` (alongside pi-extensions), not merely mentioned in a comment or
-    // at its attribute definition.
-    expect(flakeContents).toMatch(
-      /inherit[^;]*\bpi-extensions\b[^;]*\bpi-agent-browser-extension\b[^;]*;/,
-    );
-    // Structural wiring: the artifact is a runCommand derivation that builds
-    // from the pi-agent-browser-native package nested in the pi-extensions tree.
-    // Asserting derivation name + source path keeps a harmless variable rename
-    // passing while a wiring regression still fails.
-    expect(flakeContents).toContain('runCommand "pi-agent-browser-extension"');
+    // pi-web's embedded orchestrator takes no --extension flags: it discovers
+    // $PI_CODING_AGENT_DIR/extensions/<name>. Without a directory artifact the
+    // extension reaches only the `pi` binary, which is how bd-178's Command Code
+    // provider ended up with 95 selectable models in a terminal and none in
+    // pi-web.
+    expect(flakeContents).toContain("mkPiExtensionArtifact =");
+    expect(flakeContents).toContain("piExtensionArtifacts = pkgs.lib.mapAttrs' (");
+    expect(flakeContents).toContain("piWebDirFor =");
+    // The artifact is named after the directory name and reads both the package
+    // root and the manifest entry, so a version that moves either fails the
+    // build instead of leaving a dangling symlink in the store.
+    expect(flakeContents).toContain(`runCommand "pi-extension-${nixInterp("dirName")}"`);
     expect(flakeContents).toContain(
-      "pi-extensions}/lib/node_modules/pi-extensions/node_modules/pi-agent-browser-native",
+      `pkg="${nixInterp("thirdPartyExtensionsDir")}/${nixInterp("name")}"`,
     );
+    // A set, so it ships through legacyPackages rather than packages.
+    expect(flakeContents).toContain("legacyPackages = { inherit pi-web-extension-dirs; };");
+    expect(flakeContents).toContain("pi-web-extension-dirs = piExtensionArtifacts // {");
+    expect(flakeContents).toContain("belayd-harness = belayd-harness;");
+    // Individual artifacts stay buildable for verification.
+    expect(flakeContents).toContain(
+      `pkgs.lib.nameValuePair "pi-extension-${nixInterp("dirName")}" artifact`,
+    );
+    expect(packageJsonContents).toContain('"pi-agent-browser-native": "pi-agent-browser"');
+  });
+
+  it("gives every third-party extension a pi-web directory name", () => {
+    if (packageJsonContents === null) {
+      throw new Error(`could not read package.json at ${packageJsonPath}`);
+    }
+    // piWebDirFor throws at evaluation time for a manifest entry without a
+    // directory name, which breaks the whole flake build. Catching the drift
+    // here keeps "add a dependency + piExtensions entry" a one-file change.
+    const manifest = JSON.parse(packageJsonContents) as {
+      piExtensions?: Record<string, string>;
+      piWebDirs?: Record<string, string>;
+    };
+    const entries = Object.keys(manifest.piExtensions ?? {});
+    expect(entries.length).toBeGreaterThan(0);
+    expect(Object.keys(manifest.piWebDirs ?? {}).sort()).toEqual(entries.sort());
+    for (const dirName of Object.values(manifest.piWebDirs ?? {})) {
+      expect(dirName).toMatch(/^[a-z0-9][a-z0-9-]*$/);
+    }
   });
 
   it("resolves the package from the Nix tree in the isolated repo-dev wrapper", () => {
@@ -159,15 +193,16 @@ describe("bd-83: pi-web embeds pi-coding-agent >= 1.0 for agent-browser", () => 
     expect(integrityPatchContents).toBeNull();
   });
 
-  it("records the nix-tmp home-manager symlink for the pi-web orchestrator", () => {
+  it("records the nix-tmp home-manager symlinks for the pi-web orchestrator", () => {
     if (nixTmpPatchContents === null) {
       throw new Error(`could not read nix-tmp patch at ${nixTmpPatchPath}`);
     }
-    // The actual symlink lives in the separate nix-tmp repo; this in-tree patch
-    // is the reviewable record, so deleting it would drop the only trace here.
+    // The symlinks live in the separate nix-tmp repo; this in-tree patch is the
+    // reviewable record, so deleting it would drop the only trace here.
+    expect(nixTmpPatchContents).toContain("belaydLegacyPackages.pi-web-extension-dirs");
     expect(nixTmpPatchContents).toContain(
-      'home.file.".pi/agent/extensions/pi-agent-browser".source',
+      `lib.nameValuePair ".pi/agent/extensions/${nixInterp("name")}"`,
     );
-    expect(nixTmpPatchContents).toContain("pi-agent-browser-extension");
+    expect(nixTmpPatchContents).toContain(`legacyPackages.${nixInterp("system")}`);
   });
 });

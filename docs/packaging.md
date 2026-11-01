@@ -25,17 +25,20 @@ rather than hiding it.
    (`{"packages": [{"source": ".."}]}`) rather than six raw file paths, because
    raw path arrays are concatenated and never deduped while a package has an
    identity (its resolved absolute path).
-2. **`nix/pi-extensions/package.json` → `piExtensions`** — third-party
-   extensions as `package name → entry path inside that package`. The same file
-   already owns the npm dependency specs, so the entry path lives next to the
-   version it belongs to.
+2. **`nix/pi-extensions/package.json` → `piExtensions` / `piWebDirs`** —
+   third-party extensions as `package name → entry path inside that package`,
+   plus `package name → directory name under ~/.pi/agent/extensions/`. The same
+   file already owns the npm dependency specs, so the entry path lives next to
+   the version it belongs to, and the directory name next to the path it has to
+   mirror.
 
 Adding an extension is therefore a one-file change:
 
 - harness extension: create `extensions/<name>.ts` and add it to
   `package.json` `pi.extensions` (a test enforces that the two agree);
-- third-party extension: add the dependency **and** the `piExtensions` entry to
-  `nix/pi-extensions/package.json`.
+- third-party extension: add the dependency **and** the `piExtensions` entry
+  (and its `piWebDirs` name) to `nix/pi-extensions/package.json`, then
+  `pnpm install` + `nix build .#pi-extensions` for the new `npmDepsHash`.
 
 `bin/pi` no longer hardcodes an `-e` list and no longer fetches
 `npm:pi-agent-browser-native@0.9.2` at startup (that fetch silently produced a
@@ -49,6 +52,43 @@ The third-party list is therefore also where the provider extensions live:
 `openrouter` and `commandcode` providers (pi ships neither). Command Code's key
 precedence, model ids and plan-gating behaviour are documented in
 `docs/commandcode-provider.md`.
+
+## The directory form: `-e` is not enough
+
+The two consumers take extension lists differently, and only one of them takes
+`-e`:
+
+| Consumer | Gets extensions from |
+|---|---|
+| `pi` binary, spawned sub-agents | the `-e` list derived from the manifests (it runs `-ne`) |
+| pi-web orchestrator | discovery of `$PI_CODING_AGENT_DIR/extensions/<name>/package.json` `pi.extensions` |
+
+So every manifest entry needs both forms. `flake.nix` builds them from the same
+manifest:
+
+- `packages.<system>.pi-extension-<dirName>` — a store dir per package, holding
+  symlinks to the package's top-level entries plus a `node_modules` link into
+  the pi-extensions tree (so a loader that follows the symlink still resolves
+  the entry's runtime deps);
+- `legacyPackages.<system>.pi-web-extension-dirs` — the set pi-web needs, keyed
+  by directory name: one artifact per third-party extension plus
+  `belayd-harness` (whose own `package.json` carries the harness entry list).
+  It is a set, not a derivation, hence `legacyPackages`.
+
+The nix-tmp `belayd-pi-web` home-manager module turns that set into symlinks
+(`home.file = { skills } // lib.mapAttrs' …`; the delta is recorded in
+`nix/nix-tmp-belayd-pi-web.patch`). `piWebDirFor` in `flake.nix` throws at
+**evaluation** time when a `piExtensions` entry has no `piWebDirs` name, so a
+new dependency cannot silently stay terminal-only — the failure mode bd-205
+fixed, where bd-178's `commandcode` provider had 95 selectable models in a
+terminal and 0 in pi-web.
+
+Provider registrations additionally need a **daemon restart**: pi-web freezes
+the provider registry when `pi-web-sessiond` starts and logs
+`PROVIDER_MUTATION_IGNORED` (`reason: not-in-startup-baseline`) for anything
+registered later. `/reload` and a web/API restart do not rebuild it. Tools-only
+extensions (exa, ast-grep, vision, plannotator, agent-browser) are picked up by
+the next session with no restart.
 
 ## Which pi binary a sub-agent gets
 
