@@ -91,15 +91,25 @@ Now:
 
   External blockers get no gate: bd's ordinary dependency edge already blocks the
   member bead for them.
-- **Gate shape.** bd 1.3.0 accepts only `human`, `timer`, `gh:run`, and `gh:pr`, and
-  a `timer` gate would auto-resolve — wrong, the gate must be resolved by a
-  *landing*. Ordering gates are therefore typed `human` and carry a **structured**
-  marker in title and reason:
+- **Gate shape.** bd 1.3.0 supports `human`, `timer`, `gh:run`, `gh:pr`, and
+  `bead`. Ordering uses `bead` with `await-id` set to the blocker, making the wait
+  a native non-human/ordering wait rather than prose a needs-you surface ignores.
+  bd's `bead` semantics resolve on the awaited bead *closing* (the acceptance
+  fact), not on landing, and this bd build does not auto-resolve on that close, so
+  the fleet still resolves the gate on landing. When the fleet is gone,
+  `bd gate resolve <gate-id>` — or `bd gate check --type=bead` once the blocker is
+  closed — is the manual fallback. A `timer` gate would auto-resolve on the clock
+  — wrong, the gate must be tied to the blocker landing. Every ordering gate also
+  carries a **structured** marker in title and reason:
 
   ```text
   title:  belayd-fleet-ordering: fleet:<fleetId> bd-12 -> bd-13
   reason: belayd-fleet-ordering: fleet:<fleetId> bd-12 -> bd-13: bd-12 must land …
   ```
+
+  Ordering gates created before bd-176 are typed `human`, but the marker still
+  classifies them as ordering — never as a human wait — so existing fleets stay
+  correct without a migration.
 
   Classification requires that whole shape (prefix *and* a fleet id *and* both
   bead ids), never the bare prefix, and it is fail-closed in both directions: a

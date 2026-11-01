@@ -128,6 +128,7 @@ export {
   stripBdShowComments,
 } from "./bead-comments.js";
 export type {
+  GateCreateOptions,
   LookupOpenHumanGateOptions,
   OpenHumanGate,
   OpenHumanGateLookup,

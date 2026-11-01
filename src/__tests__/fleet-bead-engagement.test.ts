@@ -232,15 +232,16 @@ describe("lookupFleetBeadEngagement", () => {
   });
 
   it("reads a fleet ordering gate as waiting on its blocker, never as a human wait", async () => {
-    // bd-158: the same `gate list` read names the member a bead is ordered behind.
-    // It must not land in `awaitingHuman` (nobody has to answer it) and must not
-    // leave the member in "Needs you".
+    // bd-158/bd-176: the same `gate list` read names the member a bead is ordered
+    // behind. A bead-typed ordering gate must not land in `awaitingHuman` (nobody
+    // has to answer it) and must not put the member in "Needs you".
     const { runBd } = instrumentedRunner({
       gates: () => [
         {
           id: "bd-950",
           status: "open",
-          await_type: "human",
+          await_type: "bead",
+          await_id: "bd-12",
           title: "belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
           description:
             "Ad-hoc gate blocking bd-15\n\nReason: belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
@@ -263,6 +264,40 @@ describe("lookupFleetBeadEngagement", () => {
         },
       ],
     });
+
+    // The view renders it as ordering, and no needs-you surface ever lists it.
+    const status = applyFleetBeadEngagement(fleetWith("bd-15"), result);
+    const text = formatFleetStatus(status);
+    expect(text).toContain("  waiting on: bd-12 (fleet ordering gate)");
+    expect(text).toContain("  awaiting human: no");
+    expect(text).not.toContain("Needs you");
+    expect(formatNeedsYou(status)).toBeUndefined();
+  });
+
+  it("keeps a legacy human-typed ordering gate out of Needs you too", async () => {
+    // Gates the fleet created before bd-176 are typed `human`; the marker still
+    // classifies them as ordering, so an upgraded view does not suddenly list
+    // eight mechanical waits as human to-dos.
+    const { runBd } = instrumentedRunner({
+      gates: () => [
+        {
+          id: "bd-951",
+          status: "open",
+          await_type: "human",
+          title: "belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
+          description: "Reason: belayd-fleet-ordering: fleet:default bd-12 -> bd-15",
+        },
+      ],
+    });
+
+    const result = await lookupFleetBeadEngagement({ taskIds: ["bd-15"], cwd: CWD, runBd });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.entries[0]?.engagement.awaitingHuman).toBe(false);
+    const status = applyFleetBeadEngagement(fleetWith("bd-15"), result);
+    expect(formatFleetStatus(status)).toContain("  waiting on: bd-12 (fleet ordering gate)");
+    expect(formatNeedsYou(status)).toBeUndefined();
   });
 
   it("breaks equal timestamps by comment id, deterministically", async () => {

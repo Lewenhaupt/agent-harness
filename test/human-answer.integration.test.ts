@@ -116,7 +116,7 @@ describe.skipIf(!bdAvailable)("human answer channel against a real bd", () => {
         "gate",
         "--actor",
         HARNESS_ACTOR,
-        ...buildGateCreateArgv({ beadId, reason: "which option?" }).slice(1),
+        ...buildGateCreateArgv({ awaitType: "human", beadId, reason: "which option?" }).slice(1),
         "--json",
       ],
       { cwd: dir, env: { ...process.env, BEADS_ACTOR: "" } },

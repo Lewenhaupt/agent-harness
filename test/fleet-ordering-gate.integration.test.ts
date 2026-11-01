@@ -133,6 +133,17 @@ describe.skipIf(!bdAvailable)("fleet ordering gates against a real bd", () => {
     const gate = created.gates[0];
     if (gate === undefined) throw new Error("no gate recorded");
 
+    // bd-176 grounds the native await type against the real CLI: the launched
+    // ordering gate is `bead` and names the blocker, so a needs-you surface keyed
+    // on human awaits never lists it.
+    const listed = JSON.parse(await bd(dir, ["gate", "list", dependent, "--json"])) as Array<{
+      await_type?: string;
+      await_id?: string;
+    }>;
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.await_type).toBe("bead");
+    expect(listed[0]?.await_id).toBe(blocker);
+
     // The blocker is actively being worked, exactly the state that used to make
     // the fleet close a bead just to unblock its dependent.
     await bd(dir, ["update", blocker, "--status", "in_progress"]);
@@ -163,6 +174,79 @@ describe.skipIf(!bdAvailable)("fleet ordering gates against a real bd", () => {
     // exits 0 on a second resolve, so nothing has to guess).
     const again = await resolveFleetOrderingGates({ gates: created.gates, cwd: dir, runBd });
     expect(again).toEqual({ ok: true, resolved: created.gates, remaining: [] });
+  });
+
+  it("creates opposite member edges without a bd cycle, each resolving independently", async () => {
+    // bd-176 probe: `--await-id` is only a field on the gate record. bd does not
+    // model it as a dependency edge, so A -> B and B -> A both create (no cycle
+    // rejection), each bead is blocked by exactly its own gate, and resolving one
+    // gate frees exactly its dependent — no self-unblocking.
+    const created = await createFleetOrderingGates({
+      fleetId: "default",
+      taskIds: [blocker, dependent],
+      edges: [
+        { blocker, blocked: dependent },
+        { blocker: dependent, blocked: blocker },
+      ],
+      cwd: dir,
+      runBd,
+    });
+    if (!created.ok) throw new Error(created.error);
+    expect(created.gates).toHaveLength(2);
+    const toDependent = created.gates.find((gate) => gate.blocked === dependent);
+    const toBlocker = created.gates.find((gate) => gate.blocked === blocker);
+    expect(toDependent?.blocker).toBe(blocker);
+    expect(toBlocker?.blocker).toBe(dependent);
+    if (toDependent === undefined || toBlocker === undefined) return;
+    expect(toDependent.gateId).not.toBe(toBlocker.gateId);
+
+    // Each bead's one open gate names the opposite member as its await id.
+    const dependentGates = JSON.parse(
+      await bd(dir, ["gate", "list", dependent, "--json"]),
+    ) as Array<{ id?: string; await_type?: string; await_id?: string }>;
+    expect(dependentGates).toHaveLength(1);
+    expect(dependentGates[0]?.id).toBe(toDependent.gateId);
+    expect(dependentGates[0]?.await_type).toBe("bead");
+    expect(dependentGates[0]?.await_id).toBe(blocker);
+
+    const blockerGates = JSON.parse(await bd(dir, ["gate", "list", blocker, "--json"])) as Array<{
+      id?: string;
+      await_type?: string;
+      await_id?: string;
+    }>;
+    expect(blockerGates).toHaveLength(1);
+    expect(blockerGates[0]?.id).toBe(toBlocker.gateId);
+    expect(blockerGates[0]?.await_type).toBe("bead");
+    expect(blockerGates[0]?.await_id).toBe(dependent);
+
+    // Both beads are blocked by their own gate: no self-unblocking.
+    const blocked = await bd(dir, ["blocked"]);
+    expect(blocked).toContain(blocker);
+    expect(blocked).toContain(dependent);
+
+    // Resolving the gate that blocks the dependent frees exactly it; the blocker
+    // stays blocked by the other gate.
+    const resolved = await resolveFleetOrderingGates({ gates: [toDependent], cwd: dir, runBd });
+    expect(resolved.ok).toBe(true);
+    const blockedAfter = await bd(dir, ["blocked"]);
+    expect(blockedAfter).not.toContain(dependent);
+    expect(blockedAfter).toContain(blocker);
+  });
+
+  it("still reads a plain human gate as a human wait", async () => {
+    // The narrowing is one-directional: ordering moves off `human`, but a gate a
+    // person must actually resolve stays a human wait (bd-176 re-scope).
+    await bd(dir, [
+      "gate",
+      "create",
+      "--blocks",
+      dependent,
+      "--type=human",
+      "--reason",
+      "which option?",
+    ]);
+    const human = await lookupOpenHumanGate({ beadId: dependent, cwd: dir, runBd });
+    expect(human).toMatchObject({ ok: true, status: "open" });
   });
 
   it("tolerates only bd's exact unknown-gate answer, which it captures here", async () => {

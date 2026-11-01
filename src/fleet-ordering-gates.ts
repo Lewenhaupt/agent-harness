@@ -20,10 +20,19 @@
  * - **close** = acceptance. Only `src/fleet-accept.ts` closes, only when the launch
  *   asked for it (`--accept`), and the human otherwise accepts with `wt merge`.
  *
- * Gate type: bd 1.3.0 accepts `human`, `timer`, `gh:run`, and `gh:pr` only, with
- * no custom type. A `timer` gate would auto-resolve (wrong: the gate must be
- * resolved by a *landing*), so ordering gates are typed `human` and distinguished
- * by the structured marker in their title and reason:
+ * Gate type: bd 1.3.0 accepts `human`, `timer`, `gh:run`, `gh:pr`, and `bead`.
+ * `bead`'s await semantics are "the awaited bead is closed" — that is the
+ * *acceptance* fact (close), not landing, and this bd build does not auto-resolve
+ * the gate on that close. Ordering gates are created with
+ * `--type=bead --await-id <blocker>` (bd-176) so the wait is a native non-human
+ * wait rather than one a needs-you surface lists, and the fleet must still
+ * resolve the gate on `landedAt` by gate id so dependents advance on landing, not
+ * on acceptance. When the fleet is gone, `bd gate resolve <gate-id>` — or
+ * `bd gate check --type=bead` once the blocker is closed — is the manual
+ * fallback. A `timer` gate would auto-resolve (wrong: the gate must be tied to
+ * the blocker), so it is not used.
+ *
+ * Every ordering gate also carries a structured marker in its title and reason:
  *
  *     belayd-fleet-ordering: fleet:<fleetId> <blocker> -> <blocked>
  *
@@ -31,7 +40,8 @@
  * real human question may happen to start with it. `fleetOrderingGateMarkerOf`
  * requires the full shape (fleet id plus both bead ids), so an ordering gate is
  * never "answered" by the human-answer poll and a human gate is never mistaken for
- * ordering; see `bead-gates.ts`.
+ * ordering; see `bead-gates.ts`. It also keeps legacy ordering gates, created
+ * before bd-176 and typed `human`, recognizable as ordering.
  *
  * Records: the intent (`fleet.json`) holds one `{ blocker, blocked, gateId }` per
  * created gate. bd is also read as truth here (`bd gate list <blocked>`), because
@@ -137,7 +147,8 @@ export function fleetOrderingGateReason(input: {
   const marker = renderFleetOrderingGateMarker(input);
   const prose =
     `: ${input.blocker} must land (merge into the base branch) before ${input.blocked}` +
-    " — this gate is fleet ordering, not a human question; resolve it with `bd gate resolve`";
+    " — fleet ordering, not a human question; the fleet resolves it on landing, " +
+    "else `bd gate resolve <id>`";
   return `${marker}${prose.slice(0, GATE_REASON_PROSE_MAX)}`;
 }
 
@@ -150,13 +161,26 @@ export function fleetOrderingGateTitle(input: {
   return renderFleetOrderingGateMarker(input);
 }
 
-/** `bd gate create --blocks <blocked> --type=human --title <marker> --reason …`. */
+/**
+ * `bd gate create --blocks <blocked> --type=bead --await-id <blocker>`.
+ *
+ * A native `bead` gate: the fleet resolves it by gate id on landing. bd does not
+ * auto-resolve it when the blocker closes in this build, so the gate's await type
+ * is a classification aid, not the resolution trigger. `--await-id` is only a
+ * field on the gate record — it does not add a bd dependency edge, so two opposite
+ * member edges do not form a bd dependency cycle; the real-bd probe in
+ * `test/fleet-ordering-gate.integration.test.ts` verifies both gates create, each
+ * bead is blocked by its own gate, and resolving one frees exactly its dependent.
+ * See the module header.
+ */
 export function buildFleetOrderingGateArgv(input: {
   fleetId: string;
   blocker: string;
   blocked: string;
 }): readonly string[] {
   return buildGateCreateArgv({
+    awaitType: "bead",
+    awaitId: input.blocker,
     beadId: input.blocked,
     reason: fleetOrderingGateReason(input),
     title: fleetOrderingGateTitle(input),
@@ -463,7 +487,8 @@ function unusableGateCreateText(
     `gate id (output: ${output}). The launch was refused and nothing was left open: ` +
     `check \`bd version\` (this harness expects bd 1.3.0's \`--json\` payload or the ` +
     `\`✓ Created gate bd-N\` text form), then create the gate by hand with: bd gate create ` +
-    `--blocks ${edge.blocked} --type=human --title '${title}' --reason '${reason}'`
+    `--blocks ${edge.blocked} --type=bead --await-id ${edge.blocker} --title '${title}' ` +
+    `--reason '${reason}'`
   );
 }
 

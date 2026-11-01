@@ -91,7 +91,10 @@ describe("planFleetOrderingGates", () => {
 });
 
 describe("gate argv, title and reason", () => {
-  it("builds a human-typed gate whose title is the structured marker", () => {
+  it("builds a bead-typed gate awaiting the blocker, whose title is the structured marker", () => {
+    // bd-176: ordering is a native `bead` gate, not a `human` one, so a needs-you
+    // surface keyed on human awaits never lists it. The awaited bead is the
+    // blocker; the blocked bead stays `--blocks`.
     const argv = buildFleetOrderingGateArgv({
       fleetId: "default",
       blocker: "bd-12",
@@ -102,7 +105,9 @@ describe("gate argv, title and reason", () => {
       "create",
       "--blocks",
       "bd-13",
-      "--type=human",
+      "--type=bead",
+      "--await-id",
+      "bd-12",
       "--title",
       MARKER,
       "--reason",
@@ -110,7 +115,7 @@ describe("gate argv, title and reason", () => {
     ]);
   });
 
-  it("names both beads and the fleet so a human reading bd sees why it is blocked", () => {
+  it("names both beads and the fleet, and says it is ordering rather than a human question", () => {
     const reason = fleetOrderingGateReason({
       fleetId: "night",
       blocker: "bd-12",
@@ -120,6 +125,11 @@ describe("gate argv, title and reason", () => {
     expect(reason).toContain("bd-13");
     expect(reason).toContain("fleet:night");
     expect(reason).toContain("must land");
+    expect(reason).toContain("fleet ordering, not a human question");
+    // The escape hatch is actionable, and the reason never claims bd resolves it
+    // automatically on close (this bd build does not).
+    expect(reason).toContain("bd gate resolve <id>");
+    expect(reason).not.toContain("blocker closes");
   });
 
   it("keeps the marker intact when the prose is long", () => {
@@ -141,9 +151,17 @@ describe("ordering gates and human gates stay separate", () => {
   const orderingRecord = {
     id: "bd-900",
     status: "open",
-    await_type: "human",
+    await_type: "bead",
+    await_id: "bd-12",
     title: MARKER,
     description: `Ad-hoc gate blocking bd-13\n\nReason: ${MARKER}: bd-12 must land`,
+  };
+  /** A gate the fleet created before bd-176: typed `human`, still marked ordering. */
+  const legacyOrderingRecord = {
+    ...orderingRecord,
+    id: "bd-901",
+    await_type: "human",
+    await_id: undefined,
   };
   const humanRecord = {
     id: "bd-910",
@@ -161,10 +179,12 @@ describe("ordering gates and human gates stay separate", () => {
     description: `Gate blocking bd-13\n\nReason: ${FLEET_ORDERING_GATE_PREFIX} should we ship option A?`,
   };
 
-  it("never reads a fleet ordering gate as a human question", () => {
-    expect(isFleetOrderingGateRecord(orderingRecord)).toBe(true);
-    expect(parseOpenHumanGate([orderingRecord], "bd-13")).toBeUndefined();
-    expect(parseOpenOrderingGateBlocker([orderingRecord], "bd-13")).toBe("bd-12");
+  it("never reads an ordering gate as a human question, whether bead-typed or legacy human-typed", () => {
+    for (const record of [orderingRecord, legacyOrderingRecord]) {
+      expect(isFleetOrderingGateRecord(record)).toBe(true);
+      expect(parseOpenHumanGate([record], "bd-13")).toBeUndefined();
+      expect(parseOpenOrderingGateBlocker([record], "bd-13")).toBe("bd-12");
+    }
   });
 
   it("never reads a human question as an ordering gate", () => {
@@ -212,13 +232,20 @@ describe("ordering gates and human gates stay separate", () => {
 
   it("rejects a record whose title and description disagree about the edge", () => {
     // Two sources, one answer: a mismatched record is not safely readable, so it
-    // falls back to the conservative classification (a human gate, wait armed).
-    const mismatched = {
+    // falls back to its await type. A legacy human-typed gate stays a human wait…
+    const legacyMismatch = {
+      ...legacyOrderingRecord,
+      description: "Reason: belayd-fleet-ordering: fleet:default bd-77 -> bd-13",
+    };
+    expect(isFleetOrderingGateRecord(legacyMismatch)).toBe(false);
+    expect(parseOpenHumanGate([legacyMismatch], "bd-13")).toMatchObject({ gateId: "bd-901" });
+
+    // …and a bead-typed one is never a human wait at all.
+    const beadMismatch = {
       ...orderingRecord,
       description: "Reason: belayd-fleet-ordering: fleet:default bd-77 -> bd-13",
     };
-    expect(isFleetOrderingGateRecord(mismatched)).toBe(false);
-    expect(parseOpenHumanGate([mismatched], "bd-13")).toMatchObject({ gateId: "bd-900" });
+    expect(parseOpenHumanGate([beadMismatch], "bd-13")).toBeUndefined();
   });
 
   it("keeps a real ordering gate ordering when bd truncated its reason", () => {
@@ -289,10 +316,16 @@ function fakeBd(
     return { stdout: JSON.stringify(gates.length === 0 ? null : gates) };
   }
 
-  function createGate(): { stdout: string } {
+  function createGate(argv: readonly string[]): { stdout: string } {
     const id = minted[nextMinted] ?? `bd-9${nextMinted + 1}`;
     nextMinted += 1;
-    return { stdout: JSON.stringify({ id, status: "open", await_type: "human" }) };
+    // bd-176: ordering gates are `bead` gates; mirror bd's `await_id` echo so the
+    // fake cannot hide a missing `--await-id`.
+    const awaitIndex = argv.indexOf("--await-id");
+    const awaitId = awaitIndex === -1 ? undefined : argv[awaitIndex + 1];
+    return {
+      stdout: JSON.stringify({ id, status: "open", await_type: "bead", await_id: awaitId }),
+    };
   }
 
   function resolveGate(gateId: string): { stdout: string } {
@@ -305,7 +338,7 @@ function fakeBd(
     const verb = argv[1];
     if (argv[0] !== "gate") return { stdout: "" };
     if (verb === "list") return listGates(argv[2] ?? "");
-    if (verb === "create") return createGate();
+    if (verb === "create") return createGate(argv);
     if (verb === "resolve") return resolveGate(argv[2] ?? "");
     return { stdout: "" };
   }
@@ -327,14 +360,18 @@ function openMarkerGate(input: {
   fleetId?: string;
   blocker: string;
   blocked: string;
+  /** Legacy gates the fleet created before bd-176 are typed `human`. */
+  awaitType?: "bead" | "human";
 }): unknown {
   const marker =
     `${FLEET_ORDERING_GATE_PREFIX} fleet:${input.fleetId ?? "default"} ` +
     `${input.blocker} -> ${input.blocked}`;
+  const awaitType = input.awaitType ?? "bead";
   return {
     id: input.id,
     status: "open",
-    await_type: "human",
+    await_type: awaitType,
+    ...(awaitType === "bead" ? { await_id: input.blocker } : {}),
     title: marker,
     description: `Ad-hoc gate blocking ${input.blocked}\n\nReason: ${marker}`,
   };
@@ -365,6 +402,33 @@ describe("createFleetOrderingGates", () => {
     // One list (bd truth) then one create.
     expect(bd.calls.map((call) => call[1])).toEqual(["list", "create"]);
     expect(bd.calls[1]?.slice(0, 4)).toEqual(["gate", "create", "--blocks", "bd-13"]);
+  });
+
+  it("emits swapped --await-id/--blocks argv for opposite member edges", async () => {
+    // This pins the argv shape only; the fake bd accepts whatever it is handed, so
+    // the real no-cycle behaviour is verified against bd in
+    // `test/fleet-ordering-gate.integration.test.ts`.
+    const bd = fakeBd({ minted: ["bd-960", "bd-961"] });
+    const result = await createFleetOrderingGates({
+      fleetId: "default",
+      taskIds: ["bd-12", "bd-13"],
+      edges: [
+        { blocker: "bd-12", blocked: "bd-13" },
+        { blocker: "bd-13", blocked: "bd-12" },
+      ],
+      cwd: "/repo",
+      runBd: bd.runBd,
+    });
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.gates).toHaveLength(2);
+    const creates = bd.calls.filter((call) => call[1] === "create").map((call) => call.slice(0, 7));
+    expect(creates).toEqual(
+      expect.arrayContaining([
+        ["gate", "create", "--blocks", "bd-13", "--type=bead", "--await-id", "bd-12"],
+        ["gate", "create", "--blocks", "bd-12", "--type=bead", "--await-id", "bd-13"],
+      ]),
+    );
   });
 
   it("does not create a second gate for an edge it already recorded", async () => {
@@ -520,7 +584,7 @@ describe("createFleetOrderingGates", () => {
     expect(result.error).toContain("Created gate bd-N");
     expect(result.error).toContain("launch was refused and nothing was left open");
     expect(result.error).toContain(
-      "bd gate create --blocks bd-13 --type=human --title " +
+      "bd gate create --blocks bd-13 --type=bead --await-id bd-12 --title " +
         "'belayd-fleet-ordering: fleet:default bd-12 -> bd-13'",
     );
     expect(result.created).toEqual([]);

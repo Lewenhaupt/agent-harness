@@ -1,5 +1,11 @@
 # Fleet ordering as bd gates, and `--accept` as opt-in (bd-158)
 
+> **Divergence note (bd-176).** This is the historical bd-158 record, and it
+> describes ordering gates as `--type=human`. Since bd-176 the fleet creates them
+> as `--type=bead --await-id <blocker>` (see `docs/fleet.md`); legacy
+> `human`-typed ordering gates remain recognized by their marker. The rest of this
+> document is unchanged.
+
 Before bd-158 a fleet had one bit to express two different facts. bd derives
 "blocked" from the *blocker bead's status*, so the only way a landed member could
 release its dependents was to close its bead — and the run did that automatically

@@ -57,7 +57,9 @@ const resolvedHumanGate = {
 
 describe("gate argv builders", () => {
   it("creates a human gate that blocks the bead", () => {
-    expect(buildGateCreateArgv({ beadId: "bd-152", reason: "which option?" })).toEqual([
+    expect(
+      buildGateCreateArgv({ awaitType: "human", beadId: "bd-152", reason: "which option?" }),
+    ).toEqual([
       "gate",
       "create",
       "--blocks",
@@ -66,6 +68,62 @@ describe("gate argv builders", () => {
       "--reason",
       "which option?",
     ]);
+  });
+
+  it("creates a bead gate awaiting the blocker, with an optional title", () => {
+    // bd 1.3.0 supports `--type=bead --await-id <bead>`; a bead gate without an
+    // await id is unrepresentable in the type, so this is the only argv shape.
+    expect(
+      buildGateCreateArgv({
+        awaitType: "bead",
+        awaitId: "bd-12",
+        beadId: "bd-13",
+        reason: "ordering",
+        title: "marker",
+      }),
+    ).toEqual([
+      "gate",
+      "create",
+      "--blocks",
+      "bd-13",
+      "--type=bead",
+      "--await-id",
+      "bd-12",
+      "--title",
+      "marker",
+      "--reason",
+      "ordering",
+    ]);
+  });
+
+  it("omits --title on a bead gate when no custom title is given", () => {
+    expect(
+      buildGateCreateArgv({
+        awaitType: "bead",
+        awaitId: "bd-12",
+        beadId: "bd-13",
+        reason: "ordering",
+      }),
+    ).toEqual([
+      "gate",
+      "create",
+      "--blocks",
+      "bd-13",
+      "--type=bead",
+      "--await-id",
+      "bd-12",
+      "--reason",
+      "ordering",
+    ]);
+  });
+
+  it("rejects a bead gate built without an await id at the type level", () => {
+    // The discriminated union, not a runtime check, is what prevents a `bead`
+    // gate with no `--await-id` (bd-176). This pins the compile-time guard.
+    const buildWithoutAwaitId = () =>
+      // @ts-expect-error a `bead` gate must name the bead it awaits
+      buildGateCreateArgv({ awaitType: "bead", beadId: "bd-13", reason: "ordering" });
+    expect(buildWithoutAwaitId).toBeTypeOf("function");
   });
 
   it("lists the gates of one bead as JSON and resolves by gate id", () => {

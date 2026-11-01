@@ -614,6 +614,7 @@ async function createHumanGate(options: {
     withActorArgv(
       [
         ...buildGateCreateArgv({
+          awaitType: "human",
           beadId: options.taskId,
           reason: options.question,
           ...(options.title === undefined ? {} : { title: options.title }),

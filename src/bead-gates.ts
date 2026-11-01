@@ -32,15 +32,27 @@ import type { FleetBeadRunner } from "./fleet-beads.js";
 const HUMAN_GATE_TYPE = "human";
 
 /**
+ * bd's native await type for ordering: the gate waits on another bead. The
+ * ordering semantics live in the fleet, not in bd's auto-resolution (see
+ * `fleet-ordering-gates.ts`); the type only keeps the wait off needs-you
+ * surfaces that key on `human`.
+ */
+const BEAD_GATE_TYPE = "bead";
+
+/**
  * Stable marker carried by the gates the fleet creates to order its own members
  * (bd-158), in both `--title` and `--reason`.
  *
- * bd 1.3.0 accepts only `human`, `timer`, `gh:run`, and `gh:pr` — there is no
- * custom await type — and an ordering gate must not auto-resolve like a timer,
- * so its *type* cannot distinguish it from a real human wait. The marker does:
- * `parseOpenHumanGate` refuses a marked record, so the human-answer poll can
- * never "answer" an ordering gate with a comment, and the fleet view renders it
- * as "waiting on member X" instead of "awaiting human".
+ * New ordering gates are typed `bead` with the awaited bead set to the blocker
+ * (bd-176): bd 1.3.0 supports `human`, `timer`, `gh:run`, `gh:pr`, and `bead`,
+ * and `bead` makes the wait a native non-human wait instead of a `human` one a
+ * needs-you surface lists. The marker still matters: it carries the
+ * fleet id and both bead ids for dedup/adoption/reaping, and legacy gates the
+ * fleet created before bd-176 are typed `human`, so the type alone cannot tell
+ * them from a real human wait. `parseOpenHumanGate` refuses a marked record, so
+ * the human-answer poll can never "answer" an ordering gate with a comment, and
+ * the fleet view renders it as "waiting on member X" instead of "awaiting
+ * human".
  *
  * The marker is *structured*, not a bare prefix: `<prefix> fleet:<fleetId>
  * <blocker> -> <blocked>`. Classification requires that whole shape, because a
@@ -202,19 +214,44 @@ export interface OpenHumanGate {
   createdAt?: string;
 }
 
-/** `bd gate create --blocks <bead> --type=human [--title <title>] --reason <reason>`. */
-export function buildGateCreateArgv(options: {
-  beadId: string;
-  reason: string;
-  /** Custom gate title; bd's default (`Gate: human`) says nothing about the wait. */
-  title?: string;
-}): readonly string[] {
+/**
+ * The await type of a bd gate create, as a discriminated union so a `bead` gate
+ * cannot be built without the bead it awaits (bd-176).
+ *
+ * `human` emits `--type=human` with no `--await-id`; `bead` emits
+ * `--type=bead --await-id <awaitId>`, which is how fleet ordering is expressed
+ * natively. A `bead` gate without an await id is unrepresentable, not a runtime
+ * check that can be forgotten.
+ */
+export type GateCreateOptions =
+  | {
+      awaitType: "human";
+      beadId: string;
+      reason: string;
+      /** Custom gate title; bd's default (`Gate: human`) says nothing about the wait. */
+      title?: string;
+    }
+  | {
+      awaitType: "bead";
+      /** The bead whose closure resolves the gate. */
+      awaitId: string;
+      beadId: string;
+      reason: string;
+      title?: string;
+    };
+
+/** `bd gate create --blocks <bead> --type=<type> [--await-id <bead>] …`. */
+export function buildGateCreateArgv(options: GateCreateOptions): readonly string[] {
+  const typeArgs =
+    options.awaitType === "bead"
+      ? [`--type=${BEAD_GATE_TYPE}`, "--await-id", options.awaitId]
+      : [`--type=${HUMAN_GATE_TYPE}`];
   return [
     "gate",
     "create",
     "--blocks",
     options.beadId,
-    `--type=${HUMAN_GATE_TYPE}`,
+    ...typeArgs,
     ...(options.title === undefined ? [] : ["--title", options.title]),
     "--reason",
     options.reason,
@@ -247,8 +284,8 @@ export function buildGateResolveArgv(gateId: string): readonly string[] {
  *
  * bd answers `null` for no gates and an array of gate records otherwise, newest
  * first. Records without a usable `id`, a `status` other than `open`, or an
- * `await_type` other than `human` are not a human wait: a timer or `gh:run`
- * gate must never be "answered" by a comment. The blocked bead's own id is
+ * `await_type` other than `human` are not a human wait: a `timer`, `gh:run`, or
+ * `bead` gate must never be "answered" by a comment. The blocked bead's own id is
  * rejected as a gate id, because treating it as one would make the harness
  * resolve the work item instead of the gate.
  */
