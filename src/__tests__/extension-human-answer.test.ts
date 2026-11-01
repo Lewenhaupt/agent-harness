@@ -330,6 +330,7 @@ function findCall(prefix: string): BdCallRecord | undefined {
 const ASK_GATE_KEY = "gate create --blocks bd-152 --type=human --reason Which option? --json";
 const ASK_COMMENT_KEY = "comment --stdin -- bd-152";
 const GATE_LIST_KEY = "gate list bd-152 --json";
+const GATE_LIST_ALL_KEY = "gate list bd-152 --all --json";
 const COMMENTS_KEY = "comments bd-152 --json";
 const RESOLVE_KEY = "gate resolve bd-159";
 
@@ -872,6 +873,102 @@ describe("human answer delivery", () => {
     await startSession(mock, ctx);
     await ask(mock, ctx);
     bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    bd.reply(GATE_LIST_ALL_KEY, { stdout: JSON.stringify([]) });
+
+    const answer = humanAnswer(await startTurn(mock, ctx));
+    expect(answer?.content).toContain("was resolved without a comment");
+    expect(answer?.content).not.toContain("resolver's note");
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+  });
+
+  it("delivers the note a Scotty approval left in the gate's close_reason", async () => {
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await ask(mock, ctx);
+    // Approving in Scotty closes the gate with `Approved by … via Scotty at …`
+    // plus the approval note; the note is the answer and must reach the session.
+    bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    bd.reply(GATE_LIST_ALL_KEY, {
+      stdout: JSON.stringify([
+        {
+          id: "bd-159",
+          status: "closed",
+          issue_type: "gate",
+          await_type: "human",
+          close_reason:
+            "Approved by hugo via Scotty at 2026-11-01T09:52:05.582Z\n\nRetry proof — providers ran out",
+        },
+      ]),
+    });
+
+    const answer = humanAnswer(await startTurn(mock, ctx));
+    expect(answer?.content).toBe(
+      'The human gate on bd-152 was resolved without a comment; the resolver\'s note was "Retry proof — providers ran out". You may proceed.',
+    );
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+  });
+
+  it("resolves without the note when the approval carried none of its own", async () => {
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await ask(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    bd.reply(GATE_LIST_ALL_KEY, {
+      stdout: JSON.stringify([
+        {
+          id: "bd-159",
+          status: "closed",
+          issue_type: "gate",
+          await_type: "human",
+          close_reason: "Approved by hugo via Scotty at 2026-11-01T09:52:05.582Z",
+        },
+      ]),
+    });
+
+    const answer = humanAnswer(await startTurn(mock, ctx));
+    expect(answer?.content).toBe(
+      "The human gate on bd-152 was resolved without a comment; you may proceed.",
+    );
+  });
+
+  it("never adopts another wait's gate note", async () => {
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await ask(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    bd.reply(GATE_LIST_ALL_KEY, {
+      stdout: JSON.stringify([
+        {
+          id: "bd-170",
+          status: "closed",
+          issue_type: "gate",
+          await_type: "human",
+          close_reason: "Approved by hugo via Scotty at 2026-11-01T09:52:05.582Z\n\nunrelated",
+        },
+      ]),
+    });
+
+    const answer = humanAnswer(await startTurn(mock, ctx));
+    expect(answer?.content).not.toContain("unrelated");
+    expect(answer?.content).toContain("was resolved without a comment");
+  });
+
+  it("resolves without a note when the closed-gate read fails", async () => {
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await ask(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    // The gate is genuinely gone, so a failed second read must not keep the
+    // workflow blocked; only the note is lost.
+    bd.reply(GATE_LIST_ALL_KEY, { error: "bd: database is locked" });
 
     const answer = humanAnswer(await startTurn(mock, ctx));
     expect(answer?.content).toContain("was resolved without a comment");

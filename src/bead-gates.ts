@@ -12,7 +12,10 @@
  * 1. `belayd_ask_human` creates the gate (`buildGateCreateArgv`) and posts the
  *    question as an authored comment.
  * 2. The poll reads it (`lookupOpenHumanGate`); a comment by a non-`belayd:*`
- *    author is the answer.
+ *    author is the answer. When the gate is already gone, that read settles the
+ *    wait — and `lookupResolvedHumanGate` recovers whatever note the resolver
+ *    left in the gate's `close_reason` (Scotty's Approve writes it there, not in
+ *    the bead thread).
  * 3. The answer resolves the gate (`buildGateResolveArgv`), which reopens the
  *    work bead for the next phase.
  *
@@ -223,6 +226,17 @@ export function buildGateListArgv(beadId: string): readonly string[] {
   return ["gate", "list", beadId, "--json"];
 }
 
+/**
+ * `bd gate list <bead> --all --json` — open *and* closed gates of that bead.
+ *
+ * Only used after the open read already said "no gate": a gate resolved by
+ * someone else keeps its `close_reason`, which is where Scotty's approval note
+ * (and any `bd gate resolve --reason`) puts the person's answer.
+ */
+export function buildGateListAllArgv(beadId: string): readonly string[] {
+  return ["gate", "list", beadId, "--all", "--json"];
+}
+
 /** `bd gate resolve <gate-id>`; equivalent to `bd close <gate-id>`. */
 export function buildGateResolveArgv(gateId: string): readonly string[] {
   return ["gate", "resolve", gateId];
@@ -244,6 +258,86 @@ export function parseOpenHumanGate(raw: unknown, beadId: string): OpenHumanGate 
     if (gate !== undefined) return gate;
   }
   return undefined;
+}
+
+/** A human gate whose resolution left the person's own text behind. */
+export interface ResolvedHumanGate {
+  gateId: string;
+  /** bd's verbatim `close_reason`, when it stores one. */
+  closeReason?: string;
+  /** The human text in `closeReason`, minus the tool's own decision line. */
+  note?: string;
+}
+
+/**
+ * The decision line a closing tool writes in front of the human's text.
+ *
+ * Scotty's Approve writes `Approved by <actor> via Scotty at <iso>` and appends
+ * the approval note after a blank line, so that first line is bookkeeping, not
+ * an answer. Matched narrowly (a whole line, a real ISO timestamp) because
+ * anything unrecognized is kept as part of the note: delivering a stray line is
+ * better than swallowing the person's answer.
+ */
+const RESOLVE_DECISION_LINE =
+  /^(?:Approved|Resolved) by .+? (?:via Scotty )?at \d{4}-\d{2}-\d{2}T[\d:.]+Z$/u;
+
+/**
+ * The human text in a gate's `close_reason`, or undefined when it carries none.
+ *
+ * The note is returned verbatim (wrapped lines included); flattening and capping
+ * happen at delivery, in `excerptComment`.
+ */
+export function humanGateResolveNote(closeReason: unknown): string | undefined {
+  if (typeof closeReason !== "string") return undefined;
+  const lines = closeReason.split("\n");
+  if (lines.length > 0 && RESOLVE_DECISION_LINE.test(lines[0]?.trim() ?? "")) {
+    lines.shift();
+  }
+  const note = lines.join("\n").trim();
+  return note === "" ? undefined : note;
+}
+
+/**
+ * The closed human gate that resolved `beadId`, from `bd gate list <bead> --all --json`.
+ *
+ * Fail closed: only a `closed` record of type `human` that is not a fleet
+ * ordering gate and not the work bead itself counts. When the wait knows its
+ * gate id, a different id is ignored — adopting the wrong gate would attribute
+ * someone else's resolution (and its note) to this wait.
+ */
+export function parseResolvedHumanGate(
+  raw: unknown,
+  beadId: string,
+  gateId?: string,
+): ResolvedHumanGate | undefined {
+  for (const record of gateRecordList(raw)) {
+    const gate = resolvedHumanGateFromRecord(record, beadId, gateId);
+    if (gate !== undefined) return gate;
+  }
+  return undefined;
+}
+
+function resolvedHumanGateFromRecord(
+  record: Record<string, unknown>,
+  beadId: string,
+  gateId: string | undefined,
+): ResolvedHumanGate | undefined {
+  if (isFleetOrderingGateRecord(record)) return undefined;
+  const id = record.id;
+  if (typeof id !== "string" || id === "" || id === beadId) return undefined;
+  if (gateId !== undefined && id !== gateId) return undefined;
+  if (record.status !== "closed") return undefined;
+  if (record.await_type !== HUMAN_GATE_TYPE) return undefined;
+  const closeReason =
+    typeof record.close_reason === "string" && record.close_reason !== ""
+      ? record.close_reason
+      : undefined;
+  const note = humanGateResolveNote(closeReason);
+  return {
+    gateId: id,
+    ...(closeReason === undefined ? {} : { closeReason }),
+    ...(note === undefined ? {} : { note }),
+  };
 }
 
 /** Array-or-single-object tolerance for untrusted bd JSON. */
@@ -444,6 +538,60 @@ export async function lookupOpenHumanGate(
     return orderingBlocker === undefined
       ? { ok: true, status: "none" }
       : { ok: true, status: "none", orderingBlocker };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** Outcome of one closed-gate read. */
+export type ResolvedHumanGateLookup =
+  | { ok: true; status: "none" }
+  | { ok: true; status: "closed"; gate: ResolvedHumanGate }
+  | { ok: false; error: string };
+
+export interface LookupResolvedHumanGateOptions {
+  beadId: string;
+  /** The wait's own gate id, when bd reported it at creation time. */
+  gateId?: string;
+  cwd: string;
+  runBd: FleetBeadRunner;
+  /** Test seam for the read-only guard; production always uses the default. */
+  buildArgv?: (beadId: string) => readonly string[];
+}
+
+/**
+ * Read the already-resolved gate of a wait, so its note is not lost.
+ *
+ * Called only after {@link lookupOpenHumanGate} reported `none`, i.e. once per
+ * wait, and guarded exactly like the open read. A failure here is not a reason
+ * to keep the workflow blocked: bd already said the gate is gone, so the caller
+ * keeps the resolution and only the note is lost.
+ */
+export async function lookupResolvedHumanGate(
+  options: LookupResolvedHumanGateOptions,
+): Promise<ResolvedHumanGateLookup> {
+  const buildArgv = options.buildArgv ?? buildGateListAllArgv;
+  const argv = buildArgv(options.beadId);
+  if (options.beadId === "" || options.beadId.startsWith("-")) {
+    return { ok: false, error: `refusing to read gates for bead id "${options.beadId}"` };
+  }
+  if (!isBdReadArgv(argv)) {
+    return { ok: false, error: `refusing non-read bd argv "${argv.join(" ")}"` };
+  }
+
+  try {
+    const { stdout } = await options.runBd(argv, {
+      cwd: options.cwd,
+      stdin: undefined,
+      timeoutInMs: BEAD_READ_TIMEOUT_MS,
+      maxBufferInBytes: BEAD_READ_MAX_BUFFER_BYTES,
+    });
+    const gate = parseResolvedHumanGate(
+      JSON.parse(stdout) as unknown,
+      options.beadId,
+      options.gateId,
+    );
+    return gate === undefined ? { ok: true, status: "none" } : { ok: true, status: "closed", gate };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }

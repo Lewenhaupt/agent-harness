@@ -712,10 +712,13 @@ the review findings`.
 
 ### Rules of thumb
 
-- **Answer the gate; prefer `resolve` to deleting it.** `bd gate resolve <gate>`
-  and a comment both release the member. A gate that simply disappears reads as
-  "resolved without a comment", so the member proceeds with no record of why —
-  resolving keeps the answer visible in the bead's thread.
+- **Reply in the thread; an approval note is the fallback.** A comment on the work
+  bead is the answer channel (Scotty's gate card cannot post one — open the bead
+  it says it unblocks, or `bd comment <bead> --stdin`). Resolving the gate instead
+  (`bd gate resolve <gate> --reason "…"`, or Scotty's **Add approval note** +
+  **Approve**) resumes the member with the reason as a note; with no reason it
+  resumes on "resolved without a comment", so the decision leaves no text behind.
+  A gate that simply disappears still reads as an out-of-band resolution.
 - **Do not treat a long wait as a hang.** A live human wait is exempt from the 1 h
   idle cap on purpose; only `stalled` means a member is at fault.
 - **A `halted: awaiting-human` run needs a re-arm**, not a resume: any halt is

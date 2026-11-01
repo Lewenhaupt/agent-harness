@@ -20,6 +20,7 @@ import {
   buildGateCreateArgv,
   buildGateResolveArgv,
   lookupOpenHumanGate,
+  lookupResolvedHumanGate,
   parseCreatedGateId,
 } from "../../src/bead-gates.js";
 import { orchestratorActor, withActorArgv } from "../../src/beads-actor.js";
@@ -147,7 +148,8 @@ export function clearHumanAnswerWait(state: CoreSessionState): void {
 type HumanAnswerObservation =
   | { kind: "pending" }
   | { kind: "unknown" }
-  | { kind: "resolved" }
+  /** `note` is the text the resolver left behind when the gate was closed, if any. */
+  | { kind: "resolved"; note?: string }
   | { kind: "answered"; author: string; text: string };
 
 /** Observations that carry something worth delivering. */
@@ -177,7 +179,7 @@ async function observeHumanAnswer(
     warnUnrecognizedHumanGate(state, awaiting.beadId);
     return { kind: "unknown" };
   }
-  if (gate.status === "none") return { kind: "resolved" };
+  if (gate.status === "none") return resolvedObservation(awaiting, cwd);
 
   const comments = await lookupBeadComments({
     beadId: awaiting.beadId,
@@ -197,6 +199,32 @@ async function observeHumanAnswer(
   );
   if (answer === undefined) return { kind: "pending" };
   return { kind: "answered", author: answer.author, text: answer.text };
+}
+
+/**
+ * A closed gate is a resolution; its `close_reason` may also carry the answer.
+ *
+ * Resolving out of band (Scotty's Approve, `bd gate resolve --reason`) records
+ * the person's text on the *gate*, not on the bead, so without this second read
+ * the workflow resumes with "resolved without a comment" and the note is lost.
+ * Deliberately not fail-closed: the gate is already gone, so a failed read keeps
+ * the resolution (only the note is dropped) instead of waiting on a gate bd will
+ * never report again.
+ */
+async function resolvedObservation(
+  awaiting: AwaitingHuman & { gateId?: string },
+  cwd: string,
+): Promise<HumanAnswerObservation> {
+  const closed = await lookupResolvedHumanGate({
+    beadId: awaiting.beadId,
+    ...(awaiting.gateId === undefined ? {} : { gateId: awaiting.gateId }),
+    cwd,
+    runBd: runBdCommand,
+  });
+  if (!closed.ok || closed.status === "none" || closed.gate.note === undefined) {
+    return { kind: "resolved" };
+  }
+  return { kind: "resolved", note: closed.gate.note };
 }
 
 /** Say once per wait that bd's gate JSON no longer parses; never spam the poll. */
@@ -250,7 +278,9 @@ function humanAnswerText(
   observed: DeliverableObservation,
 ): string {
   if (observed.kind === "resolved") {
-    return `The human gate on ${awaiting.beadId} was resolved without a comment; you may proceed.`;
+    const base = `The human gate on ${awaiting.beadId} was resolved without a comment`;
+    if (observed.note === undefined) return `${base}; you may proceed.`;
+    return `${base}; the resolver's note was "${excerptComment(observed.note)}". You may proceed.`;
   }
   return `${observed.author} answered: ${excerptComment(observed.text)}`;
 }

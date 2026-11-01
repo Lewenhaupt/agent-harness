@@ -388,12 +388,28 @@ hugo answered: option b — keep the shim
 | What did I answer? | `bd comments bd-152 --json \| jq -r '.[] \| "\(.author)\t\(.text)"'` |
 | Which comments the harness ignores | `bd comments bd-152 --json \| jq -r '.[] \| select(.author \| startswith("belayd:")) \| .author'` |
 
-Answer out-of-band with `bd gate resolve <gate-id>` (or `bd close <gate-id>`) and
-the workflow resumes without a comment, receiving:
+Answer out-of-band with `bd gate resolve <gate-id> --reason "..."` (or
+`bd close <gate-id> --reason "..."`) and the workflow resumes without a comment,
+receiving:
 
 ```text
-The human gate on bd-152 was resolved without a comment; you may proceed.
+The human gate on bd-152 was resolved without a comment; the resolver's note was "option b — keep the shim". You may proceed.
 ```
+
+The note is the gate's `close_reason`, read back with
+`bd gate list bd-152 --all --json` after the open read reports no gate. A closing
+tool's own decision line is dropped: Scotty writes
+`Approved by <actor> via Scotty at <iso>` and appends the "Add approval note" text
+after a blank line, so **approving with a note in Scotty is a working answer** —
+the note is what the session receives. Approving with no note (or `bd gate resolve`
+with no `--reason`) leaves the shorter
+`The human gate on bd-152 was resolved without a comment; you may proceed.`
+
+A note is only read from *this* wait's gate: when `bd gate create` reported the gate
+id, a closed gate with a different id is ignored, so one wait can never inherit
+another's approval note. The comment thread is still the richer channel (it is what
+Scotty's bead view shows, and `bd comments` keeps it), and only a comment opens the
+answer path that resolves the gate itself.
 
 ### Refusal surface while waiting
 
@@ -416,7 +432,8 @@ Still callable, so the session can ask again, report, and be stopped:
 | Gate create fails | no wait is armed and no phase tool is refused — the workflow is not blocked by a gate bd never created |
 | Comment write fails, compensating resolve succeeds | tool returns exit 1, no wait: nothing is left blocking the bead |
 | Comment write fails *and* gate resolve fails | wait **stays armed** (poll keeps watching) and the text warns the bead may be left blocked; recover with `bd gate list <bead>` + `bd gate resolve <gate>` |
-| Gate resolved externally, no comment | wait clears, workflow resumes with the "resolved without a comment" message |
+| Gate resolved externally, no comment | wait clears, workflow resumes with the "resolved without a comment" message — plus the gate's `close_reason` note when it carried one |
+| Gate resolved externally, closed-gate read fails | the resolution stands (the wait clears and resumption is not delayed); the note is lost, warned in the daemon log |
 | `bd gate list` says there are no gates any more | that is a genuine resolution, not a parse failure |
 
 The distinction that matters: **`none` unblocks, `unrecognized` never does.**
