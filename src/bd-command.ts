@@ -72,6 +72,59 @@ export const BD_ALLOWED_SUBCOMMANDS: readonly string[] = [
 /** `bd gate <child>` invocations that only read (bd-152). */
 export const BD_GATE_READ_SUBCOMMANDS: readonly string[] = ["list", "show"];
 
+/**
+ * One long bd flag plus its optional one-letter shorthand.
+ *
+ * Flags are described once and matched by {@link bdArgvHasFlag}, so the bd
+ * option validation (bd-179) and the GitHub-primary append-only policy (bd-180)
+ * cannot disagree about which spellings of a graph-owning flag exist.
+ */
+export interface BdFlagForm {
+  readonly long: string;
+  readonly short?: string;
+}
+
+/** Status mutation (`bd update -s/--status`). */
+export const BD_STATUS_FLAG: BdFlagForm = { long: "--status", short: "-s" };
+/** Assignment (`bd update -a/--assignee`). */
+export const BD_ASSIGNEE_FLAG: BdFlagForm = { long: "--assignee", short: "-a" };
+/** Ownership (`bd update --owner`). */
+export const BD_OWNER_FLAG: BdFlagForm = { long: "--owner" };
+/** Priority (`bd update -p/--priority`). */
+export const BD_PRIORITY_FLAG: BdFlagForm = { long: "--priority", short: "-p" };
+/** Reparenting (`bd update/create --parent`). */
+export const BD_PARENT_FLAG: BdFlagForm = { long: "--parent" };
+/** Lease claim (`bd update/create --claim`). */
+export const BD_CLAIM_FLAG: BdFlagForm = { long: "--claim" };
+/** Deferral (`bd update --defer`). */
+export const BD_DEFER_FLAG: BdFlagForm = { long: "--defer" };
+/** Label removal (`bd update --remove-label`). */
+export const BD_REMOVE_LABEL_FLAG: BdFlagForm = { long: "--remove-label" };
+/** Whole-label replacement (`bd update --set-labels`). */
+export const BD_SET_LABELS_FLAG: BdFlagForm = { long: "--set-labels" };
+
+function matchesFlagForm(token: string, form: BdFlagForm): boolean {
+  if (token === form.long || token.startsWith(`${form.long}=`)) return true;
+  const short = form.short;
+  if (short === undefined) return false;
+  if (token === short || token.startsWith(`${short}=`)) return true;
+  // pflag accepts an attached shorthand value (`-sclosed`). A long flag starts
+  // with `--`, so it can never be mistaken for the one-letter form.
+  return !token.startsWith("--") && token.startsWith(short) && token.length > short.length;
+}
+
+/**
+ * Does argv carry a flag, in any spelling bd accepts?
+ *
+ * Long (`--status`, `--status=closed`), separate (`-s closed`), equals
+ * (`-s=closed`), and attached (`-sclosed`) shorthand values all match. Matching
+ * is intentionally broader than bd's grammar for invalid tokens: a token that
+ * merely looks like the shorthand is refused rather than assumed harmless.
+ */
+export function bdArgvHasFlag(argv: readonly string[], form: BdFlagForm): boolean {
+  return argv.some((token) => matchesFlagForm(token, form));
+}
+
 /** Whether `bd <subcommand>` is on the read-only list. */
 export function isBdReadSubcommand(subcommand: string): boolean {
   return BD_READ_SUBCOMMANDS.includes(subcommand);
@@ -192,7 +245,7 @@ export function validateBdCommand(command: string): BdCommandValidation {
   // Beads hierarchy mutations must not be reachable through the bd tool:
   // parent-child links need `bd dep`/`bd link` instead, and task lifecycle
   // (status/claim) stays with the human via `wt merge`.
-  if (argv.some((token) => token === "--parent" || token.startsWith("--parent="))) {
+  if (bdArgvHasFlag(argv, BD_PARENT_FLAG)) {
     return {
       ok: false,
       error:
@@ -206,13 +259,13 @@ export function validateBdCommand(command: string): BdCommandValidation {
     };
   }
   if (subcommand === "create" || subcommand === "update") {
-    if (argv.some((token) => token === "--status" || token.startsWith("--status="))) {
+    if (bdArgvHasFlag(argv, BD_STATUS_FLAG)) {
       return {
         ok: false,
         error: "bd <sub> --status is not allowed through the bd tool. Leave beads open/backlog.",
       };
     }
-    if (argv.some((token) => token === "--claim")) {
+    if (bdArgvHasFlag(argv, BD_CLAIM_FLAG)) {
       // Load-bearing for assignment (bd-150): a claim takes a lease on the bead,
       // and every later `bd update --assignee`/`bd assign` refuses while a lease
       // is live. The harness instead mirrors the driving actor as the assignee

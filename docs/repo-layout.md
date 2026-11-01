@@ -68,6 +68,15 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/instruction-groups.ts` | Managed instruction groups for the pi system prompt |
 | `src/cast-utils.ts` | Terminal-output cleaning and asciicast parsing utilities |
 
+### github
+
+| File | Purpose |
+|---|---|
+| `src/github-authority.ts` | GitHub authority per repo (extending the publish config reader) and deterministic drift classification (bd-180) |
+| `src/github-issue-map.ts` | Bead ↔ GitHub issue identity map with never-throw read/write seams (bd-180) |
+| `src/github-ready.ts` | GitHub-primary readiness and stale-gate expiry (bd-180) |
+| `src/github-append-policy.ts` | Append-only bd policy for phase agents in a GitHub-primary repo (bd-180) |
+
 ### models
 
 | File | Purpose |
@@ -269,6 +278,7 @@ raise the ceiling deliberately and say why.
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |
 | `docs/fleet.md` (+ `fleet-run/status/launch/merge/reconcile.md`) | fleet supervisor |
+| `docs/github-primary.md`, `docs/bd-180-userguide.md` | GitHub-primary authority, bead ↔ issue map, drift, readiness, append-only policy |
 | `docs/aws-credential-isolation.md` | sandbox + credential broker |
 | `docs/pi-web-service.md`, `docs/pi-web-agent-browser.md` | pi-web units and wiring |
 | `docs/arion.md` | scotty/portainer containers |

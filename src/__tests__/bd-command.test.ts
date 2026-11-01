@@ -174,9 +174,12 @@ describe("validateBdCommand", () => {
     expect(validateBdCommand("link bd-1 bd-2 --type=parent-child")).toHaveProperty("ok", false);
   });
 
-  it("rejects --status and --claim on create/update", () => {
+  it("rejects --status and --claim on create/update, including short spellings", () => {
     expect(validateBdCommand("update bd-42 --status in_progress")).toHaveProperty("ok", false);
     expect(validateBdCommand("update bd-42 --status=in_progress")).toHaveProperty("ok", false);
+    expect(validateBdCommand("update bd-42 -s in_progress")).toHaveProperty("ok", false);
+    expect(validateBdCommand("update bd-42 -s=in_progress")).toHaveProperty("ok", false);
+    expect(validateBdCommand("update bd-42 -sclosed")).toHaveProperty("ok", false);
     expect(validateBdCommand("update bd-42 --claim")).toHaveProperty("ok", false);
     expect(validateBdCommand("create --title=x --status open")).toHaveProperty("ok", false);
   });

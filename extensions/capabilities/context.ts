@@ -324,6 +324,8 @@ export interface CoreSessionState {
   consultPhases: readonly string[];
   completedPhaseNames: string[];
   currentTaskId: string;
+  /** bd-180: repo-authority config warnings already emitted in this session. */
+  authorityWarningsSeen?: Set<string>;
   /** Proof base resolved for the current task, cached so the spawn and verifier paths agree. */
   proofBase?: string;
   fullTools: string[] | undefined;

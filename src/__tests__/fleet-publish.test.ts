@@ -7,6 +7,7 @@ import {
   formatFleetPublish,
   parseFleetPublish,
   readFleetPublishConfig,
+  readRepoConfigObject,
   resolveFleetPublish,
 } from "../fleet-publish.js";
 
@@ -469,5 +470,122 @@ describe("readFleetPublishConfig", () => {
       exec: noGit,
     });
     expect(result).toEqual({ warnings: [] });
+  });
+
+  it("still reads git config as a separate source when the file is broken", () => {
+    // bd-180 moved the file read into the shared `readRepoConfigObject`; the
+    // publish reader must keep both sources and both warning sets intact.
+    const result = readFleetPublishConfig({
+      repoRoot,
+      fs: fsWith("{ not json"),
+      exec: gitValues({ "belayd.publish": "push", "belayd.publish.remote": "fork" }),
+    });
+    expect(result.configFile).toBe(undefined);
+    expect(result.gitConfig).toEqual({ mode: "push", remote: "fork" });
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain(configPath);
+    expect(result.warnings[0]).toContain("invalid JSON");
+  });
+
+  it("reports the non-object root once and still reads git config", () => {
+    const result = readFleetPublishConfig({
+      repoRoot,
+      fs: fsWith(JSON.stringify(["pr"])),
+      exec: gitValues({ "belayd.publish": "pr", "belayd.publish.base": "main" }),
+    });
+    expect(result.configFile).toBe(undefined);
+    expect(result.gitConfig).toEqual({ mode: "pr", base: "main" });
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("expected a JSON object");
+  });
+
+  it("ignores the bd-180 authority keys, so a repo config only warns about publish", () => {
+    // The shared reader must not turn another reader's keys into publish errors,
+    // and an ambiguous authority is the authority reader's refusal, not ours.
+    for (const config of [
+      { authority: "github", github: { owner: "acme", repo: "widgets" } },
+      { authority: "bd", github: { owner: "acme", repo: "widgets" } },
+      { authority: "gitlab" },
+    ]) {
+      const result = readFleetPublishConfig({
+        repoRoot,
+        fs: fsWith(JSON.stringify(config)),
+        exec: noGit,
+      });
+      expect(result, JSON.stringify(config)).toEqual({ warnings: [] });
+    }
+  });
+});
+
+describe("readRepoConfigObject", () => {
+  const repoRoot = "/repo";
+  const configPath = "/repo/.belayd/config.json";
+
+  function fsWith(content: string | undefined): { readFileSync: (path: string) => string } {
+    return {
+      readFileSync: (path) => {
+        if (content === undefined) {
+          const error = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return content;
+      },
+    };
+  }
+
+  it("reads the config object without warnings", () => {
+    const config = { publish: { mode: "pr" }, authority: "bd" };
+    expect(readRepoConfigObject({ repoRoot, fs: fsWith(JSON.stringify(config)) })).toEqual({
+      config,
+      warnings: [],
+    });
+  });
+
+  it("is the only file it reads, with no git-config seam", () => {
+    const requested: string[] = [];
+    readRepoConfigObject({
+      repoRoot,
+      fs: {
+        readFileSync: (path) => {
+          requested.push(path);
+          return "{}";
+        },
+      },
+    });
+    expect(requested).toEqual([configPath]);
+  });
+
+  it("treats an absent file as no config and no warning", () => {
+    expect(readRepoConfigObject({ repoRoot, fs: fsWith(undefined) })).toEqual({ warnings: [] });
+  });
+
+  it("warns on an unreadable file without throwing", () => {
+    const result = readRepoConfigObject({
+      repoRoot,
+      fs: {
+        readFileSync: () => {
+          const error = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+          error.code = "EACCES";
+          throw error;
+        },
+      },
+    });
+    expect(result).toEqual({
+      warnings: [`${configPath}: could not read (EACCES: permission denied)`],
+    });
+  });
+
+  it("warns on invalid JSON and on a non-object root", () => {
+    expect(readRepoConfigObject({ repoRoot, fs: fsWith("{") }).warnings[0]).toContain(
+      "invalid JSON",
+    );
+    for (const content of ["[]", "null", "42", '"x"']) {
+      const result = readRepoConfigObject({ repoRoot, fs: fsWith(content) });
+      expect(result, content).toHaveProperty("warnings", [
+        expect.stringContaining("expected a JSON object"),
+      ]);
+      expect(result.config).toBeUndefined();
+    }
   });
 });

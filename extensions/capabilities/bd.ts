@@ -7,13 +7,121 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { bdCommandReadsStdin, validateBdCommand } from "../../src/bd-command.js";
+import { bdCommandReadsStdin, parseBdCommand, validateBdCommand } from "../../src/bd-command.js";
+import { classifyBdWriteForAuthority } from "../../src/github-append-policy.js";
 import { emptyUsage, runBdCommand } from "./context.js";
+
+/** Where the repo's authority landed, or why it could not be resolved. */
+export type BdAuthorityResolution =
+  | { ok: true; authority: "bd" | "github" }
+  | { ok: false; error: string };
 
 /** Session-scoped seams the composer supplies. */
 export interface BdToolDeps {
   /** Attribute a validated argv to this session's beads actor (bd-150). */
   attributeBdArgv: (argv: readonly string[], ctx: unknown) => readonly string[];
+  /** Resolve the repo's authority from session context (bd-180); absent means local mode. */
+  resolveAuthority?: (ctx: unknown) => BdAuthorityResolution;
+  /** True when this session is a phase sub-agent (bd-180 append-only policy). */
+  isPhaseSession?: (ctx: unknown) => boolean;
+}
+
+/**
+ * The refusal message for a phase sub-agent's write, or undefined when the write
+ * is allowed. Kept out of `execute` so the tool callback stays readable.
+ *
+ * Only a phase session in a GitHub-primary repo is checked; the human-facing
+ * orchestrator is exempt, and an ambiguous authority refuses rather than
+ * narrowing to local mode.
+ */
+function phaseWriteRefusal(input: {
+  argv: readonly string[];
+  ctx: unknown;
+  deps: BdToolDeps;
+}): string | undefined {
+  if (input.deps.isPhaseSession?.(input.ctx) !== true) return undefined;
+  const resolved: BdAuthorityResolution = input.deps.resolveAuthority?.(input.ctx) ?? {
+    ok: true,
+    authority: "bd",
+  };
+  if (!resolved.ok) {
+    return `bd write refused: ${resolved.error}`;
+  }
+  const policy = classifyBdWriteForAuthority({
+    argv: input.argv,
+    authority: resolved.authority,
+  });
+  return policy.verdict === "refused" ? `bd write refused: ${policy.message}` : undefined;
+}
+
+/**
+ * Authority refusal for a command that bd's own validation already rejects.
+ *
+ * `close` never reaches the normal policy path because the bd tool's allowlist
+ * rejects it first, which used to hide the authority-facing reason in a
+ * GitHub-primary repo. Parsing the command here lets the policy name GitHub as
+ * the owner while local/orchestrator sessions keep the original validation
+ * error byte-for-byte.
+ */
+function authorityRefusalForCommand(
+  command: string,
+  ctx: unknown,
+  deps: BdToolDeps,
+): string | undefined {
+  if (command.trim() === "" || command.includes("\u0000")) return undefined;
+  const parsed = parseBdCommand(command);
+  if (!parsed.ok || parsed.argv.length === 0) return undefined;
+  return phaseWriteRefusal({ argv: parsed.argv, ctx, deps });
+}
+
+/** A tool result carrying a refusal, in the shape every error path uses. */
+function toolError(text: string) {
+  return {
+    content: [{ type: "text" as const, text }],
+    details: { messages: [], usage: emptyUsage(), exitCode: 1 },
+  };
+}
+
+/** The stdin-contract refusal, or undefined when the command may run. */
+function stdinRefusal(stdin: string | undefined, argv: readonly string[]): string | undefined {
+  if (stdin === undefined || stdin === "") return undefined;
+  if (bdCommandReadsStdin(argv)) return undefined;
+  return (
+    "bd command received a `stdin` payload but has no flag that reads stdin. " +
+    "Append `--stdin` (or `--file -` / `--body-file -`) so bd consumes it."
+  );
+}
+
+/** A command that passed every pre-execution guard. */
+type PreparedBdCommand =
+  | { ok: true; argv: readonly string[]; stdin: string | undefined; cwd: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate, attribute and policy-check one bd command before it spawns.
+ * Extracted from `execute` so the tool callback stays below the complexity
+ * limit; the order is load-bearing: the authority reason overrides a generic
+ * allowlist rejection only for a phase session in a GitHub-primary repo.
+ */
+function prepareBdCommand(
+  params: { command: string; stdin?: string },
+  ctx: unknown,
+  deps: BdToolDeps,
+): PreparedBdCommand {
+  const validation = validateBdCommand(params.command);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      error: authorityRefusalForCommand(params.command, ctx, deps) ?? validation.error,
+    };
+  }
+  const stdin = params.stdin;
+  const stdinError = stdinRefusal(stdin, validation.argv);
+  if (stdinError !== undefined) return { ok: false, error: stdinError };
+  const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
+  const refusal = phaseWriteRefusal({ argv: validation.argv, ctx, deps });
+  if (refusal !== undefined) return { ok: false, error: refusal };
+  return { ok: true, argv: validation.argv, stdin, cwd };
 }
 
 /**
@@ -47,38 +155,17 @@ export function registerBdTool(pi: ExtensionAPI, deps: BdToolDeps): void {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const validation = validateBdCommand(params.command);
-      if (!validation.ok) {
-        return {
-          content: [{ type: "text" as const, text: validation.error }],
-          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
-        };
-      }
+      const prepared = prepareBdCommand(params, ctx, deps);
+      if (!prepared.ok) return toolError(prepared.error);
 
-      const stdin = params.stdin;
-      if (stdin !== undefined && stdin !== "" && !bdCommandReadsStdin(validation.argv)) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                "bd command received a `stdin` payload but has no flag that reads stdin. " +
-                "Append `--stdin` (or `--file -` / `--body-file -`) so bd consumes it.",
-            },
-          ],
-          details: { messages: [], usage: emptyUsage(), exitCode: 1 },
-        };
-      }
-
-      const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
       // Attribute the write to the workflow actor (bd-150). A caller-supplied
       // `--actor` still wins: this default sits at index 1 and bd's last flag
       // wins. `--claim` stays rejected above, which is what keeps assign legal.
-      const argv = deps.attributeBdArgv(validation.argv, ctx);
+      const argv = deps.attributeBdArgv(prepared.argv, ctx);
       try {
         const { stdout, stderr } = await runBdCommand(argv, {
-          cwd,
-          stdin,
+          cwd: prepared.cwd,
+          stdin: prepared.stdin,
           timeoutInMs: 30_000,
           maxBufferInBytes: 1024 * 1024,
         });

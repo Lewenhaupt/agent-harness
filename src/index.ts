@@ -93,11 +93,21 @@ export {
   BASH_MAX_TIMEOUT_SECONDS,
   resolveBashTimeout,
 } from "./bash-timeout.js";
-export type { BdCommandParse, BdCommandValidation } from "./bd-command.js";
+export type { BdCommandParse, BdCommandValidation, BdFlagForm } from "./bd-command.js";
 export {
   BD_ALLOWED_SUBCOMMANDS,
+  BD_ASSIGNEE_FLAG,
+  BD_CLAIM_FLAG,
+  BD_DEFER_FLAG,
   BD_GATE_READ_SUBCOMMANDS,
+  BD_OWNER_FLAG,
+  BD_PARENT_FLAG,
+  BD_PRIORITY_FLAG,
   BD_READ_SUBCOMMANDS,
+  BD_REMOVE_LABEL_FLAG,
+  BD_SET_LABELS_FLAG,
+  BD_STATUS_FLAG,
+  bdArgvHasFlag,
   bdCommandReadsStdin,
   buildBeadShowArgv,
   isBdReadArgv,
@@ -142,6 +152,7 @@ export {
   fleetOrderingGateMarkerOf,
   isFleetOrderingGateRecord,
   lookupOpenHumanGate,
+  openHumanGateFromRecord,
   parseCreatedGateId,
   parseFleetOrderingGateMarkerLine,
   parseOpenFleetOrderingGates,
@@ -419,6 +430,7 @@ export type {
   FleetPublishStackComposition,
   ReadFleetPublishConfigOptions,
   ReadFleetPublishConfigResult,
+  RepoConfigRead,
 } from "./fleet-publish.js";
 export {
   DEFAULT_FLEET_PUBLISH,
@@ -429,6 +441,7 @@ export {
   formatFleetPublish,
   parseFleetPublish,
   readFleetPublishConfig,
+  readRepoConfigObject,
   resolveFleetPublish,
 } from "./fleet-publish.js";
 export type {
@@ -711,6 +724,73 @@ export {
   FLEET_SUPERVISOR_NAME_PREFIX,
   supervisorRunStatus,
 } from "./fleet-supervisor-name.js";
+export type { BdWriteRefusalReason, BdWriteVerdict } from "./github-append-policy.js";
+export { classifyBdWrite, classifyBdWriteForAuthority } from "./github-append-policy.js";
+export type {
+  GithubAuthority,
+  GithubAuthorityConfig,
+  GithubAuthorityParse,
+  GithubDrift,
+  GithubDriftBead,
+  GithubDriftInput,
+  GithubDriftKind,
+  GithubDriftStatus,
+  GithubIssueObservation,
+  GithubOpenGate,
+  GithubRepoRef,
+  ReadGithubAuthorityResult,
+  SessionGithubAuthorityResult,
+} from "./github-authority.js";
+export {
+  classifyGithubDrift,
+  GITHUB_AUTHORITIES,
+  GITHUB_DRIFT_KINDS,
+  githubDriftStatus,
+  githubDriftWarning,
+  parseGithubAuthority,
+  readGithubAuthorityConfig,
+  resolveGithubAuthorityForSession,
+} from "./github-authority.js";
+export type {
+  GithubIssueIdentity,
+  GithubIssueMap,
+  GithubIssueMapFsSeam,
+  GithubMapRepo,
+  GithubUnmappedDependency,
+  ReadGithubIssueMapResult,
+  WriteGithubIssueMapResult,
+} from "./github-issue-map.js";
+export {
+  emptyGithubIssueMap,
+  GITHUB_ISSUE_MAP_VERSION,
+  githubIssueMapPath,
+  lookupGithubIssue,
+  parseGithubIssueMap,
+  readGithubIssueMap,
+  recordUnmappedDependency,
+  removeGithubIssue,
+  serializeGithubIssueMap,
+  upsertGithubIssue,
+  writeGithubIssueMap,
+} from "./github-issue-map.js";
+export type {
+  ComputeGithubReadyInput,
+  GithubBlockedByEdge,
+  GithubGate,
+  GithubGateClassification,
+  GithubGateEvidence,
+  GithubGateVerdict,
+  GithubPrEvidence,
+  GithubReadyResult,
+  GithubRunEvidence,
+} from "./github-ready.js";
+export {
+  classifyGates,
+  classifyOpenGate,
+  computeReady,
+  parseGithubGate,
+  parseGithubGates,
+} from "./github-ready.js";
 // Handoff packets carried into a spawned orchestrator
 export type {
   BuildHandoffInput,

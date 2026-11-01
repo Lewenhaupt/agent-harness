@@ -396,6 +396,54 @@ function parseGitBoolean(value: string): boolean | undefined {
   return undefined;
 }
 
+/** The parsed repo config object and the warnings the shared read produced. */
+export interface RepoConfigRead {
+  config?: Record<string, unknown>;
+  warnings: readonly string[];
+}
+
+/**
+ * Read `<repoRoot>/.belayd/config.json` as a JSON object, never throwing.
+ *
+ * This is the one reader of the repo config file, shared by the publish contract
+ * (bd-174.1) and the authority contract (bd-180) so the two cannot disagree about
+ * what the file says or how a broken file is reported. An absent file is the
+ * normal "no repo config" case; unreadable, invalid, or non-object content is a
+ * warning and no config, exactly as the publish reader has always behaved.
+ */
+export function readRepoConfigObject(options: {
+  repoRoot: string;
+  fs?: FleetPublishFsSeam;
+}): RepoConfigRead {
+  const fs = options.fs ?? defaultFs;
+  const warnings: string[] = [];
+  const configPath = join(options.repoRoot, ".belayd", "config.json");
+
+  let rawConfig: string | undefined;
+  try {
+    rawConfig = fs.readFileSync(configPath);
+  } catch (error) {
+    // Absent file is the normal "no repo config" case; anything else is a warning.
+    if (!isErrnoException(error) || error.code !== "ENOENT") {
+      warnings.push(`${configPath}: could not read (${errorMessage(error)})`);
+    }
+    return { warnings };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawConfig);
+  } catch (error) {
+    warnings.push(`${configPath}: invalid JSON (${errorMessage(error)})`);
+    return { warnings };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    warnings.push(`${configPath}: expected a JSON object`);
+    return { warnings };
+  }
+  return { config: parsed as Record<string, unknown>, warnings };
+}
+
 /**
  * Read the publish contract from repo config, never throwing.
  *
@@ -410,32 +458,14 @@ export function readFleetPublishConfig(
   options: ReadFleetPublishConfigOptions,
 ): ReadFleetPublishConfigResult {
   const exec = options.exec ?? defaultGitExec;
-  const fs = options.fs ?? defaultFs;
   const warnings: string[] = [];
   const configPath = join(options.repoRoot, ".belayd", "config.json");
-
-  let configFile: FleetPublishRequest | undefined;
-  let rawConfig: string | undefined;
-  try {
-    rawConfig = fs.readFileSync(configPath);
-  } catch (error) {
-    // Absent file is the normal "no repo config" case; anything else is a warning.
-    if (!isErrnoException(error) || error.code !== "ENOENT") {
-      warnings.push(`${configPath}: could not read (${errorMessage(error)})`);
-    }
-  }
-  if (rawConfig !== undefined) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawConfig);
-    } catch (error) {
-      warnings.push(`${configPath}: invalid JSON (${errorMessage(error)})`);
-      parsed = undefined;
-    }
-    if (parsed !== undefined) {
-      configFile = readRepoConfigPublish(configPath, parsed, warnings);
-    }
-  }
+  const repoConfig = readRepoConfigObject({ repoRoot: options.repoRoot, fs: options.fs });
+  warnings.push(...repoConfig.warnings);
+  const configFile =
+    repoConfig.config === undefined
+      ? undefined
+      : readRepoConfigPublish(configPath, repoConfig.config, warnings);
 
   const gitConfig = readGitConfigPublish(options.repoRoot, exec, warnings);
   return {

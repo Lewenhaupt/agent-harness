@@ -48,6 +48,7 @@ import {
   readWorktreeBranch,
   resolveBashTimeout,
   resolveGitCommonDir,
+  resolveGithubAuthorityForSession,
   resolveOutlineTargets,
   resolveWorktreePath,
   scanProcesses,
@@ -69,6 +70,7 @@ import { createFleet, type FleetApi, type FleetForceStopSeams } from "./capabili
 import { registerHooks } from "./capabilities/hooks.js";
 import {
   type HumanGateDeps,
+  isSubAgentSession,
   openReviewHumanGate,
   registerHumanGate,
 } from "./capabilities/human-gate.js";
@@ -85,6 +87,7 @@ import {
   createInitialSessionState,
   createSessionStateStore,
   resolveSessionBdActor,
+  warnOncePerSession,
 } from "./capabilities/session-state.js";
 import { registerTaskStartTools, registerTaskStopTools } from "./capabilities/task-control.js";
 import { registerWorkflowCommands } from "./capabilities/workflow-commands.js";
@@ -316,6 +319,35 @@ export default function belaydAgentHarness(
 
   registerBdTool(pi, {
     attributeBdArgv: (argv, ctx) => attributedBdArgv(argv, ctx, getSessionState),
+    // bd-180: a GitHub-primary repo is append-only from a phase sub-agent. The
+    // composer owns the git/repo-root resolution (a capability may not reach
+    // fleet modules), so the capability gets the resolved authority as a seam.
+    resolveAuthority: (ctx) => {
+      const cwd = (ctx as { cwd?: string })?.cwd;
+      if (cwd === undefined) {
+        return { ok: false, error: "authority unresolved: the session has no working directory" };
+      }
+      const result = resolveGithubAuthorityForSession({ cwd, resolveGitCommonDir });
+      const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+      const state =
+        typeof manager?.getSessionId === "function"
+          ? getSessionState(ctx as { sessionManager: { getSessionId: () => string } })
+          : undefined;
+      for (const warning of result.ok ? result.warnings : []) {
+        const message = `[belayd-harness] ${warning}`;
+        if (state === undefined) console.warn(message);
+        else warnOncePerSession(state, warning, message);
+      }
+      if (!result.ok) return { ok: false, error: result.error };
+      return { ok: true, authority: result.authority };
+    },
+    isPhaseSession: (ctx) => {
+      const manager = (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })
+        .sessionManager;
+      const name =
+        typeof manager?.getSessionName === "function" ? manager.getSessionName() : undefined;
+      return isSubAgentSession(name);
+    },
   });
 
   registerArchify(pi);

@@ -394,7 +394,12 @@ export function isFleetOrderingGateRecord(record: Record<string, unknown>): bool
   return fleetOrderingGateMarkerOf(record) !== undefined;
 }
 
-function openHumanGateFromRecord(
+/**
+ * The open human gate in one gate record, or undefined when it is not a human
+ * wait. Exported for the GitHub-primary readiness classifier (bd-180), so the
+ * gate-kind parser cannot drift from the answer channel's.
+ */
+export function openHumanGateFromRecord(
   record: Record<string, unknown>,
   beadId: string,
 ): OpenHumanGate | undefined {

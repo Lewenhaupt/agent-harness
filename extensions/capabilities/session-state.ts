@@ -88,6 +88,22 @@ export function createInitialSessionState(): CoreSessionState {
 export type AskHoldContext = { sessionManager: { getBranch?: () => readonly unknown[] } };
 
 /**
+ * Emit one warning per session for a stable key.
+ *
+ * The per-call resolution stays untouched; only the log line is deduped, so an
+ * operator typo in a repo config does not spam every phase `bd` invocation. The
+ * set lives on the session state (the one allowed per-session home), so it dies
+ * with the session instead of growing a process-global cache.
+ */
+export function warnOncePerSession(state: CoreSessionState, key: string, message: string): void {
+  const seen = state.authorityWarningsSeen ?? new Set<string>();
+  state.authorityWarningsSeen = seen;
+  if (seen.has(key)) return;
+  seen.add(key);
+  console.warn(message);
+}
+
+/**
  * Read the active branch defensively.
  *
  * `getBranch` is the only accurate view of "what the human sees last", which is

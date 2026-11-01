@@ -7,7 +7,8 @@
  * without a shell.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -110,6 +111,11 @@ describe("bd tool proxy", () => {
 
   beforeEach(async () => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-bd-tool-"));
+    // bd-180: a phase session now resolves authority from the repo root, so the
+    // fixture is a real repo with an explicit local authority.
+    execFileSync("git", ["init", "-q"], { cwd });
+    mkdirSync(join(cwd, ".belayd"), { recursive: true });
+    writeFileSync(join(cwd, ".belayd", "config.json"), JSON.stringify({ authority: "bd" }));
     execFileMock.clear();
     tool = await loadBdTool();
   });
@@ -227,6 +233,225 @@ describe("bd tool proxy", () => {
       "bd-150",
       "ok",
     ]);
+  });
+
+  it("refuses a phase write when the session repo root cannot be resolved", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "belayd-bd-tool-outside-"));
+    try {
+      const result = await tool.execute(
+        "c8b",
+        { command: "note bd-150 ok" },
+        undefined,
+        undefined,
+        sessionCtx("belayd-bd-150-sub-review-abc123", outside),
+      );
+      expect(result.details.exitCode).toBe(1);
+      expect(result.content[0]?.text).toContain("authority unresolved");
+      expect(execFileMock.calls).toHaveLength(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the GitHub-primary policy to a phase session, not the orchestrator", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const phase = await tool.execute(
+      "c8c",
+      { command: "update bd-150 -s closed" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(phase.details.exitCode).toBe(1);
+    expect(phase.content[0]?.text).toContain("GitHub owns status");
+    expect(execFileMock.calls).toHaveLength(0);
+
+    // The same lifecycle command keeps bd's own local-mode refusal for the
+    // orchestrator, which is not subject to the append-only policy.
+    const orchestrator = await tool.execute(
+      "c8d",
+      { command: "close bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150", cwd),
+    );
+    expect(orchestrator.details.exitCode).toBe(1);
+    expect(orchestrator.content[0]?.text).toContain('bd subcommand "close" is not allowed');
+  });
+
+  it("names GitHub as the closure owner for a phase session", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const result = await tool.execute(
+      "c8e",
+      { command: "close bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("GitHub owns closure");
+    expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("keeps a bd-authority phase session's writes and never forks gh", async () => {
+    const result = await tool.execute(
+      "c8h",
+      { command: "dep add bd-2 bd-1" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(result.details.exitCode).toBe(0);
+    expect(execFileMock.calls).toHaveLength(1);
+    expect(execFileMock.calls[0]?.file).toBe("bd");
+    expect(execFileMock.calls[0]?.args).toContain("dep");
+    // Local mode never reaches a GitHub seam, so no other binary may be spawned.
+    expect(execFileMock.calls.every((call) => call.file === "bd")).toBe(true);
+  });
+
+  it("keeps reads and appended comments open in a github-primary phase session", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const phase = sessionCtx("belayd-bd-150-sub-review-abc123", cwd);
+    const read = await tool.execute(
+      "c8i",
+      { command: "show bd-150 --json" },
+      undefined,
+      undefined,
+      phase,
+    );
+    expect(read.details.exitCode).toBe(0);
+    const comment = await tool.execute(
+      "c8j",
+      { command: "comment bd-150 shipped" },
+      undefined,
+      undefined,
+      phase,
+    );
+    expect(comment.details.exitCode).toBe(0);
+    expect(execFileMock.calls).toHaveLength(2);
+    expect(execFileMock.calls.every((call) => call.file === "bd")).toBe(true);
+  });
+
+  it("exempts the orchestrator from the policy in a github-primary repo", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const result = await tool.execute(
+      "c8k",
+      { command: "dep add bd-2 bd-1" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150", cwd),
+    );
+    expect(result.details.exitCode).toBe(0);
+    expect(execFileMock.calls[0]?.args).toContain("dep");
+  });
+
+  it("resolves the authority from the repo root, not a subdirectory cwd", async () => {
+    const nested = join(cwd, "src", "nested");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const result = await tool.execute(
+      "c8l",
+      { command: "close bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", nested),
+    );
+    expect(result.details.exitCode).toBe(1);
+    // Reading the config under the raw cwd would miss it and fall back to bd.
+    expect(result.content[0]?.text).toContain("GitHub owns closure");
+    expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("refuses a phase write when the authority config is ambiguous", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "bd", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const result = await tool.execute(
+      "c8m",
+      { command: "note bd-150 ok" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("bd write refused");
+    expect(result.content[0]?.text).toContain("ambiguous authority");
+    expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("refuses a phase write when the session has no working directory", async () => {
+    const result = await tool.execute("c8n", { command: "note bd-150 ok" }, undefined, undefined, {
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getSessionName: () => "belayd-bd-150-sub-review-abc123",
+      },
+    });
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("no working directory");
+    expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("keeps bd's own hierarchy refusal for create --parent in a phase session", async () => {
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: "acme", repo: "widgets" } }),
+    );
+    const result = await tool.execute(
+      "c8o",
+      { command: "create --title=child --parent bd-150" },
+      undefined,
+      undefined,
+      sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+    );
+    expect(result.details.exitCode).toBe(1);
+    expect(result.content[0]?.text).toContain("--parent");
+    expect(execFileMock.calls).toHaveLength(0);
+  });
+
+  it("warns once per session for the same broken authority config", async () => {
+    writeFileSync(join(cwd, ".belayd", "config.json"), "{ not json");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const first = await tool.execute(
+        "c8f",
+        { command: "note bd-150 first" },
+        undefined,
+        undefined,
+        sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+      );
+      const second = await tool.execute(
+        "c8g",
+        { command: "note bd-150 second" },
+        undefined,
+        undefined,
+        sessionCtx("belayd-bd-150-sub-review-abc123", cwd),
+      );
+      expect(first.details.exitCode).toBe(0);
+      expect(second.details.exitCode).toBe(0);
+      expect(execFileMock.calls).toHaveLength(2);
+      const configWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes(".belayd/config.json"),
+      );
+      expect(configWarnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("lets an explicit caller --actor win over the injected default", async () => {
