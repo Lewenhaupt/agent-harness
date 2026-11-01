@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 
 import { FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "../fleet-capacity.js";
 import { countActiveFleetOrchestrators } from "../fleet-launch.js";
+import { DEFAULT_FLEET_PUBLISH } from "../fleet-publish.js";
 import { FLEET_RUN_STALE_TICK_MS, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { classifyMemberLease, classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
 import {
@@ -23,7 +24,9 @@ import {
   buildFleetStatus,
   DEFAULT_FLEET_ID,
   deriveFleetMemberState,
+  FLEET_INTENT_MEMBERS_MAX,
   FLEET_MEMBER_STATES,
+  FLEET_SCHEMA_VERSION,
   type FleetBeadEngagement,
   type FleetCapacityInput,
   type FleetIntent,
@@ -36,6 +39,7 @@ import {
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
+  fleetIntentWriteRefusal,
   fleetMergeQueueFilePath,
   fleetStateDir,
   formatBeadOwnership,
@@ -187,11 +191,13 @@ function sampleMember(overrides: Partial<FleetMemberSnapshot> = {}): FleetMember
 
 function sampleIntent(overrides: Partial<FleetIntent> = {}): FleetIntent {
   return {
-    schemaVersion: 1,
+    schemaVersion: FLEET_SCHEMA_VERSION,
     fleetId: "fleet-1",
     taskIds: ["bd-12", "bd-15"],
     createdAt: 1_000,
     updatedAt: 2_000,
+    baseBranch: "main",
+    publish: { mode: "local" },
     ...overrides,
   };
 }
@@ -301,9 +307,100 @@ describe("parseFleetIntent", () => {
     expect(parseFleetIntent(sampleIntent())).toHaveProperty("taskIds", ["bd-12", "bd-15"]);
   });
 
+  it("accepts a planted publish contract and refuses malformed ones (bd-174.1)", () => {
+    const withPublish = (publish: unknown) => ({ ...sampleIntent(), publish });
+    // The publish contract is validated by zod; `fleetIntentWriteRefusal` shares
+    // the reader's schema, so an accepted write is exactly a parsable record.
+    expect(
+      fleetIntentWriteRefusal(
+        withPublish({
+          mode: "pr",
+          remote: "origin",
+          base: "main",
+          ready: true,
+          stacks: "per-chain",
+        }),
+      ),
+    ).toBe(undefined);
+    expect(fleetIntentWriteRefusal(withPublish({ mode: "pr" }))).toContain("publish");
+    expect(fleetIntentWriteRefusal(withPublish({ mode: "local", remote: "origin" }))).toBe(
+      undefined,
+    );
+
+    // The reader validates the same union, so a planted `pr` record parses and a
+    // malformed one reads as corrupt instead of being half-accepted.
+    expect(
+      parseFleetIntent(withPublish({ mode: "pr", remote: "origin", base: "main" })),
+    ).toHaveProperty("publish", { mode: "pr", remote: "origin", base: "main" });
+    expect(parseFleetIntent(withPublish({ mode: "pr" }))).toBe(undefined);
+    expect(parseFleetIntent(withPublish({ mode: "deploy" }))).toBe(undefined);
+  });
+
+  it("requires baseBranch on a v2 record", () => {
+    const withoutBase = { ...sampleIntent(), baseBranch: undefined };
+    expect(fleetIntentWriteRefusal(withoutBase)).toContain("baseBranch");
+    expect(parseFleetIntent(withoutBase)).toBe(undefined);
+  });
+
+  it("migrates a v1 record, filling the frozen defaults", () => {
+    const legacy = {
+      schemaVersion: 1,
+      fleetId: "fleet-1",
+      taskIds: ["bd-12"],
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+    expect(parseFleetIntent(legacy)).toEqual({
+      ...legacy,
+      schemaVersion: FLEET_SCHEMA_VERSION,
+      baseBranch: "main",
+      publish: { mode: "local" },
+    });
+    expect(parseFleetIntent({ ...legacy, baseBranch: "develop" })).toHaveProperty(
+      "baseBranch",
+      "develop",
+    );
+  });
+
+  it("mints a fresh publish object so a record cannot corrupt the default", () => {
+    const migrated = parseFleetIntent({
+      schemaVersion: 1,
+      fleetId: "fleet-1",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    expect(migrated).toBeDefined();
+    if (migrated === undefined) return;
+    expect(migrated.publish).toEqual(DEFAULT_FLEET_PUBLISH);
+    expect(migrated.publish).not.toBe(DEFAULT_FLEET_PUBLISH);
+    (migrated.publish as { mode: string }).mode = "push";
+    expect(DEFAULT_FLEET_PUBLISH).toEqual({ mode: "local" });
+  });
+
+  it("keeps v1 validation strict during migration", () => {
+    const legacy = {
+      schemaVersion: 1,
+      fleetId: "fleet-1",
+      taskIds: "bd-12",
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    };
+    expect(parseFleetIntent(legacy)).toBe(undefined);
+
+    // A v1 bound is still a bound: migration fills defaults for absent fields, it
+    // never upgrades an over-bound record into a valid v2 one.
+    expect(
+      parseFleetIntent({
+        ...legacy,
+        taskIds: Array.from({ length: FLEET_INTENT_MEMBERS_MAX + 1 }, (_, index) => `bd-${index}`),
+      }),
+    ).toBe(undefined);
+  });
+
   it("returns undefined for corrupt, wrong-version, or invalid intent", () => {
     expect(parseFleetIntent("not json")).toBe(undefined);
-    expect(parseFleetIntent({ ...sampleIntent(), schemaVersion: 2 })).toBe(undefined);
+    expect(parseFleetIntent({ ...sampleIntent(), schemaVersion: 99 })).toBe(undefined);
     expect(parseFleetIntent({ ...sampleIntent(), taskIds: "bd-12" })).toBe(undefined);
   });
 

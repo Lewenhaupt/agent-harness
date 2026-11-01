@@ -11,6 +11,7 @@ import { pauseFleet, resumeFleet } from "../fleet-pause.js";
 import type { FleetStateFs } from "../fleet-state.js";
 import { fleetAuditLogPath, fleetIntentFilePath } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
 
 const commonDir = "/repo/.git";
@@ -229,10 +230,14 @@ describe("resumeFleet", () => {
   });
 
   it("leaves every other intent field untouched", () => {
+    // A v2 record on purpose: the frozen landing contract is present, so the
+    // resume must carry it rather than re-derive (or drop) it.
     const fs = seed({
+      schemaVersion: FLEET_SCHEMA_VERSION,
       paused: true,
       maxConcurrent: 2,
       baseBranch: "trunk",
+      publish: { mode: "pr", remote: "origin", base: "trunk" },
       supervisor: { sessionId: "supervisor-session", pid: 4242, armToken: "token" },
       deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no slot" }],
     });
@@ -248,6 +253,7 @@ describe("resumeFleet", () => {
     expect(intent.taskIds).toEqual(["bd-12", "bd-15"]);
     expect(intent.maxConcurrent).toBe(2);
     expect(intent.baseBranch).toBe("trunk");
+    expect(intent.publish).toEqual({ mode: "pr", remote: "origin", base: "trunk" });
     expect(intent.createdAt).toBe(1);
     expect(intent.deferred).toEqual([{ taskId: "bd-19", reason: "capacity", detail: "no slot" }]);
   });

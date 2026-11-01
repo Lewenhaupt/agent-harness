@@ -37,6 +37,17 @@ import type {
   ResolveFleetOrderingGatesResult,
 } from "./fleet-ordering-gates.js";
 import { orderingGateBudgetRefusal } from "./fleet-ordering-gates.js";
+import type {
+  FleetPublish,
+  FleetPublishMode,
+  FleetPublishRequest,
+  FleetPublishStackComposition,
+} from "./fleet-publish.js";
+import {
+  FLEET_PUBLISH_MODES,
+  FLEET_PUBLISH_STACK_COMPOSITIONS,
+  formatFleetPublish,
+} from "./fleet-publish.js";
 import type { FleetDependencyGraph, FleetSchedule, FleetScheduleResult } from "./fleet-schedule.js";
 import { planFleetSchedule } from "./fleet-schedule.js";
 import type { FleetMemberLiveness } from "./fleet-sessions.js";
@@ -479,6 +490,8 @@ export interface MergeFleetIntentInput {
   now: number;
   maxConcurrent: number;
   baseBranch?: string;
+  /** Publish contract this launch resolved; preserved from `current` on a re-arm. */
+  publish?: FleetPublish;
   supervisor: NonNullable<FleetIntent["supervisor"]>;
   /**
    * Members P3 deferred this launch, with the reason each waits.
@@ -524,6 +537,7 @@ export function mergeFleetIntent(input: MergeFleetIntentInput): FleetIntent {
     now: input.now,
     maxConcurrent: input.maxConcurrent,
     ...(input.baseBranch === undefined ? {} : { baseBranch: input.baseBranch }),
+    ...(input.publish === undefined ? {} : { publish: input.publish }),
     supervisor: input.supervisor,
   });
   const current = input.current;
@@ -569,6 +583,12 @@ function inheritFleetFacts(
   return {
     ...merged,
     createdAt: current.createdAt,
+    // The landing contract is frozen at the first launch: a later launch, advance,
+    // or re-arm must never overwrite the recorded base branch or publish mode,
+    // even if the flag or the repo config changed. A mid-run config edit must not
+    // change where the fleet's work lands.
+    baseBranch: current.baseBranch,
+    publish: current.publish,
     ...(current.paused === undefined ? {} : { paused: current.paused }),
     ...(current.park === undefined ? {} : { park: current.park }),
     ...(current.note === undefined ? {} : { note: current.note }),
@@ -657,6 +677,8 @@ export interface FleetCommandArgs {
    * with no remaining purpose, so removal is hygiene, not acceptance.
    */
   accept?: boolean;
+  /** Partial publish contract assembled from the publish flags (bd-174.1). */
+  publish?: FleetPublishRequest;
 }
 
 export type FleetCommandParse = { ok: true; args: FleetCommandArgs } | { ok: false; error: string };
@@ -665,6 +687,8 @@ export type FleetCommandParse = { ok: true; args: FleetCommandArgs } | { ok: fal
 export function fleetUsageText(): string {
   return [
     "Usage: /fleet bd-12 bd-15 [bd-19] [--fleet <id>] [--concurrency <n>] [--manual] [--accept]",
+    "             [--publish <local|pr|push>] [--publish-remote <name>] [--publish-base <branch>]",
+    "             [--publish-ready|--no-publish-ready] [--publish-stacks <per-chain>]",
     "  task ids: beads to run as members, each in its own worktree (1 or more)",
     `  --fleet <id>: fleet directory name (default: ${DEFAULT_FLEET_ID})`,
     `  --concurrency <n>: concurrent orchestrators, capped at ${FLEET_MAX_CONCURRENT_ORCHESTRATORS}`,
@@ -672,6 +696,10 @@ export function fleetUsageText(): string {
     "  --accept: also close each landed bead (its merged worktree is removed on landing",
     "            either way); default: land only, leaving every bead in_progress + human",
     "            for you to accept",
+    "  --publish: how merged work is published (default local: no remote, no network); the",
+    "             resolved contract is frozen into fleet.json at launch",
+    "  --publish-remote/--publish-base/--publish-ready/--publish-stacks: complete a pr/push",
+    "             contract; they apply to whatever mode the config resolves to",
   ].join("\n");
 }
 
@@ -681,6 +709,12 @@ const FLEET_FLAG_NAMES: readonly string[] = [
   "--manual",
   "--accept",
   "--no-accept",
+  "--publish",
+  "--publish-remote",
+  "--publish-base",
+  "--publish-ready",
+  "--no-publish-ready",
+  "--publish-stacks",
 ];
 
 /**
@@ -690,24 +724,71 @@ const FLEET_FLAG_NAMES: readonly string[] = [
  * concurrency contain no spaces); anything that looks like a flag is validated
  * rather than treated as an id, so a typo cannot silently become a task id.
  */
+/** Value-less flags, which must never read the next token as their value. */
+function parseFleetBooleanFlag(token: string): FleetFlagParse | undefined {
+  // `--accept` is opt-in (bd-158); `--no-accept` stays valid as an explicit
+  // restatement of the default, so an older muscle memory is not a parse error.
+  // `--publish-ready` pairs with `--no-publish-ready`, mirroring accept.
+  switch (token) {
+    case "--manual":
+      return { ok: true, consumed: 1, untilComplete: false };
+    case "--accept":
+      return { ok: true, consumed: 1, accept: true };
+    case "--no-accept":
+      return { ok: true, consumed: 1, accept: false };
+    case "--publish-ready":
+      return { ok: true, consumed: 1, publish: { ready: true } };
+    case "--no-publish-ready":
+      return { ok: true, consumed: 1, publish: { ready: false } };
+    default:
+      return undefined;
+  }
+}
+
+/** Flags that consume one value; undefined lets the integer fallback decide. */
+function parseFleetValueFlag(token: string, value: string): FleetFlagParse | undefined {
+  switch (token) {
+    case "--fleet":
+      return { ok: true, consumed: 2, fleetId: value };
+    case "--publish":
+      if (!(FLEET_PUBLISH_MODES as readonly string[]).includes(value)) {
+        return {
+          ok: false,
+          error: `--publish must be one of ${FLEET_PUBLISH_MODES.join(", ")}, got "${value}".\n${fleetUsageText()}`,
+        };
+      }
+      return { ok: true, consumed: 2, publish: { mode: value as FleetPublishMode } };
+    case "--publish-remote":
+      return { ok: true, consumed: 2, publish: { remote: value } };
+    case "--publish-base":
+      return { ok: true, consumed: 2, publish: { base: value } };
+    case "--publish-stacks":
+      if (!(FLEET_PUBLISH_STACK_COMPOSITIONS as readonly string[]).includes(value)) {
+        return {
+          ok: false,
+          error: `--publish-stacks must be one of ${FLEET_PUBLISH_STACK_COMPOSITIONS.join(", ")}, got "${value}".\n${fleetUsageText()}`,
+        };
+      }
+      return { ok: true, consumed: 2, publish: { stacks: value as FleetPublishStackComposition } };
+    default:
+      return undefined;
+  }
+}
+
 function parseFleetFlagToken(tokens: readonly string[], index: number): FleetFlagParse {
   const token = tokens[index] ?? "";
   if (!FLEET_FLAG_NAMES.includes(token)) {
     return { ok: false, error: `Unknown flag ${token}.\n${fleetUsageText()}` };
   }
-  // Boolean flags take no value: `--manual --fleet night` must not read "--fleet"
-  // as the manual value.
-  if (token === "--manual") return { ok: true, consumed: 1, untilComplete: false };
-  // `--accept` is opt-in (bd-158); `--no-accept` stays valid as an explicit
-  // restatement of the default, so an older muscle memory is not a parse error.
-  if (token === "--accept") return { ok: true, consumed: 1, accept: true };
-  if (token === "--no-accept") return { ok: true, consumed: 1, accept: false };
+  const booleanFlag = parseFleetBooleanFlag(token);
+  if (booleanFlag !== undefined) return booleanFlag;
 
   const value = tokens[index + 1];
   if (value === undefined || value.startsWith("--")) {
     return { ok: false, error: `${token} needs a value.\n${fleetUsageText()}` };
   }
-  if (token === "--fleet") return { ok: true, consumed: 2, fleetId: value };
+  const valueFlag = parseFleetValueFlag(token, value);
+  if (valueFlag !== undefined) return valueFlag;
 
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
@@ -724,6 +805,7 @@ type FleetFlagParse =
       concurrency?: number;
       untilComplete?: boolean;
       accept?: boolean;
+      publish?: FleetPublishRequest;
     }
   | { ok: false; error: string };
 
@@ -768,6 +850,8 @@ interface FleetCollectedArgs {
   concurrency?: number;
   untilComplete?: boolean;
   accept?: boolean;
+  /** Partial publish contract assembled from the publish flags. */
+  publish?: FleetPublishRequest;
 }
 
 /** Fold one parsed flag into the accumulator (only the flags it carries). */
@@ -779,6 +863,10 @@ function applyFleetFlag(
   if (flag.concurrency !== undefined) collected.concurrency = flag.concurrency;
   if (flag.untilComplete !== undefined) collected.untilComplete = flag.untilComplete;
   if (flag.accept !== undefined) collected.accept = flag.accept;
+  if (flag.publish !== undefined) {
+    // Merge, never replace: `--publish pr --publish-base develop` is one request.
+    collected.publish = { ...collected.publish, ...flag.publish };
+  }
 }
 
 // ── Tool parameter narrowing ──────────────────────────────────────────
@@ -1120,6 +1208,8 @@ export interface RunFleetLaunchOptions {
    */
   origin?: "launch" | "advance";
   baseBranch?: string;
+  /** Publish contract resolved by the caller; frozen into the intent by the merge. */
+  publish?: FleetPublish;
   /** bd-119 ownership verdict for an existing member worktree, or undefined. */
   probeOwnership: (taskId: string) => string | undefined;
   /** The existing single-bead launch path, injected so this engine stays testable. */
@@ -1619,6 +1709,7 @@ function writeLaunchIntent(
         now: options.now,
         maxConcurrent: plan.maxConcurrent,
         ...(options.baseBranch === undefined ? {} : { baseBranch: options.baseBranch }),
+        ...(options.publish === undefined ? {} : { publish: options.publish }),
         supervisor: plan.supervisor,
         // A launch restates the deferred plan it computed, including a plan whose
         // wave 0 is empty (all slots busy): a member-less launch that dropped
@@ -1764,12 +1855,17 @@ async function pruneFailedMembers(
     ...(options.fs === undefined ? {} : { fs: options.fs }),
     update: (current) => {
       if (current === undefined) {
+        // The record vanished mid-launch: re-create it with the contract this
+        // launch already resolved, exactly as `writeLaunchIntent` would, so the
+        // prune cannot silently freeze the defaults instead.
         return mergeFleetIntent({
           current: undefined,
           fleetId: plan.fleetId,
           taskIds: [],
           now: options.now,
           maxConcurrent: plan.maxConcurrent,
+          ...(options.baseBranch === undefined ? {} : { baseBranch: options.baseBranch }),
+          ...(options.publish === undefined ? {} : { publish: options.publish }),
           supervisor: plan.supervisor,
         });
       }
@@ -2021,6 +2117,8 @@ function auditLaunchRequest(
   if (plan.taskIds.length === 0) return undefined;
   const clamped = plan.clampedFrom === undefined ? "" : ` (clamped from ${plan.clampedFrom})`;
   const base = options.baseBranch === undefined ? "" : ` base ${options.baseBranch}`;
+  const publish =
+    options.publish === undefined ? "" : ` publish ${formatFleetPublish(options.publish)}`;
   const advance = options.origin === "advance";
   return audit({
     gitCommonDir: options.gitCommonDir,
@@ -2031,7 +2129,7 @@ function auditLaunchRequest(
     taskIds: plan.taskIds,
     detail:
       (advance ? "advanced from the persisted deferred worklist; " : "") +
-      `maxConcurrent ${plan.maxConcurrent}${clamped}${base}`,
+      `maxConcurrent ${plan.maxConcurrent}${clamped}${base}${publish}`,
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
 }

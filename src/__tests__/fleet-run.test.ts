@@ -49,6 +49,7 @@ import {
   worktreeCreatedAtFromStat,
 } from "../fleet-run.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
 import { REVIEW_HUMAN_GATE_REASON } from "../review-findings.js";
 import type { RunManifest } from "../run-manifest.js";
 import { RunStatus } from "../run-manifest.js";
@@ -518,11 +519,13 @@ describe("worktreeCreatedAtFromStat (bd-166)", () => {
 
 function intent(overrides: Partial<FleetIntent> = {}): FleetIntent {
   return {
-    schemaVersion: 1,
+    schemaVersion: FLEET_SCHEMA_VERSION,
     fleetId: "default",
     taskIds: ["bd-12", "bd-15"],
     createdAt: 1_000,
     updatedAt: 1_000,
+    baseBranch: "main",
+    publish: { mode: "local" },
     ...overrides,
   };
 }

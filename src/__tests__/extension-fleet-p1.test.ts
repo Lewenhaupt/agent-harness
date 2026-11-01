@@ -2519,6 +2519,243 @@ describe("launch tool validation", () => {
   });
 });
 
+/**
+ * Publish contract at the launch surface (bd-174.1).
+ *
+ * Every case drives the real `/fleet` command or the real `belayd_fleet_launch`
+ * tool against a temp fleet directory, so the resolver, the repo-config reader and
+ * the intent write are the real implementations and only spawning is stubbed.
+ * That is what makes a refusal observable as files that never appeared: no
+ * `fleet.json`, no `audit.log`, no member worktree, no session.
+ */
+describe("fleet publish config (bd-174.1)", () => {
+  let cwd: string;
+  let commonDir: string;
+  const fleetId = "default";
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-publish-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.byBranch = undefined;
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    liveness.memberTaskIds = [];
+    ctxNotifications = [];
+  });
+
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+    git.failWith = undefined;
+    liveness.memberTaskIds = [];
+  });
+
+  function intentNow() {
+    const read = readFleetIntent({ gitCommonDir: commonDir, fleetId });
+    if (!read.ok) throw new Error(`intent unreadable: ${read.error}`);
+    return read.intent;
+  }
+
+  function auditActions(): string[] {
+    const auditPath = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
+    if (!existsSync(auditPath)) return [];
+    return readFileSync(auditPath, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => (JSON.parse(line) as { action: string }).action);
+  }
+
+  function notificationText(): string {
+    return ctxNotifications.map((entry) => entry.message).join("\n");
+  }
+
+  function writeRepoConfig(publish: unknown, root = cwd): void {
+    mkdirSync(join(root, ".belayd"), { recursive: true });
+    writeFileSync(join(root, ".belayd", "config.json"), JSON.stringify({ publish }));
+  }
+
+  /** Everything a launch would leave behind had it got past publish resolution. */
+  function expectNothingLaunched(): void {
+    expect(intentNow()).toBe(undefined);
+    expect(auditActions()).toEqual([]);
+    expect(daemon.calls).toEqual([]);
+    expect(existsSync(join(worktree.path, "feat-bd-12"))).toBe(false);
+  }
+
+  async function runFleet(args: string, sessionId = "publisher-session") {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, sessionId);
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler(args, ctx);
+    return { mock, ctx };
+  }
+
+  async function blockReason(
+    mock: MockPi,
+    toolName: string,
+    ctx: ReturnType<typeof makeCtx>,
+  ): Promise<unknown> {
+    for (const handler of mock.toolCall) {
+      const outcome = (await handler({ toolName }, ctx)) as { block?: boolean; reason?: string };
+      if (outcome?.block === true) return outcome.reason;
+    }
+    return undefined;
+  }
+
+  it("freezes the inert local contract when nothing configures publishing", async () => {
+    const { mock } = await runFleet("bd-12 --manual");
+
+    const intent = intentNow();
+    // Local is the default and carries no remote field at all: nothing to publish.
+    expect(intent?.publish).toEqual({ mode: "local" });
+    // The stub answers no branch, so the documented repository default is frozen
+    // rather than left absent for a reader to guess at.
+    expect(intent?.baseBranch).toBe("main");
+    // The harness's git stub fails every `git config` call, which is deliberately
+    // reported as a warning (a real failure must not look like "unset"); no publish
+    // *source* warned, so nothing here says the config was unusable.
+    expect(
+      ctxNotifications.filter((entry) =>
+        /config\.json|invalid publish|unknown publish/.test(entry.message),
+      ),
+    ).toEqual([]);
+    // The launch itself is unchanged: same audit trail, one member session.
+    expect(auditActions()).toEqual(["schedule-planned", "launch", "member-launch"]);
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(await blockReason(mock, "belayd_commit", makeCtx(cwd, "publisher-session"))).toContain(
+      "Fleet supervisor sessions do not run phases",
+    );
+  });
+
+  it("reads the mode from .belayd/config.json when no flag names one", async () => {
+    writeRepoConfig({ mode: "pr", remote: "cfg", base: "develop" });
+
+    await runFleet("bd-12 --manual");
+
+    expect(intentNow()?.publish).toEqual({ mode: "pr", remote: "cfg", base: "develop" });
+  });
+
+  it("lets --publish beat the repo config per field", async () => {
+    writeRepoConfig({ mode: "pr", remote: "cfg" });
+
+    await runFleet("bd-12 --manual --publish push --publish-remote flag-remote");
+
+    // The flag supplies the mode and the remote; the config's own mode loses.
+    expect(intentNow()?.publish).toEqual({ mode: "push", remote: "flag-remote" });
+  });
+
+  it("warns and ignores an invalid repo config instead of refusing the launch", async () => {
+    writeRepoConfig({ mode: "sometimes" });
+
+    await runFleet("bd-12 --manual");
+
+    // A broken repo config degrades to a warning and the inert default, never to a
+    // launch refusal: the operator can still start the fleet.
+    expect(notificationText()).toContain("invalid publish");
+    expect(ctxNotifications.some((entry) => entry.level === "warning")).toBe(true);
+    expect(intentNow()?.publish).toEqual({ mode: "local" });
+  });
+
+  it("reads the repo config from the main checkout, not the linked worktree", async () => {
+    const mainCheckout = join(cwd, "main-checkout");
+    const linkedWorktree = join(cwd, "wt-feat-bd-12");
+    mkdirSync(linkedWorktree, { recursive: true });
+    // `.belayd/config.json` is repo-scoped: gitCommonDir is shared by every
+    // worktree, so the main checkout's copy wins and the worktree's is not read.
+    writeRepoConfig({ mode: "pr", remote: "main-remote" }, mainCheckout);
+    writeRepoConfig({ mode: "push", remote: "worktree-remote" }, linkedWorktree);
+    commonDir = join(mainCheckout, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
+    git.commonDir = commonDir;
+
+    const mock = await loadFleetExtension();
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 --manual", makeCtx(linkedWorktree, "publisher-session"));
+
+    expect(intentNow()?.publish).toEqual({
+      mode: "pr",
+      remote: "main-remote",
+      base: "main",
+    });
+  });
+
+  it("never re-reads the contract on a re-arm", async () => {
+    mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
+    writeFileSync(
+      join(commonDir, "belayd", "fleet", fleetId, "fleet.json"),
+      JSON.stringify({
+        schemaVersion: 2,
+        fleetId,
+        taskIds: ["bd-12"],
+        createdAt: 1,
+        updatedAt: 1,
+        baseBranch: "develop",
+        publish: { mode: "pr", remote: "origin", base: "develop" },
+        supervisor: { sessionId: "dead-session", pid: 999_999 },
+      }),
+    );
+    // Both other sources now disagree with the recorded contract, which is exactly
+    // the mid-run edit the freeze exists to survive.
+    writeRepoConfig({ mode: "local" });
+
+    await runFleet("bd-12 --manual --publish push --publish-remote other-remote");
+
+    const intent = intentNow();
+    expect(intent?.publish).toEqual({ mode: "pr", remote: "origin", base: "develop" });
+    expect(intent?.baseBranch).toBe("develop");
+    // The re-arm did happen: the record names this session's supervisor now.
+    expect(intent?.supervisor).toMatchObject({ sessionId: "publisher-session" });
+    expect(auditActions()).toContain("re-arm");
+  });
+
+  it("refuses a config contract its mode cannot carry and touches nothing", async () => {
+    // `base` belongs to `pr` alone: a push fleet has no base branch to target.
+    writeRepoConfig({ mode: "push", base: "develop" });
+    const { mock, ctx } = await runFleet("bd-12 --manual");
+
+    const text = notificationText();
+    expect(text).toContain('publish: "base" only applies to mode "pr"');
+    expect(text).toContain('mode resolved to "push"');
+    // The refusal is the only error reported: it happens before scheduling, so no
+    // member (and no scheduler warning) got that far.
+    const errors = ctxNotifications.filter((entry) => entry.level === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toContain("only applies to mode");
+    expectNothingLaunched();
+    // Resolve-before-side-effect ordering: the session was never armed, so its
+    // tools still work normally.
+    expect(await blockReason(mock, "belayd_commit", ctx)).toBe(undefined);
+  });
+
+  it("refuses a flag contract its mode cannot carry from the launch tool", async () => {
+    const mock = await loadFleetExtension();
+    const launch = mock.tools.get("belayd_fleet_launch");
+    if (launch === undefined) throw new Error("belayd_fleet_launch was not registered");
+
+    const result = await launch.execute(
+      "launch-publish-1",
+      { tasks: ["bd-12"], untilComplete: false, publish: "local", publishRemote: "fork" },
+      undefined,
+      undefined,
+      makeCtx(cwd, "publisher-session"),
+    );
+
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain('publish: "remote" only applies to mode "pr"/"push"');
+    expectNothingLaunched();
+  });
+});
+
 describe("belayd_fleet_merge", () => {
   let cwd: string;
   let commonDir: string;
@@ -3093,7 +3330,21 @@ describe("fleet run mode", () => {
     // The engine's own warnings are notified after it wrote the re-planned intent and
     // before the tick re-reads it: the window a reconcile or an operator cleanup can
     // empty, which would otherwise let the tick classify from the pre-launch plan.
-    afterLaunchHook = () => rmSync(fleetFile, { force: true });
+    // Publish config is resolved before the launch engine and can notify a
+    // warning first; skip those so the hook still fires on the engine's own
+    // post-write warning, the window this test is about.
+    const deleteAfterLaunchEngine = (): void => {
+      const last = ctxNotifications[ctxNotifications.length - 1];
+      if (
+        last?.message.startsWith("git config ") ||
+        last?.message.includes(".belayd/config.json")
+      ) {
+        afterLaunchHook = deleteAfterLaunchEngine;
+        return;
+      }
+      rmSync(fleetFile, { force: true });
+    };
+    afterLaunchHook = deleteAfterLaunchEngine;
 
     await vi.advanceTimersByTimeAsync(2_000);
 

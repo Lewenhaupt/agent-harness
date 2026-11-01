@@ -652,7 +652,7 @@ async function repairPark(options: {
 
   const restored = await restoreRecordedStash({
     rootCwd: reconcile.rootCwd,
-    baseBranch: intent.baseBranch ?? "main",
+    baseBranch: intent.baseBranch,
     fleetId: reconcile.fleetId,
     gitCommonDir: reconcile.gitCommonDir,
     stashRef: park.stashRef,
@@ -1192,7 +1192,7 @@ async function reconcileQueueAndPark(options: {
   const inspected = await inspectQueue({
     reconcile,
     fs,
-    baseBranch: intent.baseBranch ?? "main",
+    baseBranch: intent.baseBranch,
   });
   if (!inspected.ok) {
     run.lines.push(`- queue: unreadable (${inspected.error}); left untouched`);

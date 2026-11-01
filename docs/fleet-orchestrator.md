@@ -99,11 +99,18 @@ operator (/fleet bd-12 bd-15 bd-19)
 
 | Path | Purpose | Written by |
 |------|---------|------------|
-| `fleet.json` | Operator intent: fleet id, task ids, requested concurrency ceiling, paused flag, base branch, supervisor record (`sessionId`, `pid`, `pidStartTime`, `armToken`), note, the (P3) `deferred` members with the reason each waits, and the (P2/P4) `park` record (`reason`, `stashRef`, `recordedAt`) | P1/P3 (`belayd_fleet_launch` / `/fleet`), P2 (`parkFleet`), P4 (`belayd_fleet_pause` / `belayd_fleet_resume` / `belayd_fleet_reconcile`); P0 only reads it |
+| `fleet.json` | Operator intent: fleet id, task ids, requested concurrency ceiling, paused flag, the required base branch this fleet lands on (frozen at launch), the publish contract (`local`/`pr`/`push`, frozen at launch; `local` is the inert default), supervisor record (`sessionId`, `pid`, `pidStartTime`, `armToken`), note, the (P3) `deferred` members with the reason each waits, and the (P2/P4) `park` record (`reason`, `stashRef`, `recordedAt`) | P1/P3 (`belayd_fleet_launch` / `/fleet`), P2 (`parkFleet`), P4 (`belayd_fleet_pause` / `belayd_fleet_resume` / `belayd_fleet_reconcile`); P0 only reads it |
 | `inbox/` | Member → supervisor notes, drained by `belayd_fleet_inbox` | P1 |
 | `events/` | Supervisor → member notifications (base moved, rebase due, sibling landed, pause/resume), drained at the member's turn start. One file **per recipient**: a broadcast is fanned out at enqueue time | P1 |
 | `merge-queue.json` | Single-flight merge queue (entries + one lease holder) | P2 (`belayd_fleet_merge`) |
 | `audit.log` | Append-only audit of every cross-tree authority action (launch, re-arm, per-member launch attempt, prune, note, inbox drain, events ack, merge acquire/release/stash/restore/gates/broadcast, P3's `schedule-planned`/`member-deferred`/`capacity-blocked`, and P4's `fleet-paused`/`fleet-resumed`/`fleet-unparked`/`member-stopped`/`advance`/`queue-*`/`member-pruned-dead`) | P1/P2/P3/P4 |
+
+The publish contract is resolved once at launch from `--publish*` flags, then
+`<repo-root>/.belayd/config.json` (`{"publish": {...}}` or the shorthand
+`{"publish": "pr"}`), then `git config belayd.publish.*`, then the inert `local`
+default, and frozen into `fleet.json`. The config file is **repo-scoped**: it
+lives in the main checkout (the parent of the shared `git-common-dir`), so every
+linked worktree of the repository sees the same contract.
 
 `src/fleet-state.ts` owns this layout. It is storage and pure parsing only — no
 scheduling, spawning, merging, stashing, or bead mutation; P1's launch and
@@ -583,7 +590,7 @@ Preconditions, all checked **before any mutation** (the queue entry is left
 
 - the fleet intent exists and is not `paused`;
 - `rootCwd` is this repository's **own** checkout (not a linked worktree) and is
-  on the base branch (`fleet.json` `baseBranch`, default `main`);
+  on the base branch (`fleet.json` `baseBranch`, required and frozen at launch);
 - the member branch is checked out in a worktree that is **clean**;
 - the queue has a selectable `queued` entry; the lock is then acquired.
 

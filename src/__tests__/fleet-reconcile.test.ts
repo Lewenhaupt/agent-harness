@@ -47,6 +47,7 @@ import {
   writeFleetMergeQueue,
 } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
 import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
@@ -68,12 +69,13 @@ function seedIntent(commonDir: string, fleetId: string, intent: Partial<FleetInt
     gitCommonDir: commonDir,
     fleetId,
     intent: {
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12", "bd-15"],
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
+      publish: { mode: "local" },
       ...intent,
     },
   });

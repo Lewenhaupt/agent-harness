@@ -63,7 +63,12 @@ import {
   writeFleetMergeQueue,
 } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
-import { FLEET_INTENT_ORDERING_GATES_MAX, fleetStateDir } from "../fleet-status.js";
+import {
+  FLEET_INTENT_MEMBERS_MAX,
+  FLEET_INTENT_ORDERING_GATES_MAX,
+  FLEET_SCHEMA_VERSION,
+  fleetStateDir,
+} from "../fleet-status.js";
 
 const commonDir = "/repo/.git";
 const fleetId = "fleet-1";
@@ -205,13 +210,14 @@ describe("fleet.json intent", () => {
     expect(loaded).toHaveProperty("ok", true);
     if (!loaded.ok) return;
     expect(loaded.intent).toEqual({
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12", "bd-15"],
       createdAt: 1_000,
       updatedAt: 1_000,
       maxConcurrent: 2,
       baseBranch: "main",
+      publish: { mode: "local" },
       supervisor: { sessionId: "session-1", pid: 4242 },
       note: "night shift",
     });
@@ -241,7 +247,7 @@ describe("fleet.json intent", () => {
     expect(projected).not.toHaveProperty("park");
     expect(projected).not.toHaveProperty("note");
     expect(projected).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12"],
       createdAt: 1_000,
@@ -257,7 +263,10 @@ describe("fleet.json intent", () => {
   it("omits optional fields it was not given", () => {
     const intent = createFleetIntent({ fleetId, taskIds: [], now: 5 });
     expect(intent).not.toHaveProperty("maxConcurrent");
-    expect(intent).not.toHaveProperty("baseBranch");
+    // baseBranch and publish are frozen fields, not optional: a launch always
+    // records a concrete landing contract.
+    expect(intent).toHaveProperty("baseBranch", "main");
+    expect(intent).toHaveProperty("publish", { mode: "local" });
     expect(intent).not.toHaveProperty("supervisor");
     expect(intent).not.toHaveProperty("note");
   });
@@ -406,6 +415,60 @@ describe("fleet.json intent", () => {
 
     expect(written).toEqual({ ok: true });
     expect(fs.files.has(path)).toBe(true);
+  });
+
+  it("upgrades a legacy v1 record to the current shape before writing it", () => {
+    // `fleetIntentWriteRefusal` validates v2 only, so a v1 record handed to a
+    // writer (an older caller, a fixture) is migrated first: the bytes on disk are
+    // always the current shape, never a v1 record the next read has to upgrade
+    // again.
+    const fs = createFakeFs();
+    const legacy = {
+      schemaVersion: 1,
+      fleetId,
+      taskIds: ["bd-12"],
+      createdAt: 1_000,
+      updatedAt: 2_000,
+    } as unknown as FleetIntent;
+
+    expect(writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: legacy, fs })).toEqual({
+      ok: true,
+    });
+    expect(JSON.parse(fs.files.get(path) ?? "{}")).toEqual({
+      schemaVersion: FLEET_SCHEMA_VERSION,
+      fleetId,
+      taskIds: ["bd-12"],
+      createdAt: 1_000,
+      updatedAt: 2_000,
+      baseBranch: "main",
+      publish: { mode: "local" },
+    });
+
+    // A legacy record that names its own base branch keeps it verbatim.
+    const named = { ...legacy, baseBranch: "develop", updatedAt: 3_000 };
+    expect(writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: named, fs })).toEqual({
+      ok: true,
+    });
+    const stored = JSON.parse(fs.files.get(path) ?? "{}");
+    expect(stored).toHaveProperty("schemaVersion", FLEET_SCHEMA_VERSION);
+    expect(stored).toHaveProperty("baseBranch", "develop");
+    expect(stored).toHaveProperty("publish", { mode: "local" });
+
+    // Migration never upgrades an invalid record into a valid one: a v1 record over
+    // a v1 bound is still refused, and the previous bytes survive.
+    const before = fs.files.get(path);
+    const overBound = {
+      ...legacy,
+      taskIds: Array.from(
+        { length: FLEET_INTENT_MEMBERS_MAX + 1 },
+        (_, index) => `bd-${1000 + index}`,
+      ),
+    } as unknown as FleetIntent;
+    const refused = writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: overBound, fs });
+    expect(refused).toHaveProperty("ok", false);
+    if (refused.ok) return;
+    expect(refused.error).toContain("invalid fleet intent");
+    expect(fs.files.get(path)).toBe(before);
   });
 
   it("refuses an update whose base record changed since it was read", () => {

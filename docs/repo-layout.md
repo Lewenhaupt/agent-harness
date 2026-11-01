@@ -118,6 +118,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/fleet-mode.ts` | Fleet supervisor mode (bd-126 P1) |
 | `src/fleet-ordering-gates.ts` | Fleet wave ordering as bd gates, resolved on landing not closing (bd-158) |
 | `src/fleet-pause.ts` | Cooperative fleet pause and resume (bd-126 P4) |
+| `src/fleet-publish.ts` | Fleet publish contract (`local`/`pr`/`push`) and its flag → repo config → git config → local resolution (bd-174.1) |
 | `src/fleet-reconcile.ts` | Fleet-level crash reconcile and pause repair (bd-126 P4) |
 | `src/fleet-run.ts` | The run-to-completion loop's decision layer: one tick, one action (bd-126 P5) |
 | `src/fleet-schedule.ts` | Fleet scheduling — P3 of the fleet supervisor (bd-126) |

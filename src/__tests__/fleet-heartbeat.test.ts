@@ -24,6 +24,7 @@ import {
 } from "../fleet-heartbeat.js";
 import type { FleetSupervisorLiveness, FleetSupervisorState } from "../fleet-mode.js";
 import type { FleetIntent } from "../fleet-status.js";
+import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
 
 let gitCommonDir: string;
 
@@ -225,11 +226,13 @@ describe("planSupervisorReadoption", () => {
 
   function intent(overrides: Partial<FleetIntent> = {}): FleetIntent {
     return {
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId: "default",
       taskIds: ["bd-12"],
       createdAt: 1,
       updatedAt: 1,
+      baseBranch: "main",
+      publish: { mode: "local" },
       supervisor: { sessionId: SESSION, pid: 4242, armToken: "old-token" },
       run: {
         schemaVersion: 1,

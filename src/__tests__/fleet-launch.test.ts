@@ -31,6 +31,7 @@ import { fleetDir, formatAuditEntry } from "../fleet-state.js";
 import {
   FLEET_INTENT_DEFERRED_MAX,
   FLEET_INTENT_ORDERING_GATES_MAX,
+  FLEET_SCHEMA_VERSION,
   type FleetIntent,
 } from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
@@ -307,6 +308,46 @@ describe("parseFleetCommandArgs", () => {
     expect(nan).toHaveProperty("ok", false);
     if (!nan.ok) expect(nan.error).toContain('needs a number, got "soon"');
   });
+
+  it("collects the publish flags into one contract (bd-174.1)", () => {
+    expect(parseFleetCommandArgs("bd-12 --publish pr")).toEqual({
+      ok: true,
+      args: { taskIds: ["bd-12"], publish: { mode: "pr" } },
+    });
+    expect(
+      parseFleetCommandArgs(
+        "bd-12 --publish pr --publish-remote fork --publish-base develop --publish-ready --publish-stacks per-chain",
+      ),
+    ).toEqual({
+      ok: true,
+      args: {
+        taskIds: ["bd-12"],
+        publish: {
+          mode: "pr",
+          remote: "fork",
+          base: "develop",
+          ready: true,
+          stacks: "per-chain",
+        },
+      },
+    });
+    expect(parseFleetCommandArgs("bd-12 --publish pr --no-publish-ready")).toHaveProperty(
+      "args.publish.ready",
+      false,
+    );
+  });
+
+  it("rejects an invalid publish mode or stack with the usage text", () => {
+    const badMode = parseFleetCommandArgs("bd-12 --publish sometimes");
+    expect(badMode).toHaveProperty("ok", false);
+    if (!badMode.ok) {
+      expect(badMode.error).toContain("--publish must be one of local, pr, push");
+      expect(badMode.error).toContain("Usage: /fleet");
+    }
+    const badStacks = parseFleetCommandArgs("bd-12 --publish-stacks per-fleet");
+    expect(badStacks).toHaveProperty("ok", false);
+    if (!badStacks.ok) expect(badStacks.error).toContain("per-chain");
+  });
 });
 
 describe("parseFleetTaskIds", () => {
@@ -331,7 +372,7 @@ describe("mergeFleetIntent", () => {
 
   function current(): FleetIntent {
     return {
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12"],
       createdAt: 10,
@@ -340,6 +381,7 @@ describe("mergeFleetIntent", () => {
       paused: true,
       note: "operator note",
       baseBranch: "main",
+      publish: { mode: "local" },
       supervisor: { sessionId: "s1", pid: 11 },
     };
   }
@@ -361,7 +403,9 @@ describe("mergeFleetIntent", () => {
     expect(merged.maxConcurrent).toBe(3);
     expect(merged.paused).toBe(true);
     expect(merged.note).toBe("operator note");
-    expect(merged.baseBranch).toBe("develop");
+    // The recorded landing contract is frozen: the launch's "develop" is ignored.
+    expect(merged.baseBranch).toBe("main");
+    expect(merged.publish).toEqual({ mode: "local" });
     expect(merged.supervisor).toEqual(supervisor);
   });
 
@@ -379,6 +423,43 @@ describe("mergeFleetIntent", () => {
     expect(merged.createdAt).toBe(20);
     expect(merged.fleetId).toBe(fleetId);
     expect(merged.supervisor).toEqual(supervisor);
+  });
+
+  it("freezes the recorded landing contract on a later launch (bd-174.1)", () => {
+    const recorded: FleetIntent = {
+      ...current(),
+      baseBranch: "develop",
+      publish: { mode: "pr", remote: "origin", base: "develop" },
+    };
+    const merged = mergeFleetIntent({
+      current: recorded,
+      fleetId,
+      taskIds: ["bd-15"],
+      now: 30,
+      maxConcurrent: 3,
+      baseBranch: "main",
+      publish: { mode: "local" },
+      supervisor,
+    });
+
+    expect(merged.baseBranch).toBe("develop");
+    expect(merged.publish).toEqual({ mode: "pr", remote: "origin", base: "develop" });
+  });
+
+  it("uses the passed contract on a first launch", () => {
+    const merged = mergeFleetIntent({
+      current: undefined,
+      fleetId,
+      taskIds: ["bd-12"],
+      now: 20,
+      maxConcurrent: 3,
+      baseBranch: "develop",
+      publish: { mode: "push", remote: "fork" },
+      supervisor,
+    });
+
+    expect(merged.baseBranch).toBe("develop");
+    expect(merged.publish).toEqual({ mode: "push", remote: "fork" });
   });
 });
 
@@ -728,6 +809,31 @@ describe("runFleetLaunch", () => {
       "member-launch-failed",
       "member-pruned",
     ]);
+  });
+
+  it("recreates a vanished intent with the launch's resolved contract on the prune path", async () => {
+    const fs = createFakeFleetFs();
+    const intentPath = `${fleetDir(commonDir, fleetId)}/fleet.json`;
+
+    const result = await runFleetLaunch({
+      ...base,
+      baseBranch: "develop",
+      publish: { mode: "pr", remote: "fork", base: "develop" },
+      taskIds: ["bd-12"],
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => {
+        // The record vanishes mid-launch, after `writeLaunchIntent` read it back.
+        fs.files.delete(intentPath);
+        return { taskId, ok: false, detail: "daemon unavailable" };
+      },
+      fs,
+    });
+
+    expect(result.ok).toBe(false);
+    const intent = JSON.parse(fs.files.get(intentPath) ?? "{}") as FleetIntent;
+    // The prune must re-freeze the contract this launch resolved, not the defaults.
+    expect(intent.baseBranch).toBe("develop");
+    expect(intent.publish).toEqual({ mode: "pr", remote: "fork", base: "develop" });
   });
 
   it("reports a fleet whose members all failed as not started", async () => {
@@ -1663,11 +1769,13 @@ describe("runFleetLaunch: liveness-aware capacity and releases (bd-166)", () => 
 
   it("clears a member's release entry when a launch re-arms it", () => {
     const current: FleetIntent = {
-      schemaVersion: 1,
+      schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12", "bd-15"],
       createdAt: 1_000,
       updatedAt: 2_000,
+      baseBranch: "main",
+      publish: { mode: "local" },
       released: [
         { taskId: "bd-12", reason: "operator-release", at: 1_500 },
         { taskId: "bd-15", reason: "run-halted", at: 1_600 },
@@ -1700,11 +1808,13 @@ describe("runFleetLaunch: liveness-aware capacity and releases (bd-166)", () => 
 
 describe("planFleetAdvance", () => {
   const intent: FleetIntent = {
-    schemaVersion: 1,
+    schemaVersion: FLEET_SCHEMA_VERSION,
     fleetId,
     taskIds: ["bd-12"],
     createdAt: 1,
     updatedAt: 1,
+    baseBranch: "main",
+    publish: { mode: "local" },
     deferred: [{ taskId: "bd-15", reason: "capacity", detail: "all slots taken" }],
   };
 

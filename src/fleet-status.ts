@@ -19,6 +19,7 @@ import type { FleetCapacityArithmetic, FleetCapacitySupervisor } from "./fleet-c
 import { describeFleetCapacity, FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "./fleet-capacity.js";
 import type { FleetSupervisorLiveness } from "./fleet-mode.js";
 import { classifyFleetSupervisor, isProcessAlive, readProcessStartTime } from "./fleet-mode.js";
+import { defaultFleetPublish, FleetPublishSchema } from "./fleet-publish.js";
 import {
   FLEET_MEMBER_RELEASE_REASONS,
   FLEET_RUN_STALE_TICK_INTERVALS,
@@ -54,6 +55,7 @@ import {
 import type { RunManifest, RunManifestFs } from "./run-manifest.js";
 import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
 import { isValidTaskId } from "./session-naming.js";
+import { DEFAULT_BASE_BRANCH } from "./stack-rebase.js";
 import type { WorkflowState } from "./workflow-state.js";
 import { parseWorkflowState, workflowStateFilePath } from "./workflow-state.js";
 import type { GitCommonDirResult, WorktreeListEntry } from "./worktree.js";
@@ -63,8 +65,13 @@ import { listWorktrees as defaultListWorktrees, resolveGitCommonDir } from "./wo
  * `schemaVersion` of the `fleet.json` intent record. The merge queue and the
  * mailbox notes keep their own versions (`fleet-state.ts`) so bumping the
  * intent schema cannot invalidate every note already in a mailbox.
+ *
+ * v2 exists for the publish contract (bd-174.1): a fleet now freezes the branch
+ * it lands on (`baseBranch`, required) and the publish mode it was launched
+ * under (`publish`). A v1 record has neither, so it is migrated on read by
+ * {@link migrateFleetIntentV1} instead of being rejected.
  */
-export const FLEET_SCHEMA_VERSION = 1;
+export const FLEET_SCHEMA_VERSION = 2;
 
 /** Fleet id used when the caller does not name one. */
 export const DEFAULT_FLEET_ID = "default";
@@ -113,8 +120,7 @@ export const FLEET_INTENT_SUMMARY_MAX = 8;
  * ordering, P4 pause) read/write the same record, which is why the schema is
  * declared here now.
  */
-const FleetIntentSchema = z.object({
-  schemaVersion: z.literal(FLEET_SCHEMA_VERSION),
+const FleetIntentSharedFields = {
   fleetId: z.string(),
   /**
    * Members this fleet owns: launched and running, plus any the run stopped.
@@ -220,8 +226,6 @@ const FleetIntentSchema = z.object({
    * restart resumes the loop instead of re-landing members it already landed.
    */
   run: FleetRunSchema.optional(),
-  /** Branch merges land on (P2). Absent means the repository's default branch. */
-  baseBranch: z.string().optional(),
   /**
    * The supervisor session that owns this fleet (P4 crash reconcile): a later
    * session needs to tell "my fleet" from one abandoned by a dead process.
@@ -240,15 +244,67 @@ const FleetIntentSchema = z.object({
       armToken: z.string().optional(),
     })
     .optional(),
+};
+
+/**
+ * The frozen v1 intent shape, kept only to migrate an existing record on read.
+ *
+ * It is one of the two schemas `parseFleetIntent` accepts, and it reuses the
+ * shared fields so a field added to the current record still parses in a v1
+ * record (nothing drops).
+ */
+const FleetIntentSchemaV1 = z.object({
+  schemaVersion: z.literal(1),
+  ...FleetIntentSharedFields,
+  baseBranch: z.string().optional(),
+});
+
+/** The current intent shape (v2): a required base branch plus a publish contract. */
+const FleetIntentSchema = z.object({
+  schemaVersion: z.literal(FLEET_SCHEMA_VERSION),
+  ...FleetIntentSharedFields,
+  /**
+   * Branch this fleet lands on, frozen at launch (v2). Readers never infer a
+   * default: a legacy v1 record is migrated on read so every consumer sees a
+   * concrete value.
+   */
+  baseBranch: z.string().min(1).max(256),
+  /**
+   * Publish contract resolved at launch and frozen here (v2). A mid-run config
+   * edit must not change where the fleet's work lands, so a re-arm, advance, or
+   * relaunch never overwrites this.
+   */
+  publish: FleetPublishSchema,
 });
 
 export type FleetIntent = z.infer<typeof FleetIntentSchema>;
+export type FleetIntentV1 = z.infer<typeof FleetIntentSchemaV1>;
 export type FleetSupervisor = NonNullable<FleetIntent["supervisor"]>;
+
+/**
+ * Upgrade a v1 record to the current shape (v2).
+ *
+ * This is the ONE place a default branch is supplied for a legacy record, and it
+ * is a read-time upgrade path rather than a reader-side fallback: after migration
+ * every consumer reads a concrete `intent.baseBranch`, so no `?? "main"` survives
+ * anywhere. `publish` defaults to the inert local contract, which is exactly the
+ * behaviour a pre-publish fleet had.
+ */
+export function migrateFleetIntentV1(record: FleetIntentV1): FleetIntent {
+  return {
+    ...record,
+    schemaVersion: FLEET_SCHEMA_VERSION,
+    baseBranch: record.baseBranch ?? DEFAULT_BASE_BRANCH,
+    publish: defaultFleetPublish(),
+  };
+}
 
 /** Parse a fleet intent file; absent/corrupt/wrong-version all yield undefined. */
 export function parseFleetIntent(raw: unknown): FleetIntent | undefined {
-  const result = FleetIntentSchema.safeParse(raw);
-  return result.success ? result.data : undefined;
+  const current = FleetIntentSchema.safeParse(raw);
+  if (current.success) return current.data;
+  const legacy = FleetIntentSchemaV1.safeParse(raw);
+  return legacy.success ? migrateFleetIntentV1(legacy.data) : undefined;
 }
 
 /**

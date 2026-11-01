@@ -23,6 +23,8 @@ import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import type { FleetPublish } from "./fleet-publish.js";
+import { defaultFleetPublish } from "./fleet-publish.js";
 import type { FleetIntent } from "./fleet-status.js";
 import {
   FLEET_INTENT_ORDERING_GATES_MAX,
@@ -37,6 +39,7 @@ import {
   parseFleetIntent,
   sanitizeFleetId,
 } from "./fleet-status.js";
+import { DEFAULT_BASE_BRANCH } from "./stack-rebase.js";
 import type { WorkflowFs } from "./workflow-state.js";
 import { atomicWriteJson } from "./workflow-state.js";
 
@@ -184,6 +187,21 @@ function withDirectoryFleetId(intent: FleetIntent, fleetId: string): FleetIntent
   return { ...intent, fleetId: sanitizeFleetId(fleetId) };
 }
 
+/**
+ * Absorb a legacy v1 record handed to a writer.
+ *
+ * {@link fleetIntentWriteRefusal} validates the current (v2) schema only — a
+ * writer can only mint a current record — so a v1 record an older caller or a
+ * fixture still hands us is upgraded here exactly as `parseFleetIntent` does on
+ * read. Anything that is not a v1 record is returned unchanged, so a v2 record's
+ * forward-compat fields survive a replace.
+ */
+function migrateLegacyIntentForWrite(intent: FleetIntent): FleetIntent {
+  if (typeof intent !== "object" || intent === null) return intent;
+  if ((intent as { schemaVersion?: unknown }).schemaVersion !== 1) return intent;
+  return parseFleetIntent(intent) ?? intent;
+}
+
 export interface FleetIntentOptions {
   gitCommonDir: string;
   fleetId: string;
@@ -290,7 +308,7 @@ export function writeFleetIntent(options: WriteFleetIntentOptions): FleetStateWr
 function writeFleetIntentUnchecked(options: WriteFleetIntentOptions): FleetStateWriteResult {
   const fs = options.fs ?? nodeFsSeam;
   const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
-  const intent = withDirectoryFleetId(options.intent, options.fleetId);
+  const intent = withDirectoryFleetId(migrateLegacyIntentForWrite(options.intent), options.fleetId);
   const refusal = fleetIntentWriteRefusal(intent);
   if (refusal !== undefined) {
     return { ok: false, error: `refusing to write ${filePath}: ${refusal}` };
@@ -394,6 +412,8 @@ export interface CreateFleetIntentInput {
   now: number;
   maxConcurrent?: number;
   baseBranch?: string;
+  /** Publish contract frozen at launch (bd-174.1). Defaults to local. */
+  publish?: FleetPublish;
   supervisor?: FleetIntent["supervisor"];
   note?: string;
   /** Members P3 could not launch yet, with the reason each waits. */
@@ -425,7 +445,8 @@ export function createFleetIntent(input: CreateFleetIntentInput): FleetIntent {
     createdAt: input.now,
     updatedAt: input.now,
     ...(input.maxConcurrent === undefined ? {} : { maxConcurrent: input.maxConcurrent }),
-    ...(input.baseBranch === undefined ? {} : { baseBranch: input.baseBranch }),
+    baseBranch: input.baseBranch ?? DEFAULT_BASE_BRANCH,
+    publish: input.publish ?? defaultFleetPublish(),
     ...(input.supervisor === undefined ? {} : { supervisor: input.supervisor }),
     ...(input.note === undefined ? {} : { note: input.note }),
     ...(input.deferred === undefined ? {} : { deferred: input.deferred }),

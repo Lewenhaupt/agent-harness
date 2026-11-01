@@ -410,6 +410,28 @@ export type {
 } from "./fleet-pause.js";
 export { pauseFleet, resumeFleet } from "./fleet-pause.js";
 export type {
+  FleetPublish,
+  FleetPublishFsSeam,
+  FleetPublishGitExec,
+  FleetPublishMode,
+  FleetPublishRequest,
+  FleetPublishResolveResult,
+  FleetPublishStackComposition,
+  ReadFleetPublishConfigOptions,
+  ReadFleetPublishConfigResult,
+} from "./fleet-publish.js";
+export {
+  DEFAULT_FLEET_PUBLISH,
+  defaultFleetPublish,
+  FLEET_PUBLISH_MODES,
+  FLEET_PUBLISH_STACK_COMPOSITIONS,
+  FleetPublishSchema,
+  formatFleetPublish,
+  parseFleetPublish,
+  readFleetPublishConfig,
+  resolveFleetPublish,
+} from "./fleet-publish.js";
+export type {
   DiagnoseMergeQueueInput,
   FleetOrderingGateSeam,
   MemberLivenessReport,
@@ -628,6 +650,7 @@ export type {
   FleetCapacityMemberInput,
   FleetEngagementLookup,
   FleetIntent,
+  FleetIntentV1,
   FleetLeaseSnapshot,
   FleetLeaseView,
   FleetMemberSnapshot,
@@ -670,6 +693,7 @@ export {
   formatBeadOwnership,
   formatFleetStatus,
   formatNeedsYou,
+  migrateFleetIntentV1,
   NEEDS_YOU_EXCERPT_MAX_CHARS,
   NEEDS_YOU_LIST_MAX,
   parseBeadView,

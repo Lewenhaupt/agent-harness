@@ -2325,7 +2325,7 @@ function prepareDrainContext(
       fs,
       git,
       intent,
-      baseBranch: intent.baseBranch ?? "main",
+      baseBranch: intent.baseBranch,
       entry,
       clock,
       warnings: [],

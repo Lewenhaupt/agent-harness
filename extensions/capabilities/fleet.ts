@@ -10,6 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -75,6 +76,13 @@ import {
   resolveFleetOrderingGatesForBead,
 } from "../../src/fleet-ordering-gates.js";
 import { pauseFleet, resumeFleet } from "../../src/fleet-pause.js";
+import type {
+  FleetPublish,
+  FleetPublishMode,
+  FleetPublishRequest,
+  FleetPublishStackComposition,
+} from "../../src/fleet-publish.js";
+import { readFleetPublishConfig, resolveFleetPublish } from "../../src/fleet-publish.js";
 import { reconcileAuthority, runFleetReconcile } from "../../src/fleet-reconcile.js";
 import {
   deriveFleetMemberProgress,
@@ -306,6 +314,27 @@ export interface FleetApi {
     taskId: string;
     branch: string;
   }) => { ok: true } | { ok: false; error: string };
+}
+
+/**
+ * Assemble a partial publish request from the launch tool/flag params, or
+ * undefined when none were given so the resolver can use the repo config.
+ */
+function fleetPublishRequest(input: {
+  mode?: FleetPublishMode;
+  remote?: string;
+  base?: string;
+  ready?: boolean;
+  stacks?: FleetPublishStackComposition;
+}): FleetPublishRequest | undefined {
+  const request: FleetPublishRequest = {
+    ...(input.mode === undefined ? {} : { mode: input.mode }),
+    ...(input.remote === undefined ? {} : { remote: input.remote }),
+    ...(input.base === undefined ? {} : { base: input.base }),
+    ...(input.ready === undefined ? {} : { ready: input.ready }),
+    ...(input.stacks === undefined ? {} : { stacks: input.stacks }),
+  };
+  return Object.keys(request).length === 0 ? undefined : request;
 }
 
 export function createFleet(deps: FleetDeps): FleetApi {
@@ -1040,7 +1069,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       fleetId: mode.fleetId,
       action: "fleet-landed",
       taskIds: [taskId],
-      detail: `merged ${taskId} into ${mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH}`,
+      detail: `merged ${taskId} into ${mode.intent.baseBranch}`,
     });
 
     const accepted = await acceptLandedMemberOnDisk({
@@ -1196,7 +1225,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       taskId,
       branch: branch.ok ? branch.branch : `feat/${taskId}`,
       worktreePath: worktreePath ?? "",
-      baseBranch: mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH,
+      baseBranch: mode.intent.baseBranch,
       closeBead: options.accept,
       removeWorktree: worktreePath !== undefined,
       now: options.now,
@@ -2144,12 +2173,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     if (!branch.ok) return false;
     try {
       await runGitCommand(
-        [
-          "merge-base",
-          "--is-ancestor",
-          branch.branch,
-          options.mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH,
-        ],
+        ["merge-base", "--is-ancestor", branch.branch, options.mode.intent.baseBranch],
         { cwd: options.ctx.cwd, timeoutInMs: 15_000, maxBufferInBytes: 1024 * 1024 },
       );
       return true;
@@ -2190,7 +2214,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       taskId: options.taskId,
       now: options.now,
     });
-    const base = options.mode.intent.baseBranch ?? DEFAULT_BASE_BRANCH;
+    const base = options.mode.intent.baseBranch;
     auditFleetAction({
       ctx: options.ctx,
       gitCommonDir: options.mode.gitCommonDir,
@@ -3009,6 +3033,71 @@ export function createFleet(deps: FleetDeps): FleetApi {
     };
   }
 
+  /**
+   * Resolve the publish contract for one launch call, surfacing config warnings.
+   *
+   * This is the only read of the flag/repo/git config sources in the launch path:
+   * the resolved value is frozen into the intent and never re-read mid-run.
+   */
+  /** The base branch a launch freezes: the current branch or the repo default. */
+  function currentBaseBranch(cwd: string): string {
+    return currentBranch(cwd) ?? DEFAULT_BASE_BRANCH;
+  }
+
+  /** Post-launch side effects that depend on the run mode and the call origin. */
+  function recordLaunchFollowUp(options: {
+    ctx: ExtensionContext;
+    state: FleetState;
+    fleetId: string;
+    ok: boolean;
+    outcomes: readonly FleetMemberLaunchOutcome[];
+    runMode: { accept: boolean } | undefined;
+    origin: "launch" | "advance" | undefined;
+  }): void {
+    if (options.runMode !== undefined && options.origin !== "advance" && options.ok) {
+      startFleetRunAfterLaunch({
+        ctx: options.ctx,
+        state: options.state,
+        fleetId: options.fleetId,
+        accept: options.runMode.accept,
+        outcomes: options.outcomes,
+      });
+    }
+    // An advance is a step of the live run, so it must record the members it
+    // launched there and beat the supervisor heartbeat: without this they sat in
+    // `taskIds` while `run.members` stayed stale, invisible to idle/stall
+    // accounting and to status (bd-166, the wave2 record).
+    if (options.origin === "advance" && options.ok) {
+      recordAdvanceRunMembers({
+        ctx: options.ctx,
+        fleetId: options.fleetId,
+        outcomes: options.outcomes,
+      });
+    }
+  }
+
+  function resolveLaunchPublish(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    baseBranch: string;
+    flag: FleetPublishRequest | undefined;
+  }): { ok: true; publish: FleetPublish } | { ok: false; text: string } {
+    // `.belayd/config.json` is repo-scoped: `gitCommonDir` is shared by every
+    // worktree, so its parent is the main checkout and the config is read from
+    // there even when the launch runs in a linked worktree. That is intended.
+    const config = readFleetPublishConfig({ repoRoot: dirname(options.gitCommonDir) });
+    for (const warning of config.warnings) options.ctx.ui.notify(warning, "warning");
+    const resolved = resolveFleetPublish({
+      ...(options.flag === undefined ? {} : { flag: options.flag }),
+      ...(config.configFile === undefined ? {} : { configFile: config.configFile }),
+      ...(config.gitConfig === undefined ? {} : { gitConfig: config.gitConfig }),
+      baseBranch: options.baseBranch,
+    });
+    return resolved.ok
+      ? { ok: true, publish: resolved.publish }
+      : { ok: false, text: resolved.error };
+  }
+
   async function runFleetLaunch(options: {
     ctx: ExtensionContext;
     taskIds: readonly string[];
@@ -3016,6 +3105,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     requestedConcurrency?: number;
     /** `advance` when the worklist came from the persisted deferred plan (P4). */
     origin?: "launch" | "advance";
+    /** Partial publish contract from the flag surface; completed at resolve time. */
+    publish?: FleetPublishRequest;
     /**
      * Start (or resume) the run-to-completion loop after this launch.
      *
@@ -3034,7 +3125,20 @@ export function createFleet(deps: FleetDeps): FleetApi {
     if (!common.ok) {
       return { ok: false, text: `Fleet launch needs a git repository: ${common.error}` };
     }
-    const baseBranch = currentBranch(ctx.cwd);
+    const resolvedBaseBranch = currentBaseBranch(ctx.cwd);
+    // The publish mode is resolved EXACTLY ONCE per launch call (flag → repo
+    // config → git config → local) and frozen into the intent. A re-arm or an
+    // advance reads the recorded contract instead: `mergeFleetIntent` keeps the
+    // current intent's `publish`/`baseBranch`, so a mid-run config edit cannot
+    // change where the fleet lands. An invalid contract is refused here, before
+    // any worktree, intent write, or arm.
+    const resolvedPublish = resolveLaunchPublish({
+      ctx,
+      gitCommonDir: common.gitCommonDir,
+      baseBranch: resolvedBaseBranch,
+      flag: options.publish,
+    });
+    if (!resolvedPublish.ok) return { ok: false, text: resolvedPublish.text };
 
     // Minted per arming and kept only in this session's memory: the intent carries
     // it, so the on-disk record alone is not enough to become the supervisor.
@@ -3052,7 +3156,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
         gitCommonDir: common.gitCommonDir,
         armToken,
         supervisedFleetId: supervised?.fleetId,
-        baseBranch,
+        baseBranch: resolvedBaseBranch,
+        publish: resolvedPublish.publish,
         ...(pidStartTime === undefined ? {} : { pidStartTime }),
       }),
     );
@@ -3064,26 +3169,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       armToken,
       pinSupervisor: options.origin !== "advance",
     });
-    if (options.runMode !== undefined && options.origin !== "advance" && applied.ok) {
-      startFleetRunAfterLaunch({
-        ctx,
-        state,
-        fleetId: result.fleetId,
-        accept: options.runMode.accept,
-        outcomes: applied.outcomes ?? [],
-      });
-    }
-    // An advance is a step of the live run, so it must record the members it
-    // launched there and beat the supervisor heartbeat: without this they sat in
-    // `taskIds` while `run.members` stayed stale, invisible to idle/stall
-    // accounting and to status (bd-166, the wave2 record).
-    if (options.origin === "advance" && applied.ok) {
-      recordAdvanceRunMembers({
-        ctx,
-        fleetId: result.fleetId,
-        outcomes: applied.outcomes ?? [],
-      });
-    }
+    recordLaunchFollowUp({
+      ctx,
+      state,
+      fleetId: result.fleetId,
+      ok: applied.ok,
+      outcomes: applied.outcomes ?? [],
+      runMode: options.runMode,
+      origin: options.origin,
+    });
     return applied;
   }
 
@@ -3156,7 +3250,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     gitCommonDir: string;
     armToken: string;
     supervisedFleetId: string | undefined;
-    baseBranch: string | undefined;
+    baseBranch: string;
+    publish: FleetPublish;
     pidStartTime?: string;
   }): Parameters<typeof runFleetLaunchEngine>[0] {
     const { ctx, options } = input;
@@ -3180,7 +3275,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
       supervisorBeat: (fleetId) =>
         readSupervisorHeartbeat({ gitCommonDir: input.gitCommonDir, fleetId }),
       now: Date.now(),
-      ...(input.baseBranch === undefined ? {} : { baseBranch: input.baseBranch }),
+      baseBranch: input.baseBranch,
+      publish: input.publish,
       ...(options.requestedConcurrency === undefined
         ? {}
         : { requestedConcurrency: options.requestedConcurrency }),
@@ -4908,7 +5004,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "landed. Landing never closes a bead: each one is left in_progress + human for you to " +
       "accept, unless accept=true (then the bead is closed and the worktree removed). " +
       "untilComplete=false keeps the explicit surface " +
-      "(belayd_fleet_merge / belayd_fleet_advance on call). This session becomes the fleet " +
+      "(belayd_fleet_merge / belayd_fleet_advance on call). The launch freezes a publish " +
+      "contract into fleet.json (default local: merged work stays local, no remote and no " +
+      "network); the resolved value is never re-read mid-run. This session becomes the fleet " +
       "supervisor: it runs no phases and owns no worktree — observe with belayd_fleet_status, " +
       "message members with belayd_fleet_note, read reports with belayd_fleet_inbox, pause with " +
       "belayd_fleet_pause, repair crashes with belayd_fleet_reconcile.",
@@ -4941,16 +5039,46 @@ export function createFleet(deps: FleetDeps): FleetApi {
             "advance because the fleet resolves its bd ordering gates on landing",
         }),
       ),
+      publish: Type.Optional(
+        Type.Union([Type.Literal("local"), Type.Literal("pr"), Type.Literal("push")], {
+          description:
+            "Publish mode (default local: merged work stays local, no remote and no network). " +
+            "The resolved contract is frozen into fleet.json at launch and never re-read",
+        }),
+      ),
+      publishRemote: Type.Optional(
+        Type.String({ description: "Remote for pr/push publishes (default origin)" }),
+      ),
+      publishBase: Type.Optional(
+        Type.String({
+          description:
+            "Base branch a pr publish targets (default: the repository's current branch)",
+        }),
+      ),
+      publishReady: Type.Optional(
+        Type.Boolean({ description: "Open the PR ready for review (default: draft)" }),
+      ),
+      publishStacks: Type.Optional(
+        Type.Literal("per-chain", { description: "Stack composition (only per-chain)" }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const extensionCtx = ctx as ExtensionContext;
       const parsed = parseFleetTaskIds(params.tasks);
       if (!parsed.ok) return textToolResult(`belayd_fleet_launch: ${parsed.error}.`, 1);
+      const publish = fleetPublishRequest({
+        mode: params.publish,
+        remote: params.publishRemote,
+        base: params.publishBase,
+        ready: params.publishReady,
+        stacks: params.publishStacks,
+      });
       const result = await runFleetLaunch({
         ctx: extensionCtx,
         taskIds: parsed.taskIds,
         fleetId: fleetIdParam(params.fleetId),
         ...(params.concurrency === undefined ? {} : { requestedConcurrency: params.concurrency }),
+        ...(publish === undefined ? {} : { publish }),
         ...(params.untilComplete === false ? {} : { runMode: { accept: params.accept === true } }),
       });
       return textToolResult(result.text, result.ok ? 0 : 1);
@@ -5480,7 +5608,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "releases the gates the landing satisfied and starts the next wave until every member is " +
       "landed. Landing never closes a bead: they stay in_progress + human for you to accept. " +
       "`--manual` keeps the explicit surface; `--accept` also closes each landed bead. " +
-      "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>] [--manual] [--accept].",
+      "`--publish <local|pr|push>` freezes the publish contract into fleet.json (default local: " +
+      "no remote and no network); `--publish-remote`, `--publish-base`, `--publish-ready` and " +
+      "`--publish-stacks` complete a pr/push contract. " +
+      "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>] [--manual] [--accept] " +
+      "[--publish <local|pr|push>].",
     handler: async (args, ctx) => {
       const parsed = parseFleetCommandArgs(args);
       if (!parsed.ok) {
@@ -5494,6 +5626,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         ...(parsed.args.concurrency === undefined
           ? {}
           : { requestedConcurrency: parsed.args.concurrency }),
+        ...(parsed.args.publish === undefined ? {} : { publish: parsed.args.publish }),
         // `/fleet` runs to completion unless `--manual` asked for the explicit
         // surface; acceptance is opt-in (bd-158), so a bare `/fleet` lands members
         // and leaves every bead for the human. Ordering no longer needs a close:
