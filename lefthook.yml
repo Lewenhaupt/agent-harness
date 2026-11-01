@@ -5,14 +5,23 @@
 # TTY-only intermittent hang in lefthook (see evilmartians/lefthook#1256).
 no_tty: true
 
+# Git exports a git context to hooks, and from a LINKED worktree that context is
+# `GIT_DIR=<common>/.git/worktrees/<name>`. Any job command that runs `git init`
+# inherits it, ignores its `cwd`, and reinitialises the caller's repository from
+# the worktree admin dir — with no work tree set, git writes `core.bare = true`
+# into the SHARED config, after which every worktree fails with "this operation
+# must be run in a work tree". That is what broke `wt merge` (bd-206),
+# so every job starts from a context-free environment. Test fixtures must strip
+# it themselves too (src/worktree.ts gitContextFreeEnv, bd-58).
+
 pre-commit:
   jobs:
     - name: biome format + lint (staged)
       glob: "*.{ts,tsx,js,jsx,json}"
-      run: pnpm biome check --fix --no-errors-on-unmatched {staged_files}
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm biome check --fix --no-errors-on-unmatched {staged_files}
       stage_fixed: true
     - name: lint (full)
-      run: pnpm lint
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm lint
 
 # Typecheck, tests, build, and the flake package build are moved off the
 # commit path to keep pre-commit short — the longer the hook runs, the larger
@@ -20,17 +29,17 @@ pre-commit:
 pre-push:
   jobs:
     - name: typecheck
-      run: CI=1 pnpm typecheck
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX CI=1 pnpm typecheck
     - name: tests
-      run: pnpm test
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm test
     # `tsc --noEmit` (typecheck above) skips declaration emit, which can still
     # fail on private-name leaks; the emit is an explicit acceptance criterion.
     - name: build
-      run: pnpm build
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm build
     # belayd-harness.pnpmDeps.hash is a fixed-output hash over the full
     # pnpm-lock.yaml store, so any lockfile change (devDependencies included)
     # invalidates it. Nothing else in the hook can see that. Gated on the files
     # that can move the hash; fast when the pinned store is already cached.
     - name: flake package build (belayd-harness)
       glob: "{flake.nix,flake.lock,pnpm-lock.yaml,package.json}"
-      run: nix build .#belayd-harness --no-link
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX nix build .#belayd-harness --no-link

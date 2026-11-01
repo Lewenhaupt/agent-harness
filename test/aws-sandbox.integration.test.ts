@@ -23,6 +23,7 @@ import {
   socketPathFor,
 } from "../src/aws-broker/scope.js";
 import { createSocketBindLock, startUnixSocketServer } from "../src/aws-broker/server.js";
+import { gitContextFreeEnv } from "../src/worktree.js";
 
 const BWRAP = which("bwrap");
 const DIRENV = which("direnv");
@@ -43,12 +44,18 @@ function requireBwrap(): string {
 }
 
 /**
- * Strip direnv per-directory state and the wrapper guard, mirroring
- * src/spawn.ts: without this the harness process own devShell state leaks in
- * and `direnv export bash` returns a diff relative to the wrong .envrc.
+ * Strip direnv per-directory state, the wrapper guard, and any inherited git
+ * context, mirroring src/spawn.ts: without this the harness process own devShell
+ * state leaks in and `direnv export bash` returns a diff relative to the wrong
+ * .envrc.
+ *
+ * The git context matters for the fixtures below: a hook run from a linked
+ * worktree exports `GIT_DIR=<common>/.git/worktrees/<name>`, and a `git init`
+ * that inherits it reinitialises the caller's repository (`core.bare = true`)
+ * instead of creating the temp one (bd-206).
  */
 function cleanEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  const env: NodeJS.ProcessEnv = { ...gitContextFreeEnv(), ...extra };
   for (const key of Object.keys(env)) {
     if (key.startsWith("DIRENV_") || key === "BELAYD_SHELL_ACTIVE") delete env[key];
   }
