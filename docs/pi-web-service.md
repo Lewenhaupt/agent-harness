@@ -60,6 +60,25 @@ Both units run as `user` with an explicit environment:
 - `BELAYD_AWS_BIN` / `BELAYD_AWS_CREDENTIAL_PROCESS_BIN` point at the harness's
   broker CLI and shim wrappers (bd-125).
 
+`COMMAND_CODE_API_KEY` is **not** in that list because it is a per-host
+credential, not a deployment constant. Export it for the daemon with a systemd
+drop-in so every spawned `pi -ne` session inherits it:
+
+```ini
+# /etc/systemd/system/pi-web-sessiond.service.d/commandcode.conf
+[Service]
+EnvironmentFile=/etc/belayd/commandcode.env   # COMMAND_CODE_API_KEY=...
+```
+
+`pi-web-sessiond` spawns the agent sessions, so the var belongs there (the web
+unit does not spawn agents). `systemctl daemon-reload && systemctl restart
+pi-web-sessiond` afterwards. Running `/login` → Command Code writes
+`~/.pi/agent/auth.json` and works without the env var; `src/spawn.ts` scrubs
+only AWS credential variables, so the key reaches sub-agents either way. With
+neither, the provider is classified `unconfigured` and the phase degrades to
+`llmgateway/glm-5.3-flash` instead of failing. See
+`docs/commandcode-provider.md`.
+
 ### AWS credential isolation (bd-125)
 
 `pi-web-sessiond` runs inside a bubblewrap *mask*

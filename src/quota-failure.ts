@@ -21,6 +21,22 @@
  * Status codes and network-error signatures harvested from
  * @pedro_klein/pi-gateway's detect.ts.
  *
+ * A plan-gated 403 is the fifth mode: Command Code's subscription plans gate
+ * individual model ids, so a 403 body carries `MODEL_NOT_IN_PLAN` /
+ * `upgrade_required` / "not included in your plan" wording while the provider
+ * still serves everything else the caller's plan covers. It is classified as
+ * `unavailable` rather than `quota` on purpose: `spawn-with-fallback` cools a
+ * whole provider only for `quota`/`unconfigured`, and one gated id must not
+ * disable the entire Command Code bucket. See docs/commandcode-provider.md.
+ *
+ * A provider with no credential at all is the sixth mode: the pinned Command
+ * Code extension emits a statusless `message_end` error ("No Command Code API
+ * key. …") when nothing resolves to a key. Classifying that as `other` used to
+ * stop the fallback loop and fail the whole phase, even though the standard
+ * class primary lives on that provider and the key is deliberately per-host.
+ * It is `unconfigured`, a provider-scoped kind that is fallback-worthy and
+ * never counts as quota (no bucket was spent, no capacity window observed).
+ *
  * A quota failure's suggested cooldown is resolved by `resolveQuotaCooldown`: a
  * provider reset hint ("Resets in 7hr 57min") wins, provider subscription
  * usage-limit wording without a hint gets the long
@@ -38,6 +54,12 @@ export type FailureKind =
   | "transient"
   /** The model id is retired/unknown/not servable at this endpoint. */
   | "unavailable"
+  /**
+   * The provider has no credential configured at all, so none of its models can
+   * run. Provider-scoped (like `quota`) but deliberately not `quota`: no bucket
+   * was spent and no capacity window was observed.
+   */
+  | "unconfigured"
   | "auth"
   | "other";
 
@@ -47,7 +69,7 @@ export interface FailureClassification {
   model?: string;
   /** Human-readable reason for the classification. */
   reason?: string;
-  /** Suggested cooldown, when the kind is retryable elsewhere (quota/transient/unavailable). */
+  /** Suggested cooldown, when the kind is retryable elsewhere (quota/transient/unavailable/unconfigured). */
   cooldownSeconds?: number;
   /**
    * True when `cooldownSeconds` is an authoritative provider-supplied window
@@ -101,6 +123,17 @@ export const DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS = 10 * 60;
  * the entry expires and the model is probed again.
  */
 export const DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS = 6 * 60 * 60;
+/**
+ * Cooldown for a provider that has no credential configured.
+ *
+ * Provider-scoped because a missing key is a property of the provider, not of
+ * the model: no model on it can run, so cooling only the candidate would burn a
+ * spawn per sibling id in the same class. Short (the entitlement window's
+ * span) because the fix is an operator action — a key added to the service env
+ * or via `/login` must be picked up during the same working day, not after the
+ * six-hour model-unavailable window.
+ */
+export const DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS = 10 * 60;
 
 /** Status codes indicating a capacity/quota/credit/rate limit. */
 const QUOTA_STATUS_CODES = new Set([402, 429]);
@@ -108,8 +141,9 @@ const QUOTA_STATUS_CODES = new Set([402, 429]);
 const TRANSIENT_STATUS_CODES = new Set([408, 425, 500, 502, 503, 504]);
 /**
  * Status codes indicating an auth problem — not solved by switching models.
- * A 403 whose body carries provider-entitlement wording is handled as a
- * provider-scoped quota failure before this branch runs.
+ * A 403 whose body carries provider-entitlement or plan-gating wording is
+ * handled before this branch runs (as a provider-scoped quota failure and a
+ * model-scoped unavailable failure respectively).
  */
 const AUTH_STATUS_CODES = new Set([401, 403]);
 
@@ -179,6 +213,45 @@ const PROVIDER_ENTITLEMENT_PATTERN =
   /subscription|not subscribed|entitlement|required to use|upgrade/i;
 
 /**
+ * Plan-gating wording carried in 403 bodies: the caller's subscription does not
+ * include *this model*, while the rest of the provider's catalog is fine.
+ * Observed bodies from Command Code's Provider API (bd-178):
+ *
+ * - `403: {"error":{"code":"MODEL_NOT_IN_PLAN","message":"… is not included in your plan"}}`
+ * - `403: {"code":"upgrade_required","message":"Upgrade your plan"}`
+ *
+ * Must be checked BEFORE `PROVIDER_ENTITLEMENT_PATTERN`, which also matches
+ * "upgrade"/"subscription": a plan gate is model-scoped, so cooling the whole
+ * provider would throw away the ids the plan does serve.
+ */
+const MODEL_NOT_IN_PLAN_PATTERN =
+  /MODEL_NOT_IN_PLAN|upgrade_required|not included in (?:your|the) plan|plan (?:does not|doesn't) include/i;
+
+/**
+ * Statusless "no credential configured" wording. Two observed sources (bd-178):
+ *
+ * - The pinned Command Code extension, whose stream emits an assistant error
+ *   with no status code when nothing resolves to a key:
+ *   `No Command Code API key. Run /login and select Command Code, set
+ *   COMMAND_CODE_API_KEY (or legacy COMMANDCODE_API_KEY), or configure
+ *   ~/.commandcode/auth.json, ~/.pi/agent/auth.json or ~/.omp/agent/auth.json`
+ * - pi itself (1.0.2), which refuses to start before any stream exists when the
+ *   selected provider has no resolvable key: `No API key found for commandcode.`
+ *   on stderr, exit 1. That shape reaches `classifyProcessFailure`, so the
+ *   pattern is consulted on both the assistant error body and process stderr.
+ *
+ * The generic arms also cover a provider that reports the same condition under
+ * its own env var ("no API key found (set LLMGATEWAY_API_KEY …)"). They are
+ * matched only when the text carries NO status code, so a 401 "invalid api key"
+ * (a credentials problem that switching models cannot fix) stays `auth`. The
+ * `required` branch is deliberately broad — any statusless text that says an API
+ * key is required is treated as a provider with no key configured, because
+ * fallback is the safe response either way and no other kind covers it.
+ */
+const UNCONFIGURED_PROVIDER_PATTERN =
+  /(?:no|missing)\s+command\s*code\s+api\s*key|\bno api key (?:found|configured|set|available)\b|\bapi key (?:is )?(?:not set|not configured|missing|required)\b/i;
+
+/**
  * Classify a spawn result into one of the failure kinds.
  *
  * Pure — reads only the passed-in details and returns a value.
@@ -211,6 +284,12 @@ export function classifySpawnFailure(details: SpawnDetails): FailureClassificati
  * Classify a non-zero exit that produced no assistant error event, using the
  * stderr the child wrote. Signature-first: an exit code alone says nothing about
  * whether another candidate could succeed.
+ *
+ * pi refuses to start at all when the selected provider resolves to no key
+ * (`No API key found for <provider>.`, live on pi 1.0.2), and that refusal never
+ * reaches a model turn, so the assistant path's rules can only fire here. The
+ * no-key rule is therefore mirrored on the statusless stderr text; a
+ * status-coded line keeps a status classification instead.
  */
 function classifyProcessFailure(details: SpawnDetails): FailureClassification {
   const stderr = details.stderr ?? "";
@@ -241,6 +320,28 @@ function classifyProcessFailure(details: SpawnDetails): FailureClassification {
     };
   }
 
+  const status = extractStatusFromText(stderr);
+  // Same statusless-only discipline as `unconfiguredProviderRule`: a line that
+  // carries a code is an upstream rejection the status rules own, never a
+  // provider with no credential.
+  if (status === undefined && UNCONFIGURED_PROVIDER_PATTERN.test(stderr)) {
+    return {
+      kind: "unconfigured",
+      model,
+      reason: "Provider has no API key configured.",
+      cooldownSeconds: DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS,
+    };
+  }
+  // A status-coded startup refusal (401/403 in stderr) is a credential problem,
+  // not an unexplained failure: same stop verdict, accurate diagnosis.
+  if (status !== undefined && AUTH_STATUS_CODES.has(status)) {
+    return {
+      kind: "auth",
+      model,
+      reason: `Authentication/authorization failure (HTTP ${status}).`,
+    };
+  }
+
   return {
     kind: "other",
     reason: "Process exited non-zero without an assistant error event (startup or config failure).",
@@ -266,6 +367,19 @@ const quotaStatusRule: ClassificationRule = (status, errorMessage) => {
   };
 };
 
+/** A 403 saying this model is outside the caller's plan: endpoint-scoped skip. */
+const modelNotInPlanRule: ClassificationRule = (status, errorMessage) => {
+  if (status !== 403 || errorMessage === undefined) return undefined;
+  if (!MODEL_NOT_IN_PLAN_PATTERN.test(errorMessage)) return undefined;
+  // `unavailable`, not `quota`: spawn-with-fallback only cools the whole
+  // provider for `quota`, and one gated id must not disable the bucket.
+  return {
+    kind: "unavailable",
+    reason: "Model gated by the provider plan (HTTP 403).",
+    cooldownSeconds: DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
+  };
+};
+
 /** A 403 carrying subscription wording: the provider, not the credentials, is the problem. */
 const providerEntitlementRule: ClassificationRule = (status, errorMessage) => {
   if (status !== 403 || errorMessage === undefined) return undefined;
@@ -281,6 +395,20 @@ const providerEntitlementRule: ClassificationRule = (status, errorMessage) => {
 const authRule: ClassificationRule = (status) => {
   if (status === undefined || !AUTH_STATUS_CODES.has(status)) return undefined;
   return { kind: "auth", reason: `Authentication/authorization failure (HTTP ${status}).` };
+};
+
+/**
+ * A statusless "no API key configured" body: the provider cannot run any model,
+ * but a different provider can, so this must fall back instead of stopping.
+ */
+const unconfiguredProviderRule: ClassificationRule = (status, errorMessage) => {
+  if (status !== undefined || errorMessage === undefined) return undefined;
+  if (!UNCONFIGURED_PROVIDER_PATTERN.test(errorMessage)) return undefined;
+  return {
+    kind: "unconfigured",
+    reason: "Provider has no API key configured.",
+    cooldownSeconds: DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS,
+  };
 };
 
 /**
@@ -344,13 +472,17 @@ const gatewayRejectionRule: ClassificationRule = (status, errorMessage) => {
 
 /**
  * Ordered rules; the first match wins. Order matters: a quota status must beat
- * model wording (a 429 body can mention the model), and auth must beat
- * unavailable (a 403 body can mention a model name without it being retired).
+ * model wording (a 429 body can mention the model), a plan-gating 403 must beat
+ * the broader entitlement wording, and auth must beat unavailable (a 403 body
+ * can mention a model name without it being retired). The unconfigured rule is
+ * statusless-only, so it can never preempt a status-coded classification.
  */
 const CLASSIFICATION_RULES: readonly ClassificationRule[] = [
   quotaStatusRule,
+  modelNotInPlanRule,
   providerEntitlementRule,
   authRule,
+  unconfiguredProviderRule,
   modelUnavailableRule,
   transientStatusRule,
   networkErrorRule,
@@ -388,6 +520,7 @@ export function isFallbackWorthy(kind: FailureKind): boolean {
     case "quota":
     case "transient":
     case "unavailable":
+    case "unconfigured":
       return true;
     case "success":
     case "auth":
@@ -456,11 +589,10 @@ function lastAssistantMessage(messages: unknown[]): Record<string, unknown> | un
  * Extract an HTTP status from a message.
  *
  * Tried in order: a structured `errorStatus` field (number or numeric string),
- * an "NNN:" prefix on `errorMessage` ("429: {...}"), a status inside a short
- * human preamble ("Model response failed: 410: {...}"), a JSON `code`/`status`
- * field in the body, and finally any HTTP-ish code in the body. The generic last
- * resort matters because providers disagree about where the code lives, and a
- * missed code means the fallback loop cannot classify the failure at all.
+ * then the free-form `errorMessage` text (see {@link extractStatusFromText}).
+ * The generic last resort there matters because providers disagree about where
+ * the code lives, and a missed code means the fallback loop cannot classify the
+ * failure at all.
  */
 function extractStatus(msg: Record<string, unknown>): number | undefined {
   const errorStatus = msg.errorStatus;
@@ -471,18 +603,27 @@ function extractStatus(msg: Record<string, unknown>): number | undefined {
   }
 
   const errorMessage = msg.errorMessage;
-  if (typeof errorMessage !== "string") return undefined;
+  return typeof errorMessage === "string" ? extractStatusFromText(errorMessage) : undefined;
+}
 
-  const prefix = /^\s*(\d{3})\b/.exec(errorMessage);
+/**
+ * Extract an HTTP status from free-form error/stderr text: an "NNN:" prefix
+ * ("429: {...}"), a code inside a short human preamble ("Model response
+ * failed: 410: {...}"), a JSON `code`/`status` field, or any standalone
+ * `4xx`/`5xx` token. Shared by the assistant and process paths so a code pi
+ * writes to stderr is read the same way an error body's is.
+ */
+function extractStatusFromText(text: string): number | undefined {
+  const prefix = /^\s*(\d{3})\b/.exec(text);
   if (prefix?.[1] !== undefined) return Number(prefix[1]);
 
-  const preamble = /^[^"{}]{0,48}?\b(\d{3})\s*:/.exec(errorMessage);
+  const preamble = /^[^"{}]{0,48}?\b(\d{3})\s*:/.exec(text);
   if (preamble?.[1] !== undefined) return Number(preamble[1]);
 
-  const jsonField = /"(?:code|status)"\s*:\s*"?(\d{3})"?/.exec(errorMessage);
+  const jsonField = /"(?:code|status)"\s*:\s*"?(\d{3})"?/.exec(text);
   if (jsonField?.[1] !== undefined) return Number(jsonField[1]);
 
-  const anywhere = /\b([45]\d{2})\b/.exec(errorMessage);
+  const anywhere = /\b([45]\d{2})\b/.exec(text);
   if (anywhere?.[1] !== undefined) return Number(anywhere[1]);
 
   return undefined;

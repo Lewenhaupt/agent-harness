@@ -10,14 +10,24 @@
  * default primary (per-token billing) and mirrors every model id on the other
  * providers, so the first failover hop is the SAME model id on the alternate
  * provider — identical behavior, different credential/quota bucket.
- * `opencode-go` is the exception preferred provider for `deepseek-v4.1-flash`,
- * whose subscription bucket is far cheaper than per-token for that one model.
- * That model's wire id differs per provider too: opencode-go serves the bare
- * gateway slug, while the per-token gateways serve the pinned `-1017` build, so
- * the same canonical id never sends a retired slug to a provider that dropped
- * it (`PROVIDER_MODEL_IDS`).
- * `openrouter` carries the same models as a last-resort quota bucket, but under
- * vendor-qualified ids (e.g. `z-ai/glm-5.2`), mapped in `PROVIDER_MODEL_IDS`.
+ *
+ * Two models override that default:
+ *
+ * - `opencode-go` is preferred for `deepseek-v4.1-flash`, whose subscription
+ *   bucket is far cheaper than per-token for that one model. Its wire id differs
+ *   per provider too: opencode-go serves the bare gateway slug, while the
+ *   per-token gateways serve the pinned `-1017` build, so the same canonical id
+ *   never sends a retired slug to a provider that dropped it
+ *   (`PROVIDER_MODEL_IDS`).
+ * - `commandcode` (Command Code's Goat subscription, provider id
+ *   `commandcode`) is preferred for `glm-5.3-flash`, the standard class primary
+ *   that `belayd-reviewer` resolves to. Command Code serves it as
+ *   `z-ai/glm-5.3-flash`, which its plan does not gate. See
+ *   docs/commandcode-provider.md.
+ *
+ * Otherwise the order is per-token gateway, then the two subscription buckets,
+ * then `openrouter` as a last-resort quota bucket under vendor-qualified ids
+ * (e.g. `z-ai/glm-5.2`), mapped in `PROVIDER_MODEL_IDS`.
  */
 
 export type ModelClass = "frontier" | "standard" | "fast";
@@ -39,6 +49,7 @@ export type AgentModelSpec =
 export const DEFAULT_PROVIDER_PREFERENCE: readonly string[] = [
   "llmgateway",
   "opencode-go",
+  "commandcode",
   "openrouter",
 ];
 
@@ -58,6 +69,14 @@ export const PROVIDER_PREFERENCE: readonly string[] = DEFAULT_PROVIDER_PREFERENC
 const SUBSCRIPTION_PREFERRED_MODEL = "deepseek-v4.1-flash";
 
 /**
+ * The model whose Command Code (Goat) subscription is cheaper and
+ * plan-eligible, so the subscription becomes its primary bucket. Named once so
+ * the class spec, the class lookup and the provider override below cannot drift
+ * apart — the same reason `SUBSCRIPTION_PREFERRED_MODEL` exists.
+ */
+const COMMANDCODE_PREFERRED_MODEL = "glm-5.3-flash";
+
+/**
  * The pinned DeepSeek V4.1 Flash build the per-token gateways serve. The
  * unversioned slug above is deprecated on llmgateway, while opencode-go's catalog
  * lists only that bare slug (it does not serve the pinned build) — so the build id
@@ -67,27 +86,42 @@ const SUBSCRIPTION_PREFERRED_MODEL = "deepseek-v4.1-flash";
 const DEEPSEEK_FLASH_PINNED_BUILD = "deepseek-v4.1-flash-1017";
 
 /**
- * Per-model provider overrides. opencode-go's plan gives that subscription-
- * preferred model generous headroom, so the subscription bucket is reserved for
- * it; every other model bills per-token and stays on llmgateway. Values must
+ * Per-model provider overrides. opencode-go's plan gives `deepseek-v4.1-flash`
+ * generous headroom, and Command Code's Goat plan serves `glm-5.3-flash`
+ * without plan gating, so each subscription bucket is reserved for its own
+ * model; every other model bills per-token and stays on llmgateway. Values must
  * stay a permutation of `DEFAULT_PROVIDER_PREFERENCE` (asserted in the tests):
  * the same provider set, only reordered, so no model loses a failover bucket.
  * Exported so the tests can assert over the override keys themselves and catch
  * an override for a model that is not in a class spec.
  */
 export const MODEL_PROVIDER_PREFERENCE: Readonly<Record<string, readonly string[]>> = {
-  [SUBSCRIPTION_PREFERRED_MODEL]: ["opencode-go", "llmgateway", "openrouter"],
+  [SUBSCRIPTION_PREFERRED_MODEL]: ["opencode-go", "llmgateway", "commandcode", "openrouter"],
+  [COMMANDCODE_PREFERRED_MODEL]: ["commandcode", "llmgateway", "opencode-go", "openrouter"],
 };
 
 /**
  * Provider-specific model ids. Most providers accept the canonical bare id.
- * OpenRouter only serves vendor-qualified ids (`provider/<suffix>`), and
- * llmgateway serves a pinned build for DeepSeek's flash model. The first entry
- * is the id pi must send; trailing entries are other wire ids the provider has
- * served for the same model, kept in the reverse direction so a marker written
- * before a build swap (`canonicalModelId`) still resolves to its class.
+ * OpenRouter serves only vendor-qualified ids (`provider/<suffix>`), and
+ * llmgateway serves a pinned build for DeepSeek's flash model. Command Code uses
+ * its own vendor prefixes for most families, verified against its live anonymous
+ * catalog (`GET https://api.commandcode.ai/provider/v1/models`, bd-178), and
+ * deliberately maps only ids whose canonical model is already in
+ * `MODEL_CLASS_SPECS`; its prefixes and casing differ per family
+ * (`z-ai/glm-5.3-flash`, `zai-org/GLM-5.3`), and `gpt-5.6-luna` is served bare,
+ * so it needs no entry. The first entry is the id pi must send; trailing entries
+ * are other wire ids the provider has served for the same model, kept in the
+ * reverse direction so a marker written before a build swap (`canonicalModelId`)
+ * still resolves to its class.
  */
 const PROVIDER_MODEL_IDS: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>> = {
+  commandcode: {
+    [SUBSCRIPTION_PREFERRED_MODEL]: ["deepseek/deepseek-v4.1-flash"],
+    "deepseek-v4-flash": ["deepseek/deepseek-v4-flash"],
+    "glm-5.3": ["zai-org/GLM-5.3"],
+    [COMMANDCODE_PREFERRED_MODEL]: ["z-ai/glm-5.3-flash"],
+    "mimo-v2.6-flash": ["xiaomi/mimo-v2.6-flash"],
+  },
   llmgateway: {
     [SUBSCRIPTION_PREFERRED_MODEL]: [DEEPSEEK_FLASH_PINNED_BUILD],
   },
@@ -254,7 +288,9 @@ export function primaryModelOf(modelClass: ModelClass): string {
   if (provider === undefined || primaryId === undefined) {
     throw new Error(`model class ${modelClass} has no primary model`);
   }
-  return `${provider}/${primaryId}`;
+  // Via `providerModelId`: the primary must be a spawnable id, and Command Code
+  // serves `glm-5.3-flash` under its vendor-qualified spelling.
+  return `${provider}/${providerModelId(provider, primaryId)}`;
 }
 
 /** Resolve a spec into the concrete spawn pair (model + optional class). */

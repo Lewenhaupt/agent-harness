@@ -757,6 +757,65 @@ Named tests: `src/__tests__/quota-failure.test.ts` →
 `src/__tests__/spawn-with-fallback.test.ts` →
 `cools the provider for hours, so 15 minutes later it is still skipped`.
 
+### Provider without a key: `unconfigured` (bd-178)
+
+A provider whose credential is absent fails every one of its models the same
+way. In production the failure happens before the extension's stream exists: on
+pi 1.0.2 the child process exits 1 with `No API key found for <provider>.` on
+stderr and zero assistant turns, so `classifySpawnFailure` takes its **process**
+path. In-process, the pinned Command Code extension reports the same condition as
+a statusless assistant error ("No Command Code API key. Run /login …"). Both
+used to fall through to `other`, which stops the fallback and fails the phase —
+even though the standard class primary (`commandcode/z-ai/glm-5.3-flash`) is on
+that provider and the key is deliberately per-host
+(`docs/pi-web-service.md`).
+
+What changed:
+
+- **New `FailureKind`: `unconfigured`.** Matched only on text with **no** status
+  code — the assistant-path error body *and* the process-path stderr (pi's
+  startup refusal) — so a 401/403 "invalid api key" stays `auth` and a 429 stays
+  `quota`.
+- **Provider-scoped, but not quota.** `recordCooldown`'s provider scope is now
+  selected by `quota` OR `unconfigured` (`isProviderScopedFailure`): a missing
+  key disables every model on the provider, so cooling one endpoint would burn a
+  wasted spawn per sibling. It stays out of `quota` so `recordCapacityFromFailure`
+  and the telemetry `quotaFailures` counter never see it.
+- **Excluded from the capacity probe.** `recordCooldown` also stores a stable
+  `cause` tag on the provider entry (`quota` | `unconfigured`,
+  `ProviderCooldownCause` in `src/model-cooldown.ts`), and
+  `probeFromCooldownStore` filters `unconfigured` entries out
+  (`isCapacityCause`, `src/capacity-cache.ts`). Otherwise the 10-minute window
+  would surface as a capacity window, make `isModelExhausted(commandcode/…)`
+  true, and let the all-exhausted fast-fail report "out of capacity, retrying
+  after reset" for what is a configuration error. An entry with no tag (legacy
+  file) still counts as capacity, because `quota` was the only provider-scoped
+  cause before the tag existed.
+- **Short, expiring window.** `DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS`
+  (10 min) because the fix is an operator action (`COMMAND_CODE_API_KEY` in the
+  service env, or `/login`). The provider entry expires, so a key added later is
+  picked up without editing `~/.pi/agent/model-cooldowns.json`; a repeated
+  unconfigured mark escalates like any other unhinted provider guess, capped by
+  `MAX_ESCALATED_COOLDOWN_SECONDS`.
+
+Named tests: `src/__tests__/quota-failure.test.ts` →
+`classifies the extension's no-key message as provider-scoped unconfigured`,
+`classifies pi's no-key startup refusal as unconfigured (bd-178)`,
+`classifies generic no-key wording from other providers`,
+`keeps a status-coded credential failure on the status rule`,
+`keeps status-coded process stderr on its status rule`,
+`leaves an unrelated statusless failure as other`;
+`src/__tests__/capacity-cache.test.ts` →
+`keeps an unconfigured provider out of the capacity signal (bd-178)`,
+`keeps a tagged entry from a legacy-shaped providers map out of the signal`,
+`keeps an unconfigured cooldown written by another member out of the signal`,
+`treats an entry without a cause tag as capacity (legacy files)`; and
+`src/__tests__/spawn-with-fallback.test.ts` →
+`end-to-end: an unkeyed Command Code provider degrades to llmgateway`,
+`end-to-end: pi's process-path no-key refusal degrades to llmgateway (bd-178)`,
+`terminates and surfaces the trail when every hop has no key (bd-178)`,
+`reports a missing key as the skip cause, not a quota failure (bd-178)`.
+
 ### 4. Telemetry artifacts: `.belayd/telemetry.json`
 
 Path: `<repo-cwd>/.belayd/telemetry.json` (gitignored; `modelTelemetryPath(cwd)`).
@@ -893,10 +952,12 @@ scout	attempts=2	fallbacks=0	noops=1	cost=$0.0140
 `quotaFailures` says *why* the fallbacks happened: a phase whose `fallbacks`
 are almost all explained by `quotaFailures` is fighting provider limits (the
 pre-dispatch check plus the tuned class are the levers); fallbacks with zero
-`quotaFailures` mean model-level failures (auth, transient, unavailable,
-"other") where the class routing, not capacity, is the lever. A fallback trail
-showing `(unavailable)` means a candidate id is retired at that endpoint — swap
-it in `MODEL_CLASS_SPECS` rather than waiting for the cooldown.
+`quotaFailures` mean model- or credential-level failures (transient,
+unavailable, unconfigured, "other") where the class routing, not capacity, is
+the lever. A fallback trail showing `(unavailable)` means a candidate id is
+retired at that endpoint — swap it in `MODEL_CLASS_SPECS` rather than waiting
+for the cooldown; `(unconfigured)` means that provider has no key and the phase
+degraded to the next provider.
 
 **Which candidate actually absorbs the work?** Group by model to see whether the
 class primary is really the one doing the work:

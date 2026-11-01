@@ -17,24 +17,37 @@ Unknown explicit models have no class-derived fallback. The valid tiers are
 `frontier`, `standard`, and `fast`.
 
 Provider preference is per model, not global: `DEFAULT_PROVIDER_PREFERENCE`
-orders the gateways `llmgateway`, `opencode-go`, `openrouter`, and
+orders the gateways `llmgateway`, `opencode-go`, `commandcode`, `openrouter`, and
 `MODEL_PROVIDER_PREFERENCE` overrides that for models whose subscription bucket
-is cheaper. Today the only override is `deepseek-v4.1-flash`, which prefers
-`opencode-go` first; every other model bills per-token and stays on
-`llmgateway`. `providerPreferenceFor(modelId)` resolves the effective order
-(canonicalizing provider-qualified ids first).
+is cheaper. There are two overrides today:
+
+- `deepseek-v4.1-flash` prefers `opencode-go` first (its subscription bucket is
+  far cheaper for that one model), then `llmgateway`, `commandcode`, `openrouter`;
+- `glm-5.3-flash` — the `standard` class primary — prefers `commandcode` first
+  (Command Code's Goat plan serves it as `z-ai/glm-5.3-flash`, which is not
+  plan-gated), then `llmgateway`, `opencode-go`, `openrouter`.
+
+Every other model bills per-token and stays on `llmgateway`, with the two
+subscription buckets as the next hops and `openrouter` last.
+`providerPreferenceFor(modelId)` resolves the effective order (canonicalizing
+provider-qualified ids first).
 
 That canonical id is also the one whose wire id differs per provider: `llmgateway`
 deprecated the unversioned `deepseek-v4.1-flash` slug in favour of the pinned
-`deepseek-v4.1-flash-1017` build, and `opencode-go`'s catalog lists only the bare
-slug (it does not serve the pinned build). `PROVIDER_MODEL_IDS` remaps it per
-provider — `opencode-go` gets the bare slug, `llmgateway` gets
-`deepseek-v4.1-flash-1017`, `openrouter` gets
-`deepseek/deepseek-v4.1-flash-1017` — so a frontier candidate list reads
+`deepseek-v4.1-flash-1017` build, `opencode-go`'s catalog lists only the bare
+slug (it does not serve the pinned build), and Command Code serves it as
+`deepseek/deepseek-v4.1-flash`. `PROVIDER_MODEL_IDS` remaps it per provider —
+`opencode-go` gets the bare slug, `llmgateway` gets `deepseek-v4.1-flash-1017`,
+OpenRouter gets `deepseek/deepseek-v4.1-flash-1017`, Command Code gets
+`deepseek/deepseek-v4.1-flash` — so a frontier candidate list reads
 `opencode-go/deepseek-v4.1-flash`, `llmgateway/deepseek-v4.1-flash-1017`,
+`commandcode/deepseek/deepseek-v4.1-flash`,
 `openrouter/deepseek/deepseek-v4.1-flash-1017`. Canonicalization
-(`canonicalModelId`) maps both spellings back to `deepseek-v4.1-flash` so class
-lookup and same-model failover partitioning are unaffected.
+(`canonicalModelId`) maps every spelling back to `deepseek-v4.1-flash` so class
+lookup and same-model failover partitioning are unaffected. Command Code's
+vendor prefixes differ per family (`z-ai/glm-5.3-flash`,
+`zai-org/GLM-5.3`, `xiaomi/mimo-v2.6-flash`; `gpt-5.6-luna` is bare); the
+canonical ↔ wire table lives in docs/commandcode-provider.md.
 
 ## How to Verify
 
@@ -43,7 +56,7 @@ Run these commands from the repository root. Run each command to completion:
 1. ```bash
    pnpm test
    ```
-   Expected: 3251 unit tests in 124 files pass; Vitest exits with status 0.
+   Expected: 3446 unit tests in 130 files pass; Vitest exits with status 0.
    This includes
    the model-class, agent-registry, spawn-fallback, and extension
    phase-threading tests, plus the bd-142 classification cases
@@ -51,12 +64,13 @@ Run these commands from the repository root. Run each command to completion:
    `falls back on a deactivated model (410) and cools only that endpoint`).
    The model-class suite also pins the per-provider wire id split: opencode-go
    keeps `deepseek-v4.1-flash` while llmgateway/openrouter send the pinned
-   `deepseek-v4.1-flash-1017` build.
+   `deepseek-v4.1-flash-1017` build; Command Code sends
+   `deepseek/deepseek-v4.1-flash`.
 
 2. ```bash
    pnpm test:integration
    ```
-   Expected: 106 integration tests in 14 files pass and Vitest exits with
+   Expected: 108 integration tests in 14 files pass and Vitest exits with
    status 0.
 
 3. ```bash
@@ -103,7 +117,7 @@ Expected behavior:
   | `belayd-scout` | `fast` → `llmgateway/mimo-v2.6-flash` |
   | `belayd-planner` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-implementer` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
-  | `belayd-reviewer` | `standard` → `llmgateway/glm-5.3-flash` |
+  | `belayd-reviewer` | `standard` → `commandcode/z-ai/glm-5.3-flash` |
   | `belayd-tester` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-userguide` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
   | `belayd-proof-generator` | `frontier` → `opencode-go/deepseek-v4.1-flash` |
@@ -118,34 +132,42 @@ The tier-to-primary mapping used by `primaryModelOf` is:
 | `modelClass` | Primary model |
 | --- | --- |
 | `frontier` | `opencode-go/deepseek-v4.1-flash` |
-| `standard` | `llmgateway/glm-5.3-flash` |
+| `standard` | `commandcode/z-ai/glm-5.3-flash` |
 | `fast` | `llmgateway/mimo-v2.6-flash` |
 
-Only `frontier` stays on the opencode-go subscription: its primary is the one
-model the subscription is cheap for. Every other class bills per-token on
-`llmgateway`, which makes opencode-go only the second hop for their own models
-and puts the `deepseek-v4.1-flash` group — led by
+`primaryModelOf` resolves the first-preference provider *and* that provider's
+wire id, so the standard primary is the spawnable
+`commandcode/z-ai/glm-5.3-flash` rather than the canonical `glm-5.3-flash` slug.
+
+The `frontier` class stays on the opencode-go subscription because its primary
+is the one model that subscription is cheap for. The `standard` class moved onto
+the Command Code (Goat) subscription when `glm-5.3-flash` began preferring it:
+its primary is the reviewer's model, and Goat serves it without gating. `fast`
+bills per-token on `llmgateway`, which makes both subscriptions later hops for
+its own models and puts the `deepseek-v4.1-flash` group — led by
 `opencode-go/deepseek-v4.1-flash` — at the end of each non-frontier class's
 candidate list.
 
 - On a quota, transient, or model-unavailable failure, the next attempt stays
   within that class: the same model on each alternate provider (in that
   model's `providerPreferenceFor` order — for `deepseek-v4.1-flash`
-  `opencode-go`, then `llmgateway`, then `openrouter`; for every other model
-  `llmgateway`, then `opencode-go`, then `openrouter`) is preferred before
-  another model in the class. OpenRouter
-  serves the same models under vendor-qualified ids (`glm-5.3-flash` →
-  `z-ai/glm-5.3-flash`, `mimo-v2.6-flash` → `xiaomi/mimo-v2.6-flash`,
-  `gpt-5.6-luna` → `openai/gpt-5.6-luna`, `deepseek-v4.1-flash` →
-  `deepseek/deepseek-v4.1-flash-1017`), so a candidate looks like
-  `openrouter/z-ai/glm-5.3-flash`. A successful result may include a trailing
-  `[belayd model fallback] ...` note showing the attempted models. With no
-  failure, no fallback note is added.
-- The failure kinds that trigger fallback are exactly `quota`, `transient`, and
-  `unavailable` (`isFallbackWorthy`). `unavailable` covers a model id the
-  endpoint refuses as retired or unknown — HTTP 404/410, or wording such as
-  "has been deactivated and is no longer available", "Requested model X not
-  supported", "X is not a valid model ID" — and is cooled down **per
+  `opencode-go`, then `llmgateway`, then `commandcode`, then `openrouter`; for
+  `glm-5.3-flash` `commandcode`, then `llmgateway`, then `opencode-go`, then
+  `openrouter`; for every other model `llmgateway`, then `opencode-go`, then
+  `commandcode`, then `openrouter`) is preferred before another model in the
+  class. OpenRouter serves the same models under vendor-qualified ids
+  (`glm-5.3-flash` → `z-ai/glm-5.3-flash`, `mimo-v2.6-flash` →
+  `xiaomi/mimo-v2.6-flash`, `gpt-5.6-luna` → `openai/gpt-5.6-luna`,
+  `deepseek-v4.1-flash` → `deepseek/deepseek-v4.1-flash-1017`), and Command Code
+  under its own (`commandcode/z-ai/glm-5.3-flash`), so a candidate looks like
+  `openrouter/z-ai/glm-5.3-flash` or `commandcode/z-ai/glm-5.3-flash`. A
+  successful result may include a trailing `[belayd model fallback] ...` note
+  showing the attempted models. With no failure, no fallback note is added.
+- The failure kinds that trigger fallback are exactly `quota`, `transient`,
+  `unavailable`, and `unconfigured` (`isFallbackWorthy`). `unavailable` covers a
+  model id the endpoint refuses as retired or unknown — HTTP 404/410, or wording
+  such as "has been deactivated and is no longer available", "Requested model X
+  not supported", "X is not a valid model ID" — and is cooled down **per
   endpoint** (never per provider: the same bare id is usually still served by
   another gateway) for six hours. It exists because provider catalogs go stale:
   `mimo-v2.5` stayed in pi's cached `opencode-go` catalog after the gateway
@@ -158,11 +180,31 @@ candidate list.
   and the fallback continues to the alternate provider for the same model. A
   bare 401/403 (a credentials problem) still stops the fallback rather than
   switching models.
+- A **plan-gated** 403 — Command Code's `MODEL_NOT_IN_PLAN` / `upgrade_required`
+  / "not included in your plan" bodies — is the opposite scope: it becomes
+  `unavailable`, cooled **per endpoint** for six hours, so only that model id is
+  skipped and the rest of the Command Code bucket keeps serving other models.
+  It is matched before the broader entitlement wording, which would otherwise
+  cool the whole provider. See docs/commandcode-provider.md.
+- An **unkeyed** provider — in production pi's own startup refusal
+  (`No API key found for <provider>.` on stderr, exit 1, zero assistant turns),
+  or in-process the statusless "No Command Code API key. Run /login …" error,
+  or generic "no API key" wording without a status code — becomes
+  `unconfigured`: fallback-worthy and cooled **per provider** (a missing key
+  disables every model on it) for ten minutes, but never counted as `quota`. The
+  provider entry carries a stable `cause` tag and `probeFromCooldownStore` filters
+  `unconfigured` entries out (`isCapacityCause`, `src/capacity-cache.ts`), so the
+  configuration error never masquerades as spent capacity. This is why a host
+  that deliberately keeps `COMMAND_CODE_API_KEY` out of the deployment env still
+  runs the `standard` class: the reviewer logs one `unconfigured` attempt and the
+  phase continues on `llmgateway/glm-5.3-flash`. A status-coded 401/403 "invalid
+  api key" stays `auth` and still stops. See docs/commandcode-provider.md.
 - When the child process fails without an assistant error event, the exit code
   and stderr are classified by the same signatures: a network error is
   `transient`, retired-model wording is `unavailable`, quota wording is `quota`,
-  and anything else stays `other` (a genuine startup/config failure, which
-  must not be hidden by switching models).
+  and statusless no-key wording (pi's startup refusal) is `unconfigured`. A
+  401/403 in the stderr text is `auth`, and anything else stays `other` (a
+  genuine startup/config failure, which must not be hidden by switching models).
 - Inspect persistent sub-agent sessions, if needed, with:
 
   ```bash
@@ -171,18 +213,24 @@ candidate list.
 
 ### Consequences of the per-model preference
 
-- **Provider-scoped failures overflow onto the subscription.** Cooldowns
+- **Provider-scoped failures overflow onto the other subscriptions.** Cooldowns
   (`src/model-cooldown.ts`) and the capacity cache both work per provider, so a
-  single llmgateway 429 moves **every** non-DeepSeek phase onto opencode-go and
-  spends the subscription bucket on glm/mimo work. That overflow is accepted
-  for now; guarding it would mean an opencode-go restriction on models other
-  than `deepseek-v4.1-flash`.
-- **Cost moves onto the meter** for every non-DeepSeek phase.
+  single llmgateway 429 moves **every** phase onto opencode-go and then Command
+  Code, spending subscription buckets on models their plans may not include.
+  That overflow is accepted; the plan-gated ids are then refused per endpoint
+  (see above) and the chain continues to OpenRouter.
+- **Cost moves onto the subscriptions** for the two preferred models.
   `.belayd/telemetry.json` records per-`(phase, model)` rows, so the delta is
-  measurable after one workflow run.
-- **A llmgateway stall lands on the generous bucket**, not on another per-token
-  model: the `deepseek-v4.1-flash` group leads with
-  `opencode-go/deepseek-v4.1-flash` and sits last in every non-frontier class.
+  measurable after one workflow run. Command Code cost rows come from the
+  extension's static price table with DeepSeek peak/off-peak bands applied at
+  request time, so values vary by hour — expected.
+- **The reviewer is now on Goat.** `belayd-reviewer` declares `standard`, whose
+  primary is `commandcode/z-ai/glm-5.3-flash`, so review turns spend the $20/5h
+  and $50/week caps first. When those stall, the same model still has
+  llmgateway, opencode-go, and OpenRouter hops — degradation, not failure.
+- **A llmgateway stall lands on a subscription bucket**, not on another per-token
+  model: `deepseek-v4.1-flash` leads with `opencode-go/deepseek-v4.1-flash` and
+  `glm-5.3-flash` leads with `commandcode/z-ai/glm-5.3-flash`.
 
 To verify a workflow model override, use a fresh task with a workflow that has
 one. For example:
@@ -250,7 +298,7 @@ primaryModelOf("fast");
 // "llmgateway/mimo-v2.6-flash"
 
 resolveModelSpec({ modelClass: "standard" });
-// { model: "llmgateway/glm-5.3-flash", modelClass: "standard" }
+// { model: "commandcode/z-ai/glm-5.3-flash", modelClass: "standard" }
 
 resolveModelSpec({ model: "vendor/x" });
 // { model: "vendor/x", modelClass: undefined }
@@ -264,10 +312,13 @@ const candidates = candidatesForModel("opencode-go/glm-5.3", "fast");
 //   "opencode-go/glm-5.3",        // requested model always comes first
 //   "llmgateway/mimo-v2.6-flash",
 //   "opencode-go/mimo-v2.6-flash",
+//   "commandcode/xiaomi/mimo-v2.6-flash",
 //   "openrouter/xiaomi/mimo-v2.6-flash",
 //   "llmgateway/deepseek-v4-flash",
 //   "opencode-go/deepseek-v4-flash",
+//   "commandcode/deepseek/deepseek-v4-flash",
 //   "openrouter/deepseek/deepseek-v4-flash",
+//   "commandcode/z-ai/glm-5.3-flash",
 //   "llmgateway/glm-5.3-flash",
 //   "opencode-go/glm-5.3-flash",
 //   "openrouter/z-ai/glm-5.3-flash",

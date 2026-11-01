@@ -65,6 +65,22 @@ describe("canonicalModelId", () => {
     );
   });
 
+  it("maps Command Code's wire ids back to their canonical id", () => {
+    // bd-178: Command Code serves the same catalog under its own spellings —
+    // vendor-qualified lowercase for GLM Flash and the DeepSeek/MiMo families,
+    // and an upper-cased `zai-org/` slug for the non-Flash GLM. Canonical
+    // resolution keeps class lookup and same-id failover grouping intact.
+    expect(canonicalModelId("commandcode/z-ai/glm-5.3-flash")).toBe("glm-5.3-flash");
+    expect(canonicalModelId("commandcode/zai-org/GLM-5.3")).toBe("glm-5.3");
+    expect(canonicalModelId("commandcode/deepseek/deepseek-v4.1-flash")).toBe(
+      "deepseek-v4.1-flash",
+    );
+    expect(canonicalModelId("commandcode/deepseek/deepseek-v4-flash")).toBe("deepseek-v4-flash");
+    expect(canonicalModelId("commandcode/xiaomi/mimo-v2.6-flash")).toBe("mimo-v2.6-flash");
+    // Command Code serves the bare `gpt-5.6-luna` id, so no aliasing is needed.
+    expect(canonicalModelId("commandcode/gpt-5.6-luna")).toBe("gpt-5.6-luna");
+  });
+
   it("behaves like bareModelId for providers without aliases", () => {
     expect(canonicalModelId("opencode-go/mimo-v2.6-flash")).toBe("mimo-v2.6-flash");
     expect(canonicalModelId("llmgateway/glm-5.2")).toBe("glm-5.2");
@@ -89,6 +105,13 @@ describe("modelClassOf", () => {
     expect(modelClassOf("openrouter/xiaomi/mimo-v2.6-flash")).toBe("fast");
   });
 
+  it("resolves a class from a Command Code vendor-qualified id", () => {
+    expect(modelClassOf("commandcode/z-ai/glm-5.3-flash")).toBe("standard");
+    expect(modelClassOf("commandcode/zai-org/GLM-5.3")).toBe("frontier");
+    expect(modelClassOf("commandcode/deepseek/deepseek-v4.1-flash")).toBe("frontier");
+    expect(modelClassOf("commandcode/xiaomi/mimo-v2.6-flash")).toBe("fast");
+  });
+
   it("resolves a class from a bare id", () => {
     expect(modelClassOf("mimo-v2.6-flash")).toBe("fast");
     expect(modelClassOf("glm-5.3")).toBe("frontier");
@@ -104,10 +127,13 @@ describe("resolveModelCandidates", () => {
     expect(resolveModelCandidates("fast")).toEqual([
       "llmgateway/mimo-v2.6-flash",
       "opencode-go/mimo-v2.6-flash",
+      "commandcode/xiaomi/mimo-v2.6-flash",
       "openrouter/xiaomi/mimo-v2.6-flash",
       "llmgateway/deepseek-v4-flash",
       "opencode-go/deepseek-v4-flash",
+      "commandcode/deepseek/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
+      "commandcode/z-ai/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
       "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
@@ -121,14 +147,17 @@ describe("resolveModelCandidates", () => {
     // A regression that applied the override globally (or lost it) shows up
     // here as a reordered block, not just a changed primary.
     expect(resolveModelCandidates("standard")).toEqual([
+      "commandcode/z-ai/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
       "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
       "llmgateway/gpt-5.6-luna",
       "opencode-go/gpt-5.6-luna",
+      "commandcode/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
       "opencode-go/deepseek-v4.1-flash",
       "llmgateway/deepseek-v4.1-flash-1017",
+      "commandcode/deepseek/deepseek-v4.1-flash",
       "openrouter/deepseek/deepseek-v4.1-flash-1017",
     ]);
   });
@@ -163,14 +192,17 @@ describe("resolveModelCandidates", () => {
   it("keeps the same model id adjacent across providers", () => {
     const candidates = resolveModelCandidates("frontier");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
-    // The subscription provider keeps the bare slug; the per-token gateways
+    // The subscription providers keep the bare slug; the per-token gateways
     // send the pinned build the deprecated slug routes to.
     expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash-1017");
-    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
+    expect(candidates[2]).toBe("commandcode/deepseek/deepseek-v4.1-flash");
+    expect(candidates[3]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
     // The non-DeepSeek frontier models flip to the llmgateway-first default.
-    expect(candidates[3]).toBe("llmgateway/glm-5.3");
-    expect(candidates[4]).toBe("opencode-go/glm-5.3");
-    expect(candidates[5]).toBe("openrouter/z-ai/glm-5.3");
+    expect(candidates[4]).toBe("llmgateway/glm-5.3");
+    expect(candidates[5]).toBe("opencode-go/glm-5.3");
+    // Command Code spellings differ per vendor prefix and case.
+    expect(candidates[6]).toBe("commandcode/zai-org/GLM-5.3");
+    expect(candidates[7]).toBe("openrouter/z-ai/glm-5.3");
   });
 });
 
@@ -179,11 +211,13 @@ describe("providerPreferenceFor", () => {
     expect(providerPreferenceFor("deepseek-v4.1-flash")).toEqual([
       "opencode-go",
       "llmgateway",
+      "commandcode",
       "openrouter",
     ]);
     expect(providerPreferenceFor("opencode-go/deepseek-v4.1-flash")).toEqual([
       "opencode-go",
       "llmgateway",
+      "commandcode",
       "openrouter",
     ]);
     // Canonical resolution: OpenRouter's vendor-qualified spelling hits the
@@ -191,19 +225,56 @@ describe("providerPreferenceFor", () => {
     expect(providerPreferenceFor("openrouter/deepseek/deepseek-v4.1-flash")).toEqual([
       "opencode-go",
       "llmgateway",
+      "commandcode",
+      "openrouter",
+    ]);
+  });
+
+  it("keeps glm-5.3-flash on the Command Code subscription first (bd-178)", () => {
+    // The standard class primary — and therefore belayd-reviewer — moves onto
+    // the Goat subscription. Command Code serves the model (as
+    // `z-ai/glm-5.3-flash`) and that id is not Goat-gated.
+    expect(providerPreferenceFor("glm-5.3-flash")).toEqual([
+      "commandcode",
+      "llmgateway",
+      "opencode-go",
+      "openrouter",
+    ]);
+    // Canonical resolution through Command Code's own wire id hits the same
+    // override.
+    expect(providerPreferenceFor("commandcode/z-ai/glm-5.3-flash")).toEqual([
+      "commandcode",
+      "llmgateway",
+      "opencode-go",
       "openrouter",
     ]);
   });
 
   it("defaults every other model to llmgateway first", () => {
+    const overridden = new Set(Object.keys(MODEL_PROVIDER_PREFERENCE));
     for (const spec of Object.values(MODEL_CLASS_SPECS)) {
       for (const id of spec.models) {
-        if (id === "deepseek-v4.1-flash") continue;
+        if (overridden.has(id)) continue;
         expect(providerPreferenceFor(id)[0], id).toBe("llmgateway");
       }
     }
-    expect(providerPreferenceFor("glm-5.3-flash")).toEqual(DEFAULT_PROVIDER_PREFERENCE);
     expect(providerPreferenceFor("unknown/x")).toEqual(DEFAULT_PROVIDER_PREFERENCE);
+  });
+
+  it("lists each provider at most once in every preference order", () => {
+    // The permutation sweep compares each list against the default, so a
+    // duplicated provider (say commandcode twice) would be self-consistent
+    // there while spending two hops on one bucket and dropping another. Check
+    // the lists themselves for duplicates, and that the default still carries
+    // all four providers.
+    const lists: Array<[string, readonly string[]]> = [
+      ["default", DEFAULT_PROVIDER_PREFERENCE],
+      ...Object.entries(MODEL_PROVIDER_PREFERENCE),
+    ];
+    for (const [name, providers] of lists) {
+      expect(new Set(providers).size, name).toBe(providers.length);
+    }
+    expect(new Set(DEFAULT_PROVIDER_PREFERENCE).size).toBe(4);
   });
 
   it("keeps every override a permutation of the default provider set", () => {
@@ -239,7 +310,8 @@ describe("candidatesForModel", () => {
     const candidates = candidatesForModel("opencode-go/deepseek-v4.1-flash");
     expect(candidates[0]).toBe("opencode-go/deepseek-v4.1-flash");
     expect(candidates[1]).toBe("llmgateway/deepseek-v4.1-flash-1017");
-    expect(candidates[2]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
+    expect(candidates[2]).toBe("commandcode/deepseek/deepseek-v4.1-flash");
+    expect(candidates[3]).toBe("openrouter/deepseek/deepseek-v4.1-flash-1017");
   });
 
   it("groups OpenRouter's vendor-qualified id with the same model", () => {
@@ -249,7 +321,8 @@ describe("candidatesForModel", () => {
     const candidates = candidatesForModel("opencode-go/glm-5.3");
     expect(candidates[0]).toBe("opencode-go/glm-5.3");
     expect(candidates[1]).toBe("llmgateway/glm-5.3");
-    expect(candidates[2]).toBe("openrouter/z-ai/glm-5.3");
+    expect(candidates[2]).toBe("commandcode/zai-org/GLM-5.3");
+    expect(candidates[3]).toBe("openrouter/z-ai/glm-5.3");
   });
 
   it("does not duplicate the requested model", () => {
@@ -293,26 +366,32 @@ describe("candidatesForModel", () => {
       "glm-5.3",
       "llmgateway/glm-5.3",
       "opencode-go/glm-5.3",
+      "commandcode/zai-org/GLM-5.3",
       "openrouter/z-ai/glm-5.3",
       "opencode-go/deepseek-v4.1-flash",
       "llmgateway/deepseek-v4.1-flash-1017",
+      "commandcode/deepseek/deepseek-v4.1-flash",
       "openrouter/deepseek/deepseek-v4.1-flash-1017",
       "llmgateway/gpt-5.6-luna",
       "opencode-go/gpt-5.6-luna",
+      "commandcode/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
     ]);
   });
 
-  it("keeps the standard primary on llmgateway with deepseek as last resort", () => {
-    expect(candidatesForModel("llmgateway/glm-5.3-flash")).toEqual([
+  it("keeps the standard primary on the Command Code subscription with deepseek last", () => {
+    expect(candidatesForModel("commandcode/z-ai/glm-5.3-flash")).toEqual([
+      "commandcode/z-ai/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
       "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
       "llmgateway/gpt-5.6-luna",
       "opencode-go/gpt-5.6-luna",
+      "commandcode/gpt-5.6-luna",
       "openrouter/openai/gpt-5.6-luna",
       "opencode-go/deepseek-v4.1-flash",
       "llmgateway/deepseek-v4.1-flash-1017",
+      "commandcode/deepseek/deepseek-v4.1-flash",
       "openrouter/deepseek/deepseek-v4.1-flash-1017",
     ]);
   });
@@ -326,10 +405,13 @@ describe("candidatesForModel", () => {
       "glm-5.2",
       "llmgateway/mimo-v2.6-flash",
       "opencode-go/mimo-v2.6-flash",
+      "commandcode/xiaomi/mimo-v2.6-flash",
       "openrouter/xiaomi/mimo-v2.6-flash",
       "llmgateway/deepseek-v4-flash",
       "opencode-go/deepseek-v4-flash",
+      "commandcode/deepseek/deepseek-v4-flash",
       "openrouter/deepseek/deepseek-v4-flash",
+      "commandcode/z-ai/glm-5.3-flash",
       "llmgateway/glm-5.3-flash",
       "opencode-go/glm-5.3-flash",
       "openrouter/z-ai/glm-5.3-flash",
@@ -365,7 +447,26 @@ describe("model class coverage", () => {
     }
     expect(PROVIDER_PREFERENCE).toContain("opencode-go");
     expect(PROVIDER_PREFERENCE).toContain("llmgateway");
+    expect(PROVIDER_PREFERENCE).toContain("commandcode");
     expect(PROVIDER_PREFERENCE).toContain("openrouter");
+  });
+
+  it("maps every class model to a Command Code wire id (bd-178)", () => {
+    // Command Code's `-e` extension registers the provider but not the ids, so
+    // a missing mapping would send a canonical slug the provider rejects.
+    // Every class model must appear in a commandcode candidate, and every
+    // mapped wire id must resolve back to its canonical id.
+    const commandCodeCandidates = (["frontier", "standard", "fast"] as const)
+      .flatMap((modelClass) => resolveModelCandidates(modelClass))
+      .filter((candidate) => candidate.startsWith("commandcode/"));
+    const coveredCanonicalIds = new Set(commandCodeCandidates.map(canonicalModelId));
+    for (const id of Object.values(MODEL_CLASS_SPECS).flatMap((spec) => spec.models)) {
+      expect(coveredCanonicalIds.has(id), id).toBe(true);
+    }
+    for (const candidate of commandCodeCandidates) {
+      expect(providerOf(candidate)).toBe("commandcode");
+      expect(MODEL_TO_CLASS[canonicalModelId(candidate)], candidate).toBeDefined();
+    }
   });
 
   it("maps every class model to an OpenRouter vendor-qualified id", () => {
@@ -383,7 +484,9 @@ describe("model class coverage", () => {
 describe("primaryModelOf", () => {
   it("resolves each class to its primary model's first-preference provider", () => {
     expect(primaryModelOf("frontier")).toBe("opencode-go/deepseek-v4.1-flash");
-    expect(primaryModelOf("standard")).toBe("llmgateway/glm-5.3-flash");
+    // The primary carries the provider's wire id: Command Code serves this
+    // model as `z-ai/glm-5.3-flash`, not as the canonical slug.
+    expect(primaryModelOf("standard")).toBe("commandcode/z-ai/glm-5.3-flash");
     expect(primaryModelOf("fast")).toBe("llmgateway/mimo-v2.6-flash");
   });
 });
@@ -391,7 +494,7 @@ describe("primaryModelOf", () => {
 describe("resolveModelSpec", () => {
   it("resolves a modelClass-only spec to the class primary", () => {
     expect(resolveModelSpec({ modelClass: "standard" })).toEqual({
-      model: "llmgateway/glm-5.3-flash",
+      model: "commandcode/z-ai/glm-5.3-flash",
       modelClass: "standard",
     });
   });

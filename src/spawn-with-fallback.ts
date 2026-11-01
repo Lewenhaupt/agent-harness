@@ -2,10 +2,10 @@
  * Quota-aware spawn loop.
  *
  * Tries an ordered list of candidate models for a single sub-agent task. On a
- * quota/credit/rate-limit, transient, or model-unavailable failure (`isFallbackWorthy`)
- * it cools the target down and moves to the next candidate; on
- * auth/config/startup failures it stops immediately — switching models won't fix
- * those and would hide a real misconfiguration.
+ * quota/credit/rate-limit, transient, model-unavailable, or provider-without-key
+ * failure (`isFallbackWorthy`) it cools the target down and moves to the next
+ * candidate; on auth/config/startup failures it stops immediately — switching
+ * models won't fix those and would hide a real misconfiguration.
  *
  * Each attempt normally gets a fresh session id (a "-fallback-N" suffix) so
  * pi never resumes a half-failed session. In resume mode (`resumeSession`)
@@ -23,9 +23,13 @@ import type { CapacityCache, CapacityWindow } from "./capacity-cache.js";
 import { orderCandidatesByCapacity } from "./capacity-cache.js";
 import type { ModelClass } from "./model-classes.js";
 import { candidatesForModel, providerOf } from "./model-classes.js";
-import { createModelCooldownStore, type ModelCooldownStore } from "./model-cooldown.js";
+import {
+  createModelCooldownStore,
+  type ModelCooldownStore,
+  type ProviderCooldownCause,
+} from "./model-cooldown.js";
 import type { ModelTelemetryStore } from "./model-telemetry.js";
-import type { FailureClassification } from "./quota-failure.js";
+import type { FailureClassification, FailureKind } from "./quota-failure.js";
 import { classifySpawnFailure, isFallbackWorthy } from "./quota-failure.js";
 import { spawnAgentProcess } from "./spawn.js";
 
@@ -148,10 +152,28 @@ function skippedClassification(model: string): FailureClassification {
   return { kind: "other", reason: `Model ${model} is cooling down after a quota failure.` };
 }
 
-function skippedProviderClassification(provider: string): FailureClassification {
+/**
+ * Human phrase for a provider-wide skip cause. Exhaustive over
+ * `ProviderCooldownCause`, so adding a cause forces a phrase instead of silently
+ * collapsing into a generic sentence; absent means an entry without a tag
+ * (legacy file or another caller), which keeps the historical wording.
+ */
+const SKIPPED_PROVIDER_CAUSE: Readonly<Record<ProviderCooldownCause, string>> = {
+  quota: "is cooling down after a quota failure",
+  unconfigured: "has no API key configured",
+};
+
+function skippedProviderClassification(
+  provider: string,
+  cause: ProviderCooldownCause | undefined,
+): FailureClassification {
+  const phrase =
+    cause === undefined
+      ? "is cooling down after a provider-scoped failure"
+      : SKIPPED_PROVIDER_CAUSE[cause];
   return {
     kind: "other",
-    reason: `Provider ${provider} is exhausted after a quota failure; skipping remaining models on it.`,
+    reason: `Provider ${provider} ${phrase}; skipping remaining models on it.`,
   };
 }
 
@@ -252,7 +274,13 @@ function skipCandidate(candidate: string, store: ModelCooldownStore): SpawnAttem
     const provider = providerOf(candidate);
     return {
       model: candidate,
-      classification: skippedProviderClassification(provider),
+      // The skip row carries the cause the cooldown entry recorded, so an
+      // operator can tell "bucket spent" from "no key configured" without
+      // cross-referencing ~/.pi/agent/model-cooldowns.json.
+      classification: skippedProviderClassification(
+        provider,
+        store.providerEntries().get(provider)?.cause,
+      ),
       skippedProvider: provider,
     };
   }
@@ -266,7 +294,36 @@ function skipCandidate(candidate: string, store: ModelCooldownStore): SpawnAttem
   return undefined;
 }
 
-/** Record a cooldown: provider-scoped for quota, endpoint-scoped otherwise. */
+/**
+ * True when a failure disables the whole provider rather than one endpoint.
+ *
+ * `quota` spends the credential's bucket, so every model on it is dead until
+ * reset. `unconfigured` means the credential itself is absent, so the same is
+ * true for a different reason — but it is kept out of `quota` so telemetry and
+ * the capacity cache never record a spent bucket for it (nothing was measured).
+ */
+function isProviderScopedFailure(kind: FailureKind): boolean {
+  return kind === "quota" || kind === "unconfigured";
+}
+
+/**
+ * Stable cooldown cause for a provider-wide failure, or undefined for kinds that
+ * are endpoint-scoped. Kept next to `isProviderScopedFailure` so the two cannot
+ * disagree: the capacity probe and the attempt trail both depend on `quota` and
+ * `unconfigured` being distinguishable.
+ */
+function providerCooldownCause(kind: FailureKind): ProviderCooldownCause | undefined {
+  switch (kind) {
+    case "quota":
+      return "quota";
+    case "unconfigured":
+      return "unconfigured";
+    default:
+      return undefined;
+  }
+}
+
+/** Record a cooldown: provider-scoped for quota/unconfigured, endpoint-scoped otherwise. */
 function recordCooldown(
   store: ModelCooldownStore,
   candidate: string,
@@ -276,16 +333,19 @@ function recordCooldown(
   if (classification.cooldownSeconds === undefined) return;
   const seconds = classification.cooldownSeconds;
   const reason = classification.reason ?? classification.kind;
-  // Only a quota failure exhausts a whole credential bucket. A transient fault or
-  // a retired model id is endpoint-specific: the same bare id is usually still
+  // Only a provider-wide failure exhausts a whole credential. A transient fault
+  // or a retired model id is endpoint-specific: the same bare id is usually still
   // served by another provider, so cooling the provider instead would discard
   // healthy candidates.
-  if (classification.kind === "quota" && provider !== "") {
+  if (isProviderScopedFailure(classification.kind) && provider !== "") {
     // A parsed reset hint is authoritative; an unhinted quota window is a guess,
     // so the store escalates it when this provider was already cooling instead
     // of re-guessing the same span (bd-38: a weekly limit re-probed every
-    // 15 minutes, each probe burning a real fallback session).
+    // 15 minutes, each probe burning a real fallback session). The `cause` tag
+    // persists why: the capacity probe excludes `unconfigured`, and the skip row
+    // reports it.
     store.markProviderCooldown(provider, seconds, reason, {
+      cause: providerCooldownCause(classification.kind),
       hinted: classification.cooldownHinted === true,
     });
   } else {

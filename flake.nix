@@ -845,7 +845,7 @@
           pname = "pi-extensions";
           version = "0.1.0";
           src = ./nix/pi-extensions;
-          npmDepsHash = "sha256-BKydHW7WAmVfDt7sqX7NkUCN1jh2OJW7GgNBEM5iehU=";
+          npmDepsHash = "sha256-OzQUqmFSBRNrT5nFBcUngwRajtERM2w9i33wJW/6s60=";
           npmDepsFetcherVersion = 2;
           npmFlags = [ "--legacy-peer-deps" ];
           dontNpmBuild = true;
@@ -899,6 +899,12 @@
         # skills, and the LLM Gateway models all baked into one binary. The only
         # global pi state left is ~/.pi/agent/auth.json (credentials), plus
         # sessions and the wrapper-managed models.json/settings.json.
+        #
+        # This is the mkCodingAgent MODULE SET, not a build target: it is exposed
+        # as `packages.belayd-pi` for module consumers, so `nix build .#belayd-pi`
+        # fails with "expected … to be a derivation or path but found a set".
+        # Build the wrapper with `nix build .#pi`, which is generated from this
+        # set below.
         belayd-pi = pi-nix.lib.mkCodingAgent {
           inherit pkgs;
           modules = [

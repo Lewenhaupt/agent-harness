@@ -151,12 +151,74 @@ describe("createCapacityCache", () => {
 describe("probeFromCooldownStore", () => {
   it("maps persisted provider cooldowns to capacity windows", async () => {
     const store = createModelCooldownStore(() => 1_000);
-    store.markProviderCooldown("opencode-go", 3_600, "quota");
+    store.markProviderCooldown("opencode-go", 3_600, "quota", { cause: "quota" });
 
     const result = await probeFromCooldownStore(store)();
 
     expect(result.windows).toEqual([
       { provider: "opencode-go", resetAt: 1_000 + 3_600_000, reason: "quota" },
+    ]);
+  });
+
+  it("keeps an unconfigured provider out of the capacity signal (bd-178)", async () => {
+    // A missing API key is a configuration error, not spent capacity. Surfacing
+    // it as a capacity window would make the all-exhausted fast-fail claim the
+    // provider is "out of capacity, retrying after reset" — a wrong diagnosis,
+    // and it would hide the real fix (setting the key).
+    const store = createModelCooldownStore(() => 1_000);
+    store.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
+      cause: "unconfigured",
+    });
+    // A genuine quota window on another provider must still surface: the filter
+    // is narrow, not a blanket skip of every provider entry.
+    store.markProviderCooldown("opencode-go", 3_600, "Quota/credit/rate limit (HTTP 429).", {
+      cause: "quota",
+    });
+
+    const cache = createCapacityCache({ probe: probeFromCooldownStore(store), now: () => 1_000 });
+    await cache.refreshIfStale();
+
+    expect(cache.windows().map((window) => window.provider)).toEqual(["opencode-go"]);
+    expect(cache.isModelExhausted("commandcode/z-ai/glm-5.3-flash")).toBe(false);
+    expect(cache.isModelExhausted("llmgateway/glm-5.3-flash")).toBe(false);
+    expect(cache.isModelExhausted("opencode-go/mimo-v2.6-flash")).toBe(true);
+  });
+
+  it("treats an entry without a cause tag as capacity (legacy files)", async () => {
+    // `quota` was the only provider-scoped cause before the tag existed, so an
+    // untagged window from an older build must keep driving the capacity signal.
+    const store = createModelCooldownStore(() => 1_000);
+    store.markProviderCooldown("opencode-go", 3_600, "Weekly usage limit reached.");
+
+    expect((await probeFromCooldownStore(store)()).windows).toHaveLength(1);
+  });
+
+  it("keeps a tagged entry from a legacy-shaped providers map out of the signal", async () => {
+    // The inverse of the case above: a tag already present in a file this build
+    // did not write must survive parsing. If the loader dropped tags it did not
+    // produce, an `unconfigured` entry read from an older-shaped `providers` map
+    // would silently become capacity again — the W1 bug via the read path.
+    const filePath = "/tmp/model-cooldowns.json";
+    const fs = createFakeFs({
+      [filePath]: JSON.stringify({
+        version: 1,
+        providers: {
+          commandcode: {
+            until: 2_000,
+            reason: "Provider has no API key configured.",
+            cause: "unconfigured",
+          },
+          "opencode-go": { until: 2_000, reason: "Weekly usage limit reached." },
+        },
+      }),
+    });
+    const store = createModelCooldownStore({ now: () => 1_000, filePath, fs });
+
+    // The cooldown itself is still read (it stays reactively visible), just not
+    // as shared capacity.
+    expect(store.providerEntries().get("commandcode")).toHaveProperty("cause", "unconfigured");
+    expect((await probeFromCooldownStore(store)()).windows).toEqual([
+      { provider: "opencode-go", resetAt: 2_000, reason: "Weekly usage limit reached." },
     ]);
   });
 
@@ -181,6 +243,28 @@ describe("probeFromCooldownStore", () => {
         reason: "GoUsageLimitError",
       },
     ]);
+  });
+
+  it("keeps an unconfigured cooldown written by another member out of the signal", async () => {
+    // The `cause` tag is persisted, so the filter still works across fleet
+    // members: a window another process wrote is read back with its cause and
+    // must not become capacity.
+    const fs = createFakeFs();
+    const filePath = "/tmp/model-cooldowns.json";
+    const thisProcess = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+
+    otherMember.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
+      cause: "unconfigured",
+    });
+
+    expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([]);
+    // The cooldown itself is still visible reactively, with its cause.
+    expect(thisProcess.cooldownScope("commandcode/anything")).toBe("provider");
+    expect(thisProcess.providerEntries().get("commandcode")).toHaveProperty(
+      "cause",
+      "unconfigured",
+    );
   });
 
   it("never throws and yields no windows for a missing or corrupt file", async () => {

@@ -8,6 +8,7 @@ import {
   DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
   DEFAULT_QUOTA_COOLDOWN_SECONDS,
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+  DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS,
   isFallbackWorthy,
   parseQuotaResetSeconds,
   resolveQuotaCooldown,
@@ -240,6 +241,133 @@ describe("classifySpawnFailure model unavailability (bd-142)", () => {
   });
 });
 
+describe("classifySpawnFailure plan gating (bd-178)", () => {
+  it("classifies a 403 MODEL_NOT_IN_PLAN error as a model-scoped unavailable failure", () => {
+    // Command Code answers a model outside the caller's plan with this body.
+    // `unavailable` (not `quota`) is what keeps the cooldown endpoint-scoped:
+    // one gated id must not disable the whole Command Code bucket.
+    const result = classifySpawnFailure(
+      details([
+        assistantError(
+          '403: {"error":{"code":"MODEL_NOT_IN_PLAN","message":"z-ai/glm-5.3 is not included in your plan","type":"invalid_request_error"}}',
+          "commandcode/zai-org/GLM-5.3",
+        ),
+      ]),
+    );
+    expect(result).toHaveProperty("kind", "unavailable");
+    expect(result).toHaveProperty("model", "commandcode/zai-org/GLM-5.3");
+    expect(result).toHaveProperty("cooldownSeconds", DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS);
+  });
+
+  it("classifies a 403 upgrade_required error as model-scoped unavailable", () => {
+    expect(
+      classifySpawnFailure(
+        details([assistantError('403: {"code":"upgrade_required","message":"Upgrade your plan"}')]),
+      ),
+    ).toHaveProperty("kind", "unavailable");
+  });
+
+  it("classifies plan-exclusion wording on a 403 as unavailable", () => {
+    for (const message of [
+      '403: {"message":"Model xai/grok-4.6 is not included in your plan"}',
+      '403: {"message":"This model is not included in the plan"}',
+      '403: {"message":"Your plan does not include this model"}',
+      '403: {"message":"Your plan doesn\'t include this model"}',
+    ]) {
+      expect(classifySpawnFailure(details([assistantError(message)])), message).toHaveProperty(
+        "kind",
+        "unavailable",
+      );
+    }
+  });
+
+  it("keeps the live OpenCode Go subscription 403 a provider-scoped quota failure", () => {
+    // The Go body says "subscription"/"required to use", which must keep
+    // cooling the whole provider instead of becoming a model-scoped skip.
+    const result = classifySpawnFailure(
+      details([
+        assistantError(
+          '403: {"type":"server_error","message":"Upstream request failed: An active OpenCode Go subscription is required to use Go models."}',
+        ),
+      ]),
+    );
+    expect(result).toHaveProperty("kind", "quota");
+    expect(result).toHaveProperty("cooldownSeconds", DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS);
+  });
+
+  it("keeps a bare 403 classified as auth", () => {
+    expect(
+      classifySpawnFailure(details([assistantError('403: {"message":"invalid api key"}')])),
+    ).toHaveProperty("kind", "auth");
+  });
+
+  it("does not read plan-exclusion wording on a non-403 status", () => {
+    // A 429 carrying the same wording is a spent bucket, not a plan gate: the
+    // quota rule must win and keep the provider-scoped cooldown.
+    expect(
+      classifySpawnFailure(
+        details([assistantError('429: {"code":"MODEL_NOT_IN_PLAN","message":"slow down"}')]),
+      ),
+    ).toHaveProperty("kind", "quota");
+  });
+});
+
+/** The exact statusless error the pinned Command Code extension emits (bd-178). */
+const COMMANDCODE_NO_KEY_MESSAGE =
+  "No Command Code API key. Run /login and select Command Code, set COMMAND_CODE_API_KEY (or legacy COMMANDCODE_API_KEY), or configure ~/.commandcode/auth.json, ~/.pi/agent/auth.json or ~/.omp/agent/auth.json";
+
+describe("classifySpawnFailure unconfigured providers (bd-178)", () => {
+  it("classifies the extension's no-key message as provider-scoped unconfigured", () => {
+    // The standard class primary is commandcode/z-ai/glm-5.3-flash and the key
+    // is per-host, so an unkeyed provider must degrade to the next candidate
+    // instead of classifying as `other` and failing the phase.
+    const result = classifySpawnFailure(
+      details([assistantError(COMMANDCODE_NO_KEY_MESSAGE, "commandcode/z-ai/glm-5.3-flash")]),
+    );
+    expect(result).toHaveProperty("kind", "unconfigured");
+    expect(result).toHaveProperty("model", "commandcode/z-ai/glm-5.3-flash");
+    expect(result).toHaveProperty(
+      "cooldownSeconds",
+      DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS,
+    );
+    expect(result).not.toHaveProperty("kind", "quota");
+    expect(result).not.toHaveProperty("kind", "auth");
+    expect(result).not.toHaveProperty("kind", "other");
+  });
+
+  it("classifies generic no-key wording from other providers", () => {
+    for (const message of [
+      "no API key found (set LLMGATEWAY_API_KEY or add an 'llmgateway' api_key to ~/.pi/agent/auth.json)",
+      "Missing Command Code API key",
+      "OpenRouter API key is not configured",
+    ]) {
+      expect(classifySpawnFailure(details([assistantError(message)])), message).toHaveProperty(
+        "kind",
+        "unconfigured",
+      );
+    }
+  });
+
+  it("keeps a status-coded credential failure on the status rule", () => {
+    // The no-key rule is statusless on purpose: a 401/403 is an auth problem
+    // (stop, do not hide it) and a 429 is a spent bucket, whatever the body says.
+    expect(
+      classifySpawnFailure(details([assistantError("401: API key is not set")])),
+    ).toHaveProperty("kind", "auth");
+    expect(
+      classifySpawnFailure(details([assistantError("403: API key is not set")])),
+    ).toHaveProperty("kind", "auth");
+  });
+
+  it("leaves an unrelated statusless failure as other", () => {
+    // Guards the breadth of the no-key rule: credential/workspace wording that
+    // does not talk about an API key must not become fallback-worthy.
+    expect(
+      classifySpawnFailure(details([assistantError("auth required for this workspace")])),
+    ).toHaveProperty("kind", "other");
+  });
+});
+
 describe("classifySpawnFailure without an assistant error event", () => {
   it("classifies a non-zero exit after a network error as transient", () => {
     const result = classifySpawnFailure({
@@ -272,13 +400,69 @@ describe("classifySpawnFailure without an assistant error event", () => {
       "other",
     );
   });
+
+  it("classifies pi's no-key startup refusal as unconfigured (bd-178)", () => {
+    // Live pi 1.0.2 with no key for the selected provider: pi refuses before the
+    // stream exists (exit 1, zero assistant turns), so the assistant-path rule
+    // never runs and this is the shape the fallback loop actually sees. Every
+    // provider emits the same core line, so this covers llmgateway/opencode-go/
+    // openrouter too.
+    const stderr = [
+      "[honcho-memory] no Honcho API key found (set HONCHO_API_KEY or add a 'honcho' api_key to ~/.pi/agent/auth.json)",
+      "No API key found for commandcode.",
+      "",
+      "Use /login to log into a provider via OAuth or API key. See:",
+      "  /nix/store/…-pi-1.0.2/libexec/pi/docs/providers.md",
+      "  /nix/store/…-pi-1.0.2/libexec/pi/docs/models.md",
+    ].join("\n");
+    const result = classifySpawnFailure({
+      ...details([], 1, "commandcode/z-ai/glm-5.3-flash"),
+      stderr,
+    });
+
+    expect(result).toHaveProperty("kind", "unconfigured");
+    expect(result).toHaveProperty("model", "commandcode/z-ai/glm-5.3-flash");
+    expect(result).toHaveProperty(
+      "cooldownSeconds",
+      DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS,
+    );
+    expect(isFallbackWorthy(result.kind)).toBe(true);
+  });
+
+  it("classifies the bare provider refusal line on its own", () => {
+    // Same wording without the unrelated extension warning around it, so the
+    // match is pinned to pi's refusal rather than to a neighbouring log line.
+    expect(
+      classifySpawnFailure({ ...details([], 1), stderr: "No API key found for llmgateway." }),
+    ).toHaveProperty("kind", "unconfigured");
+  });
+
+  it("keeps status-coded process stderr on its status rule", () => {
+    // Mirrors the assistant-path boundary: a status-coded line is an upstream
+    // rejection, not a provider without a credential. `auth` still stops the
+    // loop and `quota` still cools the provider, so the no-key rule cannot
+    // hijack either.
+    expect(
+      classifySpawnFailure({
+        ...details([], 1),
+        stderr: 'No API key found for commandcode.\n401: {"message":"invalid api key"}',
+      }),
+    ).toHaveProperty("kind", "auth");
+    expect(
+      classifySpawnFailure({
+        ...details([], 1),
+        stderr: '429: {"message":"Weekly usage limit reached. Resets in 7hr 57min."}',
+      }),
+    ).toHaveProperty("kind", "quota");
+  });
 });
 
 describe("isFallbackWorthy", () => {
-  it("retries quota, transient, and unavailable failures only", () => {
+  it("retries quota, transient, unavailable, and unconfigured failures only", () => {
     expect(isFallbackWorthy("quota")).toBe(true);
     expect(isFallbackWorthy("transient")).toBe(true);
     expect(isFallbackWorthy("unavailable")).toBe(true);
+    expect(isFallbackWorthy("unconfigured")).toBe(true);
     expect(isFallbackWorthy("auth")).toBe(false);
     expect(isFallbackWorthy("other")).toBe(false);
     expect(isFallbackWorthy("success")).toBe(false);

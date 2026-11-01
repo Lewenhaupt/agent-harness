@@ -274,3 +274,5 @@ raise the ceiling deliberately and say why.
 | `docs/arion.md` | scotty/portainer containers |
 | `docs/bootstrap.md` | `/bootstrap` scaffolding |
 | `docs/llmgateway.md` | LLM Gateway models |
+| `docs/commandcode-provider.md` | Command Code (Goat) provider: key precedence, wire ids, plan gating |
+| `docs/agent-model-class.md` | model classes, provider preference, failover contract |

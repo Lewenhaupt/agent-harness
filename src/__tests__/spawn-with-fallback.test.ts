@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SpawnResult, SpawnUsage } from "../agent-registry.js";
-import { createCapacityCache } from "../capacity-cache.js";
+import { createCapacityCache, probeFromCooldownStore } from "../capacity-cache.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
 import { createModelTelemetryStore } from "../model-telemetry.js";
+import { withFallbackNote } from "../quality-gate-run.js";
 import {
   type classifySpawnFailure,
   DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
@@ -219,7 +220,82 @@ describe("spawnAgentWithFallback", () => {
       "llmgateway/c",
     ]);
     expect(attempts[1]).toHaveProperty("skippedProvider", "opencode-go");
+    // The skip row names the cause, so the log answers "why skipped?" without a
+    // trip to ~/.pi/agent/model-cooldowns.json.
+    expect(attempts[1]).toHaveProperty(
+      "classification.reason",
+      expect.stringContaining("after a quota failure"),
+    );
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a missing key as the skip cause, not a quota failure (bd-178)", async () => {
+    // Warning 2: generalizing the phrase must not collapse "bucket spent" and
+    // "no key configured" into one opaque sentence.
+    const noKeyDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "commandcode/z-ai/glm-5.3-flash",
+          stopReason: "error",
+          errorMessage:
+            "No Command Code API key. Run /login and select Command Code, set COMMAND_CODE_API_KEY (or legacy COMMANDCODE_API_KEY), or configure ~/.commandcode/auth.json, ~/.pi/agent/auth.json or ~/.omp/agent/auth.json",
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("commandcode/z-ai/glm-5.3-flash"),
+        details: noKeyDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const first = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: [
+        "commandcode/z-ai/glm-5.3-flash",
+        "commandcode/zai-org/GLM-5.3",
+        "llmgateway/glm-5.3-flash",
+      ],
+    });
+
+    // Same-provider sibling is skipped inside the same run, with the key cause.
+    expect(first.attempts.map((a) => a.model)).toEqual([
+      "commandcode/z-ai/glm-5.3-flash",
+      "commandcode/zai-org/GLM-5.3",
+      "llmgateway/glm-5.3-flash",
+    ]);
+    expect(first.attempts[1]).toHaveProperty("skippedProvider", "commandcode");
+    expect(first.attempts[1]).toHaveProperty(
+      "classification.reason",
+      expect.stringContaining("has no API key configured"),
+    );
+
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
+    const second = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["commandcode/z-ai/glm-5.3-flash", "llmgateway/glm-5.3-flash"],
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(second.attempts[0]).toHaveProperty("skippedProvider", "commandcode");
+    expect(second.attempts[0]).toHaveProperty(
+      "classification.reason",
+      expect.stringContaining("has no API key configured"),
+    );
   });
 
   it("tries a single candidate for an unknown model", async () => {
@@ -361,6 +437,186 @@ describe("spawnAgentWithFallback", () => {
     expect(store.cooldownScope("opencode-go/deepseek-v4.1-flash")).toBe("provider");
     expect(store.isCoolingDown("opencode-go/glm-5.3")).toBe(true);
     expect(store.isCoolingDown("llmgateway/deepseek-v4.1-flash")).toBe(false);
+  });
+
+  it("end-to-end: a model-not-in-plan 403 cools only that endpoint and keeps the provider", async () => {
+    // bd-178: Command Code gates models by plan. `unavailable` is
+    // model-scoped, so the retry lands on a different provider for the SAME
+    // model id and the Command Code bucket stays usable for its other ids.
+    const gatedDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "commandcode/zai-org/GLM-5.3",
+          stopReason: "error",
+          errorMessage:
+            '403: {"error":{"code":"MODEL_NOT_IN_PLAN","message":"zai-org/GLM-5.3 is not included in your plan"}}',
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("commandcode/zai-org/GLM-5.3"),
+        details: gatedDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/zai-org/GLM-5.3",
+      modelClass: "frontier",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["commandcode/zai-org/GLM-5.3", "llmgateway/glm-5.3"],
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3");
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["unavailable", "success"]);
+    // Model-scoped: only the gated endpoint cools, never the provider bucket.
+    expect(store.cooldownScope("commandcode/zai-org/GLM-5.3")).toBe("model");
+    expect(store.providerEntries().size).toBe(0);
+    expect(store.isCoolingDown("commandcode/z-ai/glm-5.3-flash")).toBe(false);
+    expect(store.isCoolingDown("llmgateway/glm-5.3")).toBe(false);
+  });
+
+  it("end-to-end: an unkeyed Command Code provider degrades to llmgateway", async () => {
+    // bd-178: the standard primary lives on commandcode and the key is per-host,
+    // so an unconfigured provider must fall through, not fail the phase. The
+    // extension emits a statusless error, which used to classify as `other`
+    // (isFallbackWorthy false) and stop the loop — contrast the auth/other test
+    // above, which still stops.
+    const noKeyDetails = {
+      messages: [
+        {
+          role: "assistant",
+          content: [],
+          model: "commandcode/z-ai/glm-5.3-flash",
+          stopReason: "error",
+          errorMessage:
+            "No Command Code API key. Run /login and select Command Code, set COMMAND_CODE_API_KEY (or legacy COMMANDCODE_API_KEY), or configure ~/.commandcode/auth.json, ~/.pi/agent/auth.json or ~/.omp/agent/auth.json",
+        },
+      ],
+      usage: zeroUsage(),
+      exitCode: 0,
+    };
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        ...makeResult("commandcode/z-ai/glm-5.3-flash"),
+        details: noKeyDetails,
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["commandcode/z-ai/glm-5.3-flash", "llmgateway/glm-5.3-flash"],
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3-flash");
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["unconfigured", "success"]);
+    // Provider-scoped: the missing key disables every Command Code model, so
+    // siblings are skipped too — while llmgateway stays available.
+    expect(store.cooldownScope("commandcode/z-ai/glm-5.3-flash")).toBe("provider");
+    expect(store.isCoolingDown("commandcode/zai-org/GLM-5.3")).toBe(true);
+    expect(store.isCoolingDown("llmgateway/glm-5.3-flash")).toBe(false);
+    expect(store.entries().size).toBe(0);
+  });
+
+  it("end-to-end: pi's process-path no-key refusal degrades to llmgateway (bd-178)", async () => {
+    // The production shape: pi exits 1 with `No API key found for commandcode.`
+    // on stderr and never emits an assistant turn, so only the process path can
+    // classify it. That path used to return `other`, which stopped the loop.
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce({
+        content: [{ type: "text", text: "(no output)" }],
+        details: {
+          messages: [],
+          usage: zeroUsage(),
+          exitCode: 1,
+          model: "commandcode/z-ai/glm-5.3-flash",
+          stderr: "No API key found for commandcode.",
+        },
+      })
+      .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["commandcode/z-ai/glm-5.3-flash", "llmgateway/glm-5.3-flash"],
+    });
+
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["unconfigured", "success"]);
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3-flash");
+    // Same provider-scoped, tagged cooldown the assistant path writes — the
+    // process path is a different classifier, not a different cooldown rule —
+    // and the tag keeps it out of the capacity signal.
+    expect(store.cooldownScope("commandcode/z-ai/glm-5.3-flash")).toBe("provider");
+    expect(store.providerEntries().get("commandcode")).toHaveProperty("cause", "unconfigured");
+    expect(store.providerEntries().get("commandcode")).toHaveProperty(
+      "reason",
+      "Provider has no API key configured.",
+    );
+    expect((await probeFromCooldownStore(store)()).windows).toEqual([]);
+    expect(withFallbackNote(result, attempts).content[0]).toHaveProperty(
+      "text",
+      "result-from-llmgateway/glm-5.3-flash\n\n[belayd model fallback] commandcode/z-ai/glm-5.3-flash (unconfigured) → llmgateway/glm-5.3-flash (success)",
+    );
+  });
+
+  it("terminates and surfaces the trail when every hop has no key (bd-178)", async () => {
+    // A keyless host must not loop or report success: each fallback-worthy
+    // unconfigured attempt consumes its own candidate, then the loop returns the
+    // last real failure (exit 1) with the whole trail as the note.
+    const noKey = (model: string, provider: string) => ({
+      // `spawnAgentProcess` reports an empty run as "(no output)", which is what
+      // the caller sees after the loop gives up.
+      content: [{ type: "text", text: "(no output)" }],
+      details: {
+        messages: [],
+        usage: zeroUsage(),
+        exitCode: 1,
+        model,
+        stderr: `No API key found for ${provider}.`,
+      },
+    });
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(noKey("commandcode/z-ai/glm-5.3-flash", "commandcode"))
+      .mockResolvedValueOnce(noKey("llmgateway/glm-5.3-flash", "llmgateway"));
+
+    const store = createModelCooldownStore(() => 0);
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      candidates: ["commandcode/z-ai/glm-5.3-flash", "llmgateway/glm-5.3-flash"],
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+    expect(attempts.map((a) => a.classification.kind)).toEqual(["unconfigured", "unconfigured"]);
+    expect(result.details.exitCode).toBe(1);
+    expect(withFallbackNote(result, attempts).content[0]).toHaveProperty(
+      "text",
+      "(no output)\n\n[belayd model fallback] commandcode/z-ai/glm-5.3-flash (unconfigured) → llmgateway/glm-5.3-flash (unconfigured)",
+    );
+    // A missing key disables each bucket, and none of it is capacity.
+    expect(store.cooldownScope("commandcode/anything")).toBe("provider");
+    expect(store.cooldownScope("llmgateway/anything")).toBe("provider");
+    expect((await probeFromCooldownStore(store)()).windows).toEqual([]);
   });
 
   it("uses modelClass to drive fallback for a known model", async () => {
@@ -681,6 +937,41 @@ describe("spawnAgentWithFallback", () => {
     expect(attempts.map((a) => a.model)).toEqual(["opencode-go/a", "opencode-go/b"]);
     expect(attempts.every((a) => a.skippedCapacity === "opencode-go")).toBe(true);
     expect(result.content[0]?.text).toContain("capacity-exhausted");
+  });
+
+  it("does not fast-fail on a provider that is only unconfigured (bd-178)", async () => {
+    // Warning 1: the cooldown store is the production capacity probe. An
+    // unconfigured provider must be skipped reactively (with its cause), never
+    // reported as capacity-exhausted and never fast-failed.
+    const store = createModelCooldownStore(() => 0);
+    store.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
+      cause: "unconfigured",
+    });
+    const capacity = createCapacityCache({
+      probe: probeFromCooldownStore(store),
+      now: () => 0,
+    });
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["commandcode/z-ai/glm-5.3-flash", "llmgateway/glm-5.3-flash"],
+      capacity,
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(result.content[0]).toHaveProperty("text", "result-from-llmgateway/glm-5.3-flash");
+    expect(attempts.map((a) => a.skippedCapacity)).toEqual([undefined, undefined]);
+    expect(attempts[0]).toHaveProperty("skippedProvider", "commandcode");
+    expect(attempts[0]).toHaveProperty(
+      "classification.reason",
+      expect.stringContaining("has no API key configured"),
+    );
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
   });
 
   it("keys the telemetry fallback flag off the spawned-attempt ordinal, not the candidate index", async () => {

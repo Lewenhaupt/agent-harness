@@ -1,5 +1,12 @@
 # Per-model provider preference: llmgateway by default, opencode-go reserved for `deepseek-v4.1-flash` (bd-147)
 
+> **Superseded in part.** bd-178 added Command Code (Goat) as a fourth bucket
+> (`llmgateway`, `opencode-go`, `commandcode`, `openrouter`) and moved
+> `glm-5.3-flash` — the `standard` primary, i.e. `belayd-reviewer` — onto
+> `commandcode/z-ai/glm-5.3-flash`. The preferences and literals below are the
+> truthful record of bd-147; use `docs/agent-model-class.md` and
+> `docs/commandcode-provider.md` for the current order.
+
 Before bd-147, provider order was one global list (`opencode-go` first), so
 every class primary and every fallback hop billed against the opencode-go
 subscription bucket. bd-147 makes the order **per model**: `llmgateway`

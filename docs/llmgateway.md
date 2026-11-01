@@ -193,7 +193,7 @@ against `/tmp/shell.json` — they should be identical. Both map:
 The command must be wired into the pi binary to be available:
 
 - `bin/pi` — `-e "$repo_dir/extensions/llmgateway-refresh.ts"` (dev loop; loads immediately).
-- `flake.nix` — `belayd-pi` `extensions` list (global install).
+- `flake.nix` — the `belayd-pi` module set's `extensions` list (global install; the module set is not a build target — build `.#pi`).
 - `package.json` — `pi.extensions` array.
 - `.pi/settings.json` — `"../extensions/llmgateway-refresh.ts"`.
 

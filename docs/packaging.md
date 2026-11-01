@@ -44,6 +44,12 @@ smaller tool set under `PI_OFFLINE=1`). It resolves entry points from
 devShell and by the pi-web runtime environment; outside the devShell it falls
 back to the manifest's npm specs and warns.
 
+The third-party list is therefore also where the provider extensions live:
+`@robhowley/pi-openrouter` and `pi-commandcode-provider` register the
+`openrouter` and `commandcode` providers (pi ships neither). Command Code's key
+precedence, model ids and plan-gating behaviour are documented in
+`docs/commandcode-provider.md`.
+
 ## Which pi binary a sub-agent gets
 
 `src/pi-binary.ts` resolves in this order and reports provenance:

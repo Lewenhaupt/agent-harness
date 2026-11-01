@@ -23,7 +23,7 @@
  */
 
 import { providerOf } from "./model-classes.js";
-import type { ModelCooldownStore } from "./model-cooldown.js";
+import type { CooldownEntry, ModelCooldownStore, ProviderCooldownCause } from "./model-cooldown.js";
 import { parseQuotaResetSeconds } from "./quota-failure.js";
 
 /** One provider's known exhaustion window. */
@@ -80,6 +80,38 @@ export const DEFAULT_CAPACITY_BODY_LIMIT_BYTES = 256 * 1024;
 /** Env var naming the optional provider usage/reset endpoint. */
 export const CAPACITY_PROBE_URL_ENV = "BELAYD_CAPACITY_PROBE_URL";
 
+/**
+ * Whether each provider-scoped cooldown cause is spent capacity.
+ *
+ * Consumers of a capacity window conclude "provider is out of capacity, retrying
+ * after reset", which is a misleading diagnosis for a provider that simply has
+ * no credential: `unconfigured` windows are deliberately excluded. The tag
+ * consulted is the entry's stable `cause`, never its display `reason` (a merge
+ * can pair the reason with a window another mark produced).
+ *
+ * Exhaustive over `ProviderCooldownCause`, so a new cause has to be classified
+ * here deliberately rather than inheriting "capacity" by not being listed.
+ */
+const IS_CAPACITY_CAUSE: Readonly<Record<ProviderCooldownCause, boolean>> = {
+  quota: true,
+  unconfigured: false,
+};
+
+/**
+ * True when a cooldown entry describes spent capacity rather than a configuration
+ * problem.
+ *
+ * This is an allowlist on purpose: only a known capacity cause (or no tag at
+ * all) counts, so an unclassified cause cannot silently become capacity again.
+ * An entry without a tag predates the field or came from another caller, and is
+ * treated as capacity because `quota` was the only provider-scoped cause before
+ * the tag existed.
+ */
+function isCapacityCause(entry: CooldownEntry): boolean {
+  const cause = entry.cause;
+  return cause === undefined ? true : IS_CAPACITY_CAUSE[cause];
+}
+
 /** Default probe: treat persisted provider cooldowns as capacity windows. */
 export function probeFromCooldownStore(store: ModelCooldownStore): CapacityProbe {
   return () => {
@@ -89,11 +121,13 @@ export function probeFromCooldownStore(store: ModelCooldownStore): CapacityProbe
     // refresh is a no-op for an in-memory store and never throws.
     store.refresh();
     return {
-      windows: [...store.providerEntries()].map(([provider, entry]) => ({
-        provider,
-        resetAt: entry.until,
-        reason: entry.reason,
-      })),
+      windows: [...store.providerEntries()]
+        .filter(([, entry]) => isCapacityCause(entry))
+        .map(([provider, entry]) => ({
+          provider,
+          resetAt: entry.until,
+          reason: entry.reason,
+        })),
     };
   };
 }

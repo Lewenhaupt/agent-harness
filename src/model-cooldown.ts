@@ -11,7 +11,9 @@
  * behave:
  *
  * - **provider** (`opencode-go`): a quota/credit/rate limit (402/429) exhausts
- *   the provider's whole quota bucket, so every model on it is dead until reset.
+ *   the provider's whole quota bucket, so every model on it is dead until reset;
+ *   a provider with no credential configured (`unconfigured`) is equally dead for
+ *   every model, for a different reason.
  * - **model** (`opencode-go/mimo-v2.6-flash`): a transient failure (5xx, network),
  *   or a model id the endpoint retired (404/410), is endpoint-specific — the same
  *   bare model id may still be healthy on another provider, so only this exact
@@ -50,6 +52,17 @@ import { z } from "zod";
 
 import { providerOf } from "./model-classes.js";
 
+/**
+ * Stable cause tag for a provider-wide cooldown, persisted on the entry.
+ *
+ * `reason` is display text and must never be branched on (a merge can pair it
+ * with a window another mark produced), so consumers that need to know *why* a
+ * provider is cooling read this instead: the capacity probe must not treat a
+ * missing credential as spent capacity, and the fallback loop's skip rows
+ * report which of the two causes skipped the provider.
+ */
+export type ProviderCooldownCause = "quota" | "unconfigured";
+
 export interface CooldownEntry {
   /** Epoch ms until which the target should not be attempted. */
   until: number;
@@ -58,6 +71,13 @@ export interface CooldownEntry {
    * entry can pair this reason with a window another mark produced.
    */
   reason: string;
+  /**
+   * Stable cause tag, set for provider-scoped marks. Absent on model-scoped
+   * marks, on entries other builds wrote before the field existed, and on any
+   * caller that did not supply one; consumers must treat absent as "unknown or
+   * capacity" rather than assuming a cause.
+   */
+  cause?: ProviderCooldownCause;
   /**
    * How many consecutive unhinted marks produced this window (absent on hinted
    * windows). Mirrors the escalation ladder so a persisted file is diagnosable
@@ -109,6 +129,12 @@ export interface CooldownMarkOptions {
    * escalates rather than re-guessing.
    */
   hinted?: boolean;
+  /**
+   * Stable cause tag stored on the entry (see `ProviderCooldownCause`), so a
+   * reader does not have to match the human-readable `reason`. Ignored for
+   * model-scoped marks, which are always endpoint-specific.
+   */
+  cause?: ProviderCooldownCause;
 }
 
 export interface ModelCooldownStore {
@@ -122,9 +148,10 @@ export interface ModelCooldownStore {
     options?: CooldownMarkOptions,
   ): void;
   /**
-   * Cool down a whole provider (quota/credit exhaustion). An unhinted mark
-   * escalates a provider that was already cooled recently; a hinted mark
-   * replaces the window exactly and clears the escalation ladder.
+   * Cool down a whole provider (quota/credit exhaustion, or an absent
+   * credential). An unhinted mark escalates a provider that was already cooled
+   * recently; a hinted mark replaces the window exactly and clears the
+   * escalation ladder.
    */
   markProviderCooldown(
     provider: string,
@@ -186,6 +213,9 @@ const PersistedEntrySchema = z
   .object({
     until: z.number().finite(),
     reason: z.string(),
+    // Stable cause tag; a value this build does not know is dropped rather than
+    // carried into the typed entry (consumers would have to re-validate it).
+    cause: z.enum(["quota", "unconfigured"]).optional(),
     // Zero is meaningless on an entry (the ladder map is the authority for the
     // count and carries the timestamp), so a stored 0 normalizes to absent.
     escalations: z.number().int().positive().optional(),
@@ -270,6 +300,7 @@ function parseEntryMap(value: unknown): Map<string, CooldownEntry> {
     const parsed = PersistedEntrySchema.safeParse(candidate);
     if (!parsed.success) continue;
     const entry: CooldownEntry = { until: parsed.data.until, reason: parsed.data.reason };
+    if (parsed.data.cause !== undefined) entry.cause = parsed.data.cause;
     if (parsed.data.escalations !== undefined) entry.escalations = parsed.data.escalations;
     if (parsed.data.lastMarkedAt !== undefined) entry.lastMarkedAt = parsed.data.lastMarkedAt;
     entries.set(key, entry);
@@ -339,6 +370,7 @@ function toRecord(entries: ReadonlyMap<string, CooldownEntry>): Record<string, P
   const record: Record<string, PersistedEntry> = {};
   for (const [key, entry] of entries) {
     const persisted: PersistedEntry = { until: entry.until, reason: entry.reason };
+    if (entry.cause !== undefined) persisted.cause = entry.cause;
     if ((entry.escalations ?? 0) > 0) persisted.escalations = entry.escalations;
     if (entry.lastMarkedAt !== undefined) persisted.lastMarkedAt = entry.lastMarkedAt;
     record[key] = persisted;
@@ -347,7 +379,13 @@ function toRecord(entries: ReadonlyMap<string, CooldownEntry>): Record<string, P
 }
 
 /** Fields this module owns per entry; anything else is carried over verbatim. */
-const ENTRY_KEYS: ReadonlySet<string> = new Set(["until", "reason", "escalations", "lastMarkedAt"]);
+const ENTRY_KEYS: ReadonlySet<string> = new Set([
+  "until",
+  "reason",
+  "cause",
+  "escalations",
+  "lastMarkedAt",
+]);
 const ESCALATION_KEYS: ReadonlySet<string> = new Set(["count", "lastMarkedAt"]);
 
 /**
@@ -464,12 +502,13 @@ function preferEntry(a: CooldownEntry, b: CooldownEntry): CooldownEntry {
 /**
  * Merge `incoming` into `target` per key, keeping the *whole* winning entry.
  *
- * The winner's `until`, `reason`, `escalations` and `lastMarkedAt` travel
+ * The winner's `until`, `reason`, `cause`, `escalations` and `lastMarkedAt` travel
  * together on purpose: pairing one side's window with the other side's reason or
- * escalation count would describe a mark that never happened. A ladder count is
- * only forgotten here when a newer mark superseded it, which is exactly what a
- * hinted reset is; the ladder map itself merges separately and never loses a
- * count on a tie (see `mergeEscalationMaps`).
+ * escalation count would describe a mark that never happened, and a `cause`
+ * borrowed from a losing mark would misreport why the provider is cooling. A
+ * ladder count is only forgotten here when a newer mark superseded it, which is
+ * exactly what a hinted reset is; the ladder map itself merges separately and
+ * never loses a count on a tie (see `mergeEscalationMaps`).
  */
 function mergeEntryMaps(
   target: Map<string, CooldownEntry>,
@@ -653,6 +692,7 @@ export function createModelCooldownStore(
     },
     markProviderCooldown(provider, durationSeconds, reason, markOptions) {
       const t = markOptions?.nowMs ?? now();
+      const cause = markOptions?.cause;
       const previousCount = state.escalations.get(provider)?.count ?? 0;
       if (markOptions?.hinted === true) {
         // A provider-supplied reset window is authoritative: set it exactly (even
@@ -662,6 +702,7 @@ export function createModelCooldownStore(
         state.providers.set(provider, {
           until: t + durationSeconds * 1000,
           reason,
+          ...(cause !== undefined ? { cause } : {}),
           lastMarkedAt: t,
         });
         persist();
@@ -672,6 +713,7 @@ export function createModelCooldownStore(
       state.providers.set(provider, {
         until: escalatedUntil(durationSeconds, count, t),
         reason,
+        ...(cause !== undefined ? { cause } : {}),
         escalations: count,
         lastMarkedAt: t,
       });

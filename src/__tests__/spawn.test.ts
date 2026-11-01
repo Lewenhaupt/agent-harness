@@ -554,6 +554,59 @@ describe("launchAgentProcess env (W5)", () => {
     }
   });
 
+  it("passes the Command Code API key through to spawned pi sessions", async () => {
+    // bd-178: only AWS credential vars are scrubbed. The pi-commandcode-provider
+    // extension reads COMMAND_CODE_API_KEY (or its legacy COMMANDCODE_API_KEY)
+    // from the inherited env, so a phase agent served by Command Code keeps
+    // working without a per-host /login. The AWS key in the same env object pins
+    // the other side of that contract: the scrub still runs.
+    const restore = applyProcessEnv({
+      COMMAND_CODE_API_KEY: "cc-live-key",
+      COMMANDCODE_API_KEY: "cc-legacy-key",
+      AWS_ACCESS_KEY_ID: "AKIAEXAMPLE",
+    });
+    try {
+      const mod = await import("../spawn.js");
+      const options = { model: "m", tools: ["read"], systemPrompt: "s", task: "t" };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      expect(spawnOptions.env.COMMAND_CODE_API_KEY).toBe("cc-live-key");
+      expect(spawnOptions.env.COMMANDCODE_API_KEY).toBe("cc-legacy-key");
+      expect(spawnOptions.env).not.toHaveProperty("AWS_ACCESS_KEY_ID");
+
+      handle.cleanup();
+    } finally {
+      restore();
+    }
+  });
+
+  it("lets an explicit options.env override the inherited Command Code key", async () => {
+    const restore = applyProcessEnv({ COMMAND_CODE_API_KEY: "cc-env-key" });
+    try {
+      const mod = await import("../spawn.js");
+      const options = {
+        model: "m",
+        tools: ["read"],
+        systemPrompt: "s",
+        task: "t",
+        env: { COMMAND_CODE_API_KEY: "cc-scoped-key" },
+      };
+      const built = mod.buildSpawnArgs(options);
+      const handle = mod.launchAgentProcess(options, built);
+
+      const callArgs = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1] as unknown[];
+      const spawnOptions = callArgs[2] as { env: NodeJS.ProcessEnv };
+      expect(spawnOptions.env.COMMAND_CODE_API_KEY).toBe("cc-scoped-key");
+
+      handle.cleanup();
+    } finally {
+      restore();
+    }
+  });
+
   it("strips direnv per-directory state from process.env and options.env, preserving user config and unrelated vars", async () => {
     // Only the per-directory STATE keys are stripped. USER-CONFIG keys and
     // unknown DIRENV_* vars must survive, proving this is an explicit list and
