@@ -51,6 +51,7 @@ import {
   defaultFleetMergeGitRunner,
   drainFleetMerge,
   enqueueFleetMerge,
+  formatDrainResultText,
   formatFleetMergeQueue,
 } from "../../src/fleet-merge.js";
 import {
@@ -1206,7 +1207,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       options.ctx.ui.notify(warning, "warning");
       console.warn(`[belayd-harness] ${warning}`);
     }
-    return drained.ok ? { ok: true } : { ok: false, error: drained.text };
+    return drained.ok ? { ok: true } : { ok: false, error: formatDrainResultText(drained) };
   }
 
   /** Accept a landed member: close its bead (when enabled) and remove its worktree. */
@@ -3696,7 +3697,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     // An empty queue is not a failure: the operator asked for the next merge and
     // there is none, which exits 0 with an explanatory result.
     const exitCode = drained.ok || drained.reason === "no-queued-entry" ? 0 : 1;
-    return textToolResult(drained.text, exitCode);
+    return textToolResult(formatDrainResultText(drained), exitCode);
   }
 
   /**

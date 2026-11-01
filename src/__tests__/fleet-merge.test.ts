@@ -34,6 +34,7 @@ import {
   drainFleetMerge,
   enqueueFleetMerge,
   FLEET_MERGE_ORPHAN_LOCK_GRACE_MS,
+  formatDrainResultText,
   formatFleetMergeQueue,
   readFleetGateCommands,
   releaseFleetMerge,
@@ -55,6 +56,11 @@ import {
   updateFleetIntent,
   updateFleetMergeQueue,
 } from "../fleet-state.js";
+import { serializeProofReceipt } from "../proof-receipt.js";
+// The receipt branch of the proof gate is asserted against the same real
+// worktree the drain reads, so "a receipt-published bead passes both gates with
+// no proof in the diff" is one end-to-end property rather than two halves.
+import { gateProofContent } from "../quality-gates.js";
 import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
@@ -1582,6 +1588,311 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     // `work/bd-15` already contains the new base, so no rebase-hint is due; the
     // old hardcoded `feat/bd-15` would have produced a spurious one.
     expect(kinds).toEqual(["base-moved", "sibling-landed"]);
+  });
+});
+
+describe("drainFleetMerge: publish payload guard (bd-181)", () => {
+  it("refuses a branch that still carries proof artifacts, naming them", async () => {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.memberPath, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", "shot.png"), "png");
+    commit(fixture.memberPath, "commit proof artifact");
+    enqueue(fixture);
+
+    const rootHead = git(fixture.root, ["rev-parse", "HEAD"]);
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    expect(result.text).toContain("proof-artifacts-in-diff");
+    expect(result.text).toContain("docs/proof/bd-12/shot.png");
+    expect(result.paths).toStrictEqual(["docs/proof/bd-12/shot.png"]);
+    // Nothing was mutated before the refusal: no lock, no stash, no rebase.
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
+    expect(readQueue(fixture).entries.find((entry) => entry.taskId === "bd-12")?.state).toBe(
+      "queued",
+    );
+    expect(auditActions(fixture)).not.toContain("merge-acquired");
+  });
+
+  it("refuses harness-local paths in the payload with paths-outside-scope", async () => {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.memberPath, ".belayd"), { recursive: true });
+    writeFileSync(join(fixture.memberPath, ".belayd", "workflow.json"), "{}\n");
+    commit(fixture.memberPath, "commit harness bookkeeping");
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("paths-outside-scope");
+    expect(result.text).toContain("paths-outside-scope");
+    expect(result.text).toContain(".belayd/workflow.json");
+    expect(result.paths).toStrictEqual([".belayd/workflow.json"]);
+  });
+
+  it("refuses a proof path with a space and non-ASCII characters (git would C-quote it)", async () => {
+    const fixture = createFixtureRepo();
+    // Default `git diff --name-only` renders this as
+    // `"docs/proof/bd-12/caf\303\251 proof.png"`, which matches neither the proof
+    // directory prefix nor the `.png` extension. The NUL-delimited, quotePath-free
+    // read is what makes the gate see the real path.
+    mkdirSync(join(fixture.memberPath, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", "café proof.png"), "png");
+    commit(fixture.memberPath, "commit quoted-proof artifact");
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    expect(result.text).toContain("docs/proof/bd-12/café proof.png");
+    expect(result.paths).toStrictEqual(["docs/proof/bd-12/café proof.png"]);
+  });
+
+  it("normalizes a `.//proof/` path before classifying it", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    // A real repository cannot hold this path in an index entry (git normalizes
+    // it), so the seam returns the exact bytes a NUL-delimited diff would carry.
+    const gitRunner: FleetMergeGitRunner = async (argv, options) =>
+      argv.includes("diff") && argv.includes("--name-only")
+        ? { ok: true, stdout: "member.txt\0.//proof/bd-12/shot.png\0", stderr: "" }
+        : defaultFleetMergeGitRunner(argv, options);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    expect(result.text).toContain("proof/bd-12/shot.png");
+    expect(result.paths).toStrictEqual(["proof/bd-12/shot.png"]);
+  });
+
+  it("fails closed when the payload diff cannot be read", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const rootHead = git(fixture.root, ["rev-parse", "HEAD"]);
+    const gitRunner: FleetMergeGitRunner = async (argv, options) =>
+      argv.includes("diff") && argv.includes("--name-only")
+        ? { ok: false, error: "diff exploded", stdout: "", stderr: "" }
+        : defaultFleetMergeGitRunner(argv, options);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("publish-payload-unreadable");
+    expect(result.text).toContain("diff exploded");
+    expect(result.paths).toBeUndefined();
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
+    expect(readQueue(fixture).entries[0]?.state).toBe("queued");
+  });
+
+  it("leaves the ordinary merge path green when the payload is clean", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", true);
+  });
+
+  it("merges a receipt-published bead whose diff carries no proof files", async () => {
+    const fixture = createFixtureRepo();
+    // Mirror the real repository: `.belayd/` is gitignored, which is what makes
+    // the receipt invisible to the payload diff. Without it the untracked
+    // receipt would make the member worktree dirty and the drain would refuse
+    // for an unrelated reason.
+    writeFileSync(join(fixture.memberPath, ".gitignore"), ".belayd/\n");
+    writeFileSync(join(fixture.memberPath, "src-change.txt"), "source change\n");
+    commit(fixture.memberPath, "receipt-published change");
+
+    mkdirSync(join(fixture.memberPath, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(fixture.memberPath, ".belayd", "proof-receipt.json"),
+      serializeProofReceipt({
+        version: 1,
+        taskId: "bd-12",
+        url: "https://proof.example.com/uploads/bd-12",
+      }),
+    );
+    enqueue(fixture);
+
+    // The proof gate accepts the same workspace on the strength of the receipt
+    // alone: no artifact refs, no files in the tree.
+    const proof = await gateProofContent(
+      "Proof uploaded; nothing committed.\n",
+      {
+        messages: [],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+          turns: 0,
+          toolCalls: 0,
+        },
+        exitCode: 0,
+      },
+      { cwd: fixture.memberPath, proofDir: join(tmpdir(), "belayd-external-proof", "bd-12") },
+    );
+    expect(proof).toHaveProperty("passed", true);
+    expect(proof.feedback).toContain(
+      "Proof receipt accepted: https://proof.example.com/uploads/bd-12",
+    );
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", true);
+    // The receipt itself was never carried: the merged root has no receipt file
+    // and the member's own receipt survived untouched next to the worktree.
+    expect(existsSync(join(fixture.root, ".belayd", "proof-receipt.json"))).toBe(false);
+    expect(
+      JSON.parse(readFileSync(join(fixture.memberPath, ".belayd", "proof-receipt.json"), "utf8")),
+    ).toStrictEqual({
+      version: 1,
+      taskId: "bd-12",
+      url: "https://proof.example.com/uploads/bd-12",
+    });
+  });
+
+  it("refuses a payload that commits the receipt file itself", async () => {
+    const fixture = createFixtureRepo();
+    // No `.gitignore` in the fixture root, so `git add -A` commits the receipt:
+    // bypassing the ignore rule must still be refused, not published.
+    mkdirSync(join(fixture.memberPath, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(fixture.memberPath, ".belayd", "proof-receipt.json"),
+      serializeProofReceipt({ version: 1, taskId: "bd-12", id: "upload-42" }),
+    );
+    commit(fixture.memberPath, "commit the receipt");
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("paths-outside-scope");
+    expect(result.paths).toStrictEqual([".belayd/proof-receipt.json"]);
+    expect(result.text).toContain(".belayd/proof-receipt.json");
+  });
+
+  it("carries every refused path in `paths` while keeping `text` to one line", async () => {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.memberPath, "docs", "proof", "bd-12"), { recursive: true });
+    for (let index = 0; index < 12; index += 1) {
+      writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", `shot-${index}.png`), "png");
+    }
+    commit(fixture.memberPath, "commit many proof artifacts");
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    // `text` stays a single readable line and points at the full data.
+    expect(result.text.split("\n")).toHaveLength(1);
+    expect(result.text).toContain("(+2 more — the full list is in `paths`)");
+    // `paths` is complete, sorted, and rendered by the report helper.
+    expect(result.paths).toHaveLength(12);
+    expect(result.paths).toStrictEqual(
+      [...(result.paths ?? [])].sort((left, right) => (left < right ? -1 : 1)),
+    );
+    const report = formatDrainResultText(result);
+    expect(report).toContain("Refused paths (12):");
+    expect(report).toContain("- docs/proof/bd-12/shot-0.png");
+    expect(report).toContain("- docs/proof/bd-12/shot-11.png");
+  });
+
+  it("merges a branch that deletes a legacy proof artifact (the migration direction)", async () => {
+    const fixture = createFixtureRepo();
+    // Legacy in-tree proof has to land on the base first: `base...branch` diffs
+    // the merge-base, so a deletion is only visible when the base already holds
+    // the file. Rebasing the member onto that commit makes the removal part of
+    // the payload rather than a stale base difference.
+    mkdirSync(join(fixture.root, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.root, "docs", "proof", "bd-12", "shot.png"), "legacy png");
+    commit(fixture.root, "legacy in-tree proof on base");
+    git(fixture.memberPath, ["rebase", "-q", "main"]);
+    git(fixture.memberPath, ["rm", "-q", "-r", "docs/proof"]);
+    commit(fixture.memberPath, "upload proof, delete the in-tree artifact");
+
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    // Removing proof is the sanctioned migration, not a publish payload: the
+    // guard refuses proof carried *in*, never proof taken out.
+    expect(result).toHaveProperty("ok", true);
+    expect(result).not.toHaveProperty("paths");
+    expect(existsSync(join(fixture.root, "docs", "proof", "bd-12", "shot.png"))).toBe(false);
+  });
+
+  it("still refuses a branch that deletes one proof artifact and adds another", async () => {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.root, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.root, "docs", "proof", "bd-12", "old.png"), "old legacy png");
+    commit(fixture.root, "legacy in-tree proof on base");
+    git(fixture.memberPath, ["rebase", "-q", "main"]);
+    git(fixture.memberPath, ["rm", "-q", "docs/proof/bd-12/old.png"]);
+    mkdirSync(join(fixture.memberPath, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", "new.png"), "brand new png");
+    commit(fixture.memberPath, "delete one proof file, carry in another");
+
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    // Only the carried-in path is named; the deletion is not an offence.
+    expect(result.paths).toStrictEqual(["docs/proof/bd-12/new.png"]);
+    expect(result.text).toContain("docs/proof/bd-12/new.png");
+    expect(result.text).not.toContain("docs/proof/bd-12/old.png");
+  });
+
+  it("refuses a proof artifact renamed out of the proof directory", async () => {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.root, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.root, "docs", "proof", "bd-12", "shot.png"), "renamable png");
+    commit(fixture.root, "legacy in-tree proof on base");
+    git(fixture.memberPath, ["rebase", "-q", "main"]);
+    mkdirSync(join(fixture.memberPath, "assets"), { recursive: true });
+    // A rename is reported as `R` and `--name-only` emits only the destination,
+    // so the delete half never reaches the gate: the destination path carries
+    // the proof extension and is what trips `proof-artifacts-in-diff`. (If git
+    // ever reported this fixture as delete+add instead, the add is likewise the
+    // path that trips it.)
+    git(fixture.memberPath, ["mv", "docs/proof/bd-12/shot.png", "assets/shot.png"]);
+    commit(fixture.memberPath, "move proof artifact into a source path");
+
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    expect(result.paths).toStrictEqual(["assets/shot.png"]);
+  });
+
+  it("formatDrainResultText leaves a result without paths untouched", () => {
+    expect(
+      formatDrainResultText({
+        ok: false,
+        reason: "merge-failed",
+        text: "merge of feat/bd-12 into main failed",
+        parked: false,
+        warnings: [],
+      }),
+    ).toBe("merge of feat/bd-12 into main failed");
   });
 });
 

@@ -25,6 +25,8 @@ export type AgentDefinition = AgentModelSpec & {
   qualityGate?: QualityGate;
 };
 
+import type { ProofReceiptReader } from "./proof-receipt.js";
+
 /** Result from a quality gate check. */
 export interface GateResult {
   passed: boolean;
@@ -47,6 +49,11 @@ export interface GateOptions {
    * so a retry cannot pass on a previous attempt's leftovers.
    */
   proofRunStartMs?: number;
+  /**
+   * Reads the workspace proof receipt for the proof gate. Defaults to the real
+   * file reader; tests inject a seam so the receipt branch needs no filesystem.
+   */
+  readProofReceipt?: ProofReceiptReader;
   /**
    * Worktree-relative path of the userguide phase's deliverable. When set, the
    * userguide gate validates that file on disk instead of trusting the agent's
@@ -457,7 +464,11 @@ done
 
 Save all artifacts to the directory specified by the \`BELAYD_PROOF_TASK_DIR\` environment variable. Create a subdirectory named after the task ID. The harness creates a symlink at \`proof-of-work/\` pointing to the external directory, so artifacts referenced as \`proof-of-work/<task-id>/...\` resolve correctly.
 
-## Artifact references (required)
+## Never write proof into the repository
+
+Proof artifacts AND their helper scripts/logs must NEVER be written into the repository tree. Do not create or write under \`docs/proof/\`, do not create a \`proof-of-work/\` directory inside the checkout, and do not leave screenshots, traces, recordings, helper scripts or logs anywhere in the worktree. The only \`proof-of-work/\` path you may reference is the harness-created symlink to the external directory; the artifacts themselves live under \`$BELAYD_PROOF_TASK_DIR\` outside the worktree. Anything proof-shaped in the repository fails the publish gate and blocks the work from landing.
+
+## Artifact references (required without a receipt)
 
 End your output with a \`## Artifacts\` section containing exactly one line per produced artifact, in this exact format:
 
@@ -487,7 +498,17 @@ where <reason> is one of: \`rename/refactor\`, \`config-only\`, \`doc-only\`, \`
 
 Browser-proof trouble is NOT a skippable reason. A missing or incompatible Playwright browser revision, a failing E2E spec, or an unavailable test runner never justify skipping visual proof for a UI change — use playwright-cli (independent browser) or fix the browser path instead.
 
-When done, output the \`## Artifacts\` section described above listing every produced artifact in the canonical \`proof-of-work/<task-id>/<file>\` form so the quality gate can validate them.${SHARED_AGENT_GUIDANCE}`;
+When done, output the \`## Artifacts\` section described above listing every produced artifact in the canonical \`proof-of-work/<task-id>/<file>\` form so the quality gate can validate them.
+
+## Receipt (when an upload platform is available)
+
+When the proof-of-work upload platform is available and you uploaded the artifacts, end your output with a \`## Receipt\` section of the form:
+
+\`\`\`
+receipt: <https URL>
+\`\`\`
+
+The receipt URL is the reference the quality gate accepts in place of artifact refs, and only an https URL is accepted from your output. Without an upload platform — and therefore without an upload URL — you have no receipt: the artifacts are still required, and the gate validates that every listed ref exists. When a receipt is accepted, the \`## Artifacts\` section is optional; still list the artifacts you produced for reviewers.${SHARED_AGENT_GUIDANCE}`;
 
 const DOCUMENTER_SYSTEM_PROMPT = `You are a documenter. Update project documentation to reflect the changes made.
 

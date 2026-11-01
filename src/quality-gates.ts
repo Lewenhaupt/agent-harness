@@ -7,10 +7,17 @@
 
 import { exec } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { resolve, sep } from "node:path";
+import { basename, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type { GateOptions, GateResult, QualityGate, SpawnDetails } from "./agent-registry.js";
 import { cleanTerminalOutput, parseCast } from "./cast-utils.js";
+import type { ProofReceipt, ProofReceiptReader } from "./proof-receipt.js";
+import {
+  findProofReceiptRefs,
+  isProofReceiptUrl,
+  PROOF_RECEIPT_RELATIVE_PATH,
+  readProofReceipt,
+} from "./proof-receipt.js";
 import {
   checkPathTraversal,
   checkProofArtifactsExist,
@@ -735,15 +742,111 @@ function noProofArtifactsFeedback(output: string, proofDir: string | undefined):
 }
 
 /**
+ * Receipt authority for the proof gate (bd-181).
+ *
+ * A receipt asserts that a proof upload happened and binds it to a task id. The
+ * gate cannot verify the upload (the reviewing platform is not ready), so the
+ * stored, task-bound `.belayd/proof-receipt.json` file is the only authority:
+ *
+ * - A stored receipt that is malformed, unreadable, or names a different task
+ *   fails closed. An agent-authored line never outranks the file.
+ * - An output `receipt:` / `## Receipt` line is accepted only when it matches
+ *   the stored receipt's id or url. With no stored receipt, only an absolute
+ *   `https:` upload URL is accepted (plain `http:` is rejected, matching the
+ *   published contract): an id-only line is the cheapest thing to fabricate and
+ *   is never verified, so it buys nothing.
+ *
+ * The residual gap is explicit: in the no-stored-receipt branch nothing proves
+ * the URL exists. The artifact branch stays strictly stronger evidence because
+ * its refs are existence-checked and `.cast` files are content-validated.
+ *
+ * Returns undefined only when there is no receipt anywhere, which is the signal
+ * to fall back to the external proof root (the documented transition period).
+ */
+function receiptGateResult(
+  output: string,
+  cwd: string,
+  proofDir: string | undefined,
+  readReceipt: ProofReceiptReader,
+): GateResult | undefined {
+  const taskId = proofDir === undefined ? undefined : basename(proofDir);
+  const stored = readReceipt({ cwd });
+  if (!stored.ok) {
+    return { passed: false, feedback: `Invalid proof receipt: ${stored.error}` };
+  }
+
+  const refs = findProofReceiptRefs(output);
+  const storedReceipt = stored.receipt;
+
+  if (storedReceipt !== undefined) {
+    if (taskId !== undefined && storedReceipt.taskId !== taskId) {
+      return {
+        passed: false,
+        feedback:
+          `Proof receipt in ${PROOF_RECEIPT_RELATIVE_PATH} names ${storedReceipt.taskId}, ` +
+          `not ${taskId}; refusing a receipt for a different task`,
+      };
+    }
+    const mismatched = refs.filter((ref) => !receiptNamesReference(storedReceipt, ref));
+    if (mismatched.length > 0) {
+      return {
+        passed: false,
+        feedback:
+          "Proof receipt line does not match the stored receipt " +
+          `(${receiptReference(storedReceipt)}): ${mismatched.join(", ")}`,
+      };
+    }
+    return {
+      passed: true,
+      feedback: `Proof receipt accepted: ${receiptReference(storedReceipt)}`,
+    };
+  }
+
+  const [reference] = refs;
+  if (reference === undefined) return undefined;
+  if (!isProofReceiptUrl(reference)) {
+    return {
+      passed: false,
+      feedback:
+        `Proof receipt reference ${reference} is not an upload URL and no stored receipt ` +
+        `(${PROOF_RECEIPT_RELATIVE_PATH}) backs it; provide an https upload URL or ` +
+        "artifact refs",
+    };
+  }
+  return { passed: true, feedback: `Proof receipt accepted: ${reference}` };
+}
+
+/** Resolve the receipt reader: the injected test seam, else the real file reader. */
+function proofReceiptReader(options: GateOptions | undefined): ProofReceiptReader {
+  return options?.readProofReceipt ?? readProofReceipt;
+}
+
+/** True when an output reference names the stored receipt's id or upload URL. */
+function receiptNamesReference(receipt: ProofReceipt, reference: string): boolean {
+  return reference === receipt.id || reference === receipt.url;
+}
+
+/** The identifying part of a receipt (URL preferred), for gate feedback. */
+function receiptReference(receipt: ProofReceipt): string {
+  return receipt.url ?? receipt.id ?? "(missing)";
+}
+
+/**
  * Quality gate for proof-of-work content.
  *
- * Resolution order: optional proofRequired, documented skip reason, then
- * artifact validation. Artifacts must be referenced in the output (canonical
- * `proof-of-work/...` refs or absolute paths inside the proof task dir); when
- * nothing is recognized but the task dir holds accepted artifacts, those are
- * used instead of failing. .cast recordings are content-validated and every
- * other accepted artifact type must exist on disk. Never judges whether a
- * proof is relevant.
+ * Resolution order: optional proofRequired, documented skip reason, then a
+ * proof receipt, then artifact validation. A receipt only asserts that an
+ * upload happened; the gate cannot verify the upload (the reviewing platform is
+ * not ready). The stored, task-bound receipt file is the authoritative form; an
+ * output upload URL with no stored receipt is accepted but unverified, while the
+ * artifact branch (existence-checked, `.cast` content-validated) remains
+ * strictly stronger evidence. See `receiptGateResult`. When no receipt is
+ * available the gate falls back to artifacts referenced in the output (canonical
+ * `proof-of-work/...` refs or absolute paths inside the external proof task
+ * dir) or recovered from that task dir. In-tree content is never the criterion:
+ * the gate reads no git diff and proof files must never be committed. .cast
+ * recordings are content-validated and every other accepted artifact type must
+ * exist on disk. Never judges whether a proof is relevant.
  */
 export async function gateProofContent(
   output: string,
@@ -761,6 +864,9 @@ export async function gateProofContent(
 
   const cwd = options?.cwd ?? process.cwd();
   const proofDir = options?.proofDir !== undefined ? resolve(options.proofDir) : undefined;
+
+  const receipt = receiptGateResult(output, cwd, proofDir, proofReceiptReader(options));
+  if (receipt !== undefined) return receipt;
 
   // Fail closed on traversal-shaped refs before the enumeration fallback can
   // rescue a fabricated ref with artifacts that do happen to exist on disk.

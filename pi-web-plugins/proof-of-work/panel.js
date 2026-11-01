@@ -1,4 +1,4 @@
-import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofRoot, resolveTracePath, traceFileAvailable, mediaPreviewUrl } from "./discovery.js";
+import { listTaskDirs, listTaskFiles, readProofFile, getFileExtension, PROOF_OF_WORK_ROOT, resolveProofReceipt, resolveProofRoot, resolveTracePath, traceFileAvailable, mediaPreviewUrl } from "./discovery.js";
 import { renderFileContent, renderTracePlaceholder, isTraceFile, renderMediaLoadError } from "./renderers.js";
 
 export const proofPanelTagName = "pi-web-proof-of-work-panel";
@@ -22,6 +22,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   contextValue;
   listing;
   proofRoot;
+  receipt;
   selectedTaskPath;
   taskFiles;
   selectedFilePath;
@@ -130,6 +131,12 @@ class PiWebProofOfWorkPanel extends HTMLElement {
       return;
     }
     this.proofRoot = root;
+
+    // A receipt is read on every scan: it is small, and a stale receipt would
+    // claim an upload that no longer describes the bead.
+    const receipt = await resolveProofReceipt(context.files);
+    if (!this.isCurrentScan(context, token)) return;
+    this.receipt = receipt;
 
     const listing = await listTaskDirs(context.files, root.path);
     if (!this.isCurrentScan(context, token)) return;
@@ -325,6 +332,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     this.destroyPlayers();
     this.listing = undefined;
     this.proofRoot = undefined;
+    this.receipt = undefined;
     this.selectedTaskPath = undefined;
     this.taskFiles = undefined;
     this.selectedFilePath = undefined;
@@ -380,11 +388,11 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     }
 
     if (listing.kind === "missing" || listing.tasks.length === 0) {
-      this.taskListEl.innerHTML = `<div class="empty-state"><strong>No artifacts found.</strong><p>Proof-of-work artifacts live outside the workspace in the external proof base, presented as <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
+      this.taskListEl.innerHTML = `${this.renderReceiptBlock()}<div class="empty-state"><strong>No artifacts found.</strong><p>Proof-of-work artifacts live outside the workspace in the external proof base, presented as <code>${escapeHtml(PROOF_OF_WORK_ROOT)}/&lt;task-id&gt;/</code>.</p></div>`;
       return;
     }
 
-    this.taskListEl.innerHTML = listing.tasks.map((task) => {
+    this.taskListEl.innerHTML = `${this.renderReceiptBlock()}${listing.tasks.map((task) => {
       const selected = task.path === this.selectedTaskPath;
       const taskFilesForTask = this.selectedTaskPath === task.path ? this.taskFiles : undefined;
       return `
@@ -398,7 +406,30 @@ class PiWebProofOfWorkPanel extends HTMLElement {
           </div>
         </div>
       `;
-    }).join("");
+    }).join("")}`;
+  }
+
+  /**
+   * Render the upload receipt above the artifact list when the bead's proof was
+   * uploaded. The receipt is additive during the transition period: the
+   * external proof root keeps rendering below it whenever artifacts exist.
+   */
+  renderReceiptBlock() {
+    const receipt = this.receipt;
+    if (receipt === undefined || receipt.kind === "none") return "";
+    if (receipt.kind === "invalid") {
+      return `<div class="status error small"><strong>Proof receipt unreadable.</strong><pre>${escapeHtml(receipt.detail)}</pre></div>`;
+    }
+    const { taskId, id, url } = receipt.receipt;
+    const idRow =
+      id === undefined
+        ? ""
+        : `<div class="receipt-row"><span class="receipt-label">Receipt</span><code>${escapeHtml(id)}</code></div>`;
+    const urlRow =
+      url === undefined
+        ? ""
+        : `<div class="receipt-row"><span class="receipt-label">Upload</span><a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a></div>`;
+    return `<div class="status info small receipt"><strong>Proof uploaded</strong><div class="receipt-row"><span class="receipt-label">Task</span><code>${escapeHtml(taskId)}</code></div>${idRow}${urlRow}</div>`;
   }
 
   renderFileListItems(taskFiles) {
@@ -943,6 +974,9 @@ function proofStyles() {
       .status { border: 1px solid var(--pi-border); border-radius: 8px; padding: 10px; }
       .status.info { border-color: var(--pi-accent-border); background: var(--pi-bg-overlay-soft); }
       .status.error { border-color: var(--pi-danger); color: var(--pi-danger); }
+      .status.receipt { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+      .receipt-row { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+      .receipt-label { color: var(--pi-muted); flex: 0 0 auto; }
       .empty { padding: 16px; color: var(--pi-muted); }
       .cast-player { min-height: 200px; border: 1px solid var(--pi-border-muted); border-radius: 8px; background: var(--pi-bg); }
       .cast-player .status { margin: 8px; }

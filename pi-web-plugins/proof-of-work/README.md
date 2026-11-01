@@ -448,6 +448,40 @@ legacy workspace-relative `proof-of-work/` directory. Artifacts are therefore
 reported logically as `proof-of-work/<task-id>/...`, while external-mode files
 are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 
+### Proof receipts (bd-181)
+
+Proof artifacts are being phased out of repositories: they upload to the
+proof-of-work platform and the workflow keeps a **receipt** (an id and/or a URL)
+at `<workspace>/.belayd/proof-receipt.json`. The panel reads it on every scan
+(`resolveProofReceipt()` in `discovery.js`) and, when valid, renders a receipt
+block above the artifact list: task id, receipt id, and the upload URL as an
+external link.
+
+The receipt file holds one JSON object and is validated against the same shape
+as `src/proof-receipt.ts` (`ProofReceiptSchema`) — the two are a mirrored
+cross-component contract:
+
+```json
+{ "version": 1, "taskId": "bd-181", "id": "upload-42", "url": "https://proof.example.com/u/42" }
+```
+
+- `version` must be `1`, `taskId` must be a non-empty string, and at least one of
+  `id`/`url` is required; `url` must be an absolute `https` URL with a host and
+  a path (plain `http` is rejected), and `id` a UUID or at least 8 characters of
+  `[A-Za-z0-9]` containing `-`/`_`. Short prose (`done`, `1`, `yes`) is rejected
+  by the same mirrored shape rules the gate uses.
+- Receipt reading never fails the panel: a missing file is *no receipt*, and a
+  malformed/denied/binary file renders *"Proof receipt unreadable."* plus the
+  detail.
+- The external proof-root listing keeps rendering whether or not a receipt
+exists (transition period); both can render at once. Nothing changes for
+workspaces that have no receipt yet.
+
+To verify: write a receipt into a workspace that already shows artifacts, click
+↻ **Refresh**, and confirm the receipt block appears above the task list while
+the artifact list still renders. Delete the file and refresh; the block is gone
+and the artifacts remain.
+
 ### Supported formats
 
 | Extension | Renderer | Notes |
@@ -748,7 +782,7 @@ The plugin is a plain JavaScript ES module with no build step. It consists of fo
 | File | Responsibility |
 |---|---|
 | `pi-web-plugin.js` | Plugin metadata (browser plugin `apiVersion: 4`) and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
-| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
+| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `resolveProofReceipt()` reads `.belayd/proof-receipt.json`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
 | `panel.js` | Custom element `<pi-web-proof-work-panel>` — all UI, state management, player lifecycle |
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
@@ -770,7 +804,7 @@ is not among them. A future host bump that drops v4 therefore fails this guard �
 rather than silently passing —
 until `apiVersion` in `pi-web-plugin.js` is updated to match.
 
-Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step).
+Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step); receipt rendering is covered in `panel.test.js`.
 
 Async operations are guarded by a monotonic `scanToken` counter that prevents stale responses from overwriting newer state. Cast recordings play via blob URLs; raster images and video set `src` to the streaming preview endpoint URL via `mediaPreviewUrl()`, with explicit error fallback.
 

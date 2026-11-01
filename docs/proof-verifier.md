@@ -4,13 +4,52 @@ bd-48 adds a standalone, optional `belayd_proof_verifier` tool to the
 belayd-agent-harness pi extension. It separates proof checking into two stages:
 
 1. **Deterministic form gate** — `gateProofContent` in `src/quality-gates.ts`
-   remains the **only blocking** proof check (zero AI tokens). It validates
-   that artifacts are referenced, exist on disk, and that `.cast` recordings
-   are well-formed — it never judges relevance.
+   remains the **only blocking** proof check (zero AI tokens). It is
+   **receipt-first** (bd-181): a stored `.belayd/proof-receipt.json` passes it
+   without any artifact refs; with no stored receipt an agent-authored
+   `receipt: <https URL>` line passes only when it is an absolute `https:` upload
+   URL (a plain `http:` URL or an id-only line fails outright). Otherwise it
+   falls back to the external proof root — artifacts must be referenced, exist on
+   disk, and `.cast` recordings must be well-formed. In-tree proof content is
+   never the criterion: the gate reads no git diff. It never judges relevance.
 2. **LLM reasonableness verdict** — `belayd_proof_verifier` runs a read-only
    judge over the proof output and change context, returning an **advisory,
    non-blocking** `{ reasonable: true|false, reason }` verdict. It never gates a
    proof retry.
+
+## Receipts (bd-181)
+
+Proof artifacts are phased out of repositories: they upload to the proof-of-work
+platform and the workflow keeps a receipt — an id and/or URL — in
+`src/proof-receipt.ts` / `.belayd/proof-receipt.json`. The receipt lives under
+`.belayd/`, which is gitignored, so it can never enter a diff. `parseProofReceipt`
+requires `version: 1`, a `taskId`, and at least one of `id`/`url` (an absolute
+`https:` URL with a non-root path — plain `http:` is rejected, matching the
+prompt — or an `id` that is a UUID or at least 8 characters of `[A-Za-z0-9]`
+containing `-`/`_`). The shape is a zod schema (`ProofReceiptSchema`) validated at
+the boundary; the browser plugin's reader mirrors it by hand.
+
+What a receipt does and does not prove: it asserts that an upload happened and
+binds it to a task id. The gate cannot verify the upload until the reviewing
+platform exists. The stored `.belayd/proof-receipt.json` written by the harness is
+the only form that is task-bound and authoritative: a malformed or different-task
+stored receipt fails closed, and an agent-authored `receipt:` line is accepted
+when it matches the stored receipt's `id`/`url`. With no stored receipt, only an
+absolute `https:` upload URL from the output is accepted (a plain `http:` URL is
+refused) — and that URL is not verified either, so the artifact branch
+(existence-checked refs, content-validated `.cast`) remains strictly stronger
+evidence.
+
+The publish side has a matching guard: `evaluatePublishGate` in
+`src/publish-gate.ts` refuses a payload that carries proof artifacts in
+(`proof-artifacts-in-diff`) or paths outside the publishable/intended set
+(`paths-outside-scope`), and `drainFleetMerge` calls it before mutating
+anything. The payload is read with `--diff-filter=ACMRT`, so proof artifacts that
+are **added or modified** are refused while **deleting** them is allowed — that is
+the migration: upload the proof, keep the receipt, remove the in-tree files.
+Committed `docs/proof/**` history is not migrated; proof carried in is stopped,
+proof removed is allowed. A rename out of a proof directory stays in the payload
+(as its destination path) and is still refused.
 
 The verifier is **not** a new phase in `PHASE_ORDER` or the workflow registry —
 the orchestrator calls it after the proof phase on its own judgment. A
@@ -30,6 +69,11 @@ pnpm lint
 
 The bd-48-specific coverage lives in:
 
+- `src/__tests__/proof-receipt.test.ts` — the receipt contract: parsing,
+  serialization, output scanning, and the injected-filesystem read/write
+  helpers.
+- `src/__tests__/publish-gate.test.ts` — the publish guard path classification
+  and its deterministic refusal reasons.
 - `src/__tests__/proof-verification.test.ts` — artifact ref scanning,
   path-traversal guards, `.cast` extraction, `How to Verify` section
   extraction, and `buildVerifierPrompt` fencing.

@@ -1,6 +1,27 @@
 
 export const PROOF_OF_WORK_ROOT = "proof-of-work";
 
+// SYNC WARNING: The receipt path, JSON shape and reference shape below are a
+// cross-component contract duplicated in `src/proof-receipt.ts`
+// (`PROOF_RECEIPT_RELATIVE_PATH`, `ProofReceiptSchema` (zod), `isProofReceiptId`
+// and `isProofReceiptUrl`). The receipt lives at ".belayd/proof-receipt.json"
+// and holds one JSON object:
+// `{ version: 1, taskId: string, id?: string, url?: string, uploadedAt?: string,
+// artifactCount?: number }` with at least one of `id`/`url`. An `id` is a UUID
+// or >= 8 chars of `[A-Za-z0-9]` containing `-`/`_`; a `url` is an absolute
+// `https:` URL (plain `http:` is rejected — there is no localhost exception)
+// with a non-empty host and a non-root path. That id shape is a deliberate
+// contract decision, not a formatting preference: accepting a short, unpadded
+// platform id later is a `PROOF_RECEIPT_VERSION` bump in `src/proof-receipt.ts`
+// (mirrored here), never a local tweak.
+//
+// This file cannot import zod or the TypeScript module, so `normalizeProofReceipt`
+// below is the hand-rolled mirror of `ProofReceiptSchema`. It must be kept in
+// sync with the zod schema in `src/proof-receipt.ts` — strict key set, the
+// `version: 1` literal, the at-least-one-reference rule, the id shape, and the
+// https-only url rule — and vice versa.
+export const PROOF_RECEIPT_PATH = ".belayd/proof-receipt.json";
+
 // SYNC WARNING: The marker path and file format below are a cross-component
 // contract duplicated in `src/proof-dir.ts` (`PROOF_DIR_MARKER_RELATIVE_PATH`).
 // The marker lives at ".belayd/proof-dir" and contains a single-line absolute
@@ -57,6 +78,134 @@ export async function resolveProofRoot(files) {
     return { kind: "unavailable", detail: `proof-dir marker is not an absolute path: ${base}` };
   }
   return { kind: "external", path: base };
+}
+
+/** Accepted receipt keys; anything else is an unknown shape. */
+const receiptKeys = new Set([
+  "version",
+  "taskId",
+  "id",
+  "url",
+  "uploadedAt",
+  "artifactCount",
+]);
+
+function receiptString(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+const MIN_RECEIPT_ID_LENGTH = 8;
+const receiptIdPattern = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const receiptUuidPattern =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** Mirrors `isProofReceiptId`: UUIDs, or >= 8 id chars containing `-`/`_`. */
+function isProofReceiptId(value) {
+  if (receiptUuidPattern.test(value)) return true;
+  if (!receiptIdPattern.test(value)) return false;
+  if (value.length < MIN_RECEIPT_ID_LENGTH) return false;
+  return value.includes("-") || value.includes("_");
+}
+
+/**
+ * Mirrors `isProofReceiptUrl`: absolute `https:` only, non-empty host, non-root
+ * path. Plain `http:` is rejected because the published contract (the proof
+ * prompt and `docs/proof-verifier.md`) is https-only; see the SYNC WARNING.
+ */
+function isProofReceiptUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.hostname === "") return false;
+  return parsed.pathname !== "" && parsed.pathname !== "/";
+}
+
+/**
+ * Validate and normalize a parsed receipt object, mirroring
+ * `ProofReceiptSchema` in `src/proof-receipt.ts` (see the SYNC WARNING above).
+ * Returns undefined for any data that does not match the contract.
+ */
+function normalizeProofReceipt(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  if (Object.keys(raw).some((key) => !receiptKeys.has(key))) return undefined;
+  if (raw.version !== 1) return undefined;
+
+  const taskId = receiptString(raw.taskId);
+  if (taskId === undefined) return undefined;
+
+  const id = raw.id === undefined ? undefined : receiptString(raw.id);
+  if (raw.id !== undefined && id === undefined) return undefined;
+
+  const url = raw.url === undefined ? undefined : receiptString(raw.url);
+  if (raw.url !== undefined && url === undefined) return undefined;
+
+  if (id === undefined && url === undefined) return undefined;
+  // The stored receipt is held to the same reference shape as an output line;
+  // the two are compared by the gate, so the shapes must agree.
+  if (id !== undefined && !isProofReceiptId(id)) return undefined;
+  if (url !== undefined && !isProofReceiptUrl(url)) return undefined;
+
+  const uploadedAt = raw.uploadedAt === undefined ? undefined : receiptString(raw.uploadedAt);
+  if (raw.uploadedAt !== undefined && uploadedAt === undefined) return undefined;
+
+  const artifactCount = raw.artifactCount;
+  if (
+    artifactCount !== undefined &&
+    (!Number.isInteger(artifactCount) || artifactCount < 0)
+  ) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    taskId,
+    ...(id === undefined ? {} : { id }),
+    ...(url === undefined ? {} : { url }),
+    ...(uploadedAt === undefined ? {} : { uploadedAt }),
+    ...(artifactCount === undefined ? {} : { artifactCount }),
+  };
+}
+
+/**
+ * Read the proof receipt from the (gitignored) workspace receipt file.
+ *
+ * A missing file is `{ kind: "none" }` — the platform does not exist for most
+ * beads yet, so the panel falls back to the external proof root. Malformed,
+ * denied or binary content is `{ kind: "invalid", detail }`. Never rejects.
+ */
+export async function resolveProofReceipt(files) {
+  let file;
+  try {
+    file = await files.readFile(PROOF_RECEIPT_PATH);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === "Path does not exist") return { kind: "none" };
+    return { kind: "invalid", detail: message };
+  }
+
+  if (file.binary) return { kind: "invalid", detail: "proof receipt is binary" };
+  if (typeof file.content !== "string") {
+    return { kind: "invalid", detail: "proof receipt has no text content" };
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(file.content);
+  } catch {
+    return { kind: "invalid", detail: "proof receipt is not valid JSON" };
+  }
+
+  const receipt = normalizeProofReceipt(raw);
+  if (receipt === undefined) {
+    return { kind: "invalid", detail: "proof receipt does not match the receipt contract" };
+  }
+  return { kind: "receipt", receipt };
 }
 
 /** List task directories under proof-of-work/. Never rejects. */

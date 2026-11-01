@@ -61,6 +61,7 @@ import {
   updateFleetMergeQueue,
 } from "./fleet-state.js";
 import type { FleetIntent } from "./fleet-status.js";
+import { evaluatePublishGate } from "./publish-gate.js";
 import type { WorktreeListEntry } from "./worktree.js";
 import { gitContextFreeEnv, parseWorktreeListPorcelainZ } from "./worktree.js";
 
@@ -1032,6 +1033,11 @@ export type FleetMergeFailureReason =
   | "member-branch-mismatch"
   | "member-branch-missing"
   | "gate-commands-missing"
+  // bd-181: the publish payload is refused rather than carried (proof must be
+  // uploaded, never published as files).
+  | "proof-artifacts-in-diff"
+  | "paths-outside-scope"
+  | "publish-payload-unreadable"
   | "stash-failed"
   | "rebase-failed"
   | "gate-failed"
@@ -1056,6 +1062,12 @@ export type DrainFleetMergeResult =
       reason: FleetMergeFailureReason;
       text: string;
       taskId?: string;
+      /**
+       * Complete offending path list for a publish refusal, sorted. `text` is
+       * bounded to one readable line; callers that render a report must use this
+       * field to show every path.
+       */
+      paths?: readonly string[];
       /** Set when the root was stashed; always reported, never hidden. */
       stashRef?: string;
       parked: boolean;
@@ -1081,6 +1093,8 @@ interface MergeAttemptContext {
 interface MergeCheckFailure {
   reason: FleetMergeFailureReason;
   text: string;
+  /** Offending paths when the refusal is path-shaped (publish gate only). */
+  paths?: readonly string[];
 }
 
 /** Run one git command; undefined means it failed (stdout is the error text). */
@@ -1361,6 +1375,72 @@ async function checkMergePreconditions(
   }
 
   return { memberWorktree };
+}
+
+/**
+ * Refuse a branch whose payload carries proof (bd-181).
+ *
+ * Proof artifacts are uploaded, never committed, so a diff that adds or
+ * modifies them is exactly what the publish transition must not carry. Deleting
+ * proof artifacts is *allowed* and is the documented migration path: upload the
+ * proof, keep the receipt at `.belayd/proof-receipt.json`, remove the in-tree
+ * files. The diff is therefore read with `--diff-filter=ACMRT`, which excludes
+ * deletions and leaves added/copied/modified/renamed/type-changed entries — a
+ * rename is classified by its destination path, so moving proof content out of
+ * a proof directory into a source path is still refused.
+ *
+ * The check runs after the preconditions and before the lock, the root stash and
+ * the rebase: a refusal must not mutate anything.
+ *
+ * The diff is branch-scoped (`<base>...<branch>`), so proof directories that
+ * already landed in history are untouched and are deliberately *not* migrated:
+ * this only stops proof from being carried in, never its removal.
+ *
+ * No `intendedPaths` is passed because the drain has no declared payload — the
+ * publish executor (bd-174.3) will pass its own set to `evaluatePublishGate`.
+ */
+async function checkPublishPayload(
+  context: MergeAttemptContext,
+): Promise<MergeCheckFailure | undefined> {
+  // `-z` + `core.quotePath=false` are both required: git C-quotes non-ASCII and
+  // space-containing paths in its default `--name-only` output, and a quoted
+  // literal (`"docs/proof/x/caf\303\251.png"`) matches neither a proof-directory
+  // prefix nor a proof extension, so proof would merge through the gate.
+  //
+  // `--diff-filter=ACMRT` drops deletions from the payload: proof that is
+  // *added or modified* is refused, while *deleting* proof artifacts is the
+  // documented migration path (upload it, keep the receipt, remove the files)
+  // and must merge. A rename out of a proof directory still counts — it is
+  // reported as `R` and `--name-only` emits the destination path, which is
+  // what the gate classifies; the source path no longer exists in the result.
+  // `--name-status` is deliberately avoided: its `-z` output interleaves a
+  // status letter with each path and would break the plain NUL-split below.
+  const diff = await gitWithError(
+    context,
+    [
+      "-c",
+      "core.quotePath=false",
+      "diff",
+      "--name-only",
+      "-z",
+      "--diff-filter=ACMRT",
+      `${context.baseBranch}...${context.entry.branch}`,
+    ],
+    context.options.rootCwd,
+  );
+  if (!diff.ok) {
+    // Fail closed: an unreadable payload cannot be proven proof-free.
+    return {
+      reason: "publish-payload-unreadable",
+      text: `could not read the publish payload of ${context.entry.branch}: ${diff.error}`,
+    };
+  }
+
+  const changedPaths = diff.stdout.split("\0").filter((path) => path !== "");
+  const gate = evaluatePublishGate({ changedPaths });
+  if (gate.ok) return undefined;
+  // `paths` is the complete sorted list; `text` is bounded to one line.
+  return { reason: gate.reason, text: gate.text, paths: gate.paths };
 }
 
 /** Stash a dirty root, recording the ref so it can be reported and restored. */
@@ -2222,6 +2302,7 @@ function drainFailure(options: {
   reason: FleetMergeFailureReason;
   text: string;
   taskId?: string;
+  paths?: readonly string[];
   parked?: boolean;
   warnings: readonly string[];
 }): DrainFleetMergeResult {
@@ -2230,6 +2311,7 @@ function drainFailure(options: {
     reason: options.reason,
     text: options.text,
     ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+    ...(options.paths === undefined ? {} : { paths: options.paths }),
     parked: options.parked ?? false,
     warnings: options.warnings,
   };
@@ -2343,6 +2425,7 @@ function drainRefusal(
     reason: failure.reason,
     text: failure.text,
     taskId: context.entry.taskId,
+    ...(failure.paths === undefined ? {} : { paths: failure.paths }),
     warnings: context.warnings,
   });
 }
@@ -2379,6 +2462,7 @@ async function finishFailedDrain(
     reason,
     text,
     taskId: context.entry.taskId,
+    ...(failure.paths === undefined ? {} : { paths: failure.paths }),
     ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
     parked,
     warnings: context.warnings,
@@ -2450,6 +2534,22 @@ async function finishSuccessfulDrain(context: MergeAttemptContext): Promise<Drai
 }
 
 /**
+ * Report text for a drain result: the one-line refusal plus the complete path
+ * list when the refusal is path-shaped.
+ *
+ * `DrainFleetMergeResult.text` is bounded to one readable line, so the result
+ * carries the full sorted `paths` separately. A caller that renders a report
+ * must surface them, or the operator cannot see everything it has to delete.
+ */
+export function formatDrainResultText(result: DrainFleetMergeResult): string {
+  if (result.ok) return result.text;
+  const paths = result.paths;
+  if (paths === undefined || paths.length === 0) return result.text;
+  const lines = paths.map((path) => `- ${path}`);
+  return [result.text, "", `Refused paths (${paths.length}):`, ...lines].join("\n");
+}
+
+/**
  * Drain one merge: acquire, precondition, rebase -> gates -> merge -> broadcast,
  * restore the root, release.
  *
@@ -2476,6 +2576,9 @@ export async function drainFleetMerge(
 
   const preconditions = await checkMergePreconditions(context);
   if ("reason" in preconditions) return drainRefusal(context, preconditions);
+
+  const payload = await checkPublishPayload(context);
+  if (payload !== undefined) return drainRefusal(context, payload);
 
   const acquired = acquireForDrain(context);
   if (!acquired.ok) return drainRefusal(context, acquired.failure);

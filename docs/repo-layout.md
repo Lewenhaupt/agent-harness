@@ -47,7 +47,9 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/quality-gates.ts` | Deterministic quality gates for Belayd agents |
 | `src/quality-gate-run.ts` | Quality-gate runner — the retry loop around a phase's deterministic gates |
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
+| `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt at `.belayd/proof-receipt.json` |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
+| `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
 | `src/review-findings.ts` | Durable review findings: severity/disposition record, gate reason, and the human-gate comment body (bd-175) |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
@@ -123,7 +125,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/fleet-heartbeat.ts` | Supervisor heartbeat for a run-mode fleet (bd-126 P5) |
 | `src/fleet-launch.ts` | Fleet launch: the decision half of `belayd_fleet_launch` / `/fleet` (bd-126 P1) |
 | `src/fleet-mailbox.ts` | Fleet mailbox rendering (bd-126 P1) |
-| `src/fleet-merge.ts` | Fleet merge queue — P2 of the fleet supervisor (bd-126) |
+| `src/fleet-merge.ts` | Fleet merge queue — P2 of the fleet supervisor (bd-126); refuses a payload that carries proof (bd-181) |
 | `src/fleet-mode.ts` | Fleet supervisor mode (bd-126 P1) |
 | `src/fleet-ordering-gates.ts` | Fleet wave ordering as bd gates, resolved on landing not closing (bd-158) |
 | `src/fleet-pause.ts` | Cooperative fleet pause and resume (bd-126 P4) |
@@ -185,7 +187,7 @@ order so pi hook/tool order is unchanged.
 | `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping |
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
-| `proof.ts` | Proof dirs, receipt resolution, `belayd_proof_verifier` |
+| `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
 | `review.ts` | Review scoping/build (`buildReviewTask`), bounded review delivery, review↔fix guidance |
 | `session-state.ts` | Per-session state store (generic over the composed type), ask-hold, beads-actor attribution, run tracking, status formatting |
 | `model.ts` | Model-routing state (bd-116): capacity cache, per-workflow telemetry store, cooldown store, flush/reset rules |

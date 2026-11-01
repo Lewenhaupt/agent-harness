@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   PROOF_DIR_MARKER_PATH,
   PROOF_OF_WORK_ROOT,
+  PROOF_RECEIPT_PATH,
   getFileExtension,
   listTaskDirs,
   listTaskFiles,
   mediaPreviewUrl,
   readProofFile,
+  resolveProofReceipt,
   resolveProofRoot,
   resolveTracePath,
   traceFileAvailable,
@@ -36,6 +38,91 @@ function readFileReturning(content, extra = {}) {
 function rejectWith(message) {
   return Promise.reject(new Error(message));
 }
+
+describe("resolveProofReceipt", () => {
+  const receipt = { version: 1, taskId: "bd-181", url: "https://proof.example.com/u/1" };
+
+  it("exposes the gitignored receipt path", () => {
+    expect(PROOF_RECEIPT_PATH).toBe(".belayd/proof-receipt.json");
+  });
+
+  it("returns none when the receipt file is missing", async () => {
+    const files = fakeFiles({ readFile: () => rejectWith("Path does not exist") });
+
+    expect(await resolveProofReceipt(files)).toEqual({ kind: "none" });
+  });
+
+  it("returns the normalized receipt when one exists", async () => {
+    const files = fakeFiles({
+      readFile: async () =>
+        readFileReturning(JSON.stringify({ ...receipt, taskId: "  bd-181  " })),
+    });
+
+    expect(await resolveProofReceipt(files)).toEqual({ kind: "receipt", receipt });
+  });
+
+  it("accepts an id-only receipt", async () => {
+    const files = fakeFiles({
+      readFile: async () => readFileReturning(JSON.stringify({ version: 1, taskId: "bd-181", id: "upload-42" })),
+    });
+
+    expect(await resolveProofReceipt(files)).toEqual({
+      kind: "receipt",
+      receipt: { version: 1, taskId: "bd-181", id: "upload-42" },
+    });
+  });
+
+  it("reports invalid JSON", async () => {
+    const files = fakeFiles({ readFile: async () => readFileReturning("{not json") });
+
+    expect(await resolveProofReceipt(files)).toEqual({
+      kind: "invalid",
+      detail: "proof receipt is not valid JSON",
+    });
+  });
+
+  it("reports a binary receipt", async () => {
+    const files = fakeFiles({
+      readFile: async () => readFileReturning("", { binary: true }),
+    });
+
+    expect(await resolveProofReceipt(files)).toEqual({
+      kind: "invalid",
+      detail: "proof receipt is binary",
+    });
+  });
+
+  it("reports a denied read", async () => {
+    const files = fakeFiles({ readFile: () => rejectWith("Path outside allowed paths") });
+
+    expect(await resolveProofReceipt(files)).toEqual({
+      kind: "invalid",
+      detail: "Path outside allowed paths",
+    });
+  });
+
+  it.each([
+    ["a newer version", { version: 2, taskId: "bd-181", url: receipt.url }],
+    ["no reference", { version: 1, taskId: "bd-181" }],
+    ["a relative url", { version: 1, taskId: "bd-181", url: "proof.example.com/x" }],
+    ["a non-http url", { version: 1, taskId: "bd-181", url: "ftp://proof.example.com/x" }],
+    // The contract is https-only (mirrors `isProofReceiptUrl`); a plain-http
+    // receipt must be invalid here exactly as it is on the TypeScript side.
+    ["a plain-http url", { version: 1, taskId: "bd-181", url: "http://proof.example.com/x" }],
+    ["a url without a path", { version: 1, taskId: "bd-181", url: "https://proof.example.com" }],
+    ["a prose id", { version: 1, taskId: "bd-181", id: "done" }],
+    ["a short id", { version: 1, taskId: "bd-181", id: "u-1" }],
+    ["an empty task id", { version: 1, taskId: " ", url: receipt.url }],
+    ["an unknown key", { version: 1, taskId: "bd-181", url: receipt.url, proof: "x" }],
+  ])("rejects %s as invalid", async (_label, raw) => {
+    const files = fakeFiles({ readFile: async () => readFileReturning(JSON.stringify(raw)) });
+
+    expect(await resolveProofReceipt(files)).toEqual({
+      kind: "invalid",
+      detail: "proof receipt does not match the receipt contract",
+    });
+  });
+});
 
 describe("resolveProofRoot", () => {
   it("resolves the external base from an absolute marker", async () => {

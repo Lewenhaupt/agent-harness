@@ -306,3 +306,73 @@ describe("launchTraceViewer navigation gating", () => {
     expect(windowRef.location.href).toBe(params.viewerUrl);
   });
 });
+
+/**
+ * Receipt rendering (bd-181): a proof upload receipt renders above the artifact
+ * list, and the external proof root keeps rendering whether or not one exists.
+ */
+describe("proof receipt rendering", () => {
+  const loadedListing = {
+    kind: "loaded",
+    tasks: [{ name: "bd-181", path: "proof-of-work/bd-181" }],
+  };
+
+  function renderInstance({ listing, receipt, selectedTaskPath }) {
+    const instance = Object.create(capturedPanelClass.prototype);
+    instance.contextValue = { workspace: { path: "/ws" } };
+    instance.taskListEl = { innerHTML: "" };
+    instance.listing = listing;
+    instance.receipt = receipt;
+    instance.taskFiles = undefined;
+    instance.selectedTaskPath = selectedTaskPath;
+    instance.renderTaskList();
+    return instance.taskListEl.innerHTML;
+  }
+
+  it("renders task id, receipt id, and the URL as an external link", () => {
+    const html = renderInstance({
+      listing: loadedListing,
+      receipt: {
+        kind: "receipt",
+        receipt: { version: 1, taskId: "bd-181", id: "upload-42", url: "https://proof.example.com/u/42" },
+      },
+    });
+
+    expect(html).toContain("Proof uploaded");
+    expect(html).toContain("bd-181");
+    expect(html).toContain("upload-42");
+    expect(html).toContain('href="https://proof.example.com/u/42"');
+    expect(html).toContain('target="_blank"');
+    // The external proof root listing is still there next to the receipt.
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+
+  it("renders the receipt even when the external proof root has no artifacts", () => {
+    const html = renderInstance({
+      listing: { kind: "loaded", tasks: [] },
+      receipt: { kind: "receipt", receipt: { version: 1, taskId: "bd-181", id: "upload-42" } },
+    });
+
+    expect(html).toContain("Proof uploaded");
+    expect(html).toContain("No artifacts found.");
+    expect(html).not.toContain("<a href=");
+  });
+
+  it("keeps the artifact list when the receipt is absent", () => {
+    const html = renderInstance({ listing: loadedListing, receipt: { kind: "none" } });
+
+    expect(html).not.toContain("Proof uploaded");
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+
+  it("keeps the artifact list and reports an unreadable receipt", () => {
+    const html = renderInstance({
+      listing: loadedListing,
+      receipt: { kind: "invalid", detail: "proof receipt is not valid JSON" },
+    });
+
+    expect(html).toContain("Proof receipt unreadable.");
+    expect(html).toContain("proof receipt is not valid JSON");
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+});

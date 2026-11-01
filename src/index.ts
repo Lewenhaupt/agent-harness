@@ -352,6 +352,7 @@ export {
   enqueueFleetMerge,
   FLEET_MERGE_GATE_SCRIPTS,
   FLEET_MERGE_ORPHAN_LOCK_GRACE_MS,
+  formatDrainResultText,
   formatFleetMergeDrainReport,
   formatFleetMergeQueue,
   parseDroppedStashSha,
@@ -1148,6 +1149,27 @@ export {
   resolveProofBase,
 } from "./proof-dir.js";
 export type {
+  ProofReceipt,
+  ProofReceiptFs,
+  ProofReceiptIoOptions,
+  ProofReceiptReader,
+  ProofReceiptReadResult,
+} from "./proof-receipt.js";
+export {
+  findProofReceiptRefs,
+  formatProofReceipt,
+  isProofReceiptId,
+  isProofReceiptReference,
+  isProofReceiptUrl,
+  nodeProofReceiptFs,
+  PROOF_RECEIPT_RELATIVE_PATH,
+  PROOF_RECEIPT_VERSION,
+  parseProofReceipt,
+  readProofReceipt,
+  serializeProofReceipt,
+  writeProofReceipt,
+} from "./proof-receipt.js";
+export type {
   EnumerateProofDirOptions,
   ExtractedProofArtifact,
   ProofRefScan,
@@ -1175,6 +1197,17 @@ export {
   resolveProofRefInDir,
   scanProofRefs,
 } from "./proof-verification.js";
+export type {
+  PublishGateInput,
+  PublishGateRefusalReason,
+  PublishGateResult,
+} from "./publish-gate.js";
+export {
+  evaluatePublishGate,
+  isHarnessLocalPath,
+  isProofArtifactPathInDiff,
+  isPublishablePath,
+} from "./publish-gate.js";
 export {
   gateFullValidation,
   gateLint,

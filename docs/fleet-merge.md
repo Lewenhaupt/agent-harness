@@ -80,23 +80,40 @@ runs the documented sequence:
 1. **preconditions** — fleet not paused; root is the repository's own checkout on
    the base branch; member worktree is on the queued branch and clean. Any failure
    is refused **before** a mutation and leaves the entry `queued`.
-2. **acquire** — atomically create `<fleetDir>/merge.lock.d`. A live lease from
+2. **publish payload** — `git diff --name-only --diff-filter=ACMRT <base>...<branch>`
+   is checked by `evaluatePublishGate` (`src/publish-gate.ts`, bd-181) before the
+   lock, the stash, or the rebase. A payload that still carries proof (proof
+   artifacts that are **added or modified**) refuses with
+   `proof-artifacts-in-diff`; harness-local, absolute, traversal, backslash or
+   non-ASCII (lookalike) paths refuse with `paths-outside-scope`; an unreadable
+   diff refuses with
+   `publish-payload-unreadable`. **Deleting** proof artifacts is allowed — that is
+   the migration: upload the proof, keep the receipt, `git rm -r docs/proof`. The
+   one-line refusal text is bounded (10 paths,
+   then a `(+N more)` pointer naming `paths`), and the drain result carries the
+   complete sorted list as `paths`, which `belayd_fleet_merge` renders as
+   `Refused paths (N):` lines. The diff is branch-scoped, so proof directories
+   already in history are not migrated — proof carried in is stopped, proof
+   removed is allowed. `--diff-filter=ACMRT` is what excludes deletions; a
+   rename is still reported (as its destination path), so renaming proof content
+   out of a proof directory is refused.
+3. **acquire** — atomically create `<fleetDir>/merge.lock.d`. A live lease from
    another supervisor is refused ("held by X until T"); an expired lease is
    acquirable.
-3. **stash a dirty root** — `git stash push --include-untracked`, the stash
+4. **stash a dirty root** — `git stash push --include-untracked`, the stash
    **sha** recorded and audited (an unverifiable ref fails the step).
-4. **rebase** the member branch onto the base in the member worktree. A conflict
+5. **rebase** the member branch onto the base in the member worktree. A conflict
    is aborted (`git rebase --abort`), so the member's commits are unchanged; a
    failed abort is warned instead of leaving an unexplained "rebase in
    progress".
-5. **gates** — the target's `package.json` scripts (`test`, `test:integration`,
+6. **gates** — the target's `package.json` scripts (`test`, `test:integration`,
    `typecheck`, `lint`, `build` — whichever exist) run against the rebased result
    in the member worktree, through the target's own package manager. The lease is
    renewed before each one.
-6. **merge** — `git merge --ff-only <memberBranch>` in the root, after
+7. **merge** — `git merge --ff-only <memberBranch>` in the root, after
    re-verifying that the root is still on the base branch (a branch switch during
    the gates refuses with `root-not-on-base` instead of moving that branch).
-7. **restore** the stashed root immediately: `git stash apply <sha>` (refusing if
+8. **restore** the stashed root immediately: `git stash apply <sha>` (refusing if
    the sha no longer resolves, the root is no longer this repository's own
    checkout, or it moved off the base branch), then `git stash drop` of exactly
    that entry. The drop is **cross-checked**: the position is verified immediately
@@ -110,7 +127,6 @@ runs the documented sequence:
    `rebase-hint` to members whose **actual** branch (from git's worktree list, not
    an assumed `feat/<id>`) does not yet contain the new commit.
 9. **release** the lock (record cleared, directory removed).
-
 Every step is audited (see the table in `docs/fleet-orchestrator.md`).
 
 ### Reading the result
@@ -133,6 +149,9 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 | `lock-unavailable` | another supervisor holds a live lease, or an orphaned primitive is inside its grace window |
 | `root-not-own-checkout` / `root-not-on-base` | run the drain from the root on the base branch |
 | `member-worktree-dirty` | commit or discard the member's working-tree changes first |
+| `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof and keep the receipt at `.belayd/proof-receipt.json` instead. Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
+| `paths-outside-scope` | the payload contains harness-local (`.belayd`, `.belayd/`, `.belayd-task.json`, `proof-of-work`), absolute, traversal or backslash paths, a non-ASCII/lookalike path (refused rather than guessed; rename it to ASCII), or (when the publisher declares a payload) a path outside it |
+| `publish-payload-unreadable` | the payload diff could not be computed; the drain fails closed rather than guessing |
 
 ### What it will not do
 
