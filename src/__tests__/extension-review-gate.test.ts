@@ -139,6 +139,7 @@ describe("openReviewHumanGate", () => {
     return {
       getSessionState: () => state,
       resolveSessionBdActor: () => ACTOR,
+      resolveGithubAnswerTarget: () => ({ kind: "local" }),
       sendUserMessage: () => {},
     };
   }

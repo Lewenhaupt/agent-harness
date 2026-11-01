@@ -173,6 +173,8 @@ export type SessionGithubAuthorityResult =
   | {
       ok: true;
       authority: GithubAuthority;
+      /** The whole contract, including the `github` repo ref bd-182 needs. */
+      config: GithubAuthorityConfig;
       repoRoot: string;
       warnings: readonly string[];
     }
@@ -203,6 +205,7 @@ export function resolveGithubAuthorityForSession(options: {
   return {
     ok: true,
     authority: read.value.authority,
+    config: read.value,
     repoRoot,
     warnings: read.warnings,
   };

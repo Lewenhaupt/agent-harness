@@ -75,6 +75,25 @@ function lineCount(source: string): number {
   return source.split("\n").length - (source.endsWith("\n") ? 1 : 0);
 }
 
+/** Every module the capability walk reads, scanned from all capabilities at once. */
+function scannedModules(): Set<string> {
+  const read = new Set<string>();
+  for (const entry of capabilityModules()) {
+    scanCapabilityModule({
+      entry,
+      seams: {
+        read: (repoRelativePath) => {
+          read.add(repoRelativePath);
+          return diskSeams.read(repoRelativePath);
+        },
+        exists: diskSeams.exists,
+      },
+      fleetAllowed: FLEET_IMPORT_ALLOWLIST.has(entry),
+    });
+  }
+  return read;
+}
+
 describe("capability import boundary (bd-179)", () => {
   it("has capability modules instead of the monolith", () => {
     const modules = capabilityModules();
@@ -92,6 +111,24 @@ describe("capability import boundary (bd-179)", () => {
         violations.map((violation) => `[${violation.kind}] ${violation.detail}`).join("\n"),
       ).toEqual([]);
     }
+  });
+
+  it("keeps the bd-182 GitHub answer modules inside the scan scope", () => {
+    const read = scannedModules();
+    // human-gate.ts owns the answer channel; the walk must reach the modules
+    // that read and parse the thread instead of skipping them as external.
+    expect(read.has("src/github-comments.ts")).toBe(true);
+    expect(read.has("src/github-answer-target.ts")).toBe(true);
+    // The resolver is composer-only: through src/github-authority.ts it reaches
+    // src/fleet-publish.ts, so no capability may import it.
+    expect(read.has("src/github-answer-target-resolution.ts")).toBe(false);
+    expect(
+      scanCapabilityModule({
+        entry: "src/github-answer-target-resolution.ts",
+        seams: diskSeams,
+        fleetAllowed: false,
+      }).map((violation) => violation.kind),
+    ).toEqual(["fleet"]);
   });
 
   it("keeps the fleet-import allowlist explicit and minimal", () => {

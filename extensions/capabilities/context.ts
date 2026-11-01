@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 
 import { writePhaseArtifact } from "../../src/artifacts.js";
 import type { BeadsAssigneeResult } from "../../src/beads-assignee.js";
+import type { HumanAnswerChannel } from "../../src/github-answer-target.js";
 import type { HandoffPacket } from "../../src/handoff.js";
 import {
   appendMetricsEvent,
@@ -105,6 +106,24 @@ export function runBdCommand(
   },
 ): Promise<{ stdout: string; stderr: string }> {
   return runFileCommand("bd", argv, options);
+}
+
+/**
+ * Run `gh` with an explicit argv array and no shell (bd-182).
+ *
+ * Same private runner as `bd`, so the GitHub answer channel spawns exactly the
+ * way the bead read does; only the binary differs.
+ */
+export function runGhCommand(
+  argv: readonly string[],
+  options: {
+    cwd: string;
+    stdin: string | undefined;
+    timeoutInMs: number;
+    maxBufferInBytes: number;
+  },
+): Promise<{ stdout: string; stderr: string }> {
+  return runFileCommand("gh", argv, options);
 }
 
 /**
@@ -385,7 +404,12 @@ export interface CoreSessionState {
    * The bd gate — not this field — is the durable state: a restart re-discovers
    * it at session start, and delivering the answer clears both together.
    */
-  awaitingHuman?: AwaitingHuman & { gateId?: string };
+  awaitingHuman?: AwaitingHuman & {
+    gateId?: string;
+    channel?: HumanAnswerChannel;
+    /** The harness's own posted question; excluded from answer selection. */
+    answerCommentId?: string;
+  };
   /**
    * Set synchronously while a review gate is being opened, before its bd writes
    * complete (bd-175). It reserves the wait so a second concurrent delivery
@@ -407,6 +431,18 @@ export interface CoreSessionState {
   humanAnswerClaimed?: boolean;
   /** The unrecognized-gate warning was already logged for the current wait. */
   humanAnswerWarned?: boolean;
+  /** Separately one-shot: an unrecognized gate must not mute a failed channel read. */
+  humanUnrecognizedGateWarned?: boolean;
+  /** Separately one-shot: a dropped-comment warning is its own diagnosis. */
+  humanAnswerDroppedWarned?: boolean;
+  /**
+   * Separately one-shot: an unresolvable `gh` identity is its own diagnosis.
+   *
+   * Kept apart from {@link humanAnswerWarned} so the identity message (which
+   * names whether the read fails closed or relies on the posted comment id)
+   * cannot mute, or be muted by, a failed channel read.
+   */
+  harnessIdentityWarned?: boolean;
   /**
    * Completion follow-ups held because an unanswered `ask_user` question set is
    * open (bd-177).

@@ -198,15 +198,58 @@ exempt: it is the actor that applies GitHub's decisions locally. Under
 `authority: "bd"` the policy never refuses, so local mode is byte-for-byte
 unchanged.
 
-## 7. Not here
+## 7. Reading a person's answer from issue comments (bd-182)
 
-This bead owns the authority, map, drift, readiness/expiry, and append-only
-policy only. These are owned elsewhere and must not be duplicated here:
+Under `authority: "github"` the question lands on the **issue**, never the PR, and
+the answer is read from there. The shape is unchanged from bd-152: the bd
+`human` gate is the durable wait (nothing on GitHub has to represent "waiting"),
+the question is an authored comment, the first qualifying comment at/after the
+gate's `createdAt` is the answer, delivery is a real user turn, and the gate is
+resolved only after a successful send.
+
+Only the read half and the question's channel change:
+
+- **read** — `gh api --paginate --slurp
+  repos/{owner}/{repo}/issues/{n}/comments?since=<gateCreatedAt>`. `since` is a
+  query parameter (not a `gh` flag), and `--slurp` keeps every page inside one
+  JSON document.
+- **cursor** — the gate's `createdAt`, not a persisted comment id. bd/GitHub
+  timestamps have second granularity, hence `>=`: an answer posted before a
+  harness restart is still delivered, because the cursor comes from the gate.
+- **channel** — the wait records where the question was actually posted
+  (`bd` comment or mapped issue) and the poll reads that recorded channel. A
+  later authority/map failure never overrides it; only a wait that predates the
+  field resolves once and records the result.
+- **identity** — the primary guarantee is the posted question's own comment id:
+  `gh api` returns it from the POST and it is excluded from the answer read even
+  when `gh` authenticates as a human account. Bot identity is defence in depth:
+  an answer is a comment whose author is **not** a bot (`user.type == "Bot"`, a
+  case-insensitive `[bot]` suffix, a login in `BELAYD_GITHUB_BOT_LOGINS`) and not
+  the authenticated `gh api user` login. If neither the posted id nor that login
+  can be determined, the read fails closed (`unknown`) instead of risking a
+  self-answered wait.
+- **degradation** — `gh` absent, unauthenticated, non-zero exit, or non-JSON
+  output is `unknown`, never "no answer yet": the wait stays armed and the gate
+  is not resolved.
+- **ask** — a GitHub-primary bead with no entry in `.belayd/github-map.json` is
+  refused (`exit 1`, naming the bead and the map) and **no gate is opened**, so
+  an unanswerable wait cannot block the bead. A failed post compensates through
+  the existing gate-resolve path.
+
+Local mode (`authority: "bd"`) keeps the bd-152 path byte for byte: the same bd
+comment write, the same `bd comments` read, the same `isHumanComment` filter.
+
+User guide: [`docs/bd-182-userguide.md`](bd-182-userguide.md).
+
+## 8. Not here
+
+This bead owns the authority, map, drift, readiness/expiry, append-only policy,
+and the GitHub-primary answer read (§7, bd-182). These are owned elsewhere and
+must not be duplicated here:
 
 | Concern | Owner |
 |---|---|
 | Close-on-merge and `mergedAt` acceptance (the human label's replacement in PR mode) | bd-174.4 / bd-174.10 / bd-174.12 |
-| Reading a person's answer from issue comments | bd-182 |
 | PR body and deferred findings | bd-183 / bd-184 |
 | Token and credential boundary for GitHub access | bd-7 |
 
@@ -214,7 +257,7 @@ The projection does not close beads itself. In PR mode the merge event is the
 human's acceptance; the local-mode "never close, the human closes with
 `wt merge`" rule stays a local-mode rule.
 
-## 8. Modules
+## 9. Modules
 
 | File | Purpose |
 |---|---|
@@ -222,7 +265,11 @@ human's acceptance; the local-mode "never close, the human closes with
 | `src/github-issue-map.ts` | Bead ↔ issue map: pure parse/serialize/upsert plus never-throw fs seams |
 | `src/github-ready.ts` | GitHub-primary readiness and stale-gate expiry |
 | `src/github-append-policy.ts` | Append-only bd policy for phase agents |
+| `src/github-answer-target.ts` | Resolve the answer channel for one bead (local bd thread vs mapped issue) |
+| `src/github-comments.ts` | Issue-comment read/post: guarded argv, tolerant `--slurp` parse, dropped-record count, posted-id + bot identity filter |
 
 Tests: `src/__tests__/github-authority.test.ts`,
 `src/__tests__/github-issue-map.test.ts`, `src/__tests__/github-ready.test.ts`,
-`src/__tests__/github-append-policy.test.ts`.
+`src/__tests__/github-append-policy.test.ts`,
+`src/__tests__/github-comments.test.ts`, plus the GitHub-primary suite in
+`src/__tests__/extension-human-answer.test.ts`.

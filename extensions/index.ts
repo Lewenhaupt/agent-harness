@@ -48,6 +48,7 @@ import {
   readWorktreeBranch,
   resolveBashTimeout,
   resolveGitCommonDir,
+  resolveGithubAnswerTargetForSession,
   resolveGithubAuthorityForSession,
   resolveOutlineTargets,
   resolveWorktreePath,
@@ -86,8 +87,8 @@ import {
   attributedBdArgv,
   createInitialSessionState,
   createSessionStateStore,
+  emitSessionWarnings,
   resolveSessionBdActor,
-  warnOncePerSession,
 } from "./capabilities/session-state.js";
 import { registerTaskStartTools, registerTaskStopTools } from "./capabilities/task-control.js";
 import { registerWorkflowCommands } from "./capabilities/workflow-commands.js";
@@ -195,6 +196,17 @@ export default function belaydAgentHarness(
   const humanGateDeps: HumanGateDeps = {
     getSessionState,
     resolveSessionBdActor: (ctx) => resolveSessionBdActor(ctx, getSessionState),
+    // bd-182: the composer owns git/repo-root resolution, so the capability gets
+    // the resolved answer channel (local bd thread vs mapped GitHub issue).
+    resolveGithubAnswerTarget: (ctx, beadId) => {
+      const cwd = ctx.cwd;
+      if (cwd === undefined) {
+        return { kind: "unknown", reason: "authority unresolved: the session has no cwd" };
+      }
+      const resolved = resolveGithubAnswerTargetForSession({ cwd, beadId, resolveGitCommonDir });
+      emitSessionWarnings(ctx, resolved.warnings, getSessionState);
+      return resolved.target;
+    },
     sendUserMessage: (text: string) => {
       pi.sendUserMessage(text);
     },
@@ -328,16 +340,7 @@ export default function belaydAgentHarness(
         return { ok: false, error: "authority unresolved: the session has no working directory" };
       }
       const result = resolveGithubAuthorityForSession({ cwd, resolveGitCommonDir });
-      const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
-      const state =
-        typeof manager?.getSessionId === "function"
-          ? getSessionState(ctx as { sessionManager: { getSessionId: () => string } })
-          : undefined;
-      for (const warning of result.ok ? result.warnings : []) {
-        const message = `[belayd-harness] ${warning}`;
-        if (state === undefined) console.warn(message);
-        else warnOncePerSession(state, warning, message);
-      }
+      emitSessionWarnings(ctx, result.ok ? result.warnings : [], getSessionState);
       if (!result.ok) return { ok: false, error: result.error };
       return { ok: true, authority: result.authority };
     },

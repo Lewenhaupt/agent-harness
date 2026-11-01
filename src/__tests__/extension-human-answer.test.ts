@@ -16,11 +16,22 @@
  * from the command shape.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  type HumanGateDeps,
+  humanAnswerMessage,
+  openReviewHumanGate,
+  stopHumanAnswerPoll,
+} from "../../extensions/capabilities/human-gate.js";
+import { createInitialSessionState } from "../../extensions/capabilities/session-state.js";
+import type { GithubAnswerTarget } from "../github-answer-target.js";
+import { REVIEW_HUMAN_GATE_REASON } from "../review-findings.js";
 
 import { writeWorkflowState } from "../workflow-state.js";
 
@@ -44,6 +55,9 @@ const bd = vi.hoisted(() => {
   const calls: Array<{ file: string; argv: readonly string[]; stdin: string }> = [];
   const replies = new Map<string, BdReply | undefined>();
   const state = { fail: undefined as string | undefined };
+  // Replies whose callback is queued until `release`, so a test can hold a read
+  // open and run a second claim inside that window.
+  const holds = new Map<string, Array<() => void>>();
 
   /** Remove `--actor <value>` so replies key on the command shape only. */
   const keyOf = (argv: readonly string[]): string => {
@@ -79,11 +93,19 @@ const bd = vi.hoisted(() => {
             return;
           }
           const reply = replies.get(keyOf(args)) ?? {};
-          if (reply.error !== undefined) {
-            callback(new Error(reply.error), "", "");
+          const finish = (): void => {
+            if (reply.error !== undefined) {
+              callback(new Error(reply.error), "", "");
+              return;
+            }
+            callback(null, reply.stdout ?? "", "");
+          };
+          const held = holds.get(keyOf(args));
+          if (held !== undefined) {
+            held.push(finish);
             return;
           }
-          callback(null, reply.stdout ?? "", "");
+          finish();
         },
       };
       return { stdin: childStdin };
@@ -101,9 +123,19 @@ const bd = vi.hoisted(() => {
     failEverything: (error: string) => {
       state.fail = error;
     },
+    /** Queue the next replies for `key` until `release(key)` runs them. */
+    hold: (key: string) => {
+      holds.set(key, []);
+    },
+    release: (key: string) => {
+      const queued = holds.get(key) ?? [];
+      holds.delete(key);
+      for (const finish of queued) finish();
+    },
     reset: () => {
       calls.length = 0;
       replies.clear();
+      holds.clear();
       state.fail = undefined;
     },
   };
@@ -119,7 +151,11 @@ vi.mock("node:child_process", async (importOriginal) => {
       const done = callback as (error: Error | null, stdout: string) => void;
       done(null, "");
     }),
-    execFileSync: vi.fn(() => ""),
+    execFileSync: vi.fn((file: string, args: readonly string[]) =>
+      // The human-answer seams resolve the repo root (bd-182); a `.git` marker
+      // under the test cwd keeps local mode local without a real repository.
+      file === "git" && args.includes("--git-common-dir") ? ".git" : "",
+    ),
     execSync: vi.fn(() => ""),
   };
 });
@@ -226,7 +262,7 @@ function textOf(result: ToolResult): string {
 // module-level map, so a shared id would leak `awaitingHuman` between tests.
 let sessionCounter = 0;
 
-function makeCtx(dir: string, sessionName = "belayd-bd-152") {
+function makeCtx(dir: string, sessionName = "belayd-bd-152"): ExtensionContext {
   sessionCounter += 1;
   const sessionId = `session-${sessionCounter}`;
   return {
@@ -237,7 +273,7 @@ function makeCtx(dir: string, sessionName = "belayd-bd-152") {
     },
     cwd: dir,
     ui: { notify: () => {} },
-  };
+  } as unknown as ExtensionContext;
 }
 
 /** Run the session_shutdown handlers, as pi does when a session is deleted. */
@@ -1132,5 +1168,755 @@ describe("human wait discovery after a restart", () => {
     expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe(
       "hugo answered: option b, ship it",
     );
+  });
+});
+
+/**
+ * GitHub-primary answer channel (bd-182).
+ *
+ * Under `authority: "github"` the question goes to the mapped **issue** and the
+ * answer is read back from issue comments. The bd gate stays the durable wait,
+ * the cursor is the gate's `createdAt`, and identity is what keeps the harness
+ * from reading its own question as the answer.
+ */
+describe("GitHub-primary answer channel (bd-182)", () => {
+  let cwd: string;
+
+  const ISSUE = 7;
+  const GH_OWNER = "acme";
+  const GH_REPO = "widgets";
+  const GATE_CREATED_AT = "2026-10-26T20:00:00Z";
+
+  function commentsSinceKey(since = GATE_CREATED_AT): string {
+    // The harness derives the cursor from the ISO form, which carries millis.
+    const cursor = new Date(since).toISOString();
+    return `api --paginate --slurp repos/${GH_OWNER}/${GH_REPO}/issues/${ISSUE}/comments?since=${encodeURIComponent(cursor)}`;
+  }
+
+  const GH_CREATE_KEY = `api --method POST repos/${GH_OWNER}/${GH_REPO}/issues/${ISSUE}/comments --input -`;
+
+  function ghCalls(): BdCallRecord[] {
+    return bd.calls.filter((call) => call.file === "gh");
+  }
+
+  function findGhCall(prefix: string): BdCallRecord | undefined {
+    return ghCalls().find((call) => call.argv.join(" ").startsWith(prefix));
+  }
+
+  function issueComments(
+    entries: Array<{ login: string; type?: string; createdAt: string; body: string }>,
+  ): string {
+    return JSON.stringify(
+      entries.map((entry, index) => ({
+        id: index + 1,
+        body: entry.body,
+        created_at: entry.createdAt,
+        user: { login: entry.login, type: entry.type ?? "User" },
+      })),
+    );
+  }
+
+  const ASK_ISSUE_COMMENT = {
+    login: "belayd-harness[bot]",
+    type: "Bot",
+    createdAt: "2026-10-26T20:00:01Z",
+    body: "Which option?",
+  };
+
+  function humanIssueComment(body = "option b, ship it"): string {
+    return issueComments([
+      ASK_ISSUE_COMMENT,
+      { login: "hugo", type: "User", createdAt: "2026-10-26T20:05:00Z", body },
+    ]);
+  }
+
+  function seedGithubRepo(mappedIssues: Record<string, number> = { "bd-152": ISSUE }): void {
+    mkdirSync(join(cwd, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".belayd", "config.json"),
+      JSON.stringify({ authority: "github", github: { owner: GH_OWNER, repo: GH_REPO } }),
+    );
+    const issues: Record<string, { number: number; nodeId: string }> = {};
+    for (const [beadId, number] of Object.entries(mappedIssues)) {
+      issues[beadId] = { number, nodeId: `I_${number.toString()}` };
+    }
+    writeFileSync(
+      join(cwd, ".belayd", "github-map.json"),
+      JSON.stringify({
+        version: 1,
+        repo: { owner: GH_OWNER, name: GH_REPO },
+        issues,
+        unmappedDependencies: [],
+      }),
+    );
+  }
+
+  function askTool(mock: MockPi): RegisteredTool {
+    const tool = mock.tools.get("belayd_ask_human");
+    if (tool === undefined) throw new Error("belayd_ask_human was not registered");
+    return tool;
+  }
+
+  async function ask(mock: MockPi, ctx: unknown): Promise<ToolResult> {
+    return askTool(mock).execute("ask", { question: "Which option?" }, undefined, undefined, ctx);
+  }
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), "belayd-github-answer-"));
+    bd.reset();
+    bd.reply(ASK_GATE_KEY, { stdout: JSON.stringify({ id: "bd-159", status: "open" }) });
+    bd.reply(GH_CREATE_KEY, { stdout: "{}" });
+    bd.reply("api user", {
+      stdout: JSON.stringify({ login: "belayd-harness[bot]" }),
+    });
+    bd.reply(GATE_LIST_KEY, { stdout: JSON.stringify([]) });
+    bd.reply(RESOLVE_KEY, { stdout: "resolved" });
+  });
+
+  afterEach(() => {
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("does not resolve the wait for a bot or [bot]-typed comment", async () => {
+    process.env.BELAYD_GITHUB_BOT_LOGINS = "harness-bot";
+    try {
+      seedGithubRepo();
+      const mock = await loadExtension();
+      const ctx = makeCtx(cwd);
+      seedWorkflow(cwd);
+      await startSession(mock, ctx);
+      bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+      bd.reply(commentsSinceKey(), {
+        stdout: issueComments([
+          ASK_ISSUE_COMMENT,
+          { login: "harness-bot", type: "User", createdAt: "2026-10-26T20:02:00Z", body: "nope" },
+          { login: "ci", type: "Bot", createdAt: "2026-10-26T20:03:00Z", body: "nope" },
+        ]),
+      });
+
+      vi.useFakeTimers();
+      try {
+        await ask(mock, ctx);
+        await vi.advanceTimersByTimeAsync(30_000);
+        await settleMicrotasks();
+        expect(mock.sentUserMessages).toEqual([]);
+        expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+        expect(findCall(RESOLVE_KEY)).toBeUndefined();
+        expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(ghCalls().length).toBeGreaterThan(0);
+      await shutdownSession(mock, ctx);
+    } finally {
+      delete process.env.BELAYD_GITHUB_BOT_LOGINS;
+    }
+  });
+
+  it("freezes the bot-login allowlist for one wait and re-reads it after a restart", async () => {
+    // "start-bot" is in the allowlist when the wait starts, "late-bot" is not.
+    // Flipping the env between two claims must not change which comment counts.
+    process.env.BELAYD_GITHUB_BOT_LOGINS = "start-bot";
+    try {
+      seedGithubRepo();
+      const mock = await loadExtension();
+      const ctx = makeCtx(cwd);
+      seedWorkflow(cwd);
+      await startSession(mock, ctx);
+      bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+      const startBotComment = {
+        login: "start-bot",
+        createdAt: "2026-10-26T20:02:00Z",
+        body: "start-bot says no",
+      };
+      const lateBotComment = {
+        login: "late-bot",
+        createdAt: "2026-10-26T20:03:00Z",
+        body: "option b, ship it",
+      };
+      // First claim resolves the allowlist: start-bot's comment is not an answer.
+      bd.reply(commentsSinceKey(), { stdout: issueComments([startBotComment]) });
+
+      vi.useFakeTimers();
+      try {
+        await ask(mock, ctx);
+        await vi.advanceTimersByTimeAsync(30_000);
+        await settleMicrotasks();
+        expect(mock.sentUserMessages).toEqual([]);
+
+        // The env flips mid-wait. Frozen at wait start, start-bot still cannot
+        // become the answer and late-bot still counts as a human.
+        process.env.BELAYD_GITHUB_BOT_LOGINS = "late-bot";
+        bd.reply(commentsSinceKey(), {
+          stdout: issueComments([startBotComment, lateBotComment]),
+        });
+        await vi.advanceTimersByTimeAsync(30_000);
+        await settleMicrotasks();
+        // Re-reading the env per claim would deliver start-bot's earlier comment.
+        expect(mock.sentUserMessages).toEqual(["late-bot answered: option b, ship it"]);
+        await vi.advanceTimersByTimeAsync(30_000);
+        await settleMicrotasks();
+        expect(mock.sentUserMessages).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      // A restart is a new wait: it re-reads the env, so start-bot is a human
+      // now and its earlier comment is the answer the frozen wait refused.
+      await shutdownSession(mock, ctx);
+      const restarted = makeCtx(cwd);
+      seedWorkflow(cwd);
+      await startSession(mock, restarted);
+      expect(humanAnswer(await startTurn(mock, restarted))?.content).toBe(
+        "start-bot answered: start-bot says no",
+      );
+    } finally {
+      delete process.env.BELAYD_GITHUB_BOT_LOGINS;
+    }
+  });
+
+  it("resolves exactly once for a human issue comment at/after the gate time", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment() });
+
+    vi.useFakeTimers();
+    try {
+      await ask(mock, ctx);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await settleMicrotasks();
+      expect(mock.sentUserMessages).toEqual(["hugo answered: option b, ship it"]);
+
+      // Exactly once: the claim and cleared wait stop both later paths, and the
+      // gate resolve happened only after the successful send.
+      expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await settleMicrotasks();
+      expect(mock.sentUserMessages).toHaveLength(1);
+      expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares one claim between an in-flight poll tick and the turn-start fallback", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment() });
+
+    vi.useFakeTimers();
+    try {
+      await ask(mock, ctx);
+      // Hold the issue read open so the turn starts while the poll tick still
+      // owns the claim. Both paths read the same comment; only the claim keeps
+      // it from being sent twice.
+      bd.hold(commentsSinceKey());
+      vi.advanceTimersByTime(30_000);
+      const turn = startTurn(mock, ctx);
+      expect(humanAnswer(await turn)).toBeUndefined();
+      expect(mock.sentUserMessages).toEqual([]);
+
+      bd.release(commentsSinceKey());
+      await settleMicrotasks();
+      expect(mock.sentUserMessages).toEqual(["hugo answered: option b, ship it"]);
+      expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the wait armed when the send fails, then delivers on a later tick", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment() });
+
+    vi.useFakeTimers();
+    try {
+      await ask(mock, ctx);
+      mock.failNextSends(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await settleMicrotasks();
+
+      expect(mock.sentUserMessages).toEqual([]);
+      expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+      expect(findCall(RESOLVE_KEY)).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      await settleMicrotasks();
+      expect(mock.sentUserMessages).toEqual(["hugo answered: option b, ship it"]);
+      expect(findCall(RESOLVE_KEY)).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("re-arms after a restart and still uses the gate time as the cursor", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    // The gate and the answer both predate this process: the cursor must be the
+    // gate's createdAt, never the restart time.
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment() });
+    await startSession(mock, ctx);
+
+    expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe(
+      "hugo answered: option b, ship it",
+    );
+    expect(findGhCall("api --paginate --slurp")?.argv.join(" ")).toContain(
+      encodeURIComponent(new Date(GATE_CREATED_AT).toISOString()),
+    );
+    expect(findCall(RESOLVE_KEY)).toBeDefined();
+  });
+
+  it("never settles the wait when gh is unauthenticated or absent", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    // The gate must be visible to the session-start discovery, not only later.
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { error: "gh: command not found" });
+    await startSession(mock, ctx);
+
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+    expect(ghCalls().some((call) => call.argv[0] === "api")).toBe(true);
+    await shutdownSession(mock, ctx);
+  });
+
+  it("refuses to ask, and opens no gate, for a bead with no mapped issue", async () => {
+    seedGithubRepo({});
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+
+    const result = await ask(mock, ctx);
+
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain("no issue in .belayd/github-map.json");
+    expect(textOf(result)).toContain("no gate was opened");
+    expect(findCall("gate create")).toBeUndefined();
+    expect(findGhCall("api --method POST")).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+  });
+
+  it("refuses to ask, and opens no gate, when the map cannot be read", async () => {
+    seedGithubRepo();
+    writeFileSync(join(cwd, ".belayd", "github-map.json"), "{ not json");
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+
+    const result = await ask(mock, ctx);
+
+    // Unresolvable is not unmapped, but neither may block the bead on a wait
+    // whose question was never posted.
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain("cannot ask about bd-152");
+    expect(textOf(result)).toContain("no gate was opened");
+    expect(findCall("gate create")).toBeUndefined();
+    expect(findGhCall("api --method POST")).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+  });
+
+  it("posts the question to the issue endpoint, never a PR", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(commentsSinceKey(), { stdout: issueComments([ASK_ISSUE_COMMENT]) });
+
+    const result = await ask(mock, ctx);
+    expect(result.details.exitCode).toBe(0);
+    const created = findGhCall("api --method POST");
+    expect(created?.argv).toEqual([
+      "api",
+      "--method",
+      "POST",
+      `repos/${GH_OWNER}/${GH_REPO}/issues/${ISSUE}/comments`,
+      "--input",
+      "-",
+    ]);
+    expect(created?.stdin).toBe(JSON.stringify({ body: "Which option?" }));
+    expect(ghCalls().some((call) => call.argv.join(" ").includes("/pulls/"))).toBe(false);
+    await shutdownSession(mock, ctx);
+  });
+
+  it("compensates when the question post fails", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(GH_CREATE_KEY, { error: "gh: HTTP 403" });
+
+    const result = await ask(mock, ctx);
+
+    // A failed post must not leave the bead blocked on an unasked question.
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain(`could not post the question on GitHub issue #${ISSUE}`);
+    expect(findCall(RESOLVE_KEY)?.argv).toContain("bd-159");
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+  });
+
+  const REVIEW_FINDINGS = [
+    "## Critical (must fix)",
+    "- `src/a.ts:12` — off-by-one in the loop bound",
+    "",
+    "## Warnings (should fix)",
+    "None",
+  ].join("\n");
+
+  const REVIEW_GATE_KEY =
+    `gate create --blocks bd-152 --type=human ` +
+    `--title belayd-review: bd-152 findings (round 1) ` +
+    `--reason ${REVIEW_HUMAN_GATE_REASON} --json`;
+
+  function reviewState() {
+    const state = createInitialSessionState();
+    state.gateActive = true;
+    state.currentTaskId = "bd-152";
+    return state;
+  }
+
+  function reviewDeps(
+    state: ReturnType<typeof reviewState>,
+    target: GithubAnswerTarget,
+  ): { deps: HumanGateDeps; resolve: Mock<() => GithubAnswerTarget> } {
+    const resolve = vi.fn<() => GithubAnswerTarget>(() => target);
+    return {
+      resolve,
+      deps: {
+        getSessionState: () => state,
+        resolveSessionBdActor: () => "belayd:bd-152:orchestrator",
+        resolveGithubAnswerTarget: resolve,
+        sendUserMessage: () => {},
+      },
+    };
+  }
+
+  it("posts review findings to a mapped issue and delivers its answer once", async () => {
+    seedGithubRepo();
+    const state = reviewState();
+    const { deps } = reviewDeps(state, {
+      kind: "github",
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      issue: ISSUE,
+    });
+    const ctx = makeCtx(cwd);
+    bd.reply(REVIEW_GATE_KEY, { stdout: JSON.stringify({ id: "bd-159", status: "open" }) });
+    bd.reply(GH_CREATE_KEY, { stdout: JSON.stringify({ id: 700 }) });
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    // The harness's own findings comment, answer-shaped and reused by id: the
+    // exclusion must be exercised through the real POST flow.
+    bd.reply(commentsSinceKey(), {
+      stdout: JSON.stringify([
+        {
+          id: 700,
+          body: "Which option?",
+          created_at: "2026-10-26T20:00:05Z",
+          user: { login: "hugo", type: "User" },
+        },
+        {
+          id: 701,
+          body: "option b, ship it",
+          created_at: "2026-10-26T20:05:00Z",
+          user: { login: "hugo", type: "User" },
+        },
+      ]),
+    });
+
+    const opened = await openReviewHumanGate({
+      state,
+      ctx,
+      deps,
+      taskId: "bd-152",
+      reviewText: REVIEW_FINDINGS,
+    });
+    expect(opened.opened).toBe(true);
+    expect(state.awaitingHuman?.channel).toEqual({
+      kind: "github",
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      issue: ISSUE,
+    });
+    // Findings went to the issue, not a bd comment, and the posted record is
+    // excluded from the answer read.
+    expect(findGhCall("api --method POST")?.argv.join(" ")).toContain(
+      `/issues/${ISSUE.toString()}/comments`,
+    );
+    expect(findCall(ASK_COMMENT_KEY)).toBeUndefined();
+    expect(state.awaitingHuman?.answerCommentId).toBe("700");
+
+    const delivered = await humanAnswerMessage(ctx, deps);
+    expect(delivered?.message.content).toBe("hugo answered: option b, ship it");
+    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
+    expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
+    stopHumanAnswerPoll(state);
+  });
+
+  it("falls back to the bd comment for an unmapped review and reads that channel", async () => {
+    seedGithubRepo({});
+    const state = reviewState();
+    const { deps, resolve } = reviewDeps(state, {
+      kind: "unmapped",
+      reason: "bd-152 has no issue in .belayd/github-map.json",
+    });
+    const ctx = makeCtx(cwd);
+    bd.reply(REVIEW_GATE_KEY, { stdout: JSON.stringify({ id: "bd-159", status: "open" }) });
+    bd.reply(ASK_COMMENT_KEY, { stdout: "" });
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(COMMENTS_KEY, { stdout: humanComment() });
+
+    const opened = await openReviewHumanGate({
+      state,
+      ctx,
+      deps,
+      taskId: "bd-152",
+      reviewText: REVIEW_FINDINGS,
+    });
+    expect(opened.opened).toBe(true);
+    // The findings were posted where the wait says they were posted.
+    expect(findCall(ASK_COMMENT_KEY)).toBeDefined();
+    expect(state.awaitingHuman?.channel).toEqual({ kind: "bd" });
+
+    // Keyed off the recorded channel: no fresh authority/map resolution, and
+    // the bd thread the guidance points at is the one that is read.
+    resolve.mockClear();
+    const delivered = await humanAnswerMessage(ctx, deps);
+    expect(delivered?.message.content).toBe("hugo answered: option b, ship it");
+    expect(resolve).not.toHaveBeenCalled();
+    stopHumanAnswerPoll(state);
+  });
+
+  it("keeps a channel-less wait armed when the map is unreadable, then resolves once usable", async () => {
+    const state = reviewState();
+    state.awaitingHuman = { beadId: "bd-152", askedAt: Date.now() };
+    const { deps, resolve } = reviewDeps(state, {
+      kind: "unknown",
+      reason: ".belayd/github-map.json: invalid JSON",
+    });
+    const ctx = makeCtx(cwd);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    // A bd comment exists too: an implementation that memoised a guessed bd
+    // channel on the failed tick would deliver this instead of staying armed.
+    bd.reply(COMMENTS_KEY, { stdout: humanComment("bd answer") });
+
+    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
+    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    // Nothing recorded a weaker channel it could not verify.
+    expect(state.awaitingHuman?.channel).toBeUndefined();
+    // Still armed: no channel-less wait may settle on a thread it never read.
+    expect(state.awaitingHuman).toBeDefined();
+    expect(state.humanAnswerClaimed).toBe(false);
+
+    // The failure clears: the same wait re-resolves, records the real channel,
+    // and delivers that channel's answer exactly once.
+    const githubTarget: GithubAnswerTarget = {
+      kind: "github",
+      owner: GH_OWNER,
+      repo: GH_REPO,
+      issue: ISSUE,
+    };
+    resolve.mockReturnValue(githubTarget);
+    bd.reply("api user", {
+      stdout: JSON.stringify({ login: "belayd-harness[bot]" }),
+    });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment("issue answer") });
+
+    expect((await humanAnswerMessage(ctx, deps))?.message.content).toBe(
+      "hugo answered: issue answer",
+    );
+    expect(state.awaitingHuman).toBeUndefined();
+    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
+    expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
+  });
+
+  it("never reads the harness's own question back as the answer (C2)", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    // gh authenticates as the operator's human account; the question is posted
+    // seconds after the gate, so the cursor alone cannot exclude it.
+    bd.reply("api user", { stdout: JSON.stringify({ login: "hugo" }) });
+    bd.reply(GH_CREATE_KEY, { stdout: JSON.stringify({ id: 900 }) });
+    const questionComment = {
+      id: 900,
+      body: "Which option?",
+      created_at: "2026-10-26T20:00:05Z",
+      user: { login: "hugo", type: "User" },
+    };
+    bd.reply(commentsSinceKey(), { stdout: JSON.stringify([questionComment]) });
+
+    const result = await ask(mock, ctx);
+    expect(result.details.exitCode).toBe(0);
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+
+    // A later comment from another human is the answer.
+    bd.reply(commentsSinceKey(), {
+      stdout: JSON.stringify([
+        questionComment,
+        {
+          id: 901,
+          body: "option b, ship it",
+          created_at: "2026-10-26T20:05:00Z",
+          user: { login: "reviewer", type: "User" },
+        },
+      ]),
+    });
+    expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe(
+      "reviewer answered: option b, ship it",
+    );
+    expect(findCall(RESOLVE_KEY)).toBeDefined();
+  });
+
+  it("excludes the harness's own question by authenticated login when its id is unknown", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    // gh authenticates as the operator's own account and the POST response
+    // carried no id, so only the login allowlist can exclude the question.
+    bd.reply("api user", { stdout: JSON.stringify({ login: "hugo" }) });
+    bd.reply(GH_CREATE_KEY, { stdout: "{}" });
+    const questionComment = {
+      id: 900,
+      body: "Which option?",
+      created_at: "2026-10-26T20:00:05Z",
+      user: { login: "hugo", type: "User" },
+    };
+    bd.reply(commentsSinceKey(), { stdout: JSON.stringify([questionComment]) });
+
+    expect((await ask(mock, ctx)).details.exitCode).toBe(0);
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+
+    // A later comment from another human is the answer.
+    bd.reply(commentsSinceKey(), {
+      stdout: JSON.stringify([
+        questionComment,
+        {
+          id: 901,
+          body: "option b, ship it",
+          created_at: "2026-10-26T20:05:00Z",
+          user: { login: "reviewer", type: "User" },
+        },
+      ]),
+    });
+    expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe(
+      "reviewer answered: option b, ship it",
+    );
+    expect(findCall(RESOLVE_KEY)).toBeDefined();
+  });
+
+  /** Ask with an unreadable `gh` identity and no posted comment id. */
+  async function askWithoutIdentity(mock: MockPi, ctx: unknown, apiUser: BdReply): Promise<void> {
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply("api user", apiUser);
+    // The POST response carries no id, so the primary exclusion is unavailable.
+    bd.reply(GH_CREATE_KEY, { stdout: "{}" });
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment() });
+    await ask(mock, ctx);
+  }
+
+  it("fails closed while the identity is unknown, then retries it on the next claim", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await askWithoutIdentity(mock, ctx, { error: "gh: not logged in" });
+
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+
+    // The failed lookup must not be memoised for the life of the wait: one
+    // transient `gh` blip recovers on the next claim, without a restart.
+    bd.reply("api user", {
+      stdout: JSON.stringify({ login: "belayd-harness[bot]" }),
+    });
+    expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe(
+      "hugo answered: option b, ship it",
+    );
+    // Exactly once, even though the identity was retried.
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
+  });
+
+  it("re-resolves an unreadable identity after a restart", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    await askWithoutIdentity(mock, ctx, { error: "gh: not logged in" });
+
+    expect(humanAnswer(await startTurn(mock, ctx))).toBeUndefined();
+    expect(findCall(RESOLVE_KEY)).toBeUndefined();
+    await shutdownSession(mock, ctx);
+
+    // The restart re-reads the identity from the open gate; the cursor is still
+    // the gate time, so the comment posted before the restart is the answer.
+    bd.reply("api user", {
+      stdout: JSON.stringify({ login: "belayd-harness[bot]" }),
+    });
+    const restarted = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, restarted);
+    expect(humanAnswer(await startTurn(mock, restarted))?.content).toBe(
+      "hugo answered: option b, ship it",
+    );
+  });
+
+  it("does not pin a restart to a guessed bd channel when the map is broken", async () => {
+    seedGithubRepo();
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    // The question was posted on the issue, but this session restarts while the
+    // map is corrupt: discovery must not guess the bd thread from that failure.
+    writeFileSync(join(cwd, ".belayd", "github-map.json"), "{ not json");
+    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
+    bd.reply(COMMENTS_KEY, { stdout: humanComment("bd answer") });
+    await startSession(mock, ctx);
+    await flush();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+
+    // The map recovers: the channel-less wait resolves again and reads GitHub.
+    seedGithubRepo();
+    bd.reply(commentsSinceKey(), { stdout: humanIssueComment("issue answer") });
+    expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe("hugo answered: issue answer");
+    await shutdownSession(mock, ctx);
   });
 });

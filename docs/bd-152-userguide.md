@@ -29,6 +29,10 @@ restart re-discovers the wait from `bd gate list` (that is why
 | Phase refusal while waiting | `src/process-gate.ts` (`AwaitingHuman`, `awaitingHumanRefusal`) |
 | Real-bd proof | `test/human-answer.integration.test.ts` |
 
+Historical note: this document describes the **bd-authority** channel. In a
+GitHub-primary repo the question goes to the mapped issue and the answer is read
+from its comments; see [`docs/github-primary.md`](github-primary.md) §7 (bd-182).
+
 ## How to Verify
 
 Run everything from the repository root. Every command below was executed in

@@ -24,6 +24,15 @@ import {
   parseCreatedGateId,
 } from "../../src/bead-gates.js";
 import { orchestratorActor, withActorArgv } from "../../src/beads-actor.js";
+import type { GithubAnswerTarget, HumanAnswerChannel } from "../../src/github-answer-target.js";
+import {
+  type AuthenticatedLoginLookup,
+  harnessGithubLogins,
+  lookupAuthenticatedLogin,
+  lookupIssueComments,
+  postIssueComment,
+  selectHumanAnswer,
+} from "../../src/github-comments.js";
 import {
   buildReviewFindingsRecord,
   formatReviewFindingsComment,
@@ -33,14 +42,71 @@ import {
 } from "../../src/review-findings.js";
 import { isValidTaskId } from "../../src/session-naming.js";
 import type { AwaitingHuman } from "../../src/workflow-phases.js";
-import { type CoreSessionState, errorText, runBdCommand, textToolResult } from "./context.js";
+import {
+  type CoreSessionState,
+  errorText,
+  runBdCommand,
+  runGhCommand,
+  textToolResult,
+} from "./context.js";
 
 /** Composer-supplied seams: the session store and the beads-actor resolver. */
 export interface HumanGateDeps {
   getSessionState: (ctx: { sessionManager: { getSessionId: () => string } }) => CoreSessionState;
   resolveSessionBdActor: (ctx: unknown) => string | undefined;
+  /**
+   * Which channel answers a bead's question (bd-182). Synchronous because every
+   * reader it wraps is, and it runs on the 30 s poll as well as at ask time.
+   */
+  resolveGithubAnswerTarget: (ctx: { cwd?: string }, beadId: string) => GithubAnswerTarget;
   /** Deliver a detected answer as a real user turn. */
   sendUserMessage: (text: string) => void;
+}
+
+/**
+ * The in-memory mirror of one open wait.
+ *
+ * `channel` records where the question actually went, so the waiting guidance
+ * names the real place to answer instead of promising a bd comment on a
+ * GitHub-primary repo. The bd gate stays the durable state either way.
+ */
+export interface HumanAnswerWait extends AwaitingHuman {
+  gateId?: string;
+  channel?: HumanAnswerChannel;
+  /** The comment the harness itself posted; never an answer. */
+  answerCommentId?: string;
+  /**
+   * The authenticated `gh` identity, cached for this wait once it resolves.
+   *
+   * In-memory only: a restart legitimately re-resolves it, and one wait must not
+   * see two different harness identities mid-flight (bd-182 review S1). Only a
+   * successful lookup is stored — a failure is retried on the next claim cycle
+   * so one transient `gh` blip is not a wait that only a restart can answer.
+   */
+  harnessIdentity?: AuthenticatedLoginLookup;
+  /**
+   * The operator's bot-login allowlist, resolved once for this wait.
+   *
+   * In-memory only, like {@link harnessIdentity}: a restart re-reads the
+   * environment, but one wait never sees two different allowlists (bd-182 W5).
+   */
+  harnessBotLogins?: readonly string[];
+}
+
+/** The channel a resolved target maps to; an unusable target falls back to bd. */
+function channelOf(target: GithubAnswerTarget): HumanAnswerChannel {
+  if (target.kind === "github") {
+    return { kind: "github", owner: target.owner, repo: target.repo, issue: target.issue };
+  }
+  return { kind: "bd" };
+}
+
+/** Human wording for an error that names where the question was meant to go. */
+function channelLabel(channel: HumanAnswerChannel): string {
+  if (channel.kind === "github") {
+    return `on GitHub issue #${channel.issue.toString()} (${channel.owner}/${channel.repo})`;
+  }
+  return "as a bd comment";
 }
 
 /**
@@ -55,27 +121,37 @@ export function nextStepBlockLines(state: CoreSessionState, nextStepLine: string
 }
 
 /**
- * Prompt guidance for the human answer channel (bd-152).
+ * Prompt guidance for the human answer channel (bd-152, bd-182).
  *
  * The ask line is unconditional: the one moment the orchestrator needs
  * `belayd_ask_human` is the moment it feels blocked, which is exactly when an
  * advisory note is not read unless it has been repeated every turn. The wait
  * block replaces the "call belayd_X" next step, because a refused tool with no
- * explanation is what makes a model retry or guess instead of waiting.
+ * explanation is what makes a model retry or guess instead of waiting. The reply
+ * line names the real channel, so a GitHub-primary wait never tells anyone to
+ * answer in a place its poll does not read.
  */
 export function humanAnswerGuidanceLines(state: CoreSessionState): string[] {
   const lines = [
     "",
-    "**Blocked on a human decision?** Call `belayd_ask_human` with the question, then END YOUR TURN: it posts the question as a bd comment, opens a `human` gate, and refuses every phase tool until an answer arrives. Never guess and never proceed without the answer.",
+    "**Blocked on a human decision?** Call `belayd_ask_human` with the question, then END YOUR TURN: it posts the question (as a bd comment, or on the mapped GitHub issue for a GitHub-primary repo), opens a `human` gate, and refuses every phase tool until an answer arrives. Never guess and never proceed without the answer.",
   ];
   const awaiting = state.awaitingHuman;
   if (awaiting === undefined) return lines;
   lines.push(
     "",
     `⏸ **Waiting for a human answer on ${awaiting.beadId}** — phase tools are refused until the answer arrives.`,
-    `Asked ${formatAskedAt(awaiting.askedAt)}. Reply on the bead (bd comment ${awaiting.beadId} --stdin, or in Scotty); the answer arrives in this session as a user message.`,
+    `Asked ${formatAskedAt(awaiting.askedAt)}. ${replyChannelLine(awaiting)}; the answer arrives in this session as a user message.`,
   );
   return lines;
+}
+
+/** Where to answer, in the words a person can act on. */
+function replyChannelLine(awaiting: HumanAnswerWait): string {
+  if (awaiting.channel?.kind === "github") {
+    return `Reply on GitHub issue #${awaiting.channel.issue.toString()} (${awaiting.channel.owner}/${awaiting.channel.repo})`;
+  }
+  return `Reply on the bead (bd comment ${awaiting.beadId} --stdin, or in Scotty)`;
 }
 
 /** Human-readable ask time; a corrupt timestamp must not throw in a prompt. */
@@ -140,8 +216,13 @@ export function stopHumanAnswerPoll(state: CoreSessionState): void {
 export function clearHumanAnswerWait(state: CoreSessionState): void {
   stopHumanAnswerPoll(state);
   state.awaitingHuman = undefined;
-  // A new question deserves its own warning budget.
+  // A new question deserves its own warning budgets; the flags are separate so
+  // one diagnosis (a failed read) cannot mute another (a malformed gate), and
+  // the identity warning has its own flag again.
   state.humanAnswerWarned = false;
+  state.humanUnrecognizedGateWarned = false;
+  state.humanAnswerDroppedWarned = false;
+  state.harnessIdentityWarned = false;
 }
 
 /** What one gate + comment read says about the open question. */
@@ -170,8 +251,9 @@ function isDeliverable(observed: HumanAnswerObservation): observed is Deliverabl
  */
 async function observeHumanAnswer(
   state: CoreSessionState,
-  awaiting: AwaitingHuman & { gateId?: string },
+  awaiting: HumanAnswerWait,
   cwd: string,
+  deps: HumanGateDeps,
 ): Promise<HumanAnswerObservation> {
   const gate = await lookupOpenHumanGate({ beadId: awaiting.beadId, cwd, runBd: runBdCommand });
   if (!gate.ok) return { kind: "unknown" };
@@ -181,24 +263,192 @@ async function observeHumanAnswer(
   }
   if (gate.status === "none") return resolvedObservation(awaiting, cwd);
 
-  const comments = await lookupBeadComments({
-    beadId: awaiting.beadId,
-    cwd,
-    runBd: runBdCommand,
-  });
-  if (!comments.ok) return { kind: "unknown" };
-
   // The gate's creation time is the baseline: it is written by bd itself, so a
   // restart loses nothing (the old design had to persist the comment id). bd
   // timestamps have second granularity, hence `>=` — a human answering in the
   // same second the question was asked is still an answer.
   const gateTime = gate.gate.createdAt === undefined ? Number.NaN : Date.parse(gate.gate.createdAt);
   const baseline = Number.isFinite(gateTime) ? gateTime : awaiting.askedAt;
+  // Read off the wait's recorded channel. Re-resolving every tick used to let a
+  // later broken map override where the question was actually posted (bd-182
+  // review C1), leaving a bd-answerable wait that the poll never read.
+  const channel = awaiting.channel ?? resolveChannel(state, awaiting, cwd, deps);
+  if (channel === undefined) return { kind: "unknown" };
+  if (channel.kind === "bd") return observeBeadAnswer(awaiting.beadId, baseline, cwd);
+  return observeGithubAnswer({ state, awaiting, channel, baseline, cwd });
+}
+
+/**
+ * Resolve and record the channel for a wait that predates the channel field.
+ *
+ * Only a usable target is recorded: `unmapped`/`unknown` keeps failing closed
+ * (the caller must not start reading a different thread just because a map went
+ * bad). A recorded channel is never replaced by a later resolution.
+ */
+function resolveChannel(
+  state: CoreSessionState,
+  awaiting: HumanAnswerWait,
+  cwd: string,
+  deps: HumanGateDeps,
+): HumanAnswerChannel | undefined {
+  const target = deps.resolveGithubAnswerTarget({ cwd }, awaiting.beadId);
+  if (target.kind === "unmapped" || target.kind === "unknown") {
+    warnUnavailableHumanAnswer(state, awaiting.beadId, target.reason);
+    return undefined;
+  }
+  const channel = channelOf(target);
+  awaiting.channel = channel;
+  return channel;
+}
+
+/** The bd-152 read: the first non-harness comment on the bead's thread. */
+async function observeBeadAnswer(
+  beadId: string,
+  baseline: number,
+  cwd: string,
+): Promise<HumanAnswerObservation> {
+  const comments = await lookupBeadComments({ beadId, cwd, runBd: runBdCommand });
+  if (!comments.ok) return { kind: "unknown" };
   const answer = comments.comments.find(
     (comment) => isHumanComment(comment) && commentTimeInMs(comment) >= baseline,
   );
   if (answer === undefined) return { kind: "pending" };
   return { kind: "answered", author: answer.author, text: answer.text };
+}
+
+/**
+ * The bd-182 read: the first human comment on the recorded issue at/after the gate.
+ *
+ * Identity is enforced twice (review C2): the harness's own posted comment id is
+ * excluded, and the authenticated `gh` login joins the allowlist. When that
+ * identity cannot be read, a known posted id still protects the wait; with
+ * neither, the read fails closed rather than risk reading the question back.
+ */
+async function observeGithubAnswer(options: {
+  state: CoreSessionState;
+  awaiting: HumanAnswerWait;
+  channel: Extract<HumanAnswerChannel, { kind: "github" }>;
+  baseline: number;
+  cwd: string;
+}): Promise<HumanAnswerObservation> {
+  const { state, awaiting, channel, baseline, cwd } = options;
+  const subject = `${channel.owner}/${channel.repo}#${channel.issue.toString()}`;
+  const identity = await waitHarnessIdentity(awaiting, cwd);
+  const botLogins = waitHarnessBotLogins(awaiting);
+  const allowlist = identity.ok ? [...botLogins, identity.login] : botLogins;
+  if (!identity.ok) {
+    const postedId = awaiting.answerCommentId;
+    if (postedId === undefined) {
+      // No primary exclusion and no identity: an issue comment cannot be told
+      // apart from the harness's own question, so keep the wait armed. The
+      // warning must say that — an operator chasing a stuck wait must not be
+      // told an exclusion is protecting a read that never happens.
+      warnHarnessIdentityUnavailable(
+        state,
+        subject,
+        `could not resolve the authenticated gh login (${identity.error}) and no posted ` +
+          "comment id is known, so the read fails closed: the wait stays armed until the " +
+          "identity resolves",
+      );
+      return { kind: "unknown" };
+    }
+    warnHarnessIdentityUnavailable(
+      state,
+      subject,
+      `could not resolve the authenticated gh login (${identity.error}); ` +
+        `relying on the posted comment id ${postedId} and the bot/allowlist rules`,
+    );
+  }
+  const comments = await lookupIssueComments({
+    repo: { owner: channel.owner, repo: channel.repo },
+    number: channel.issue,
+    since: new Date(baseline).toISOString(),
+    cwd,
+    runGh: runGhCommand,
+  });
+  if (!comments.ok) {
+    warnUnavailableHumanAnswer(state, subject, comments.error);
+    return { kind: "unknown" };
+  }
+  if (comments.dropped > 0) warnDroppedComments(state, subject, comments.dropped);
+  const answer = selectHumanAnswer(comments.comments, {
+    sinceMs: baseline,
+    allowlist,
+    ...(awaiting.answerCommentId === undefined ? {} : { excludeId: awaiting.answerCommentId }),
+  });
+  if (answer === undefined) return { kind: "pending" };
+  return { kind: "answered", author: answer.author, text: answer.text };
+}
+
+/**
+ * Resolve the authenticated identity once per wait, caching only a success.
+ *
+ * A failed lookup is returned for this cycle but never stored, so the next claim
+ * retries it. Caching the failure would mean a single transient `gh` error makes
+ * a comment answer undeliverable until the process restarts; staying fail-closed
+ * for the current cycle is enough (see {@link observeGithubAnswer}).
+ */
+async function waitHarnessIdentity(
+  awaiting: HumanAnswerWait,
+  cwd: string,
+): Promise<AuthenticatedLoginLookup> {
+  const cached = awaiting.harnessIdentity;
+  if (cached?.ok === true) return cached;
+  const identity = await lookupAuthenticatedLogin({ cwd, runGh: runGhCommand });
+  if (identity.ok) awaiting.harnessIdentity = identity;
+  return identity;
+}
+
+/**
+ * Parse the operator's bot-login allowlist once per wait, not once per tick.
+ *
+ * A restart re-reads `BELAYD_GITHUB_BOT_LOGINS`; within one wait it is fixed, so
+ * an env edit mid-wait cannot make the same wait see two allowlists.
+ */
+function waitHarnessBotLogins(awaiting: HumanAnswerWait): readonly string[] {
+  const cached = awaiting.harnessBotLogins;
+  if (cached !== undefined) return cached;
+  const logins = harnessGithubLogins(process.env.BELAYD_GITHUB_BOT_LOGINS);
+  awaiting.harnessBotLogins = logins;
+  return logins;
+}
+
+/** Say once per wait why the answer channel could not be read; never spam the poll. */
+function warnUnavailableHumanAnswer(
+  state: CoreSessionState,
+  subject: string,
+  reason: string,
+): void {
+  if (state.humanAnswerWarned === true) return;
+  state.humanAnswerWarned = true;
+  console.warn(`[belayd-harness] cannot read the human answer channel for ${subject}: ${reason}`);
+}
+
+/**
+ * Say once per wait that the `gh` identity is unknown.
+ *
+ * Its own flag (not `humanAnswerWarned`): the message names an outcome that
+ * differs between the fail-closed path and the posted-id path, and it must not
+ * consume the budget of a failed channel read.
+ */
+function warnHarnessIdentityUnavailable(
+  state: CoreSessionState,
+  subject: string,
+  reason: string,
+): void {
+  if (state.harnessIdentityWarned === true) return;
+  state.harnessIdentityWarned = true;
+  console.warn(`[belayd-harness] cannot read the human answer channel for ${subject}: ${reason}`);
+}
+
+/** Say once per wait that comments could not be parsed, e.g. a deleted account. */
+function warnDroppedComments(state: CoreSessionState, subject: string, dropped: number): void {
+  if (state.humanAnswerDroppedWarned === true) return;
+  state.humanAnswerDroppedWarned = true;
+  console.warn(
+    `[belayd-harness] dropped ${dropped.toString()} unparsable issue comment(s) on ${subject}; ` +
+      "a comment with no author or body can never be delivered as the answer.",
+  );
 }
 
 /**
@@ -212,7 +462,7 @@ async function observeHumanAnswer(
  * never report again.
  */
 async function resolvedObservation(
-  awaiting: AwaitingHuman & { gateId?: string },
+  awaiting: HumanAnswerWait,
   cwd: string,
 ): Promise<HumanAnswerObservation> {
   const closed = await lookupResolvedHumanGate({
@@ -229,8 +479,8 @@ async function resolvedObservation(
 
 /** Say once per wait that bd's gate JSON no longer parses; never spam the poll. */
 function warnUnrecognizedHumanGate(state: CoreSessionState, beadId: string): void {
-  if (state.humanAnswerWarned === true) return;
-  state.humanAnswerWarned = true;
+  if (state.humanUnrecognizedGateWarned === true) return;
+  state.humanUnrecognizedGateWarned = true;
   console.warn(
     `[belayd-harness] bd reported gates for ${beadId} that are not open human gates; ` +
       "the human wait stays armed (bd gate JSON may have changed).",
@@ -239,7 +489,7 @@ function warnUnrecognizedHumanGate(state: CoreSessionState, beadId: string): voi
 
 /** A detected answer plus the wait it belongs to. */
 interface DetectedHumanAnswer {
-  awaiting: AwaitingHuman & { gateId?: string };
+  awaiting: HumanAnswerWait;
   message: string;
 }
 
@@ -255,13 +505,14 @@ interface DetectedHumanAnswer {
 export async function claimHumanAnswer(
   state: CoreSessionState,
   ctx: ExtensionContext,
+  deps: HumanGateDeps,
 ): Promise<DetectedHumanAnswer | undefined> {
   const awaiting = state.awaitingHuman;
   if (awaiting === undefined) return undefined;
   if (state.humanAnswerClaimed === true) return undefined;
   state.humanAnswerClaimed = true;
   try {
-    const observed = await observeHumanAnswer(state, awaiting, ctx.cwd);
+    const observed = await observeHumanAnswer(state, awaiting, ctx.cwd, deps);
     if (isDeliverable(observed) && state.awaitingHuman === awaiting) {
       return { awaiting, message: humanAnswerText(awaiting, observed) };
     }
@@ -273,10 +524,7 @@ export async function claimHumanAnswer(
 }
 
 /** The message a delivered answer (or an out-of-band gate resolve) becomes. */
-function humanAnswerText(
-  awaiting: AwaitingHuman & { gateId?: string },
-  observed: DeliverableObservation,
-): string {
+function humanAnswerText(awaiting: HumanAnswerWait, observed: DeliverableObservation): string {
   if (observed.kind === "resolved") {
     const base = `The human gate on ${awaiting.beadId} was resolved without a comment`;
     if (observed.note === undefined) return `${base}; you may proceed.`;
@@ -295,7 +543,7 @@ function humanAnswerText(
 async function settleHumanAnswer(options: {
   state: CoreSessionState;
   ctx: ExtensionContext;
-  awaiting: AwaitingHuman & { gateId?: string };
+  awaiting: HumanAnswerWait;
   deps: HumanGateDeps;
 }): Promise<void> {
   try {
@@ -320,7 +568,7 @@ async function settleHumanAnswer(options: {
  * re-discovers the still-open gate.
  */
 async function resolveHumanGate(options: {
-  awaiting: AwaitingHuman & { gateId?: string };
+  awaiting: HumanAnswerWait;
   ctx: ExtensionContext;
   deps: HumanGateDeps;
 }): Promise<{ resolved: boolean; error?: string }> {
@@ -352,7 +600,7 @@ async function resolveHumanGate(options: {
 
 /** The wait's gate id, re-read from the bead when `bd gate create` did not name it. */
 async function findHumanGateId(
-  awaiting: AwaitingHuman & { gateId?: string },
+  awaiting: HumanAnswerWait,
   cwd: string,
 ): Promise<string | undefined> {
   if (awaiting.gateId !== undefined) return awaiting.gateId;
@@ -376,7 +624,7 @@ async function pollHumanAnswerOnce(
     stopHumanAnswerPoll(state);
     return;
   }
-  const detected = await claimHumanAnswer(state, ctx);
+  const detected = await claimHumanAnswer(state, ctx, deps);
   if (detected === undefined) return;
   if (!sendHumanAnswer(detected.message, deps)) {
     state.humanAnswerClaimed = false;
@@ -412,7 +660,7 @@ export async function humanAnswerMessage(
   deps: HumanGateDeps,
 ): Promise<{ message: { customType: string; content: string; display: boolean } } | undefined> {
   const state = deps.getSessionState(ctx);
-  const detected = await claimHumanAnswer(state, ctx);
+  const detected = await claimHumanAnswer(state, ctx, deps);
   if (detected === undefined) return undefined;
   await settleHumanAnswer({ state, ctx, awaiting: detected.awaiting, deps });
   return {
@@ -443,7 +691,18 @@ export function discoverHumanAnswerWait(options: {
     if (!found.ok || found.status !== "open") return;
     // The workflow may have been torn down while the read was in flight.
     if (!state.gateActive || state.awaitingHuman !== undefined) return;
-    state.awaitingHuman = { beadId, gateId: found.gate.gateId, askedAt: Date.now() };
+    // Re-resolve the channel now: a restart must not lose that this repo asks on
+    // GitHub. The cursor still comes from the gate's `createdAt`, never from the
+    // restart time, so an answer posted before the restart is still delivered.
+    // Only a usable target is recorded: a broken map must not pin the wait to a
+    // guessed bd channel, so `resolveChannel` retries on the next tick instead.
+    const target = options.deps.resolveGithubAnswerTarget({ cwd: ctx.cwd }, beadId);
+    state.awaitingHuman = {
+      beadId,
+      gateId: found.gate.gateId,
+      askedAt: Date.now(),
+      ...(target.kind === "github" ? { channel: channelOf(target) } : {}),
+    };
     startHumanAnswerPoll(state, ctx, options.deps);
   })().catch((error: unknown) => {
     console.warn(`[belayd-harness] human gate discovery failed: ${errorText(error)}`);
@@ -475,14 +734,48 @@ export async function reapHumanGateForTask(options: {
 }
 
 /**
+ * Post a question or findings on the wait's channel.
+ *
+ * GitHub-primary posts to the mapped **issue** (never a PR); local mode keeps
+ * the authored bd comment byte for byte. The body never reaches argv: it goes on
+ * stdin, either as `{"body": …}` JSON or verbatim.
+ */
+async function postChannelBody(options: {
+  channel: HumanAnswerChannel;
+  body: string;
+  actor: string;
+  taskId: string;
+  cwd: string;
+}): Promise<{ ok: true; commentId?: string } | { ok: false; error: string }> {
+  if (options.channel.kind === "github") {
+    return postIssueComment({
+      repo: { owner: options.channel.owner, repo: options.channel.repo },
+      number: options.channel.issue,
+      body: options.body,
+      cwd: options.cwd,
+      runGh: runGhCommand,
+    });
+  }
+  const posted = await runBdResult(
+    withActorArgv(["comment", "--stdin", "--", options.taskId], options.actor),
+    { cwd: options.cwd, stdin: options.body },
+  );
+  return posted.ok ? { ok: true } : { ok: false, error: posted.error };
+}
+
+/**
  * Implement `belayd_ask_human`: gate + authored question, then stop.
  *
- * Two bd writes, deliberately NOT through the `bd` proxy: argv validation only
+ * Two writes, deliberately NOT through the `bd` proxy: argv validation only
  * inspects `argv[0]`, so allowing `gate` there would expose the whole gate
  * lifecycle (src/bd-command.ts). Order matters — the gate is created first, so
- * the wait is visible in bd/Scotty even if the comment write fails; the comment
- * carries the question and is authored by the workflow actor, which is what
- * keeps it from ever counting as the answer.
+ * the wait is visible in bd/Scotty even if the question write fails; the
+ * question is authored by the workflow actor (or the GitHub App bot), which is
+ * what keeps it from ever counting as the answer.
+ *
+ * The channel is resolved BEFORE the gate exists (bd-182): a bead with no
+ * mapped issue has no answer channel under GitHub-primary, and an unanswerable
+ * wait must not block the bead.
  */
 async function askHuman(options: {
   params: { question?: string; beadId?: string };
@@ -501,6 +794,15 @@ async function askHuman(options: {
   }
 
   const actor = deps.resolveSessionBdActor(ctx) ?? orchestratorActor(target.taskId);
+  const answerTarget = deps.resolveGithubAnswerTarget({ cwd: ctx.cwd }, target.taskId);
+  if (answerTarget.kind === "unmapped" || answerTarget.kind === "unknown") {
+    return textToolResult(
+      `belayd_ask_human: cannot ask about ${target.taskId}: ${answerTarget.reason}. ` +
+        "Map the bead to a GitHub issue in .belayd/github-map.json (or fix .belayd/config.json) and retry; no gate was opened.",
+      1,
+    );
+  }
+  const channel = channelOf(answerTarget);
   const created = await createHumanGate({
     taskId: target.taskId,
     question: target.question,
@@ -512,16 +814,20 @@ async function askHuman(options: {
     // blocked on a gate bd never created.
     return textToolResult(`belayd_ask_human: could not open a human gate: ${created.error}`, 1);
   }
-  const awaiting: AwaitingHuman & { gateId?: string } = {
+  const awaiting: HumanAnswerWait = {
     beadId: target.taskId,
     askedAt: Date.now(),
+    channel,
     ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
   };
 
-  const posted = await runBdResult(
-    withActorArgv(["comment", "--stdin", "--", target.taskId], actor),
-    { cwd: ctx.cwd, stdin: target.question },
-  );
+  const posted = await postChannelBody({
+    channel,
+    body: target.question,
+    actor,
+    taskId: target.taskId,
+    cwd: ctx.cwd,
+  });
   if (!posted.ok) {
     // An unasked question must not leave an orphan gate blocking the bead. When
     // the compensation also fails the gate is genuinely open (that is usually
@@ -533,7 +839,7 @@ async function askHuman(options: {
       startHumanAnswerPoll(state, ctx, options.deps);
       return textToolResult(
         [
-          `belayd_ask_human: could not post the question as a bd comment (${posted.error}).`,
+          `belayd_ask_human: could not post the question ${channelLabel(channel)} (${posted.error}).`,
           `Resolving the gate it created also failed (${cleaned.error ?? "unknown error"}).`,
           "The bead may be left blocked by an open human gate and the question may not be posted.",
           `Check with bd gate list ${target.taskId}, resolve it with bd gate resolve <gate>, or retry.`,
@@ -542,11 +848,12 @@ async function askHuman(options: {
       );
     }
     return textToolResult(
-      `belayd_ask_human: could not post the question as a bd comment: ${posted.error}`,
+      `belayd_ask_human: could not post the question ${channelLabel(channel)}: ${posted.error}`,
       1,
     );
   }
 
+  if (posted.commentId !== undefined) awaiting.answerCommentId = posted.commentId;
   state.awaitingHuman = awaiting;
   startHumanAnswerPoll(state, ctx, deps);
   return textToolResult(askResultText({ taskId: target.taskId, gateId: created.gateId }), 0);
@@ -713,11 +1020,18 @@ export async function openReviewHumanGate(options: {
     if (!created.ok) {
       return { opened: false, reason: `could not open a human gate: ${created.error}` };
     }
-    state.awaitingHuman = {
+    const answerTarget = options.deps.resolveGithubAnswerTarget(
+      { cwd: options.ctx.cwd },
+      options.taskId,
+    );
+    const channel = channelOf(answerTarget);
+    const wait: HumanAnswerWait = {
       beadId: options.taskId,
       askedAt,
+      channel,
       ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
     };
+    state.awaitingHuman = wait;
 
     const written = writeReviewFindingsRecord({ cwd: options.ctx.cwd, record });
     if (!written.ok) {
@@ -726,15 +1040,18 @@ export async function openReviewHumanGate(options: {
 
     // A failed comment must not remove the gate: the gate's reason is itself the
     // visible wait, so the member stays stopped on a findable record either way.
-    const posted = await runBdResult(
-      withActorArgv(["comment", "--stdin", "--", options.taskId], actor),
-      {
-        cwd: options.ctx.cwd,
-        stdin: phaseCommentBody("review", formatReviewFindingsComment(record)),
-      },
-    );
+    const posted = await postChannelBody({
+      channel,
+      body: phaseCommentBody("review", formatReviewFindingsComment(record)),
+      actor,
+      taskId: options.taskId,
+      cwd: options.ctx.cwd,
+    });
     if (!posted.ok) {
       console.warn(`[belayd-harness] could not post the review findings comment: ${posted.error}`);
+    } else if (posted.commentId !== undefined) {
+      // The findings record is the question here; exclude it like the ask path.
+      wait.answerCommentId = posted.commentId;
     }
 
     startHumanAnswerPoll(state, options.ctx, options.deps);
@@ -773,11 +1090,12 @@ export function registerHumanGate(pi: ExtensionAPI, deps: HumanGateDeps): void {
     name: "belayd_ask_human",
     label: "Ask a human",
     description:
-      "Stop and ask a human a question about the current bead. Posts the question as a bd " +
-      "comment, opens a `human` bd gate that blocks the bead, and refuses every phase tool " +
-      "until someone answers (a comment authored by anyone other than belayd:*). The answer " +
-      "arrives in this session as a user message. Use this instead of guessing when the work " +
-      "is blocked on a decision only a human can make; END YOUR TURN after calling it.",
+      "Stop and ask a human a question about the current bead. Posts the question (as a bd " +
+      "comment, or on the mapped GitHub issue for a GitHub-primary repo), opens a `human` bd " +
+      "gate that blocks the bead, and refuses every phase tool until someone answers (a " +
+      "comment from a human, not from the harness). The answer arrives in this session as a " +
+      "user message. Use this instead of guessing when the work is blocked on a decision only " +
+      "a human can make; END YOUR TURN after calling it.",
     parameters: Type.Object({
       question: Type.String({
         description:

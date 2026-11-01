@@ -725,6 +725,13 @@ export {
   FLEET_SUPERVISOR_NAME_PREFIX,
   supervisorRunStatus,
 } from "./fleet-supervisor-name.js";
+export type {
+  GithubAnswerTarget,
+  HumanAnswerChannel,
+} from "./github-answer-target.js";
+export { classifyGithubAnswerTarget } from "./github-answer-target.js";
+export type { ResolvedAnswerTarget } from "./github-answer-target-resolution.js";
+export { resolveGithubAnswerTargetForSession } from "./github-answer-target-resolution.js";
 export type { BdWriteRefusalReason, BdWriteVerdict } from "./github-append-policy.js";
 export { classifyBdWrite, classifyBdWriteForAuthority } from "./github-append-policy.js";
 export type {
@@ -752,6 +759,31 @@ export {
   readGithubAuthorityConfig,
   resolveGithubAuthorityForSession,
 } from "./github-authority.js";
+export type {
+  AuthenticatedLoginLookup,
+  GhArgvBuild,
+  GhRunner,
+  GithubIssueComment,
+  IssueCommentsLookup,
+  IssueCommentsTarget,
+  ParsedIssueComments,
+} from "./github-comments.js";
+export {
+  buildAuthenticatedUserArgv,
+  buildIssueCommentCreateArgv,
+  buildIssueCommentsArgv,
+  GH_COMMAND_MAX_BUFFER_BYTES,
+  GH_COMMAND_TIMEOUT_MS,
+  harnessGithubLogins,
+  isGhReadArgv,
+  isHumanIssueComment,
+  lookupAuthenticatedLogin,
+  lookupIssueComments,
+  parseIssueComments,
+  parseIssueCommentsWithDropped,
+  postIssueComment,
+  selectHumanAnswer,
+} from "./github-comments.js";
 export type {
   GithubIssueIdentity,
   GithubIssueMap,

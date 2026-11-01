@@ -103,6 +103,32 @@ export function warnOncePerSession(state: CoreSessionState, key: string, message
   console.warn(message);
 }
 
+/** Structural guard for a pi context that can resolve a session state. */
+export function hasSessionManager(ctx: unknown): ctx is SessionContext {
+  const manager = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+  return typeof manager?.getSessionId === "function";
+}
+
+/**
+ * Emit repo-config warnings once per session, or to the log when the context is
+ * too narrow to resolve a session (a test double, a load-time call).
+ *
+ * Both authority seams that read `.belayd/config.json` use this so one operator
+ * typo logs once, not once per bd call and not once per 30 s answer poll.
+ */
+export function emitSessionWarnings(
+  ctx: unknown,
+  warnings: readonly string[],
+  getState: (ctx: SessionContext) => CoreSessionState,
+): void {
+  const state = hasSessionManager(ctx) ? getState(ctx) : undefined;
+  for (const warning of warnings) {
+    const message = `[belayd-harness] ${warning}`;
+    if (state === undefined) console.warn(message);
+    else warnOncePerSession(state, warning, message);
+  }
+}
+
 /**
  * Read the active branch defensively.
  *

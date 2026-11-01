@@ -78,6 +78,8 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/github-issue-map.ts` | Bead ↔ GitHub issue identity map with never-throw read/write seams (bd-180) |
 | `src/github-ready.ts` | GitHub-primary readiness and stale-gate expiry (bd-180) |
 | `src/github-append-policy.ts` | Append-only bd policy for phase agents in a GitHub-primary repo (bd-180) |
+| `src/github-answer-target.ts` | Answer channel per bead: local bd thread vs mapped GitHub issue (bd-182) |
+| `src/github-comments.ts` | GitHub issue-comment read/post with bot identity filter, the answer channel for GitHub-primary repos (bd-182) |
 
 ### models
 
