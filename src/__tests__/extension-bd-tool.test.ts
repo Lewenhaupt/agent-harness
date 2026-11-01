@@ -8,11 +8,12 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { gitContextFreeEnv } from "../../src/worktree.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -113,7 +114,19 @@ describe("bd tool proxy", () => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-bd-tool-"));
     // bd-180: a phase session now resolves authority from the repo root, so the
     // fixture is a real repo with an explicit local authority.
-    execFileSync("git", ["init", "-q"], { cwd });
+    //
+    // The env must be git-context free (bd-58): under a git hook from a LINKED
+    // worktree git exports GIT_DIR=<common>/.git/worktrees/<name>, and an
+    // inherited value makes `git init` ignore `cwd` — it reinitialises the
+    // caller's repository from the worktree admin dir, which rewrites
+    // `core.bare = true` in the shared config and breaks every worktree. The
+    // wall-clock cost is one process; the alternative is a corrupted checkout.
+    execFileSync("git", ["init", "-q"], { cwd, env: gitContextFreeEnv() });
+    // Assert the fixture instead of trusting it: without this a leaked context
+    // surfaces as nine unrelated assertion failures about authority resolution.
+    if (!existsSync(join(cwd, ".git"))) {
+      throw new Error(`fixture did not create a repository at ${cwd}`);
+    }
     mkdirSync(join(cwd, ".belayd"), { recursive: true });
     writeFileSync(join(cwd, ".belayd", "config.json"), JSON.stringify({ authority: "bd" }));
     execFileMock.clear();
