@@ -1204,6 +1204,16 @@ export {
   replaceOrchestratorClaim,
 } from "./orchestrator-claim.js";
 export type {
+  ModelRoute,
+  ModelRoutePlan,
+  ProviderWindow,
+} from "./orchestrator-model.js";
+export {
+  describeBlockedProviders,
+  planModelRoute,
+  splitModelRoute,
+} from "./orchestrator-model.js";
+export type {
   OutlineAppliedFilters,
   OutlineFile,
   OutlineFileSymbols,
@@ -1410,6 +1420,7 @@ export {
 } from "./quality-gates.js";
 export type { FailureClassification, FailureKind, QuotaCooldown } from "./quota-failure.js";
 export {
+  classifyAssistantMessage,
   classifySpawnFailure,
   DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
   DEFAULT_PROVIDER_USAGE_LIMIT_COOLDOWN_SECONDS,
@@ -1507,7 +1518,7 @@ export type {
   SpawnWithFallbackOptions,
   SpawnWithFallbackResult,
 } from "./spawn-with-fallback.js";
-export { spawnAgentWithFallback } from "./spawn-with-fallback.js";
+export { recordFailureCooldown, spawnAgentWithFallback } from "./spawn-with-fallback.js";
 export type {
   GitExec,
   StackNode,

@@ -11,8 +11,10 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { orchestratorActor } from "../../src/beads-actor.js";
 import { mirrorAssignee } from "../../src/beads-assignee.js";
+import type { CapacityCache } from "../../src/capacity-cache.js";
 import type { HandoffPacket } from "../../src/handoff.js";
 import { buildOrchestratorPrompt, taskIdFromBranch, writeHandoff } from "../../src/handoff.js";
+import type { ModelCooldownStore } from "../../src/model-cooldown.js";
 import {
   acquireOrchestratorClaim,
   assignOrchestratorClaimSession,
@@ -21,6 +23,12 @@ import {
   releaseOrchestratorClaim,
   replaceOrchestratorClaim,
 } from "../../src/orchestrator-claim.js";
+import {
+  describeBlockedProviders,
+  type ProviderWindow,
+  planModelRoute,
+  splitModelRoute,
+} from "../../src/orchestrator-model.js";
 import { computeOrchestratorSessionName } from "../../src/session-naming.js";
 import type { TranscriptEntry } from "../../src/session-transcript.js";
 import { hasConversation, narrowTranscriptEntries } from "../../src/session-transcript.js";
@@ -31,6 +39,7 @@ import {
   type WorkflowSubType,
 } from "../../src/workflow-registry.js";
 import {
+  clearWorkflowState,
   type HandedOffMarker,
   readWorkflowState,
   saveHandedOffMarker,
@@ -61,7 +70,23 @@ export interface LaunchDeps {
   core: Pick<WorkflowCoreApi, "disarmForHandoff" | "reportHandoffProblem">;
   /** Stops the worktree-lease heartbeat; the fleet capability owns the timer. */
   stopOrchestratorLeaseTimer: (state: CoreSessionState) => void;
+  /** Model-routing state the composer owns (bd-116 session state). */
+  modelRouting: LaunchModelRouting;
   seams: LaunchSeams;
+}
+
+/**
+ * Routing seams the orchestrator launch reads (bd-229).
+ *
+ * The child session is created by the pi-web daemon, which starts pi on the
+ * operator's global default model; the harness's own knowledge that a provider
+ * is spent lives here, so the launch path has to consult it explicitly.
+ */
+export interface LaunchModelRouting {
+  cooldownStore: ModelCooldownStore;
+  capacity: CapacityCache;
+  /** `BELAYD_MODEL_FALLBACK=0` opts out of every routing decision, including this one. */
+  enabled: boolean;
 }
 
 /** Labels resolved from a beads issue. */
@@ -95,7 +120,7 @@ export interface LaunchApi {
 }
 
 export function createLaunch(deps: LaunchDeps): LaunchApi {
-  const { pi, getSessionState, core, stopOrchestratorLeaseTimer, seams } = deps;
+  const { pi, getSessionState, core, stopOrchestratorLeaseTimer, modelRouting, seams } = deps;
 
   // ── Worktree creation helper ────────────────────────────────────────
   function ensureWorktree(projectRoot: string, branch: string, base?: string): string | undefined {
@@ -293,6 +318,207 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     return { ok: true, pendingClaimId };
   }
 
+  // ── Orchestrator model routing (bd-229) ────────────────────────────────
+
+  /**
+   * True when a candidate's provider (or its exact endpoint) is known to be
+   * unable to serve a turn: a reactive cooldown mark from an earlier failure, or
+   * a pre-dispatch capacity window.
+   */
+  function candidateBlocked(candidate: string): boolean {
+    if (modelRouting.cooldownStore.cooldownScope(candidate) !== undefined) return true;
+    return modelRouting.capacity.isModelExhausted(candidate);
+  }
+
+  /**
+   * Reset windows from both sources, so a refusal can name when a provider is
+   * back. The cooldown store is the reactive record; the capacity cache adds a
+   * configured usage endpoint's view of the same provider.
+   */
+  function exhaustionWindows(): ProviderWindow[] {
+    const windows: ProviderWindow[] = [];
+    for (const [provider, entry] of modelRouting.cooldownStore.providerEntries()) {
+      windows.push({ provider, resetAt: entry.until });
+    }
+    windows.push(...modelRouting.capacity.windows());
+    return windows;
+  }
+
+  /** Refusal text naming every provider that cannot serve this launch. */
+  function describeNoModelAvailable(blocked: readonly string[], detail?: string): string {
+    const named = describeBlockedProviders({
+      candidates: blocked,
+      windows: exhaustionWindows(),
+      nowMs: Date.now(),
+    });
+    return (
+      `Refusing to launch: no model candidate can serve a turn (${named}). Wait for that ` +
+      "window to lapse or top up the provider, then retry. BELAYD_MODEL_FALLBACK=0 skips this " +
+      "check, but the session will fail on the same provider." +
+      (detail === undefined ? "" : ` Last error: ${detail}`)
+    );
+  }
+
+  /**
+   * Refuse a launch before any side effect when the caller's model has no usable
+   * candidate.
+   *
+   * The caller's model stands in for the child's here: pi-web resolves both from
+   * the same global default (plus any workspace `.pi/settings.json` override), so
+   * it answers "is any provider able to serve this launch" without creating
+   * anything. The authoritative per-session check happens after creation.
+   */
+  async function preflightModelAvailability(
+    current: string | undefined,
+  ): Promise<string | undefined> {
+    if (!modelRouting.enabled || current === undefined) return undefined;
+    await modelRouting.capacity.refreshIfStale();
+    const plan = planModelRoute({ current, isBlocked: candidateBlocked });
+    if (plan.available.length > 0) return undefined;
+    return describeNoModelAvailable(plan.blocked);
+  }
+
+  /**
+   * The model a newly created child session is about to run on.
+   *
+   * `GET /sessions/:id/status` is authoritative: pi-web resolves the session
+   * model from the global default plus a workspace override, and this route
+   * reports the resolved model. A daemon that cannot answer leaves the caller's
+   * model as the best available stand-in.
+   */
+  async function readSessionModel(sessionId: string, cwd: string): Promise<string | undefined> {
+    try {
+      const status = await daemonRequest(
+        "GET",
+        `/sessions/${sessionId}/status?cwd=${encodeURIComponent(cwd)}`,
+      );
+      return providerQualifiedModel(status.model);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Ask pi-web to run the child session on `candidate`. */
+  async function setSessionModel(options: {
+    sessionId: string;
+    cwd: string;
+    candidate: string;
+  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    const route = splitModelRoute(options.candidate);
+    if (route === undefined) {
+      return { ok: false, error: `cannot set the unqualified model id ${options.candidate}` };
+    }
+    try {
+      await daemonRequest("POST", `/sessions/${options.sessionId}/model`, {
+        cwd: options.cwd,
+        provider: route.provider,
+        modelId: route.modelId,
+      });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: errorText(error) };
+    }
+  }
+
+  /**
+   * Move a newly created child session off a blocked model, before it is
+   * prompted.
+   *
+   * Errors are values: a candidate pi-web refuses (unknown wire id, no
+   * credential) falls through to the next one, and only a session left on a
+   * blocked model is a launch failure — that session would die on its first
+   * turn, which is exactly the outcome bd-229 exists to prevent.
+   */
+  async function routeOrchestratorModel(options: {
+    sessionId: string;
+    cwd: string;
+    callerModel: string | undefined;
+  }): Promise<{ ok: true; model?: string; previous?: string } | { ok: false; error: string }> {
+    if (!modelRouting.enabled) return { ok: true };
+    await modelRouting.capacity.refreshIfStale();
+    const current = (await readSessionModel(options.sessionId, options.cwd)) ?? options.callerModel;
+    if (current === undefined) return { ok: true };
+
+    const plan = planModelRoute({ current, isBlocked: candidateBlocked });
+    if (plan.currentUsable) return { ok: true };
+
+    let lastError: string | undefined;
+    for (const candidate of plan.available) {
+      const applied = await setSessionModel({
+        sessionId: options.sessionId,
+        cwd: options.cwd,
+        candidate,
+      });
+      if (applied.ok) return { ok: true, model: candidate, previous: current };
+      lastError = applied.error;
+    }
+    return { ok: false, error: describeNoModelAvailable(plan.blocked, lastError) };
+  }
+
+  /**
+   * Drop a child session that cannot be routed, so a refused launch does not
+   * leave a live orphan: stop it, then archive it out of the active list.
+   *
+   * Best effort by design — a daemon that cannot stop the session must not mask
+   * the routing error the caller needs to see.
+   */
+  async function abandonUnroutableSession(options: {
+    sessionId: string;
+    worktreePath: string;
+  }): Promise<void> {
+    for (const action of ["stop", "archive"] as const) {
+      try {
+        await daemonRequest("POST", `/sessions/${options.sessionId}/${action}`, {
+          cwd: options.worktreePath,
+        });
+      } catch (error) {
+        console.warn(
+          `[belayd-harness] could not ${action} unroutable session ${options.sessionId}: ${errorText(error)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Route a newborn child session, and drop it when it cannot be routed.
+   *
+   * A refused launch must leave nothing behind: the session is stopped and
+   * archived, the lease it was given is released, and the workflow state written
+   * for its first turn is cleared. That state is written before the session
+   * exists (its `session_start` reads it), so cleanup is the only way back.
+   */
+  async function routeOrAbandon(options: {
+    sessionId: string;
+    worktreePath: string;
+    taskId: string;
+    callerModel: string | undefined;
+  }): Promise<{ ok: true; model?: string; previous?: string } | { ok: false; error: string }> {
+    const routed = await routeOrchestratorModel({
+      sessionId: options.sessionId,
+      cwd: options.worktreePath,
+      callerModel: options.callerModel,
+    });
+    if (routed.ok) {
+      if (routed.model !== undefined) {
+        console.warn(
+          `[belayd-harness] orchestrator ${options.taskId} routed to ${routed.model} ` +
+            `because ${routed.previous} is unavailable`,
+        );
+      }
+      return routed;
+    }
+    await abandonUnroutableSession({
+      sessionId: options.sessionId,
+      worktreePath: options.worktreePath,
+    });
+    releaseOrchestratorClaim({
+      worktreePath: options.worktreePath,
+      sessionId: options.sessionId,
+    });
+    clearWorkflowState({ cwd: options.worktreePath });
+    return routed;
+  }
+
   /** Delegate a worktree workflow to the pi-web session daemon. */
   async function createOrchestratorSession(options: {
     ctx: ExtensionContext;
@@ -321,6 +547,10 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
       forkPoint: options.forkPoint,
       handoff: options.handoff,
     });
+
+    // The caller's model is the pre-create stand-in for the child's (see
+    // `preflightModelAvailability`), which the launch already checked.
+    const callerModel = providerQualifiedModel(ctx.model);
 
     // Claim the worktree before the session exists.
     //
@@ -399,6 +629,16 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
         `[belayd-harness] could not record the orchestrator session in ${worktreePath}: ${assigned.error}`,
       );
     }
+
+    // Route the child off a model its provider cannot serve, before it is
+    // prompted (bd-229): pi-web started it on the operator's global default.
+    const routed = await routeOrAbandon({
+      sessionId: created.id,
+      worktreePath,
+      taskId,
+      callerModel,
+    });
+    if (!routed.ok) return { ok: false, error: routed.error };
 
     // The session daemon's per-session routes scope every request by cwd, so
     // the prompt body must carry the worktree path alongside the prompt text.
@@ -610,6 +850,12 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     });
     if (blocker !== undefined) return { ok: false, error: blocker };
 
+    // Refuse before any side effect when no provider can serve the child's first
+    // turn (bd-229). This runs before the worktree is created too: a launch that
+    // can only fail should not leave a worktree, a lease and armed state behind.
+    const unusable = await preflightModelAvailability(providerQualifiedModel(options.ctx.model));
+    if (unusable !== undefined) return { ok: false, error: unusable };
+
     const worktreePath = ensureWorktree(options.ctx.cwd, options.branch, options.base);
     if (!worktreePath) {
       return {
@@ -786,4 +1032,21 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     launchBlocker,
     launchWorktreeWorkflow,
   };
+}
+
+/**
+ * A `provider/modelId` id from a pi model object or a daemon status field, or
+ * undefined when it is not a qualified model.
+ *
+ * Shared by the caller's `ctx.model` and the child's `status.model`: both are
+ * untrusted at the boundary (the daemon response is `Record<string, unknown>`),
+ * and an unqualified id must not reach the model route or a cooldown mark as a
+ * provider-less model.
+ */
+function providerQualifiedModel(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as { provider?: unknown; id?: unknown };
+  if (typeof record.provider !== "string" || record.provider === "") return undefined;
+  if (typeof record.id !== "string" || record.id === "") return undefined;
+  return `${record.provider}/${record.id}`;
 }

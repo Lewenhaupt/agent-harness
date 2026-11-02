@@ -78,6 +78,7 @@ import {
 import { createLaunch } from "./capabilities/launch.js";
 import { registerMetrics } from "./capabilities/metrics.js";
 import { modelCooldown, modelFallbackEnabled, modelState } from "./capabilities/model.js";
+import { registerModelRecovery } from "./capabilities/model-recovery.js";
 import { registerOutline } from "./capabilities/outline.js";
 import { createPhaseRunner } from "./capabilities/phase-run.js";
 import { registerAgentPhaseTools, registerStatusTool } from "./capabilities/phase-tools.js";
@@ -106,6 +107,26 @@ import { createWorkflowCore } from "./capabilities/workflow-core.js";
 type SessionState = CoreSessionState & FleetSessionState;
 
 const getSessionState = createSessionStateStore<SessionState>(createInitialSessionState);
+
+/**
+ * One model-routing bundle per capability (bd-116, bd-229): a capability that
+ * routes models must see the same cooldown store, capacity cache and kill switch
+ * as the spawn loop, and a per-call copy is how those drift apart.
+ */
+const modelRouting = {
+  cooldownStore: modelCooldown,
+  capacity: modelState.capacity,
+  enabled: modelFallbackEnabled,
+  telemetry: modelState.telemetry,
+};
+
+/** The session name, when the runtime exposes one (used to spot phase sub-agents). */
+function sessionNameOf(ctx: unknown): string | undefined {
+  const manager = (ctx as { sessionManager?: unknown } | null)?.sessionManager as
+    | { getSessionName?: () => string | undefined }
+    | undefined;
+  return typeof manager?.getSessionName === "function" ? manager.getSessionName() : undefined;
+}
 
 // ── Extension factory ──────────────────────────────────────────────────
 
@@ -217,10 +238,10 @@ export default function belaydAgentHarness(
   const runQualityGate = createQualityGateRunner({
     spawnAgentWithFallback,
     routing: {
-      cooldownStore: modelCooldown,
-      enabled: modelFallbackEnabled,
-      telemetry: modelState.telemetry,
-      capacity: modelState.capacity,
+      cooldownStore: modelRouting.cooldownStore,
+      enabled: modelRouting.enabled,
+      telemetry: modelRouting.telemetry,
+      capacity: modelRouting.capacity,
     },
     recordAttempt: recordGateAttemptMetric,
     isKnownPhase: (phaseName: string): phaseName is Phase => ALL_PHASE_NAMES.includes(phaseName),
@@ -247,6 +268,10 @@ export default function belaydAgentHarness(
     getSessionState,
     core,
     stopOrchestratorLeaseTimer,
+    // bd-229: the child orchestrator session is a pi-web session, not a spawned
+    // subprocess, so the launch path must consult the same routing state the
+    // spawn path uses or it starts the session on a provider that is spent.
+    modelRouting: modelRouting,
     seams: {
       setupWorktree,
       awaitWorktreeReady,
@@ -309,10 +334,10 @@ export default function belaydAgentHarness(
     activeWorkflowOwnership: core.activeWorkflowOwnership,
     spawnAgentWithFallback,
     modelRouting: {
-      cooldownStore: modelCooldown,
-      enabled: modelFallbackEnabled,
-      telemetry: modelState.telemetry,
-      capacity: modelState.capacity,
+      cooldownStore: modelRouting.cooldownStore,
+      enabled: modelRouting.enabled,
+      telemetry: modelRouting.telemetry,
+      capacity: modelRouting.capacity,
     },
   });
 
@@ -344,13 +369,7 @@ export default function belaydAgentHarness(
       if (!result.ok) return { ok: false, error: result.error };
       return { ok: true, authority: result.authority };
     },
-    isPhaseSession: (ctx) => {
-      const manager = (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })
-        .sessionManager;
-      const name =
-        typeof manager?.getSessionName === "function" ? manager.getSessionName() : undefined;
-      return isSubAgentSession(name);
-    },
+    isPhaseSession: (ctx) => isSubAgentSession(sessionNameOf(ctx)),
   });
 
   registerArchify(pi);
@@ -401,5 +420,14 @@ export default function belaydAgentHarness(
     isBashToolCallEvent,
     resolveBashTimeout,
     humanGateDeps,
+  });
+
+  // In-session model recovery (bd-229), last so it observes a settled run after
+  // every other hook has had its say. Phase sub-agents are skipped: their
+  // fallback lives in the spawner, which owns their model accounting.
+  registerModelRecovery({
+    pi,
+    routing: modelRouting,
+    isSubAgent: (ctx) => isSubAgentSession(sessionNameOf(ctx)),
   });
 }

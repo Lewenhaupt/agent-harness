@@ -272,8 +272,33 @@ export function classifySpawnFailure(details: SpawnDetails): FailureClassificati
     return { kind: "success" };
   }
 
+  return classifyAssistantRecord(assistant, details.model);
+}
+
+/**
+ * Classify the error carried by one assistant message, or undefined when the
+ * message is not an assistant error.
+ *
+ * The subprocess path reads the failure out of `SpawnDetails.messages`; the
+ * in-session path (bd-229: the orchestrator's own turn) sees the same message
+ * shape through pi's `message_end` event and must not re-derive the rules. Both
+ * go through `classifyAssistantRecord`, so a new failure mode cannot be
+ * recognized in one path and missed in the other.
+ */
+export function classifyAssistantMessage(message: unknown): FailureClassification | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const record = message as Record<string, unknown>;
+  if (record.role !== "assistant" || record.stopReason !== "error") return undefined;
+  return classifyAssistantRecord(record);
+}
+
+/** Shared tail of both entry points: status + wording rules for one error record. */
+function classifyAssistantRecord(
+  assistant: Record<string, unknown>,
+  fallbackModel?: string,
+): FailureClassification {
   const status = extractStatus(assistant);
-  const model = typeof assistant.model === "string" ? assistant.model : details.model;
+  const model = typeof assistant.model === "string" ? assistant.model : fallbackModel;
   const errorMessage =
     typeof assistant.errorMessage === "string" ? assistant.errorMessage : undefined;
 

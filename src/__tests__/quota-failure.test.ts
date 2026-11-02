@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { SpawnDetails, SpawnUsage } from "../agent-registry.js";
 import {
+  classifyAssistantMessage,
   classifySpawnFailure,
   DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS,
   DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,
@@ -743,5 +744,46 @@ describe("parseQuotaResetSeconds", () => {
   it("returns undefined when no hint is present", () => {
     expect(parseQuotaResetSeconds("Weekly limit reached")).toBeUndefined();
     expect(parseQuotaResetSeconds(undefined)).toBeUndefined();
+  });
+});
+
+/**
+ * The in-session path (bd-229): the orchestrator's own turn reports its failure
+ * as a `message_end` assistant message, not as a `SpawnDetails` record, so the
+ * same rules must be reachable from the message alone.
+ */
+describe("classifyAssistantMessage", () => {
+  it("classifies the live 402 billing_error body as quota", () => {
+    const result = classifyAssistantMessage(
+      assistantError(
+        '402: {"message":"Dev Plan credit limit reached. Upgrade your plan or wait for renewal on 11/4/2026.","type":"invalid_request_error","param":null,"code":"billing_error"}',
+      ),
+    );
+    expect(result).toHaveProperty("kind", "quota");
+    expect(result).toHaveProperty("cooldownSeconds", DEFAULT_QUOTA_COOLDOWN_SECONDS);
+    expect(result).toHaveProperty("model", "opencode-go/mimo-v2.6-flash");
+  });
+
+  it("returns undefined for a non-error assistant message", () => {
+    expect(
+      classifyAssistantMessage({ role: "assistant", stopReason: "stop", content: [] }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for a non-assistant message", () => {
+    expect(classifyAssistantMessage({ role: "user", content: "hi" })).toBeUndefined();
+    expect(classifyAssistantMessage(undefined)).toBeUndefined();
+    expect(classifyAssistantMessage("402: billing")).toBeUndefined();
+  });
+
+  it("agrees with classifySpawnFailure on the same message", () => {
+    const message = assistantError("402: insufficient_quota");
+    expect(classifyAssistantMessage(message)).toEqual(classifySpawnFailure(details([message])));
+  });
+
+  it("does not classify an auth failure as fallback-worthy", () => {
+    const result = classifyAssistantMessage(assistantError("401: invalid api key"));
+    expect(result).toHaveProperty("kind", "auth");
+    expect(result === undefined ? true : isFallbackWorthy(result.kind)).toBe(false);
   });
 });

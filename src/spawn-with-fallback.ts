@@ -323,8 +323,14 @@ function providerCooldownCause(kind: FailureKind): ProviderCooldownCause | undef
   }
 }
 
-/** Record a cooldown: provider-scoped for quota/unconfigured, endpoint-scoped otherwise. */
-function recordCooldown(
+/**
+ * Record a cooldown: provider-scoped for quota/unconfigured, endpoint-scoped otherwise.
+ *
+ * Exported because the *in-session* recovery path (bd-229: an orchestrator turn
+ * that failed on its own model) must persist the same verdict as a failed
+ * spawn, so one dead provider is learned once instead of once per path.
+ */
+export function recordFailureCooldown(
   store: ModelCooldownStore,
   candidate: string,
   provider: string,
@@ -436,7 +442,7 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
       };
     }
 
-    recordCooldown(deps.store, candidate, provider, outcome.classification);
+    recordFailureCooldown(deps.store, candidate, provider, outcome.classification);
     recordCapacityFromFailure(deps.capacity, provider, outcome.classification);
   }
 

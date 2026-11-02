@@ -23,9 +23,12 @@ verifier moved from the `standard` to the `fast` capability class.
 
 This document covers user-visible behaviour only. Internals:
 `src/capacity-cache.ts`, `src/model-telemetry.ts`, `src/model-session-state.ts`,
-`src/spawn-with-fallback.ts`, `src/run-manifest.ts`, and the capability wiring in
-`extensions/capabilities/model.ts` (routing state) and
-`extensions/capabilities/phase-run.ts` (per-run telemetry attach).
+`src/spawn-with-fallback.ts`, `src/run-manifest.ts`, `src/quota-failure.ts`, and
+the capability wiring in `extensions/capabilities/model.ts` (routing state) and
+`extensions/capabilities/phase-run.ts` (per-run telemetry attach). Orchestrator
+sessions route themselves through `src/orchestrator-model.ts`,
+`extensions/capabilities/launch.ts` and
+`extensions/capabilities/model-recovery.ts` (bd-229).
 
 ## How to Verify
 
@@ -815,6 +818,67 @@ Named tests: `src/__tests__/quota-failure.test.ts` →
 `end-to-end: pi's process-path no-key refusal degrades to llmgateway (bd-178)`,
 `terminates and surfaces the trail when every hop has no key (bd-178)`,
 `reports a missing key as the skip cause, not a quota failure (bd-178)`.
+
+### Orchestrator sessions route their own model (bd-229)
+
+The fallback loop above only ever wrapped *spawned pi subprocesses*. A
+`/belayd` child orchestrator, a `belayd_start_followup` child, and every fleet
+member are pi-web **session daemon** sessions: `createOrchestratorSession` posts
+`{ cwd, name }` to `/sessions` with no model, so pi-web starts the child on the
+operator's global default (`defaultProvider` / `defaultModel` in
+`~/.pi/agent/settings.json`). When that default was a spent provider, the child's
+first turn died with `402 … "code":"billing_error"` while the cooldown store
+already knew the provider was out — the workflow gate was armed and no phase
+ever ran.
+
+What the launch path does now, before the child is prompted:
+
+1. **Pre-flight, no side effects.** The caller's model stands in for the child's
+   (pi-web resolves both from the same settings). `planModelRoute` orders the
+   candidates with the current model first, and the launch refuses when none is
+   available — before a worktree, a lease or `.belayd/workflow.json` exists.
+   The error names each provider and its reset time:
+
+   ```text
+   Refusing to launch: no model candidate can serve a turn (llmgateway (resets 2026-11-03T03:15:00.000Z), …). Wait for that window to lapse or top up the provider, then retry. BELAYD_MODEL_FALLBACK=0 skips this check, but the session will fail on the same provider.
+   ```
+
+2. **Post-create routing.** After the daemon creates the session, its model is
+   read from `GET /sessions/:id/status` (authoritative: it includes a workspace
+   `.pi/settings.json` override) and, when that model's provider or endpoint is
+   cooling, the first usable candidate is applied with
+   `POST /sessions/:id/model` `{ cwd, provider, modelId }`. A candidate pi-web
+   refuses (unknown wire id, no credential) falls through to the next; a session
+   left unroutable is stopped, archived, and its lease and workflow state
+   released. The switch is logged (`orchestrator <task> routed to <model>
+   because <model> is unavailable`).
+
+3. **In-session recovery.** An orchestrator or human session has no spawner, so
+   a quota-class failure on its own turn used to end the run. `message_end` now
+   classifies the assistant error with the same rules as the spawn path
+   (`classifyAssistantMessage`) and persists the cooldown; `agent_before_settle`
+   then switches to the next candidate and returns `continue: true`, so pi makes
+   one more provider request instead of stopping. It is bounded (3 switches per
+   session, never repeating a model it already ran on) and it skips phase
+   sub-agents, whose model accounting belongs to `spawn-with-fallback`.
+
+`BELAYD_MODEL_FALLBACK=0` disables all three. Phase sub-agents are unaffected:
+their attempts, telemetry and `-fallback-N` naming still describe the model each
+spawn actually used.
+
+Named tests: `src/__tests__/orchestrator-model.test.ts` (candidate ordering,
+refusal wording, wire-id splitting);
+`src/__tests__/extension-orchestrator-model-routing.test.ts` →
+`moves the child session off a spent provider before prompting it`,
+`leaves a healthy session model alone`,
+`routes even when the caller's model differs from the child's`,
+`refuses before any side effect when every provider is spent`,
+`skips routing entirely when fallback is disabled`; and
+`src/__tests__/extension-model-recovery.test.ts` →
+`switches to the next candidate and continues the run once on a 402`,
+`persists a provider-scoped cooldown so the next phase spawn skips it`,
+`does not repeat a candidate it already ran on`,
+`leaves a phase sub-agent alone`, `stops switching at the per-session cap`.
 
 ### 4. Telemetry artifacts: `.belayd/telemetry.json`
 

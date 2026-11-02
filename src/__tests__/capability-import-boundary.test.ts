@@ -49,8 +49,13 @@ const FLEET_IMPORT_ALLOWLIST: ReadonlySet<string> = new Set(["extensions/capabil
  * Every new capability line belongs in `extensions/capabilities/`, so reaching
  * that target is what keeps bd-179 from regressing into the 13k-line blast
  * radius it split. Raise this only for wiring, never for a capability body.
+ *
+ * bd-229 raised it from 415: one more `register<Capability>` call, plus the
+ * shared `modelRouting` bundle and `sessionNameOf` helper that replaced the
+ * three copies of the same literal/closure the capability registrations had
+ * (their bodies stayed in `capabilities/`).
  */
-const INDEX_MAX_LINES = 415;
+const INDEX_MAX_LINES = 450;
 
 const diskSeams: ModuleGraphSeams = {
   read: (repoRelativePath) => {
