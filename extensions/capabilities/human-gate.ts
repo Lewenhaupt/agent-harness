@@ -24,6 +24,7 @@ import {
   parseCreatedGateId,
 } from "../../src/bead-gates.js";
 import { orchestratorActor, withActorArgv } from "../../src/beads-actor.js";
+import { parsePublicationAnswer } from "../../src/finding-sensitivity.js";
 import type { GithubAnswerTarget, HumanAnswerChannel } from "../../src/github-answer-target.js";
 import {
   type AuthenticatedLoginLookup,
@@ -35,8 +36,16 @@ import {
 } from "../../src/github-comments.js";
 import {
   buildReviewFindingsRecord,
+  carryForwardSensitivity,
   formatReviewFindingsComment,
+  hasSensitiveFindings,
   nextReviewRound,
+  type PublicationAnswerRefusalCause,
+  REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
+  readReviewFindingsRecord,
+  recordPublicationAnswer,
+  releasedPublicationIn,
+  reviewFindingsGateReason,
   reviewFindingsGateTitle,
   writeReviewFindingsRecord,
 } from "../../src/review-findings.js";
@@ -514,7 +523,18 @@ export async function claimHumanAnswer(
   try {
     const observed = await observeHumanAnswer(state, awaiting, ctx.cwd, deps);
     if (isDeliverable(observed) && state.awaitingHuman === awaiting) {
-      return { awaiting, message: humanAnswerText(awaiting, observed) };
+      // The publication choice is recorded before the answer is delivered, so the
+      // message can tell the orchestrator what the record now says. `awaiting` is
+      // the wait that was answered: only a review wait carries
+      // `reviewFindings`, so an unrelated question's answer can never release a
+      // withheld finding (bd-183 review, Critical).
+      const choice = recordPublicationChoice({
+        cwd: ctx.cwd,
+        answer: deliverableAnswerText(observed),
+        waiting: awaiting,
+      });
+      const message = humanAnswerText(awaiting, observed);
+      return { awaiting, message: choice === undefined ? message : `${message}\n${choice}` };
     }
   } catch (error) {
     console.warn(`[belayd-harness] human answer check failed: ${errorText(error)}`);
@@ -531,6 +551,89 @@ function humanAnswerText(awaiting: HumanAnswerWait, observed: DeliverableObserva
     return `${base}; the resolver's note was "${excerptComment(observed.note)}". You may proceed.`;
   }
   return `${observed.author} answered: ${excerptComment(observed.text)}`;
+}
+
+/** The answer's own words; an out-of-band resolve may only leave a note. */
+function deliverableAnswerText(observed: DeliverableObservation): string {
+  return observed.kind === "answered" ? observed.text : (observed.note ?? "");
+}
+
+/**
+ * Record the human's publication choice for the review's sensitive findings.
+ *
+ * Returns the line the session is shown, or `undefined` when the answered wait is
+ * not a review wait with sensitive findings (a bare `belayd_ask_human` question,
+ * a restart-discovered gate, an ordinary review) — then the answer message keeps
+ * its bd-152 shape and nothing is written.
+ *
+ * **Keyed on the wait, never on the file.** why: `.belayd/review-findings.json`
+ * exists in every worktree that ever ran a review, so "a sensitive record exists"
+ * would let any later human answer in the worktree ("yes, ship it") release every
+ * withheld finding (bd-183 review, Critical). `reviewFindings` is set only by
+ * {@link openReviewHumanGate}, only when the record has sensitive findings, and
+ * carries the round so a re-review's record cannot be answered by an older wait.
+ *
+ * Fail-closed: no marker → no recording; a write failure or a refused recording →
+ * only a warning/message, and a record without a decision already blocks
+ * publishing (see `src/finding-publication.ts`).
+ */
+function recordPublicationChoice(options: {
+  cwd: string;
+  answer: string;
+  waiting: AwaitingHuman & { gateId?: string };
+}): string | undefined {
+  const reviewWait = options.waiting.reviewFindings;
+  if (reviewWait === undefined) return undefined;
+  const written = recordPublicationAnswer({
+    cwd: options.cwd,
+    answer: options.answer,
+    round: reviewWait.round,
+  });
+  if (!written.ok) {
+    console.warn(`[belayd-harness] could not record the publication choice: ${written.error}`);
+    return (
+      "Sensitive findings: the publication choice could not be recorded, so they stay withheld — " +
+      "nothing about them can appear in a PR until the record says publish."
+    );
+  }
+  if (!written.recorded) {
+    return publicationAnswerRefusalLine(written.cause, reviewWait.round);
+  }
+  const chosen = parsePublicationAnswer(options.answer).kind;
+  return (
+    `Sensitive findings: publication choice "${chosen}" is recorded in ` +
+    `${REVIEW_FINDINGS_RECORD_RELATIVE_PATH}; nothing about them may appear in a PR unless that ` +
+    "choice is publish (it is re-read from the record on every publish)."
+  );
+}
+
+/**
+ * The one line for a refused recording, phrased from its cause.
+ *
+ * why: "no record", "the record moved to another round" and "it has no sensitive
+ * finding" need different follow-ups (re-open a gate / answer the current one /
+ * nothing to do), so a single generic sentence would hide the state from the
+ * orchestrator (bd-183 review). Every cause is still a non-write and therefore
+ * withheld — only the explanation differs.
+ */
+function publicationAnswerRefusalLine(cause: PublicationAnswerRefusalCause, round: number): string {
+  switch (cause) {
+    case "no-record":
+      return (
+        "Sensitive findings: no review record was found, so the publication choice was not " +
+        "recorded and they stay withheld — nothing about them can appear in a PR."
+      );
+    case "round-mismatch":
+      return (
+        `Sensitive findings: the review record is no longer round ${round}, so the publication ` +
+        "choice was not recorded and they stay withheld — answer the current review gate."
+      );
+    case "no-sensitive-findings":
+      return (
+        "Sensitive findings: the review record has no security-class finding any more, so there " +
+        "was no publication choice to record."
+      );
+  }
 }
 
 /**
@@ -993,14 +1096,21 @@ export async function openReviewHumanGate(options: {
   if (!isValidTaskId(options.taskId)) {
     return { opened: false, reason: `invalid task id "${options.taskId}"` };
   }
-  const record = buildReviewFindingsRecord({
+  // Read once for the reset announcement and the cross-round union below; the
+  // round itself still comes from `nextReviewRound`, so the two can never disagree
+  // about the round count.
+  const previous = readReviewFindingsRecord({ cwd: options.ctx.cwd });
+  const rebuilt = buildReviewFindingsRecord({
     taskId: options.taskId,
     text: options.reviewText,
     round: nextReviewRound({ cwd: options.ctx.cwd }),
   });
-  if (record === undefined) {
+  if (rebuilt === undefined) {
     return { opened: false, reason: "the review reported no findings" };
   }
+  // A finding that was security-class in an earlier round stays security-class
+  // even when the live rule table no longer matches it (bd-183 review, Critical).
+  const record = carryForwardSensitivity({ record: rebuilt, previous });
 
   const actor =
     options.deps.resolveSessionBdActor(options.ctx) ?? orchestratorActor(options.taskId);
@@ -1010,11 +1120,22 @@ export async function openReviewHumanGate(options: {
   const askedAt = Date.now();
   state.reviewGatePending = true;
   try {
+    const sensitive = hasSensitiveFindings(record);
+    // A re-review rebuilds the record without decisions, so an earlier round's
+    // "publish" silently stops applying. Announce that instead of letting the
+    // human re-discover it as a withheld finding (bd-183 review).
+    const previousDecisionsReset =
+      previous !== undefined && previous.round < record.round && releasedPublicationIn(previous);
     const created = await createHumanGate({
       taskId: options.taskId,
-      question: record.reason,
+      question: reviewFindingsGateReason(record, { previousDecisionsReset }),
       actor,
-      title: reviewFindingsGateTitle({ taskId: options.taskId, round: record.round }),
+      title: reviewFindingsGateTitle({
+        taskId: options.taskId,
+        round: record.round,
+        sensitive,
+        previousDecisionsReset,
+      }),
       ctx: options.ctx,
     });
     if (!created.ok) {
@@ -1030,6 +1151,9 @@ export async function openReviewHumanGate(options: {
       askedAt,
       channel,
       ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
+      // Only a sensitive review wait may record a publication decision; the ask
+      // tool and restart discovery never set this marker.
+      ...(sensitive ? { reviewFindings: { round: record.round } } : {}),
     };
     state.awaitingHuman = wait;
 
@@ -1042,7 +1166,10 @@ export async function openReviewHumanGate(options: {
     // visible wait, so the member stays stopped on a findable record either way.
     const posted = await postChannelBody({
       channel,
-      body: phaseCommentBody("review", formatReviewFindingsComment(record)),
+      body: phaseCommentBody(
+        "review",
+        formatReviewFindingsComment(record, { previousDecisionsReset }),
+      ),
       actor,
       taskId: options.taskId,
       cwd: options.ctx.cwd,

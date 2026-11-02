@@ -40,7 +40,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/role-tools.ts` | Per-role tool surfaces |
 | `src/tool-audit.ts` | Tool-surface auditing for the harness |
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
-| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers |
+| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` and its `reviewFindings` round marker (bd-183) |
 | `src/workflow-registry.ts` | Workflow sub-type registry — defines 7 workflow types with phase sequences, |
 | `src/workflow-state.ts` | Belayd workflow state persistence |
 | `src/handoff.ts` | Handoff packets carried from a parent session into a spawned orchestrator |
@@ -51,7 +51,9 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
-| `src/review-findings.ts` | Durable review findings: severity/disposition record, gate reason, and the human-gate comment body (bd-175) |
+| `src/review-findings.ts` | Durable review findings: severity/disposition record, gate reason, and the human-gate comment body (bd-175); per-finding sensitivity and the human publication decision (bd-183) |
+| `src/finding-sensitivity.ts` | Deterministic finding-sensitivity classifier (bd-183) — security topics, credential shapes, deny paths; answer parsing and the redacted one-liner |
+| `src/finding-publication.ts` | Publication safety surface (bd-183) — the only supported source of deferred-finding text for a PR body (bd-184) |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
 | `src/run-detached.ts` | Detached background run orchestration |
 | `src/session-naming.ts` | Session naming utilities for subagent session management |
@@ -217,7 +219,7 @@ order so pi hook/tool order is unchanged.
 | `bd.ts` | `bd` CLI proxy tool |
 | `commit.ts` | `belayd_commit` + `belayd_stack_rebase`, commit preflight/runners, commit-body helpers |
 | `doctor.ts` | `belayd_doctor` packaging/tool-surface report |
-| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping |
+| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review gate and the single choke point that records a publication choice (bd-183) |
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
 | `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
