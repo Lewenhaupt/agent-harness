@@ -15,11 +15,15 @@ things change behind that tool:
    the diff itself (bounded), plus an instruction to read only files in the
    diff rather than re-deriving it with `git diff` / `git status` / repo-wide
    searches.
-2. **A re-review is scoped to the fix round.** When a review completes
-   successfully, the harness records `HEAD` as `reviewedSha` in
-   `.belayd/workflow.json`. The next `belayd_review` call for that task diffs
-   from that SHA, so the reviewer sees only the fix diff plus the orchestrator's
-   task text (which already enumerates the findings to verify).
+2. **A re-review is scoped to the fix round.** When the review task is built —
+   before the diff is collected — the harness captures the state that review is
+   about to read: a `git stash create` snapshot of the uncommitted tracked work
+   plus a manifest of the untracked files, written to `.belayd/review-scope.json`
+   (bd-228). A successful review promotes that record into
+   `.belayd/workflow.json` as `reviewedSha` + `reviewedUntracked` and consumes
+   the scope file. The next `belayd_review` call for that task diffs the fix
+   round only — not the pre-work HEAD — and stops re-listing untracked files it
+   already reviewed.
 3. **The delivered review is bounded.** Critical/Warnings/Suggestions are capped
    at 6 / 6 / 4 bullets, an empty section must be exactly `None`, verification
    narration is dropped, and any dropped bullet is disclosed in the report (a
@@ -81,11 +85,33 @@ against the base-branch tip and says so in `range:`.
 
 ### What a re-review task looks like (fix-scoped)
 
-After a successful review, `.belayd/workflow.json` gains a `reviewedSha`. The
-next review for the same task renders as `mode: re-review of fixes` with
+When a review task is built, `.belayd/review-scope.json` records
+`{ taskId, sha, untracked, capturedAt }` — captured **before** the diff is
+collected, so what the reviewer is about to read is exactly what the next
+re-review will diff from. A mid-review edit therefore widens the next
+re-review (it was not in the diff) instead of hiding content. A successful
+review promotes the record into `.belayd/workflow.json` as `reviewedSha` +
+`reviewedUntracked` and clears the scope file; a failed review promotes nothing
+and the next build overwrites the record.
+
+`reviewedSha` is **not** HEAD in the normal workflow: review runs before commit,
+so the reviewed change set is normally uncommitted. It is a dangling
+`git stash create` commit of the tracked working state, which captures exactly
+what the review read without touching the worktree, the index, HEAD or any ref
+(a clean tree has nothing to snapshot, so HEAD is the fallback there).
+
+The next review for the same task renders as `mode: re-review of fixes` with
 `range: <reviewedSha>`, and the inlined diff is only `git diff <reviewedSha>`.
-No separate "prior findings" section is added, because your `task` text already
-lists the findings.
+`reviewedUntracked` lists `{ path, blob }` for every untracked file the previous
+review reviewed; a currently-untracked path is dropped from the re-review's
+`New (untracked) files` list (and from `changedFiles`) only when its current
+blob — `git hash-object -- <path>` — is identical. A file the fix round modified
+or added stays in scope, and so does anything whose hash cannot be read: the
+filter fails open, so it can never hide a file from the reviewer. Paths are
+read from `git status --porcelain -z -uall`, so a space, newline or quote in a
+filename round-trips byte-exactly, and `-uall` expands a new directory into
+individual files that can be hashed. No separate "prior findings" section is
+added, because your `task` text already lists the findings.
 
 ### Fallbacks you may see
 
@@ -96,9 +122,9 @@ lists the findings.
 | An inlined diff exceeds 800 lines or 60 KB | The diff is cut and ends with ``... (diff truncated: N more lines; run `git diff <range>` for the rest)`` |
 
 The scope is never silently widened or narrowed: a fallback always carries the
-git error that caused it in the task text, and a `reviewedSha` on disk is only
-used when it belongs to the task being reviewed (a stale `workflow.json` from
-another task is ignored).
+git error that caused it in the task text, and a `reviewedSha`/`reviewedUntracked`
+pair on disk is only used when it belongs to the task being reviewed (a stale
+`workflow.json` from another task is ignored).
 
 ### Line-numbered diff (bd-159)
 
@@ -204,7 +230,12 @@ switch models.
 
 ### Inspecting what was reviewed
 
-- Recorded revision: `.belayd/workflow.json` → `reviewedSha`.
+- Pending scope (present only while a review runs): `.belayd/review-scope.json`
+  → `{ taskId, sha, untracked, capturedAt }`. It is captured when the review
+  task is built and consumed by a successful review.
+- Promoted record: `.belayd/workflow.json` → `reviewedSha` (a dangling
+  `git stash create` snapshot of the reviewed working tree, HEAD on a clean
+  tree) and → `reviewedUntracked` (the already-reviewed untracked files).
 - The fix diff a re-review inlined: `git diff <reviewedSha>`.
 - The whole change set a first review inlined: `git diff $(git merge-base main HEAD)`.
 - The review task text itself: the review sub-agent's session transcript under
@@ -236,17 +267,24 @@ Run these from the repository root.
    ```
 
    `review-context.test.ts` covers section caps + omission notes, narration
-   drops, idempotence, docs-only classification, untracked-file collection,
-   the re-review range, the diff truncation limits, and task rendering.
-   `extension-session-naming.test.ts` covers the end-to-end paths: inlined
-   first review, fix-scoped re-review, bounded delivery, the disabled
+   drops, idempotence, docs-only classification, untracked-file collection from
+   `-z -uall` output (space/newline/quote paths, rename source paths), the
+   re-review range, the `git stash create` reviewed-state capture, batched
+   `hash-object` chunking, the reviewed-untracked filtering (drop/keep/fail-open),
+   the diff truncation limits, and task rendering.
+   `extension-session-naming.test.ts` covers the end-to-end paths: capture
+   before the diff, the review-start snapshot surviving a mid-review change,
+   fix-scoped re-review (including when implement never committed, bd-228),
+   no-promotion on a missing or foreign scope, bounded delivery, the disabled
    bounding on a failed run, the unavailable-diff disclosure, the
    whole-change-set fallback note, and the foreign-task `reviewedSha` guard.
-   `workflow-state.test.ts` covers `saveReviewedSha` round-trip, the
-   `missing-state` / `task-mismatch` cases, and parsing a pre-bd-113
-   `workflow.json`. `agent-registry.test.ts` asserts the reviewer prompt keeps
-   the security mandate and review tools while carrying the shared output
-   contract and dropping `## Files Reviewed`.
+   `workflow-state.test.ts` covers the review-scope record round-trip, atomic
+   replacement, invalid/missing records, clearing, the `saveReviewedSha` sha +
+   manifest round-trip and manifest clearing, the `missing-state` /
+   `task-mismatch` cases, and parsing a pre-bd-113 `workflow.json`.
+   `agent-registry.test.ts` asserts the reviewer prompt keeps the security
+   mandate and review tools while carrying the shared output contract and
+   dropping `## Files Reviewed`.
 
 2. **First review gets the diff inline** — run a workflow up to review
    (`belayd_start_task` → `belayd_implement` → `belayd_review`), then read the
@@ -264,15 +302,23 @@ Run these from the repository root.
    A compliant run needs no `git diff` / `git status` rediscovery before its
    first read.
 
-3. **The reviewed SHA is recorded** — after the review completes:
+3. **The reviewed state is recorded** — after the review completes, with the
+   change set still uncommitted (the normal workflow: commit runs later):
 
    ```bash
-   jq -r .reviewedSha .belayd/workflow.json
-   git rev-parse HEAD          # compare: the sha recorded at review completion
+   jq -r '.reviewedSha, (.reviewedUntracked // [])' .belayd/workflow.json
+   ls .belayd/review-scope.json   # absent: a successful review consumed it
+   git rev-parse HEAD         # the pre-work revision, NOT what review covered
+   git stash list             # empty: the snapshot is a dangling commit, no ref
    ```
 
-   Expected: a hex SHA (not `null`/missing). It is written only on a
-   **successful**, gate-owned review.
+   Expected: a hex SHA (not `null`/missing) that differs from `HEAD` while the
+   tracked work is uncommitted, and a `reviewedUntracked` manifest naming each
+   untracked file the review covered. Both are promoted from the scope captured
+   when the review task was built, and written only on a **successful**,
+   gate-owned review, in a single write. While a review is running (or after a
+   failed one) `.belayd/review-scope.json` holds the pending
+   `{ taskId, sha, untracked, capturedAt }` record instead.
 
 4. **A re-review is scoped to the fix round** — make a fix, commit or leave it
    in the working tree, call `belayd_review` again, and re-read the newest
@@ -284,9 +330,11 @@ Run these from the repository root.
    ```
 
    Expected: `mode: re-review of fixes` and `range: <reviewedSha from step 3>`,
-   and the inlined diff is `git diff <reviewedSha>` — the fix round only — with
-   the line-number gutter prepended to every line (strip the first six columns
-   to compare against `git diff <reviewedSha>` directly).
+   and the inlined diff is `git diff <reviewedSha>` — the fix round only — not
+   the whole change set, with the line-number gutter prepended to every line
+   (strip the first six columns to compare against `git diff <reviewedSha>`
+   directly). An untracked file the first review already listed must not appear
+   under `New (untracked) files` again unless the fix round changed it.
 
 5. **The delivered report is bounded** — the orchestrator receives the review
    as a `belayd-run-complete` follow-up. In the orchestrator transcript (or the
@@ -388,20 +436,47 @@ more than the cap, and no bullet that only reports what was checked.
   lists them explicitly under `New (untracked) files — read these directly`
   and includes them in the changed-file count. A brand-new file is therefore
   reviewed even before it is staged or committed. Paths under `.belayd/` are
-  excluded.
+  excluded. The scan uses `git status --porcelain -z -uall`: NUL-separated
+  fields carry a path verbatim (a space, newline, tab or quote is safe, and a
+  rename's source field is never mistaken for an untracked entry), and `-uall`
+  expands a new directory into the individual files that can be hashed. A
+  review's untracked files are recorded in `reviewedUntracked`, and a re-review
+  omits one only while its blob is byte-identical — a modified or newly added
+  file is listed again (bd-228).
+- **The reviewed revision is a snapshot, not a commit.** `reviewedSha` is a
+  `git stash create` commit of the reviewed tracked working state, or HEAD when
+  the tree was clean (bd-228). It is captured when the review task is built,
+  before the diff is collected, and promoted only if that review succeeds. Only
+  tracked paths are in that snapshot; the untracked review scope lives in
+  `reviewedUntracked` instead. The snapshot is unreachable and can be pruned by
+  `git gc`, after which the re-review falls back to the whole change set with
+  the disclosed fallback note above. A stash snapshot does not write
+  `refs/stash`, so `git stash list` stays empty.
+- **Hashing is batched and time-bounded.** Untracked manifests hash up to 64
+  paths per `git hash-object` call, and a re-review hashes only the paths its
+  manifest covers — never the whole untracked set. Every git call carries the
+  15 s timeout, so a hung git surfaces as an error value instead of delaying
+  delivery. A failed or partial chunk leaves its paths unresolved, which is the
+  fail-open direction: the path stays in a re-review's scope and is omitted
+  from the captured manifest.
 - **Docs-only diffs.** A change set whose tracked *and* untracked paths are all
   documentation (`docs/**`, `*.md`/`*.mdx`/`*.markdown`/`*.txt`/`*.rst`/`*.adoc`,
   `README`/`LICENSE`/`LICENCE` variants) is marked `docs-only diff: yes` and gets the
   narrowed docs instruction. The reviewer and its model class are unchanged.
   A mixed change set (`docs/a.md` + `src/a.ts`) is **not** docs-only.
-- **Failed reviews are not bounded** and record no `reviewedSha`, so the next
-  review is a first review rather than a fix-scoped one.
+- **Failed reviews are not bounded** and promote no `reviewedSha` (so no
+  `reviewedUntracked` either), so the next review is a first review rather than
+  a fix-scoped one. The scope captured for the failed build is replaced by the
+  next build, never promoted later.
 - **A stale `workflow.json` is ignored.** Only state whose `taskId` matches the
-  review's task contributes a `reviewedSha`, and a recording attempt against a
-  mismatched task is skipped with a `[belayd-harness]` warning instead of
-  writing into another task's state.
-- **Pre-bd-113 state files parse.** `reviewedSha` is optional, so an existing
-  `workflow.json` without it continues to work.
+  review's task contributes a `reviewedSha` and its `reviewedUntracked`
+  manifest, and a promotion against a mismatched task is skipped with a
+  `[belayd-harness]` warning instead of writing into another task's state. A
+  pending scope whose `taskId` does not match is likewise left alone.
+- **Pre-bd-228 state files parse.** `reviewedSha` and `reviewedUntracked` are
+  both optional, so an existing `workflow.json` without either continues to
+  work; recording a sha without a manifest clears the field rather than leaving
+  a stale one behind.
 - **Diff bounding is per review task**: 800 lines / 60 KB, and a single
   oversized line (minified bundle, lockfile blob) is cut rather than inlined
   whole. The truncation hint names the real git argument, so it stays correct on

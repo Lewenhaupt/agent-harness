@@ -22,7 +22,10 @@ import {
   writeRunManifest,
 } from "../run-manifest.js";
 import {
+  clearReviewScope,
+  readReviewScope,
   readWorkflowState as readWorkflowStateFromDisk,
+  saveReviewScope,
   type WorkflowState,
   workflowStateFilePath,
   writeWorkflowState,
@@ -108,6 +111,9 @@ const mockExecFile = vi.hoisted(() => {
       return { error: new Error("execFile not found in test environment") };
     }
     if (file === "git" && args[0] === "rev-parse") return { stdout: "abc1234\n" };
+    // A clean tree: `git stash create` prints nothing, so the reviewed revision
+    // falls back to HEAD. Tests that model a dirty tree override this.
+    if (file === "git" && args[0] === "stash") return { stdout: "" };
     return { stdout: "[feat/x abc1234] commit done" };
   };
   const fn = vi.fn(
@@ -3017,6 +3023,268 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(rereviewTask).not.toContain("## Prior findings to verify");
   });
 
+  it("records the uncommitted working tree as the reviewed revision, not HEAD (bd-228)", async () => {
+    setExecToSucceed();
+    mockExecFile.clear();
+    mockExecFile.setArgHandler((file, args) => {
+      if (file !== "git") return undefined;
+      switch (args[0]) {
+        case "stash":
+          return { stdout: "decaf00\n" };
+        case "status":
+          return { stdout: "?? src/new.ts\0" };
+        case "hash-object":
+          return { stdout: "blob1111\n" };
+        default:
+          return undefined;
+      }
+    });
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "first review");
+
+    // Review runs before commit, so the change set is normally uncommitted and
+    // HEAD is the pre-work revision: the snapshot is what the review covered.
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("decaf00");
+    });
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedUntracked).toEqual([
+      { path: "src/new.ts", blob: "blob1111" },
+    ]);
+  });
+
+  it("scopes a re-review to the fix round when implement never committed (bd-228)", async () => {
+    setExecToSucceed();
+    mockExecFile.clear();
+    const snapshot = "decaf00";
+    // Both ranges answer with a diff body, so the assertions below can tell
+    // which one was actually collected.
+    const diffOutputFor = (args: readonly string[]): string => {
+      if (args.includes("--name-only")) return "src/a.ts\n";
+      if (args.includes("--stat")) return " src/a.ts | 2 +-\n";
+      return args.includes(snapshot)
+        ? "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+tracked fix\n"
+        : "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-before\n+whole change set\n";
+    };
+    mockExecFile.setArgHandler((file, args) => {
+      if (file !== "git") return undefined;
+      switch (args[0]) {
+        case "stash":
+          return { stdout: `${snapshot}\n` };
+        case "status":
+          // The reviewed untracked file is still untracked at re-review time.
+          return { stdout: "?? src/new.ts\0" };
+        case "hash-object":
+          return { stdout: "blob1111\n" };
+        case "merge-base":
+          return { stdout: "base1234\n" };
+        case "diff":
+          return { stdout: diffOutputFor(args) };
+        default:
+          return undefined;
+      }
+    });
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "first review");
+
+    const firstTask = lastReviewTask();
+    expect(firstTask).toContain("mode: first review");
+    expect(firstTask).toContain("+whole change set");
+    expect(firstTask).toContain("- `src/new.ts`");
+
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(snapshot);
+    });
+
+    mockExecFile.clear();
+    await runPhase("review", "re-review after fixes");
+
+    const rereviewTask = lastReviewTask();
+    expect(rereviewTask).toContain("mode: re-review of fixes");
+    expect(rereviewTask).toContain(`range: ${snapshot}`);
+    // The fix round only: no re-inlined whole change set, and no already
+    // reviewed untracked file offered again as a "new" file.
+    expect(rereviewTask).toContain("+tracked fix");
+    expect(rereviewTask).not.toContain("+whole change set");
+    expect(rereviewTask).not.toContain("New (untracked) files");
+    expect(rereviewTask).not.toContain("- `src/new.ts`");
+    const argv = mockExecFile.calls.map((call) => call.args);
+    expect(argv).toContainEqual(["diff", snapshot]);
+    expect(argv).toContainEqual(["hash-object", "--", "src/new.ts"]);
+  });
+
+  it("captures the review scope before collecting the review diff (bd-228)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    mockExecFile.clear();
+    await runPhase("review", "first review");
+
+    // Capture-first is what keeps what the reviewer saw equal to the next
+    // baseline: a snapshot taken after the diff would absorb mid-review edits.
+    const argv = mockExecFile.calls.map((call) => call.args);
+    const snapshotIndex = argv.findIndex((args) => args[0] === "stash");
+    const diffIndex = argv.findIndex((args) => args[0] === "diff");
+    const statusIndex = argv.findIndex((args) => args[0] === "status");
+    expect(snapshotIndex).toBeGreaterThanOrEqual(0);
+    expect(diffIndex).toBeGreaterThan(snapshotIndex);
+    expect(statusIndex).toBeGreaterThan(snapshotIndex);
+    expect(argv).toContainEqual(["status", "--porcelain", "-z", "-uall"]);
+  });
+
+  it("records the review-start snapshot even when the tree changes before completion (bd-228)", async () => {
+    setExecToSucceed();
+    mockExecFile.clear();
+    let stashCalls = 0;
+    mockExecFile.setArgHandler((file, args) => {
+      if (file !== "git") return undefined;
+      if (args[0] !== "stash") return undefined;
+      stashCalls += 1;
+      // A second snapshot would be the post-review tree; only the first is what
+      // the reviewer actually read.
+      return { stdout: stashCalls === 1 ? "decaf00\n" : "beef123\n" };
+    });
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+    await runPhase("review", "first review");
+
+    await vi.waitFor(() => {
+      expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe("decaf00");
+    });
+    // No completion-time capture: the tree is never snapshotted a second time.
+    expect(stashCalls).toBe(1);
+  });
+
+  it("records no reviewed sha when the pending scope is gone at completion (bd-228)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    // Model a scope that never survived to completion: the promotion must
+    // record nothing rather than invent a baseline.
+    mockSpawnAgentProcess.mockImplementationOnce(async () => {
+      clearReviewScope({ cwd });
+      return successfulSpawn();
+    });
+    await runPhase("review", "first review");
+
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(undefined);
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedUntracked).toBe(undefined);
+  });
+
+  it("never promotes a review scope that belongs to another task (bd-228)", async () => {
+    setExecToSucceed();
+    const cwd = freshWorktree();
+    const { tools, messages } = await bootWithCwd(cwd);
+    const ctx = createResumeCtx({ cwd });
+
+    const runPhase = async (phaseName: string, task: string): Promise<void> => {
+      const before = runCompletionCount(messages);
+      await tools
+        .get(`belayd_${phaseName}`)
+        ?.execute(`call-${phaseName}`, { task }, undefined, undefined, ctx);
+      await vi.waitFor(() => {
+        expect(runCompletionCount(messages)).toBe(before + 1);
+      });
+    };
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
+    await runPhase("implement", "implement");
+
+    mockSpawnAgentProcess.mockImplementationOnce(async () => {
+      saveReviewScope({ cwd, taskId: "bd-99", sha: "deadbee", untracked: [] });
+      return successfulSpawn();
+    });
+    await runPhase("review", "first review");
+
+    expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(undefined);
+    // Not ours to consume: the foreign record is left for its own workflow.
+    expect(readReviewScope({ cwd })).toHaveProperty("taskId", "bd-99");
+  });
+
   it("bounds a delivered review and drops its narration bullets (bd-113)", async () => {
     setExecToSucceed();
     const cwd = freshWorktree();
@@ -3151,7 +3419,7 @@ describe("session_start resume from disk (bd-40)", () => {
         case "merge-base":
           return { stdout: "base1234\n" };
         case "status":
-          return { stdout: "?? src/new.ts\n" };
+          return { stdout: "?? src/new.ts\0" };
         case "diff":
           return wholeChangeSetDiffOutput(args);
         default:

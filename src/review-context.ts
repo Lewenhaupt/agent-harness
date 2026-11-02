@@ -383,7 +383,9 @@ export interface ReviewDiff {
   changedFiles: string[];
   /**
    * Paths git reports as untracked. They are absent from `git diff`, so the
-   * task lists them explicitly and `changedFiles` includes them.
+   * task lists them explicitly and `changedFiles` includes them. On a re-review
+   * this excludes paths an identical-blob `reviewedUntracked` entry proves the
+   * previous review already covered.
    */
   untrackedFiles: string[];
   stat: string;
@@ -392,15 +394,43 @@ export interface ReviewDiff {
   docsOnly: boolean;
 }
 
+/**
+ * One untracked path a review covered, with the blob git hashed at review
+ * time. A re-review drops the path only while the blob is unchanged, so an
+ * already-reviewed new file stops reappearing without hiding a file the fix
+ * round touched.
+ */
+export interface ReviewedUntrackedEntry {
+  path: string;
+  blob: string;
+}
+
+/** The working-tree state a review is about to cover (bd-228). */
+export interface ReviewedState {
+  /**
+   * A dangling `git stash create` commit of the tracked working state, or HEAD
+   * when the tree was clean. A re-review diffs from here to see the fix round
+   * only.
+   */
+  sha: string;
+  untracked: ReviewedUntrackedEntry[];
+}
+
 export interface CollectReviewDiffOptions {
   cwd: string;
   /** Base branch for a first review. Defaults to {@link DEFAULT_BASE_BRANCH}. */
   baseRef?: string;
   /**
-   * HEAD sha recorded after the previous review. When present the collection
+   * Revision recorded after the previous review. When present the collection
    * switches to fix-diff (re-review) mode.
    */
   reviewedSha?: string;
+  /**
+   * Untracked paths the previous review already covered. Ignored for a first
+   * review, and only consulted with a `reviewedSha` (a manifest without a
+   * range cannot scope anything).
+   */
+  reviewedUntracked?: readonly ReviewedUntrackedEntry[];
 }
 
 export type CollectReviewDiffResult =
@@ -408,6 +438,12 @@ export type CollectReviewDiffResult =
   | { ok: false; error: string };
 
 const GIT_MAX_BUFFER_BYTES = 16 * 1024 * 1024;
+// Every git call here is on a delivery path (a review completion awaits it),
+// so a hung git must surface as an error value instead of blocking delivery.
+const GIT_COMMAND_TIMEOUT_MS = 15_000;
+// `git hash-object` takes one path argument per file; chunk the argv so a large
+// untracked set cannot exceed the platform's argument limit.
+const HASH_OBJECT_CHUNK_SIZE = 64;
 const DIFF_MAX_LINES = 800;
 const DIFF_MAX_BYTES = 60_000;
 
@@ -438,7 +474,7 @@ function execFileStdout(file: string, args: readonly string[], cwd: string): Pro
     const child = execFile(
       file,
       [...args],
-      { cwd, maxBuffer: GIT_MAX_BUFFER_BYTES, encoding: "utf-8" },
+      { cwd, maxBuffer: GIT_MAX_BUFFER_BYTES, timeout: GIT_COMMAND_TIMEOUT_MS, encoding: "utf-8" },
       (error, stdout) => {
         if (error) {
           reject(error);
@@ -577,35 +613,155 @@ function nonEmptyLines(text: string): string[] {
     .filter((line) => line !== "");
 }
 
-/** Git C-quotes paths with unusual characters; unquote the common case. */
-function unquoteGitPath(path: string): string {
-  if (path.startsWith('"') && path.endsWith('"') && path.length >= 2) {
-    return path.slice(1, -1).replace(/\\(.)/g, "$1");
-  }
-  return path;
-}
-
 /** Harness/workflow state inside the worktree: never part of a change set. */
 const HARNESS_STATE_PREFIX = ".belayd/";
 
 /**
- * Extract untracked paths from `git status --porcelain`. Untracked files never
- * appear in `git diff`, so without this the reviewer would be told not to look
- * for exactly the files a new change is most likely to contain.
+ * Extract untracked paths from `git status --porcelain -z -uall` output.
+ * Untracked files never appear in `git diff`, so without this the reviewer
+ * would be told not to look for exactly the files a new change is most likely
+ * to contain.
+ *
+ * `-z` is what makes this safe (bd-228): NUL-separated fields carry the path
+ * verbatim, so a path with a space, newline, tab or quote cannot be mis-read.
+ * Line-oriented porcelain C-quotes such paths, and decoding that quoting by
+ * hand collides distinct paths — which would let the manifest record the wrong
+ * blob and hide a file the reviewer never read.
+ *
+ * `-uall` expands an untracked directory to individual files, so every entry
+ * is a path `git hash-object` can hash.
  *
  * `.belayd/` is filtered out: it holds the workflow's own state (`workflow.json`,
- * `runs/`, and the reviewer's findings scratchpad), which is git-ignored in this
- * repository but must not become "a new file to review" where it is not.
+ * `review-scope.json`, `runs/`, and the reviewer's findings scratchpad), which is
+ * git-ignored in this repository but must not become "a new file to review"
+ * where it is not.
  */
 function parseUntrackedPaths(porcelain: string): string[] {
+  const fields = porcelain.split("\0");
   const paths: string[] = [];
-  for (const line of porcelain.split("\n")) {
-    if (!line.startsWith("?? ")) continue;
-    const path = unquoteGitPath(line.slice(3).trim());
+  let index = 0;
+  while (index < fields.length) {
+    const field = fields[index] ?? "";
+    index += 1;
+    // A record is `XY <path>`; anything shorter is a stray NUL field.
+    if (field.length < 4) continue;
+    const status = field.slice(0, 2);
+    // A rename/copy record carries the source path in the next NUL field. Skip
+    // that field wholesale: a source path is never an untracked entry, and
+    // reading it as one would invent a path the reviewer never saw.
+    if (status.includes("R") || status.includes("C")) {
+      index += 1;
+      continue;
+    }
+    if (status !== "??") continue;
+    const path = field.slice(3);
     if (path === "" || path.startsWith(HARNESS_STATE_PREFIX)) continue;
     paths.push(path);
   }
   return paths;
+}
+
+/**
+ * Hash the given paths with batched `git hash-object` calls (read-only: no
+ * `-w`). A failed or unparsable chunk leaves its paths unresolved, which every
+ * caller treats as fail-open — an unresolved path is kept in scope and omitted
+ * from the manifest, never silently dropped.
+ */
+async function hashPaths(options: {
+  cwd: string;
+  paths: readonly string[];
+}): Promise<Map<string, string>> {
+  const hashed = new Map<string, string>();
+  for (let start = 0; start < options.paths.length; start += HASH_OBJECT_CHUNK_SIZE) {
+    const chunk = options.paths.slice(start, start + HASH_OBJECT_CHUNK_SIZE);
+    const result = await runGit(["hash-object", "--", ...chunk], options.cwd);
+    if (!result.ok) continue;
+    const blobs = result.value.split("\n");
+    // git terminates each blob line with a newline; drop only that tail so a
+    // path containing a newline can never affect the count.
+    if (blobs.at(-1) === "") blobs.pop();
+    // A count mismatch means a path was unreadable or the output is garbled:
+    // unresolved is the safe answer for the whole chunk.
+    if (blobs.length !== chunk.length) continue;
+    for (const [index, path] of chunk.entries()) {
+      const blob = blobs[index]?.trim() ?? "";
+      if (blob !== "") hashed.set(path, blob);
+    }
+  }
+  return hashed;
+}
+
+/**
+ * Capture the tracked revision a review is about to cover (bd-228).
+ *
+ * Review runs *before* the commit phase, so at review time the change set is
+ * normally still uncommitted and HEAD is the pre-work revision: diffing from it
+ * would re-inline the whole change set on the next review. `git stash create`
+ * snapshots the tracked working state without touching the worktree, the index,
+ * HEAD or `refs/` (the commit it prints is dangling), so `git diff <snapshot>`
+ * is exactly the fix round. A clean tree prints nothing, where HEAD is the
+ * correct base.
+ *
+ * Called when the review task is built, before the diff is collected: a snapshot
+ * taken afterwards would absorb mid-review edits the reviewer never read and
+ * hide them from the next re-review. Capturing first can only widen it.
+ */
+async function captureReviewedRevision(cwd: string): Promise<GitResult> {
+  const snapshot = await runGit(["stash", "create"], cwd);
+  const snapshotSha = snapshot.ok ? snapshot.value.trim() : "";
+  if (snapshotSha !== "") return { ok: true, value: snapshotSha };
+  const head = await runGit(["rev-parse", "HEAD"], cwd);
+  if (!head.ok) return head;
+  const headSha = head.value.trim();
+  if (headSha === "") return { ok: false, error: "git rev-parse HEAD reported no revision" };
+  return { ok: true, value: headSha };
+}
+
+/**
+ * Hash each untracked path the review covered, so the next re-review can tell
+ * an already-reviewed new file from one the fix round added. A path whose blob
+ * cannot be read is left out of the manifest, which keeps it in the next
+ * review's scope (see {@link dropAlreadyReviewedUntracked}).
+ */
+async function captureReviewedUntracked(cwd: string): Promise<ReviewedUntrackedEntry[]> {
+  const status = await runGit(["status", "--porcelain", "-z", "-uall"], cwd);
+  if (!status.ok) return [];
+  const paths = parseUntrackedPaths(status.value);
+  const blobs = await hashPaths({ cwd, paths });
+  const entries: ReviewedUntrackedEntry[] = [];
+  for (const path of paths) {
+    const blob = blobs.get(path);
+    if (blob === undefined) continue;
+    entries.push({ path, blob });
+  }
+  return entries;
+}
+
+export interface CaptureReviewedStateOptions {
+  cwd: string;
+}
+
+export type CaptureReviewedStateResult =
+  | { ok: true; value: ReviewedState }
+  | { ok: false; error: string };
+
+/**
+ * Capture the working-tree state a review is about to cover: the revision a fix
+ * round will be diffed from plus the untracked manifest. The caller records
+ * both in one write, so a manifest can never describe a different revision than
+ * the recorded sha. Read-only on git state.
+ *
+ * Known limitation: the snapshot contains only tracked paths, and a dangling
+ * commit can be pruned by `git gc`, after which a re-review falls back to the
+ * whole-change-set diff with a disclosed note.
+ */
+export async function captureReviewedState(
+  options: CaptureReviewedStateOptions,
+): Promise<CaptureReviewedStateResult> {
+  const revision = await captureReviewedRevision(options.cwd);
+  if (!revision.ok) return revision;
+  const untracked = await captureReviewedUntracked(options.cwd);
+  return { ok: true, value: { sha: revision.value, untracked } };
 }
 
 interface DiffSegmentOptions {
@@ -615,6 +771,42 @@ interface DiffSegmentOptions {
   diffArg: string;
   /** Clean label rendered to the reviewer. */
   range: string;
+  /** Untracked paths the previous review already covered (re-review only). */
+  reviewedUntracked?: readonly ReviewedUntrackedEntry[];
+}
+
+/**
+ * Drop untracked paths the previous review already covered and that are
+ * byte-identical now (bd-228).
+ *
+ * Every other currently-untracked path stays in scope: a file the fix round
+ * modified, a file it added, and any path whose blob cannot be read. Fail-open
+ * is deliberate — the fix must never silently hide a file from the reviewer,
+ * so only positive proof of an unchanged blob narrows the list.
+ */
+async function dropAlreadyReviewedUntracked(options: {
+  cwd: string;
+  paths: readonly string[];
+  reviewed: readonly ReviewedUntrackedEntry[];
+}): Promise<string[]> {
+  if (options.reviewed.length === 0) return [...options.paths];
+  const reviewedBlobByPath = new Map(options.reviewed.map((entry) => [entry.path, entry.blob]));
+  // Only paths the previous review actually covered need hashing; a path with
+  // no manifest entry is new and stays in scope without any git call.
+  const candidates = options.paths.filter((path) => reviewedBlobByPath.has(path));
+  if (candidates.length === 0) return [...options.paths];
+  const currentBlobs = await hashPaths({ cwd: options.cwd, paths: candidates });
+  const kept: string[] = [];
+  for (const path of options.paths) {
+    const reviewedBlob = reviewedBlobByPath.get(path);
+    if (reviewedBlob === undefined) {
+      kept.push(path);
+      continue;
+    }
+    const currentBlob = currentBlobs.get(path);
+    if (currentBlob === undefined || currentBlob !== reviewedBlob) kept.push(path);
+  }
+  return kept;
 }
 
 async function collectDiffSegment(options: DiffSegmentOptions): Promise<CollectReviewDiffResult> {
@@ -624,9 +816,17 @@ async function collectDiffSegment(options: DiffSegmentOptions): Promise<CollectR
   if (!names.ok) return names;
   const raw = await runGit(["diff", options.diffArg], options.cwd);
   if (!raw.ok) return raw;
-  const status = await runGit(["status", "--porcelain"], options.cwd);
+  const status = await runGit(["status", "--porcelain", "-z", "-uall"], options.cwd);
   if (!status.ok) return status;
-  const untrackedFiles = parseUntrackedPaths(status.value);
+  const scannedUntracked = parseUntrackedPaths(status.value);
+  const untrackedFiles =
+    options.mode === "rereview" && options.reviewedUntracked !== undefined
+      ? await dropAlreadyReviewedUntracked({
+          cwd: options.cwd,
+          paths: scannedUntracked,
+          reviewed: options.reviewedUntracked,
+        })
+      : scannedUntracked;
   const changedFiles = [...new Set([...nonEmptyLines(names.value), ...untrackedFiles])];
   // The truncation hint names the actual git argument, so it stays valid on the
   // merge-base-fallback path where `range` carries an explanatory note.
@@ -666,6 +866,9 @@ export async function collectReviewDiff(
       mode: "rereview",
       diffArg: options.reviewedSha,
       range: options.reviewedSha,
+      ...(options.reviewedUntracked !== undefined
+        ? { reviewedUntracked: options.reviewedUntracked }
+        : {}),
     });
   }
   const baseRef = options.baseRef ?? DEFAULT_BASE_BRANCH;

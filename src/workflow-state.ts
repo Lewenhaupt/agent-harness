@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
+import type { ReviewedUntrackedEntry } from "./review-context.js";
 import { isValidTaskId, type PhaseSessionRecord } from "./session-naming.js";
 import { isWorkflowComplete } from "./workflow-phases.js";
 
@@ -18,6 +19,13 @@ const SCHEMA_VERSION = 1;
 const PhaseSessionRecordSchema = z.object({
   base: z.string(),
   invocations: z.number().int().positive(),
+});
+
+// Typed against the review-context entry so the persisted manifest can never
+// drift from the shape the re-review filter reads (bd-228).
+const ReviewedUntrackedEntrySchema: z.ZodType<ReviewedUntrackedEntry> = z.object({
+  path: z.string(),
+  blob: z.string(),
 });
 
 /**
@@ -50,10 +58,15 @@ const WorkflowStateSchema = z.object({
   // the completed phase list on resume. Persisted so a late re-review after a
   // later phase completed still re-arms the resumable-fix directive.
   awaitingReviewResponse: z.boolean().optional(),
-  // HEAD sha covered by the most recent completed review (bd-113). A re-review
+  // Revision covered by the most recent completed review (bd-113). A re-review
   // diffs from here, so it sees only the fix round. Optional so a workflow.json
   // written before bd-113 still parses.
   reviewedSha: z.string().optional(),
+  // Untracked paths that review covered, with the blob hash at that moment
+  // (bd-228). Recorded in the same write as `reviewedSha`; used only to drop an
+  // already-reviewed new file from the next re-review. Optional so state
+  // written before bd-228 still parses.
+  reviewedUntracked: z.array(ReviewedUntrackedEntrySchema).optional(),
   // Set when this session handed its workflow off to a child orchestrator
   // (see launchWorktreeWorkflow). Optional so every workflow.json written
   // before bd-120 still parses.
@@ -63,6 +76,20 @@ const WorkflowStateSchema = z.object({
 });
 
 export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
+
+/**
+ * The working-tree state a review task was built from (bd-228). Captured
+ * before the review reads the diff and consumed when that same review
+ * succeeds, so "what the reviewer saw" is what the next re-review diffs from.
+ */
+const ReviewScopeSchema = z.object({
+  taskId: z.string(),
+  sha: z.string(),
+  untracked: z.array(ReviewedUntrackedEntrySchema),
+  capturedAt: z.number().finite(),
+});
+
+export type ReviewScope = z.infer<typeof ReviewScopeSchema>;
 
 export type HandedOffMarker = z.infer<typeof HandedOffMarkerSchema>;
 
@@ -153,6 +180,13 @@ export interface SaveReviewedShaOptions {
   cwd: string;
   sha: string;
   /**
+   * Untracked paths the review covered, hashed at review time. Written in the
+   * same read-modify-write as `sha` so the pair can never disagree; omitted or
+   * empty clears the manifest, so a caller that records a sha alone never
+   * leaves a stale manifest behind to narrow a review (bd-228).
+   */
+  untracked?: readonly ReviewedUntrackedEntry[];
+  /**
    * Task id the caller expects the on-disk workflow.json to belong to. The
    * check runs against the read immediately preceding the write, so a state
    * swap during an earlier await cannot redirect this task's sha into another
@@ -172,6 +206,25 @@ export type SaveReviewedShaResult =
   | { ok: false; reason: "missing-state"; error: string }
   | { ok: false; reason: "task-mismatch"; actualTaskId: string; error: string }
   | { ok: false; reason: "write-failed"; error: string };
+
+export interface SaveReviewScopeOptions {
+  cwd: string;
+  taskId: string;
+  sha: string;
+  untracked: readonly ReviewedUntrackedEntry[];
+  fs?: WorkflowFs;
+  now?: () => number;
+}
+
+export interface ReadReviewScopeOptions {
+  cwd: string;
+  fs?: WorkflowFs;
+}
+
+export interface ClearReviewScopeOptions {
+  cwd: string;
+  fs?: WorkflowFs;
+}
 
 const nodeFsSeam: WorkflowFs = {
   existsSync: (path) => nodeFs.existsSync(path),
@@ -211,6 +264,15 @@ export function workflowStateFilePath(cwd: string): string {
 export function callerHandoffFilePath(cwd: string, sessionKey: string): string {
   const safeKey = sessionKey.replace(/[^A-Za-z0-9._-]/g, "_");
   return join(cwd, ".belayd", `handoff-${safeKey}.json`);
+}
+
+/**
+ * Pending review scope path (bd-228). Lives beside `workflow.json` so the
+ * harness's git-ignore of `.belayd/` keeps it out of every change set; it is a
+ * single worktree-scoped record because the newest review build owns it.
+ */
+export function reviewScopeFilePath(cwd: string): string {
+  return join(cwd, ".belayd", "review-scope.json");
 }
 
 /**
@@ -366,10 +428,11 @@ export function savePhaseSession(
 }
 
 /**
- * Read-modify-write: record the revision the latest review covered and
- * `updatedAt`, preserving every identity field, the phase ledger, and the
- * awaiting-review flag. Mirrors savePhaseSession so a re-review can still be
- * scoped to the fix diff after an orchestrator restart.
+ * Read-modify-write: record the revision the latest review covered, the
+ * untracked manifest that belongs to it, and `updatedAt`, preserving every
+ * identity field, the phase ledger, and the awaiting-review flag. Mirrors
+ * savePhaseSession so a re-review can still be scoped to the fix diff after an
+ * orchestrator restart.
  */
 export function saveReviewedSha(options: SaveReviewedShaOptions): SaveReviewedShaResult {
   const fs = options.fs ?? nodeFsSeam;
@@ -394,6 +457,17 @@ export function saveReviewedSha(options: SaveReviewedShaOptions): SaveReviewedSh
     reviewedSha: options.sha,
     updatedAt: nowMs(options.now),
   };
+  // Delete rather than write `[]`: an absent manifest is the documented
+  // "nothing was filtered" state, and an empty array would be a second shape
+  // for the same thing.
+  if (options.untracked !== undefined && options.untracked.length > 0) {
+    updated.reviewedUntracked = options.untracked.map((entry) => ({
+      path: entry.path,
+      blob: entry.blob,
+    }));
+  } else {
+    delete updated.reviewedUntracked;
+  }
   const writeResult = writeWorkflowState({ cwd: options.cwd, state: updated, fs });
   if (!writeResult.ok) {
     return { ok: false, reason: "write-failed", error: writeResult.error };
@@ -496,6 +570,73 @@ export function clearCallerHandoff(
     return { ok: true };
   } catch (error) {
     // A missing marker is the expected success case; only surface real errors.
+    if (!fs.existsSync(filePath)) return { ok: true };
+    return { ok: false, error: errorMessage(error) };
+  }
+}
+
+/**
+ * Parse and strictly narrow a review-scope record. Invalid JSON, a wrong shape
+ * and an unreadable file all yield undefined — callers treat that as "no
+ * scope", which degrades the next review to a whole-change-set first review.
+ */
+export function parseReviewScope(raw: unknown): ReviewScope | undefined {
+  const result = ReviewScopeSchema.safeParse(raw);
+  return result.success ? result.data : undefined;
+}
+
+/**
+ * Read the pending review scope. Returns undefined when nothing was captured
+ * (or the record is unreadable/corrupt).
+ */
+export function readReviewScope(options: ReadReviewScopeOptions): ReviewScope | undefined {
+  const fs = options.fs ?? nodeFsSeam;
+  const filePath = reviewScopeFilePath(options.cwd);
+  if (!fs.existsSync(filePath)) return undefined;
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath);
+  } catch {
+    return undefined;
+  }
+  try {
+    return parseReviewScope(JSON.parse(text));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Overwrite the pending review scope atomically. Every review build writes this
+ * so only the newest build's record can ever be promoted; a stale record from
+ * an earlier failed review is replaced, not reused.
+ */
+export function saveReviewScope(
+  options: SaveReviewScopeOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  return atomicWriteJson(
+    reviewScopeFilePath(options.cwd),
+    {
+      taskId: options.taskId,
+      sha: options.sha,
+      untracked: options.untracked.map((entry) => ({ path: entry.path, blob: entry.blob })),
+      capturedAt: nowMs(options.now),
+    },
+    fs,
+  );
+}
+
+/** Consume the pending review scope: a missing file is the expected success case. */
+export function clearReviewScope(
+  options: ClearReviewScopeOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const filePath = reviewScopeFilePath(options.cwd);
+  try {
+    fs.unlinkSync(filePath);
+    return { ok: true };
+  } catch (error) {
     if (!fs.existsSync(filePath)) return { ok: true };
     return { ok: false, error: errorMessage(error) };
   }

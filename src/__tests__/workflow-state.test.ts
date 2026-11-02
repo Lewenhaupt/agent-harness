@@ -7,15 +7,20 @@ import {
   classifyWorkflowClaimability,
   clearCallerHandoff,
   clearHandedOffMarker,
+  clearReviewScope,
   clearWorkflowState,
   parseHandedOffMarker,
+  parseReviewScope,
   parseWorkflowState,
   readCallerHandoff,
+  readReviewScope,
   readWorkflowState,
+  reviewScopeFilePath,
   saveCompletedPhases,
   saveHandedOffMarker,
   savePhaseSession,
   saveReviewedSha,
+  saveReviewScope,
   type WorkflowFs,
   type WorkflowState,
   workflowStateDir,
@@ -262,6 +267,205 @@ describe("workflow state", () => {
     expect(parseWorkflowState(raw)?.reviewedSha).toBe(undefined);
     expect(parseWorkflowState({ ...raw, reviewedSha: "abc1234" })?.reviewedSha).toBe("abc1234");
     expect(parseWorkflowState({ ...raw, reviewedSha: 42 })).toBe(undefined);
+  });
+
+  it("records the reviewed sha and its untracked manifest in one write (bd-228)", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({ startedAt: 5_000, updatedAt: 5_000 }),
+      fs,
+    });
+
+    const result = saveReviewedSha({
+      cwd,
+      fs,
+      now: () => 9_000,
+      sha: "stash1234",
+      untracked: [
+        { path: "src/new.ts", blob: "blob1111" },
+        { path: "src/other.ts", blob: "blob2222" },
+      ],
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readWorkflowState({ cwd, fs });
+    expect(reloaded).toHaveProperty("reviewedSha", "stash1234");
+    expect(reloaded).toHaveProperty("reviewedUntracked", [
+      { path: "src/new.ts", blob: "blob1111" },
+      { path: "src/other.ts", blob: "blob2222" },
+    ]);
+    expect(reloaded).toHaveProperty("updatedAt", 9_000);
+  });
+
+  it("clears the reviewed untracked manifest when it is omitted or empty (bd-228)", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({
+        completedPhaseNames: ["implement"],
+        reviewedSha: "old1234",
+        reviewedUntracked: [{ path: "src/old.ts", blob: "blob0000" }],
+      }),
+      fs,
+    });
+
+    expect(saveReviewedSha({ cwd, fs, sha: "abc1234" })).toEqual({ ok: true });
+    const omitted = readWorkflowState({ cwd, fs });
+    // A stale manifest paired with a new sha could silently drop a file from
+    // scope, so recording a sha alone must clear it.
+    expect(omitted).toHaveProperty("reviewedSha", "abc1234");
+    expect(omitted?.reviewedUntracked).toBe(undefined);
+
+    expect(
+      saveReviewedSha({ cwd, fs, sha: "abc1234", untracked: [{ path: "src/a.ts", blob: "b1" }] }),
+    ).toEqual({ ok: true });
+    expect(saveReviewedSha({ cwd, fs, sha: "abc1234", untracked: [] })).toEqual({ ok: true });
+    expect(readWorkflowState({ cwd, fs })?.reviewedUntracked).toBe(undefined);
+  });
+
+  it("writes neither the sha nor the manifest on a task-id mismatch (bd-228)", () => {
+    const fs = createFakeFs();
+    writeWorkflowState({
+      cwd,
+      state: sampleState({
+        taskId: "bd-99",
+        reviewedSha: "deadbee",
+        reviewedUntracked: [{ path: "src/foreign.ts", blob: "blobffff" }],
+      }),
+      fs,
+    });
+    const before = fs.files.get(workflowStateFilePath(cwd));
+
+    const result = saveReviewedSha({
+      cwd,
+      fs,
+      sha: "abc1234",
+      untracked: [{ path: "src/new.ts", blob: "blob1111" }],
+      expectedTaskId: "bd-42",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("task-mismatch");
+    expect(fs.files.get(workflowStateFilePath(cwd))).toBe(before);
+  });
+
+  it("parses a pre-bd-228 workflow.json without a reviewed untracked manifest", () => {
+    const raw = { ...sampleState(), reviewedSha: "abc1234" };
+    expect(parseWorkflowState(raw)?.reviewedUntracked).toBe(undefined);
+    const withManifest = {
+      ...raw,
+      reviewedUntracked: [{ path: "src/new.ts", blob: "blob1111" }],
+    };
+    expect(parseWorkflowState(withManifest)?.reviewedUntracked).toEqual([
+      { path: "src/new.ts", blob: "blob1111" },
+    ]);
+    expect(parseWorkflowState({ ...raw, reviewedUntracked: [{ path: 42 }] })).toBe(undefined);
+  });
+
+  it("round-trips a pending review scope (bd-228)", () => {
+    const fs = createFakeFs();
+
+    const result = saveReviewScope({
+      cwd,
+      fs,
+      now: () => 9_000,
+      taskId: "bd-42",
+      sha: "decaf00",
+      untracked: [{ path: "src/new.ts", blob: "blob1111" }],
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(readReviewScope({ cwd, fs })).toEqual({
+      taskId: "bd-42",
+      sha: "decaf00",
+      untracked: [{ path: "src/new.ts", blob: "blob1111" }],
+      capturedAt: 9_000,
+    });
+  });
+
+  it("writes the review scope atomically, replacing the previous record", () => {
+    const fs = createFakeFs();
+    saveReviewScope({
+      cwd,
+      fs,
+      taskId: "bd-42",
+      sha: "old1234",
+      untracked: [{ path: "src/old.ts", blob: "blob0000" }],
+    });
+
+    const result = saveReviewScope({
+      cwd,
+      fs,
+      taskId: "bd-42",
+      sha: "new1234",
+      untracked: [],
+    });
+
+    expect(result).toEqual({ ok: true });
+    // Only the newest build's record exists: a stale scope can never be promoted.
+    expect(readReviewScope({ cwd, fs })).toHaveProperty("sha", "new1234");
+    expect(readReviewScope({ cwd, fs })).toHaveProperty("untracked", []);
+    expect([...fs.files.keys()]).toEqual([reviewScopeFilePath(cwd)]);
+    expect([...fs.files.keys()].some((path) => path.endsWith(".tmp"))).toBe(false);
+  });
+
+  it("treats a missing, corrupt or invalid review scope as no scope", () => {
+    const missing = createFakeFs();
+    expect(readReviewScope({ cwd, fs: missing })).toBe(undefined);
+
+    const corrupt = createFakeFs({ [reviewScopeFilePath(cwd)]: "not json" });
+    expect(readReviewScope({ cwd, fs: corrupt })).toBe(undefined);
+
+    const invalid = createFakeFs({
+      [reviewScopeFilePath(cwd)]: JSON.stringify({ taskId: "bd-42", sha: 42 }),
+    });
+    expect(readReviewScope({ cwd, fs: invalid })).toBe(undefined);
+
+    const unreadable = createFakeFs({ [reviewScopeFilePath(cwd)]: "{}" });
+    unreadable.readFileSync = () => {
+      throw new Error("EACCES");
+    };
+    expect(readReviewScope({ cwd, fs: unreadable })).toBe(undefined);
+
+    expect(parseReviewScope({ taskId: "bd-42", sha: "abc1234", untracked: [] })).toBe(undefined);
+  });
+
+  it("reports a review-scope write failure as a value", () => {
+    const fs = createFakeFs();
+    fs.renameSync = () => {
+      throw new Error("EXDEV");
+    };
+
+    const result = saveReviewScope({ cwd, fs, taskId: "bd-42", sha: "abc1234", untracked: [] });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("EXDEV");
+  });
+
+  it("clears the pending review scope and tolerates a missing file", () => {
+    const fs = createFakeFs();
+    saveReviewScope({ cwd, fs, taskId: "bd-42", sha: "abc1234", untracked: [] });
+
+    expect(clearReviewScope({ cwd, fs })).toEqual({ ok: true });
+    expect(readReviewScope({ cwd, fs })).toBe(undefined);
+    expect(fs.files.has(reviewScopeFilePath(cwd))).toBe(false);
+    // Consuming an absent scope is the expected success case.
+    expect(clearReviewScope({ cwd, fs })).toEqual({ ok: true });
+  });
+
+  it("reports a review-scope clear failure for a file that still exists", () => {
+    const fs = createFakeFs({ [reviewScopeFilePath(cwd)]: "{}" });
+    fs.unlinkSync = () => {
+      throw new Error("EACCES");
+    };
+
+    const result = clearReviewScope({ cwd, fs });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("EACCES");
   });
 
   it("savePhaseSession upserts one entry and preserves identity fields", () => {

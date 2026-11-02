@@ -9,11 +9,12 @@
 import { getPhaseToolName } from "../../src/agent-registry.js";
 import {
   boundReviewOutput,
+  captureReviewedState,
   collectReviewDiff,
   formatReviewTask,
 } from "../../src/review-context.js";
 import type { RunDelivery } from "../../src/run-detached.js";
-import { readWorkflowState } from "../../src/workflow-state.js";
+import { clearReviewScope, readWorkflowState, saveReviewScope } from "../../src/workflow-state.js";
 import { COMMIT_PHASE, IMPLEMENT_PHASE, REVIEW_PHASE } from "./context.js";
 
 /**
@@ -52,10 +53,44 @@ export function boundReviewDelivery(delivery: RunDelivery): RunDelivery {
 }
 
 /**
+ * Record the working-tree state this review is about to read (bd-228), so a
+ * successful review can promote it as the next re-review's baseline.
+ *
+ * Captured *before* the diff is collected: a mid-review edit then widens the
+ * next re-review instead of hiding content the reviewer never saw, because the
+ * snapshot precedes the diff rather than trailing it. A failed capture leaves
+ * no scope, so the next review is a safe whole-change-set first review.
+ *
+ * The previous record is consumed first: only the newest build's scope is
+ * promotable, and a stale record from an earlier failed review must never scope
+ * a later one.
+ */
+async function recordReviewScope(options: { cwd: string; taskId: string }): Promise<void> {
+  const cleared = clearReviewScope({ cwd: options.cwd });
+  if (!cleared.ok) {
+    console.warn(`[belayd-harness] failed to clear the previous review scope: ${cleared.error}`);
+  }
+  const captured = await captureReviewedState({ cwd: options.cwd });
+  if (!captured.ok) {
+    console.warn(`[belayd-harness] failed to capture the review scope: ${captured.error}`);
+    return;
+  }
+  const saved = saveReviewScope({
+    cwd: options.cwd,
+    taskId: options.taskId,
+    sha: captured.value.sha,
+    untracked: captured.value.untracked,
+  });
+  if (!saved.ok) {
+    console.warn(`[belayd-harness] failed to save the review scope: ${saved.error}`);
+  }
+}
+
+/**
  * Build the review phase prompt with the change set inlined (bd-113).
  *
  * A first review sees the whole change; a re-review sees only the fix diff
- * since the sha the previous review recorded. When nothing can be collected
+ * since the state the previous review recorded. When nothing can be collected
  * the task discloses the gap instead of silently sending a bare task. Any git
  * failure falls back to a disclosed scope rather than failing the phase.
  */
@@ -64,14 +99,17 @@ export async function buildReviewTask(options: {
   paramsTask: string;
   cwd: string;
 }): Promise<string> {
+  // Capture before collecting the diff: see recordReviewScope.
+  await recordReviewScope({ cwd: options.cwd, taskId: options.taskId });
   const persisted = readWorkflowState({ cwd: options.cwd });
-  // Only this task's recorded sha may scope the review; a stale workflow.json
-  // from another task must not narrow (or widen) this task's diff.
-  const reviewedSha =
-    persisted !== undefined && persisted.taskId === options.taskId
-      ? persisted.reviewedSha
-      : undefined;
-  if (reviewedSha === undefined || reviewedSha === "") {
+  // Only this task's recorded state may scope the review; a stale workflow.json
+  // from another task must not narrow (or widen) this task's diff. The
+  // untracked manifest rides the same guard so it can never filter another
+  // task's files (bd-228).
+  const ownState =
+    persisted !== undefined && persisted.taskId === options.taskId ? persisted : undefined;
+  const reviewedSha = ownState?.reviewedSha;
+  if (ownState === undefined || reviewedSha === undefined || reviewedSha === "") {
     const firstReview = await collectReviewDiff({ cwd: options.cwd });
     if (!firstReview.ok) {
       return formatReviewTask({
@@ -81,7 +119,15 @@ export async function buildReviewTask(options: {
     }
     return formatReviewTask({ paramsTask: options.paramsTask, diff: firstReview.value });
   }
-  const rereview = await collectReviewDiff({ cwd: options.cwd, reviewedSha });
+  // Both `ownState` and `reviewedSha` are narrowed by the guard above, so the
+  // manifest reads without a second optional-chain check.
+  const rereview = await collectReviewDiff({
+    cwd: options.cwd,
+    reviewedSha,
+    ...(ownState.reviewedUntracked !== undefined
+      ? { reviewedUntracked: ownState.reviewedUntracked }
+      : {}),
+  });
   if (rereview.ok) {
     return formatReviewTask({
       paramsTask: options.paramsTask,

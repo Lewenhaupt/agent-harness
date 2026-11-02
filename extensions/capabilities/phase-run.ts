@@ -49,7 +49,13 @@ import {
 import type { SpawnAttempt, SpawnWithFallbackOptions } from "../../src/spawn-with-fallback.js";
 import { getNextPhase, type Phase } from "../../src/workflow-phases.js";
 import type { WORKFLOW_REGISTRY } from "../../src/workflow-registry.js";
-import { readWorkflowState, savePhaseSession, saveReviewedSha } from "../../src/workflow-state.js";
+import {
+  clearReviewScope,
+  readReviewScope,
+  readWorkflowState,
+  savePhaseSession,
+  saveReviewedSha,
+} from "../../src/workflow-state.js";
 import type { CoreSessionState } from "./context.js";
 import {
   COMMIT_PHASE,
@@ -60,7 +66,6 @@ import {
   recordMetric,
   recordPhaseArtifact,
   recordRunEndMetrics,
-  runGitCommand,
 } from "./context.js";
 import { modelCooldown, modelFallbackEnabled, modelState, persistModelTelemetry } from "./model.js";
 import { preparePhaseProof, readUserGuideForContext } from "./proof.js";
@@ -408,28 +413,48 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }
 
   /**
-   * Record the revision a completed review covered, so the next re-review can
-   * diff only the fix round (bd-113). Best-effort: a git or disk failure must
+   * Promote the review scope captured when this review's task was built, so the
+   * next re-review diffs only the fix round (bd-113, bd-228).
+   *
+   * Promotion happens at completion, never at capture: a mid-review edit must
+   * not enter the baseline, or the next re-review would hide a change the
+   * reviewer never read. The scope is consumed here so only the newest review
+   * build's record can ever seed a baseline. Best-effort: a disk failure must
    * never affect an otherwise successful review delivery.
    */
-  async function persistReviewedSha(options: { cwd: string; taskId: string }): Promise<void> {
-    let sha: string;
-    try {
-      const { stdout } = await runGitCommand(["rev-parse", "HEAD"], {
-        cwd: options.cwd,
-        timeoutInMs: 15_000,
-        maxBufferInBytes: 1024 * 1024,
-      });
-      sha = stdout.trim();
-    } catch (error) {
-      console.warn(`[belayd-harness] failed to resolve HEAD for the reviewed sha:`, error);
+  function persistReviewedSha(options: { cwd: string; taskId: string }): void {
+    const scope = readReviewScope({ cwd: options.cwd });
+    if (scope === undefined) {
+      // No scope means no recorded revision: the next review is a
+      // whole-change-set first review, which is wider, never narrower.
+      console.warn(
+        `[belayd-harness] no review scope recorded for ${options.taskId}; the next review starts from the whole change set`,
+      );
       return;
     }
-    if (sha === "") return;
+    if (scope.taskId !== options.taskId) {
+      // Not ours to consume or promote; the next build rewrites it anyway.
+      console.warn(
+        `[belayd-harness] skipped the reviewed state: the review scope belongs to ${scope.taskId}, not ${options.taskId}`,
+      );
+      return;
+    }
+    // Consume before promoting: a failed write then leaves no scope, so the
+    // next review cannot promote a record from this one.
+    const cleared = clearReviewScope({ cwd: options.cwd });
+    if (!cleared.ok) {
+      console.warn(`[belayd-harness] failed to clear the review scope: ${cleared.error}`);
+    }
     // The identity check lives in saveReviewedSha so it shares the read that
-    // immediately precedes the write: a state swap during the rev-parse await
-    // must not redirect this task's sha into another task's workflow.json.
-    const saveResult = saveReviewedSha({ cwd: options.cwd, sha, expectedTaskId: options.taskId });
+    // immediately precedes the write: a state swap must not redirect this
+    // task's reviewed state into another task's workflow.json. The sha and its
+    // untracked manifest go in one write so they cannot disagree.
+    const saveResult = saveReviewedSha({
+      cwd: options.cwd,
+      sha: scope.sha,
+      untracked: scope.untracked,
+      expectedTaskId: options.taskId,
+    });
     if (saveResult.ok) return;
     if (saveResult.reason === "missing-state") return;
     if (saveResult.reason === "task-mismatch") {
@@ -610,7 +635,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         // the stop is findable in bd instead of only inside the worktree.
         let reviewGateOpened = false;
         if (gateOwnsRun() && delivery.success && delivery.phaseName === REVIEW_PHASE) {
-          await persistReviewedSha({ cwd, taskId: state.currentTaskId });
+          persistReviewedSha({ cwd, taskId: state.currentTaskId });
           reviewGateOpened = await openReviewGateIfFound({
             delivered,
             state,

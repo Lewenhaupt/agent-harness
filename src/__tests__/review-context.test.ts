@@ -10,6 +10,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   boundReviewOutput,
+  captureReviewedState,
   classifyDiffScope,
   collectReviewDiff,
   countReviewFindings,
@@ -93,6 +94,14 @@ function diffFixture(overrides: Partial<ReviewDiff> = {}): ReviewDiff {
 }
 
 const PREVIOUS_HEADER = ["diff", "--stat", "base123"];
+
+/**
+ * Build `git status --porcelain -z -uall` output. Each field is `XY <path>`
+ * (or `XY <dest>` followed by the source field for a rename/copy), NUL-terminated.
+ */
+function statusFields(...fields: readonly string[]): string {
+  return fields.map((field) => `${field}\0`).join("");
+}
 
 /** A diff with hunk headers, the shape the reviewer actually receives. */
 const HUNKED_DIFF = [
@@ -337,7 +346,9 @@ describe("collectReviewDiff", () => {
     mockExecFile.setHandler((args) => {
       if (args[0] === "merge-base") return { stdout: "base123\n" };
       if (args[0] === "status") {
-        return { stdout: '?? src/new.ts\n?? "docs/note with space.md"\n M src/a.ts\n' };
+        return {
+          stdout: statusFields("?? src/new.ts", "?? docs/note with space.md", " M src/a.ts"),
+        };
       }
       if (args.includes("--name-only")) return { stdout: "docs/guide.md\n" };
       if (args.includes("--stat")) return { stdout: " docs/guide.md | 1 +\n" };
@@ -361,7 +372,7 @@ describe("collectReviewDiff", () => {
   it("stays docs-only when every tracked and untracked path is docs (W1)", async () => {
     mockExecFile.setHandler((args) => {
       if (args[0] === "merge-base") return { stdout: "base123\n" };
-      if (args[0] === "status") return { stdout: "?? docs/new.md\n" };
+      if (args[0] === "status") return { stdout: statusFields("?? docs/new.md") };
       if (args.includes("--name-only")) return { stdout: "README.md\n" };
       if (args.includes("--stat")) return { stdout: " README.md | 1 +\n" };
       return { stdout: "diff --git a/README.md b/README.md\n" };
@@ -373,6 +384,52 @@ describe("collectReviewDiff", () => {
     if (!result.ok) return;
     expect(result.value.docsOnly).toBe(true);
     expect(result.value.changedFiles).toEqual(["README.md", "docs/new.md"]);
+  });
+
+  it("keeps space, newline and quote paths byte-exact from -z output (W2)", async () => {
+    const oddPaths = ["docs/note with space.md", "src/line\nbreak.ts", 'src/quote".ts'];
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "merge-base") return { stdout: "base123\n" };
+      if (args[0] === "status") {
+        return { stdout: statusFields(...oddPaths.map((path) => `?? ${path}`)) };
+      }
+      if (args.includes("--name-only")) return { stdout: "" };
+      if (args.includes("--stat")) return { stdout: "" };
+      return { stdout: "" };
+    });
+    mockExecFile.reset();
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untrackedFiles).toEqual(oddPaths);
+    expect(result.value.changedFiles).toEqual(oddPaths);
+    // `-z` is the mechanism: NUL fields carry the path verbatim, so no C-quoted
+    // path can be mis-decoded into a different file.
+    const argv = mockExecFile.calls.map((call) => call.args);
+    expect(argv).toContainEqual(["status", "--porcelain", "-z", "-uall"]);
+  });
+
+  it("never treats a rename entry's source path as untracked (W2)", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "merge-base") return { stdout: "base123\n" };
+      if (args[0] === "status") {
+        // A rename record is `R  <dest>` then the source path in the next field.
+        return { stdout: statusFields("R  src/renamed.ts", "src/original.ts", "?? src/new.ts") };
+      }
+      if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
+      if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
+      return { stdout: "diff --git a/src/a.ts b/src/a.ts\n+line\n" };
+    });
+
+    const result = await collectReviewDiff({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The source path of a rename is tracked history, not a new file, and must
+    // never be offered to the reviewer as one.
+    expect(result.value.untrackedFiles).toEqual(["src/new.ts"]);
   });
 
   it("reports a re-review failure instead of falling back to the whole change set", async () => {
@@ -455,6 +512,322 @@ describe("collectReviewDiff", () => {
     // `range` keeps its explanatory note, but the printed command stays valid.
     expect(result.value.range).toContain("merge-base unavailable");
     expect(result.value.diff).toContain("`git diff main`");
+  });
+});
+
+// ── captureReviewedState (bd-228) ──────────────────────────────────────
+
+describe("captureReviewedState", () => {
+  it("records the stash snapshot sha and the untracked manifest for a dirty tree", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "stash1234\n" };
+      if (args[0] === "status") return { stdout: statusFields("?? src/new.ts", " M src/a.ts") };
+      if (args[0] === "hash-object") return { stdout: "blob5678\n" };
+      if (args[0] === "rev-parse") return { stdout: "head1234\n" };
+      return { stdout: "" };
+    });
+    mockExecFile.reset();
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The uncommitted change set is what the review just covered, so the
+    // snapshot — not HEAD — is the revision the fix round is diffed from.
+    expect(result.value.sha).toBe("stash1234");
+    expect(result.value.untracked).toEqual([{ path: "src/new.ts", blob: "blob5678" }]);
+    const argv = mockExecFile.calls.map((call) => call.args);
+    expect(argv).toContainEqual(["stash", "create"]);
+    expect(argv).toContainEqual(["hash-object", "--", "src/new.ts"]);
+    expect(argv.some((args) => args[0] === "rev-parse")).toBe(false);
+  });
+
+  it("falls back to HEAD when the tree is clean", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "" };
+      if (args[0] === "rev-parse") return { stdout: "head1234\n" };
+      return { stdout: "" };
+    });
+    mockExecFile.reset();
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.sha).toBe("head1234");
+    expect(result.value.untracked).toEqual([]);
+  });
+
+  it("falls back to HEAD when git stash create fails", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "", error: new Error("no stash possible") };
+      if (args[0] === "rev-parse") return { stdout: "head1234\n" };
+      return { stdout: "" };
+    });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.sha).toBe("head1234");
+  });
+
+  it("returns an error when neither the snapshot nor HEAD resolves", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "", error: new Error("stash failed") };
+      return { stdout: "", error: new Error("not a git repository") };
+    });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("not a git repository");
+  });
+
+  it("leaves a path unresolved when its hash-object batch fails (fail open)", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "stash1234\n" };
+      if (args[0] === "status") return { stdout: statusFields("?? src/new.ts", "?? src/other.ts") };
+      if (args[0] === "hash-object") return { stdout: "", error: new Error("unable to hash") };
+      return { stdout: "" };
+    });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Only positively-hashed paths enter the manifest; an unresolved path stays
+    // in the next review's scope instead of being filtered out blindly.
+    expect(result.value.untracked).toEqual([]);
+  });
+
+  it("hashes space, newline and quote paths byte-exactly (W2)", async () => {
+    const oddPaths = ["docs/note with space.md", "src/line\nbreak.ts", 'src/quote".ts'];
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "stash1234\n" };
+      if (args[0] === "status") {
+        return { stdout: statusFields(...oddPaths.map((path) => `?? ${path}`)) };
+      }
+      if (args[0] === "hash-object") {
+        // Real git prints a hex blob per path; keep the fake newline-free too, so
+        // an embedded newline in a *path* cannot be confused with a blob line.
+        return {
+          stdout: args
+            .slice(2)
+            .map((_, index) => `blob${index}\n`)
+            .join(""),
+        };
+      }
+      return { stdout: "" };
+    });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untracked.map((entry) => entry.path)).toEqual(oddPaths);
+    expect(result.value.untracked.map((entry) => entry.blob)).toEqual(["blob0", "blob1", "blob2"]);
+    const argv = mockExecFile.calls.map((call) => call.args);
+    expect(argv).toContainEqual(["hash-object", "--", ...oddPaths]);
+  });
+
+  it("keeps the sha when the untracked scan fails", async () => {
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "stash1234\n" };
+      if (args[0] === "status") return { stdout: "", error: new Error("status failed") };
+      return { stdout: "" };
+    });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.sha).toBe("stash1234");
+    expect(result.value.untracked).toEqual([]);
+  });
+});
+
+// ── batched hash-object (bd-228, W3) ───────────────────────────────────
+
+describe("captureReviewedState batched hashing", () => {
+  const MANY = Array.from({ length: 65 }, (_, index) => `src/untracked-${index}.ts`);
+
+  /** Install a fake that hashes each chunk in order; chunk N can be told to fail. */
+  function installBatchHandler(options: { failingChunk?: number }): void {
+    let chunkCount = 0;
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "stash") return { stdout: "stash1234\n" };
+      if (args[0] === "status") {
+        return { stdout: MANY.map((path) => `?? ${path}\0`).join("") };
+      }
+      if (args[0] === "hash-object") {
+        chunkCount += 1;
+        if (chunkCount === options.failingChunk) {
+          return { stdout: "", error: new Error("hash failed") };
+        }
+        return {
+          stdout: args
+            .slice(2)
+            .map((path) => `blob:${path}\n`)
+            .join(""),
+        };
+      }
+      return { stdout: "" };
+    });
+    mockExecFile.reset();
+  }
+
+  it("hashes one chunk of paths per git call, in path order", async () => {
+    installBatchHandler({});
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // Positional zip: blob i belongs to path i, with no reordering.
+    expect(result.value.untracked.map((entry) => entry.path)).toEqual(MANY);
+    expect(result.value.untracked.map((entry) => entry.blob)).toEqual(
+      MANY.map((path) => `blob:${path}`),
+    );
+    const hashArgv = mockExecFile.calls
+      .map((call) => call.args)
+      .filter((args) => args[0] === "hash-object");
+    // 64 paths in the first chunk, the remaining one in the second: argv limits
+    // are respected without spawning one child per path.
+    expect(hashArgv).toHaveLength(2);
+    expect(hashArgv[0]?.slice(2)).toEqual(MANY.slice(0, 64));
+    expect(hashArgv[1]?.slice(2)).toEqual(MANY.slice(64));
+  });
+
+  it("omits an unresolved chunk from the manifest instead of guessing", async () => {
+    installBatchHandler({ failingChunk: 2 });
+
+    const result = await captureReviewedState({ cwd: "/repo" });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untracked).toHaveLength(64);
+    expect(result.value.untracked.some((entry) => entry.path === MANY[64])).toBe(false);
+  });
+});
+
+// ── re-review untracked manifest (bd-228) ──────────────────────────────
+
+describe("collectReviewDiff re-review untracked manifest", () => {
+  /**
+   * Install a re-review git fake. `hashes` maps a path to its current blob;
+   * `failHashPaths` models git exiting non-zero for a batch containing an
+   * unreadable path, which leaves the whole chunk unresolved.
+   */
+  function installRereviewHandler(options: {
+    statusPorcelain: string;
+    hashes?: Record<string, string>;
+    failHashPaths?: readonly string[];
+  }): void {
+    const hashOutcome = (paths: readonly string[]): { stdout: string; error?: Error } => {
+      if (paths.some((path) => options.failHashPaths?.includes(path) === true)) {
+        return { stdout: "", error: new Error("hash failed") };
+      }
+      return { stdout: paths.map((path) => `${options.hashes?.[path] ?? "unknown"}\n`).join("") };
+    };
+    const diffOutcome = (args: readonly string[]): { stdout: string } => {
+      if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
+      if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
+      return { stdout: "diff --git a/src/a.ts b/src/a.ts\n+fix\n" };
+    };
+    mockExecFile.setHandler((args) => {
+      if (args[0] === "status") return { stdout: options.statusPorcelain };
+      if (args[0] === "hash-object") return hashOutcome(args.slice(2));
+      return diffOutcome(args);
+    });
+    mockExecFile.reset();
+  }
+
+  const REVIEWED = [{ path: "src/reviewed.ts", blob: "blob1111" }];
+
+  it("drops an already-reviewed untracked file whose blob is unchanged", async () => {
+    installRereviewHandler({
+      statusPorcelain: statusFields("?? src/reviewed.ts", "?? src/fix.ts"),
+      hashes: { "src/reviewed.ts": "blob1111", "src/fix.ts": "blob2222" },
+    });
+
+    const result = await collectReviewDiff({
+      cwd: "/repo",
+      reviewedSha: "abc1234",
+      reviewedUntracked: REVIEWED,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The fix round's new file stays in scope; the one already reviewed does not
+    // reappear under "New (untracked) files".
+    expect(result.value.untrackedFiles).toEqual(["src/fix.ts"]);
+    expect(result.value.changedFiles).toEqual(["src/a.ts", "src/fix.ts"]);
+    // Only a path the manifest covers is hashed; `src/fix.ts` costs no git call.
+    const hashArgv = mockExecFile.calls
+      .map((call) => call.args)
+      .filter((args) => args[0] === "hash-object");
+    expect(hashArgv).toEqual([["hash-object", "--", "src/reviewed.ts"]]);
+  });
+
+  it("keeps an already-reviewed untracked file that the fix round modified", async () => {
+    installRereviewHandler({
+      statusPorcelain: statusFields("?? src/reviewed.ts"),
+      hashes: { "src/reviewed.ts": "blob9999" },
+    });
+
+    const result = await collectReviewDiff({
+      cwd: "/repo",
+      reviewedSha: "abc1234",
+      reviewedUntracked: REVIEWED,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untrackedFiles).toEqual(["src/reviewed.ts"]);
+  });
+
+  it("keeps every path when hashing fails, so the fix never hides a file", async () => {
+    installRereviewHandler({
+      statusPorcelain: statusFields("?? src/reviewed.ts"),
+      failHashPaths: ["src/reviewed.ts"],
+    });
+
+    const result = await collectReviewDiff({
+      cwd: "/repo",
+      reviewedSha: "abc1234",
+      reviewedUntracked: REVIEWED,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.untrackedFiles).toEqual(["src/reviewed.ts"]);
+  });
+
+  it("ignores the manifest on a first review", async () => {
+    const fixedResponses: Record<string, string> = {
+      "merge-base": "base123\n",
+      status: statusFields("?? src/reviewed.ts"),
+      "hash-object": "blob1111\n",
+    };
+    mockExecFile.setHandler((args) => {
+      const fixed = fixedResponses[args[0] ?? ""];
+      if (fixed !== undefined) return { stdout: fixed };
+      if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
+      if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
+      return { stdout: "diff --git a/src/a.ts b/src/a.ts\n+line\n" };
+    });
+    mockExecFile.reset();
+
+    const result = await collectReviewDiff({ cwd: "/repo", reviewedUntracked: REVIEWED });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.mode).toBe("first");
+    // A manifest only ever scopes a re-review; a first review reviews everything.
+    expect(result.value.untrackedFiles).toEqual(["src/reviewed.ts"]);
+    expect(mockExecFile.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
   });
 });
 
@@ -556,7 +929,7 @@ describe("collectReviewDiff line-number gutter", () => {
     mockExecFile.setHandler((args) => {
       if (args[0] === "merge-base") return { stdout: "base123\n" };
       if (args[0] === "status") {
-        return { stdout: "?? .belayd/review-findings.md\n?? src/new.ts\n" };
+        return { stdout: statusFields("?? .belayd/review-findings.md", "?? src/new.ts") };
       }
       if (args.includes("--name-only")) return { stdout: "src/a.ts\n" };
       if (args.includes("--stat")) return { stdout: " src/a.ts | 2 +-\n" };
