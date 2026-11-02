@@ -1,0 +1,370 @@
+{
+  "note": "Shared fixtures for src/__tests__/durable-member-contract-parity.test.ts. `frames` are reduced sequentially by BOTH src/durable-member/contract.ts (reduceConversationFrames) and pi-web-plugins/durable-member/contract.js; `mergeCases` drive mergeEarlierTranscriptPage on both sides. Both must agree with `expected`.",
+  "cases": [
+    {
+      "name": "first frame populates the view",
+      "maxEntries": 10,
+      "frames": [
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [
+            {
+              "id": "e1",
+              "conversationId": "member-a:main",
+              "cursor": "10",
+              "role": "user",
+              "kind": "message",
+              "timestamp": 10,
+              "text": "hello"
+            },
+            {
+              "id": "e2",
+              "conversationId": "member-a:main",
+              "cursor": "20",
+              "role": "assistant",
+              "kind": "message",
+              "timestamp": 20,
+              "text": "hi"
+            }
+          ],
+          "cursor": "10",
+          "hasEarlier": true,
+          "live": null,
+          "emittedAt": 900
+        }
+      ],
+      "expected": {
+        "entries": [{ "id": "e1", "text": "hello" }, { "id": "e2", "text": "hi" }],
+        "cursor": "10",
+        "hasEarlier": true,
+        "live": null
+      }
+    },
+    {
+      "name": "a repeated id updates text instead of appending a duplicate",
+      "maxEntries": 10,
+      "frames": [
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [
+            {
+              "id": "e1",
+              "conversationId": "member-a:main",
+              "cursor": "10",
+              "role": "assistant",
+              "kind": "message",
+              "timestamp": 10,
+              "text": "hel"
+            }
+          ],
+          "cursor": "10",
+          "hasEarlier": false,
+          "live": null,
+          "emittedAt": 900
+        },
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [
+            {
+              "id": "e1",
+              "conversationId": "member-a:main",
+              "cursor": "10",
+              "role": "assistant",
+              "kind": "message",
+              "timestamp": 10,
+              "text": "hello"
+            },
+            {
+              "id": "e2",
+              "conversationId": "member-a:main",
+              "cursor": "20",
+              "role": "tool",
+              "kind": "tool-output",
+              "timestamp": 20,
+              "text": "done"
+            }
+          ],
+          "cursor": "10",
+          "hasEarlier": false,
+          "live": null,
+          "emittedAt": 1000
+        }
+      ],
+      "expected": {
+        "entries": [{ "id": "e1", "text": "hello" }, { "id": "e2", "text": "done" }],
+        "cursor": "10",
+        "hasEarlier": false,
+        "live": null
+      }
+    },
+    {
+      "name": "the window cap drops the oldest entry and keeps hasEarlier",
+      "maxEntries": 2,
+      "frames": [
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [
+            {
+              "id": "e1",
+              "conversationId": "member-a:main",
+              "cursor": "10",
+              "role": "user",
+              "kind": "message",
+              "timestamp": 10,
+              "text": "one"
+            },
+            {
+              "id": "e2",
+              "conversationId": "member-a:main",
+              "cursor": "20",
+              "role": "assistant",
+              "kind": "message",
+              "timestamp": 20,
+              "text": "two"
+            },
+            {
+              "id": "e3",
+              "conversationId": "member-a:main",
+              "cursor": "30",
+              "role": "assistant",
+              "kind": "message",
+              "timestamp": 30,
+              "text": "three"
+            }
+          ],
+          "cursor": "10",
+          "hasEarlier": false,
+          "live": null,
+          "emittedAt": 900
+        }
+      ],
+      "expected": {
+        "entries": [{ "id": "e2", "text": "two" }, { "id": "e3", "text": "three" }],
+        "cursor": "20",
+        "hasEarlier": true,
+        "live": null
+      }
+    },
+    {
+      "name": "a frame for another conversation restarts the view",
+      "maxEntries": 10,
+      "frames": [
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [
+            {
+              "id": "e1",
+              "conversationId": "member-a:main",
+              "cursor": "10",
+              "role": "user",
+              "kind": "message",
+              "timestamp": 10,
+              "text": "first conversation"
+            }
+          ],
+          "cursor": "10",
+          "hasEarlier": false,
+          "live": null,
+          "emittedAt": 900
+        },
+        {
+          "conversationId": "member-b:child",
+          "entriesWindow": [
+            {
+              "id": "e9",
+              "conversationId": "member-b:child",
+              "cursor": "1",
+              "role": "user",
+              "kind": "message",
+              "timestamp": 5,
+              "text": "second conversation"
+            }
+          ],
+          "cursor": "1",
+          "hasEarlier": true,
+          "live": null,
+          "emittedAt": 1000
+        }
+      ],
+      "expected": {
+        "entries": [{ "id": "e9", "text": "second conversation" }],
+        "cursor": "1",
+        "hasEarlier": true,
+        "live": null
+      }
+    },
+    {
+      "name": "live generation follows the latest frame and clears when the run ends",
+      "maxEntries": 10,
+      "frames": [
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [],
+          "cursor": null,
+          "hasEarlier": false,
+          "live": {
+            "conversationId": "member-a:main",
+            "generationId": "gen-1",
+            "status": "streaming",
+            "partialText": "thinking",
+            "startedAt": 100,
+            "updatedAt": 200,
+            "attempt": 1,
+            "toolCalls": []
+          },
+          "emittedAt": 900
+        },
+        {
+          "conversationId": "member-a:main",
+          "entriesWindow": [],
+          "cursor": null,
+          "hasEarlier": false,
+          "live": null,
+          "emittedAt": 1000
+        }
+      ],
+      "expected": {
+        "entries": [],
+        "cursor": null,
+        "hasEarlier": false,
+        "live": null
+      }
+    }
+  ],
+  "mergeCases": [
+    {
+      "name": "an earlier page is prepended and owns the new paging state",
+      "maxEntries": 10,
+      "state": {
+        "conversationId": "member-a:main",
+        "entries": [
+          {
+            "id": "e2",
+            "conversationId": "member-a:main",
+            "cursor": "20",
+            "role": "assistant",
+            "kind": "message",
+            "timestamp": 20,
+            "text": "two"
+          },
+          {
+            "id": "e3",
+            "conversationId": "member-a:main",
+            "cursor": "30",
+            "role": "assistant",
+            "kind": "message",
+            "timestamp": 30,
+            "text": "three"
+          }
+        ],
+        "cursor": "20",
+        "hasEarlier": true,
+        "live": null
+      },
+      "page": {
+        "entries": [
+          {
+            "id": "e1",
+            "conversationId": "member-a:main",
+            "cursor": "10",
+            "role": "user",
+            "kind": "message",
+            "timestamp": 10,
+            "text": "one"
+          }
+        ],
+        "cursor": "10",
+        "hasEarlier": false
+      },
+      "expected": {
+        "entries": [
+          { "id": "e1", "text": "one" },
+          { "id": "e2", "text": "two" },
+          { "id": "e3", "text": "three" }
+        ],
+        "cursor": "10",
+        "hasEarlier": false,
+        "live": null
+      }
+    },
+    {
+      "name": "an empty earlier page ends the load-earlier affordance",
+      "maxEntries": 10,
+      "state": {
+        "conversationId": "member-a:main",
+        "entries": [
+          {
+            "id": "e1",
+            "conversationId": "member-a:main",
+            "cursor": "10",
+            "role": "user",
+            "kind": "message",
+            "timestamp": 10,
+            "text": "one"
+          }
+        ],
+        "cursor": "10",
+        "hasEarlier": true,
+        "live": null
+      },
+      "page": { "entries": [], "cursor": null, "hasEarlier": false },
+      "expected": {
+        "entries": [{ "id": "e1", "text": "one" }],
+        "cursor": "10",
+        "hasEarlier": false,
+        "live": null
+      }
+    },
+    {
+      "name": "the in-memory copy wins over an older page copy of the same id",
+      "maxEntries": 10,
+      "state": {
+        "conversationId": "member-a:main",
+        "entries": [
+          {
+            "id": "e2",
+            "conversationId": "member-a:main",
+            "cursor": "20",
+            "role": "assistant",
+            "kind": "message",
+            "timestamp": 20,
+            "text": "two (final)"
+          }
+        ],
+        "cursor": "20",
+        "hasEarlier": true,
+        "live": null
+      },
+      "page": {
+        "entries": [
+          {
+            "id": "e1",
+            "conversationId": "member-a:main",
+            "cursor": "10",
+            "role": "user",
+            "kind": "message",
+            "timestamp": 10,
+            "text": "one"
+          },
+          {
+            "id": "e2",
+            "conversationId": "member-a:main",
+            "cursor": "20",
+            "role": "assistant",
+            "kind": "message",
+            "timestamp": 20,
+            "text": "two (partial)"
+          }
+        ],
+        "cursor": "10",
+        "hasEarlier": false
+      },
+      "expected": {
+        "entries": [{ "id": "e1", "text": "one" }, { "id": "e2", "text": "two (final)" }],
+        "cursor": "10",
+        "hasEarlier": false,
+        "live": null
+      }
+    }
+  ]
+}

@@ -13,7 +13,7 @@ belayd-agent-harness/
 ├── test/                    # Integration tests
 ├── docs/                    # Per-subsystem runbooks (see the index below)
 ├── nix/pi-extensions/       # Third-party pi extension manifest + lockfile
-├── pi-web-plugins/          # pi-web browser plugin (proof-of-work panel)
+├── pi-web-plugins/          # pi-web plugins (proof-of-work panel, durable-member panel+server)
 ├── scripts/                 # belayd-shell / direnv helpers, shipped via the flake
 ├── bin/pi                   # Repo dev wrapper (derives its -e list from manifests)
 ├── flake.nix                # Packages: pi, pi-bare, belayd-harness, pi-web, archify…
@@ -156,6 +156,36 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/aws-broker/scope.ts` | Sandbox and socket paths for the per-repo AWS credential broker (bd-125) |
 | `src/aws-broker/server.ts` | Unix-socket protocol and plumbing for the broker (bd-125) |
 
+### Durable members (`src/durable-member/`)
+
+Read-only viewer contract plus the member-owned control plane for durable
+members (bd-186); design, authority matrix and the WAL probe:
+`docs/durable-member-panel.md`.
+
+**`node:sqlite` import boundary.** Production `src/` code imports it only in
+`standalone-store.ts`; the plugin's mirrored `store-reader.js` does too. The
+plain-JS probe fixtures `test/fixtures/durable-readonly-{writer,viewer}.mjs` and
+`pi-web-plugins/durable-member/fixtures/seed-member.mjs` import it directly as a
+sanctioned test-fixture exception: the two-process probe and the screenshot
+seeder must run without a TypeScript build step, so routing them through the
+store seam would make the probe depend on `dist/` output.
+
+**Boundary validation.** `commands.ts` (commands) and `standalone-store.ts`
+(entry/live-generation/task payloads) validate untrusted data with **zod**; the
+plain-JS contract mirror stays hand-rolled because the plugin is served from
+source with no build step (recorded in the SYNC WARNING on both sides and driven
+by the contract parity test).
+
+| `src/durable-member/contract.ts` | Read surface: entries, live generation, task graph, transcript, `DurableReader`, `ReadOnlySessionError`, frame reduction |
+| `src/durable-member/commands.ts` | `DurableCommand` union + zod boundary schema and refusal-code mapping (requestId is the dedupe key) |
+| `src/durable-member/authority.ts` | `VerifiedAuthority` tier binding (owner-set, opaque), role × kind matrix, configure/reset confirmation gate |
+| `src/durable-member/dedupe.ts` | requestId ledger: in-memory map + JSONL replay, deterministic prune, bounded tombstones |
+| `src/durable-member/dispatch.ts` | The one command → owner writer translation; ledger records only after a successful apply |
+| `src/durable-member/socket.ts` | Member-owned control socket (one unix listener, per-tier credentials, credential→tier derivation, optional loopback TCP with published `control.port`, NDJSON auth framing) |
+| `src/durable-member/mailbox.ts` | File transport: queue-origin tier, drain, receipts, retry-on-writer-failure and `rejected/` quarantine |
+| `src/durable-member/viewer.ts` | Assembles a `DurableReader` over the store opened `readOnly: true`, probes the invariant on a scratch database, and reduces live-generation liveness (staleness by heartbeat bound or owner-gone seam) |
+| `src/durable-member/standalone-store.ts` | Reference durable store over `node:sqlite` (stand-in, not pi-durable) and zod payload schemas |
+
 ### Extensions (`extensions/`)
 
 | File | Purpose |
@@ -278,6 +308,8 @@ raise the ceiling deliberately and say why.
 | `docs/artifacts.md` | per-phase worktree artifacts and how a phase prompt references them |
 | `docs/metrics.md` | append-only metrics event log (gate first-pass, phase economics) and its DuckDB queries |
 | `docs/diff-scoped-review.md` | review scoping and output bounding |
+| `docs/durable-member-panel.md`, `docs/durable-member-userguide.md` | durable-member viewer panel and member-owned control plane (bd-186); the second is a pointer to the operator guide |
+| `docs/bd-186-userguide.md` | operator walkthrough for the durable-member panel (bd-186): enable, seed, verify read/write halves, failure modes |
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |

@@ -1,0 +1,416 @@
+{
+  "note": "Shared fixtures for src/__tests__/durable-member-contract-parity.test.ts. Each case is validated by BOTH src/durable-member/commands.ts and pi-web-plugins/durable-member/contract.js; both must also agree with `expected`. `expand` sets a field to a repeated character before validation, so an oversized case stays readable.",
+  "cases": [
+    {
+      "name": "steer from the panel human",
+      "input": {
+        "kind": "steer",
+        "requestId": "req-steer-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1000,
+        "text": "look at the failing test first"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-steer-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1000,
+          "kind": "steer",
+          "text": "look at the failing test first"
+        }
+      }
+    },
+    {
+      "name": "followup from a supervisor is valid shape; authority is decided later",
+      "input": {
+        "kind": "followup",
+        "requestId": "req-followup-1",
+        "memberId": "member-a",
+        "authority": "fleet-supervisor",
+        "issuedAt": 1001,
+        "text": "run the gate again"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-followup-1",
+          "memberId": "member-a",
+          "authority": "fleet-supervisor",
+          "issuedAt": 1001,
+          "kind": "followup",
+          "text": "run the gate again"
+        }
+      }
+    },
+    {
+      "name": "write carries a labeled entry the model never sees",
+      "input": {
+        "kind": "write",
+        "requestId": "req-write-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1002,
+        "entry": { "role": "system", "text": "note from the operator", "kind": "note" }
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-write-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1002,
+          "kind": "write",
+          "entry": { "role": "system", "text": "note from the operator", "kind": "note" }
+        }
+      }
+    },
+    {
+      "name": "abort-submission needs a submission id",
+      "input": {
+        "kind": "abort-submission",
+        "requestId": "req-abort-sub-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1003,
+        "submissionId": "sub-42"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-abort-sub-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1003,
+          "kind": "abort-submission",
+          "submissionId": "sub-42"
+        }
+      }
+    },
+    {
+      "name": "supervisor abort with a reason",
+      "input": {
+        "kind": "abort",
+        "requestId": "req-abort-1",
+        "memberId": "member-a",
+        "authority": "fleet-supervisor",
+        "issuedAt": 1004,
+        "reason": "capacity reclaimed"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-abort-1",
+          "memberId": "member-a",
+          "authority": "fleet-supervisor",
+          "issuedAt": 1004,
+          "kind": "abort",
+          "reason": "capacity reclaimed"
+        }
+      }
+    },
+    {
+      "name": "abort without a reason omits the field",
+      "input": {
+        "kind": "abort",
+        "requestId": "req-abort-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1005
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-abort-2",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1005,
+          "kind": "abort"
+        }
+      }
+    },
+    {
+      "name": "configure with model and tools",
+      "input": {
+        "kind": "configure",
+        "requestId": "req-configure-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1006,
+        "confirmation": "member-a",
+        "config": { "model": "anthropic/claude-sonnet", "tools": ["read", "edit"] }
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-configure-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1006,
+          "confirmation": "member-a",
+          "kind": "configure",
+          "config": { "model": "anthropic/claude-sonnet", "tools": ["read", "edit"] }
+        }
+      }
+    },
+    {
+      "name": "compact with instructions",
+      "input": {
+        "kind": "compact",
+        "requestId": "req-compact-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1007,
+        "instructions": "keep the acceptance criteria"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-compact-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1007,
+          "kind": "compact",
+          "instructions": "keep the acceptance criteria"
+        }
+      }
+    },
+    {
+      "name": "compact without instructions omits the field",
+      "input": {
+        "kind": "compact",
+        "requestId": "req-compact-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1008
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-compact-2",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1008,
+          "kind": "compact"
+        }
+      }
+    },
+    {
+      "name": "reset with keepHistory",
+      "input": {
+        "kind": "reset",
+        "requestId": "req-reset-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1009,
+        "confirmation": "member-a",
+        "keepHistory": true
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-reset-1",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1009,
+          "confirmation": "member-a",
+          "kind": "reset",
+          "keepHistory": true
+        }
+      }
+    },
+    {
+      "name": "reset plain omits keepHistory",
+      "input": {
+        "kind": "reset",
+        "requestId": "req-reset-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1010,
+        "confirmation": "member-a"
+      },
+      "expected": {
+        "ok": true,
+        "value": {
+          "requestId": "req-reset-2",
+          "memberId": "member-a",
+          "authority": "panel-human",
+          "issuedAt": 1010,
+          "confirmation": "member-a",
+          "kind": "reset"
+        }
+      }
+    },
+    {
+      "name": "unknown kind is refused",
+      "input": {
+        "kind": "terminate-with-prejudice",
+        "requestId": "req-bad-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1011
+      },
+      "expected": { "ok": false, "code": "unknown-kind" }
+    },
+    {
+      "name": "missing requestId is refused",
+      "input": {
+        "kind": "steer",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1012,
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "missing-request-id" }
+    },
+    {
+      "name": "a requestId that could escape the commands dir is refused",
+      "input": {
+        "kind": "steer",
+        "requestId": "../../etc/passwd",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1013,
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "missing-request-id" }
+    },
+    {
+      "name": "blank requestId is refused",
+      "input": {
+        "kind": "steer",
+        "requestId": "",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1014,
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "missing-request-id" }
+    },
+    {
+      "name": "member mismatch against the owning member is refused",
+      "memberId": "member-b",
+      "input": {
+        "kind": "steer",
+        "requestId": "req-mismatch-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1015,
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "member-mismatch" }
+    },
+    {
+      "name": "oversized steer text is refused",
+      "expand": { "field": "text", "bytes": 65537 },
+      "input": {
+        "kind": "steer",
+        "requestId": "req-big-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1016,
+        "text": ""
+      },
+      "expected": { "ok": false, "code": "text-too-large" }
+    },
+    {
+      "name": "empty steer text is refused",
+      "input": {
+        "kind": "steer",
+        "requestId": "req-empty-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1017,
+        "text": "   "
+      },
+      "expected": { "ok": false, "code": "missing-text" }
+    },
+    {
+      "name": "write entry with an unknown role is refused",
+      "input": {
+        "kind": "write",
+        "requestId": "req-write-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1018,
+        "entry": { "role": "orchestrator", "text": "hello" }
+      },
+      "expected": { "ok": false, "code": "invalid-entry" }
+    },
+    {
+      "name": "abort-submission without an id is refused",
+      "input": {
+        "kind": "abort-submission",
+        "requestId": "req-abort-sub-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1019
+      },
+      "expected": { "ok": false, "code": "invalid-submission-id" }
+    },
+    {
+      "name": "unknown authority is refused",
+      "input": {
+        "kind": "steer",
+        "requestId": "req-auth-1",
+        "memberId": "member-a",
+        "authority": "root",
+        "issuedAt": 1020,
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "unknown-authority" }
+    },
+    {
+      "name": "non-numeric issuedAt is refused",
+      "input": {
+        "kind": "steer",
+        "requestId": "req-issued-1",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": "yesterday",
+        "text": "hello"
+      },
+      "expected": { "ok": false, "code": "invalid-issued-at" }
+    },
+    {
+      "name": "non-string confirmation is refused",
+      "input": {
+        "kind": "reset",
+        "requestId": "req-reset-3",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1021,
+        "confirmation": true
+      },
+      "expected": { "ok": false, "code": "invalid-confirmation" }
+    },
+    {
+      "name": "empty configure config is refused",
+      "input": {
+        "kind": "configure",
+        "requestId": "req-configure-2",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1022,
+        "confirmation": "member-a",
+        "config": {}
+      },
+      "expected": { "ok": false, "code": "invalid-config" }
+    },
+    {
+      "name": "oversized compact instructions are refused",
+      "expand": { "field": "instructions", "bytes": 65537 },
+      "input": {
+        "kind": "compact",
+        "requestId": "req-compact-3",
+        "memberId": "member-a",
+        "authority": "panel-human",
+        "issuedAt": 1023,
+        "instructions": ""
+      },
+      "expected": { "ok": false, "code": "text-too-large" }
+    }
+  ]
+}

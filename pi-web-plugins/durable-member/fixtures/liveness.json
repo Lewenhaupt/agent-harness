@@ -1,0 +1,343 @@
+{
+  "note": "Shared fixtures for src/__tests__/durable-member-contract-parity.test.ts. Each case is driven through BOTH src/durable-member/viewer.ts (reduceLiveLiveness + annotateLiveGeneration) and pi-web-plugins/durable-member/contract.js, and both results must equal `expected`. The cases pin the behaviours that silently drift between two hand-written mirrors: the default 30 s bound, the INCLUSIVE `>=` crossing, `ownerAlive` absent (treat-as-alive) versus false, the `?? 0` fallback for an unset or missing heartbeat, the reason strings, and the annotated `stale`/`staleReason` projection. The `missing heartbeat` case intentionally omits `updatedAt`: JSON can carry a row the reference store would not write, and an absent heartbeat must never read as fresh.",
+  "cases": [
+    {
+      "name": "no live row reduces to none and annotates to null",
+      "input": {
+        "live": null,
+        "now": 1000,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "none",
+        "reason": null,
+        "annotated": null
+      }
+    },
+    {
+      "name": "a fresh heartbeat is live",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2001,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "live",
+        "reason": null,
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": false,
+          "staleReason": null
+        }
+      }
+    },
+    {
+      "name": "one millisecond inside the default bound is still live",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 31999,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "live",
+        "reason": null,
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": false,
+          "staleReason": null
+        }
+      }
+    },
+    {
+      "name": "exactly at the default bound is stale (the crossing is inclusive)",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 32000,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "a generation older than the bound is stale",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 122000,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "a caller-supplied bound keeps the generation live below the crossing",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2499,
+        "ownerAlive": true,
+        "staleAfterMs": 500
+      },
+      "expected": {
+        "kind": "live",
+        "reason": null,
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": false,
+          "staleReason": null
+        }
+      }
+    },
+    {
+      "name": "a caller-supplied bound stales the generation at the crossing",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2500,
+        "ownerAlive": true,
+        "staleAfterMs": 500
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "a heartbeat fresh against the default is stale under a smaller bound",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2101,
+        "ownerAlive": true,
+        "staleAfterMs": 100
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "an unset heartbeat (updatedAt: 0) is stale, never running",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 0,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 30000,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "a missing heartbeat takes the same fallback as an unset one",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 30000,
+        "ownerAlive": true
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "no-heartbeat",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "no-heartbeat"
+        }
+      }
+    },
+    {
+      "name": "a fresh heartbeat is stale when the owner is known to be gone",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2001,
+        "ownerAlive": false
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "owner-gone",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "owner-gone"
+        }
+      }
+    },
+    {
+      "name": "the owner signal wins over an old heartbeat",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 122000,
+        "ownerAlive": false
+      },
+      "expected": {
+        "kind": "stale",
+        "reason": "owner-gone",
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": true,
+          "staleReason": "owner-gone"
+        }
+      }
+    },
+    {
+      "name": "an absent owner signal defaults to treat-as-alive",
+      "input": {
+        "live": {
+          "conversationId": "member-a:main",
+          "generationId": "gen-1",
+          "status": "streaming",
+          "partialText": "working",
+          "startedAt": 1000,
+          "updatedAt": 2000,
+          "attempt": 1,
+          "toolCalls": []
+        },
+        "now": 2001
+      },
+      "expected": {
+        "kind": "live",
+        "reason": null,
+        "annotated": {
+          "generationId": "gen-1",
+          "status": "streaming",
+          "stale": false,
+          "staleReason": null
+        }
+      }
+    }
+  ]
+}

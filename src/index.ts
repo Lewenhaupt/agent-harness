@@ -207,6 +207,166 @@ export type { CastEvent, CastHeader, ParsedCast } from "./cast-utils.js";
 export { castToText, cleanTerminalOutput, parseCast, readCastToText } from "./cast-utils.js";
 export type { ChdirTargetInput, ChdirTargetResult } from "./chdir-guard.js";
 export { isSafeChdirTarget } from "./chdir-guard.js";
+export type {
+  AuthorityClaimVerification,
+  DurableAuthorization,
+  DurableAuthorizationContext,
+  DurableAuthorizationRefusalReason,
+  VerifiedAuthority,
+} from "./durable-member/authority.js";
+export { authorizeDurableCommand, verifyAuthorityClaim } from "./durable-member/authority.js";
+export type {
+  AuthenticatableAuthority,
+  DurableAbortCommand,
+  DurableAbortSubmissionCommand,
+  DurableAgentConfig,
+  DurableAuthority,
+  DurableCommand,
+  DurableCommandErrorCode,
+  DurableCommandKind,
+  DurableCommandValidation,
+  DurableCommandValidationOptions,
+  DurableCompactCommand,
+  DurableConfigureCommand,
+  DurableFollowupCommand,
+  DurableResetCommand,
+  DurableSteerCommand,
+  DurableWriteCommand,
+  DurableWriteEntry,
+  DurableWriteRole,
+} from "./durable-member/commands.js";
+export {
+  AUTHENTICATABLE_AUTHORITIES,
+  AUTHORITY_CREDENTIAL_SUFFIXES,
+  DURABLE_AUTHORITIES,
+  DURABLE_COMMAND_KINDS,
+  DURABLE_WRITE_ROLES,
+  isAuthenticatableAuthority,
+  MAX_DURABLE_COMMAND_TEXT_BYTES,
+  MAX_DURABLE_CONFIG_TOOLS,
+  validateDurableCommand,
+} from "./durable-member/commands.js";
+// Durable members (bd-186): read-only viewer contract and member-owned control plane
+export type {
+  ConversationViewOptions,
+  ConversationViewState,
+  ConversationWatchFrame,
+  DurableCompactionMarker,
+  DurableConversationWatchOptions,
+  DurableEntry,
+  DurableEntryDetails,
+  DurableEntryKind,
+  DurableEntryRole,
+  DurableFailureMarker,
+  DurableLiveGeneration,
+  DurableLiveStatus,
+  DurableLiveToolCall,
+  DurableReader,
+  DurableRetryMarker,
+  DurableTaskGraphFrame,
+  DurableTaskGraphWatchOptions,
+  DurableTaskNode,
+  DurableTaskOwner,
+  DurableTaskOwnerEdge,
+  DurableTaskStatus,
+  DurableToolCall,
+  DurableToolOutput,
+  DurableTranscript,
+  DurableTranscriptWindow,
+} from "./durable-member/contract.js";
+export {
+  DEFAULT_VIEW_WINDOW,
+  DEFAULT_WATCH_POLL_MS,
+  mergeEarlierTranscriptPage,
+  ReadOnlySessionError,
+  reduceConversationFrames,
+} from "./durable-member/contract.js";
+export type {
+  DedupeLedger,
+  DedupeLedgerOpen,
+  DedupeLedgerOptions,
+  DedupeRecord,
+  DedupeRecordResult,
+} from "./durable-member/dedupe.js";
+export {
+  createDedupeLedger,
+  DEDUPE_LEDGER_FILE,
+  DEFAULT_DEDUPE_MAX_ENTRIES,
+} from "./durable-member/dedupe.js";
+export type {
+  DurableDispatchErrorCode,
+  DurableDispatcher,
+  DurableDispatcherOptions,
+  DurableDispatchResult,
+  DurableSubmission,
+  DurableSubmitInput,
+  DurableSubmitResult,
+  DurableWriter,
+} from "./durable-member/dispatch.js";
+export { createDurableDispatcher } from "./durable-member/dispatch.js";
+export type {
+  DrainOutcome,
+  DrainResult,
+  DurableCommandReceipt,
+} from "./durable-member/mailbox.js";
+export {
+  drainDurableCommands,
+  enqueueDurableCommand,
+  MEMBER_COMMANDS_DIR,
+  MEMBER_RECEIPTS_DIR,
+  MEMBER_REJECTED_DIR,
+  memberCommandsDir,
+  memberReceiptsDir,
+  memberRejectedDir,
+  readCommandReceipts,
+} from "./durable-member/mailbox.js";
+export type {
+  ControlClientOptions,
+  ControlClientResult,
+  ControlErrorCode,
+  ControlServedTier,
+  ControlServerFrame,
+  ControlServerOptions,
+  ControlServerStart,
+  ControlTarget,
+} from "./durable-member/socket.js";
+export {
+  CONTROL_ERROR_CODES,
+  CONTROL_PORT_FILE,
+  CONTROL_SOCKET_FILE,
+  DEFAULT_CONTROL_TIMEOUT_MS,
+  ensureControlToken,
+  isControlErrorCode,
+  MAX_CONTROL_FRAME_BYTES,
+  memberControlPortPath,
+  memberControlSocketPath,
+  memberControlTokenPath,
+  publishControlPort,
+  readControlToken,
+  readMemberControlTarget,
+  sendControlCommand,
+  sendMemberControlCommand,
+  startControlServer,
+} from "./durable-member/socket.js";
+export type {
+  DurableEntryInput,
+  DurableStore,
+  DurableStoreOpen,
+} from "./durable-member/standalone-store.js";
+export {
+  DEFAULT_TRANSCRIPT_PAGE,
+  DURABLE_ENTRIES_TABLE,
+  DURABLE_LIVE_TABLE,
+  DURABLE_STORE_FILE,
+  DURABLE_TASKS_TABLE,
+  openDurableStore,
+} from "./durable-member/standalone-store.js";
+export type {
+  DurableViewerOpen,
+  DurableViewerOptions,
+  ReadOnlyInvariantCheck,
+} from "./durable-member/viewer.js";
+export { assertReadOnlyViewer, openDurableViewer } from "./durable-member/viewer.js";
 // Accepting a landed member (P5): close the bead, remove the worktree
 export type {
   AcceptLandedMemberOptions,
