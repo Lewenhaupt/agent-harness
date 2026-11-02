@@ -20,6 +20,7 @@ import {
 import {
   BROKER_RUNTIME_BASE_ENV_KEY,
   SANDBOX_ACTIVE_ENV_KEY,
+  scopeIdFor,
   syntheticAwsConfigPathFor,
 } from "../aws-broker/scope.js";
 
@@ -28,6 +29,44 @@ function writeStub(path: string, body: string): string {
   mkdirSync(join(path, ".."), { recursive: true });
   writeFileSync(path, body, { mode: 0o755 });
   return path;
+}
+
+/**
+ * Git stub for one repository: `rev-parse --show-toplevel` answers the worktree
+ * the plan resolved, `worktree list --porcelain -z` prints the registered
+ * worktrees with the main one first, exactly as git does.
+ */
+function writeGitStub(options: {
+  bin: string;
+  toplevel: string;
+  mainWorktree: string;
+  /** Additional linked worktrees, main first overall. */
+  worktrees?: readonly string[];
+  /** Also fail the worktree-list probe (git state that cannot be resolved). */
+  failWorktreeList?: boolean;
+}): string {
+  const entries = [options.mainWorktree, ...(options.worktrees ?? [])];
+  const listRecords = entries
+    .map(
+      (path, index) =>
+        `printf 'worktree %s\\0HEAD 0000000000000000000000000000000000000000\\0branch refs/heads/%s\\0\\0' '${path}' '${index === 0 ? "main" : `feat-${index}`}'`,
+    )
+    .join("\n");
+  const listBranch = options.failWorktreeList === true ? "exit 1" : listRecords;
+  return writeStub(
+    join(options.bin, "git"),
+    [
+      "#!/bin/sh",
+      'case "$*" in',
+      `  *--show-toplevel*) printf '%s\\n' '${options.toplevel}' ;;`,
+      `  *"worktree list"*)
+${listBranch}`,
+      "    ;;",
+      "  *) exit 1 ;;",
+      "esac",
+      "",
+    ].join("\n"),
+  );
 }
 
 describe("aws-broker plan: generated files", () => {
@@ -86,7 +125,7 @@ describe("aws-broker plan: resolution", () => {
     mkdirSync(join(home, ".aws"), { recursive: true });
     mkdirSync(join(configHome, "belayd"), { recursive: true });
     mkdirSync(join(repo, ".belayd"), { recursive: true });
-    gitStub = writeStub(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' '${repo}'\n`);
+    gitStub = writeGitStub({ bin, toplevel: repo, mainWorktree: repo });
     bwrapStub = writeStub(join(bin, "bwrap"), "#!/bin/sh\nexit 0\n");
     writeFileSync(join(repo, ".belayd", "aws.yaml"), "profile: agent-readonly\n");
     writeFileSync(
@@ -134,6 +173,110 @@ describe("aws-broker plan: resolution", () => {
       "--mode",
       "json",
     ]);
+  });
+
+  /** A linked worktree of `repo` with its own committed repo file. */
+  function createLinkedWorktree(name: string): { worktree: string; git: string } {
+    const worktree = join(root, name);
+    mkdirSync(join(worktree, ".belayd"), { recursive: true });
+    writeFileSync(join(worktree, ".belayd", "aws.yaml"), "profile: agent-readonly\n");
+    const git = writeGitStub({
+      bin,
+      toplevel: worktree,
+      mainWorktree: repo,
+      worktrees: [worktree],
+    });
+    return { worktree, git };
+  }
+
+  it("resolves a linked worktree from a scope that names the main checkout (bd-220)", () => {
+    // The allowlist from beforeEach names `repo` exactly. `--show-toplevel` in
+    // the linked worktree answers the worktree, so only the repository-root
+    // candidate can grant it — which is the reported bug.
+    const { worktree, git } = createLinkedWorktree("repo.feat-bd-220");
+    const outcome = resolveSandboxPlan({
+      worktree,
+      env: env(),
+      gitBinary: git,
+      bwrapPath: bwrapStub,
+      nodeBinary: process.execPath,
+      clientEntryPath: defaultClientEntryPath(),
+    });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.plan.profile).toBe("agent-readonly");
+    expect(outcome.plan.region).toBe("eu-north-1");
+    // Per-worktree isolation stays: own scope id, own socket, own scope dir.
+    expect(outcome.plan.worktree).toBe(worktree);
+    expect(outcome.plan.scopeId).toBe(scopeIdFor(worktree));
+    expect(outcome.plan.scopeId).not.toBe(scopeIdFor(repo));
+    expect(outcome.plan.socketPath).toContain(scopeIdFor(worktree));
+  });
+
+  it("still refuses an unrelated checkout next to a scoped repo", () => {
+    // Widening comes from git's repository identity, never from a path prefix:
+    // `repo-evil` is its own repository and is not covered by the `repo` scope.
+    const evil = join(root, "repo-evil");
+    mkdirSync(join(evil, ".belayd"), { recursive: true });
+    writeFileSync(join(evil, ".belayd", "aws.yaml"), "profile: agent-readonly\n");
+    const git = writeGitStub({ bin, toplevel: evil, mainWorktree: evil });
+    const outcome = resolveSandboxPlan({
+      worktree: evil,
+      env: env(),
+      gitBinary: git,
+      bwrapPath: bwrapStub,
+    });
+    expect(outcome).toHaveProperty("ok", false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("refused");
+    expect(outcome.reason).toContain("not covered by any scope");
+    expect(outcome.reason).toContain(repo);
+  });
+
+  it("refuses instead of guessing when the repository cannot be identified", () => {
+    // Fail closed: a worktree whose git state cannot be enumerated must not fall
+    // back to worktree-only matching, which would silently re-open the bug for
+    // every new worktree naming scheme.
+    const { worktree } = createLinkedWorktree("repo.unresolvable");
+    const git = writeGitStub({
+      bin,
+      toplevel: worktree,
+      mainWorktree: repo,
+      failWorktreeList: true,
+    });
+    const outcome = resolveSandboxPlan({
+      worktree,
+      env: env(),
+      gitBinary: git,
+      bwrapPath: bwrapStub,
+    });
+    expect(outcome).toHaveProperty("ok", false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("refused");
+    expect(outcome.reason).toContain("could not identify the git repository");
+    expect(outcome.reason).toContain(join(configHome, "belayd", "aws.yaml"));
+  });
+
+  it("refuses a mask that hides the main checkout while the plan runs in a worktree", () => {
+    // The main checkout holds the shared `.git` every linked worktree depends
+    // on, so masking it is as dangerous as masking the resolved worktree.
+    const mainCert = join(repo, "main-cert.pem");
+    writeFileSync(mainCert, "CERT\n");
+    writeFileSync(
+      join(configHome, "belayd", "aws.yaml"),
+      `region: eu-north-1\nscopes:\n  - worktree: ${repo}\n    profiles: [agent-readonly]\n    mask: [${mainCert}]\n`,
+    );
+    const { worktree, git } = createLinkedWorktree("repo.feat-mask");
+    const outcome = resolveSandboxPlan({
+      worktree,
+      env: env(),
+      gitBinary: git,
+      bwrapPath: bwrapStub,
+    });
+    expect(outcome).toHaveProperty("ok", false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("refused");
+    expect(outcome.reason).toContain(`is inside worktree ${repo} of the same repository`);
   });
 
   it("reports not-configured when there is no allowlist or no repo file", () => {

@@ -9,11 +9,16 @@
  *    ```yaml
  *    region: eu-north-1                     # optional default region
  *    scopes:
- *      - worktree: /home/hugo/git/acme-*    # glob on the git toplevel
+ *      - worktree: /home/hugo/git/acme-*    # glob on the worktree or its repo
  *        profiles: [agent-readonly, agent-deploy]
  *        default: agent-readonly
  *        region: us-east-1                  # optional per-scope override
  *    ```
+ *
+ *    A scope names a *repository*, not just a checkout: its glob is tested
+ *    against the agent's worktree toplevel and against the repository's main
+ *    worktree root, so one entry covers the main checkout and every linked
+ *    worktree of that repo (see {@link ScopeMatchTargets}).
  *
  * 2. Repo file (`<worktree>/.belayd/aws.yaml`) names one *literal* profile:
  *
@@ -54,7 +59,13 @@
 
 /** One allowlist entry: a worktree glob plus the profiles it may use. */
 export interface AwsScopeRule {
-  /** Glob matched against the git toplevel (absolute path). */
+  /**
+   * Glob matched against the agent's worktree toplevel **and** its repository's
+   * main worktree root (absolute paths). Matching the repository root is what
+   * lets one entry cover every worktree of one repository: linked worktrees are
+   * one trust decision (same committed repo file, same `.git`), and
+   * `--show-toplevel` inside a linked worktree only ever answers the worktree.
+   */
   worktree: string;
   /** Literal profile names the repo file may name. */
   profiles: readonly string[];
@@ -603,16 +614,48 @@ export function worktreeMatchesGlob(pattern: string, worktreeRoot: string): bool
 /** Find the allowlist entry covering a worktree (first match in file order). */
 export function matchScope(
   allowlist: AwsAllowlist,
-  worktreeRoot: string,
+  targets: ScopeMatchTargets,
 ): ConfigResult<AwsScopeRule> {
   for (const rule of allowlist.scopes) {
-    if (worktreeMatchesGlob(rule.worktree, worktreeRoot)) return ok(rule);
+    if (scopeCovers(rule.worktree, targets)) return ok(rule);
   }
+  const repository =
+    targets.repoRoot !== undefined && targets.repoRoot !== targets.worktreeRoot
+      ? ` (repository root ${targets.repoRoot})`
+      : "";
   return fail(
-    `worktree ${worktreeRoot} is not covered by any scope in the belayd AWS allowlist (${allowlist.scopes
+    `worktree ${targets.worktreeRoot}${repository} is not covered by any scope in the belayd AWS allowlist (${allowlist.scopes
       .map((rule) => rule.worktree)
       .join(", ")})`,
   );
+}
+
+/** The paths one scope glob is tested against. */
+export interface ScopeMatchTargets {
+  /** Absolute git toplevel of the worktree the caller resolved. */
+  worktreeRoot: string;
+  /**
+   * Main worktree root of the same repository (git lists it first), or
+   * undefined when the caller could not resolve it. Every linked worktree of a
+   * repository reports the same main root, which is what makes one scope cover
+   * all of them. Unknown identity narrows the grant, never widens it.
+   */
+  repoRoot?: string;
+}
+
+/**
+ * True when the glob covers the worktree or the repository it belongs to.
+ *
+ * An exact-path entry naming a repo therefore covers its worktrees, and a glob
+ * written for a worktree path keeps working; the extra candidate is derived
+ * from git, never from a path prefix, so `/repo*` cannot be reached by string
+ * adjacency.
+ */
+function scopeCovers(pattern: string, targets: ScopeMatchTargets): boolean {
+  if (worktreeMatchesGlob(pattern, targets.worktreeRoot)) return true;
+  const repoRoot = targets.repoRoot;
+  if (repoRoot === undefined || repoRoot === targets.worktreeRoot) return false;
+  return worktreeMatchesGlob(pattern, repoRoot);
 }
 
 /**
@@ -626,12 +669,23 @@ export function resolveScope(options: {
   allowlist: AwsAllowlist;
   repo: AwsRepoConfig;
   worktreeRoot: string;
+  /** Main worktree root of the same repo; see {@link ScopeMatchTargets}. */
+  repoRoot?: string;
 }): ConfigResult<ResolvedAwsScope> {
-  const rule = matchScope(options.allowlist, options.worktreeRoot);
+  const rule = matchScope(options.allowlist, {
+    worktreeRoot: options.worktreeRoot,
+    repoRoot: options.repoRoot,
+  });
   if (!rule.ok) return rule;
   if (!rule.value.profiles.includes(options.repo.profile)) {
+    // Name the repository only when the worktree is not itself its root: the
+    // common single-checkout message stays byte-identical for docs and scripts.
+    const repository =
+      options.repoRoot !== undefined && options.repoRoot !== options.worktreeRoot
+        ? ` of repository ${options.repoRoot}`
+        : "";
     return fail(
-      `profile "${options.repo.profile}" is not permitted for worktree ${options.worktreeRoot} (allowed: ${rule.value.profiles.join(
+      `profile "${options.repo.profile}" is not permitted for worktree ${options.worktreeRoot}${repository} (allowed: ${rule.value.profiles.join(
         ", ",
       )})`,
     );
@@ -684,6 +738,16 @@ export interface ResolvedMaskEntry {
 /** Context a mask entry is validated against. */
 export interface MaskValidationContext {
   worktreeRoot: string;
+  /**
+   * Every worktree root of this repository, the current one included.
+   *
+   * A scope now grants the whole repository, so hiding a *sibling* worktree is
+   * exactly as dangerous as hiding the one the plan resolved: the sandbox could
+   * otherwise mask another checkout's source out of view while its agent reads
+   * it from `git`/`bd`. Empty/absent means "only `worktreeRoot`", which keeps
+   * the pure validator usable without git.
+   */
+  repoWorktreeRoots?: readonly string[];
   homeDir: string;
   runtimeBaseDir: string;
   scopeDir: string;
@@ -695,6 +759,59 @@ export interface MaskValidationContext {
 function normalizeMaskPath(value: string): string {
   const trimmed = value.replace(/\/+$/, "");
   return trimmed === "" ? "/" : trimmed;
+}
+
+/**
+ * Worktree roots a mask may not touch: the resolved one, then every other
+ * worktree of the same repository, de-duplicated after normalization.
+ */
+function protectedWorktreeRoots(context: MaskValidationContext): string[] {
+  const roots: string[] = [];
+  for (const root of [context.worktreeRoot, ...(context.repoWorktreeRoots ?? [])]) {
+    const normalized = normalizeMaskPath(root);
+    if (!roots.includes(normalized)) roots.push(normalized);
+  }
+  return roots;
+}
+
+/**
+ * Name a protected worktree in a refusal, distinguishing the one the plan
+ * resolved from a sibling so the operator knows which entry to change.
+ */
+function describeMaskedWorktree(path: string, context: MaskValidationContext): string {
+  return path === normalizeMaskPath(context.worktreeRoot)
+    ? `the worktree ${path}`
+    : `worktree ${path} of the same repository`;
+}
+
+/** Refusal detail when the mask sits inside a worktree of this repository. */
+function insideWorktreeRefusal(
+  resolvedPath: string,
+  context: MaskValidationContext,
+): string | undefined {
+  for (const worktreeRoot of protectedWorktreeRoots(context)) {
+    if (!isPathWithin(resolvedPath, worktreeRoot)) continue;
+    return `is inside ${describeMaskedWorktree(
+      worktreeRoot,
+      context,
+    )}; the operator allowlist, not the repo, decides what is hidden`;
+  }
+  return undefined;
+}
+
+/** Refusal detail when the mask hides a worktree of this repository whole. */
+function hidesWorktreeRefusal(
+  resolvedPath: string,
+  context: MaskValidationContext,
+): string | undefined {
+  for (const worktreeRoot of protectedWorktreeRoots(context)) {
+    if (!isPathWithin(worktreeRoot, resolvedPath)) continue;
+    return `hides ${describeMaskedWorktree(
+      worktreeRoot,
+      context,
+    )}; a sandboxed spawn would start in a hidden working directory`;
+  }
+  return undefined;
 }
 
 /** True when `candidate` is `base` itself or lives underneath it. */
@@ -758,16 +875,14 @@ export function validateMaskEntry(options: {
       `is inside the broker runtime base ${context.runtimeBaseDir}; masking it would hide this scope's own socket`,
     );
   }
-  if (isPathWithin(resolvedPath, context.worktreeRoot)) {
-    return refuse(
-      `is inside the worktree ${context.worktreeRoot}; the operator allowlist, not the repo, decides what is hidden`,
-    );
-  }
+  const insideWorktree = insideWorktreeRefusal(resolvedPath, context);
+  if (insideWorktree !== undefined) return refuse(insideWorktree);
   // The inverse direction matters just as much: a mask that *contains* a
   // protected path hides it wholesale. Masking the runtime base's parent would
-  // take out the control socket and every scope socket; masking the worktree's
-  // parent would hide the sandboxed spawn's own cwd. Both must fail at plan
-  // time, not as a bwrap error (or a mysteriously broken session) later.
+  // take out the control socket and every scope socket; masking a worktree's
+  // parent would hide the sandboxed spawn's own cwd (or a sibling worktree's).
+  // Both must fail at plan time, not as a bwrap error (or a mysteriously broken
+  // session) later.
   if (isPathWithin(context.runtimeBaseDir, resolvedPath)) {
     return refuse(
       `hides the broker runtime base ${context.runtimeBaseDir}; masking it would disable the control socket and every scope socket, including this one`,
@@ -778,11 +893,8 @@ export function validateMaskEntry(options: {
       `hides this scope's runtime dir ${context.scopeDir}, which holds the generated shim, config and socket; masking it would break the sandbox`,
     );
   }
-  if (isPathWithin(context.worktreeRoot, resolvedPath)) {
-    return refuse(
-      `hides the worktree ${context.worktreeRoot}; a sandboxed spawn would start in a hidden working directory`,
-    );
-  }
+  const hidesWorktree = hidesWorktreeRefusal(resolvedPath, context);
+  if (hidesWorktree !== undefined) return refuse(hidesWorktree);
   if (isPathWithin(context.homeDir, resolvedPath)) {
     return refuse(
       `hides the home directory ${context.homeDir}; mask a specific path inside it instead`,

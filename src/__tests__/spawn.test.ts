@@ -1073,7 +1073,21 @@ describe("launchAgentProcess AWS sandbox (bd-125)", () => {
       `region: eu-north-1\nscopes:\n  - worktree: ${repo}\n    profiles: [agent-readonly]\n`,
     );
     writeFileSync(join(bin, "bwrap"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\\n' '${repo}'\n`, { mode: 0o755 });
+    // `rev-parse --show-toplevel` answers the worktree, `worktree list` the
+    // repository identity (bd-220): one stub, both probes.
+    writeFileSync(
+      join(bin, "git"),
+      [
+        "#!/bin/sh",
+        'case "$*" in',
+        `  *--show-toplevel*) printf '%s\\n' '${repo}' ;;`,
+        `  *"worktree list"*) printf 'worktree %s\\0HEAD 0000000000000000000000000000000000000000\\0branch refs/heads/main\\0\\0' '${repo}' ;;`,
+        "  *) exit 1 ;;",
+        "esac",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
     // The broker CLI the plan resolver calls to start the scope socket; a
     // fixed path keeps the spawn tests independent of a live daemon.
     const brokerCli = join(bin, "belayd-aws");

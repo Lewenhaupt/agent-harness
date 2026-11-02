@@ -167,15 +167,76 @@ describe("aws-broker config: globs and resolution", () => {
     );
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    const match = matchScope(parsed.value, "/home/hugo/git/acme-web");
+    const match = matchScope(parsed.value, { worktreeRoot: "/home/hugo/git/acme-web" });
     expect(match.ok).toBe(true);
     if (!match.ok) return;
     expect(match.value.profiles).toEqual(["agent-readonly"]);
 
-    const unmatched = matchScope(parsed.value, "/srv/other");
+    const unmatched = matchScope(parsed.value, { worktreeRoot: "/srv/other" });
     expect(unmatched).toHaveProperty("ok", false);
     if (unmatched.ok) return;
     expect(unmatched.reason).toContain("not covered by any scope");
+  });
+
+  it("covers every worktree of a repo named by an exact-path scope (bd-220)", () => {
+    // A linked worktree reports its own toplevel, never the main checkout, so an
+    // exact-path scope used to grant nothing inside one. The repository root is
+    // the second, git-derived candidate.
+    const parsed = parseAllowlist(
+      [
+        "scopes:",
+        "  - worktree: /home/hugo/git/proof-of-work-reviewing-platform",
+        "    profiles: [agent-readonly]",
+      ].join("\n"),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+
+    const linked = matchScope(parsed.value, {
+      worktreeRoot: "/home/hugo/git/proof-of-work-reviewing-platform.feat-bd-168",
+      repoRoot: "/home/hugo/git/proof-of-work-reviewing-platform",
+    });
+    expect(linked.ok).toBe(true);
+    if (!linked.ok) return;
+    expect(linked.value.worktree).toBe("/home/hugo/git/proof-of-work-reviewing-platform");
+
+    // The widening is derived from git, never from string adjacency: an
+    // unrelated checkout next to the repo must still be refused.
+    const sibling = matchScope(parsed.value, {
+      worktreeRoot: "/home/hugo/git/proof-of-work-reviewing-platform-evil",
+      repoRoot: "/home/hugo/git/proof-of-work-reviewing-platform-evil",
+    });
+    expect(sibling).toHaveProperty("ok", false);
+    if (sibling.ok) return;
+    expect(sibling.reason).toContain("not covered by any scope");
+    expect(sibling.reason).toContain("/home/hugo/git/proof-of-work-reviewing-platform");
+
+    // An unresolvable repository identity narrows the grant, never widens it.
+    const unknownIdentity = matchScope(parsed.value, {
+      worktreeRoot: "/home/hugo/git/proof-of-work-reviewing-platform.feat-bd-168",
+    });
+    expect(unknownIdentity).toHaveProperty("ok", false);
+  });
+
+  it("keeps file-order-first-match when the repo root and the worktree disagree", () => {
+    const parsed = parseAllowlist(
+      [
+        "scopes:",
+        "  - worktree: /home/hugo/git/acme-wt",
+        "    profiles: [agent-worktree]",
+        "  - worktree: /home/hugo/git/acme",
+        "    profiles: [agent-repo]",
+      ].join("\n"),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    const match = matchScope(parsed.value, {
+      worktreeRoot: "/home/hugo/git/acme-wt",
+      repoRoot: "/home/hugo/git/acme",
+    });
+    expect(match.ok).toBe(true);
+    if (!match.ok) return;
+    expect(match.value.profiles).toEqual(["agent-worktree"]);
   });
 
   it("refuses a profile the scope does not grant, naming the allowed list", () => {
@@ -193,6 +254,41 @@ describe("aws-broker config: globs and resolution", () => {
     if (result.ok) return;
     expect(result.reason).toContain('profile "agent-deploy" is not permitted');
     expect(result.reason).toContain("agent-readonly");
+  });
+
+  it("resolves a linked worktree through its repository, naming the repo when refused", () => {
+    const parsed = parseAllowlist(
+      [
+        "region: eu-north-1",
+        "scopes:",
+        "  - worktree: /home/hugo/git/acme",
+        "    profiles: [agent-readonly]",
+      ].join("\n"),
+    );
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+
+    const granted = resolveScope({
+      allowlist: parsed.value,
+      repo: { profile: "agent-readonly" },
+      worktreeRoot: "/home/hugo/git/acme-wt",
+      repoRoot: "/home/hugo/git/acme",
+    });
+    expect(granted.ok).toBe(true);
+    if (!granted.ok) return;
+    expect(granted.value.profile).toBe("agent-readonly");
+
+    const refused = resolveScope({
+      allowlist: parsed.value,
+      repo: { profile: "agent-deploy" },
+      worktreeRoot: "/home/hugo/git/acme-wt",
+      repoRoot: "/home/hugo/git/acme",
+    });
+    expect(refused).toHaveProperty("ok", false);
+    if (refused.ok) return;
+    expect(refused.reason).toBe(
+      'profile "agent-deploy" is not permitted for worktree /home/hugo/git/acme-wt of repository /home/hugo/git/acme (allowed: agent-readonly)',
+    );
   });
 
   it("never substitutes the allowlist default for a repo file's literal profile", () => {
@@ -606,6 +702,53 @@ describe("aws-broker config: mask validation", () => {
       kind: "file",
     });
     expect(result.ok).toBe(true);
+  });
+
+  it("refuses a mask that touches a sibling worktree of the same repository (bd-220)", () => {
+    // A scope now grants the whole repository, so hiding a sibling worktree is
+    // exactly as dangerous as hiding the resolved one: the agent could mask
+    // another checkout's source out of view.
+    const repoWorktreeRoots = ["/home/op/git/repo", "/home/op/git/repo-feat"];
+
+    const inside = validate(
+      "/home/op/git/repo-feat/cert",
+      "/home/op/git/repo-feat/cert",
+      { kind: "file" },
+      { repoWorktreeRoots },
+    );
+    expect(inside).toHaveProperty("ok", false);
+    if (inside.ok) return;
+    expect(inside.reason).toContain(
+      "inside worktree /home/op/git/repo-feat of the same repository",
+    );
+    expect(inside.reason).toContain(context.allowlistPath);
+
+    const ancestor = validate(
+      "/home/op/git",
+      "/home/op/git",
+      { kind: "directory" },
+      { worktreeRoot: "/srv/checkout", repoWorktreeRoots },
+    );
+    expect(ancestor).toHaveProperty("ok", false);
+    if (ancestor.ok) return;
+    expect(ancestor.reason).toContain("hides worktree /home/op/git/repo of the same repository");
+    expect(ancestor.reason).toContain(
+      "a sandboxed spawn would start in a hidden working directory",
+    );
+
+    // The resolved worktree keeps its own wording, so existing messages and
+    // documentation stay accurate.
+    const current = validate(
+      "/home/op/git/repo/cert",
+      "/home/op/git/repo/cert",
+      { kind: "file" },
+      {
+        repoWorktreeRoots,
+      },
+    );
+    expect(current).toHaveProperty("ok", false);
+    if (current.ok) return;
+    expect(current.reason).toContain("inside the worktree /home/op/git/repo;");
   });
 
   it("compares paths with trailing slashes normalized", () => {

@@ -98,6 +98,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | File | Purpose |
 |---|---|
 | `src/worktree.ts` | Injectable seams for {@link setupWorktree}. Production uses the real git |
+| `src/worktree-list.ts` | Read-only `git worktree list` probe and its porcelain parsers (a leaf module so the AWS broker can share them) |
 | `src/owned-worktree.ts` | Bead ↔ branch ↔ worktree identity preflight |
 | `src/stack-rebase.ts` | Stacked-branch domain logic: recording which branch a follow-up worktree was |
 | `src/stale-file-guard.ts` | Stale-file detection pi extension |

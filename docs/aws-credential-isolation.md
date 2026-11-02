@@ -91,7 +91,7 @@ region: eu-north-1                 # optional default region
 mask:                              # optional: hidden in EVERY scope
   - /srv/belayd/agent-keyring
 scopes:
-  - worktree: /home/hugo/git/acme-*   # glob on the git toplevel
+  - worktree: /home/hugo/git/acme-*   # glob on the worktree or its repo root
     profiles: [agent-readonly, agent-deploy]
     default: agent-readonly
     region: us-east-1              # optional per-scope override
@@ -100,9 +100,24 @@ scopes:
       - /srv/belayd/acme-agent-key
 ```
 
-- `worktree` is a glob (`*` does not cross `/`, `**` does, `?` is one char).
-  The first matching scope wins.
-- A worktree matched by **no** scope gets no AWS.
+- `worktree` names a **repository**, not one checkout: the glob is tested
+  against the agent's worktree toplevel **and** against that repository's main
+  worktree root (the `git worktree list` entry git lists first). `*` does not
+  cross `/`, `**` does, `?` is one char, and the first matching scope wins.
+  One entry therefore covers the main checkout *and* every linked worktree of
+  that repo (`/home/hugo/git/acme` covers `/home/hugo/git/acme.feat-bd-220`,
+  `~/.git/acme/*`, …) without a per-worktree naming convention to learn.
+- Worktrees are one trust decision because they share everything that makes a
+  repo a repo: the same `.git` common dir, the same committed
+  `.belayd/aws.yaml`, and the same operator intent. The extra candidate comes
+  from git, never from a path prefix, so scoping `/home/hugo/git/acme` does not
+  grant `/home/hugo/git/acme-evil`.
+- A worktree matched by **no** scope gets no AWS. If git cannot enumerate the
+  repository (`git worktree list` fails), the scope is refused rather than
+  matched against the worktree alone.
+- Per-worktree isolation is unchanged: the scope socket, scope dir and
+  credential cache stay keyed by the *worktree* path, so two worktrees of one
+  repo each get their own socket (and their own cached credentials).
 - `mask` entries are absolute host paths hidden inside that scope's sandbox
   (top-level list first, then the per-scope list, de-duplicated — by entry text,
   then again by `realpath()`-resolved path, so a symlink and its target are
@@ -128,6 +143,9 @@ profile: agent-deploy
 - The repo file is mandatory. **No repo file ⇒ no AWS inside the sandbox.**
 - A profile the allowlist does not grant that worktree is refused, loudly:
   `profile "agent-deploy" is not permitted for worktree /… (allowed: agent-readonly)`.
+  Inside a linked worktree the message also names the repository
+  (`… for worktree /…/acme-api.feat-bd-42 of repository /…/acme-api (allowed: …)`),
+  because the scope matched through the repository root.
   Fixing the allowlist takes effect on the next `ensure-scope` — no daemon
   restart, no rebuild.
 
@@ -250,11 +268,12 @@ role ARNs instead.
   `~/.config/aws`, and the broker runtime base; anything else (an IAM
   RolesAnywhere certificate and key, a second keyring) is readable inside the
   sandbox until the operator adds it to the scope's `mask:` list. A mask typo
-  refuses the scope rather than being ignored, a mask entry inside the
-  worktree / scope dir / runtime base is refused (the repo cannot widen or
-  break its own sandbox), and so is an entry that *contains* the home dir,
-  worktree, scope dir or runtime base — an ancestor mask would hide the spawn
-  cwd or the broker/sessiond sockets instead of hiding one secret.
+  refuses the scope rather than being ignored, a mask entry inside any worktree
+  of the repo / the scope dir / the runtime base is refused (the repo cannot
+  widen or break its own sandbox), and so is an entry that *contains* the home
+  dir, a worktree, the scope dir or the runtime base — an ancestor mask would
+  hide the spawn cwd or the broker/sessiond sockets instead of hiding one
+  secret.
 - **The SSO cache format is a botocore internal.** We never parse it: credential
   resolution is delegated to `aws configure export-credentials --format
   process`. A direct `CreateToken` + `GetRoleCredentials` path is a later
@@ -371,14 +390,16 @@ mask:
   - /srv/belayd/agent-keyring
 
 scopes:
-  # `worktree` is a glob on the worktree's absolute git toplevel.
+  # `worktree` is a glob matched against this worktree's absolute git toplevel
+  # AND its repository's main worktree root, so one entry covers every
+  # worktree of that repo (the main checkout included).
   - worktree: /home/hugo/git/acme-*
     # Profiles that exist in YOUR ~/.aws/config (the broker resolves them as
     # you, via `aws configure export-credentials --profile <name>`).
     profiles: [agent-readonly, agent-deploy]
     default: agent-readonly        # optional, diagnostics only
     region: us-east-1              # optional per-scope override
-  - worktree: /home/hugo/git/infra/**
+  - worktree: /home/hugo/git/infra   # every worktree of the infra repo
     profiles: [agent-deploy]
     # Optional: hidden inside THIS scope's sandbox. The broker still reads
     # them; the sandboxed agent cannot.
@@ -395,7 +416,7 @@ Schema — this is the entire language (subset parser, see
 | `region` | top | no | fallback region for scopes without one |
 | `mask` | top | no | absolute paths hidden in every scope; flow `[p, p]` or a block list |
 | `scopes` | top | **yes** | block sequence of scope entries |
-| `worktree` | scope | **yes** | glob matched against the absolute git toplevel |
+| `worktree` | scope | **yes** | glob matched against the absolute git toplevel of the worktree **and** its repository's main worktree root (one entry covers every worktree of one repo) |
 | `profiles` | scope | **yes** | literal profile names; flow `[a, b]` or a block list |
 | `default` | scope | no | must be one of `profiles`; documentation only |
 | `region` | scope | no | overrides the top-level region |
@@ -429,9 +450,11 @@ item with no block-list header gives ``line 3: unexpected list item; only
 
 Glob semantics (`worktreeMatchesGlob`): `*` matches inside one path segment
 (`[^/]*`), `**` crosses `/` (`.*`), `?` is one non-`/` character. The pattern
-is anchored to the whole path and a trailing `/` is ignored. **The first
-matching scope in file order wins**; a worktree matched by no scope gets no
-AWS.
+is anchored to the whole path and a trailing `/` is ignored. Each scope is
+tested against **two** candidate paths — the worktree's git toplevel and its
+repository's main worktree root (`git worktree list`, main entry first) — so one
+entry covers every worktree of one repository. **The first matching scope in
+file order wins**; a worktree matched by no scope gets no AWS.
 
 Fail-closed behaviour of this file:
 
@@ -440,6 +463,7 @@ Fail-closed behaviour of this file:
 | missing | not-configured — silent, no AWS anywhere |
 | parses, but `scopes` is empty | refusal: `allowlist defines no scopes; AWS access stays disabled` |
 | tabs, unknown keys, bad indentation | refusal naming the line: `invalid allowlist /…/belayd/aws.yaml: line 4: unknown scope key "profile"` |
+| `git worktree list` fails for an opted-in repo | refusal naming the worktree, the git error, this allowlist and its scopes: an unresolvable repository must not be matched against the worktree alone |
 | an unusable `mask:` entry | refusal naming the entry and this allowlist, and the scope gets **no** sandbox at all — every case is in [Mask entries](#mask-entries) |
 
 #### Mask entries
@@ -510,9 +534,11 @@ applicable rule wins). The `line N:` ones are parse-time and surface as
 | equal to or inside the scope dir | `mask entry "…" is inside this scope's runtime dir <runtimeBase>/<scopeId>, which holds the generated shim, config and socket; masking it would break the sandbox` |
 | equal to or inside the broker runtime base | `mask entry "…" is inside the broker runtime base <runtimeBase>; masking it would hide this scope's own socket` |
 | equal to or inside the worktree | `mask entry "…" is inside the worktree <worktree>; the operator allowlist, not the repo, decides what is hidden` |
+| equal to or inside *another* worktree of the same repository | `mask entry "…" is inside worktree <other worktree> of the same repository; the operator allowlist, not the repo, decides what is hidden` |
 | an **ancestor** of the broker runtime base | `mask entry "…" hides the broker runtime base <runtimeBase>; masking it would disable the control socket and every scope socket, including this one` |
 | an **ancestor** of the scope dir | `mask entry "…" hides this scope's runtime dir <…>, which holds the generated shim, config and socket; masking it would break the sandbox` |
 | an **ancestor** of the worktree | `mask entry "…" hides the worktree <worktree>; a sandboxed spawn would start in a hidden working directory` |
+| an **ancestor** of *another* worktree of the same repository | `mask entry "…" hides worktree <other worktree> of the same repository; a sandboxed spawn would start in a hidden working directory` |
 | an **ancestor** of `$HOME` | `mask entry "…" hides the home directory <home>; mask a specific path inside it instead` |
 | a socket / fifo / character device / block device | `mask entry "…" is a socket, which cannot be masked cleanly` (the word is the actual kind) |
 
@@ -526,6 +552,12 @@ and `$HOME` usually contains the worktree (the scope-dir ancestor rule is
 there for completeness: the scope dir lives inside the runtime base, so the
 runtime-base rule fires first). All of them are refusals; none of them is a
 partial mask.
+
+A scope covers every worktree of its repository, so the worktree rules apply to
+**all** of them: masking a sibling worktree (`~/.git/acme/feat-bd-220`, the main
+checkout when the plan runs in a linked worktree, …) is refused exactly like
+masking the one the plan resolved. The main checkout matters most — it holds the
+shared `.git` common dir every linked worktree depends on.
 
 **One bad entry voids the whole scope**: the plan returns `refused`, so that repo
 gets no sandbox and no AWS at all — never a sandbox with the good entries applied
@@ -692,6 +724,14 @@ Repo file (`/home/hugo/git/proof-of-work-reviewing-platform/.belayd/aws.yaml`):
 ```yaml
 profile: dev-agent
 ```
+
+That **one** scope entry covers the main checkout *and every linked worktree* of
+the repository (`…/proof-of-work-reviewing-platform.feat-bd-168`,
+`~/.git/pow-*`, …), because the glob is matched against the repository root as
+well as the worktree ([glob semantics](#1-operator-write-the-allowlist)). The
+workflow creates a fresh worktree per bead, so no per-worktree scope entry is
+needed — and no new worktree naming scheme can silently fall outside the
+grant.
 
 How it differs from the SSO flow, and what you must get right:
 
@@ -1004,6 +1044,28 @@ mask is missing and that agent can request **any** allowlisted scope. If the
 sibling socket connects, the same. This check is the security property, not a
 nicety.
 
+### 5a. One scope covers every worktree of its repository
+
+Do this in an opted-in repo (check 5 uses `acme-api`, scoped as
+`worktree: /home/hugo/git/acme-api`). Create a throwaway linked worktree — the
+committed `.belayd/aws.yaml` comes with it — and resolve a plan for it:
+
+```bash
+git -C ~/git/acme-api worktree add ../acme-api-wt-check -b tmp/aws-scope-check
+belayd-aws plan --worktree ~/git/acme-api-wt-check >/dev/null; echo "exit=$?"
+belayd-aws ensure-scope --worktree ~/git/acme-api-wt-check      # → /run/belayd/aws/<idW>/sock
+belayd-aws ensure-scope --worktree ~/git/acme-api               # → /run/belayd/aws/<idM>/sock
+git -C ~/git/acme-api worktree remove ~/git/acme-api-wt-check
+```
+
+Expected: `exit=0` **without editing the allowlist**; the two scope sockets
+differ (`<idW>` hashes the worktree path), so each checkout keeps its own
+socket, scope dir and credential cache. A refusal
+`worktree … is not covered by any scope in the belayd AWS allowlist (…)` means
+the scope matched neither that worktree nor its repository root — and it stays
+the answer for an unrelated checkout (`~/git/acme-api-evil` is its own
+repository and is *not* covered by the `~/git/acme-api` entry).
+
 ### 6. Allowlisted masks hide RolesAnywhere material, the broker still resolves the profile, and the helper is on its PATH
 
 This is the IAM RolesAnywhere set
@@ -1238,7 +1300,8 @@ the token (`systemctl show pi-web-aws-broker -p User`).
   argv order and the runtime-base mask, file masks as `--ro-bind /dev/null`,
   env scrub, `BELAYD_AWS_RUNTIME_BASE_DIR` resolution),
   `aws-broker-plan` (generated-file quoting, `unavailable` on a missing
-  bwrap/runtime base, `already-sandboxed`, region refusal message),
+  bwrap/runtime base, `already-sandboxed`, region refusal message, and linked
+  worktrees resolving through their repository root),
   `aws-broker-cache` (single-flight, skew, LRU, failure propagation),
   `aws-broker-client` (document shape, static-credential refusal, the expiry vs
   non-SSO failure hints), `aws-broker-server` (request handling, socket modes,

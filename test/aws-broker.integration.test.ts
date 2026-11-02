@@ -98,7 +98,21 @@ describe("aws broker end to end (integration, real bwrap)", () => {
       mode: 0o755,
     });
     stubGit = join(bin, "git");
-    writeFileSync(stubGit, `#!/bin/sh\nprintf '%s\\n' '${repo}'\n`, { mode: 0o755 });
+    // Two probes: the plan asks `rev-parse --show-toplevel` for the worktree and
+    // `worktree list --porcelain -z` for the repository identity (bd-220).
+    writeFileSync(
+      stubGit,
+      [
+        "#!/bin/sh",
+        'case "$*" in',
+        `  *--show-toplevel*) printf '%s\\n' '${repo}' ;;`,
+        `  *"worktree list"*) printf 'worktree %s\\0HEAD 0000000000000000000000000000000000000000\\0branch refs/heads/main\\0\\0' '${repo}' ;;`,
+        "  *) exit 1 ;;",
+        "esac",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
 
     env = {
       ...process.env,

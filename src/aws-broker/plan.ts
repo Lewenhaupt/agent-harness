@@ -36,6 +36,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { listWorktrees, worktreeListDepsFor } from "../worktree-list.ts";
 import {
   type AwsAllowlist,
   type ConfigResult,
@@ -190,6 +191,62 @@ export function resolveWorktreeRoot(options: {
   }
 }
 
+/** The paths that identify one repository, shared by all its worktrees. */
+export interface RepoIdentity {
+  /** Main worktree root: the identity an allowlist scope names. */
+  repoRoot: string;
+  /** Every registered worktree root, the resolved worktree included. */
+  worktrees: readonly string[];
+}
+
+/**
+ * Resolve the repository a worktree belongs to (side effect: spawns git).
+ *
+ * `git worktree list` is the authoritative source: git lists the main worktree
+ * first, so `repoRoot` is the main checkout for a linked worktree and the
+ * checkout itself otherwise. Deliberately not `dirname(--git-common-dir)`: for a
+ * bare repository that is the repo's *parent*, a directory that need not be a
+ * repository at all, and an allowlist key that is not the repo would silently
+ * widen a scope to unrelated checkouts.
+ *
+ * Paths are canonicalized with `realpath()` when they exist because git stores
+ * the path a worktree was registered under, while `--show-toplevel` and a mask
+ * entry both hand back a physical path; comparing the two spellings would miss
+ * a grant (or a mask refusal) for one of them. A prunable worktree path that no
+ * longer exists keeps its git spelling — it can then only fail to protect a
+ * directory that is gone.
+ */
+export function resolveRepoIdentity(options: {
+  worktreeRoot: string;
+  gitBinary?: string;
+}): { ok: true; value: RepoIdentity } | { ok: false; error: string } {
+  const listed = listWorktrees(
+    options.worktreeRoot,
+    options.gitBinary === undefined ? {} : worktreeListDepsFor(options.gitBinary),
+  );
+  if (!listed.ok) return { ok: false, error: listed.error };
+
+  const main = listed.entries.find((entry) => entry.isMainWorktree);
+  if (main === undefined) {
+    return { ok: false, error: `git listed no main worktree for ${options.worktreeRoot}` };
+  }
+  const worktrees: string[] = [];
+  for (const entry of listed.entries) {
+    const root = canonicalPath(entry.path);
+    if (!worktrees.includes(root)) worktrees.push(root);
+  }
+  return { ok: true, value: { repoRoot: canonicalPath(main.path), worktrees } };
+}
+
+/** `realpath()` when the path exists, else its normalized absolute form. */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 /** The shim + synthetic config the sandbox sees. */
 export interface ScopeFileContents {
   shim: string;
@@ -282,6 +339,10 @@ export function allowlistPathFor(env: NodeJS.ProcessEnv, homeDir: string): strin
 /** The configured (pre-sandbox) answer for one worktree. */
 interface ConfiguredScope {
   worktreeRoot: string;
+  /** Main worktree root of the same repository: the scope's match identity. */
+  repoRoot: string;
+  /** Every worktree root of that repository, the resolved one included. */
+  repoWorktreeRoots: readonly string[];
   profile: string;
   region: string;
   /** Allowlist `mask:` entries (top level then per scope), unvalidated. */
@@ -327,7 +388,32 @@ function resolveConfiguredScope(options: {
   const repoResult = parseRepoConfig(readFileSync(repoPath, "utf-8"));
   if (!repoResult.ok) return skip("refused", `invalid ${repoPath}: ${repoResult.reason}`);
 
-  const resolved = resolveScope({ allowlist, repo: repoResult.value, worktreeRoot });
+  // A scope names a repository, not just one checkout (bd-220): linked
+  // worktrees of one repo are one trust decision, and `--show-toplevel` inside
+  // a linked worktree only ever answers the worktree. Resolving the repository
+  // is therefore mandatory before any grant — unknown git state must refuse
+  // rather than silently fall back to worktree-only matching.
+  const identityResult = resolveRepoIdentity({
+    worktreeRoot,
+    gitBinary: options.gitBinary,
+  });
+  if (!identityResult.ok) {
+    // Name the allowlist and its scopes like every other refusal: the operator
+    // has to be able to tell "git is broken here" from "nothing is scoped".
+    return skip(
+      "refused",
+      `could not identify the git repository of ${worktreeRoot}: ${identityResult.error}; a scope covers a repository, so AWS is refused rather than guessed (allowlist ${allowlistPath}: ${allowlist.scopes
+        .map((rule) => rule.worktree)
+        .join(", ")})`,
+    );
+  }
+
+  const resolved = resolveScope({
+    allowlist,
+    repo: repoResult.value,
+    worktreeRoot,
+    repoRoot: identityResult.value.repoRoot,
+  });
   if (!resolved.ok) return skip("refused", resolved.reason);
 
   const region = firstNonEmpty([resolved.value.region, env.AWS_REGION, env.AWS_DEFAULT_REGION]);
@@ -341,6 +427,8 @@ function resolveConfiguredScope(options: {
     ok: true,
     value: {
       worktreeRoot,
+      repoRoot: identityResult.value.repoRoot,
+      repoWorktreeRoots: identityResult.value.worktrees,
       profile: resolved.value.profile,
       region,
       // Top-level masks apply to every scope, so they come first; the per-scope
@@ -469,6 +557,9 @@ export function resolveSandboxPlan(options: ResolveSandboxPlanOptions): SandboxP
     entries: configured.value.maskEntries,
     context: {
       worktreeRoot,
+      // A scope now grants the whole repository, so a mask must not be able to
+      // hide a sibling worktree out of the agent's view either.
+      repoWorktreeRoots: configured.value.repoWorktreeRoots,
       homeDir,
       runtimeBaseDir,
       scopeDir,
