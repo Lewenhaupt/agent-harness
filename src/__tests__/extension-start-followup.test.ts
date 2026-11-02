@@ -285,8 +285,15 @@ describe("belayd_start_followup", () => {
     expect(result?.details.exitCode).toBe(0);
     expect(result?.content[0]?.text).toContain("stacked on feat/bd-102");
 
-    const wtCall = execFileSyncCalls.find((call) => call.file === "wt");
+    // The identifier probe (`wt config show`) comes first; the pin rides on the
+    // switch call that actually creates the worktree.
+    const wtCall = execFileSyncCalls.find(
+      (call) => call.file === "wt" && call.args.includes("switch"),
+    );
     expect(wtCall?.args).toEqual([
+      // Pinned worktree layout, see src/worktree.ts WORKTREE_PATH_TEMPLATE.
+      "--config-set",
+      'worktree-path="{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"',
       "switch",
       "--create",
       "feat/bd-103",

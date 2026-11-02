@@ -105,6 +105,15 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/stack-rebase.ts` | Stacked-branch domain logic: recording which branch a follow-up worktree was |
 | `src/stale-file-guard.ts` | Stale-file detection pi extension |
 
+Worktree layout is pinned, not inherited: every harness `wt switch` passes
+`--config-set` for `worktree-path` (`src/worktree.ts` `WORKTREE_PATH_TEMPLATE`),
+both as the global key and — when `wt config show --format json` reports one — on
+the project-scoped `[projects."<id>"]` key, which worktrunk merges last. A
+worktree is therefore always the sibling `<repo>.<branch>`. An ambient override
+in `~/.config/worktrunk/config.toml` (typically the bare-repo template
+`{{ repo_path }}/../{{ branch | sanitize }}`, which drops the repo prefix) would
+otherwise put two repositories' same-named branches in one shared directory.
+
 ### outline
 
 | File | Purpose |

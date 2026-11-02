@@ -54,6 +54,16 @@ const PORCELAIN_MULTI = [
 /** Porcelain output that does NOT contain feat/bd-42 (used when the worktree hasn't been created yet). */
 const PORCELAIN_WITHOUT_FEAT = ["worktree /repo/main", "branch refs/heads/main", ""].join("\n");
 
+/**
+ * Layout pinned on every `wt` call so no ambient `worktree-path` override can
+ * move a harness worktree. Written literally (not imported) so a change to the
+ * template fails this suite instead of silently following it.
+ */
+const WT_LAYOUT = [
+  "--config-set",
+  'worktree-path="{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"',
+];
+
 afterEach(() => {
   vi.resetAllMocks();
 });
@@ -141,10 +151,16 @@ describe("setupWorktree", () => {
   let deps: {
     currentBranch: () => string | undefined;
     captureStack: ReturnType<typeof vi.fn>;
+    wtProjectIdentifier: () => string | undefined;
   };
 
   beforeEach(() => {
-    deps = { currentBranch: () => "main", captureStack: vi.fn() };
+    deps = {
+      currentBranch: () => "main",
+      captureStack: vi.fn(),
+      // No ambient project-scoped worktrunk entry: the global pin is enough.
+      wtProjectIdentifier: () => undefined,
+    };
   });
 
   it("returns the worktree path immediately when already registered in git", () => {
@@ -169,9 +185,50 @@ describe("setupWorktree", () => {
     const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
+    // `<repo>.<branch>` must not depend on the operator's `worktree-path`: a
+    // bare-repo template drops the repo prefix and lets two checkouts' feats
+    // collide. `--config-set` outranks user/project config, so it is asserted
+    // ahead of the subcommand.
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "wt",
-      ["switch", "--create", "feat/bd-42", "--base", "main", "-y"],
+      [...WT_LAYOUT, "switch", "--create", "feat/bd-42", "--base", "main", "-y"],
+      expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
+    );
+  });
+
+  it("overrides a project-scoped worktree-path with the pinned sibling layout", () => {
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
+    mockedExecFileSync
+      .mockReturnValueOnce("") // git branch --list → empty
+      .mockReturnValueOnce(""); // wt switch --create → success
+    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
+    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
+
+    // Worktrunk merges `[projects."<id>"]` last, so a project-scoped
+    // `worktree-path` outranks a global `--config-set`; the pin has to name the
+    // same key or an ambient bare-repo layout still wins.
+    setupWorktree(
+      "/repo",
+      { branch: "feat/bd-42" },
+      {
+        ...deps,
+        wtProjectIdentifier: () => "github.com/acme/repo",
+      },
+    );
+
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      "wt",
+      [
+        ...WT_LAYOUT,
+        "--config-set",
+        'projects."github.com/acme/repo".worktree-path="{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}"',
+        "switch",
+        "--create",
+        "feat/bd-42",
+        "--base",
+        "main",
+        "-y",
+      ],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
   });
@@ -189,7 +246,7 @@ describe("setupWorktree", () => {
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "wt",
-      ["switch", "--create", "feat/bd-42", "--base", "main", "--clobber", "-y"],
+      [...WT_LAYOUT, "switch", "--create", "feat/bd-42", "--base", "main", "--clobber", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
   });
@@ -206,7 +263,7 @@ describe("setupWorktree", () => {
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "wt",
-      ["switch", "feat/bd-42", "-y"],
+      [...WT_LAYOUT, "switch", "feat/bd-42", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
     // An existing branch already carries whatever stack metadata it had.
@@ -252,7 +309,7 @@ describe("setupWorktree", () => {
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "wt",
-      ["switch", "--create", "feat/bd-42", "--base", "develop", "-y"],
+      [...WT_LAYOUT, "switch", "--create", "feat/bd-42", "--base", "develop", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
   });
@@ -277,7 +334,7 @@ describe("setupWorktree", () => {
     expect(result).toBe("/repo/feat");
     expect(mockedExecFileSync).toHaveBeenCalledWith(
       "wt",
-      ["switch", "--create", "feat/bd-42", "--base", "feat/bd-41", "-y"],
+      [...WT_LAYOUT, "switch", "--create", "feat/bd-42", "--base", "feat/bd-41", "-y"],
       expect.objectContaining({ timeout: 30_000, stdio: "pipe" }),
     );
     expect(deps.captureStack).toHaveBeenCalledWith({
@@ -346,6 +403,7 @@ describe("setupWorktree", () => {
       {
         currentBranch: () => "feat/bd-41",
         captureStack,
+        wtProjectIdentifier: () => undefined,
       },
     );
 

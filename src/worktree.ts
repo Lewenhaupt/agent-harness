@@ -33,6 +33,8 @@ export interface WorktreeDeps {
   currentBranch?: (cwd: string) => string | undefined;
   /** Record base + fork point for a newly created stacked branch. */
   captureStack?: (input: { cwd: string; branch: string; base: string }) => void;
+  /** Worktrunk project identifier used to pin the worktree layout. */
+  wtProjectIdentifier?: (cwd: string) => string | undefined;
 }
 
 /**
@@ -71,9 +73,71 @@ export function resolveWorktreePath(projectRoot: string, branch: string): string
 }
 
 /**
+ * Worktrunk path template pinned on every harness `wt` invocation.
+ *
+ * Worktrunk's own default is already this sibling layout, but `worktree-path`
+ * is read from user config, so an ambient override (typically the bare-repo
+ * pattern `{{ repo_path }}/../{{ branch | sanitize }}`) silently drops the repo
+ * prefix and puts every checkout's same-named branch in one shared directory —
+ * `feat/bd-42` of two repositories then fight over `<parent>/feat-bd-42`. The
+ * harness owns bead ↔ branch ↔ worktree identity (and derives task ids from the
+ * directory name), so it states the naming contract instead of inheriting it.
+ */
+export const WORKTREE_PATH_TEMPLATE = "{{ repo_path }}/../{{ repo }}.{{ branch | sanitize }}";
+
+/** Escape a value for a TOML basic string; worktrunk identifiers are paths or `<host>/<owner>/<repo>`. */
+function tomlBasicString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** Project identifier carried by `wt config show --format json`, if present. */
+function projectIdentifierFromConfigShow(raw: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  const identifier = asRecord(asRecord(parsed)?.project)?.identifier;
+  return typeof identifier === "string" && identifier !== "" ? identifier : undefined;
+}
+
+/**
+ * Read worktrunk's project identifier for `cwd` — `<host>/<owner>/<repo>` from
+ * the primary remote, or the canonical repo path when there is no remote.
+ *
+ * A user config `[projects."<identifier>"]` entry is merged after the global
+ * keys, so a project-scoped `worktree-path` outranks a global `--config-set`.
+ * Pinning the layout therefore has to override the same key, which needs the
+ * identifier. Best-effort: a `wt` too old for JSON output (or any failure)
+ * leaves only the global pin, which still beats a top-level override.
+ */
+function readWtProjectIdentifier(cwd: string): string | undefined {
+  try {
+    return projectIdentifierFromConfigShow(
+      execFileSync("wt", ["config", "show", "--format", "json"], {
+        cwd,
+        timeout: 10_000,
+        encoding: "utf8",
+        stdio: "pipe",
+      }),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve the default worktree directory path for a branch without consulting
- * git. `wt` and `git worktree` use the convention `<repo-root>.<branch>` with
- * "/" replaced by "-" in the branch name.
+ * git. It mirrors {@link WORKTREE_PATH_TEMPLATE} for a main checkout: the
+ * sibling of the repo root named `<repo-root>.<branch>`, with "/" replaced by
+ * "-" (what worktrunk's `sanitize` does to a branch name).
  */
 function defaultWorktreeDir(projectRoot: string, branch: string): string {
   const sanitized = branch.replace(/\//g, "-");
@@ -112,17 +176,30 @@ function branchAlreadyExists(projectRoot: string, branch: string): boolean {
 }
 
 /** Build the `wt switch` argv for switching to or creating the worktree. */
-function planWtArgs(
-  projectRoot: string,
-  branch: string,
-  base: string,
-  branchExists: boolean,
-): string[] {
-  if (branchExists) return ["switch", branch, "-y"];
+function planWtArgs(options: {
+  projectRoot: string;
+  branch: string;
+  base: string;
+  branchExists: boolean;
+  projectIdentifier: string | undefined;
+}): string[] {
+  const { projectRoot, branch, base, branchExists, projectIdentifier } = options;
+  const layout = `worktree-path="${WORKTREE_PATH_TEMPLATE}"`;
+  // Global options, so they precede the subcommand. The global key covers a
+  // top-level override; the project-scoped key is what beats a
+  // `[projects."<id>"]` entry, which worktrunk merges last.
+  const layoutArgs = ["--config-set", layout];
+  const projectLayoutArgs =
+    projectIdentifier === undefined
+      ? []
+      : ["--config-set", `projects."${tomlBasicString(projectIdentifier)}".${layout}`];
+  const pinnedArgs = [...layoutArgs, ...projectLayoutArgs];
+
+  if (branchExists) return [...pinnedArgs, "switch", branch, "-y"];
   // An orphaned directory from a prior failed attempt is clobbered so the
   // retry does not fail on the leftover path; a fresh path needs no clobber.
   const clobber = existsSync(defaultWorktreeDir(projectRoot, branch)) ? ["--clobber"] : [];
-  return ["switch", "--create", branch, "--base", base, ...clobber, "-y"];
+  return [...pinnedArgs, "switch", "--create", branch, "--base", base, ...clobber, "-y"];
 }
 
 /**
@@ -164,6 +241,11 @@ function captureStackForNewBranch(
  *    (orphaned from a prior failed attempt), use `wt switch --create --clobber`
  *    to overwrite it with a backup.
  *
+ * Steps 2–4 pin the layout (`WORKTREE_PATH_TEMPLATE`), so `wt` places the
+ * worktree at `<repo>.<branch>` even when the operator's worktrunk config says
+ * otherwise. A worktree that is already registered (step 1) is returned as-is,
+ * wherever it lives.
+ *
  * Returns the absolute path to the worktree.
  *
  * Throws if the worktree cannot be set up or the path cannot be resolved.
@@ -185,7 +267,14 @@ export function setupWorktree(
 
   // Step 2: Check if the branch already exists, then pick the switch arguments.
   const branchExists = branchAlreadyExists(projectRoot, options.branch);
-  const wtArgs = planWtArgs(projectRoot, options.branch, base, branchExists);
+  const readProjectIdentifier = deps.wtProjectIdentifier ?? readWtProjectIdentifier;
+  const wtArgs = planWtArgs({
+    projectRoot,
+    branch: options.branch,
+    base,
+    branchExists,
+    projectIdentifier: readProjectIdentifier(projectRoot),
+  });
 
   // Step 3: Create or switch to the worktree
   try {
