@@ -360,6 +360,36 @@ async function loadFleetExtension(seams: FleetForceStopSeams = {}): Promise<Mock
   return mock;
 }
 
+/**
+ * Reset the process-global seams every case in this file shares (bd-173).
+ *
+ * The hoisted mock state and the extension module's session-state map both live
+ * for the whole file, while these suites reuse session ids
+ * (`supervisor-session`, `operator-session`, …) and a few of them stub the same
+ * seams ad hoc. Without this reset a leftover entry acts on the next test's
+ * world: a `pendingFleetEventAcks` acks the previous test's deleted paths, an
+ * armed `fleetArm`/scheduled tick keeps a run loop alive, a leaked `bd …
+ * resolve` argv fails a "no resolve happened" assertion, and a leaked `bd show`
+ * stub rewrites the scheduler's wave order. Each of those only surfaces when a
+ * case order lines the leak up with the case that reads it, which is why a
+ * shuffled run finds them and the default order does not.
+ *
+ * Only defaults are restored here; a suite's own `beforeEach` still sets the
+ * fixtures its cases need.
+ */
+async function resetProcessGlobalState(): Promise<void> {
+  // The typing stub and the recorded argv both belong to one case.
+  childProcess.execFileCalls = [];
+  childProcess.bdStdout = undefined;
+  childProcess.bdFailure = undefined;
+  // Stop a leaked run loop before dropping its session: the loop closes over the
+  // state object, so the store's dispose hook is what clears its timer.
+  const mod = await import("../../extensions/index.js");
+  mod.getSessionState.clear();
+}
+
+beforeEach(resetProcessGlobalState);
+
 function textOf(result: ToolResult): string {
   return result.content[0]?.text ?? "";
 }
@@ -384,6 +414,47 @@ function makeCtx(dir: string, sessionId: string) {
     },
   };
 }
+
+/**
+ * The reset the other suites rely on is only half the store: `clear()` drops the
+ * entries, the composer's dispose hook is what stops a session's scheduled fleet
+ * tick. Pin the wiring — a regression there still leaves every seed-order suite
+ * below green while a leaked loop keeps ticking the reused session id.
+ */
+describe("session state reset (bd-173)", () => {
+  it("stops a cleared session's scheduled fleet tick", async () => {
+    const mod = await import("../../extensions/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "belayd-bd173-clear-"));
+    // Imported before the clock is faked: the composer does not schedule anything
+    // at import time today, but a shuffled order may run this case first.
+    vi.useFakeTimers();
+    try {
+      const control = makeCtx(dir, "clear-control-session");
+      const controlTick = vi.fn();
+      mod.getSessionState(control).fleetRunTimer = setTimeout(() => {
+        controlTick();
+      }, FLEET_RUN_TICK_INTERVAL_MS);
+      vi.advanceTimersByTime(FLEET_RUN_TICK_INTERVAL_MS);
+      // Control: a scheduled tick does fire, so the assertion below can fail.
+      expect(controlTick).toHaveBeenCalledTimes(1);
+
+      const leaked = makeCtx(dir, "clear-leaked-session");
+      const leakedTick = vi.fn();
+      mod.getSessionState(leaked).fleetRunTimer = setTimeout(() => {
+        leakedTick();
+      }, FLEET_RUN_TICK_INTERVAL_MS);
+
+      mod.getSessionState.clear();
+      vi.advanceTimersByTime(FLEET_RUN_TICK_INTERVAL_MS * 3);
+
+      expect(leakedTick).not.toHaveBeenCalled();
+      expect(mod.getSessionState.peek("clear-leaked-session")).toBeUndefined();
+      expect(mod.getSessionState.peek("clear-control-session")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 /**
  * Runs inside a tick's first notification, i.e. after the launch engine returned.

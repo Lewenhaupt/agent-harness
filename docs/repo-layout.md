@@ -293,10 +293,10 @@ import chain. This is why `src/tool-audit.ts`, `src/workflow-state.ts`,
 of `src/process-gate.ts`.
 
 The same test carries a **size ratchet** for `extensions/index.ts` (today
-415 lines; the composer is 365 and is wiring only — entry point, state store,
-seam normalisation, the ordered `register<Capability>` calls and the default
-export). New capability code belongs in a module; if the composer must grow,
-raise the ceiling deliberately and say why.
+450 lines; the composer is 447 and is wiring only — entry point, the exported
+session store, seam normalisation, the ordered `register<Capability>` calls and
+the default export). New capability code belongs in a module; if the composer
+must grow, raise the ceiling deliberately and say why.
 
 ### Tests
 

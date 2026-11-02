@@ -43,10 +43,22 @@ export interface SessionStateStore<S extends CoreSessionState> {
   peek(id: string): S | undefined;
   /** Forget a session's state (shutdown). */
   delete(id: string): void;
+  /**
+   * Drop every session's state, running the store's dispose hook first.
+   *
+   * Exists for tests: the map is keyed by session id and the suite reuses ids
+   * like `supervisor-session`, so a leftover entry (a pending fleet-event ack,
+   * an armed gate, a scheduled fleet tick) would be acted on by the next test.
+   * The dispose hook is what stops a scheduled run loop; dropping only the
+   * entry would leave its timer ticking the session id it was keyed by.
+   * Production clears per id through `delete` on `session_shutdown`.
+   */
+  clear(): void;
 }
 
 export function createSessionStateStore<S extends CoreSessionState>(
   createInitial: () => S,
+  disposeState?: (state: S) => void,
 ): SessionStateStore<S> {
   const sessionStates = new Map<string, S>();
   const store = (ctx: SessionContext): S => {
@@ -61,6 +73,10 @@ export function createSessionStateStore<S extends CoreSessionState>(
     peek: (id: string) => sessionStates.get(id),
     delete: (id: string) => {
       sessionStates.delete(id);
+    },
+    clear: () => {
+      for (const state of sessionStates.values()) disposeState?.(state);
+      sessionStates.clear();
     },
   });
 }

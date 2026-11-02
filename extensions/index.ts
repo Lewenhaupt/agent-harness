@@ -106,7 +106,21 @@ import { createWorkflowCore } from "./capabilities/workflow-core.js";
  */
 type SessionState = CoreSessionState & FleetSessionState;
 
-const getSessionState = createSessionStateStore<SessionState>(createInitialSessionState);
+/**
+ * Exported so tests can drop state leaked across cases: the store is keyed by
+ * session id for the process lifetime and test suites reuse ids. Production
+ * code only ever reaches it through the injected dependencies below.
+ *
+ * The dispose hook stops a session's pending fleet tick: the tick loop closes
+ * over the state object, so clearing its timer is the only way a dropped state
+ * stops ticking (otherwise a leaked loop keeps acting on the reused id).
+ */
+export const getSessionState = createSessionStateStore<SessionState>(
+  createInitialSessionState,
+  (state) => {
+    if (state.fleetRunTimer !== undefined) clearTimeout(state.fleetRunTimer);
+  },
+);
 
 /**
  * One model-routing bundle per capability (bd-116, bd-229): a capability that
