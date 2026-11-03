@@ -293,7 +293,7 @@ from this repository is in [How to Verify](#how-to-verify). Reading guide:
 | State | Meaning |
 |-------|---------|
 | `active` | a phase is running or the workflow is mid-flight |
-| `awaiting-human` | waiting for the operator (review response, or an undelivered report) |
+| `awaiting-human` | waiting for the operator: an open bd `human` gate on the bead, or an undelivered report (since bd-219 a review that reports findings is **not** a wait — see `docs/bd-219-userguide.md`) |
 | `blocked` | the newest run of a not-yet-completed phase failed |
 | `interrupted` | a run manifest is `interrupted` (crash/kill mid-phase) |
 | `idle` | every phase completed |

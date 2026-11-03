@@ -19,6 +19,7 @@ import type {
 import {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
+  FLEET_HUMAN_GATE_DETAIL,
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
   FLEET_RUN_MAX_IDLE_TICKS,
@@ -50,7 +51,6 @@ import {
 } from "../fleet-run.js";
 import type { FleetIntent } from "../fleet-status.js";
 import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
-import { REVIEW_HUMAN_GATE_REASON } from "../review-findings.js";
 import type { RunManifest } from "../run-manifest.js";
 import { RunStatus } from "../run-manifest.js";
 
@@ -80,7 +80,6 @@ function workflow(
     kind: "ok",
     completedPhaseNames: ["plan"],
     phaseOrder: PHASES,
-    awaitingReviewResponse: false,
     ...overrides,
   };
 }
@@ -119,14 +118,27 @@ describe("deriveFleetMemberProgress", () => {
     expect(progress).toEqual({ kind: "complete" });
   });
 
-  it("is awaiting-human while a review response is pending", () => {
+  it("keeps a post-review member running, not awaiting a human (bd-219)", () => {
+    // The review phase flag is set on every review completion. It used to be read
+    // as a human wait, so a member working its own fix loop looked stopped.
     const progress = deriveFleetMemberProgress({
       taskId: MEMBER,
-      workflow: workflow({ awaitingReviewResponse: true }),
+      workflow: workflow({ completedPhaseNames: ["plan", "implement", "review"] }),
       runs: [],
       now: 5_000,
     });
-    expect(progress.kind).toBe("awaiting-human");
+    expect(progress.kind).toBe("running");
+  });
+
+  it("is awaiting-human for an open human gate on the bead (bd-219)", () => {
+    const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
+      workflow: workflow({ completedPhaseNames: ["plan", "implement", "review"] }),
+      runs: [],
+      now: 5_000,
+      humanGateOpen: true,
+    });
+    expect(progress).toEqual({ kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL });
   });
 
   it("reports a failed pending phase", () => {
@@ -535,8 +547,15 @@ function observation(
   progress: FleetMemberProgress,
   claim: FleetMemberObservation["claim"] = "live",
   launchedAt?: number,
+  humanGateOpen = false,
 ): FleetMemberObservation {
-  return { taskId, progress, claim, ...(launchedAt === undefined ? {} : { launchedAt }) };
+  return {
+    taskId,
+    progress,
+    claim,
+    humanGateOpen,
+    ...(launchedAt === undefined ? {} : { launchedAt }),
+  };
 }
 
 /** A single-member run that already stopped its member for a failed phase. */
@@ -884,13 +903,13 @@ describe("planFleetTick", () => {
       run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
       taskId: "bd-12",
       reason: "awaiting-human",
-      detail: REVIEW_HUMAN_GATE_REASON,
+      detail: FLEET_HUMAN_GATE_DETAIL,
       now: 2_000,
     });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"], run: stopped }),
       observations: [
-        observation("bd-12", { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON }, "live"),
+        observation("bd-12", { kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL }, "live"),
       ],
       now: 5_000,
       idleTicks: FLEET_RUN_MAX_IDLE_TICKS + 1,
@@ -905,11 +924,7 @@ describe("planFleetTick", () => {
       planFleetTick({
         intent: intent({ taskIds: ["bd-12"], run: stopped }),
         observations: [
-          observation(
-            "bd-12",
-            { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON },
-            "live",
-          ),
+          observation("bd-12", { kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL }, "live"),
         ],
         now: 5_000,
         idleTicks: FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
@@ -931,7 +946,7 @@ describe("planFleetTick", () => {
         }),
         taskId: "bd-12",
         reason: "awaiting-human",
-        detail: REVIEW_HUMAN_GATE_REASON,
+        detail: FLEET_HUMAN_GATE_DETAIL,
         now: 2_000,
       }),
       taskId: "bd-15",
@@ -942,7 +957,7 @@ describe("planFleetTick", () => {
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12", "bd-15"], run: stopped }),
       observations: [
-        observation("bd-12", { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON }, "live"),
+        observation("bd-12", { kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL }, "live"),
         observation("bd-15", { kind: "running", detail: "2/5", key: "phases:2/5" }, "live"),
       ],
       now: 5_000,
@@ -961,18 +976,14 @@ describe("planFleetTick", () => {
       run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
       taskId: "bd-12",
       reason: "awaiting-human",
-      detail: REVIEW_HUMAN_GATE_REASON,
+      detail: FLEET_HUMAN_GATE_DETAIL,
       now: 2_000,
     });
     const plan = (idleTicks: number) =>
       planFleetTick({
         intent: intent({ taskIds: ["bd-12"], run: stopped }),
         observations: [
-          observation(
-            "bd-12",
-            { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON },
-            "live",
-          ),
+          observation("bd-12", { kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL }, "live"),
         ],
         now: 5_000,
         idleTicks,
@@ -984,20 +995,20 @@ describe("planFleetTick", () => {
     });
   });
 
-  it("produces the review stop detail from the shared reason constant (bd-175)", () => {
-    // The producer end of the agreement: the `awaiting-human` detail the tick
-    // records in `run.stopped[]` is the same constant the bd gate carries, so the
-    // two surfaces cannot drift. The workflow snapshot is the real input shape.
+  it("produces the human-gate stop detail from the shared constant (bd-219)", () => {
+    // The producer end: the `awaiting-human` detail the tick records in
+    // `run.stopped[]` names an open gate, the only evidence of a person-wait, so a
+    // member working its own fix loop can never be stopped as waiting.
     const progress = deriveFleetMemberProgress({
       taskId: "bd-12",
       workflow: {
         kind: "ok",
         completedPhaseNames: ["review"],
         phaseOrder: PHASES,
-        awaitingReviewResponse: true,
       },
       runs: [],
       now: 5_000,
+      humanGateOpen: true,
     });
     const action = planFleetTick({
       intent: intent({ taskIds: ["bd-12"] }),
@@ -1008,27 +1019,27 @@ describe("planFleetTick", () => {
       kind: "stop",
       taskId: "bd-12",
       reason: "awaiting-human",
-      detail: REVIEW_HUMAN_GATE_REASON,
+      detail: FLEET_HUMAN_GATE_DETAIL,
     });
   });
 
-  it("records the shared review reason verbatim in run.stopped[] (bd-175)", () => {
+  it("records the human-gate detail verbatim in run.stopped[] (bd-219)", () => {
     // The consumer end: the tick writes the plan's detail straight into the run
     // record, so the entry a human or a `needs-you` view reads is byte-identical
-    // to the constant the bd gate and the findings comment carry. Asserting the
-    // stored entry (not just the plan) is what makes "identical" testable, and
-    // the round-trip also proves the detail fits FLEET_RUN_DETAIL_MAX_LENGTH.
+    // to the constant naming an open gate. Asserting the stored entry (not just
+    // the plan) is what makes "identical" testable, and the round-trip also
+    // proves the detail fits FLEET_RUN_DETAIL_MAX_LENGTH.
     const stopped = recordRunMemberStopped({
       run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
       taskId: "bd-12",
       reason: "awaiting-human",
-      detail: REVIEW_HUMAN_GATE_REASON,
+      detail: FLEET_HUMAN_GATE_DETAIL,
       now: 2_000,
     });
     expect(stopped.stopped).toHaveLength(1);
     expect(stopped.stopped?.[0]).toMatchObject({
       reason: "awaiting-human",
-      detail: REVIEW_HUMAN_GATE_REASON,
+      detail: FLEET_HUMAN_GATE_DETAIL,
     });
   });
 

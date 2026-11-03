@@ -26,7 +26,7 @@ import {
   applyPublicationAnswer,
   buildReviewFindingsRecord,
   carryForwardSensitivity,
-  REVIEW_HUMAN_GATE_REASON,
+  REVIEW_FIX_LOOP_REASON,
   type ReviewFindingRecord,
   type ReviewFindingsRecord,
   readReviewFindingsRecord,
@@ -74,7 +74,7 @@ function recordOf(findings: readonly ReviewFindingRecord[]): ReviewFindingsRecor
     taskId: "bd-1",
     phase: "review",
     round: 1,
-    reason: REVIEW_HUMAN_GATE_REASON,
+    reason: REVIEW_FIX_LOOP_REASON,
     artifactPath: ".belayd/review-findings.md",
     findings: [...findings],
   };
@@ -86,7 +86,7 @@ function deferredFinding(finding: string): ReviewFindingRecord {
     severity: "warnings",
     phase: "review",
     round: 1,
-    disposition: { kind: "deferred", reason: REVIEW_HUMAN_GATE_REASON },
+    disposition: { kind: "deferred", reason: REVIEW_FIX_LOOP_REASON },
   };
 }
 

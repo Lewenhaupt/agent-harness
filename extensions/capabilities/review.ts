@@ -35,6 +35,22 @@ export function reviewLoopDirective(nextPhaseTool: string): string {
 }
 
 /**
+ * When a workflow may stop for a person (bd-219).
+ *
+ * Shared by the review-findings guidance and the human-answer guidance so the
+ * two can never drift: an orchestrator that read "ask whenever you feel blocked"
+ * in one block and "ask only in two cases" in the other would keep gating. Both
+ * sites emit these lines verbatim; a test pins each condition and the
+ * do-not-ask list.
+ */
+export const HUMAN_ESCALATION_LINES: readonly string[] = [
+  "**Escalate to a human only when you cannot decide it yourself** — `belayd_ask_human`, then END YOUR TURN: it posts the question, opens a `human` gate and refuses every phase tool until an answer arrives. Two conditions, nothing else:",
+  "- a Critical finding you believe must NOT be implemented (a product, risk or scope decision you may not take);",
+  "- a contradiction you cannot resolve from the bead and the repo (conflicting findings, spec vs code, incompatible requirements).",
+  "Never escalate for what you can decide: findings you can fix, Suggestions triage, which fix to do, how to proceed, or grooming/merge/close choices.",
+];
+
+/**
  * Apply the review output contract to a delivery (bd-113). Only a successful
  * review is bounded: a failed run's text is error output and must survive
  * intact for the orchestrator to act on.
@@ -175,6 +191,8 @@ export function reviewFindingsGuidanceLines(nextPhaseTool: string): string[] {
     `- Re-run the fix loop yourself: ${REVIEW_LOOP_FIX_STEP}.`,
     `- Repeat until no Critical/Warnings remain, then call \`${nextPhaseTool}\`. You may decline only Suggestions, and only with a reason.`,
     "- In the task's Final Summary, list every finding you chose not to address, each with a one-line reason.",
+    "",
+    ...HUMAN_ESCALATION_LINES,
   ];
 }
 

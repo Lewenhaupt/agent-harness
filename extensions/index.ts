@@ -70,9 +70,9 @@ import type { FleetForceStopSeams, FleetSessionState } from "./capabilities/flee
 import { createFleet, disposeFleetSessionState, type FleetApi } from "./capabilities/fleet.js";
 import { registerHooks } from "./capabilities/hooks.js";
 import {
+  deliverReviewFindings,
   type HumanGateDeps,
   isSubAgentSession,
-  openReviewHumanGate,
   registerHumanGate,
 } from "./capabilities/human-gate.js";
 import { createLaunch } from "./capabilities/launch.js";
@@ -289,7 +289,7 @@ export default function belaydAgentHarness(
     spawnAgentWithFallback,
     runQualityGate,
     workflowRegistry: WORKFLOW_REGISTRY,
-    reviewGate: (options) => openReviewHumanGate({ ...options, deps: humanGateDeps }),
+    reviewFindings: (options) => deliverReviewFindings({ ...options, deps: humanGateDeps }),
   });
 
   // ── Registration order is load-bearing; do not reorder these calls ──

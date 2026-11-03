@@ -3308,6 +3308,70 @@ describe("fleet run mode", () => {
     expect(auditEntries("fleet-run-halted")).toHaveLength(0);
   });
 
+  it("waits on the member's open bd human gate, never on the review phase flag (bd-219)", async () => {
+    // The tick is the only place the gate read lands: `deriveFleetMemberProgress`
+    // could be right while the wiring that fills `humanGateOpen` is gone, and then
+    // a member on a real gate would read as running (no 12 h cap, no stop). The
+    // workflow carries the post-review flag the whole time and never moves the
+    // member; only the bead's gate does.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    const memberPath = join(worktree.path, "feat-bd-12");
+    // The probe is stubbed: without this the tick would read the member as missing.
+    worktree.branchPath = memberPath;
+    const written = writeWorkflowState({
+      cwd: memberPath,
+      state: {
+        schemaVersion: 1,
+        taskId: "bd-12",
+        workflowType: "feature",
+        resolutionSource: "default",
+        branch: "feat/bd-12",
+        originalCwd: memberPath,
+        phaseOrder: ["plan", "implement", "review", "test", "commit"],
+        completedPhaseNames: ["plan", "implement", "review"],
+        awaitingReviewResponse: true,
+        startedAt: 1,
+        updatedAt: 1,
+      },
+    });
+    if (!written.ok) throw new Error(`could not write workflow state: ${written.error}`);
+
+    /** bd's `gate list` answer; `null` is its empty-list rendering. */
+    const gateListAnswer = (answer: string) => (args: readonly string[]) =>
+      args[0] === "gate" && args[1] === "list" ? answer : undefined;
+    childProcess.bdStdout = gateListAnswer("null");
+
+    await vi.advanceTimersByTimeAsync(1);
+    const openTick = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(openTick).toHaveProperty("ok", true);
+    if (!openTick.ok) return;
+    // No gate: the post-review flag alone is not a wait, so nothing is stopped.
+    expect(openTick.intent?.run?.stopped).toBeUndefined();
+    expect(openTick.intent?.run?.memberSignatures?.[0]?.signature).toMatch(/^running:/);
+
+    // The same member, the same flag, now with an open human gate on its bead.
+    childProcess.bdStdout = gateListAnswer(
+      JSON.stringify([
+        { id: "bd-960", status: "open", await_type: "human", created_at: "2026-11-01T10:00:00Z" },
+      ]),
+    );
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    const gatedTick = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(gatedTick).toHaveProperty("ok", true);
+    if (!gatedTick.ok) return;
+    // The gate read reached the plan as `awaiting-human`, and the tick recorded it
+    // in `run.stopped[]` so the 12 h human cap and the halt reason apply to it.
+    expect(gatedTick.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "awaiting-human" }),
+    ]);
+  });
+
   it("keeps the capacity wait alive on a tick whose member moved (bd-172)", async () => {
     // The capacity wait halts on its own counter because it only runs with no member
     // in flight, so it must read the same tick value the plan did: a stale record

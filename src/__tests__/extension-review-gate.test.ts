@@ -1,11 +1,13 @@
 /**
- * Extension-surface tests for the review human gate (bd-175).
+ * Extension-surface tests for the review-findings delivery (bd-175, bd-219).
  *
- * `openReviewHumanGate` is exercised directly against a stubbed `bd`, the way
- * the human-answer suite exercises `belayd_ask_human`: it must post the findings
- * as an authored comment, open a `human` gate carrying the shared reason, write
- * the durable disposition record, and arm the answer poll so resolving the gate
- * resumes the member. A clean review stays on the fast path and writes nothing.
+ * `deliverReviewFindings` is exercised directly against a stubbed `bd`, the way
+ * the human-answer suite exercises `belayd_ask_human`. Ordinary findings are a
+ * trace, not a question: the record is written and the findings are posted as an
+ * authored comment, and no gate/wait/poll exists, so the orchestrator can run the
+ * fix loop in the same turn. Only a security-class finding still opens the bd-183
+ * publication gate and arms the answer poll. A clean review stays on the fast
+ * path and writes nothing.
  */
 
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -13,15 +15,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { runBdCommand } from "../../extensions/capabilities/context.js";
 import {
+  deliverReviewFindings,
   type HumanGateDeps,
+  humanAnswerGuidanceLines,
   humanAnswerMessage,
-  openReviewHumanGate,
   stopHumanAnswerPoll,
 } from "../../extensions/capabilities/human-gate.js";
-import { runCompleteLoopHint, tryOpenReviewGate } from "../../extensions/capabilities/phase-run.js";
+import {
+  runCompleteLoopHint,
+  tryDeliverReviewFindings,
+  warnOnSkippedReviewFindings,
+} from "../../extensions/capabilities/phase-run.js";
+import {
+  HUMAN_ESCALATION_LINES,
+  reviewFindingsGuidanceLines,
+} from "../../extensions/capabilities/review.js";
 import { createInitialSessionState } from "../../extensions/capabilities/session-state.js";
+import { lookupOpenHumanGate } from "../bead-gates.js";
 import {
   evaluateDeferredFindingsGate,
   renderDeferredFindingsSection,
@@ -31,8 +43,13 @@ import type { GithubAnswerTarget } from "../github-answer-target.js";
 import {
   buildReviewFindingsRecord,
   carryForwardSensitivity,
+  hasSensitiveFindings,
   REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
+  REVIEW_FIX_LOOP_REASON,
+  REVIEW_GATE_FAILURE_PREFIX,
   REVIEW_HUMAN_GATE_REASON,
+  REVIEW_NO_FINDINGS_REASON,
+  REVIEW_NO_SEAM_REASON,
   type ReviewFindingsRecord,
   reviewFindingsGateReason,
   reviewFindingsGateTitle,
@@ -124,19 +141,44 @@ const REVIEW_WITH_FINDINGS = [
 
 const CLEAN_REVIEW = ["## Critical (must fix)", "None"].join("\n");
 
-const GATE_CREATE_KEY =
-  `gate create --blocks bd-1 --type=human ` +
-  `--title belayd-review: bd-1 findings (round 1) ` +
-  `--reason ${REVIEW_HUMAN_GATE_REASON} --json`;
+/** A security-class review: still escalated as a publication decision (bd-183). */
+const SENSITIVE_REVIEW = [
+  "## Critical (must fix)",
+  "- `src/auth/session.ts:42` — the session token is logged in plaintext",
+].join("\n");
+
+/** The `gate create` argv a review text must produce, from the same pure helpers. */
+function gateCreateKey(options: {
+  taskId: string;
+  text: string;
+  round?: number;
+  previousDecisionsReset?: boolean;
+}): string {
+  const record = buildReviewFindingsRecord({
+    taskId: options.taskId,
+    text: options.text,
+    round: options.round ?? 1,
+  });
+  if (record === undefined) throw new Error("expected a record");
+  const previousDecisionsReset = options.previousDecisionsReset === true;
+  const title = reviewFindingsGateTitle({
+    taskId: options.taskId,
+    round: record.round,
+    sensitive: hasSensitiveFindings(record),
+    previousDecisionsReset,
+  });
+  const reason = reviewFindingsGateReason(record, { previousDecisionsReset });
+  return `gate create --blocks ${options.taskId} --type=human --title ${title} --reason ${reason} --json`;
+}
+
 const COMMENT_KEY = "comment --stdin -- bd-1";
 
-describe("openReviewHumanGate", () => {
+describe("deliverReviewFindings", () => {
   let cwd: string;
 
   beforeEach(() => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-review-gate-"));
     bd.reset();
-    bd.reply(GATE_CREATE_KEY, { stdout: JSON.stringify({ id: "bd-160", status: "open" }) });
     bd.reply(COMMENT_KEY, { stdout: "" });
   });
 
@@ -170,12 +212,12 @@ describe("openReviewHumanGate", () => {
     ui: { notify: () => {} },
   } as unknown as ExtensionContext;
 
-  it("opens the gate, posts the findings, writes the record, and blocks", async () => {
+  it("records ordinary findings and leaves the member working (bd-219)", async () => {
     const state = makeState();
     const deps = makeDeps(state);
     ctx.cwd = cwd;
 
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps,
@@ -183,95 +225,185 @@ describe("openReviewHumanGate", () => {
       reviewText: REVIEW_WITH_FINDINGS,
     });
 
-    expect(outcome).toEqual({ opened: true, reason: REVIEW_HUMAN_GATE_REASON });
-    expect(state.awaitingHuman).toMatchObject({ beadId: "bd-1", gateId: "bd-160" });
-    // The answer poll is armed, so resolving the gate resumes the member.
-    expect(state.humanAnswerTimer).toBeDefined();
+    expect(outcome).toEqual({
+      recorded: true,
+      gateOpened: false,
+      reason: REVIEW_FIX_LOOP_REASON,
+    });
+    // No gate, no wait, no poll: the orchestrator can start the fix loop now.
+    expect(state.awaitingHuman).toBeUndefined();
+    expect(state.humanAnswerTimer).toBeUndefined();
+    expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
 
-    const gateCall = bd.calls.find((call) => bd.keyOf(call.argv).startsWith("gate create"));
-    expect(gateCall?.argv).toContain("--actor");
-    expect(gateCall?.argv).toContain(ACTOR);
-    expect(gateCall?.argv).toContain(REVIEW_HUMAN_GATE_REASON);
-
+    // The trace still exists: an authored comment a human can read.
     const comment = bd.calls.find((call) => bd.keyOf(call.argv) === COMMENT_KEY);
     expect(comment?.stdin.startsWith("[belayd:review]\n")).toBe(true);
     expect(comment?.stdin).toContain("src/a.ts:12");
+    expect(comment?.stdin).toContain("## Review findings (round 1)");
+    expect(comment?.stdin).toContain("### Next step");
+    expect(comment?.stdin).toContain("No human decision is required");
+    expect(comment?.stdin).not.toContain("### Question");
 
     const record = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
+    expect(record.round).toBe(1);
+    expect(record.reason).toBe(REVIEW_FIX_LOOP_REASON);
     expect(record.findings).toHaveLength(1);
-    expect(record.reason).toBe(REVIEW_HUMAN_GATE_REASON);
+    expect(record.findings[0].disposition).toEqual({
+      kind: "deferred",
+      reason: REVIEW_FIX_LOOP_REASON,
+    });
+  });
 
-    stopHumanAnswerPoll(state);
+  it("leaves a Suggestions-only review ungated too", async () => {
+    // Triage of a suggestion is the orchestrator's decision, not a human's
+    // (bd-219): every one of the 12 gates the field data recorded was answered
+    // "address/fix", so asking only cost the wait.
+    const state = makeState();
+    ctx.cwd = cwd;
+    const outcome = await deliverReviewFindings({
+      state,
+      ctx,
+      deps: makeDeps(state),
+      taskId: "bd-1",
+      reviewText: ["## Suggestions (consider)", "- `src/c.ts:3` — rename `x` to `count`"].join(
+        "\n",
+      ),
+    });
+    expect(outcome).toMatchObject({ recorded: true, gateOpened: false });
+    expect(state.awaitingHuman).toBeUndefined();
+    expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
+    expect(JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8")).findings).toHaveLength(
+      1,
+    );
+  });
+
+  it("leaves bd gate list empty after an ordinary findings review (acceptance)", async () => {
+    const state = makeState();
+    ctx.cwd = cwd;
+    bd.reply("gate list bd-1 --json", { stdout: JSON.stringify([]) });
+    await deliverReviewFindings({
+      state,
+      ctx,
+      deps: makeDeps(state),
+      taskId: "bd-1",
+      reviewText: REVIEW_WITH_FINDINGS,
+    });
+    const gates = await lookupOpenHumanGate({
+      beadId: "bd-1",
+      cwd,
+      runBd: (argv, options) => runBdCommand(argv, options),
+    });
+    expect(gates).toEqual({ ok: true, status: "none" });
   });
 
   it("stays on the fast path for a clean review and writes nothing to bd", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
       reviewText: CLEAN_REVIEW,
     });
-    expect(outcome).toEqual({ opened: false, reason: "the review reported no findings" });
+    expect(outcome).toEqual({
+      recorded: false,
+      gateOpened: false,
+      reason: REVIEW_NO_FINDINGS_REASON,
+    });
     expect(state.awaitingHuman).toBeUndefined();
     expect(bd.calls).toHaveLength(0);
+    expect(() => readFileSync(reviewFindingsRecordPath(cwd), "utf8")).toThrow();
   });
 
-  it("opens no second gate for a review while a human answer is already pending", async () => {
+  it("records a review that arrives while a human answer is already pending", async () => {
+    // An open ask-human wait must not be replaced or duplicated by a review, but
+    // the review's own findings are still a trace the orchestrator will need.
     const state = makeState();
     ctx.cwd = cwd;
-    state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000 };
-    const outcome = await openReviewHumanGate({
+    const pending = { beadId: "bd-1", askedAt: 1_000 };
+    state.awaitingHuman = pending;
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
       reviewText: REVIEW_WITH_FINDINGS,
     });
-    expect(outcome.opened).toBe(false);
-    expect(bd.calls).toHaveLength(0);
+    expect(outcome).toMatchObject({ recorded: true, gateOpened: false });
+    expect(state.awaitingHuman).toEqual(pending);
+    expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
+    expect(bd.calls.some((call) => bd.keyOf(call.argv) === COMMENT_KEY)).toBe(true);
   });
 
-  it("does not block the member when the gate could not be created", async () => {
+  it("still records and comments, and warns, when the sensitive gate could not be created", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    bd.reply(GATE_CREATE_KEY, { error: "bd: command not found" });
-    const outcome = await openReviewHumanGate({
-      state,
-      ctx,
-      deps: makeDeps(state),
-      taskId: "bd-1",
-      reviewText: REVIEW_WITH_FINDINGS,
+    bd.reply(gateCreateKey({ taskId: "bd-1", text: SENSITIVE_REVIEW }), {
+      error: "bd: command not found",
     });
-    expect(outcome.opened).toBe(false);
-    expect(outcome.reason).toContain("could not open a human gate");
-    expect(state.awaitingHuman).toBeUndefined();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const outcome = await deliverReviewFindings({
+        state,
+        ctx,
+        deps: makeDeps(state),
+        taskId: "bd-1",
+        reviewText: SENSITIVE_REVIEW,
+      });
+      expect(outcome).toMatchObject({ recorded: true, gateOpened: false });
+      expect(outcome.reason).toContain("could not open a human gate");
+      expect(state.awaitingHuman).toBeUndefined();
+      // A skipped bd-183 gate must be discoverable in the daemon log, not only as
+      // an unused return value (bd-219 review).
+      expect(warn).toHaveBeenCalledWith(
+        "[belayd-harness] could not open the sensitive-findings human gate",
+        "bd: command not found",
+      );
+      // The seam owns that line, so the delivery caller must not repeat it: one
+      // failed gate is exactly one log line (bd-219 review S4).
+      warnOnSkippedReviewFindings(outcome);
+      expect(
+        warn.mock.calls.filter(
+          ([message]) => typeof message === "string" && message.startsWith("[belayd-harness]"),
+        ),
+      ).toHaveLength(1);
+      // The escalation failed, but the trace it would have pointed at still lands.
+      expect(JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8")).round).toBe(1);
+      const comment = bd.calls.find((call) => bd.keyOf(call.argv) === COMMENT_KEY);
+      expect(comment?.stdin).toContain("src/auth/session.ts:42");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps the gate and the wait when only the comment write fails", async () => {
     const state = makeState();
     ctx.cwd = cwd;
+    bd.reply(gateCreateKey({ taskId: "bd-1", text: SENSITIVE_REVIEW }), {
+      stdout: JSON.stringify({ id: "bd-160", status: "open" }),
+    });
     bd.reply(COMMENT_KEY, { error: "bd: comment write failed" });
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
-      reviewText: REVIEW_WITH_FINDINGS,
+      reviewText: SENSITIVE_REVIEW,
     });
     // The gate's reason is itself the visible wait, so a failed comment must not
     // silently unblock a member the human can still see stopped in bd.
-    expect(outcome.opened).toBe(true);
+    expect(outcome.gateOpened).toBe(true);
     expect(state.awaitingHuman).toBeDefined();
+    // No comment id was posted, so the wait must not exclude one.
+    expect(state.awaitingHuman?.answerCommentId).toBeUndefined();
     stopHumanAnswerPoll(state);
   });
 
   it("does not open a gate for a narration-only review", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
@@ -281,7 +413,11 @@ describe("openReviewHumanGate", () => {
         "- verified `src/x.ts:10` handles null correctly",
       ].join("\n"),
     });
-    expect(outcome).toEqual({ opened: false, reason: "the review reported no findings" });
+    expect(outcome).toEqual({
+      recorded: false,
+      gateOpened: false,
+      reason: REVIEW_NO_FINDINGS_REASON,
+    });
     expect(state.awaitingHuman).toBeUndefined();
     expect(bd.calls).toHaveLength(0);
   });
@@ -289,68 +425,113 @@ describe("openReviewHumanGate", () => {
   it("rejects an invalid task id before any bd call", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "not a bead id",
       reviewText: REVIEW_WITH_FINDINGS,
     });
-    expect(outcome.opened).toBe(false);
+    expect(outcome).toMatchObject({ recorded: false, gateOpened: false });
     expect(outcome.reason).toContain("invalid task id");
     expect(bd.calls).toHaveLength(0);
   });
 
-  it("warns but still opens the gate when the record write fails", async () => {
+  it("warns but still posts the comment when the record write fails", async () => {
     const state = makeState();
     ctx.cwd = cwd;
     // A directory where the record file belongs makes the temp-rename fail; the
-    // gate and comment are the human-visible record and must survive it.
+    // comment is the human-visible trace and must survive it.
     mkdirSync(reviewFindingsRecordPath(cwd), { recursive: true });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const outcome = await openReviewHumanGate({
+      const outcome = await deliverReviewFindings({
         state,
         ctx,
         deps: makeDeps(state),
         taskId: "bd-1",
         reviewText: REVIEW_WITH_FINDINGS,
       });
-      expect(outcome.opened).toBe(true);
+      expect(outcome).toMatchObject({ recorded: false, gateOpened: false });
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not record"));
-      expect(state.awaitingHuman).toBeDefined();
+      expect(bd.calls.some((call) => bd.keyOf(call.argv) === COMMENT_KEY)).toBe(true);
+      expect(state.awaitingHuman).toBeUndefined();
     } finally {
       warn.mockRestore();
-      stopHumanAnswerPoll(state);
     }
   });
 
-  it("opens exactly one gate when two review deliveries settle concurrently", async () => {
+  it("names both failures when the record write and the sensitive gate both fail", async () => {
     const state = makeState();
     ctx.cwd = cwd;
+    bd.reply(gateCreateKey({ taskId: "bd-1", text: SENSITIVE_REVIEW }), {
+      error: "bd: gate backend down",
+    });
+    // Same trick as the record-only failure: a directory where the record file
+    // belongs, so the temp-rename cannot land the record either.
+    mkdirSync(reviewFindingsRecordPath(cwd), { recursive: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const outcome = await deliverReviewFindings({
+        state,
+        ctx,
+        deps: makeDeps(state),
+        taskId: "bd-1",
+        reviewText: SENSITIVE_REVIEW,
+      });
+      expect(outcome).toMatchObject({ recorded: false, gateOpened: false });
+      // One self-describing reason: naming only the gate would hide the lost
+      // record from the caller's single "not fully delivered" line.
+      expect(outcome.reason).toContain("could not record the review findings");
+      expect(outcome.reason).toContain("gate backend down");
+      expect(outcome.reason).toContain(REVIEW_GATE_FAILURE_PREFIX);
+      // Each part carries its own label: both can contain `;`, so only the label
+      // makes the joined reason unambiguous.
+      expect(outcome.reason).toContain(" and the sensitive-findings gate was not armed: ");
+      expect(outcome.reason.indexOf("could not record the review findings")).toBeLessThan(
+        outcome.reason.indexOf("the sensitive-findings gate was not armed"),
+      );
+      // The composition adds no log line: the seam still owns exactly one per
+      // failure and the caller warns once for the skipped record.
+      expect(
+        warn.mock.calls.filter(
+          ([message]) => typeof message === "string" && message.startsWith("[belayd-harness]"),
+        ),
+      ).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("opens exactly one gate when two sensitive deliveries settle concurrently", async () => {
+    const state = makeState();
+    ctx.cwd = cwd;
+    bd.reply(gateCreateKey({ taskId: "bd-1", text: SENSITIVE_REVIEW }), {
+      stdout: JSON.stringify({ id: "bd-160", status: "open" }),
+    });
     // Both calls start before either awaits: the synchronous reservation must make
     // the second bail, or it opens a duplicate gate nobody's poll watches.
-    const first = openReviewHumanGate({
+    const first = deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
-      reviewText: REVIEW_WITH_FINDINGS,
+      reviewText: SENSITIVE_REVIEW,
     });
     // The reservation is a pending marker, never `awaitingHuman`: the gate does
     // not exist yet, so the answer poll must not read an empty list as resolved.
     expect(state.awaitingHuman).toBeUndefined();
     expect(state.reviewGatePending).toBe(true);
-    const second = openReviewHumanGate({
+    const second = deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
-      reviewText: REVIEW_WITH_FINDINGS,
+      reviewText: SENSITIVE_REVIEW,
     });
     const [a, b] = await Promise.all([first, second]);
-    expect(a.opened).toBe(true);
-    expect(b.opened).toBe(false);
+    expect(a.gateOpened).toBe(true);
+    expect(b.gateOpened).toBe(false);
     expect(state.reviewGatePending).toBeUndefined();
     expect(bd.calls.filter((call) => bd.keyOf(call.argv).startsWith("gate create"))).toHaveLength(
       1,
@@ -361,8 +542,11 @@ describe("openReviewHumanGate", () => {
   it("clears the pending marker in finally and never touches awaitingHuman", async () => {
     const state = makeState();
     ctx.cwd = cwd;
+    bd.reply(gateCreateKey({ taskId: "bd-1", text: SENSITIVE_REVIEW }), {
+      stdout: JSON.stringify({ id: "bd-160", status: "open" }),
+    });
     // The throw lands after the gate exists: arming the answer poll is the last
-    // step in the gated section. The failed call must leave the reservation
+    // step of a sensitive delivery. The failed call must leave the reservation
     // cleared and the real wait set -- a `finally` that also cleared
     // `awaitingHuman` would silently unblock a member whose gate bd shows open.
     const throwingCtx = {
@@ -374,12 +558,12 @@ describe("openReviewHumanGate", () => {
       },
     } as unknown as ExtensionContext;
     await expect(
-      openReviewHumanGate({
+      deliverReviewFindings({
         state,
         ctx: throwingCtx,
         deps: makeDeps(state),
         taskId: "bd-1",
-        reviewText: REVIEW_WITH_FINDINGS,
+        reviewText: SENSITIVE_REVIEW,
       }),
     ).rejects.toThrow("session manager exploded");
     expect(state.reviewGatePending).toBeUndefined();
@@ -389,36 +573,31 @@ describe("openReviewHumanGate", () => {
     stopHumanAnswerPoll(state);
   });
 
-  it("records an increasing round across re-reviews", async () => {
+  it("records an increasing round across re-reviews without a gate", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    const first = await openReviewHumanGate({
+    const first = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
       reviewText: REVIEW_WITH_FINDINGS,
     });
-    expect(first.opened).toBe(true);
-    stopHumanAnswerPoll(state);
-    // The human answered: clear the wait, then a re-review opens round 2.
-    state.awaitingHuman = undefined;
-    const second = await openReviewHumanGate({
+    expect(first).toMatchObject({ recorded: true, gateOpened: false });
+    const second = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
       taskId: "bd-1",
       reviewText: REVIEW_WITH_FINDINGS,
     });
-    expect(second.opened).toBe(true);
+    expect(second).toMatchObject({ recorded: true, gateOpened: false });
     const record = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
     expect(record.round).toBe(2);
     expect(record.findings.every((finding: { round: number }) => finding.round === 2)).toBe(true);
-    const titles = bd.calls
-      .filter((call) => bd.keyOf(call.argv).startsWith("gate create"))
-      .map((call) => call.argv.join(" "));
-    expect(titles.some((title) => title.includes("round 2"))).toBe(true);
-    stopHumanAnswerPoll(state);
+    // Two rounds of trace, zero gates: the round counter is not tied to a wait.
+    expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
+    expect(bd.calls.filter((call) => bd.keyOf(call.argv) === COMMENT_KEY)).toHaveLength(2);
   });
 });
 
@@ -458,49 +637,56 @@ describe("runCompleteLoopHint", () => {
     return state;
   };
 
-  it("withholds the resumable-fix hint when the review gate opened", () => {
-    // A member blocked by the gate cannot call the next phase tool, so the
-    // run-complete content must not offer it (bd-175 review).
-    expect(runCompleteLoopHint({ delivered, state: makeState(), reviewGateOpened: true })).toBe("");
-  });
-
-  it("keeps the resumable-fix hint for a clean review or an absent gate seam", () => {
-    // Both reach the delivery as `reviewGateOpened: false`: a clean review wrote
-    // nothing, and a host with no seam never called the opener. The hint names the
-    // next incomplete phase after review, not review's successor literal.
-    const hint = runCompleteLoopHint({ delivered, state: makeState(), reviewGateOpened: false });
+  it("always emits the resumable-fix directive when no human wait is live", () => {
+    // bd-219: a findings review no longer gates, so withholding the directive
+    // only teaches the orchestrator that it cannot act. The next incomplete phase
+    // after review is named, not review's successor literal.
+    const hint = runCompleteLoopHint({ delivered, state: makeState() });
     expect(hint).toContain("**When review findings remain:**");
     expect(hint).toContain("belayd_test");
   });
+
+  it("emits the directive for a clean review too", () => {
+    const cleanDelivered: RunDelivery = {
+      ...delivered,
+      result: {
+        ...delivered.result,
+        content: [{ type: "text", text: CLEAN_REVIEW }],
+      },
+    };
+    expect(runCompleteLoopHint({ delivered: cleanDelivered, state: makeState() })).toContain(
+      "**When review findings remain:**",
+    );
+  });
+
+  it("withholds the directive only while a human wait is live", () => {
+    // A member blocked by `belayd_ask_human` (or the bd-183 publication gate)
+    // cannot call the next phase tool, so the run-complete content must not
+    // offer it. A gate is not a function of the review text.
+    const state = makeState();
+    state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000 };
+    expect(runCompleteLoopHint({ delivered, state })).toBe("");
+  });
 });
 
-describe("tryOpenReviewGate", () => {
-  it("returns the opener's verdict and swallows a throwing opener", async () => {
+describe("tryDeliverReviewFindings", () => {
+  it("returns the seam's verdict and swallows a throwing seam", async () => {
     const state = createInitialSessionState();
     const ctx = { cwd: "", sessionManager: {} } as unknown as ExtensionContext;
     expect(
-      await tryOpenReviewGate({
-        open: async () => ({ opened: true, reason: "ok" }),
+      await tryDeliverReviewFindings({
+        deliver: async () => ({ recorded: true, gateOpened: false, reason: "ok" }),
         state,
         ctx,
         taskId: "bd-1",
         reviewText: "x",
       }),
-    ).toBe(true);
-    expect(
-      await tryOpenReviewGate({
-        open: async () => ({ opened: false, reason: "no" }),
-        state,
-        ctx,
-        taskId: "bd-1",
-        reviewText: "x",
-      }),
-    ).toBe(false);
+    ).toEqual({ recorded: true, gateOpened: false, reason: "ok" });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       expect(
-        await tryOpenReviewGate({
-          open: async () => {
+        await tryDeliverReviewFindings({
+          deliver: async () => {
             throw new Error("bd exploded");
           },
           state,
@@ -508,9 +694,9 @@ describe("tryOpenReviewGate", () => {
           taskId: "bd-1",
           reviewText: "x",
         }),
-      ).toBe(false);
+      ).toEqual({ recorded: false, gateOpened: false, reason: "bd exploded" });
       expect(warn).toHaveBeenCalledWith(
-        "[belayd-harness] could not open the review human gate",
+        "[belayd-harness] could not record the review findings",
         expect.any(Error),
       );
     } finally {
@@ -519,13 +705,107 @@ describe("tryOpenReviewGate", () => {
   });
 });
 
+describe("warnOnSkippedReviewFindings", () => {
+  it("logs a skipped record and stays silent for every expected outcome (bd-219 review)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      warnOnSkippedReviewFindings({
+        recorded: false,
+        gateOpened: false,
+        reason: 'invalid task id "not a bead id"',
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("not fully delivered"));
+
+      // Every other outcome is expected: the clean review, a host without the
+      // seam, an ordinary fix-loop delivery, a sensitive round whose question the
+      // seam announced, and a refused gate whose one log line the seam owns.
+      warn.mockClear();
+      const expected = [
+        { recorded: false, gateOpened: false, reason: REVIEW_NO_FINDINGS_REASON },
+        { recorded: false, gateOpened: false, reason: REVIEW_NO_SEAM_REASON },
+        { recorded: true, gateOpened: false, reason: REVIEW_FIX_LOOP_REASON },
+        {
+          recorded: true,
+          gateOpened: false,
+          reason: "already waiting on bd-1; the new round's publication question is not armed",
+        },
+        { recorded: true, gateOpened: false, reason: `${REVIEW_GATE_FAILURE_PREFIX}: bd is down` },
+      ];
+      for (const delivery of expected) warnOnSkippedReviewFindings(delivery);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("surfaces a throwing seam's reason without throwing and keeps the delivery result", async () => {
+    const state = createInitialSessionState();
+    const ctx = { cwd: "", sessionManager: {} } as unknown as ExtensionContext;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const delivery = await tryDeliverReviewFindings({
+        deliver: async () => {
+          throw new Error("bd exploded");
+        },
+        state,
+        ctx,
+        taskId: "bd-1",
+        reviewText: "x",
+      });
+      expect(delivery).toEqual({ recorded: false, gateOpened: false, reason: "bd exploded" });
+      expect(() => warnOnSkippedReviewFindings(delivery)).not.toThrow();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("bd exploded"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("human escalation policy (bd-219)", () => {
+  const CONDITIONS = [
+    "Critical finding you believe must NOT be implemented",
+    "contradiction you cannot resolve from the bead and the repo",
+    "Never escalate for what you can decide",
+    "Suggestions triage",
+    // The do-not-ask list is what stops a suggestion or a fix choice becoming a
+    // gate; a list that silently shrinks to one item would read as permission.
+    "findings you can fix",
+    "which fix to do",
+    "how to proceed",
+    "grooming/merge/close choices",
+  ];
+
+  it("names only the two escalation conditions and the do-not-ask list, in both blocks", () => {
+    // Both guidance sites must state the same two conditions; a model that read
+    // "ask whenever you feel blocked" in one of them kept gating every review.
+    const blocks = {
+      review: reviewFindingsGuidanceLines("belayd_test").join("\n"),
+      human: humanAnswerGuidanceLines(createInitialSessionState()).join("\n"),
+    };
+    for (const [name, text] of Object.entries(blocks)) {
+      for (const needle of CONDITIONS) {
+        expect(text, `${name} guidance should name "${needle}"`).toContain(needle);
+      }
+      // The list must be exhaustive, not open-ended.
+      expect(text).toContain("Two conditions, nothing else");
+      for (const coercion of [
+        "Never guess and never proceed",
+        "Always ask",
+        "always ask",
+        "ask whenever",
+      ]) {
+        expect(text, `${name} guidance should not coerce: "${coercion}"`).not.toContain(coercion);
+      }
+      // Both sites emit the shared policy verbatim, so they cannot drift.
+      for (const line of HUMAN_ESCALATION_LINES) expect(text).toContain(line);
+    }
+    // Exactly two conditions: a third bullet silently widens the escalation rule.
+    expect(HUMAN_ESCALATION_LINES.filter((line) => line.startsWith("- "))).toHaveLength(2);
+  });
+});
+
 describe("sensitive review findings (bd-183)", () => {
   let cwd: string;
-
-  const SENSITIVE_REVIEW = [
-    "## Critical (must fix)",
-    "- `src/auth/session.ts:42` — the session token is logged in plaintext",
-  ].join("\n");
 
   /** A review the current rule table calls clean — the "weakened table" case. */
   const PLAIN_REVIEW = [
@@ -638,7 +918,7 @@ describe("sensitive review findings (bd-183)", () => {
 
   it("opens one gate with the disclosure wording and blocks publishing", async () => {
     const state = makeState();
-    const outcome = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
@@ -646,7 +926,7 @@ describe("sensitive review findings (bd-183)", () => {
       reviewText: SENSITIVE_REVIEW,
     });
     try {
-      expect(outcome.opened).toBe(true);
+      expect(outcome.gateOpened).toBe(true);
       const gateCall = bd.calls.find((call) => bd.keyOf(call.argv).startsWith("gate create"));
       expect(gateCall?.argv.join(" ")).toContain("sensitive findings (round 1)");
       expect(gateCall?.argv.join(" ")).toContain("publication decision");
@@ -668,17 +948,62 @@ describe("sensitive review findings (bd-183)", () => {
     }
   });
 
+  it("names the lost publication question when a human wait is already open (bd-219)", async () => {
+    // The round advances with the record, so the gate the human can see would
+    // answer this round's publication question with `round-mismatch`. A second
+    // gate is worse (two polls, one answer), so the loss is named in the comment
+    // and the result instead of disappearing.
+    const state = makeState();
+    const pending = { beadId: "bd-1", askedAt: 1_000 };
+    state.awaitingHuman = pending;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const outcome = await deliverReviewFindings({
+        state,
+        ctx,
+        deps: makeDeps(state),
+        taskId: "bd-1",
+        reviewText: SENSITIVE_REVIEW,
+      });
+      expect(outcome).toMatchObject({ recorded: true, gateOpened: false });
+      expect(outcome.reason).toContain("already waiting on bd-1");
+      expect(outcome.reason).toContain("publication question is not armed");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("could not arm the sensitive-findings publication question"),
+      );
+
+      // No second gate, no re-armed poll, and the existing wait is untouched.
+      expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
+      expect(state.awaitingHuman).toEqual(pending);
+      expect(state.humanAnswerTimer).toBeUndefined();
+
+      const comment = bd.calls.find((call) => bd.keyOf(call.argv) === COMMENT_KEY);
+      expect(comment?.stdin).toContain("Publication question not armed for this round");
+      expect(comment?.stdin).toContain("belayd_ask_human");
+
+      // Fail-closed: no decision was invented, so nothing about it may publish.
+      const record = readRecord();
+      expect(record.findings[0]?.publication).toBeUndefined();
+      expect(evaluateDeferredFindingsGate(record)).toMatchObject({
+        ok: false,
+        reason: "sensitive-findings-awaiting-human",
+      });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("records the human's publication choice when the answer is delivered", async () => {
     const state = makeState();
     const deps = makeDeps(state);
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     try {
       bd.reply("gate list bd-1 --json", {
         stdout: JSON.stringify([
@@ -734,14 +1059,14 @@ describe("sensitive review findings (bd-183)", () => {
     // own assertion on each channel.
     const state = makeState();
     const deps = makeDeps(state);
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     try {
       const content = await deliverAnswer(deps, "redact");
       expect(content).toContain('publication choice "redact" is recorded');
@@ -783,14 +1108,14 @@ describe("sensitive review findings (bd-183)", () => {
       },
     );
 
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     try {
       expect(state.awaitingHuman?.channel).toEqual({ kind: "github", owner, repo, issue });
       expect(state.awaitingHuman?.answerCommentId).toBe("700");
@@ -862,14 +1187,14 @@ describe("sensitive review findings (bd-183)", () => {
 
       const state = makeState();
       const deps = makeDeps(state, target);
-      const opened = await openReviewHumanGate({
+      const opened = await deliverReviewFindings({
         state,
         ctx,
         deps,
         taskId: "bd-1",
         reviewText: SENSITIVE_REVIEW,
       });
-      expect(opened.opened).toBe(true);
+      expect(opened.gateOpened).toBe(true);
       try {
         bd.reply(
           `api --paginate --slurp repos/${owner}/${repo}/issues/${issue.toString()}/comments?since=${since}`,
@@ -935,14 +1260,14 @@ describe("sensitive review findings (bd-183)", () => {
     // render the raw finding (bd-183 review, Critical).
     const state = makeState();
     const deps = makeDeps(state);
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     try {
       // 1. The review wait's own answer withholds.
       bd.reply("gate list bd-1 --json", { stdout: openGate("2026-10-26T20:00:00Z") });
@@ -975,14 +1300,14 @@ describe("sensitive review findings (bd-183)", () => {
   it("announces and drops publication decisions when a re-review resets the round", async () => {
     const state = makeState();
     const deps = makeDeps(state);
-    const roundOne = await openReviewHumanGate({
+    const roundOne = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(roundOne.opened).toBe(true);
+    expect(roundOne.gateOpened).toBe(true);
     try {
       bd.reply("gate list bd-1 --json", { stdout: openGate("2026-10-26T20:00:00Z") });
       bd.reply("comments bd-1 --json", {
@@ -1000,7 +1325,7 @@ describe("sensitive review findings (bd-183)", () => {
     bd.reply(sensitiveGateKey({ round: 2, previousDecisionsReset: true }), {
       stdout: JSON.stringify({ id: "bd-162", status: "open" }),
     });
-    const roundTwo = await openReviewHumanGate({
+    const roundTwo = await deliverReviewFindings({
       state,
       ctx,
       deps,
@@ -1008,7 +1333,7 @@ describe("sensitive review findings (bd-183)", () => {
       reviewText: SENSITIVE_REVIEW,
     });
     try {
-      expect(roundTwo.opened).toBe(true);
+      expect(roundTwo.gateOpened).toBe(true);
       const gateCreates = bd.calls.filter((call) => bd.keyOf(call.argv).startsWith("gate create"));
       expect(gateCreates.at(-1)?.argv.join(" ")).toContain("previous decisions reset");
       const comments = bd.calls.filter((call) => bd.keyOf(call.argv) === COMMENT_KEY);
@@ -1032,14 +1357,14 @@ describe("sensitive review findings (bd-183)", () => {
     // finding that is not permission to publish.
     const state = makeState();
     const deps = makeDeps(state);
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     try {
       bd.reply("gate list bd-1 --json", { stdout: JSON.stringify([]) });
       bd.reply("gate list bd-1 --all --json", { stdout: JSON.stringify([]) });
@@ -1054,51 +1379,32 @@ describe("sensitive review findings (bd-183)", () => {
     }
   });
 
-  it("keeps today's gate and message for a non-sensitive review", async () => {
+  it("leaves a non-sensitive review ungated, and answers arrive only for a real gate", async () => {
+    // The bd-183 machinery must not leak: a plain Critical review in a worktree
+    // that also knows about sensitive rounds still records a trace and runs the
+    // fix loop. The answer poll is not armed, so no human answer is consumed.
     const state = makeState();
     const deps = makeDeps(state);
-    bd.reply(GATE_CREATE_KEY, { stdout: JSON.stringify({ id: "bd-160", status: "open" }) });
-    const opened = await openReviewHumanGate({
+    const outcome = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: REVIEW_WITH_FINDINGS,
     });
-    expect(opened).toEqual({ opened: true, reason: REVIEW_HUMAN_GATE_REASON });
-    try {
-      const gateCall = bd.calls.find((call) => bd.keyOf(call.argv).startsWith("gate create"));
-      expect(gateCall?.argv).toContain("belayd-review: bd-1 findings (round 1)");
-      expect(gateCall?.argv).toContain(REVIEW_HUMAN_GATE_REASON);
+    expect(outcome).toEqual({
+      recorded: true,
+      gateOpened: false,
+      reason: REVIEW_FIX_LOOP_REASON,
+    });
+    expect(state.awaitingHuman).toBeUndefined();
+    expect(state.humanAnswerTimer).toBeUndefined();
+    expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
 
-      bd.reply("gate list bd-1 --json", {
-        stdout: JSON.stringify([
-          {
-            id: "bd-160",
-            status: "open",
-            issue_type: "gate",
-            await_type: "human",
-            created_at: "2026-10-26T20:00:00Z",
-          },
-        ]),
-      });
-      bd.reply("comments bd-1 --json", {
-        stdout: JSON.stringify([
-          {
-            id: "c-2",
-            issue_id: "bd-1",
-            author: "hugo",
-            created_at: "2026-10-26T20:05:00Z",
-            text: "option b, ship it",
-          },
-        ]),
-      });
-      bd.reply("gate resolve bd-160", { stdout: "resolved" });
-      const delivered = await humanAnswerMessage(ctx, deps);
-      expect(delivered?.message.content).toBe("hugo answered: option b, ship it");
-    } finally {
-      stopHumanAnswerPoll(state);
-    }
+    const record = readRecord();
+    expect(record.reason).toBe(REVIEW_FIX_LOOP_REASON);
+    expect(evaluateDeferredFindingsGate(record).ok).toBe(true);
+    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
   });
 
   it("carries an earlier round's security verdict when the live table no longer matches", async () => {
@@ -1144,7 +1450,7 @@ describe("sensitive review findings (bd-183)", () => {
     });
 
     const state = makeState();
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
@@ -1152,7 +1458,7 @@ describe("sensitive review findings (bd-183)", () => {
       reviewText: PLAIN_REVIEW,
     });
     try {
-      expect(opened.opened).toBe(true);
+      expect(opened.gateOpened).toBe(true);
       const gateCall = bd.calls
         .filter((call) => bd.keyOf(call.argv).startsWith("gate create"))
         .at(-1);
@@ -1213,7 +1519,7 @@ describe("sensitive review findings (bd-183)", () => {
     });
 
     const state = makeState();
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps: makeDeps(state),
@@ -1221,7 +1527,7 @@ describe("sensitive review findings (bd-183)", () => {
       reviewText: COLLIDING_REVIEW,
     });
     try {
-      expect(opened.opened).toBe(true);
+      expect(opened.gateOpened).toBe(true);
       const gateCall = bd.calls
         .filter((call) => bd.keyOf(call.argv).startsWith("gate create"))
         .at(-1);
@@ -1247,14 +1553,14 @@ describe("sensitive review findings (bd-183)", () => {
   it("does not announce a reset when the previous round only withheld", async () => {
     const state = makeState();
     const deps = makeDeps(state);
-    const first = await openReviewHumanGate({
+    const first = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-1",
       reviewText: SENSITIVE_REVIEW,
     });
-    expect(first.opened).toBe(true);
+    expect(first.gateOpened).toBe(true);
     try {
       await deliverAnswer(deps, "withhold");
       expect(readRecord().findings[0]?.publication).toMatchObject({ kind: "withhold" });
@@ -1265,7 +1571,7 @@ describe("sensitive review findings (bd-183)", () => {
     bd.reply(sensitiveGateKey({ round: 2 }), {
       stdout: JSON.stringify({ id: "bd-164", status: "open" }),
     });
-    const second = await openReviewHumanGate({
+    const second = await deliverReviewFindings({
       state,
       ctx,
       deps,
@@ -1273,7 +1579,7 @@ describe("sensitive review findings (bd-183)", () => {
       reviewText: SENSITIVE_REVIEW,
     });
     try {
-      expect(second.opened).toBe(true);
+      expect(second.gateOpened).toBe(true);
       const gateCall = bd.calls
         .filter((call) => bd.keyOf(call.argv).startsWith("gate create"))
         .at(-1);
@@ -1320,14 +1626,14 @@ describe("sensitive review findings (bd-183)", () => {
       bd.reset();
       bd.reply(sensitiveGateKey(), { stdout: JSON.stringify({ id: "bd-160", status: "open" }) });
       bd.reply(COMMENT_KEY, { stdout: "" });
-      const opened = await openReviewHumanGate({
+      const opened = await deliverReviewFindings({
         state,
         ctx,
         deps,
         taskId: "bd-1",
         reviewText: SENSITIVE_REVIEW,
       });
-      expect(opened.opened).toBe(true);
+      expect(opened.gateOpened).toBe(true);
       try {
         testCase.prepare();
         const content = (await deliverAnswer(deps, "publish it")) ?? "";

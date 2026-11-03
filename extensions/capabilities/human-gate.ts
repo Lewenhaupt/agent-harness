@@ -42,6 +42,9 @@ import {
   nextReviewRound,
   type PublicationAnswerRefusalCause,
   REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
+  REVIEW_GATE_FAILURE_PREFIX,
+  REVIEW_NO_FINDINGS_REASON,
+  type ReviewFindingsRecord,
   readReviewFindingsRecord,
   recordPublicationAnswer,
   releasedPublicationIn,
@@ -58,6 +61,7 @@ import {
   runGhCommand,
   textToolResult,
 } from "./context.js";
+import { HUMAN_ESCALATION_LINES } from "./review.js";
 
 /** Composer-supplied seams: the session store and the beads-actor resolver. */
 export interface HumanGateDeps {
@@ -130,21 +134,18 @@ export function nextStepBlockLines(state: CoreSessionState, nextStepLine: string
 }
 
 /**
- * Prompt guidance for the human answer channel (bd-152, bd-182).
+ * Prompt guidance for the human answer channel (bd-152, bd-182, bd-219).
  *
- * The ask line is unconditional: the one moment the orchestrator needs
- * `belayd_ask_human` is the moment it feels blocked, which is exactly when an
- * advisory note is not read unless it has been repeated every turn. The wait
- * block replaces the "call belayd_X" next step, because a refused tool with no
+ * The ask line is the shared two-condition policy, repeated every turn because
+ * the model reads it exactly when it feels blocked — which is the moment it is
+ * tempted to gate instead of fixing what it can fix (bd-219). The wait block
+ * replaces the "call belayd_X" next step, because a refused tool with no
  * explanation is what makes a model retry or guess instead of waiting. The reply
  * line names the real channel, so a GitHub-primary wait never tells anyone to
  * answer in a place its poll does not read.
  */
 export function humanAnswerGuidanceLines(state: CoreSessionState): string[] {
-  const lines = [
-    "",
-    "**Blocked on a human decision?** Call `belayd_ask_human` with the question, then END YOUR TURN: it posts the question (as a bd comment, or on the mapped GitHub issue for a GitHub-primary repo), opens a `human` gate, and refuses every phase tool until an answer arrives. Never guess and never proceed without the answer.",
-  ];
+  const lines = ["", ...HUMAN_ESCALATION_LINES];
   const awaiting = state.awaitingHuman;
   if (awaiting === undefined) return lines;
   lines.push(
@@ -570,7 +571,7 @@ function deliverableAnswerText(observed: DeliverableObservation): string {
  * exists in every worktree that ever ran a review, so "a sensitive record exists"
  * would let any later human answer in the worktree ("yes, ship it") release every
  * withheld finding (bd-183 review, Critical). `reviewFindings` is set only by
- * {@link openReviewHumanGate}, only when the record has sensitive findings, and
+ * {@link deliverReviewFindings}, only when the record has sensitive findings, and
  * carries the round so a re-review's record cannot be answered by an older wait.
  *
  * Fail-closed: no marker → no recording; a write failure or a refused recording →
@@ -1040,6 +1041,15 @@ async function createHumanGate(options: {
   return gateId === undefined ? { ok: true } : { ok: true, gateId };
 }
 
+/**
+ * The reason prefix a failed record write contributes to the delivery result.
+ *
+ * The seam owns the "could not record the review findings" line; the delivery
+ * reason reuses the same words so the caller's single "not fully delivered" line
+ * names the lost record in the same terms as the daemon log.
+ */
+const REVIEW_RECORD_FAILURE_PREFIX = "could not record the review findings";
+
 /** What the orchestrator is told after a question was asked. */
 function askResultText(options: { taskId: string; gateId?: string }): string {
   const gate = options.gateId === undefined ? "" : ` (gate ${options.gateId})`;
@@ -1055,46 +1065,54 @@ function askResultText(options: { taskId: string; gateId?: string }): string {
 }
 
 /**
- * Turn a review that reported findings into the same human wait `belayd_ask_human`
- * opens (bd-175).
+ * Record a review that reported findings, and escalate only the one decision the
+ * orchestrator may not take itself (bd-219).
  *
- * Three writes, in this order: the gate first (so the wait is visible in
- * bd/Scotty even if a later write fails), then the durable disposition record
- * (only once the gate exists — a record with no gate would claim a wait bd and
- * the fix loop cannot see), then the findings comment authored by the workflow
- * actor (so it can never count as the human's answer).
+ * The delivery is a **trace**, not a question: the durable disposition record is
+ * always written and the findings comment is always posted by the workflow
+ * actor, so a human can read what the review found and the orchestrator can read
+ * it too. No gate, no wait and no answer poll is created for ordinary findings —
+ * the fix-loop contract already says every Critical and Warning must be
+ * addressed, so asking a human whether to address them only bought a wait per
+ * review (bd-219).
  *
- * The wait is reserved synchronously before the first `await` via
- * `state.reviewGatePending`, so two review deliveries settling concurrently
- * cannot both pass the check and open two gates. The pending marker is never
- * exposed as `awaitingHuman`: the gate does not exist yet, and the answer poll
- * would read the empty gate list as "the human resolved it". The marker is
- * released in a `finally` that touches nothing else, so even a throw inside the
- * gated section cannot strand it — nor can it unblock a gate that already exists.
+ * The one exception is a security-class finding (bd-183): its *publication* is a
+ * risk decision, so the gate is created first (so the wait is visible in
+ * bd/Scotty even if a later write fails), then the same record and comment, then
+ * the answer poll. A record with no sensitive findings leaves
+ * `state.awaitingHuman` untouched. If a human wait is already open the round
+ * still advances but no second gate is created: the comment carries the re-ask
+ * notice and the result names the skipped publication question, because the open
+ * gate would otherwise answer this round with `round-mismatch`.
  *
- * Called from the review phase's completion delivery, so a non-empty review
- * stops the member on a *findable* wait: the gate blocks the bead, `needs-you`
- * views list it, and resolving it (or answering in a comment) resumes the
- * member through the existing answer poll.
+ * The reservation (`state.reviewGatePending`) is still taken synchronously
+ * before the first `await`, so two sensitive deliveries settling concurrently
+ * cannot both create a gate. It is never exposed as `awaitingHuman`: while it is
+ * set no gate exists yet, and the answer poll would read the empty gate list as
+ * "the human resolved it". The marker is released in a `finally` that touches
+ * nothing else, so a throw inside the section can neither strand it nor unblock a
+ * gate that already exists.
  */
-export async function openReviewHumanGate(options: {
+export async function deliverReviewFindings(options: {
   state: CoreSessionState;
   ctx: ExtensionContext;
   deps: HumanGateDeps;
   taskId: string;
   reviewText: string;
-}): Promise<{ opened: boolean; reason: string }> {
+}): Promise<{ recorded: boolean; gateOpened: boolean; reason: string }> {
   const { state } = options;
-  if (state.awaitingHuman !== undefined) {
-    return { opened: false, reason: `already waiting on ${state.awaitingHuman.beadId}` };
-  }
   if (state.reviewGatePending === true) {
-    return { opened: false, reason: "a review gate is already being opened" };
+    return {
+      recorded: false,
+      gateOpened: false,
+      reason: "a review delivery is already in progress",
+    };
   }
   // Same guard `resolveAskTarget` applies to the ask path: a crafted task id must
-  // never reach `orchestratorActor` or a bd argv.
+  // never reach `orchestratorActor` or a bd argv. It also guards the record write,
+  // which names the task id.
   if (!isValidTaskId(options.taskId)) {
-    return { opened: false, reason: `invalid task id "${options.taskId}"` };
+    return { recorded: false, gateOpened: false, reason: `invalid task id "${options.taskId}"` };
   }
   // Read once for the reset announcement and the cross-round union below; the
   // round itself still comes from `nextReviewRound`, so the two can never disagree
@@ -1106,69 +1124,54 @@ export async function openReviewHumanGate(options: {
     round: nextReviewRound({ cwd: options.ctx.cwd }),
   });
   if (rebuilt === undefined) {
-    return { opened: false, reason: "the review reported no findings" };
+    // Fast path: a clean review must not touch bd or the record file at all.
+    return { recorded: false, gateOpened: false, reason: REVIEW_NO_FINDINGS_REASON };
   }
   // A finding that was security-class in an earlier round stays security-class
   // even when the live rule table no longer matches it (bd-183 review, Critical).
   const record = carryForwardSensitivity({ record: rebuilt, previous });
+  const sensitive = hasSensitiveFindings(record);
+  // A re-review rebuilds the record without decisions, so an earlier round's
+  // "publish" silently stops applying. Announce that instead of letting the
+  // human re-discover it as a withheld finding (bd-183 review).
+  const previousDecisionsReset =
+    previous !== undefined && previous.round < record.round && releasedPublicationIn(previous);
 
   const actor =
     options.deps.resolveSessionBdActor(options.ctx) ?? orchestratorActor(options.taskId);
   // Reserve synchronously so a concurrent delivery bails at the check above
-  // instead of racing this one to a second gate. `reviewGatePending`, not
-  // `awaitingHuman`, because the gate does not exist yet.
+  // instead of racing this one to a second gate.
   const askedAt = Date.now();
   state.reviewGatePending = true;
   try {
-    const sensitive = hasSensitiveFindings(record);
-    // A re-review rebuilds the record without decisions, so an earlier round's
-    // "publish" silently stops applying. Announce that instead of letting the
-    // human re-discover it as a withheld finding (bd-183 review).
-    const previousDecisionsReset =
-      previous !== undefined && previous.round < record.round && releasedPublicationIn(previous);
-    const created = await createHumanGate({
-      taskId: options.taskId,
-      question: reviewFindingsGateReason(record, { previousDecisionsReset }),
-      actor,
-      title: reviewFindingsGateTitle({
-        taskId: options.taskId,
-        round: record.round,
-        sensitive,
-        previousDecisionsReset,
-      }),
+    const gate = await createSensitiveReviewGate({
+      state,
       ctx: options.ctx,
+      taskId: options.taskId,
+      record,
+      sensitive,
+      previousDecisionsReset,
+      actor,
     });
-    if (!created.ok) {
-      return { opened: false, reason: `could not open a human gate: ${created.error}` };
-    }
-    const answerTarget = options.deps.resolveGithubAnswerTarget(
-      { cwd: options.ctx.cwd },
-      options.taskId,
-    );
-    const channel = channelOf(answerTarget);
-    const wait: HumanAnswerWait = {
-      beadId: options.taskId,
-      askedAt,
-      channel,
-      ...(created.gateId === undefined ? {} : { gateId: created.gateId }),
-      // Only a sensitive review wait may record a publication decision; the ask
-      // tool and restart discovery never set this marker.
-      ...(sensitive ? { reviewFindings: { round: record.round } } : {}),
-    };
-    state.awaitingHuman = wait;
 
     const written = writeReviewFindingsRecord({ cwd: options.ctx.cwd, record });
     if (!written.ok) {
-      console.warn(`[belayd-harness] could not record the review findings: ${written.error}`);
+      console.warn(`[belayd-harness] ${REVIEW_RECORD_FAILURE_PREFIX}: ${written.error}`);
     }
 
-    // A failed comment must not remove the gate: the gate's reason is itself the
-    // visible wait, so the member stays stopped on a findable record either way.
+    // The comment is the trace a human reads and the orchestrator acts on. A
+    // failed post must not remove a gate that already blocks the bead.
+    const channel = channelOf(
+      options.deps.resolveGithubAnswerTarget({ cwd: options.ctx.cwd }, options.taskId),
+    );
     const posted = await postChannelBody({
       channel,
       body: phaseCommentBody(
         "review",
-        formatReviewFindingsComment(record, { previousDecisionsReset }),
+        formatReviewFindingsComment(record, {
+          previousDecisionsReset,
+          publicationReaskRequired: gate.status === "already-waiting",
+        }),
       ),
       actor,
       taskId: options.taskId,
@@ -1176,19 +1179,151 @@ export async function openReviewHumanGate(options: {
     });
     if (!posted.ok) {
       console.warn(`[belayd-harness] could not post the review findings comment: ${posted.error}`);
-    } else if (posted.commentId !== undefined) {
-      // The findings record is the question here; exclude it like the ask path.
-      wait.answerCommentId = posted.commentId;
     }
 
-    startHumanAnswerPoll(state, options.ctx, options.deps);
-    return { opened: true, reason: record.reason };
+    if (gate.status === "opened") {
+      const wait: HumanAnswerWait = {
+        beadId: options.taskId,
+        askedAt,
+        channel,
+        ...(gate.gateId === undefined ? {} : { gateId: gate.gateId }),
+        // Only a sensitive review wait may record a publication decision; the ask
+        // tool and restart discovery never set this marker.
+        reviewFindings: { round: record.round },
+      };
+      if (posted.ok && posted.commentId !== undefined) {
+        // The findings comment is the question here; exclude it like the ask path.
+        wait.answerCommentId = posted.commentId;
+      }
+      state.awaitingHuman = wait;
+      startHumanAnswerPoll(state, options.ctx, options.deps);
+    }
+
+    return {
+      recorded: written.ok,
+      gateOpened: gate.status === "opened",
+      reason: reviewDeliveryReason({ record, written, gate }),
+    };
   } finally {
     // Only the reservation is released here. `awaitingHuman` is the wait itself
     // and must survive a throw: clearing it in `finally` would silently unblock a
     // member whose gate is already open and visible in bd.
     state.reviewGatePending = undefined;
   }
+}
+
+/**
+ * The delivery reason for a record whose write and/or sensitive gate may have
+ * failed.
+ *
+ * Both failures can happen in the same delivery: bd refuses the publication gate
+ * and the worktree record cannot be written. Each has its own console line (the
+ * write here, the gate in {@link createSensitiveReviewGate}), but the caller's
+ * single "not fully delivered" line quotes only this string, so naming just the
+ * gate hides the lost record. A double failure therefore names both with their
+ * own labels, record first; success and every single failure keep their existing
+ * wording. The labels matter because either constituent can itself contain `;`
+ * (the already-waiting reason does), so a bare `; ` would not separate them.
+ */
+function reviewDeliveryReason(options: {
+  record: ReviewFindingsRecord;
+  written: { ok: true } | { ok: false; error: string };
+  gate: SensitiveGateOutcome;
+}): string {
+  const gateReason = gateSkippedReason(options.gate);
+  if (options.written.ok || gateReason === undefined) return gateReason ?? options.record.reason;
+  return (
+    `${REVIEW_RECORD_FAILURE_PREFIX}: ${options.written.error}` +
+    ` and the sensitive-findings gate was not armed: ${gateReason}`
+  );
+}
+
+/**
+ * Why a sensitive record did or did not get its bd-183 publication gate.
+ *
+ * `already-waiting` and `failed` are deliberately different: the first means a
+ * human wait exists and the round's question could not be attached to it, the
+ * second means bd refused the gate. Both keep the record + comment path running,
+ * and both need their own words in the delivery result.
+ */
+type SensitiveGateOutcome =
+  | { status: "not-sensitive" }
+  | { status: "opened"; gateId?: string }
+  | { status: "already-waiting"; reason: string }
+  | { status: "failed"; reason: string };
+
+/** The reason a skipped sensitive gate carries, or `undefined` when it opened. */
+function gateSkippedReason(gate: SensitiveGateOutcome): string | undefined {
+  switch (gate.status) {
+    case "already-waiting":
+    case "failed":
+      return gate.reason;
+    case "not-sensitive":
+    case "opened":
+      return undefined;
+  }
+}
+
+/**
+ * Create the bd-183 publication gate, or report why none was created.
+ *
+ * Split out of {@link deliverReviewFindings} because the decision has four
+ * separate outcomes (not sensitive, gate opened, a human wait already open, a bd
+ * failure) and each one has to keep the record + comment path running.
+ *
+ * This function owns the **single** log line for each escalation it cannot arm
+ * (a refused gate, an already-open human wait). The phase-run caller only logs a
+ * skipped record, so one failed gate never produces two lines.
+ */
+async function createSensitiveReviewGate(options: {
+  state: CoreSessionState;
+  ctx: ExtensionContext;
+  taskId: string;
+  record: ReviewFindingsRecord;
+  sensitive: boolean;
+  previousDecisionsReset: boolean;
+  actor: string;
+}): Promise<SensitiveGateOutcome> {
+  if (!options.sensitive) return { status: "not-sensitive" };
+  if (options.state.awaitingHuman !== undefined) {
+    // why: the record's round has already advanced, so the gate the human can see
+    // answers `round-mismatch` to this round's publication question. A second gate
+    // is worse (two polls, one answer), so the loss is announced instead of hidden
+    // — the comment names the re-ask and this log line names the member.
+    const reason =
+      `already waiting on ${options.state.awaitingHuman.beadId}; ` +
+      "the new round's publication question is not armed";
+    console.warn(
+      `[belayd-harness] could not arm the sensitive-findings publication question: ${reason}`,
+    );
+    return { status: "already-waiting", reason };
+  }
+  const created = await createHumanGate({
+    taskId: options.taskId,
+    question: reviewFindingsGateReason(options.record, {
+      previousDecisionsReset: options.previousDecisionsReset,
+    }),
+    actor: options.actor,
+    title: reviewFindingsGateTitle({
+      taskId: options.taskId,
+      round: options.record.round,
+      sensitive: true,
+      previousDecisionsReset: options.previousDecisionsReset,
+    }),
+    ctx: options.ctx,
+  });
+  if (!created.ok) {
+    // The gate failing must not silence the bd-183 surface: without this line the
+    // skipped publication question was only visible as an unused return value.
+    console.warn(
+      "[belayd-harness] could not open the sensitive-findings human gate",
+      created.error,
+    );
+    return { status: "failed", reason: `${REVIEW_GATE_FAILURE_PREFIX}: ${created.error}` };
+  }
+  return created.gateId === undefined
+    ? { status: "opened" }
+    : { status: "opened", gateId: created.gateId };
 }
 
 /** `runBdCommand` as an error value, so tool handlers never throw on bd. */

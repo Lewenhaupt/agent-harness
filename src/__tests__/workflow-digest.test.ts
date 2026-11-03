@@ -336,6 +336,22 @@ describe("workflow digest sections (bd-189)", () => {
     expect(text).toContain("- waiting on: unknown (gate read failed: bd gate list timed out)");
   });
 
+  it("renders no human wait for a post-review member with no open gate (bd-219)", () => {
+    // `awaitingReviewResponse` persists on every review completion, so reading it
+    // as a wait contradicted the digest's own `- state: active` while the member
+    // was running its fix loop.
+    const text = digestText({ memberState: "active", awaitingReviewResponse: true });
+    expect(text).toContain("- state: active");
+    expect(text).toContain("- waiting on: nothing (no open gate)");
+    expect(text).not.toContain("operator review response");
+
+    // The other post-bd-219 wait branch still comes from the gate read: a fleet
+    // ordering gate is a genuine wait, and the two branches must not drift.
+    expect(digestText({ gates: { orderingBlocker: "bd-12" } })).toContain(
+      "- waiting on: bd-12 (fleet ordering gate)",
+    );
+  });
+
   it("says the bead read failed instead of dropping the column (S3)", () => {
     const text = digestText({ beadError: "bd show timed out after 10000ms" });
     expect(text).toContain("- bead: unknown (bd read failed: bd show timed out after 10000ms)");

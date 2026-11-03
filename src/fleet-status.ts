@@ -403,6 +403,13 @@ export interface FleetMemberSnapshot {
   createdAt?: number;
   /** Orchestrator lease as read; no clock is applied here (freshness is the tools' job). */
   lease: FleetLeaseSnapshot;
+  /**
+   * Whether the bead had an open bd `human` gate when the caller read it (bd-219).
+   *
+   * Only set when the caller actually read the bead's gates; absent = unknown, and
+   * unknown is not a wait. The read-only builder never spawns bd itself.
+   */
+  humanGateOpen?: boolean;
 }
 
 /**
@@ -484,6 +491,12 @@ export interface FleetMemberView {
   phaseOrder: readonly string[];
   completedPhases: readonly string[];
   pendingPhases: readonly string[];
+  /**
+   * The review phase flag, persisted on every review completion. It is a *phase*
+   * fact only: since bd-219 it never means a human is waiting, because a review
+   * with findings runs its own fix loop. The `awaiting-human` state comes from an
+   * open bd gate instead.
+   */
   awaitingReviewResponse: boolean;
   latestRuns: readonly FleetPhaseRunView[];
   interruptedRunCount: number;
@@ -749,7 +762,11 @@ export interface DeriveFleetMemberStateInput {
   runs: readonly RunManifest[];
   completedPhases: readonly string[];
   pendingPhases: readonly string[];
-  awaitingReviewResponse: boolean;
+  /**
+   * The bead's open bd `human` gate, read by the caller (bd-219). Absent means the
+   * caller did not read the gates, and not-read is never a wait.
+   */
+  humanGateOpen?: boolean;
 }
 
 /**
@@ -760,7 +777,7 @@ export interface DeriveFleetMemberStateInput {
 export function deriveFleetMemberState(input: DeriveFleetMemberStateInput): FleetMemberState {
   if (input.workflow.kind !== "ok") return "missing-state";
   if (countInterrupted(input.runs) > 0) return "interrupted";
-  if (input.awaitingReviewResponse || hasUndeliveredUserCompletion(input.runs)) {
+  if (input.humanGateOpen === true || hasUndeliveredUserCompletion(input.runs)) {
     return "awaiting-human";
   }
   if (hasFailedPendingPhase(input)) return "blocked";
@@ -830,7 +847,7 @@ function memberView(
       runs,
       completedPhases,
       pendingPhases,
-      awaitingReviewResponse,
+      ...(snapshot.humanGateOpen === undefined ? {} : { humanGateOpen: snapshot.humanGateOpen }),
     }),
   };
 }
@@ -1428,7 +1445,15 @@ export function applyFleetBeadEngagement(
     members: status.members.map((member) => {
       if (member.taskId === undefined) return member;
       const engagement = byTaskId.get(member.taskId.toLowerCase());
-      return engagement === undefined ? member : { ...member, engagement };
+      if (engagement === undefined) return member;
+      // A bead with an open `human` label reads as a real person-wait without a
+      // second bd read (bd-219), but never over an unreadable tree or a crash:
+      // both are states an operator must see as themselves.
+      const awaitingHuman = engagement.awaitingHuman === true;
+      const overridable = member.state !== "missing-state" && member.state !== "interrupted";
+      return awaitingHuman && overridable
+        ? { ...member, engagement, state: "awaiting-human" }
+        : { ...member, engagement };
     }),
   };
 }

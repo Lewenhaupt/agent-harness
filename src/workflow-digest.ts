@@ -78,6 +78,13 @@ export interface SupervisionMemberFacts {
   phaseOrder: readonly string[];
   completedPhases: readonly string[];
   pendingPhases: readonly string[];
+  /**
+   * The review phase flag recorded in `workflow.json`. It is a *phase* fact and is
+   * deliberately not a wait trigger: since bd-219 it is set on every review
+   * completion while the member runs its own fix loop, so treating it as a wait
+   * described a human decision nobody was asked for. Kept on the facts so a reader
+   * sees what the state file says; {@link formatWaitingOn} ignores it.
+   */
   awaitingReviewResponse: boolean;
   /** workflow.json `updatedAt`, raised to the newest run timestamp when later. */
   updatedAt?: number;
@@ -372,9 +379,9 @@ function formatWaitingOn(member: SupervisionMemberFacts, now: number): string {
   if (gates.readError !== undefined) {
     return `- waiting on: unknown (gate read failed: ${gates.readError})`;
   }
-  if (member.awaitingReviewResponse) {
-    return "- waiting on: operator review response";
-  }
+  // `member.awaitingReviewResponse` is deliberately not consulted (bd-219): it is a
+  // persisting review phase flag, not an open question, and a "waiting on" line for
+  // it contradicts the digest's own `- state: active`.
   return "- waiting on: nothing (no open gate)";
 }
 

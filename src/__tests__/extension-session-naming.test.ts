@@ -14,6 +14,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildHandoff, handoffFilePath, writeHandoff } from "../handoff.js";
 import { REVIEW_SECTION_LIMITS } from "../review-context.js";
+import { REVIEW_FIX_LOOP_REASON, readReviewFindingsRecord } from "../review-findings.js";
 import {
   listRuns,
   RunStatus,
@@ -3340,7 +3341,11 @@ describe("session_start resume from disk (bd-40)", () => {
       sessionName: "mocked-review",
     });
 
+    // Only this review's bd calls: the recorder is shared with every case in the
+    // file, so a shuffled run would otherwise see another case's gate/comment.
+    const callsBeforeReview = mockExecFile.calls.length;
     await runPhase("review", "review");
+    const reviewCalls = mockExecFile.calls.slice(callsBeforeReview);
 
     const delivered = messages
       .filter((message) => message.customType === "belayd-run-complete")
@@ -3352,9 +3357,25 @@ describe("session_start resume from disk (bd-40)", () => {
     expect(delivered).not.toContain(`defect ${REVIEW_SECTION_LIMITS.critical + 1}`);
     expect(delivered).not.toContain("✓ All error paths look correct");
     expect(delivered).toContain("## Warnings (should fix)\n- None");
-    // The findings opened a human gate through the real seam, so the delivery must
-    // not tell the blocked member to advance to the next phase (bd-175).
-    expect(delivered).not.toContain("**When review findings remain:**");
+    // Findings no longer gate (bd-219): the delivery must tell the orchestrator
+    // how to run the fix loop, because that is what it is expected to do next.
+    expect(delivered).toContain("**When review findings remain:**");
+    expect(delivered).toContain("belayd_test");
+
+    // ...and the same real delivery is the trace, not a question: a phase run
+    // writes the disposition record and posts the authored comment, and never
+    // creates the human gate that used to stop the member.
+    const record = readReviewFindingsRecord({ cwd });
+    expect(record?.round).toBe(1);
+    expect(record?.reason).toBe(REVIEW_FIX_LOOP_REASON);
+    const reviewComment = reviewCalls.find(
+      (call) => call.file === "bd" && call.args[0] === "comment",
+    );
+    expect(reviewComment?.stdin.startsWith("[belayd:review]\n")).toBe(true);
+    expect(reviewComment?.stdin).toContain("src/a.ts:1");
+    expect(
+      reviewCalls.filter((call) => call.file === "bd" && call.args[0] === "gate"),
+    ).toHaveLength(0);
   });
 
   it("discloses an unavailable diff instead of silently sending the bare task (W3)", async () => {

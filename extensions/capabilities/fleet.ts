@@ -309,6 +309,56 @@ export interface FleetDeps {
  */
 const ORDERING_SWEEP_CONCURRENCY = 3;
 
+/**
+ * How many member `bd gate list` reads one tick runs at once (bd-219 review).
+ *
+ * Same reasoning as `ENGAGEMENT_CONCURRENCY`: every read is one bd subprocess, so
+ * a wide burst starves the database the tick is describing, while a serial crawl
+ * makes one slow bd stretch a tick by members × the 15 s read timeout — delaying
+ * the very stall/halt decisions the tick exists to make.
+ */
+const MEMBER_GATE_READ_CONCURRENCY = 4;
+
+/**
+ * Map with a small fixed concurrency, preserving input order in the result.
+ *
+ * Module-level because both the ordering sweep and the per-member observation fan-out
+ * need it; `Promise.all` over a whole list would fork every bd read at once.
+ */
+async function mapBounded<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      const item = items[index];
+      if (item !== undefined) results[index] = await fn(item);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
+ * One observation per task id, in `taskIds` order, with bounded concurrency.
+ *
+ * Exported so the ordering/count contract the tick relies on is directly
+ * testable: `fleetMemberSignatures` and the stall accounting both assume exactly
+ * one entry per member, in the caller's order, and a fan-out that dropped or
+ * reordered a member would make a healthy run look stalled.
+ */
+export async function readMemberObservationsBounded(options: {
+  taskIds: readonly string[];
+  observe: (taskId: string) => Promise<FleetMemberObservation>;
+}): Promise<FleetMemberObservation[]> {
+  return mapBounded(options.taskIds, MEMBER_GATE_READ_CONCURRENCY, options.observe);
+}
+
 /** The one turn-start message the fleet note drain produces. */
 export interface FleetDrainMessage {
   message: { customType: string; content: string; display: boolean };
@@ -1096,24 +1146,28 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /** Read every member's workflow progress plus its orchestrator lease. */
-  function readFleetMemberObservations(options: {
+  async function readFleetMemberObservations(options: {
     cwd: string;
     intent: FleetIntent;
     run: FleetRun;
     now: number;
-  }): FleetMemberObservation[] {
-    return options.intent.taskIds.map((taskId) =>
-      observeFleetMember({ cwd: options.cwd, taskId, run: options.run, now: options.now }),
-    );
+  }): Promise<FleetMemberObservation[]> {
+    // Bounded fan-out: each member may cost one bd gate read, and one hung read
+    // must not serialise the rest of the tick (bd-219 review).
+    return readMemberObservationsBounded({
+      taskIds: options.intent.taskIds,
+      observe: (taskId) =>
+        observeFleetMember({ cwd: options.cwd, taskId, run: options.run, now: options.now }),
+    });
   }
 
   /** Read one member's workflow progress and orchestrator lease from its worktree. */
-  function observeFleetMember(options: {
+  async function observeFleetMember(options: {
     cwd: string;
     taskId: string;
     run: FleetRun;
     now: number;
-  }): FleetMemberObservation {
+  }): Promise<FleetMemberObservation> {
     const launchedAt = options.run.members?.find(
       (member) => member.taskId === options.taskId,
     )?.launchedAt;
@@ -1124,11 +1178,19 @@ export function createFleet(deps: FleetDeps): FleetApi {
         taskId: options.taskId,
         progress: { kind: "missing", detail: `no worktree holds feat/${options.taskId}` },
         claim: "absent",
+        humanGateOpen: false,
         ...launched,
       };
     }
     const state = readWorkflowState({ cwd: worktreePath });
     const runs = listRuns({ cwd: worktreePath });
+    // Skip the bd spawn when the workflow state is unreadable: progress from a
+    // missing state can never be `awaiting-human`, so the read would have no
+    // consumer (bd-219 review). A worktree-less member already returned above.
+    const humanGateOpen =
+      state === undefined
+        ? false
+        : await readMemberHumanGate({ taskId: options.taskId, worktreePath });
     const workflow: FleetWorkflowProgressSnapshot =
       state === undefined
         ? { kind: "missing" }
@@ -1136,7 +1198,6 @@ export function createFleet(deps: FleetDeps): FleetApi {
             kind: "ok",
             completedPhaseNames: state.completedPhaseNames,
             phaseOrder: state.phaseOrder,
-            awaitingReviewResponse: state.awaitingReviewResponse === true,
           };
     const progress = deriveFleetMemberProgress({
       taskId: options.taskId,
@@ -1145,11 +1206,33 @@ export function createFleet(deps: FleetDeps): FleetApi {
       now: options.now,
       ...(state === undefined ? {} : { phaseOrder: state.phaseOrder }),
       ...launched,
+      humanGateOpen,
     });
     const probe = leaseProbeFor(worktreePath, options.now);
     const claim: FleetMemberClaim =
       probe.state === "live" ? "live" : probe.state === "corrupt" ? "corrupt" : probe.state;
-    return { taskId: options.taskId, progress, claim, ...launched };
+    return { taskId: options.taskId, progress, claim, humanGateOpen, ...launched };
+  }
+
+  /**
+   * Whether the member's bead has an open bd `human` gate (bd-219).
+   *
+   * Best-effort and silent on failure: one tick's bd read failing must not become
+   * a warning every 15 s, and an unread gate is "unknown", never a wait (a member
+   * wrongly read as waiting would hold the run under the 12 h human cap instead of
+   * the 1 h stall cap). An ordering gate is not this member's own wait either, so
+   * `lookupOpenHumanGate` reports it separately and it stays `false` here.
+   */
+  async function readMemberHumanGate(options: {
+    taskId: string;
+    worktreePath: string;
+  }): Promise<boolean> {
+    const lookup = await lookupOpenHumanGate({
+      beadId: options.taskId,
+      cwd: options.worktreePath,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    });
+    return lookup.ok && lookup.status === "open";
   }
 
   /** Add freshly launched members to the run record (pure; the tick persists it). */
@@ -2402,26 +2485,6 @@ export function createFleet(deps: FleetDeps): FleetApi {
     return bead === undefined ? [] : [bead];
   }
 
-  /** Map with a small fixed concurrency, preserving input order in the result. */
-  async function mapBounded<T, R>(
-    items: readonly T[],
-    limit: number,
-    fn: (item: T) => Promise<R>,
-  ): Promise<R[]> {
-    const results: R[] = new Array<R>(items.length);
-    let cursor = 0;
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (cursor < items.length) {
-        const index = cursor;
-        cursor += 1;
-        const item = items[index];
-        if (item !== undefined) results[index] = await fn(item);
-      }
-    });
-    await Promise.all(workers);
-    return results;
-  }
-
   function edgeKeyOf(edge: { blocker: string; blocked: string }): string {
     return `${edge.blocker}\u0000${edge.blocked}`;
   }
@@ -2808,7 +2871,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
     const tickIntent = swept.intent;
     const tickRun = swept.run;
-    const observations = readFleetMemberObservations({
+    const observations = await readFleetMemberObservations({
       cwd: ctx.cwd,
       intent: tickIntent,
       run: tickRun,

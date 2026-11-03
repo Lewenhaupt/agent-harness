@@ -481,7 +481,7 @@ describe("deriveFleetMemberState", () => {
     runs: [] as RunManifest[],
     completedPhases: ["plan"],
     pendingPhases: ["implement", "review", "test", "commit"],
-    awaitingReviewResponse: false,
+    humanGateOpen: false,
   };
 
   it("treats unreadable workflow state as missing-state", () => {
@@ -498,15 +498,15 @@ describe("deriveFleetMemberState", () => {
       deriveFleetMemberState({
         ...base,
         runs: [sampleRun({ phase: "implement", status: RunStatus.Interrupted })],
-        awaitingReviewResponse: true,
+        humanGateOpen: true,
       }),
     ).toBe("interrupted");
   });
 
-  it("reports awaiting-human for a pending review response or an undelivered user completion", () => {
-    expect(deriveFleetMemberState({ ...base, awaitingReviewResponse: true })).toBe(
-      "awaiting-human",
-    );
+  it("reports awaiting-human for an open human gate or an undelivered user completion", () => {
+    expect(deriveFleetMemberState({ ...base, humanGateOpen: true })).toBe("awaiting-human");
+    // A review phase flag alone is not a wait: the member runs its own fix loop.
+    expect(deriveFleetMemberState({ ...base, humanGateOpen: false })).toBe("active");
     expect(
       deriveFleetMemberState({
         ...base,
@@ -548,12 +548,12 @@ describe("deriveFleetMemberState", () => {
   });
 
   it("prefers awaiting-human over a failed pending phase", () => {
-    // An operator owes a review response; the failed run is not the dominant
+    // An operator owes an answer on an open gate; the failed run is not the dominant
     // signal, so the state must not decay to `blocked`.
     expect(
       deriveFleetMemberState({
         ...base,
-        awaitingReviewResponse: true,
+        humanGateOpen: true,
         runs: [sampleRun({ phase: "implement", status: RunStatus.Failed })],
       }),
     ).toBe("awaiting-human");
@@ -804,6 +804,41 @@ describe("buildFleetStatus", () => {
     expect(status.members[0]).toHaveProperty("state", "active");
     expect(status.members[0]).toHaveProperty("interruptedRunCount", 0);
     expect(status.members[0]?.latestRuns).toEqual([]);
+  });
+
+  it("reads a post-review member as active, not awaiting-human (bd-219)", () => {
+    // `awaitingReviewResponse` is persisted on every review completion, so it used
+    // to make a member working its own fix loop look stopped. It is a phase flag;
+    // only an open bd gate makes a person-wait.
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          workflow: okWorkflow({
+            completedPhaseNames: ["plan", "implement", "review"],
+            awaitingReviewResponse: true,
+          }),
+        }),
+      ],
+    });
+    expect(status.members[0]).toHaveProperty("awaitingReviewResponse", true);
+    expect(status.members[0]).toHaveProperty("state", "active");
+  });
+
+  it("reads an open bd human gate as awaiting-human (bd-219)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          workflow: okWorkflow({ completedPhaseNames: ["plan", "implement", "review"] }),
+          humanGateOpen: true,
+        }),
+      ],
+    });
+    expect(status.members[0]).toHaveProperty("state", "awaiting-human");
+    expect(status.counts["awaiting-human"]).toBe(1);
   });
 
   it("ignores this member's own manifests that predate its launch", () => {
@@ -2872,6 +2907,58 @@ describe("bead ownership and human surfaces (bd-153)", () => {
     // A missing entry means "unknown", not a fleet-wide warning.
     expect(attached.members[1]?.engagement).toBe(undefined);
     expect(attached.warnings).toEqual(status.warnings);
+  });
+
+  it("reads a member with an open human gate as awaiting-human (bd-219)", () => {
+    // The engagement read is the fleet's own gate evidence, so the read-only view
+    // needs no second bd call to find the one member a person owes an answer.
+    const status = statusOf([member("bd-12")]);
+    expect(status.members[0]?.state).toBe("active");
+
+    const attached = applyFleetBeadEngagement(status, {
+      ok: true,
+      entries: [
+        {
+          taskId: "bd-12",
+          engagement: { comments: { state: "read" }, awaitingHuman: true },
+        },
+      ],
+    });
+    expect(attached.members[0]?.state).toBe("awaiting-human");
+
+    // A resolved gate (or an unknown read) is not a wait: the member stays active.
+    const resolved = applyFleetBeadEngagement(status, {
+      ok: true,
+      entries: [
+        { taskId: "bd-12", engagement: { comments: { state: "read" }, awaitingHuman: false } },
+      ],
+    });
+    expect(resolved.members[0]?.state).toBe("active");
+  });
+
+  it("never overrides missing-state or interrupted with a gate wait (bd-219)", () => {
+    const missing: FleetMemberSnapshot = {
+      ...sampleMember(),
+      worktreePath: "/repo.bd-12",
+      workflow: { kind: "missing" },
+    };
+    const interrupted: FleetMemberSnapshot = {
+      ...sampleMember(),
+      worktreePath: "/repo.bd-15",
+      workflow: okWorkflow({ taskId: "bd-15", branch: "feat/bd-15" }),
+      runs: [sampleRun({ taskId: "bd-15", phase: "implement", status: RunStatus.Interrupted })],
+    };
+    const attached = applyFleetBeadEngagement(statusOf([missing, interrupted]), {
+      ok: true,
+      entries: [
+        { taskId: "bd-12", engagement: { comments: { state: "read" }, awaitingHuman: true } },
+        { taskId: "bd-15", engagement: { comments: { state: "read" }, awaitingHuman: true } },
+      ],
+    });
+    const stateOfTask = (taskId: string | undefined) =>
+      attached.members.find((member) => member.taskId === taskId)?.state;
+    expect(attached.members[0]?.state).toBe("interrupted");
+    expect(stateOfTask(undefined)).toBe("missing-state");
   });
 
   it("degrades engagement to exactly one fleet-level warning", () => {

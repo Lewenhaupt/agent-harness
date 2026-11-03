@@ -880,7 +880,7 @@ Per member:
 | `workflowFile` | `ok` / `missing` / `corrupt` |
 | `workflowType`, `phaseOrder` | `workflow.json` |
 | `completedPhases`, `pendingPhases` | `phaseOrder` minus `completedPhaseNames` |
-| `awaitingReviewResponse` | `workflow.json` flag (absent means `false`) |
+| `awaitingReviewResponse` | `workflow.json` phase flag (absent means `false`); a *phase* fact only — since bd-219 it never means a human is waiting |
 | `latestRuns` | newest manifest per phase, ordered by phase order |
 | `interruptedRunCount` | manifests with `RunStatus.Interrupted` |
 | `updatedAt` | `workflow.json` `updatedAt`, raised to the newest run timestamp when later |
@@ -892,10 +892,15 @@ Derived `state` precedence:
 |-------|---------|
 | `missing-state` | no readable `.belayd/workflow.json` |
 | `interrupted` | at least one run manifest is `interrupted` |
-| `awaiting-human` | `awaitingReviewResponse` is set, or a user-completed run's report was never delivered |
+| `awaiting-human` | the bead has an open bd `human` gate, or a user-completed run's report was never delivered |
 | `blocked` | the newest run of a not-yet-completed phase `failed` |
 | `idle` | every phase in `phaseOrder` completed |
 | `active` | anything else (workflow in progress; a running phase counts here) |
+
+The `awaiting-human` decision comes from the bead, not from the review phase flag
+(bd-219): `awaitingReviewResponse` is persisted on every review completion, so a
+member working its own fix loop used to read as stopped. The read-only view takes
+the gate from the engagement read (`bd gate list`), so it costs no extra bd call.
 
 Fleet-level warnings:
 

@@ -19,7 +19,7 @@ finding text and a rule table, not of a prompt.
 | Answer parsing | `src/finding-sensitivity.ts` | `parsePublicationAnswer` (withhold checked before the positive keywords), `redactFindingToOneLiner` |
 | Safety surface | `src/finding-publication.ts` | `projectFindingText`, `findProjectionViolations`, `findReassemblyViolations`, `selectPublishableFindings`, `evaluateDeferredFindingsGate`, `renderDeferredFindingsSection` |
 | Record | `src/review-findings.ts` | per-finding `sensitivity` / `publication`, `carryForwardSensitivity`, `recordPublicationAnswer`, `releasedPublicationIn` |
-| Gate wiring | `extensions/capabilities/human-gate.ts` | `openReviewHumanGate` (gate title/reason say "sensitive findings"), the `AwaitingHuman.reviewFindings` marker, and `recordPublicationChoice` at the single answer choke point — for both the bd comment and the GitHub issue channel |
+| Gate wiring | `extensions/capabilities/human-gate.ts` | `deliverReviewFindings` (gate title/reason say "sensitive findings"), the `AwaitingHuman.reviewFindings` marker, and `recordPublicationChoice` at the single answer choke point — for both the bd comment and the GitHub issue channel |
 | Marker type | `src/workflow-phases.ts` | `AwaitingHuman.reviewFindings?: { round: number }` — set only by the review gate of a sensitive record, and only for its own round |
 
 Two things bd-183 deliberately does **not** do: it has no PR writer (bd-184 owns
@@ -385,7 +385,7 @@ body (round-12 Critical)`), and by `finding-sensitivity.test.ts` ›
 
 ### 7. The real gate, the answer, and cleanup
 
-Run a workflow whose review reports a security-class finding. `openReviewHumanGate`
+Run a workflow whose review reports a security-class finding. `deliverReviewFindings`
 then writes the record, creates the gate, posts the `[belayd:review]` comment and
 arms the wait. What the bead shows:
 
@@ -492,7 +492,7 @@ When it was not, the line names one of three causes:
 | write failure | the publication choice could not be recorded, so they stay withheld | a read-only worktree or a failed rename — every cause is fail-closed, so nothing publishes |
 
 Only a review wait with sensitive findings records a decision. The wait carries an
-`AwaitingHuman.reviewFindings = { round }` marker, set by `openReviewHumanGate` and
+`AwaitingHuman.reviewFindings = { round }` marker, set by `deliverReviewFindings` and
 by nothing else, so an unrelated `belayd_ask_human` reply typed in the same
 worktree (even `publish as-is`) can never release a withheld finding: the ask
 wait has no marker, so no recording happens.
@@ -699,7 +699,7 @@ than left to be discovered.
 ### Operational limits
 
 - **A restart-discovered wait cannot record a decision.** `reviewFindings` is set
-  only by `openReviewHumanGate`, so a wait re-armed from an open gate after a
+  only by `deliverReviewFindings`, so a wait re-armed from an open gate after a
   session restart delivers the human's answer as a user turn but records **no**
   publication decision. Fail-closed: the findings stay withheld, and the decision
   needs a fresh review round (and its gate) to be recordable. This is what keeps an
@@ -768,7 +768,7 @@ rules lean the other way.
 stored field alone: the record file is editable and can predate a rule, so a
 hand-edited `sensitive: false` must not release text; conversely a rule table that
 weakens between rounds must not make an already-flagged finding publishable, which
-is what `carryForwardSensitivity` guarantees on the `openReviewHumanGate` write
+is what `carryForwardSensitivity` guarantees on the `deliverReviewFindings` write
 path (a monotonic table is *not* the mechanism — removing that carry-forward
 re-opens the hole).
 
@@ -816,7 +816,7 @@ rejects on).
 | `src/__tests__/finding-sensitivity.test.ts` | the four rule families, the three readings, anchors and the placeholder exemption, the refuse rule and its exemptions, `parsePublicationAnswer` spellings, `redactFindingToOneLiner`, split invariance (`— split invariance (property)`) |
 | `src/__tests__/finding-publication.test.ts` | the blocked/publish/redact/withhold outcomes, the live-classifier-OR-stored union, re-publish and round reset, the renderer invariant, the documented residual rows, the reassembly guard (`a whitespace-chunked body cannot be reassembled from the section`) |
 | `src/__tests__/review-findings.test.ts` | record shape, `carryForwardSensitivity` (including the ambiguous-key widening), `recordPublicationAnswer` and its three refusal causes, `releasedPublicationIn`, gate reason/title wording |
-| `src/__tests__/extension-review-gate.test.ts` | `openReviewHumanGate` end-to-end: gate + comment + record, both answer channels, the keyed recording, unrelated answers ignored, round reset, refusal wording |
+| `src/__tests__/extension-review-gate.test.ts` | `deliverReviewFindings` end-to-end: gate + comment + record, both answer channels, the keyed recording, unrelated answers ignored, round reset, refusal wording |
 
 Run one at a time with `pnpm test -t "<it name>"`; the full suite is 154 files
 (4365 tests on this tree).

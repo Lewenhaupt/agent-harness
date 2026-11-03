@@ -18,8 +18,9 @@ An explicit `--actor` in the command string wins over both: the proxy inserts it
 default at argv index 1 and bd's last flag wins.
 
 Workflow-lifecycle writes the harness makes on its own (accepting a member closes
-the bead, the workflow-type label write-back, the `human` review flag) carry
-`orchestratorActor(taskId)` explicitly. They act *for* the workflow, so
+the bead, the workflow-type label write-back, the `human` review-flag gate, the
+`[belayd:review]` findings comment) carry `orchestratorActor(taskId)`
+explicitly. They act *for* the workflow, so
 `bd history <id> --events` must name the driver rather than the operator.
 
 ## Actor format

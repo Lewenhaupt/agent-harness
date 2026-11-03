@@ -126,8 +126,10 @@ run is halted and recorded (`haltedReason`), because each needs a human:
   not wait for this cap at all: it ends the run as `partial` on that tick.
 - `awaiting-human` — `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` ticks (2880 at the 15 s
   interval, i.e. ~12 h) while the **only** work in flight is a live human wait
-  (see the landing window below). It is a distinct reason so a neglected gate
-  never looks like a dead member, and its detail names the members that waited
+  (see the landing window below). A live human wait means the member's bead has
+  an **open bd `human` gate**; a review phase flag is not a wait (bd-219). It is
+  a distinct reason so a neglected gate never looks like a dead member, and its
+  detail names the members that waited
   (`bd-143 awaited a human response for 2880 ticks (cap 2880); re-arm the fleet
   after answering`). A hung non-human member in the same run still halts
   `stalled` at the much smaller idle cap first.
@@ -257,27 +259,32 @@ one worktree before the lease existed. Waiting third keeps the run alive while
 anything can still deliver work; `advance` and `complete` only run once nothing
 is working at all.
 
-**An `awaiting-human` stop is findable (bd-175).** A review that reports findings
-is a human decision, so the member opens a real bd `human` gate — the same
-channel as `belayd_ask_human` — with the findings posted as an authored comment
-(summary, severity, disposition, and the artifact path) and the reason string
-`workflow is waiting for a review response` in both the gate and the run's
-`run.stopped[]` detail. The member's own answer poll watches the gate, so
-resolving it (or answering in a comment) resumes the member and the loop lands
-its work. `bd show`, `needs-you` views, and `bd ready` therefore agree with the
-fleet's own view; a clean review writes nothing and stays on the fast path.
+**An `awaiting-human` stop means a person is actually being asked (bd-219).**
+The tick reads each member's bead for an open bd `human` gate
+(`lookupOpenHumanGate`) and only that read makes the member
+`awaiting-human`; the detail is
+`waiting on an open human gate on the bead`. A review with ordinary findings is
+**not** a wait: it writes `.belayd/review-findings.json` and posts the
+`[belayd:review]` comment as the workflow actor, then the member runs its own
+fix loop — so a post-review member reads `active`, exactly as the orchestrator
+is expected to proceed. The one review that still opens a gate is a
+security-class finding (bd-183), whose publication decision the orchestrator may
+not take. An unreadable gate read is "unknown", never a wait. `bd show`,
+`needs-you` views, and `bd ready` therefore agree with the fleet's own view; a
+clean review writes nothing and stays on the fast path.
 
-**Known gate limitation: a verb-lead bullet with a defect clause.** The gate
+**Known gate limitation: a verb-lead bullet with a defect clause.** The finding
 trigger is lexical: a bullet that opens with a past-tense check verb
-(`checked`/`verified`/`tested`/`reviewed`) is narration and does not gate, even
+(`checked`/`verified`/`tested`/`reviewed`) is narration and is not recorded, even
 when a `:`/`—` clause after it restates a present-tense defect (`- Checked: race
 in src/a.ts:5`). Separating that clause from an affirmation (`- Checked: all
-fine`) needs a defect lexicon, and a wrong guess *opens a human gate for nothing*
-— the failure the narration rule exists to prevent. The tradeoff is deliberate
-and pinned by tests (`parseReviewFindings` strict cases, `hasReviewFindings`); a
-defect should be written without the check-verb prefix. A narration bullet that
-cites a location still does not gate, whether its marker is bare, backticked, or
-markdown-emphasized (`**Verified**`, `__Checked__`).
+fine`) needs a defect lexicon, and a wrong guess *records a finding (and can gate
+on a security-class one) for nothing* — the failure the narration rule exists to
+prevent. The tradeoff is deliberate and pinned by tests (`parseReviewFindings`
+strict cases, `hasReviewFindings`); a defect should be written without the
+check-verb prefix. A narration bullet that cites a location still does not count,
+whether its marker is bare, backticked, or markdown-emphasized (`**Verified**`,
+`__Checked__`).
 
 **An advance that launches nothing ends the run** (`src/fleet-run.ts`
 `emptyAdvanceAction`). The executor degrades that no-launch advance into the
@@ -338,8 +345,8 @@ blocking a sibling stays a fleet dependency — `dependency`, not
 not ticked again, the tick keeps the run open (a `wait`) while a stopped member's
 retry is observably alive: a live orchestrator lease for a `running` member, a
 live orchestrator lease for an `awaiting-human` member whose answer poll is still
-watching its gate (bd-175), or the start grace for a member that has not written
-state yet. Nothing else keeps it
+watching the open gate on its bead (bd-175), or the start grace for a member that
+has not written state yet. Nothing else keeps it
 open — a stopped member with no lease is only *described* as running by stale
 files, and waiting on it would hold the run and its capacity slots forever.
 

@@ -1,11 +1,12 @@
 /**
- * Review findings as a durable, human-visible record (bd-175).
+ * Review findings as a durable, human-visible record (bd-175, bd-219).
  *
  * A non-empty review used to stop the member `awaiting-human` with the only
  * trace inside the member's worktree (`.belayd/review-findings.md`), so bd,
  * `needs-you` views, and the fleet's own `run.stopped[]` all reported a healthy
- * workflow while a human wait was open. This module turns the review delivery
- * into:
+ * workflow while a human wait was open. bd-219 removed the enforced wait: the
+ * review delivery is a trace the orchestrator acts on by running the fix loop,
+ * not a question. This module turns the review delivery into:
  *
  * 1. a per-finding disposition record (`{ finding, severity, phase, round,
  *    disposition }`) persisted beside the workflow state, so "the findings the
@@ -14,9 +15,12 @@
  * 2. a bead comment body that names each finding, its severity and its
  *    disposition plus the artifact path — the text a human actually reads.
  *
- * The gate reason is {@link REVIEW_HUMAN_GATE_REASON}: the fleet supervisor
- * imports the same constant for its `awaiting-human` stop detail, so the two
- * can never disagree about what the wait means.
+ * Only a security-class finding still escalates (bd-183): its publication
+ * decision is a product/risk choice the orchestrator may not take itself, so
+ * {@link REVIEW_HUMAN_GATE_REASON} remains that gate's reason. The fleet's own
+ * `awaiting-human` detail is `FLEET_HUMAN_GATE_DETAIL` instead — the fleet waits
+ * on any open bd human gate, not only this one — so the remaining coupling is the
+ * gate text a human reads, not a shared constant.
  *
  * This module is pure except for {@link readReviewFindingsRecord} /
  * {@link writeReviewFindingsRecord}, documented best-effort side effects
@@ -39,12 +43,46 @@ import {
 import { parseReviewFindings, type ReviewSeverity } from "./review-context.js";
 
 /**
- * The one reason string a review wait carries, wherever it is recorded: the bd
- * gate's `--reason`, the findings comment, and the fleet's `run.stopped[]`
- * detail. The supervisor imports it, so a stop can never describe a different
- * wait from the gate blocking the bead.
+ * The reason a review wait carries: the bd-183 publication gate's `--reason`, and
+ * the sensitive finding's recorded disposition reason.
+ *
+ * The fleet does **not** share this constant (bd-219 review): its `awaiting-human`
+ * detail is `FLEET_HUMAN_GATE_DETAIL`, because the fleet waits on any open bd
+ * human gate, not only this one. The coupling that remains is the gate a human
+ * reads: this string is what that gate says, and the gate is the durable record
+ * the sensitive wait is derived from.
  */
 export const REVIEW_HUMAN_GATE_REASON = "workflow is waiting for a review response";
+
+/**
+ * What a recorded non-sensitive finding is waiting on: the orchestrator's own
+ * fix loop. bd-219 makes that the default state of a review delivery — nobody
+ * is asked, so the record must not claim a human decision is pending.
+ */
+export const REVIEW_FIX_LOOP_REASON = "awaiting the fix loop in this workflow";
+
+/**
+ * Why a review delivery did nothing: the review reported no findings.
+ *
+ * Shared with the delivery seam's caller, which must not log this expected no-op.
+ */
+export const REVIEW_NO_FINDINGS_REASON = "the review reported no findings";
+
+/**
+ * Why a review delivery did nothing: the host injected no delivery seam.
+ *
+ * A narrower host legitimately has no seam, so this is an expected outcome the
+ * caller must stay silent about rather than warn on every findings review.
+ */
+export const REVIEW_NO_SEAM_REASON = "no review-findings seam";
+
+/**
+ * Prefix of the reason a failed bd-183 publication gate reports.
+ *
+ * Shared with the seam's caller so a refused gate is logged even though the
+ * record and comment still landed.
+ */
+export const REVIEW_GATE_FAILURE_PREFIX = "could not open a human gate";
 
 /** Where the reviewer's full findings live inside the member's worktree. */
 export const REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH = ".belayd/review-findings.md";
@@ -68,6 +106,17 @@ export type ReviewFindingDisposition =
   | { kind: "deferred"; reason: string }
   | { kind: "rejected"; reason: string };
 
+/**
+ * The two sources a recorded disposition can have.
+ *
+ * One source of truth for the type and the disk schema: a new source must not
+ * type-check and then fail `safeParse`, which would discard the whole record.
+ */
+export const REVIEW_DISPOSITION_SOURCES = ["default", "recorded"] as const;
+
+/** Whether a disposition was written by this module or decided by someone else. */
+export type ReviewDispositionSource = (typeof REVIEW_DISPOSITION_SOURCES)[number];
+
 /** One finding plus the metadata bd-183/bd-184 read back. */
 export interface ReviewFindingRecord {
   finding: string;
@@ -75,6 +124,18 @@ export interface ReviewFindingRecord {
   phase: string;
   round: number;
   disposition: ReviewFindingDisposition;
+  /**
+   * Who owns the disposition: `"default"` is the deferral this module writes at
+   * build time, `"recorded"` is a decision an orchestrator or human made.
+   *
+   * Optional on read so a record written before this marker still parses and
+   * round-trips; absent is treated as recorded except where the legacy fix-loop
+   * reason proves it is this module's default
+   * ({@link isDefaultFixLoopDeferral}). The marker exists because the reason text
+   * alone cannot distinguish the two: an orchestrator is free to record a
+   * deferral that happens to quote {@link REVIEW_FIX_LOOP_REASON}.
+   */
+  dispositionSource?: ReviewDispositionSource;
   /**
    * The deterministic classifier verdict (bd-183), recorded at build time so a
    * reader never has to re-derive it and so the gate wording is stable.
@@ -131,6 +192,7 @@ const ReviewFindingsRecordSchema = z.object({
       phase: z.string(),
       round: z.number().int(),
       disposition: ReviewFindingDispositionSchema,
+      dispositionSource: z.enum(REVIEW_DISPOSITION_SOURCES).optional(),
       sensitivity: FindingSensitivitySchema.optional(),
       publication: FindingPublicationDecisionSchema.optional(),
     }),
@@ -138,11 +200,11 @@ const ReviewFindingsRecordSchema = z.object({
 });
 
 /**
- * `true` when a review reported at least one finding (the gate trigger).
+ * `true` when a review reported at least one finding (the record trigger).
  *
- * Strict on purpose: the gate path must not treat a narration bullet that only
- * mentions a `file:line` as a finding, because that would open a human wait with
- * nothing for the human to decide (bd-175 review).
+ * Strict on purpose: the trace path must not treat a narration bullet that only
+ * mentions a `file:line` as a finding, because that would record a disposition
+ * for something nobody raised (bd-175 review).
  */
 export function hasReviewFindings(text: string): boolean {
   return parseReviewFindings(text, { strict: true }).length > 0;
@@ -150,12 +212,19 @@ export function hasReviewFindings(text: string): boolean {
 
 /**
  * Build the durable record for a review delivery, or `undefined` for a clean
- * review (the fast path must not write a file or open a gate).
+ * review (the fast path must not write a file or a bd write).
  *
- * The default disposition is `deferred` pending a human review response: at the
- * moment the gate opens nothing has been addressed yet, and `deferred` is the
- * one disposition that keeps the finding visible in the deferred surface
+ * The default disposition is `deferred`, and its reason depends on the finding:
+ * a sensitive finding's deferral is a publication decision
+ * ({@link REVIEW_HUMAN_GATE_REASON}) while every other finding is deferred to the
+ * orchestrator's fix loop ({@link REVIEW_FIX_LOOP_REASON}) (bd-219 review). At the
+ * moment the record is written nothing has been addressed yet, and `deferred` is
+ * the one disposition that keeps the finding visible in the deferred surface
  * (bd-184) instead of silently claiming it was fixed.
+ *
+ * The record-level `reason` stays {@link REVIEW_FIX_LOOP_REASON} for every record:
+ * it describes the delivery, not one finding, and the gate reason is built from
+ * the findings themselves by {@link reviewFindingsGateReason}.
  *
  * Every finding is classified (bd-183) at build time. No `publication` decision
  * is set here on purpose: a decision exists only after a human answers the gate,
@@ -173,25 +242,42 @@ export function buildReviewFindingsRecord(options: {
   if (parsed.length === 0) return undefined;
   const phase = options.phase ?? REVIEW_FINDINGS_PHASE;
   const round = options.round ?? 1;
-  const disposition = options.disposition ?? {
-    kind: "deferred",
-    reason: REVIEW_HUMAN_GATE_REASON,
-  };
   return {
     schemaVersion: 1,
     taskId: options.taskId,
     phase,
     round,
-    reason: REVIEW_HUMAN_GATE_REASON,
+    reason: REVIEW_FIX_LOOP_REASON,
     artifactPath: REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
-    findings: parsed.map((finding) => ({
-      finding: finding.text,
-      severity: finding.severity,
-      phase,
-      round,
-      disposition,
-      sensitivity: classifyFindingSensitivity(finding.text),
-    })),
+    findings: parsed.map((finding) => {
+      const sensitivity = classifyFindingSensitivity(finding.text);
+      return {
+        finding: finding.text,
+        severity: finding.severity,
+        phase,
+        round,
+        disposition: options.disposition ?? defaultDisposition(sensitivity.sensitive),
+        // Why: the only disposition this module writes itself is the default, and
+        // a carried verdict may re-label exactly that one. Marking the source
+        // keeps a later orchestrator deferral from being mistaken for it even
+        // when it quotes the same reason (bd-219 review).
+        dispositionSource: options.disposition === undefined ? "default" : "recorded",
+        sensitivity,
+      };
+    }),
+  };
+}
+
+/**
+ * The default `deferred` disposition for one finding, by its own sensitivity.
+ *
+ * Extracted so the rule is readable at the build site: a sensitive finding waits
+ * on a person, everything else waits on the fix loop.
+ */
+function defaultDisposition(sensitive: boolean): ReviewFindingDisposition {
+  return {
+    kind: "deferred",
+    reason: sensitive ? REVIEW_HUMAN_GATE_REASON : REVIEW_FIX_LOOP_REASON,
   };
 }
 
@@ -221,29 +307,39 @@ const SEVERITY_SECTION_TITLES: ReadonlyArray<{ severity: ReviewSeverity; title: 
 ];
 
 /**
- * The bead comment body: the findings a human must see, grouped by severity,
- * each with its disposition, plus the artifact pointer and the one-line question
- * that makes the wait answerable. The `[belayd:review]` header is added by
- * `phaseCommentBody`, so the comment is never mistaken for a human answer.
+ * The bead comment body: the findings the orchestrator must see, grouped by
+ * severity, each with its disposition, plus the artifact pointer and the one
+ * directive that tells the orchestrator how to proceed. The `[belayd:review]`
+ * header is added by `phaseCommentBody`, so the comment is never mistaken for a
+ * human answer.
+ *
+ * A trace, not a question (bd-219): the fix-loop contract already says the
+ * orchestrator must address every Critical and Warning, so asking a human
+ * whether to address them cost a wait on every review. Escalation is the
+ * orchestrator's own judgement call, and the closing section names exactly the
+ * two conditions that permit it.
  *
  * A security-class finding is marked in place and the comment gains the
  * disclosure section (bd-183), because the human answer to that section is what
- * decides whether anything about the finding may be published. A record with no
- * sensitive findings renders byte-for-byte what bd-175 rendered (pinned by a
- * test): operators read this comment every round, and gratuitous churn hides the
- * one line that matters.
+ * decides whether anything about the finding may be published — that one still
+ * needs an answer. A record with no sensitive findings renders the same body a
+ * non-sensitive round always renders (pinned by a test): operators read this
+ * comment every round, and gratuitous churn hides the one line that matters.
  *
  * `previousDecisionsReset` announces that a re-review replaced a round whose
  * publication decisions existed, so a human is not surprised that their earlier
- * "publish" no longer applies (bd-183 review).
+ * "publish" no longer applies (bd-183 review). `publicationReaskRequired` says
+ * the publication question could not be armed for this round because a human wait
+ * is already open, so the section has to be asked again explicitly — without that
+ * line the current round's decision would be lost silently (bd-219 review).
  */
 export function formatReviewFindingsComment(
   record: ReviewFindingsRecord,
-  options?: { previousDecisionsReset?: boolean },
+  options?: { previousDecisionsReset?: boolean; publicationReaskRequired?: boolean },
 ): string {
   const counts = severityCounts(record);
   const lines = [
-    "## Review findings — human gate",
+    `## Review findings (round ${record.round})`,
     "",
     `**Reason:** ${record.reason}`,
     "",
@@ -270,19 +366,41 @@ export function formatReviewFindingsComment(
     lines.push(
       "",
       ...sensitiveFindingsSection(sensitiveCount, options?.previousDecisionsReset === true),
+      "",
+      "The sensitive findings above need an answer before anything about them is published; " +
+        "every other finding stays in the fix loop below.",
     );
+    if (options?.publicationReaskRequired === true) {
+      lines.push("", PUBLICATION_REASK_NOTICE);
+    }
   }
   lines.push(
     "",
-    "### Question",
-    "Should these findings be addressed, deferred to a bead (with a reason), or rejected? " +
-      "Reply on this bead (or resolve the gate) with your decision, then the workflow resumes.",
+    "### Next step",
+    "No human decision is required: address every Critical and Warning in the fix loop",
+    "(`belayd_implement` with these findings, then `belayd_review`). Escalate with",
+    "`belayd_ask_human` only if a Critical finding should not be implemented (a product, risk",
+    "or scope decision), or you found a contradiction the bead and the repo cannot resolve.",
   );
   return lines.join("\n");
 }
 
 /** Suffix that marks one finding as security-class in the comment. */
 const SENSITIVE_FINDING_MARKER = " — **sensitive** (publication decision required)";
+
+/**
+ * The line that keeps a lost round's publication question visible.
+ *
+ * why (bd-219 review): a sensitive delivery while another human wait is open
+ * cannot create a second gate, but it has already advanced the round, so the
+ * open gate's answer would be refused as `round-mismatch`. Naming the re-ask here
+ * is the only place the human and the orchestrator can learn it happened.
+ */
+const PUBLICATION_REASK_NOTICE =
+  "**Publication question not armed for this round.** A human wait is already open on this " +
+  "bead, so these sensitive findings could not open a gate and an answer to the older wait " +
+  "cannot decide them. Re-ask them with `belayd_ask_human` once that answer arrives; nothing " +
+  "about them may be published until a decision is recorded.";
 
 /** The one sentence that announces a reset, shared by the comment and the gate. */
 const PREVIOUS_DECISIONS_RESET_NOTICE =
@@ -333,7 +451,7 @@ function sensitiveFindingsSection(count: number, previousDecisionsReset: boolean
  * The second half is upheld by {@link carryForwardSensitivity}, not by this
  * function: the live classifier can only answer for the current table, so
  * across rounds the guarantee depends entirely on that carry-forward running on
- * the `openReviewHumanGate` write path before the record and the gate are
+ * the `deliverReviewFindings` write path before the record and the gate are
  * written. A monotonic rule table is *not* the mechanism — removing the
  * carry-forward re-opens the hole where a weakened table stores
  * `sensitive: false` and the raw text publishes with no decision recorded.
@@ -400,6 +518,15 @@ export function findingSensitivityKey(finding: string): string {
  * can still explain itself, and `publication` is never carried (decisions answer
  * exactly one round).
  *
+ * A widened verdict also re-labels the finding's default deferral: a build-time
+ * clean finding written as "awaiting the fix loop" is in fact awaiting a
+ * publication decision, and bd-184 renders that reason (bd-219 review). Only the
+ * module's own default deferral is rewritten — detected by its
+ * `dispositionSource` marker, with the legacy reason text as the fallback for
+ * records written before the marker. An orchestrator's `fixed`, explicit
+ * `rejected` or explicitly reasoned `deferred` is a decision, not a default, even
+ * when it quotes {@link REVIEW_FIX_LOOP_REASON} verbatim.
+ *
  * The key is coarse enough to collide (two distinct findings that differ only in
  * casing or emphasis share one), and ambiguity may only ever *widen* the gate:
  * when any previous finding under a key carried a sensitive verdict, every
@@ -442,9 +569,35 @@ export function carryForwardSensitivity(options: {
       ]);
       // The carried verdict has at least one reason by the schema invariant, so
       // `merged.sensitive` is true and it never stores an empty sensitive verdict.
-      return { ...finding, sensitivity: merged };
+      const disposition: ReviewFindingDisposition =
+        merged.sensitive && isDefaultFixLoopDeferral(finding)
+          ? { kind: "deferred", reason: REVIEW_HUMAN_GATE_REASON }
+          : finding.disposition;
+      return { ...finding, sensitivity: merged, disposition };
     }),
   };
+}
+
+/**
+ * True for the default deferral this module writes, the only disposition a
+ * carried-forward verdict may re-label. Anything else is a decision someone made.
+ *
+ * The `dispositionSource` marker is the authority; the reason text is only a
+ * fallback for records written before the marker existed, where a fix-loop
+ * deferral with {@link REVIEW_FIX_LOOP_REASON} is this module's default by
+ * construction. Keying solely on the text would re-label a future
+ * orchestrator-recorded deferral that reuses the same words (bd-219 review).
+ */
+function isDefaultFixLoopDeferral(finding: ReviewFindingRecord): boolean {
+  if (finding.disposition.kind !== "deferred") return false;
+  switch (finding.dispositionSource) {
+    case "default":
+      return true;
+    case "recorded":
+      return false;
+    case undefined:
+      return finding.disposition.reason === REVIEW_FIX_LOOP_REASON;
+  }
 }
 
 /** The bd gate title, distinct from a fleet ordering gate or an ask question. */
@@ -467,9 +620,15 @@ export function reviewFindingsGateTitle(options: {
  * The gate reason for one record: the shared review wait, plus the disclosure
  * question when a sensitive finding is present.
  *
- * {@link REVIEW_HUMAN_GATE_REASON} itself stays unchanged: the fleet supervisor
- * imports it as the `awaiting-human` detail, so the wait's meaning must not
- * depend on the findings.
+ * Since bd-219 only a security-class finding opens a gate, so the plain branch is
+ * the historical non-sensitive review wait (no live caller produces it any more);
+ * the sensitive branch is the one a live review still produces. The plain branch
+ * stays because the function is the record layer's single gate-reason source and
+ * its output is pinned by tests.
+ *
+ * {@link REVIEW_HUMAN_GATE_REASON} is the text a human reads on that gate. It is
+ * not shared with the fleet: `FLEET_HUMAN_GATE_DETAIL` describes an open gate of
+ * any kind, so the two strings serve different surfaces and are not coupled.
  *
  * `previousDecisionsReset` is the one-line announcement that a re-review replaced
  * a round whose publication decisions existed; without it the human would see the
@@ -495,7 +654,7 @@ export function reviewFindingsRecordPath(cwd: string): string {
 
 /**
  * Read the durable record, if one exists and parses. A corrupt/unreadable file
- * is "no record": the gate path must be able to proceed and overwrite it.
+ * is "no record": the trace path must be able to proceed and overwrite it.
  *
  * A record written before bd-183 carries no `sensitivity`; it is filled in here so
  * every reader has the metadata. That filling is **not** what safety depends on:
@@ -537,9 +696,9 @@ export function nextReviewRound(options: { cwd: string }): number {
  *
  * Temp file in the record's own directory then `renameSync`, so a crash mid-write
  * cannot leave truncated JSON for the bd-183/bd-184 readers. Best-effort on
- * purpose: the bd gate and comment are the human-visible record, and a read-only
- * worktree must not turn a review delivery into a failure. The caller reports
- * the warning and keeps the gate.
+ * purpose: the comment and the bd-183 gate are the human-visible record, and a
+ * read-only worktree must not turn a review delivery into a failure. The caller
+ * reports the warning and keeps whatever else it wrote.
  */
 export function writeReviewFindingsRecord(options: {
   cwd: string;

@@ -244,7 +244,7 @@ order so pi hook/tool order is unchanged.
 | `bd.ts` | `bd` CLI proxy tool |
 | `commit.ts` | `belayd_commit` + `belayd_stack_rebase`, commit preflight/runners, commit-body helpers |
 | `doctor.ts` | `belayd_doctor` packaging/tool-surface report |
-| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review gate and the single choke point that records a publication choice (bd-183) |
+| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review-findings delivery (`deliverReviewFindings`: record + comment always, the bd-183 publication gate only for a security-class finding) and the single choke point that records a publication choice |
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
 | `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |

@@ -27,7 +27,6 @@
 
 import { z } from "zod";
 import type { FleetIntent } from "./fleet-status.js";
-import { REVIEW_HUMAN_GATE_REASON } from "./review-findings.js";
 import type { RunManifest } from "./run-manifest.js";
 import { RunStatus } from "./run-manifest.js";
 import { isWorkflowComplete } from "./workflow-phases.js";
@@ -309,7 +308,6 @@ export type FleetWorkflowProgressSnapshot =
       kind: "ok";
       completedPhaseNames: readonly string[];
       phaseOrder: readonly string[];
-      awaitingReviewResponse: boolean;
     }
   | { kind: "missing" }
   | { kind: "corrupt" };
@@ -353,7 +351,21 @@ export interface DeriveFleetMemberProgressOptions {
    */
   launchedAt?: number;
   startGraceInMs?: number;
+  /**
+   * Whether the member's bead has an open bd `human` gate, as the tick read it
+   * (bd-219). Absent means "not read", and not-read is never a wait.
+   */
+  humanGateOpen?: boolean;
 }
+
+/**
+ * The `awaiting-human` progress detail for a member with an open human gate.
+ *
+ * The fleet no longer derives a wait from a review phase flag (bd-219): the phase
+ * flag is set on every review, so it made a member working its own fix loop look
+ * stopped. The gate read is the only evidence of a person owing an answer.
+ */
+export const FLEET_HUMAN_GATE_DETAIL = "waiting on an open human gate on the bead";
 
 /** Newest run by `startedAt`, then run id (a total order, so ticks are stable). */
 function newestRun(runs: readonly RunManifest[]): RunManifest | undefined {
@@ -537,7 +549,7 @@ export function deriveFleetMemberProgress(
     case "corrupt":
       return { kind: "state-corrupt", detail: "unreadable .belayd/workflow.json" };
     case "ok":
-      return progressFromWorkflow(options.workflow, runs);
+      return progressFromWorkflow(options.workflow, options, runs);
     case "missing":
       return progressFromMissingState({ ...options, runs });
   }
@@ -579,10 +591,11 @@ function describeFailure(run: RunManifest): string {
 /** Progress for a readable workflow state: awaiting human, complete, failed, working. */
 function progressFromWorkflow(
   workflow: Extract<FleetWorkflowProgressSnapshot, { kind: "ok" }>,
+  options: Pick<DeriveFleetMemberProgressOptions, "humanGateOpen">,
   runs: readonly RunManifest[],
 ): FleetMemberProgress {
-  if (workflow.awaitingReviewResponse) {
-    return { kind: "awaiting-human", detail: REVIEW_HUMAN_GATE_REASON };
+  if (options.humanGateOpen === true) {
+    return { kind: "awaiting-human", detail: FLEET_HUMAN_GATE_DETAIL };
   }
   const completed = new Set(workflow.completedPhaseNames);
   if (isWorkflowComplete([...workflow.completedPhaseNames], workflow.phaseOrder)) {
@@ -646,6 +659,12 @@ export interface FleetMemberObservation {
   taskId: string;
   progress: FleetMemberProgress;
   claim: FleetMemberClaim;
+  /**
+   * Whether this member's bead had an open bd `human` gate when the tick read it
+   * (bd-219). The observation is the only place the gate read lands, so the plan
+   * sees a real person-wait instead of a review phase flag.
+   */
+  humanGateOpen: boolean;
   /** Set when this run launched the member; absent for members the run did not launch. */
   launchedAt?: number;
 }

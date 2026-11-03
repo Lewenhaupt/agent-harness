@@ -24,14 +24,18 @@ import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  deliverReviewFindings,
   type HumanGateDeps,
   humanAnswerMessage,
-  openReviewHumanGate,
   stopHumanAnswerPoll,
 } from "../../extensions/capabilities/human-gate.js";
 import { createInitialSessionState } from "../../extensions/capabilities/session-state.js";
 import type { GithubAnswerTarget } from "../github-answer-target.js";
-import { REVIEW_HUMAN_GATE_REASON } from "../review-findings.js";
+import {
+  buildReviewFindingsRecord,
+  reviewFindingsGateReason,
+  reviewFindingsGateTitle,
+} from "../review-findings.js";
 
 import { writeWorkflowState } from "../workflow-state.js";
 
@@ -1579,18 +1583,21 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
   });
 
+  // A security-class review: it is the one review shape that still opens the
+  // bd-183 publication gate after bd-219, so the channel/answer plumbing here
+  // keeps exercising a real wait.
   const REVIEW_FINDINGS = [
     "## Critical (must fix)",
-    "- `src/a.ts:12` — off-by-one in the loop bound",
-    "",
-    "## Warnings (should fix)",
-    "None",
+    "- `src/auth/session.ts:42` — the session token is logged in plaintext",
   ].join("\n");
 
-  const REVIEW_GATE_KEY =
-    `gate create --blocks bd-152 --type=human ` +
-    `--title belayd-review: bd-152 findings (round 1) ` +
-    `--reason ${REVIEW_HUMAN_GATE_REASON} --json`;
+  const REVIEW_GATE_KEY = (() => {
+    const record = buildReviewFindingsRecord({ taskId: "bd-152", text: REVIEW_FINDINGS });
+    if (record === undefined) throw new Error("expected a record");
+    const title = reviewFindingsGateTitle({ taskId: "bd-152", round: 1, sensitive: true });
+    const reason = reviewFindingsGateReason(record);
+    return `gate create --blocks bd-152 --type=human --title ${title} --reason ${reason} --json`;
+  })();
 
   function reviewState() {
     const state = createInitialSessionState();
@@ -1647,14 +1654,14 @@ describe("GitHub-primary answer channel (bd-182)", () => {
       ]),
     });
 
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-152",
       reviewText: REVIEW_FINDINGS,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     expect(state.awaitingHuman?.channel).toEqual({
       kind: "github",
       owner: GH_OWNER,
@@ -1670,7 +1677,8 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     expect(state.awaitingHuman?.answerCommentId).toBe("700");
 
     const delivered = await humanAnswerMessage(ctx, deps);
-    expect(delivered?.message.content).toBe("hugo answered: option b, ship it");
+    // A sensitive review wait also reports the recorded publication choice.
+    expect(delivered?.message.content).toContain("hugo answered: option b, ship it");
     expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
     expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
     stopHumanAnswerPoll(state);
@@ -1689,14 +1697,14 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
     bd.reply(COMMENTS_KEY, { stdout: humanComment() });
 
-    const opened = await openReviewHumanGate({
+    const opened = await deliverReviewFindings({
       state,
       ctx,
       deps,
       taskId: "bd-152",
       reviewText: REVIEW_FINDINGS,
     });
-    expect(opened.opened).toBe(true);
+    expect(opened.gateOpened).toBe(true);
     // The findings were posted where the wait says they were posted.
     expect(findCall(ASK_COMMENT_KEY)).toBeDefined();
     expect(state.awaitingHuman?.channel).toEqual({ kind: "bd" });
@@ -1705,7 +1713,7 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     // the bd thread the guidance points at is the one that is read.
     resolve.mockClear();
     const delivered = await humanAnswerMessage(ctx, deps);
-    expect(delivered?.message.content).toBe("hugo answered: option b, ship it");
+    expect(delivered?.message.content).toContain("hugo answered: option b, ship it");
     expect(resolve).not.toHaveBeenCalled();
     stopHumanAnswerPoll(state);
   });

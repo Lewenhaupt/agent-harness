@@ -255,7 +255,7 @@ Derived `state` (first match wins, in this order):
 |-------|---------|------------------|
 | `missing-state` | No readable `.belayd/workflow.json` in that worktree | Nothing is driving that tree; see [Common situations](#common-situations) |
 | `interrupted` | At least one run manifest is `interrupted` | A phase crashed or was killed; that workflow needs a re-run in its own worktree |
-| `awaiting-human` | `awaitingReviewResponse` is set, or a `completedBy: "user"` run's report was never delivered | Someone must respond before it moves |
+| `awaiting-human` | The bead has an open bd `human` gate, or a `completedBy: "user"` run's report was never delivered | Someone must respond before it moves |
 | `blocked` | The newest run of a not-yet-completed phase `failed` | The phase failed; fix and re-run it in that worktree |
 | `idle` | Every phase in `phaseOrder` is complete | Workflow finished; commit/merge is still a human step |
 | `active` | Anything else — including a phase that is `running` right now | Normal progress |

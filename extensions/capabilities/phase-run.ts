@@ -27,7 +27,11 @@ import { formatWorktreePreamble } from "../../src/owned-worktree.js";
 import { collectChangeContext } from "../../src/proof-verification.js";
 import { type RunQualityGateOptions, withFallbackNote } from "../../src/quality-gate-run.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
-import { hasReviewFindings } from "../../src/review-findings.js";
+import {
+  hasReviewFindings,
+  REVIEW_NO_FINDINGS_REASON,
+  REVIEW_NO_SEAM_REASON,
+} from "../../src/review-findings.js";
 import {
   type RunDelivery,
   type RunHandle,
@@ -124,44 +128,81 @@ export interface PhaseRunnerDeps {
   }>;
   runQualityGate: (options: RunQualityGateOptions) => Promise<SpawnResult | null | undefined>;
   /**
-   * Open a human gate for a review that reported findings (bd-175). Injected so
-   * this module never reaches the human-gate capability directly; the composer
-   * wires it to `openReviewHumanGate`. Absent in narrower hosts, where a review
-   * delivery keeps the pre-bd-175 behaviour.
+   * Record a review that reported findings (bd-219). Injected so this module
+   * never reaches the human-gate capability directly; the composer wires it to
+   * `deliverReviewFindings`. Absent in narrower hosts, where a review delivery
+   * simply carries no findings trace.
    */
-  reviewGate?: ReviewGateSeam;
+  reviewFindings?: ReviewFindingsSeam;
 }
 
-/** The injected review-gate opener (bd-175); see `reviewGate` above. */
-export type ReviewGateSeam = (options: {
+/** The injected review-findings delivery (bd-219); see `reviewFindings` above. */
+export type ReviewFindingsSeam = (options: {
   state: CoreSessionState;
   ctx: ExtensionContext;
   taskId: string;
   reviewText: string;
-}) => Promise<{ opened: boolean; reason: string }>;
+}) => Promise<ReviewFindingsDelivery>;
+
+/** What one review-findings delivery did, for the caller's warning path. */
+export interface ReviewFindingsDelivery {
+  recorded: boolean;
+  gateOpened: boolean;
+  reason: string;
+}
 
 /**
- * Call the injected review-gate opener without ever letting it fail the review
- * delivery. Extracted so the catch path is unit-testable without a live run.
+ * Log a review-findings delivery whose record was skipped.
+ *
+ * The run still delivers — the findings trace is best-effort — but a skipped
+ * record must be discoverable in the daemon log, because otherwise the only trace
+ * of a lost write is a missing file. The fix-loop directive is never conditioned on
+ * this result.
+ *
+ * Expected outcomes stay silent: a clean review, a host with no seam, an ordinary
+ * findings delivery (record + comment, no gate), and a sensitive round whose
+ * publication question could not be armed because a human wait is already open
+ * (that one is announced by the seam and in the posted comment).
+ *
+ * A refused bd-183 gate is also logged by the seam, which owns the specific
+ * wording, so this caller does not repeat it: exactly one line per failed gate.
  */
-export async function tryOpenReviewGate(options: {
-  open: ReviewGateSeam;
+export function warnOnSkippedReviewFindings(delivery: ReviewFindingsDelivery): void {
+  if (isExpectedSilentDelivery(delivery.reason)) return;
+  if (delivery.recorded) return;
+  console.warn(`[belayd-harness] review findings were not fully delivered: ${delivery.reason}`);
+}
+
+/** The delivery reasons that are expected outcomes, not failures. */
+function isExpectedSilentDelivery(reason: string): boolean {
+  return reason === REVIEW_NO_FINDINGS_REASON || reason === REVIEW_NO_SEAM_REASON;
+}
+
+/**
+ * Call the injected review-findings delivery without ever letting it fail the
+ * review run. Extracted so the catch path is unit-testable without a live run.
+ */
+export async function tryDeliverReviewFindings(options: {
+  deliver: ReviewFindingsSeam;
   state: CoreSessionState;
   ctx: ExtensionContext;
   taskId: string;
   reviewText: string;
-}): Promise<boolean> {
+}): Promise<ReviewFindingsDelivery> {
   try {
-    const outcome = await options.open({
+    return await options.deliver({
       state: options.state,
       ctx: options.ctx,
       taskId: options.taskId,
       reviewText: options.reviewText,
     });
-    return outcome.opened;
   } catch (error) {
-    console.warn("[belayd-harness] could not open the review human gate", error);
-    return false;
+    console.warn("[belayd-harness] could not record the review findings", error);
+    return {
+      recorded: false,
+      gateOpened: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -186,21 +227,20 @@ function reviewLoopHintFor(delivery: RunDelivery, state: CoreSessionState): stri
 }
 
 /**
- * The loop hint a run-complete delivery carries, withheld when this delivery
- * opened a human gate (bd-175).
+ * The loop hint a run-complete delivery carries.
  *
- * A member blocked by that gate cannot call the next phase tool the hint names,
- * so offering it would only invite a refused call. Pure so all three inputs are
- * pinned directly: opening the gate is the only thing that withholds the hint —
- * a clean review and a host with no gate seam both arrive here as
- * `reviewGateOpened: false` and keep the pre-bd-175 delivery.
+ * Withheld only while a human wait is live: a member blocked by `belayd_ask_human`
+ * (or by the bd-183 publication gate) cannot call the next phase tool the hint
+ * names, so offering it would only invite a refused call. A plain findings review
+ * delivers no wait at all (bd-219), so it always carries the directive — the turn
+ * that can fix the findings is told how. A clean review and a host with no seam
+ * reach here the same way and keep the directive too.
  */
 export function runCompleteLoopHint(options: {
   delivered: RunDelivery;
   state: CoreSessionState;
-  reviewGateOpened: boolean;
 }): string {
-  if (options.reviewGateOpened) return "";
+  if (options.state.awaitingHuman !== undefined) return "";
   return reviewLoopHintFor(options.delivered, options.state);
 }
 
@@ -438,25 +478,28 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }
 
   /**
-   * A phase run is complete. Turn a review that reported findings into a human
-   * gate through the injected seam (bd-175).
+   * Record a review that reported findings through the injected seam (bd-219).
    *
-   * Best-effort: the gate is the visible record, but a bd failure must never
-   * fail an otherwise delivered review. Returns whether the gate actually
-   * opened, so the caller can withhold the resumable-fix directive that a
-   * blocked workflow could not act on.
+   * Best-effort: the record and comment are the trace, but a bd failure must
+   * never fail an otherwise delivered review. The caller logs a skipped result
+   * through {@link warnOnSkippedReviewFindings}; the fix-loop directive is never
+   * conditioned on it, so a failed trace still leaves the turn able to fix.
    */
-  async function openReviewGateIfFound(options: {
+  async function deliverReviewFindingsIfFound(options: {
     delivered: RunDelivery;
     state: CoreSessionState;
     ctx: ExtensionContext;
-  }): Promise<boolean> {
-    const openGate = deps.reviewGate;
-    if (openGate === undefined) return false;
+  }): Promise<ReviewFindingsDelivery> {
+    const deliver = deps.reviewFindings;
+    if (deliver === undefined) {
+      return { recorded: false, gateOpened: false, reason: REVIEW_NO_SEAM_REASON };
+    }
     const reviewText = options.delivered.result.content?.[0]?.text ?? "";
-    if (!hasReviewFindings(reviewText)) return false;
-    return tryOpenReviewGate({
-      open: openGate,
+    if (!hasReviewFindings(reviewText)) {
+      return { recorded: false, gateOpened: false, reason: REVIEW_NO_FINDINGS_REASON };
+    }
+    return tryDeliverReviewFindings({
+      deliver,
       state: options.state,
       ctx: options.ctx,
       taskId: options.state.currentTaskId,
@@ -696,16 +739,17 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         const delivered = boundReviewDelivery(delivery);
         // Only a gate-owned, successful review records the reviewed sha — a
         // post-completion rework run must not scope the next task's review.
-        // A review that reported findings opens a human gate here (bd-175), so
-        // the stop is findable in bd instead of only inside the worktree.
-        let reviewGateOpened = false;
+        // The same review delivery records its findings and comment (bd-219);
+        // only a security-class finding additionally opens the bd-183 gate.
         if (gateOwnsRun() && delivery.success && delivery.phaseName === REVIEW_PHASE) {
           persistReviewedSha({ cwd, taskId: state.currentTaskId });
-          reviewGateOpened = await openReviewGateIfFound({
-            delivered,
-            state,
-            ctx: options.ctx,
-          });
+          warnOnSkippedReviewFindings(
+            await deliverReviewFindingsIfFound({
+              delivered,
+              state,
+              ctx: options.ctx,
+            }),
+          );
         }
         recordRunEndMetrics({
           taskId: state.currentTaskId,
@@ -724,7 +768,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
               customType: "belayd-run-complete",
               content: core.buildRunCompleteContent(
                 delivered,
-                runCompleteLoopHint({ delivered, state, reviewGateOpened }),
+                runCompleteLoopHint({ delivered, state }),
                 core.userGuideArtifactLine(delivered, { cwd, taskId: state.currentTaskId }),
               ),
               display: true,

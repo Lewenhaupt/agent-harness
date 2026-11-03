@@ -316,9 +316,9 @@ Run these from the repository root.
    tracked work is uncommitted, and a `reviewedUntracked` manifest naming each
    untracked file the review covered. Both are promoted from the scope captured
    when the review task was built, and written only on a **successful**,
-   gate-owned review, in a single write. While a review is running (or after a
-   failed one) `.belayd/review-scope.json` holds the pending
-   `{ taskId, sha, untracked, capturedAt }` record instead.
+   gate-owned review (a review inside an active workflow), in a single write.
+   While a review is running (or after a failed one) `.belayd/review-scope.json`
+   holds the pending `{ taskId, sha, untracked, capturedAt }` record instead.
 
 4. **A re-review is scoped to the fix round** — make a fix, commit or leave it
    in the working tree, call `belayd_review` again, and re-read the newest

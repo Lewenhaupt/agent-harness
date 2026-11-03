@@ -1,4 +1,13 @@
-# Review findings now reach Beads as a visible human gate (bd-175)
+# Review findings now reach Beads as a visible trace (bd-175, superseded wait by bd-219)
+
+> **bd-219 note (current behaviour).** The enforced gate is gone. A review that
+> reports ordinary findings writes the record and posts the `[belayd:review]`
+> comment, then the orchestrator runs the fix loop — no gate, no wait, no answer
+> poll, and a post-review member reads `active`. Only a **security-class**
+> finding still opens a bd `human` gate (bd-183), for its publication decision.
+> The rest of this guide documents the bd-175 wait mechanics, which remain
+> exactly the bd-183 path and `belayd_ask_human`. See
+> `docs/bd-183-userguide.md` for the surviving gate.
 
 Before bd-175 a review that reported findings stopped the member `awaiting-human`
 with its only trace inside the member's worktree (`.belayd/review-findings.md`).
@@ -7,32 +16,34 @@ offered it, and the fleet's own `run.stopped[]` said "a human wait" in a detail
 string nobody could join back to a gate — because there was no gate. The wait was
 real and unfindable at the same time.
 
-bd-175 makes the review wait a first-class Beads wait:
+bd-175 made that wait a first-class Beads wait (bd-219 removed it for ordinary
+findings):
 
 | What happens now | Where it shows |
 |---|---|
-| A review with findings opens a bd `human` gate that **blocks the bead** | `bd gate list <bead>`, `bd blocked`, `bd ready` (bead absent) |
+| A review with ordinary findings writes a record and a comment, **no gate** (bd-219) | `.belayd/review-findings.json`, `bd show <bead>` → `[belayd:review]` comment |
+| A **security-class** finding opens a bd `human` gate that blocks the bead (bd-183) | `bd gate list <bead>`, `bd blocked`, `bd ready` (bead absent) |
 | The findings are posted as an authored comment | `bd show <bead>` → `[belayd:review]` comment |
 | One `{finding, severity, phase, round, disposition}` entry per finding, dispositions `deferred` | `<worktree>/.belayd/review-findings.json` |
-| The existing human-answer poll is armed, so answering resumes the member | comment on the bead, or `bd gate resolve <gate>` |
-| The fleet records the **same** reason string in `run.stopped[]` | `belayd_fleet_status`, `<git-common-dir>/belayd/fleet/<id>/fleet.json` |
+| A sensitive wait arms the existing human-answer poll, so answering resumes the member | comment on the bead, or `bd gate resolve <gate>` |
+| The fleet reads the bead's **open gate** for its `awaiting-human` stop detail | `belayd_fleet_status`, `<git-common-dir>/belayd/fleet/<id>/fleet.json` |
 | A live human wait is exempt from the 1 h idle cap and gets its own 12 h cap | `FLEET_RUN_MAX_HUMAN_WAIT_TICKS`, halt reason `awaiting-human` |
 | A clean review keeps the old fast path | no gate, no comment, no record, no bd calls |
 
 | Piece | Where |
 |---|---|
-| Record, comment body, gate title, the shared reason constant | `src/review-findings.ts` (`buildReviewFindingsRecord`, `formatReviewFindingsComment`, `reviewFindingsGateTitle`, `REVIEW_HUMAN_GATE_REASON`) |
-| Gate trigger (which bullets count as findings) | `src/review-context.ts` (`parseReviewFindings` with `{ strict: true }`) via `hasReviewFindings` |
-| Gate + comment + record + poll arming | `extensions/capabilities/human-gate.ts` (`openReviewHumanGate`) |
-| Wiring into the review delivery, and withholding the advance hint | `extensions/capabilities/phase-run.ts` (`openReviewGateIfFound`, `runCompleteLoopHint`) |
-| Human-wait cap, halt reason, lease evidence | `src/fleet-run.ts` (`FLEET_RUN_MAX_HUMAN_WAIT_TICKS`, `idleOrWait`, `retryIsAlive`) |
+| Record, comment body, gate title, the reason constants | `src/review-findings.ts` (`buildReviewFindingsRecord`, `formatReviewFindingsComment`, `reviewFindingsGateTitle`, `REVIEW_FIX_LOOP_REASON`, `REVIEW_HUMAN_GATE_REASON`) |
+| Finding trigger (which bullets count as findings) | `src/review-context.ts` (`parseReviewFindings` with `{ strict: true }`) via `hasReviewFindings` |
+| Record + comment + the bd-183 gate + poll arming | `extensions/capabilities/human-gate.ts` (`deliverReviewFindings`) |
+| Wiring into the review delivery | `extensions/capabilities/phase-run.ts` (`deliverReviewFindingsIfFound`, `runCompleteLoopHint`) |
+| Human-wait cap, halt reason, lease evidence | `src/fleet-run.ts` (`FLEET_RUN_MAX_HUMAN_WAIT_TICKS`, `FLEET_HUMAN_GATE_DETAIL`, `idleOrWait`, `retryIsAlive`) |
 | The human-answer channel this reuses | `docs/bd-152-userguide.md` |
 
-`REVIEW_HUMAN_GATE_REASON` is the one string in all three places (`"workflow is
-waiting for a review response"`): the gate's `--reason`, the findings comment's
-`**Reason:**` line, and the fleet's `run.stopped[]` detail. `src/fleet-run.ts`
-imports the constant, so a stop can never describe a different wait from the gate
-blocking the bead.
+`REVIEW_HUMAN_GATE_REASON` is the text a real (bd-183) review wait carries
+(`"workflow is waiting for a review response"`): the bd-183 gate's `--reason`, and
+the sensitive finding's recorded disposition reason. The fleet's `awaiting-human`
+detail is `FLEET_HUMAN_GATE_DETAIL` instead, because the fleet waits on any open
+bd human gate; the two strings serve different surfaces.
 
 ## How to Verify
 
@@ -90,21 +101,22 @@ Case names worth knowing, by what they prove:
 
 | Test (`src/__tests__/…`) | Proves |
 | --- | --- |
-| `extension-review-gate` › `opens the gate, posts the findings, writes the record, and blocks` | gate argv (`--blocks`, `--type=human`, `--title "belayd-review: …"`, `--reason`), comment stdin starting `[belayd:review]`, the record file, `awaitingHuman`, poll armed |
+| `extension-review-gate` › `records ordinary findings and leaves the member working (bd-219)` | comment stdin starting `[belayd:review]`, the record file, **no** gate, `awaitingHuman` undefined, no poll |
+| `extension-review-gate` › `opens one gate with the disclosure wording and blocks publishing` | the surviving bd-183 gate: argv (`--blocks`, `--type=human`, `--title "belayd-review: …"`, `--reason`), `awaitingHuman`, poll armed, publication withheld |
 | `extension-review-gate` › `stays on the fast path for a clean review and writes nothing to bd` | **zero** bd calls, no gate, no record, no wait |
 | `extension-review-gate` › `does not open a gate for a narration-only review` | narration bullets do not open a human wait |
 | `extension-review-gate` › `keeps the gate and the wait when only the comment write fails` | gate is created first, so a failed comment still leaves a findable wait |
-| `extension-review-gate` › `opens exactly one gate when two review deliveries settle concurrently` | the `reviewGatePending` reservation |
-| `extension-review-gate` › `records an increasing round across re-reviews` | `round` comes from the persisted record, not memory |
-| `extension-review-gate` › `withholds the resumable-fix hint when the review gate opened` / `keeps the resumable-fix hint for a clean review or an absent gate seam` | `runCompleteLoopHint` |
+| `extension-review-gate` › `opens exactly one gate when two sensitive deliveries settle concurrently` | the `reviewGatePending` reservation |
+| `extension-review-gate` › `records an increasing round across re-reviews without a gate` | `round` comes from the persisted record, not memory |
+| `extension-review-gate` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive only while a human wait is live` | `runCompleteLoopHint` |
 | `review-findings` › `returns undefined for a clean review (the fast path writes nothing)` | no record for a clean review |
 | `review-findings` › `reports an error and leaves no temp file behind when the rename fails` | atomic temp-rename write |
 | `fleet-run` › `exempts an awaiting-human live wait from the idle cap (bd-175)` | 240 idle ticks on a lone live human wait is still `wait` |
 | `fleet-run` › `reaches the 12h awaiting-human halt when the human wait is the only work (bd-175)` | `halt` / `awaiting-human` at 2880 ticks |
 | `fleet-run` › `prefers the idle-cap stalled halt over a live human wait when a sibling is hung (bd-175)` | a hung non-human member still stalls at 1 h, naming the human wait |
-| `fleet-run` › `records the shared review reason verbatim in run.stopped[] (bd-175)` | the persisted entry is byte-identical to `REVIEW_HUMAN_GATE_REASON` |
+| `fleet-run` › `records the human-gate detail verbatim in run.stopped[] (bd-219)` | the persisted entry is byte-identical to `FLEET_HUMAN_GATE_DETAIL` |
 | `extension-session-naming` › `inlines the diff in a first review …` | a clean review delivery **keeps** `**When review findings remain:**` |
-| `extension-session-naming` › `bounds a delivered review and drops its narration bullets (bd-113)` | a findings review through the real seam **suppresses** that hint |
+| `extension-session-naming` › `bounds a delivered review and drops its narration bullets (bd-113)` | a findings review through the real seam **keeps** that hint (bd-219) |
 
 ### 3. Which review text opens a gate
 
@@ -161,8 +173,15 @@ That output *is* the documented limitation (see
 
 ### 4. End-to-end: the gate, the comment, the record
 
+> **Historical output.** The transcript below is the pre-bd-219 bd-175 run. Since
+> bd-219 these same ordinary findings produce
+> `{recorded: true, gateOpened: false, reason: "awaiting the fix loop in this workflow"}`
+> and `awaitingHuman: undefined` — same record, same comment, no gate and no
+> poll. A security-class finding still produces exactly the gate shown here
+> (bd-183).
+
 A throwaway bd database, never the repo's `.beads/`. `bd init --prefix bd` is
-required: `isValidTaskId` (which guards `openReviewHumanGate`, the actor line and
+required: `isValidTaskId` (which guards `deliverReviewFindings`, the actor line and
 the bd argv) accepts only `bd-<alnum>` / `bd-<alnum>.<alnum>`, so the default
 directory-derived prefix (`bd175-verify-…`) would be refused with
 `opened: false, reason: invalid task id "bd175-verify-…"`.
@@ -176,7 +195,7 @@ ID=$(bd create "review gate probe" -t task --json | jq -r '.id')
 echo "bead: $ID"                              # e.g. bd-6og
 ```
 
-Now drive `openReviewHumanGate` — the function the review delivery calls — with a
+Now drive `deliverReviewFindings` — the function the review delivery calls — with a
 stub session state and context. No model, no live workflow:
 
 ```bash
@@ -189,9 +208,15 @@ if (repo === undefined || cwd === undefined || taskId === undefined) {
   throw new Error("<repo> <cwd> <bead-id> [findings|clean]");
 }
 
-const { openReviewHumanGate } = (await import(
+const { deliverReviewFindings } = (await import(
   `${repo}/extensions/capabilities/human-gate.ts`
-)) as { openReviewHumanGate: (options: unknown) => Promise<{ opened: boolean; reason: string }> };
+)) as {
+  deliverReviewFindings: (options: unknown) => Promise<{
+    recorded: boolean;
+    gateOpened: boolean;
+    reason: string;
+  }>;
+};
 const { readReviewFindingsRecord, reviewFindingsRecordPath } = (await import(
   `${repo}/src/review-findings.ts`
 )) as {
@@ -232,7 +257,7 @@ const ctx = {
   sessionManager: { getSessionId: () => "demo-session", getSessionName: () => "belayd-demo" },
 };
 
-const outcome = await openReviewHumanGate({
+const outcome = await deliverReviewFindings({
   state,
   ctx,
   taskId,
@@ -554,6 +579,12 @@ rm -rf /tmp/bd175-verify /tmp/bd175-clean \
 
 ### What changes in your day
 
+> **bd-219:** this section describes the bd-175 wait for a review with findings.
+> Since bd-219 only a **security-class** finding still gates; an ordinary findings
+> review writes the record and the `[belayd:review]` comment and the orchestrator
+> runs its own fix loop (`docs/bd-219-userguide.md`). Read `belayd-review:` below
+> as the bd-183 publication gate.
+
 A review that reports findings is now a question you have to answer before the
 workflow continues — and it is visible in bd instead of only in a worktree file:
 
@@ -694,21 +725,29 @@ Two related nuances:
 
 ### When no gate appears
 
-Every failure is best-effort, and each one has a distinct signature:
+Every failure is best-effort, and each one has a distinct signature. A review
+with ordinary findings has **no** gate by design since bd-219 — `recorded: true`,
+`gateOpened: false`; only a security-class finding is expected to gate.
 
 | What you see | Cause | What to do |
 |---|---|---|
-| Review with findings, member stopped `awaiting-human`, **no** gate on the bead | `bd gate create` failed (bd missing, database unreachable, argv refused) | Fix bd, then re-run the review or open the wait by hand with `belayd_ask_human`; until then the wait exists only inside the member's session |
+| Security-class review, record + comment, **no** gate on the bead | `bd gate create` failed (bd missing, database unreachable, argv refused); the delivery returned `gateOpened: false` with the error in `reason`; logged once as `could not open the sensitive-findings human gate` | Nothing is blocked — the findings still reach the orchestrator; run the fix loop, and escalate with `belayd_ask_human` only for a publication decision you may not take |
 | Gate open, **no** `[belayd:review]` comment | the comment write failed (warned as `could not post the review findings comment`) | Keep the gate — the reason text is the visible wait — and read `.belayd/review-findings.md` |
 | Gate and comment, **no** `.belayd/review-findings.json` | record write failed (read-only worktree) — warned as `could not record the review findings` | Nothing blocks: the gate and the comment are the human-visible record |
-| `opened: false, reason: "a review gate is already being opened"` / `"already waiting on …"` | a review already opened a gate, or a `belayd_ask_human` wait is open | Answer the open gate; exactly one is ever created |
-| `opened: false, reason: "invalid task id …"` | the bead id is not in the `bd-<alnum>` shape | Use a normal bead id (this is the guard that keeps a crafted id out of bd argv) |
+| `gateOpened: false, reason: "a review delivery is already in progress"` | a concurrent review delivery holds the reservation | Exactly one gate is ever created; nothing else to do |
+| `gateOpened: false, reason: "invalid task id …"` | the bead id is not in the `bd-<alnum>` shape | Use a normal bead id (this is the guard that keeps a crafted id out of bd argv) |
+| Ordinary findings: record + comment, no gate | intended (bd-219) | Run the fix loop (`belayd_implement`, then `belayd_review`) |
 | Clean review: no gate, no comment, no record | intended | Nothing — advance as before |
 
 Every one of those warnings is prefixed `[belayd-harness]`, so the daemon log
-carries the same text as the terminal — search it for `could not open the review
-human gate`, `could not post the review findings comment`, or `could not record
-the review findings`.
+carries the same text as the terminal. Each failure has exactly one owner in the
+log: the delivery seam logs a refused bd-183 gate
+(`could not open the sensitive-findings human gate`) and an already-open wait that
+could not re-arm the publication question
+(`could not arm the sensitive-findings publication question`); the phase runner
+logs only a skipped record (`review findings were not fully delivered`); and the
+record/comment write failures log `could not record` / `could not post`. Search
+the log for those strings.
 
 ### Rules of thumb
 

@@ -24,7 +24,9 @@ import {
   nextReviewRound,
   REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
   REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
+  REVIEW_FIX_LOOP_REASON,
   REVIEW_HUMAN_GATE_REASON,
+  type ReviewFindingDisposition,
   type ReviewFindingsRecord,
   readReviewFindingsRecord,
   recordPublicationAnswer,
@@ -189,7 +191,7 @@ describe("buildReviewFindingsRecord", () => {
       taskId: "bd-1",
       phase: "review",
       round: 1,
-      reason: REVIEW_HUMAN_GATE_REASON,
+      reason: REVIEW_FIX_LOOP_REASON,
       artifactPath: REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
       findings: [
         {
@@ -197,7 +199,8 @@ describe("buildReviewFindingsRecord", () => {
           severity: "critical",
           phase: "review",
           round: 1,
-          disposition: { kind: "deferred", reason: REVIEW_HUMAN_GATE_REASON },
+          disposition: { kind: "deferred", reason: REVIEW_FIX_LOOP_REASON },
+          dispositionSource: "default",
           sensitivity: { sensitive: false, reasons: [] },
         },
         {
@@ -205,7 +208,8 @@ describe("buildReviewFindingsRecord", () => {
           severity: "warnings",
           phase: "review",
           round: 1,
-          disposition: { kind: "deferred", reason: REVIEW_HUMAN_GATE_REASON },
+          disposition: { kind: "deferred", reason: REVIEW_FIX_LOOP_REASON },
+          dispositionSource: "default",
           sensitivity: { sensitive: false, reasons: [] },
         },
       ],
@@ -218,6 +222,23 @@ describe("buildReviewFindingsRecord", () => {
     expect(record?.findings[0]?.sensitivity?.reasons.length).toBeGreaterThan(0);
     // No decision until a human answers: that absence is what blocks publishing.
     expect(record?.findings[0]?.publication).toBeUndefined();
+  });
+
+  it("defers a sensitive finding to the publication decision, not the fix loop (bd-219)", () => {
+    // The bd-184 deferred surface renders this reason, and a security-class
+    // finding's deferral is a human publication choice — saying "awaiting the fix
+    // loop" there described a decision nobody was asked for.
+    const record = buildReviewFindingsRecord({ taskId: "bd-1", text: SENSITIVE_REVIEW });
+    if (record === undefined) throw new Error("expected a record");
+    expect(record.findings[0]?.disposition).toEqual({
+      kind: "deferred",
+      reason: REVIEW_HUMAN_GATE_REASON,
+    });
+    // The record-level reason still describes the delivery, and the gate reason
+    // built from the findings is unchanged.
+    expect(record.reason).toBe(REVIEW_FIX_LOOP_REASON);
+    expect(reviewFindingsGateReason(record)).toContain(REVIEW_HUMAN_GATE_REASON);
+    expect(reviewFindingsGateReason(record)).toContain("publication decision");
   });
 
   it("honours an explicit round and disposition", () => {
@@ -253,40 +274,45 @@ describe("formatReviewFindingsComment", () => {
     const record = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     if (record === undefined) throw new Error("expected a record");
     const body = formatReviewFindingsComment(record);
-    expect(body).toContain(REVIEW_HUMAN_GATE_REASON);
+    expect(body).toContain("## Review findings (round 1)");
+    expect(body).toContain(REVIEW_FIX_LOOP_REASON);
     expect(body).toContain("**Findings:** 2 (Critical: 1, Warnings: 1, Suggestions: 0)");
     expect(body).toContain("### Critical (must fix)");
     expect(body).toContain("### Warnings (should fix)");
     expect(body).not.toContain("### Suggestions (consider)");
     expect(body).toContain("`src/a.ts:12` — off-by-one in the loop bound");
     expect(body).toContain(REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH);
-    expect(body).toContain("### Question");
+    expect(body).toContain("### Next step");
+    expect(body).not.toContain("### Question");
   });
 
-  it("is byte-identical to the bd-175 comment for a record with no sensitive findings", () => {
-    // Pinned: operators read this comment every round, so a clean record must not
-    // gain a marker or a section. The literal is the bd-175 output.
+  it("renders the bd-219 trace verbatim for a record with no sensitive findings", () => {
+    // Pinned: operators read this comment every round, so a non-sensitive record
+    // must render exactly one fixed body — no marker, no publication section, no
+    // question. Any drift here means the round's comment gained or lost a line.
     const record = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     if (record === undefined) throw new Error("expected a record");
     expect(formatReviewFindingsComment(record)).toBe(
       [
-        "## Review findings — human gate",
+        "## Review findings (round 1)",
         "",
-        `**Reason:** ${REVIEW_HUMAN_GATE_REASON}`,
+        `**Reason:** ${REVIEW_FIX_LOOP_REASON}`,
         "",
         "**Findings:** 2 (Critical: 1, Warnings: 1, Suggestions: 0)",
         "",
         `Full findings: \`${REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH}\``,
         "",
         "### Critical (must fix)",
-        `- \`src/a.ts:12\` — off-by-one in the loop bound — deferred — ${REVIEW_HUMAN_GATE_REASON}`,
+        `- \`src/a.ts:12\` — off-by-one in the loop bound — deferred — ${REVIEW_FIX_LOOP_REASON}`,
         "",
         "### Warnings (should fix)",
-        `- \`src/b.ts:5\` — missing null check — deferred — ${REVIEW_HUMAN_GATE_REASON}`,
+        `- \`src/b.ts:5\` — missing null check — deferred — ${REVIEW_FIX_LOOP_REASON}`,
         "",
-        "### Question",
-        "Should these findings be addressed, deferred to a bead (with a reason), or rejected? " +
-          "Reply on this bead (or resolve the gate) with your decision, then the workflow resumes.",
+        "### Next step",
+        "No human decision is required: address every Critical and Warning in the fix loop",
+        "(`belayd_implement` with these findings, then `belayd_review`). Escalate with",
+        "`belayd_ask_human` only if a Critical finding should not be implemented (a product, risk",
+        "or scope decision), or you found a contradiction the bead and the repo cannot resolve.",
       ].join("\n"),
     );
   });
@@ -317,8 +343,8 @@ describe("sensitivity helpers", () => {
     const plain = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     const sensitive = buildReviewFindingsRecord({ taskId: "bd-1", text: SENSITIVE_REVIEW });
     if (plain === undefined || sensitive === undefined) throw new Error("expected records");
-    // The shared constant stays untouched: the fleet supervisor imports it as the
-    // `awaiting-human` detail.
+    // The constant itself stays untouched: it is the text a human reads on the
+    // bd-183 gate. The fleet's own detail is `FLEET_HUMAN_GATE_DETAIL`.
     expect(reviewFindingsGateReason(plain)).toBe(REVIEW_HUMAN_GATE_REASON);
     expect(reviewFindingsGateReason(sensitive)).toContain(REVIEW_HUMAN_GATE_REASON);
     expect(reviewFindingsGateReason(sensitive)).toContain("publication decision");
@@ -344,9 +370,9 @@ describe("sensitivity helpers", () => {
     ).toBe("belayd-review: bd-1 sensitive findings (round 2; previous decisions reset)");
   });
 
-  it("keeps the gate reason string on the record so the fleet detail cannot drift", () => {
+  it("keeps the fix-loop reason on the record, not a wait it never had", () => {
     const record = buildReviewFindingsRecord({ taskId: "bd-1", text: SENSITIVE_REVIEW });
-    expect(record?.reason).toBe(REVIEW_HUMAN_GATE_REASON);
+    expect(record?.reason).toBe(REVIEW_FIX_LOOP_REASON);
   });
 });
 
@@ -382,7 +408,7 @@ describe("writeReviewFindingsRecord / readReviewFindingsRecord", () => {
     expect(result).toEqual({ ok: true });
     const written = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
     expect(written.findings).toHaveLength(2);
-    expect(written.reason).toBe(REVIEW_HUMAN_GATE_REASON);
+    expect(written.reason).toBe(REVIEW_FIX_LOOP_REASON);
     expect(readReviewFindingsRecord({ cwd })?.round).toBe(1);
   });
 
@@ -692,6 +718,22 @@ describe("applyPublicationAnswer / recordPublicationAnswer", () => {
       expect(readReviewFindingsRecord({ cwd })).toEqual(record);
     }
   });
+
+  it("reads a record written before the disposition marker", () => {
+    // The marker is optional on read with no schemaVersion bump: in-flight rounds
+    // written by the previous build must still load their round and findings.
+    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
+    const base = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
+    if (base === undefined) throw new Error("expected a record");
+    const [baseFinding] = base.findings;
+    if (baseFinding === undefined) throw new Error("expected a finding");
+    const legacyFinding = { ...baseFinding };
+    delete legacyFinding.dispositionSource;
+    const legacy: ReviewFindingsRecord = { ...base, findings: [legacyFinding] };
+
+    writeReviewFindingsRecord({ cwd, record: legacy });
+    expect(readReviewFindingsRecord({ cwd })).toEqual(legacy);
+  });
 });
 
 describe("carryForwardSensitivity", () => {
@@ -749,6 +791,108 @@ describe("carryForwardSensitivity", () => {
     expect(hasSensitiveFindings(carried)).toBe(true);
     // A decision answers one round: nothing is carried into the rebuilt record.
     expect(carried.findings[0]?.publication).toBeUndefined();
+  });
+
+  it("re-labels the default deferral when a carried verdict makes the finding sensitive (bd-219)", () => {
+    // The exact bd-183 scenario: the live table weakened, so the rebuilt record is
+    // built clean and gets the fix-loop deferral, while the carry makes it
+    // security-class. bd-184 renders the reason, so it must name the decision.
+    const previous = previousRecord({
+      sensitive: true,
+      reasons: [{ kind: "security-topic", match: "auth" }],
+    });
+    const rebuilt = buildReviewFindingsRecord({ taskId: "bd-1", text: PLAIN_REVIEW, round: 2 });
+    if (rebuilt === undefined) throw new Error("expected a record");
+    expect(rebuilt.findings[0]?.disposition).toEqual({
+      kind: "deferred",
+      reason: REVIEW_FIX_LOOP_REASON,
+    });
+    expect(rebuilt.findings[0]?.dispositionSource).toBe("default");
+
+    const carried = carryForwardSensitivity({ record: rebuilt, previous });
+    expect(carried.findings[0]?.disposition).toEqual({
+      kind: "deferred",
+      reason: REVIEW_HUMAN_GATE_REASON,
+    });
+    // Still module-owned, so a later round may re-label it again; it is not a
+    // decision someone made.
+    expect(carried.findings[0]?.dispositionSource).toBe("default");
+    // The label is not a decision: publication stays fail-closed.
+    expect(carried.findings[0]?.publication).toBeUndefined();
+  });
+
+  it("keeps an orchestrator deferral that reuses the fix-loop reason (bd-219 review)", () => {
+    // The marker, not the text, decides who owns the disposition: an orchestrator
+    // may record a deferral whose reason happens to quote the module's default.
+    const previous = previousRecord({
+      sensitive: true,
+      reasons: [{ kind: "security-topic", match: "auth" }],
+    });
+    const recorded: ReviewFindingDisposition = {
+      kind: "deferred",
+      reason: REVIEW_FIX_LOOP_REASON,
+    };
+    const rebuilt = buildReviewFindingsRecord({
+      taskId: "bd-1",
+      text: PLAIN_REVIEW,
+      round: 2,
+      disposition: recorded,
+    });
+    if (rebuilt === undefined) throw new Error("expected a record");
+    expect(rebuilt.findings[0]?.dispositionSource).toBe("recorded");
+
+    const carried = carryForwardSensitivity({ record: rebuilt, previous });
+    expect(carried.findings[0]?.sensitivity?.sensitive).toBe(true);
+    expect(carried.findings[0]?.disposition).toEqual(recorded);
+    expect(carried.findings[0]?.dispositionSource).toBe("recorded");
+  });
+
+  it("still re-labels a legacy default deferral that predates the marker", () => {
+    // A record written by an older build has no `dispositionSource`. Its fix-loop
+    // deferral is this module's default by construction, so the reason fallback
+    // keeps the existing re-label behaviour for in-flight rounds.
+    const previous = previousRecord({
+      sensitive: true,
+      reasons: [{ kind: "security-topic", match: "auth" }],
+    });
+    const rebuilt = buildReviewFindingsRecord({ taskId: "bd-1", text: PLAIN_REVIEW, round: 2 });
+    if (rebuilt === undefined) throw new Error("expected a record");
+    const finding = rebuilt.findings[0];
+    if (finding === undefined) throw new Error("expected a finding");
+    const legacyFinding = { ...finding };
+    delete legacyFinding.dispositionSource;
+    const legacy: ReviewFindingsRecord = { ...rebuilt, findings: [legacyFinding] };
+
+    const carried = carryForwardSensitivity({ record: legacy, previous });
+    expect(carried.findings[0]?.disposition).toEqual({
+      kind: "deferred",
+      reason: REVIEW_HUMAN_GATE_REASON,
+    });
+    expect(carried.findings[0]?.dispositionSource).toBeUndefined();
+  });
+
+  it("never rewrites a disposition the orchestrator made", () => {
+    const previous = previousRecord({
+      sensitive: true,
+      reasons: [{ kind: "security-topic", match: "auth" }],
+    });
+    const decisions: readonly ReviewFindingDisposition[] = [
+      { kind: "fixed" },
+      { kind: "rejected", reason: "out of scope" },
+      { kind: "deferred", reason: "tracked as bd-42" },
+    ];
+    for (const disposition of decisions) {
+      const rebuilt = buildReviewFindingsRecord({
+        taskId: "bd-1",
+        text: PLAIN_REVIEW,
+        round: 2,
+        disposition,
+      });
+      if (rebuilt === undefined) throw new Error("expected a record");
+      const carried = carryForwardSensitivity({ record: rebuilt, previous });
+      expect(carried.findings[0]?.sensitivity?.sensitive).toBe(true);
+      expect(carried.findings[0]?.disposition).toEqual(disposition);
+    }
   });
 
   it("returns the rebuilt record unchanged when the previous round had nothing sensitive", () => {
