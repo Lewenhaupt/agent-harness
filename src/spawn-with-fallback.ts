@@ -429,6 +429,8 @@ function skipCandidate(candidate: string, store: ModelCooldownStore): SpawnAttem
  * reset. `unconfigured` means the credential itself is absent, so the same is
  * true for a different reason — but it is kept out of `quota` so telemetry and
  * the capacity cache never record a spent bucket for it (nothing was measured).
+ * `capacity` is never provider-scoped: it is a local, per-bucket refusal with no
+ * upstream cost and no cooldown to record.
  */
 function isProviderScopedFailure(kind: FailureKind): boolean {
   return kind === "quota" || kind === "unconfigured";
@@ -464,6 +466,10 @@ export function recordFailureCooldown(
   provider: string,
   classification: FailureClassification,
 ): void {
+  // A capacity refusal is local bookkeeping — nothing upstream was spent and
+  // the next candidate has its own bucket — so it must never cool a provider or
+  // model, whatever a future classification might attach to it.
+  if (classification.kind === "capacity") return;
   if (classification.cooldownSeconds === undefined) return;
   const seconds = classification.cooldownSeconds;
   const reason = classification.reason ?? classification.kind;
@@ -499,6 +505,8 @@ function recordCapacityFromFailure(
   classification: FailureClassification,
 ): void {
   if (capacity === undefined) return;
+  // Strictly `quota`: a local `capacity` refusal spent nothing, so it must not
+  // create a spent-capacity window or reorder the provider's models.
   if (classification.kind !== "quota" || provider === "") return;
   const seconds = classification.cooldownSeconds;
   if (seconds === undefined) return;

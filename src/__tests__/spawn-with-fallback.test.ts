@@ -1913,3 +1913,38 @@ describe("mergeRunModelSelections", () => {
     expect(merged).toHaveProperty("servedModel", "opencode-go/b");
   });
 });
+
+describe("capacity refusal fallback (bd-187 W2)", () => {
+  it("moves to the next candidate without cooling the provider or counting quota failures", async () => {
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"))
+      .mockResolvedValueOnce(makeResult("openrouter/mimo-v2.6-flash"));
+
+    const store = createModelCooldownStore(() => 0);
+    const telemetry = createModelTelemetryStore();
+    const { attempts } = await spawnAgentWithFallback({
+      model: "llmgateway/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      candidates: ["llmgateway/mimo-v2.6-flash", "openrouter/mimo-v2.6-flash"],
+      cooldownStore: store,
+      telemetry,
+      classify: seqClassifier("capacity", "success"),
+    });
+
+    // A capacity denial means "not this provider right now", so the loop tries
+    // the next candidate instead of hard-failing the phase.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(2);
+    expect(attempts.map((attempt) => attempt.model)).toEqual([
+      "llmgateway/mimo-v2.6-flash",
+      "openrouter/mimo-v2.6-flash",
+    ]);
+
+    // Nothing upstream was spent: no cooldown row, no quota-failure count.
+    expect(store.isCoolingDown("llmgateway/mimo-v2.6-flash")).toBe(false);
+    expect(store.entries().size).toBe(0);
+    expect(store.providerEntries().size).toBe(0);
+    expect(telemetry.totals().quotaFailures).toBe(0);
+  });
+});

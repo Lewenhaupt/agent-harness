@@ -60,8 +60,23 @@ export type FailureKind =
    * was spent and no capacity window was observed.
    */
   | "unconfigured"
+  /**
+   * The local shared capacity limit refused the dispatch before any request was
+   * sent (bd-187). Fallback-worthy: a different candidate has its own bucket.
+   * Never `quota`: nothing upstream was spent, so no cooldown or capacity window
+   * may be recorded for it.
+   */
+  | "capacity"
   | "auth"
   | "other";
+
+/**
+ * Stable marker embedded in the provider wrapper's capacity-refusal message.
+ * Exported so the refusal text and the classification rule cannot drift: pi
+ * converts a synchronous stream throw into an assistant error message, and this
+ * marker is the only part of the typed refusal that survives that conversion.
+ */
+export const CAPACITY_REFUSAL_MARKER = "belayd-capacity-refused";
 
 export interface FailureClassification {
   kind: FailureKind;
@@ -69,7 +84,11 @@ export interface FailureClassification {
   model?: string;
   /** Human-readable reason for the classification. */
   reason?: string;
-  /** Suggested cooldown, when the kind is retryable elsewhere (quota/transient/unavailable/unconfigured). */
+  /**
+   * Suggested cooldown, when the kind is retryable elsewhere (quota/transient/
+   * unavailable/unconfigured). Never set for `capacity` or `auth`: nothing
+   * upstream was spent, so there is no window to cool.
+   */
   cooldownSeconds?: number;
   /**
    * True when `cooldownSeconds` is an authoritative provider-supplied window
@@ -315,11 +334,23 @@ function classifyAssistantRecord(
  * reaches a model turn, so the assistant path's rules can only fire here. The
  * no-key rule is therefore mirrored on the statusless stderr text; a
  * status-coded line keeps a status classification instead.
+ *
+ * The wrapper's capacity marker is checked first, with the same precedence the
+ * assistant path gives it: a child refused for local capacity writes the marker
+ * to stderr, and calling that `other` would hard-fail the phase instead of
+ * falling back to the next candidate.
  */
 function classifyProcessFailure(details: SpawnDetails): FailureClassification {
   const stderr = details.stderr ?? "";
   const model = details.model;
 
+  if (stderr.includes(CAPACITY_REFUSAL_MARKER)) {
+    return {
+      kind: "capacity",
+      model,
+      reason: "Local provider capacity limit refused the dispatch.",
+    };
+  }
   if (NETWORK_ERROR_PATTERN.test(stderr)) {
     return {
       kind: "transient",
@@ -496,13 +527,31 @@ const gatewayRejectionRule: ClassificationRule = (status, errorMessage) => {
 };
 
 /**
- * Ordered rules; the first match wins. Order matters: a quota status must beat
- * model wording (a 429 body can mention the model), a plan-gating 403 must beat
- * the broader entitlement wording, and auth must beat unavailable (a 403 body
- * can mention a model name without it being retired). The unconfigured rule is
+ * The provider wrapper's own capacity refusal, after pi converted the thrown
+ * refusal into an assistant error message. First rule: the marker is ours and is
+ * authoritative whatever status pi attaches to the wrapper text.
+ */
+const capacityRefusalRule: ClassificationRule = (_status, errorMessage) => {
+  if (errorMessage === undefined) return undefined;
+  if (!errorMessage.includes(CAPACITY_REFUSAL_MARKER)) return undefined;
+  // No cooldownSeconds on purpose: nothing upstream was spent, so this must not
+  // cool the provider or record a capacity window.
+  return {
+    kind: "capacity",
+    reason: "Local provider capacity limit refused the dispatch.",
+  };
+};
+
+/**
+ * Ordered rules; the first match wins. Order matters: the wrapper's capacity
+ * marker must beat every upstream wording rule, a quota status must beat model
+ * wording (a 429 body can mention the model), a plan-gating 403 must beat the
+ * broader entitlement wording, and auth must beat unavailable (a 403 body can
+ * mention a model name without it being retired). The unconfigured rule is
  * statusless-only, so it can never preempt a status-coded classification.
  */
 const CLASSIFICATION_RULES: readonly ClassificationRule[] = [
+  capacityRefusalRule,
   quotaStatusRule,
   modelNotInPlanRule,
   providerEntitlementRule,
@@ -546,6 +595,9 @@ export function isFallbackWorthy(kind: FailureKind): boolean {
     case "transient":
     case "unavailable":
     case "unconfigured":
+    // A local capacity refusal says "not this provider right now"; a different
+    // candidate has its own (provider, class) bucket, so fall back to it.
+    case "capacity":
       return true;
     case "success":
     case "auth":

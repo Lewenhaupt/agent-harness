@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { SpawnDetails, SpawnUsage } from "../agent-registry.js";
 import {
+  CAPACITY_REFUSAL_MARKER,
   classifyAssistantMessage,
   classifySpawnFailure,
   DEFAULT_ENTITLEMENT_COOLDOWN_SECONDS,
@@ -785,5 +786,60 @@ describe("classifyAssistantMessage", () => {
     const result = classifyAssistantMessage(assistantError("401: invalid api key"));
     expect(result).toHaveProperty("kind", "auth");
     expect(result === undefined ? true : isFallbackWorthy(result.kind)).toBe(false);
+  });
+});
+
+describe("capacity refusals (bd-187 W2)", () => {
+  it("classifies the wrapper's stable marker as capacity with no cooldown", () => {
+    const classification = classifyAssistantMessage(
+      assistantError(
+        `${CAPACITY_REFUSAL_MARKER}: model dispatch refused (capacity): capacity in use (8/8) on llmgateway/standard`,
+      ),
+    );
+    expect(classification).toMatchObject({ kind: "capacity" });
+    expect(classification?.cooldownSeconds).toBeUndefined();
+    expect(classification?.cooldownHinted).toBeUndefined();
+  });
+
+  it("wins over upstream wording the wrapper text might contain", () => {
+    // The marker is ours and authoritative even if the embedded details mention
+    // a quota status or model wording.
+    const classification = classifyAssistantMessage(
+      assistantError(
+        `429: ${CAPACITY_REFUSAL_MARKER}: model dispatch refused (capacity): quota 429 rate limit`,
+      ),
+    );
+    expect(classification).toMatchObject({ kind: "capacity" });
+  });
+
+  it("is fallback-worthy", () => {
+    expect(isFallbackWorthy("capacity")).toBe(true);
+  });
+
+  it("classifies the marker on the process path (stderr), not just the assistant path", () => {
+    const withMarker: SpawnDetails = {
+      messages: [],
+      usage: zeroUsage(),
+      exitCode: 1,
+      model: "llmgateway/mimo-v2.6-flash",
+      stderr: `${CAPACITY_REFUSAL_MARKER}: model dispatch refused (capacity): capacity in use (8/8) on llmgateway/standard`,
+    };
+    const classification = classifySpawnFailure(withMarker);
+    expect(classification).toMatchObject({ kind: "capacity", model: "llmgateway/mimo-v2.6-flash" });
+    expect(classification.cooldownSeconds).toBeUndefined();
+    expect(isFallbackWorthy(classification.kind)).toBe(true);
+
+    // The marker keeps its assistant-path precedence over quota wording.
+    expect(
+      classifySpawnFailure({
+        ...withMarker,
+        stderr: `429: ${CAPACITY_REFUSAL_MARKER}: model dispatch refused (capacity): quota 429 rate limit`,
+      }),
+    ).toMatchObject({ kind: "capacity" });
+
+    // An unrelated non-zero exit is still unclassifiable.
+    expect(
+      classifySpawnFailure({ ...withMarker, stderr: "boom: unexpected crash" }),
+    ).toHaveProperty("kind", "other");
   });
 });

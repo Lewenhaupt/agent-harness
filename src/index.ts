@@ -1151,6 +1151,35 @@ export {
   resetModelSessionState,
 } from "./model-session-state.js";
 export type {
+  ActiveCooldown,
+  CapacityRelease,
+  CapacityReservation,
+  CapacitySnapshot,
+  CooldownRecord,
+  CooldownScope as SharedCooldownScope,
+  LeaseRenewal,
+  MarkCooldownInput,
+  ModelStateOpen,
+  ModelStateResult,
+  ModelStateStore,
+  ModelStateStoreOptions,
+  ReleaseCapacityInput,
+  RenewLeaseInput,
+  ReserveCapacityInput,
+  SpendRow,
+  SpendTotals,
+} from "./model-state-store.js";
+export {
+  DEFAULT_CAPACITY_LEASE_TTL_MS,
+  defaultModelStatePath,
+  MODEL_STATE_FILE_ENV,
+  MODEL_STATE_READ_CACHE_MAX_AGE_MS,
+  MODEL_STATE_SCHEMA_VERSION,
+  openModelStateStore,
+  PROVIDER_SCOPE_MODEL,
+  resolveModelStatePath,
+} from "./model-state-store.js";
+export type {
   AppendModelTelemetryOptions,
   AppendModelTelemetryResult,
   ModelPhaseEvent,
@@ -1401,6 +1430,48 @@ export {
   scanProofRefs,
 } from "./proof-verification.js";
 export type {
+  CapacityAcquisition,
+  CapacityConfig,
+  CapacityDenialDetails,
+  CapacityLease,
+  DispatchDecision,
+  DispatchDecisionDenied,
+  ProviderPolicy,
+  ProviderUsageLike,
+} from "./provider-policy.js";
+export {
+  CAPACITY_LIMIT_ENV,
+  createLeaseTtlResolver,
+  createProviderPolicy,
+  DEFAULT_CAPACITY_LIMIT,
+  decideDispatch,
+  LEASE_RENEWAL_INTERVAL_FLOOR_MS,
+  LEASE_TTL_ENV,
+  LEASE_TTL_FLOOR_MS,
+  MAX_ATTEMPTS_PER_DISPATCH,
+  RECOMMENDED_RETRY_MAX_RETRIES,
+  recordFailure as recordProviderFailure,
+  recordSpend as recordProviderSpend,
+  resolveCapacityLimit,
+  resolveLeaseTtlMs,
+  TRANSIENT_RETRY_BUDGET,
+} from "./provider-policy.js";
+export type {
+  DispatchAttribution,
+  ModelsLike,
+  ProviderLike,
+  ProviderStreamFunction,
+  ProviderStreamLike,
+  ProviderWrapperOptions,
+} from "./provider-wrapper.js";
+export {
+  installProviderPolicy,
+  ProviderPolicyRefusalError,
+  setDispatchAttribution,
+  wrapProvider,
+  wrapProviderCollection,
+} from "./provider-wrapper.js";
+export type {
   PublishGateInput,
   PublishGateRefusalReason,
   PublishGateResult,
@@ -1421,6 +1492,7 @@ export {
 } from "./quality-gates.js";
 export type { FailureClassification, FailureKind, QuotaCooldown } from "./quota-failure.js";
 export {
+  CAPACITY_REFUSAL_MARKER,
   classifyAssistantMessage,
   classifySpawnFailure,
   DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS,

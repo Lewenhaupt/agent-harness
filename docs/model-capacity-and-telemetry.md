@@ -948,6 +948,168 @@ refusal wording, wire-id splitting);
 `does not repeat a candidate it already ran on`,
 `leaves a phase sub-agent alone`, `stops switching at the per-session cap`.
 
+### Shared model-state store and provider wrapper (bd-187)
+
+bd-38/bd-116/bd-229/bd-234 above are still live; bd-187 adds a second,
+additive layer that a follow-up bead will migrate them onto.
+
+**What it is.** A pi-ai **provider wrapper** (`src/provider-wrapper.ts`) over a
+shared **SQLite** state file (`src/model-state-store.ts`), with the policy in
+`src/provider-policy.ts`. The wrapper spreads the real provider and overrides
+only `stream`/`streamSimple`; every other member is forwarded untouched and the
+provider **id never changes** (pi `model_change` entries and pi-durable
+`pi.agent` documents store provider ids, so a rename orphans conversations).
+
+**Path.** `$XDG_STATE_HOME/belayd/model-state.sqlite`, or
+`~/.local/state/belayd/model-state.sqlite` without `XDG_STATE_HOME`.
+`BELAYD_MODEL_STATE_FILE` overrides it (same precedent as
+`BELAYD_MODEL_COOLDOWN_FILE`). WAL, busy timeout, schema marker in
+`PRAGMA user_version`, and a short synchronous read cache (1 000 ms).
+
+**Tables.** `cooldown(provider, model, until_ms, reason, retry_after_ms)`
+(`model = '*'` means provider-wide), `capacity(provider, class, limit, in_use)`,
+`lease(lease_id, provider, class, daemon_pid, host, expires_ms)` and
+`spend(ts, provider, model, phase, task_id, input, output, cache_read,
+cache_write, cost)`. Reserve/release are short `BEGIN IMMEDIATE` transactions
+that recompute `in_use` from the lease table. Expiry is time-based
+(`expires_ms`), never pid-based, so a SIGKILLed daemon cannot hold capacity;
+the unhinted cooldown ladder lives in `cooldown_ladder` so a 6 h guess still
+doubles to the 24 h ceiling. A release is ownership-checked (`host` +
+`daemon_pid`): another process knowing the lease id cannot free the slot, and a
+repeat release is an idempotent no-op. The database file and its `-wal`/`-shm`
+sidecars are chmod'd 0600 (directory 0700) after every write — including lease
+renewals, which share the release path's post-commit duties — so the shared
+budget state is not world-readable on a multi-user host.
+
+**Capacity is on the production path.** Every wrapped dispatch reserves a lease
+before calling the real provider and releases it when the stream settles
+(success, terminal error, or rejected stream), so `in_use` is live cross-process
+concurrency. The limit is per `(provider, class)` bucket, defaults to **8**, and
+is set with `BELAYD_MODEL_CAPACITY_LIMIT` (`0` disables capacity). One scalar
+limit covers the whole bucket: in a fan-out every spawned child holds its own
+lease against the same bucket, so the (limit+1)th child is refused — and because
+the refusal classifies as `capacity` (below), it falls back to the next
+candidate instead of failing the phase. A refusal is a typed
+`ProviderPolicyRefusalError` with `scope: "capacity"` and the provider, class,
+`inUse`, `limit` and a wait hint; the real provider is never called.
+
+A lease is renewed on a heartbeat at a third of its TTL while the stream is live
+(`BELAYD_MODEL_LEASE_TTL_MS`, default 10 minutes), so a turn that outlives the
+original TTL keeps its slot instead of being handed to another process. The TTL
+is clamped to a **10 s floor** (`LEASE_TTL_FLOOR_MS`) and the derived interval to
+a **1 s floor** (`LEASE_RENEWAL_INTERVAL_FLOOR_MS`) independently: a tiny TTL
+would otherwise commit a `BEGIN IMMEDIATE` renewal every few hundred milliseconds
+per live stream, contending with cooldown/spend writers across every wrapped
+runtime under the store's 5 s busy timeout. A sub-floor value is refused with one
+warning naming the env var and the floor used, not silently accepted. The
+heartbeat stops on every settle path; if the process is SIGKILLed, the lease
+expires by `expires_ms` and only then frees the slot. An expired lease can never
+be renewed (its slot may already be reused). A read-only or unopenable store
+skips capacity entirely and dispatches without a lease — bookkeeping failure
+never blocks a turn.
+
+**Capacity refusals are fallback-worthy.** The wrapper embeds the stable
+`CAPACITY_REFUSAL_MARKER` in a capacity refusal message, and `quota-failure.ts`
+classifies that marker as the additive `capacity` kind
+(`isFallbackWorthy("capacity") === true`) on **both** paths: the assistant
+record (the marker survives pi's conversion of the thrown refusal) and the
+process path (a child that writes the marker to stderr and exits non-zero). Both
+checks run first, before every network/quota wording rule. A capacity denial
+therefore moves the spawn loop to the next candidate instead of dying as
+`other`. It records **no**
+cooldown and no capacity window, and telemetry does not count it as a
+`quotaFailure`: nothing upstream was spent.
+
+**Degradation (acceptance criterion).** The store factory returns
+`{ ok: false }` instead of throwing. A read-only store (`readOnly: true`) serves
+every read and fails every write as a value. Either way the policy becomes
+permissive and the wrapped provider still serves: a state-store error never
+becomes a provider error. The store is also opened **lazily on the first
+dispatch**, so extension load creates no file. A model whose id cannot be
+resolved is dispatched permissively too: nothing is written under a synthetic
+`unknown` key, and one warning per provider names the condition.
+
+**Both runtimes.** The pi extension registers the wrappers from
+`extensions/capabilities/model.ts` via `pi.registerProvider` (the first provider
+registration in this repo). pi-durable uses the runtime-agnostic
+`installProviderPolicy(models, options)` with the same wrapping code path. At
+least one provider stays **direct/unwrapped** so a broken wrapper or state store
+is never the only path to a model: the extension keeps `llmgateway` (the
+harness's per-token primary) direct unless `BELAYD_MODEL_STATE_DIRECT_PROVIDER`
+names another one. `BELAYD_MODEL_STATE_WRAPPER=0` disables wrapping. Wrapping is
+idempotent, so repeated `session_start` cannot double-observe a stream. Providers
+outside the policy (realised with no object, still missing after a previous
+observation, missing id, or a failed registration) are named in one warning; the
+intentionally-direct provider is not listed. Registration failures are warned
+once per session with a running count, and the window resets on the next
+`session_start`.
+
+A lazy provider (registered with no provider object yet) is deferred on first
+sighting, reported once after that, and **remembered until it materialises** — a
+provider that stays missing would otherwise alternate deferred → bypassed →
+deferred and re-warn on every second session. Materialisation is re-checked at
+session boundaries **and** on every turn start (`reconcileDeferredProviders`,
+which is a no-op unless a previously deferred id now has an object), so a
+dynamic catalog that composes mid-session gets wrapped at its next observation
+instead of staying direct for the whole session. Known limit: a provider that
+materialises after that observation remains direct until the next one; pi emits
+no notification for a provider object appearing.
+
+**Spend attribution is per dispatch.** The wrapper **snapshots** a shared
+mutable `DispatchAttribution` holder (`{ phase, taskId }`) once per dispatch
+invocation (per caller attempt) and uses that snapshot for the spend row, so a
+stream that settles after the next run boundary cannot be relabelled as the new
+phase/task. The extension repoints the holder from the current turn's session
+state (`plan` vs `orchestrator`, current task id) and pi-durable hands in its own
+holder; repointing affects **future** dispatches only. Idempotent re-installs
+reuse the holder, so stale labels cannot survive a task cycle.
+
+**Retry amplification is two layers.** The wrapper adds **no** retry for a
+quota-class failure: it classifies, records the cooldown and surfaces the
+failure, so provider calls equal the caller's attempt count. For a transient
+synchronous dispatch throw it may spend one extra attempt
+(`TRANSIENT_RETRY_BUDGET = 1`), bounded by `MAX_ATTEMPTS_PER_DISPATCH = 2` per
+caller attempt. The second, **unenforced** layer is pi's own retry:
+`settings.retry.maxRetries` defaults to **3** and multiplies whatever the
+caller does, beyond this repo's control. Set it to
+`RECOMMENDED_RETRY_MAX_RETRIES = 1` (pi-durable) or a 429 becomes a 429 storm.
+This repo does not write `~/.pi/agent/settings.json`; the recommendation is
+exported and documented only.
+
+**No cross-process in-flight coalescing.** Two processes can both see free
+capacity and both dispatch. That is a proxy feature, and the gateway design was
+explicitly rejected (bd-188), so the store deliberately does not pretend to do
+it.
+
+Named tests: `src/__tests__/model-state-store.test.ts` (schema/WAL, cooldown
+upsert/prune, capacity reserve/release, lease ownership, lease renewal and
+expired-renewal refusal, renewal cache invalidation and mode re-tightening,
+0600/0700 modes, expired lease, spend reconcile,
+read-only and unopenable stores, read cache),
+`src/__tests__/provider-policy.test.ts` (provider vs model denials, hinted
+`retry_after_ms`, unhinted doubling to 24 h, capacity acquire/release and typed
+denial, retry constants, lease TTL parsing, TTL floor and one-time clamp
+warning),
+`src/__tests__/provider-wrapper.test.ts` (id preserved, members forwarded,
+idempotent double-wrap with one call/spend/cooldown row, quota no-retry and
+bounded transient retries by attempt count, capacity lease hold/lease renewal
+past the original TTL on one connection (the cross-connection proof lives in the
+integration file)/release on success/error/rejection with no timer left,
+capacity refusal classified as `capacity`, per-dispatch attribution snapshot,
+unresolvable model ids skipped, denial never calls the provider, spend on
+success, read-only and unopenable stores still serve, stream rejection not
+swallowed),
+`src/__tests__/extension-model-providers.test.ts` (one direct provider, bypass
+warning content, lazy-provider deferral, one warning for a permanently missing
+lazy provider, mid-session materialisation reconcile, per-session failure
+warning count),
+`src/__tests__/extension-provider-registration.test.ts` (a throwing registry
+leaves the rest of `session_start` running), and
+`test/model-state-cross-process.integration.test.ts` (two processes see one
+window, a live child renews its lease past the original TTL so a second
+connection is still refused and succeeds only after release, SIGKILLed lease
+expires, spend totals reconcile).
+
 ### 4. Telemetry artifacts: `.belayd/telemetry.json`
 
 Path: `<repo-cwd>/.belayd/telemetry.json` (gitignored; `modelTelemetryPath(cwd)`).

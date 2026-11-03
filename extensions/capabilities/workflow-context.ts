@@ -18,6 +18,7 @@ import {
   manageInstructionGroupsWarning,
   NO_GROUP_REGISTERED_WARNING,
 } from "../../src/instruction-groups.js";
+import { parseSubagentSessionName } from "../../src/session-naming.js";
 import { getNextPhase } from "../../src/workflow-phases.js";
 import type { CoreSessionState } from "./context.js";
 import { errorText, REVIEW_PHASE } from "./context.js";
@@ -27,6 +28,11 @@ import {
   humanAnswerMessage,
   nextStepBlockLines,
 } from "./human-gate.js";
+import {
+  reconcileDeferredProviders,
+  setModelStateAttribution,
+  warnProviderRegistrationFailure,
+} from "./model.js";
 import { nextPhaseToolAfter, reviewFindingsGuidanceLines } from "./review.js";
 import { releaseHeldFollowUps, type SessionContext } from "./session-state.js";
 import type { WorkflowCoreApi } from "./workflow-core.js";
@@ -243,6 +249,25 @@ export function registerWorkflowContext(deps: WorkflowContextDeps): void {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const state = getSessionState(ctx);
+    // bd-187 W3: repoint spend attribution from this turn's context. The wrapper
+    // snapshots the shared holder at the start of each dispatch, so this is per
+    // turn, not a value baked in when providers were wrapped. A phase sub-agent
+    // session wears its task+phase in its name, which is the only place the
+    // child process still sees them; a planning/orchestrator session uses the
+    // gate state.
+    const subagent = parseSubagentSessionName(ctx.sessionManager.getSessionName?.() ?? "");
+    setModelStateAttribution({
+      phase: subagent?.phase ?? (state.planningActive ? "plan" : "orchestrator"),
+      taskId: subagent?.taskId ?? state.currentTaskId,
+    });
+    // bd-187 W2: a dynamic catalog can materialise a deferred provider between
+    // two session starts; this turn boundary is the observation point that wraps
+    // it. A no-op unless a previously deferred id now has an object.
+    try {
+      reconcileDeferredProviders(pi, ctx.modelRegistry);
+    } catch (error) {
+      warnProviderRegistrationFailure(error);
+    }
     // File-only fallback: if the daemon wake path never fired (e.g. restart),
     // a pending user completion is still recovered on the next turn.
     if (state.gateActive) core.reconcileUserCompletions({ state, ctx, cwd: ctx.cwd });

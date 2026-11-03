@@ -77,7 +77,7 @@ import {
 } from "./capabilities/human-gate.js";
 import { createLaunch } from "./capabilities/launch.js";
 import { registerMetrics } from "./capabilities/metrics.js";
-import { modelCooldown, modelFallbackEnabled, modelState } from "./capabilities/model.js";
+import { createModelRouting } from "./capabilities/model.js";
 import { registerModelRecovery } from "./capabilities/model-recovery.js";
 import { registerOutline } from "./capabilities/outline.js";
 import { createPhaseRunner } from "./capabilities/phase-run.js";
@@ -115,14 +115,9 @@ export const getSessionState = createSessionStateStore<SessionState>(
 /**
  * One model-routing bundle per capability (bd-116, bd-229): a capability that
  * routes models must see the same cooldown store, capacity cache and kill switch
- * as the spawn loop, and a per-call copy is how those drift apart.
+ * as the spawn loop, and a per-call copy is how those drift apart. Provider
+ * wrapping (bd-187) is installed on `session_start`, where the registry exists.
  */
-const modelRouting = {
-  cooldownStore: modelCooldown,
-  capacity: modelState.capacity,
-  enabled: modelFallbackEnabled,
-  telemetry: modelState.telemetry,
-};
 
 /** The session name, when the runtime exposes one (used to spot phase sub-agents). */
 function sessionNameOf(ctx: unknown): string | undefined {
@@ -201,6 +196,7 @@ export default function belaydAgentHarness(
 ): void {
   if (harnessAlreadyLoaded(pi)) return;
 
+  const modelRouting = createModelRouting();
   const seams: Required<Pick<FleetForceStopSeams, "scan" | "signal">> &
     Omit<FleetForceStopSeams, "scan" | "signal"> = {
     ...seamOverrides,

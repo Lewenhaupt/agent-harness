@@ -42,7 +42,11 @@ import {
   isSubAgentSession,
 } from "./human-gate.js";
 import type { LaunchApi } from "./launch.js";
-import { resetModelTelemetry } from "./model.js";
+import {
+  beginProviderRegistrationSession,
+  registerModelProviderWrappersSafely,
+  resetModelTelemetry,
+} from "./model.js";
 import {
   abortActiveRuns,
   releaseHeldFollowUps,
@@ -460,6 +464,12 @@ export function registerWorkflowCommands(deps: WorkflowCommandsDeps): void {
   });
 
   pi.on("session_start", (_event, ctx) => {
+    // bd-187: the shared provider wrapper needs the registry, which only a
+    // session context exposes; registering here also covers restarts. A broken
+    // registry must not abort the rest of this handler (telemetry, state reset,
+    // run tracking): providers stay direct and the failure is warned once.
+    beginProviderRegistrationSession();
+    registerModelProviderWrappersSafely(pi, ctx.modelRegistry);
     // A session can restart mid-workflow (compaction/resume). Flush pending
     // rows before dropping the store, otherwise telemetry recorded since the
     // last settle is lost. Per-run stores keep an open run's own delta exact.

@@ -91,11 +91,18 @@ barrel — a module whose symbols are not re-exported there is internal.
 |---|---|
 | `src/model-classes.ts` | Model classes — named capability tiers for Belayd sub-agents |
 | `src/model-cooldown.ts` | Model cooldown store with optional file persistence |
+| `src/model-state-store.ts` | Shared model-state SQLite store — cooldown, capacity/lease (renewed, ownership-checked), spend (bd-187) |
+| `src/provider-policy.ts` | Dispatch cooldown, capacity leases (TTL env + heartbeat) and spend over the shared store, plus the retry budget and attribution holder |
+| `src/provider-wrapper.ts` | Structural pi-ai provider wrapper and runtime-agnostic `installProviderPolicy` (bd-187) |
 | `src/model-session-state.ts` | Session-scoped mutable model-routing state (bd-116) |
 | `src/model-telemetry.ts` | Per-(phase, model) execution telemetry |
 | `src/capacity-cache.ts` | Pre-dispatch provider capacity cache |
 | `src/quota-failure.ts` | Failure classification (quota, transient, model-unavailable, auth) and `isFallbackWorthy` |
 | `src/llmgateway-models.ts` | LLM Gateway models.json mapping — pure functions |
+
+The shared model-state store lives at
+`$XDG_STATE_HOME/belayd/model-state.sqlite` (`BELAYD_MODEL_STATE_FILE`
+overrides), WAL mode, alongside proof/metrics/audit state.
 
 ### worktree
 
@@ -176,11 +183,18 @@ Read-only viewer contract plus the member-owned control plane for durable
 members (bd-186); design, authority matrix and the WAL probe:
 `docs/durable-member-panel.md`.
 
-**`node:sqlite` import boundary.** Production `src/` code imports it only in
-`standalone-store.ts`; the plugin's mirrored `store-reader.js` does too. The
-plain-JS probe fixtures `test/fixtures/durable-readonly-{writer,viewer}.mjs` and
+**`node:sqlite` import boundary.** Production `src/` code imports it in two
+modules: `durable-member/standalone-store.ts` (the reference durable store) and
+`model-state-store.ts` (the shared cooldown/capacity/spend store, bd-187). The
+second is deliberately separate: it has no durable-member contract to mirror, it
+is opened read-only by design in some callers, and it must degrade to a
+permissive policy when the engine or the file is unavailable. Everything else
+reaches both through their module APIs. The plugin's mirrored `store-reader.js`
+also imports it. The plain-JS probe fixtures
+`test/fixtures/durable-readonly-{writer,viewer}.mjs`,
+`test/fixtures/model-state-process.mjs` and
 `pi-web-plugins/durable-member/fixtures/seed-member.mjs` import it directly as a
-sanctioned test-fixture exception: the two-process probe and the screenshot
+sanctioned test-fixture exception: the two-process probes and the screenshot
 seeder must run without a TypeScript build step, so routing them through the
 store seam would make the probe depend on `dist/` output.
 
@@ -236,7 +250,7 @@ order so pi hook/tool order is unchanged.
 | `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
 | `review.ts` | Review scoping/build (`buildReviewTask`), bounded review delivery, review↔fix guidance |
 | `session-state.ts` | Per-session state store (generic over the composed type), ask-hold, beads-actor attribution, run tracking, status formatting |
-| `model.ts` | Model-routing state (bd-116): capacity cache, per-workflow telemetry store, cooldown store, flush/reset rules |
+| `model.ts` | Model-routing state (bd-116): capacity cache, per-workflow telemetry store, cooldown store, flush/reset rules, and the shared model-state store + provider-wrapper registration (bd-187) |
 | `daemon.ts` | pi-web session-daemon socket API and web-server HTTP helpers |
 | `hooks.ts` | Bash timeout, process-gate `tool_call` refusal, uncommitted-files notice, workflow-completion teardown |
 | `workflow-core.ts` | Gate lifecycle (`activateGate`, `applyToolGate`, `evaluateToolCallGate`), workflow messaging, phase ledger, handoff disarm, resume-from-disk, user-completion reconcile, worktree ownership |
