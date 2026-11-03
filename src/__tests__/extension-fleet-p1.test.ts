@@ -50,6 +50,7 @@ import {
   writeFleetMergeQueue,
   writeSupervisorHeartbeat,
 } from "../index.js";
+import { ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS } from "../orchestrator-claim.js";
 import { RunStatus, writeRunManifest } from "../run-manifest.js";
 import { writeWorkflowState } from "../workflow-state.js";
 
@@ -450,6 +451,52 @@ describe("session state reset (bd-173)", () => {
       expect(leakedTick).not.toHaveBeenCalled();
       expect(mod.getSessionState.peek("clear-leaked-session")).toBeUndefined();
       expect(mod.getSessionState.peek("clear-control-session")).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a cleared session's orchestrator-lease heartbeat (bd-189 W2)", async () => {
+    const mod = await import("../../extensions/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "belayd-bd189-lease-clear-"));
+    vi.useFakeTimers();
+    try {
+      // Control: a lease heartbeat interval really does fire, so the assertion
+      // below can fail rather than passing on an interval that never ran.
+      const control = makeCtx(dir, "lease-clear-control");
+      const controlBeat = vi.fn();
+      mod.getSessionState(control).orchestratorLeaseTimer = setInterval(
+        () => controlBeat(),
+        ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
+      );
+      vi.advanceTimersByTime(ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS);
+      expect(controlBeat).toHaveBeenCalledTimes(1);
+
+      const leaked = makeCtx(dir, "lease-clear-leaked");
+      const leakedBeat = vi.fn();
+      mod.getSessionState(leaked).orchestratorLeaseTimer = setInterval(
+        () => leakedBeat(),
+        ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
+      );
+
+      mod.getSessionState.clear();
+      vi.advanceTimersByTime(ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS * 3);
+
+      // No heartbeat write/`bd` call after dispose: the interval was cleared.
+      expect(leakedBeat).not.toHaveBeenCalled();
+      // Isolation for the next case: a fresh session starts from a clean slate
+      // and its own heartbeat fires exactly once per interval.
+      const next = makeCtx(dir, "lease-clear-next");
+      const nextBeat = vi.fn();
+      const nextState = mod.getSessionState(next);
+      expect(nextState.orchestratorLeaseTimer).toBeUndefined();
+      nextState.orchestratorLeaseTimer = setInterval(
+        () => nextBeat(),
+        ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
+      );
+      vi.advanceTimersByTime(ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS);
+      expect(nextBeat).toHaveBeenCalledTimes(1);
+      mod.getSessionState.clear();
     } finally {
       vi.useRealTimers();
     }

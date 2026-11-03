@@ -304,6 +304,10 @@ A finished workflow therefore shows `missing-state` with
 line. A worktree with neither state nor manifests is the case the
 `no .belayd/workflow.json …` warning is for.
 
+For "what is going on with **that** member, and is it stuck", the cheap
+follow-up is `belayd_workflow_digest <taskId>` — no model call, no transcript:
+see [the bd-189 tier guide](bd-189-userguide.md).
+
 **Which session is the supervisor.** The supervisor is an ordinary chat session
 whose run loop is a background timer, so nothing used to mark it. On launch,
 advance and re-arm it is renamed to `Fleet supervisor: bd-150, bd-151, …`, with

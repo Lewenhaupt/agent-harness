@@ -282,60 +282,58 @@ function readSettingsSessionDir(agentDir: string): string | undefined {
 }
 
 /**
- * True when `dir` holds a pi session file whose header id matches `sessionId`.
+ * The path of the session file in `dir` whose header id matches `sessionId`.
  *
  * pi resolves `--session-id` by the exact `id` in a session file's first line
  * (the header), not by filename. Matching the header avoids false positives
  * from suffix collisions when an id contains `_`. Files whose header cannot be
  * parsed or lacks a string id never match.
  */
-function sessionFileExists(dir: string, sessionId: string): boolean {
-  if (!existsSync(dir)) return false;
+export function findSessionFileInDir(dir: string, sessionId: string): string | undefined {
+  if (!existsSync(dir)) return undefined;
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch {
-    return false;
+    return undefined;
   }
-  return entries.some((name) => {
-    if (!name.endsWith(".jsonl")) return false;
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
     try {
-      const firstLine = readFileSync(join(dir, name), "utf-8").split("\n", 1)[0] ?? "";
+      const path = join(dir, name);
+      const firstLine = readFileSync(path, "utf-8").split("\n", 1)[0] ?? "";
       const header = JSON.parse(firstLine) as unknown;
-      if (typeof header !== "object" || header === null) return false;
-      return (header as { id?: unknown }).id === sessionId;
+      if (typeof header !== "object" || header === null) continue;
+      if ((header as { id?: unknown }).id === sessionId) return path;
     } catch {
-      return false;
+      // Unreadable or header-less files never match.
     }
-  });
+  }
+  return undefined;
 }
 
 /**
- * Resolve whether a project session with `sessionId` already exists on disk.
+ * Resolve the directory pi persists this project's sessions in.
  *
- * pi stores sessions as `~/.pi/agent/sessions/<project-slug>/<ts>_<id>.jsonl`.
  * Resolution mirrors pi, in priority order:
  *   1. `PI_CODING_AGENT_SESSION_DIR` (non-empty) — files live directly there.
  *   2. `sessionDir` in `<agentDir>/settings.json` when it is a string.
  *   3. `<agentDir>/sessions/<project-slug>/`, where `agentDir` is
  *      `PI_CODING_AGENT_DIR` when set, else `~/.pi/agent`.
- * Returns false when the directory or session cannot be read — the caller then
- * falls back to a fresh session.
+ *
+ * The directory is returned whether or not it exists: callers that need a file
+ * handle the missing directory themselves.
  *
  * Note: pi derives these env-var names from `piConfig.name`. The harness
  * assumes the default `pi` app name (this repo does not set `piConfig.name`),
  * so `PI_CODING_AGENT_*` are the correct overrides; a renamed app would use a
  * different prefix.
  */
-export function resolveProjectSessionExists(
-  sessionId: string,
-  opts?: { cwd?: string; env?: NodeJS.ProcessEnv },
-): boolean {
-  if (!sessionId || typeof sessionId !== "string") return false;
+export function resolveProjectSessionDir(opts?: { cwd?: string; env?: NodeJS.ProcessEnv }): string {
   const env = opts?.env ?? process.env;
   const sessionDirOverride = env.PI_CODING_AGENT_SESSION_DIR;
   if (sessionDirOverride !== undefined && sessionDirOverride !== "") {
-    return sessionFileExists(expandHome(sessionDirOverride), sessionId);
+    return expandHome(sessionDirOverride);
   }
   const agentDirOverride = env.PI_CODING_AGENT_DIR;
   const agentDir =
@@ -345,11 +343,35 @@ export function resolveProjectSessionExists(
 
   const settingsSessionDir = readSettingsSessionDir(agentDir);
   if (settingsSessionDir !== undefined && settingsSessionDir !== "") {
-    return sessionFileExists(expandHome(settingsSessionDir), sessionId);
+    return expandHome(settingsSessionDir);
   }
 
-  return sessionFileExists(
-    join(agentDir, "sessions", projectSessionSlug(opts?.cwd ?? process.cwd())),
-    sessionId,
-  );
+  return join(agentDir, "sessions", projectSessionSlug(opts?.cwd ?? process.cwd()));
+}
+
+/**
+ * The on-disk path of a project session, or undefined when it does not exist.
+ *
+ * `resolveProjectSessionExists` delegates here so path resolution has exactly
+ * one implementation: the transcript readers need the path, the spawner only
+ * needs "does it exist".
+ */
+export function resolveProjectSessionPath(
+  sessionId: string,
+  opts?: { cwd?: string; env?: NodeJS.ProcessEnv },
+): string | undefined {
+  if (!sessionId || typeof sessionId !== "string") return undefined;
+  return findSessionFileInDir(resolveProjectSessionDir(opts), sessionId);
+}
+
+/**
+ * Resolve whether a project session with `sessionId` already exists on disk.
+ * Returns false when the directory or session cannot be read — the caller then
+ * falls back to a fresh session.
+ */
+export function resolveProjectSessionExists(
+  sessionId: string,
+  opts?: { cwd?: string; env?: NodeJS.ProcessEnv },
+): boolean {
+  return resolveProjectSessionPath(sessionId, opts) !== undefined;
 }

@@ -64,6 +64,13 @@ export const MEMBER_FLEET_TOOLS: readonly string[] = [
  * crash reconcile. The supervisor session arms no process gate, so a gated
  * member declaring these only pays for nine schemas it must never call — they
  * were in every gated session before this split.
+ *
+ * The tiered supervision read surface (bd-189) lives here too, not in
+ * `MEMBER_FLEET_TOOLS`: a phase agent's own member visibility comes from
+ * `belayd_fleet_status`, and the transcript tools read *other* agents' work. Raw
+ * transcripts are exactly what the ownership and leakage rules keep out of a
+ * phase surface, so `belayd_transcript` must never appear in
+ * {@link workflowGateToolSet}.
  */
 export const SUPERVISOR_FLEET_TOOLS: readonly string[] = [
   "belayd_fleet_launch",
@@ -73,6 +80,9 @@ export const SUPERVISOR_FLEET_TOOLS: readonly string[] = [
   "belayd_fleet_advance",
   "belayd_fleet_reconcile",
   "belayd_fleet_release",
+  "belayd_workflow_digest",
+  "belayd_transcript_digest",
+  "belayd_transcript",
 ];
 
 /** Every fleet tool, for the contract audit. */

@@ -119,6 +119,9 @@ export const HARNESS_TOOL_NAMES: readonly string[] = [
   "belayd_status",
   "belayd_stop_planning",
   "belayd_stop_task",
+  "belayd_transcript",
+  "belayd_transcript_digest",
+  "belayd_workflow_digest",
 ];
 
 /**

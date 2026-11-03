@@ -10,12 +10,13 @@
  */
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { COMMENT_EXCERPT_MAX_CHARS, excerptComment } from "../../src/bead-comments.js";
+import { lookupOpenHumanGate } from "../../src/bead-gates.js";
 import { withActorArgv } from "../../src/beads-actor.js";
 import { acceptLandedMember } from "../../src/fleet-accept.js";
 import { lookupFleetBeadEngagement } from "../../src/fleet-bead-engagement.js";
@@ -149,9 +150,11 @@ import {
   applyFleetBeadEngagement,
   applyFleetBeadLookup,
   DEFAULT_FLEET_ID,
+  type FleetBead,
   type FleetBeadLookup,
   type FleetEngagementLookup,
   type FleetIntent,
+  type FleetMemberView,
   type FleetStatus,
   fleetBeadTaskIds,
   formatBeadOwnership,
@@ -162,6 +165,7 @@ import {
   computeFleetSupervisorName,
   supervisorRunStatus,
 } from "../../src/fleet-supervisor-name.js";
+import { readModelTelemetry } from "../../src/model-telemetry.js";
 import {
   adoptOrchestratorClaim,
   heartbeatOrchestratorClaim,
@@ -182,6 +186,12 @@ import {
 import { listRuns } from "../../src/run-manifest.js";
 import { isValidTaskId } from "../../src/session-naming.js";
 import { currentBranch, DEFAULT_BASE_BRANCH } from "../../src/stack-rebase.js";
+import type {
+  SupervisionGateFacts,
+  SupervisionInputResult,
+  SupervisionMemberFacts,
+  SupervisionRunFacts,
+} from "../../src/workflow-digest.js";
 import type { WorkflowResolutionSource, WorkflowSubType } from "../../src/workflow-registry.js";
 import { resolveWorkflowSelection } from "../../src/workflow-registry.js";
 import { readWorkflowState, workflowStateFilePath } from "../../src/workflow-state.js";
@@ -189,6 +199,38 @@ import type { CoreSessionState } from "./context.js";
 import { errorText, runBdCommand, runGitCommand, textToolResult } from "./context.js";
 import { piWebEndpoint, piWebRequest } from "./daemon.js";
 import { clearHumanAnswerWait, isSubAgentSession } from "./human-gate.js";
+
+/**
+ * Stop a session's orchestrator-lease heartbeat.
+ *
+ * Exported (and shared with the fleet instance's `stopOrchestratorLeaseTimer`) so
+ * there is exactly one clearing implementation: the session-state store's dispose
+ * hook runs before any fleet instance exists, and a dropped state must not keep
+ * renewing a worktree lease into the next session id.
+ */
+export function stopOrchestratorLeaseHeartbeat(state: {
+  orchestratorLeaseTimer?: ReturnType<typeof setInterval>;
+}): void {
+  if (state.orchestratorLeaseTimer === undefined) return;
+  clearInterval(state.orchestratorLeaseTimer);
+  state.orchestratorLeaseTimer = undefined;
+}
+
+/**
+ * Release every session-scoped timer of a state the store is dropping (bd-173).
+ *
+ * Covers both timers the fleet slice drives: the run-loop tick (`fleetRunTimer`)
+ * and the orchestrator-lease heartbeat (`orchestratorLeaseTimer`). Both close over
+ * the state object, so clearing them is the only way a dropped state stops acting
+ * — otherwise a leaked loop keeps ticking and heartbeating on a reused session id.
+ */
+export function disposeFleetSessionState(state: {
+  fleetRunTimer?: ReturnType<typeof setInterval>;
+  orchestratorLeaseTimer?: ReturnType<typeof setInterval>;
+}): void {
+  if (state.fleetRunTimer !== undefined) clearTimeout(state.fleetRunTimer);
+  stopOrchestratorLeaseHeartbeat(state);
+}
 
 /** The slice of the harness session state the fleet supervisor owns. */
 export interface FleetSessionState {
@@ -300,6 +342,17 @@ export interface FleetApi {
     resumed: FleetResumeOutcome;
   }): void;
   readBeadOwnership(taskId: string, cwd: string): Promise<string | undefined>;
+  /**
+   * The single tier-2 supervision seam (bd-189): one member's deterministic
+   * facts, gathered through the fleet read path the supervisor already trusts.
+   *
+   * Read-only: one fleet status read, one read-only bd `show`, one read-only
+   * `bd gate list`,
+   * one read-only `git log -1` for the branch head, plus plain fs reads of that
+   * worktree's `.belayd/` records. It never spawns, writes, or touches another
+   * worktree's files.
+   */
+  readSupervisionInput(request: { taskId?: string; cwd: string }): Promise<SupervisionInputResult>;
   stopOrchestratorLeaseTimer(state: CoreSessionState): void;
   releaseSessionOrchestratorLease(state: CoreSessionState, sessionId: string, cwd: string): void;
   /** Fleet-mode refusal for one tool call, or undefined when the call is fine. */
@@ -336,6 +389,15 @@ function fleetPublishRequest(input: {
     ...(input.stacks === undefined ? {} : { stacks: input.stacks }),
   };
   return Object.keys(request).length === 0 ? undefined : request;
+}
+
+/**
+ * One bead record by id, case-insensitively (bd ids are compared the same way
+ * everywhere else in the fleet view).
+ */
+function findBeadById(beads: readonly FleetBead[], taskId: string): FleetBead | undefined {
+  const lowered = taskId.toLowerCase();
+  return beads.find((candidate) => candidate.id.toLowerCase() === lowered);
 }
 
 export function createFleet(deps: FleetDeps): FleetApi {
@@ -446,6 +508,215 @@ export function createFleet(deps: FleetDeps): FleetApi {
       cwd,
       runBd: (argv, options) => runBdCommand(argv, options),
     });
+  }
+
+  // ── Tier-2 supervision seam (bd-189) ─────────────────────────────────
+  //
+  // The digest capability may not import any `src/fleet-*.ts` module, so the
+  // fleet facts it needs are gathered here and handed over as plain data. It is
+  // read-only by construction: one fleet status read, one `bd show`, one
+  // `bd gate list`, and plain fs reads of that worktree's own `.belayd/`.
+
+  /** The member the caller means: by task id, else by the worktree it is in. */
+  function selectSupervisionMember(
+    members: readonly FleetMemberView[],
+    request: { taskId?: string; cwd: string },
+  ): FleetMemberView | undefined {
+    const requested = request.taskId?.trim() ?? "";
+    if (requested !== "") return members.find((member) => member.taskId === requested);
+    // A session inside a member worktree answers about its own member.
+    const cwd = resolve(request.cwd);
+    return members.find((member) => resolve(member.worktreePath) === cwd);
+  }
+
+  /**
+   * The bd waits blocking one member.
+   *
+   * `createdAt` is what makes the gate age computable, which is why this is a
+   * direct gate read instead of the engagement view (that one reports the wait
+   * but not its age). A failed read is reported, never rendered as "no gate".
+   */
+  async function readSupervisionGates(taskId: string, cwd: string): Promise<SupervisionGateFacts> {
+    const lookup = await lookupOpenHumanGate({
+      beadId: taskId,
+      cwd,
+      runBd: (argv, options) => runBdCommand(argv, options),
+    });
+    if (!lookup.ok) return { readError: lookup.error };
+    if (lookup.status === "open") {
+      const createdAt = lookup.gate.createdAt;
+      const createdAtMs = createdAt === undefined ? undefined : Date.parse(createdAt);
+      return {
+        humanGateId: lookup.gate.gateId,
+        ...(createdAtMs === undefined || Number.isNaN(createdAtMs)
+          ? {}
+          : { humanGateCreatedAtMs: createdAtMs }),
+      };
+    }
+    if (lookup.status === "unrecognized") {
+      return { readError: "bd returned gate records that did not parse" };
+    }
+    return lookup.orderingBlocker === undefined ? {} : { orderingBlocker: lookup.orderingBlocker };
+  }
+
+  async function readSupervisionInput(request: {
+    taskId?: string;
+    cwd: string;
+  }): Promise<SupervisionInputResult> {
+    const status = readFleetStatus({ cwd: request.cwd, fleetId: DEFAULT_FLEET_ID });
+    if (!status.ok) return { ok: false, error: `fleet read failed: ${status.error}` };
+    const member = selectSupervisionMember(status.value.members, request);
+    if (member === undefined) {
+      return { ok: false, error: unknownSupervisionMemberError(status.value.members, request) };
+    }
+    const taskId = member.taskId;
+    if (taskId === undefined) {
+      return {
+        ok: false,
+        error: `${member.worktreePath} holds no readable workflow state, so it has no task id to digest`,
+      };
+    }
+
+    return {
+      ok: true,
+      member: await collectSupervisionFacts(member, taskId, request.cwd),
+    };
+  }
+
+  /** All the per-member reads one digest needs, in one parallel batch. */
+  async function collectSupervisionFacts(
+    member: FleetMemberView,
+    taskId: string,
+    cwd: string,
+  ): Promise<SupervisionMemberFacts> {
+    const [gates, beadLookup, branchHeadCommitAt] = await Promise.all([
+      readSupervisionGates(taskId, cwd),
+      findBead(taskId, cwd),
+      readBranchHeadCommitAt(member.worktreePath),
+    ]);
+    return supervisionMemberFacts({
+      member,
+      taskId,
+      gates,
+      runs: supervisionRuns(member.worktreePath, taskId),
+      telemetry: readModelTelemetry({ cwd: member.worktreePath }),
+      bead: beadLookup.ok ? findBeadById(beadLookup.beads, taskId) : undefined,
+      beadError: beadLookup.ok ? undefined : beadLookup.error,
+      branchHeadCommitAt,
+    });
+  }
+  /** Bounded "which member did you mean" refusal, naming what the fleet does hold. */
+  function unknownSupervisionMemberError(
+    members: readonly FleetMemberView[],
+    request: { taskId?: string; cwd: string },
+  ): string {
+    const known = members
+      .flatMap((candidate) => (candidate.taskId === undefined ? [] : [candidate.taskId]))
+      .slice(0, 12);
+    const wanted = request.taskId?.trim() ?? "";
+    const head =
+      wanted === ""
+        ? "this directory is not a fleet member worktree"
+        : `no fleet member records task id ${wanted}`;
+    const tail =
+      known.length === 0 ? "the fleet has no members" : `known members: ${known.join(", ")}`;
+    return `${head}; ${tail}`;
+  }
+
+  /**
+   * The newest commit instant on the member's branch, from one read-only call.
+   *
+   * `git log -1` never writes, and this is the digest's "no commits" evidence:
+   * a phase that has been running for an hour without a commit looks identical
+   * to a hung one in every `.belayd/` file. An unreadable branch (detached HEAD
+   * with no commits, a deleted worktree) simply drops this input.
+   */
+  async function readBranchHeadCommitAt(worktreePath: string): Promise<number | undefined> {
+    try {
+      const { stdout } = await runGitCommand(["log", "-1", "--format=%ct", "HEAD"], {
+        cwd: worktreePath,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 64 * 1024,
+      });
+      const seconds = Number.parseInt(stdout.trim(), 10);
+      return Number.isFinite(seconds) ? seconds * 1000 : undefined;
+    } catch {
+      // No branch, no commits, or no git: the digest loses one progress input.
+      return undefined;
+    }
+  }
+
+  /** The bead columns, or the reason they are unknown. */
+  function beadFactsOf(input: {
+    bead: FleetBead | undefined;
+    beadError: string | undefined;
+  }): Pick<SupervisionMemberFacts, "bead" | "beadError"> {
+    if (input.bead === undefined) {
+      return input.beadError === undefined ? {} : { beadError: input.beadError };
+    }
+    return {
+      bead: {
+        ...(input.bead.title === undefined ? {} : { title: input.bead.title }),
+        ...(input.bead.status === undefined ? {} : { status: input.bead.status }),
+      },
+    };
+  }
+
+  /** The spend section, absent when the worktree has no telemetry file. */
+  function telemetryFactsOf(
+    telemetry: ReturnType<typeof readModelTelemetry>,
+  ): Pick<SupervisionMemberFacts, "telemetry"> {
+    return telemetry === undefined
+      ? {}
+      : { telemetry: { stats: telemetry.stats, totals: telemetry.totals } };
+  }
+
+  /**
+   * Assemble the digest's plain-data view of one member.
+   */
+  function supervisionMemberFacts(input: {
+    member: FleetMemberView;
+    taskId: string;
+    gates: SupervisionGateFacts;
+    runs: SupervisionRunFacts[];
+    telemetry: ReturnType<typeof readModelTelemetry>;
+    bead: FleetBead | undefined;
+    beadError: string | undefined;
+    branchHeadCommitAt: number | undefined;
+  }): SupervisionMemberFacts {
+    const { member, taskId, gates, runs, telemetry, bead, beadError, branchHeadCommitAt } = input;
+    return {
+      taskId,
+      worktreePath: member.worktreePath,
+      ...(member.branch === undefined ? {} : { branch: member.branch }),
+      memberState: member.state,
+      phaseOrder: member.phaseOrder,
+      completedPhases: member.completedPhases,
+      pendingPhases: member.pendingPhases,
+      awaitingReviewResponse: member.awaitingReviewResponse,
+      ...(member.updatedAt === undefined ? {} : { updatedAt: member.updatedAt }),
+      lease: member.lease,
+      gates,
+      runs,
+      ...beadFactsOf({ bead, beadError }),
+      ...(branchHeadCommitAt === undefined ? {} : { branchHeadCommitAt }),
+      ...telemetryFactsOf(telemetry),
+    };
+  }
+
+  /**
+   * This member's own run manifests, reduced to what the digest renders.
+   */
+  function supervisionRuns(worktreePath: string, taskId: string): SupervisionRunFacts[] {
+    return listRuns({ cwd: worktreePath })
+      .filter((run) => run.taskId === taskId)
+      .map((run) => ({
+        phase: run.phase,
+        status: run.status,
+        startedAt: run.startedAt,
+        ...(run.completedAt === undefined ? {} : { completedAt: run.completedAt }),
+        ...(run.failureReason === undefined ? {} : { failureReason: run.failureReason }),
+      }));
   }
 
   // ── Fleet supervisor (bd-126 P1–P4): launch, mailbox, merge, pause, reconcile ──
@@ -564,9 +835,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   function stopOrchestratorLeaseTimer(state: CoreSessionState): void {
-    if (state.orchestratorLeaseTimer === undefined) return;
-    clearInterval(state.orchestratorLeaseTimer);
-    state.orchestratorLeaseTimer = undefined;
+    stopOrchestratorLeaseHeartbeat(state);
   }
 
   function startOrchestratorLeaseHeartbeat(options: {
@@ -5647,6 +5916,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     stopFleetRunTimer,
     runFleetLaunch,
     readBeadOwnership,
+    readSupervisionInput,
     resumeFleetRunLoop,
     readoptFleetRuns,
     stopOrchestratorLeaseTimer,

@@ -39,13 +39,15 @@ export function narrowTranscriptEntries(entries: unknown): TranscriptEntry[] {
 }
 
 /**
- * Extract the text of an assistant message's content.
+ * Extract the text of a message's content.
  *
  * Assistant content is normally an array of blocks; only `text` blocks count.
  * Thinking and toolCall blocks are ignored because they are not the answer the
  * orchestrator needs. A plain string content is accepted for completeness.
+ * Exported so the on-disk transcript reader (`session-transcript-file.ts`)
+ * renders a message body exactly the way `lastAssistantText` does.
  */
-function textFromContent(content: unknown): string | undefined {
+export function textFromContent(content: unknown): string | undefined {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return undefined;
   const parts: string[] = [];

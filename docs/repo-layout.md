@@ -55,9 +55,11 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/finding-sensitivity.ts` | Deterministic finding-sensitivity classifier (bd-183) — security topics, credential shapes, deny paths; answer parsing and the redacted one-liner |
 | `src/finding-publication.ts` | Publication safety surface (bd-183) — the only supported source of deferred-finding text for a PR body (bd-184) |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
+| `src/workflow-digest.ts` | Deterministic workflow digest for one fleet member (bd-189, tier 2) — sections, the ranked stuck verdict, and no model or transcript seam |
 | `src/run-detached.ts` | Detached background run orchestration |
 | `src/session-naming.ts` | Session naming utilities for subagent session management |
 | `src/session-transcript.ts` | Session transcript helpers |
+| `src/session-transcript-file.ts` | On-disk pi session transcripts (bd-189) — pick the file, parse the JSONL, paginate newest-first, with every read bounded |
 | `src/session-conditions.ts` | Session condition checks for proactive notifications |
 | `src/claim-registry.ts` | Cross-extension registration dedup |
 | `src/chdir-guard.ts` | Guard for restoring a session's working directory |
@@ -244,6 +246,7 @@ order so pi hook/tool order is unchanged.
 | `workflow-context.ts` | Per-turn gate/planning context injection and the three `before_agent_start` hooks |
 | `planning.ts` | `/plan` command, `belayd_plan_scout`, `belayd_plan_research` |
 | `phase-tools.ts` | Per-agent phase tools and `belayd_status` |
+| `supervision.ts` | Tiered supervision reads (bd-189): `belayd_workflow_digest`, `belayd_transcript_digest` (bounded child summary), `belayd_transcript` (explicit, paged raw pages) |
 | `task-control.ts` | `belayd_start_task`, `belayd_start_followup`, `belayd_stop_task`, `belayd_stop_planning` |
 
 The session state is split in two halves but stays **one runtime object**:
@@ -292,11 +295,13 @@ import chain. This is why `src/tool-audit.ts`, `src/workflow-state.ts`,
 `isWorkflowComplete` from the dependency-free `src/workflow-phases.ts` instead
 of `src/process-gate.ts`.
 
-The same test carries a **size ratchet** for `extensions/index.ts` (today
-450 lines; the composer is 447 and is wiring only — entry point, the exported
-session store, seam normalisation, the ordered `register<Capability>` calls and
-the default export). New capability code belongs in a module; if the composer
-must grow, raise the ceiling deliberately and say why.
+The same test carries a **size ratchet** for `extensions/index.ts`: the composer
+must stay at or below the test's `INDEX_MAX_LINES` ceiling, and it is wiring only
+— entry point, the exported session store, seam normalisation, the ordered
+`register<Capability>` calls and the default export. Do not restate the current
+line count here; `INDEX_MAX_LINES` is the single figure to compare against. New
+capability code belongs in a module; if the composer must grow, raise the ceiling
+deliberately and say why.
 
 ### Tests
 
@@ -322,6 +327,7 @@ must grow, raise the ceiling deliberately and say why.
 | `docs/diff-scoped-review.md` | review scoping and output bounding |
 | `docs/durable-member-panel.md`, `docs/durable-member-userguide.md` | durable-member viewer panel and member-owned control plane (bd-186); the second is a pointer to the operator guide |
 | `docs/bd-186-userguide.md` | operator walkthrough for the durable-member panel (bd-186): enable, seed, verify read/write halves, failure modes |
+| `docs/bd-189-userguide.md` | operator walkthrough for the tiered supervision reads (bd-189): the four tiers, the digest verdict families, transcript digest/paging, the diagnosis playbook, failure modes |
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |

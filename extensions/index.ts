@@ -66,8 +66,8 @@ import { registerCommitTool, registerStackRebaseTool } from "./capabilities/comm
 import type { CoreSessionState } from "./capabilities/context.js";
 import { recordGateAttemptMetric } from "./capabilities/context.js";
 import { registerDoctor } from "./capabilities/doctor.js";
-import type { FleetSessionState } from "./capabilities/fleet.js";
-import { createFleet, type FleetApi, type FleetForceStopSeams } from "./capabilities/fleet.js";
+import type { FleetForceStopSeams, FleetSessionState } from "./capabilities/fleet.js";
+import { createFleet, disposeFleetSessionState, type FleetApi } from "./capabilities/fleet.js";
 import { registerHooks } from "./capabilities/hooks.js";
 import {
   type HumanGateDeps,
@@ -91,35 +91,25 @@ import {
   emitSessionWarnings,
   resolveSessionBdActor,
 } from "./capabilities/session-state.js";
+import { registerSupervisionTools } from "./capabilities/supervision.js";
 import { registerTaskStartTools, registerTaskStopTools } from "./capabilities/task-control.js";
 import { registerWorkflowCommands } from "./capabilities/workflow-commands.js";
 import { registerWorkflowContext } from "./capabilities/workflow-context.js";
 import { createWorkflowCore } from "./capabilities/workflow-core.js";
 
 /**
- * The harness session state, composed from the two halves that own its fields:
- * the fleet-free core (`capabilities/context.ts`) and the fleet supervisor slice
- * (`capabilities/fleet.ts`, the only fleet-allowlisted capability module).
- *
- * One intersection, one object identity: the store below still creates and
- * returns a single `SessionState` per pi session.
+ * The harness session state: the fleet-free core (`capabilities/context.ts`) and
+ * the fleet slice (`capabilities/fleet.ts`) as one intersection, one object.
  */
 type SessionState = CoreSessionState & FleetSessionState;
 
 /**
- * Exported so tests can drop state leaked across cases: the store is keyed by
- * session id for the process lifetime and test suites reuse ids. Production
- * code only ever reaches it through the injected dependencies below.
- *
- * The dispose hook stops a session's pending fleet tick: the tick loop closes
- * over the state object, so clearing its timer is the only way a dropped state
- * stops ticking (otherwise a leaked loop keeps acting on the reused id).
+ * Exported so tests can drop state leaked across cases (the store is keyed by
+ * session id for the process lifetime and suites reuse ids).
  */
 export const getSessionState = createSessionStateStore<SessionState>(
   createInitialSessionState,
-  (state) => {
-    if (state.fleetRunTimer !== undefined) clearTimeout(state.fleetRunTimer);
-  },
+  disposeFleetSessionState,
 );
 
 /**
@@ -360,6 +350,17 @@ export default function belaydAgentHarness(
     getSessionState,
     core,
     readBeadOwnership: (taskId, cwd) => fleet.readBeadOwnership(taskId, cwd),
+  });
+
+  // bd-189: tiered supervisor read surface (digest → transcript digest → raw transcript).
+  // The fleet seam is a closure on purpose: `fleet` is assigned below at its original
+  // registration position, so this arrow reads it at call time instead of at register time.
+  registerSupervisionTools({
+    pi,
+    getSessionState,
+    readSupervisionInput: (request) => fleet.readSupervisionInput(request),
+    spawnAgentWithFallback,
+    modelRouting,
   });
 
   registerHumanGate(pi, humanGateDeps);
