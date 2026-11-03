@@ -904,6 +904,14 @@ export interface FleetMemberLaunchOutcome {
   workflowType?: string;
   /** Orchestrator session the launch created, so a run can record and verify it. */
   sessionId?: string;
+  /**
+   * A non-fatal problem after the member started (bd-233 S3).
+   *
+   * The spawn marker clear is best effort: when it fails the member keeps its slot
+   * until the grace expires, so the launch still succeeds but the operator must hear
+   * why the slot frees late instead of finding it in a `console.warn` alone.
+   */
+  warning?: string;
 }
 
 export interface FormatFleetLaunchReportInput {
@@ -1108,6 +1116,11 @@ export function collectFleetLaunchContext(
         runMode: loaded.intent.run !== undefined,
         beat: options.supervisorBeat?.(sanitized),
         now: options.now ?? 0,
+        // A beat only proves a loop *was* alive when it was written; a provably
+        // dead pid closes the stale window immediately (bd-233), so a re-arm does
+        // not wait 10 minutes on a cancelled supervisor.
+        ...(loaded.intent.supervisor === undefined ? {} : { supervisor: loaded.intent.supervisor }),
+        liveness: options.liveness,
       }),
     });
     if (sanitized === targetFleetId) targetIntent = loaded.intent;
@@ -1776,6 +1789,9 @@ async function launchAllMembers(
   for (const taskId of plan.taskIds) {
     const outcome = await options.launchMember(taskId);
     outcomes.push(outcome);
+    // A post-spawn problem (e.g. a marker that could not be cleared) rides the launch
+    // report's warning channel, so the operator sees it without a console dive (S3).
+    if (outcome.warning !== undefined) warnings.push(outcome.warning);
     const memberAudit = audit({
       gitCommonDir: options.gitCommonDir,
       fleetId: plan.fleetId,

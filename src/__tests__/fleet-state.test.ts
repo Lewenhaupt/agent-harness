@@ -10,13 +10,14 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   ackNotes,
   addFleetOrderingGates,
   appendFleetAuditEntry,
   canAcquireFleetMerge,
+  clearFleetLaunchMarker,
   createFleetIntent,
   createFleetMergeLock,
   createFleetMergeQueue,
@@ -58,17 +59,29 @@ import {
   retireFleetDeferral,
   updateFleetIntent,
   updateFleetMergeQueue,
+  withFleetLaunchMarker,
   withoutPauseFields,
   writeFleetIntent,
+  writeFleetLaunchMarker,
   writeFleetMergeQueue,
 } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
 import {
   FLEET_INTENT_MEMBERS_MAX,
   FLEET_INTENT_ORDERING_GATES_MAX,
+  FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS,
+  FLEET_MEMBER_SPAWN_GRACE_MS,
   FLEET_SCHEMA_VERSION,
+  FLEET_SPAWN_GRACE_MARGIN_MS,
+  FLEET_SPAWN_RPC_ALLOWANCE_MS,
+  fleetLaunchMarkerPath,
+  fleetSpawnInFlight,
   fleetStateDir,
+  isFleetSpawnInFlight,
+  parseFleetLaunchMarker,
+  readFleetLaunchMarker,
 } from "../fleet-status.js";
+import { WORKTREE_READY_TIMEOUT_MS } from "../worktree.js";
 
 const commonDir = "/repo/.git";
 const fleetId = "fleet-1";
@@ -1739,5 +1752,543 @@ describe("merge-queue.json", () => {
     if (written.ok) return;
     expect(written.error).toContain("EXDEV");
     expect(fs.files.has(path)).toBe(false);
+  });
+});
+
+// ── Spawn markers (bd-233 review round 2) ─────────────────────────────
+
+/** The marker path, unwrapped: these tests only use valid bead ids. */
+function markerPath(taskId: string): string {
+  const resolved = fleetLaunchMarkerPath(commonDir, fleetId, taskId);
+  if (!resolved.ok) throw new Error(resolved.error);
+  return resolved.path;
+}
+
+describe("fleet spawn markers (bd-233)", () => {
+  const now = 1_000_000;
+
+  it("writes, reads and clears one member's marker under launch/", () => {
+    const fs = createFakeFs();
+    const written = writeFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      now,
+      owner: "spawn-a",
+      fs,
+    });
+    expect(written).toHaveProperty("ok", true);
+    expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+    expect(
+      readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs }),
+    ).toEqual({ schemaVersion: 1, taskId: "bd-12", startedAt: now, owner: "spawn-a" });
+
+    const cleared = clearFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      owner: "spawn-a",
+      fs,
+    });
+    expect(cleared).toHaveProperty("ok", true);
+    expect(
+      readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs }),
+    ).toBeUndefined();
+    // Idempotent: clearing an absent marker is success.
+    expect(
+      clearFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        owner: "spawn-a",
+        fs,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("bounds the window by the grace and ignores an expired or corrupt marker", () => {
+    const marker = { schemaVersion: 1 as const, taskId: "bd-12", startedAt: now - 1_000 };
+    expect(isFleetSpawnInFlight({ marker, now })).toBe(true);
+    expect(
+      isFleetSpawnInFlight({
+        marker: { ...marker, startedAt: now - FLEET_MEMBER_SPAWN_GRACE_MS },
+        now,
+      }),
+    ).toBe(false);
+    // No marker means no window: the git evidence decides.
+    expect(isFleetSpawnInFlight({ marker: undefined, now })).toBe(false);
+    expect(parseFleetLaunchMarker({ taskId: "bd-12" })).toBeUndefined();
+    expect(parseFleetLaunchMarker("not a marker")).toBeUndefined();
+  });
+
+  it("reports in-flight only for a live marker, and never for another member", () => {
+    const fs = createFakeFs();
+    writeFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      now: now - 1_000,
+      owner: "spawn-a",
+      fs,
+    });
+    expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", now, fs })).toBe(
+      true,
+    );
+    expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-15", now, fs })).toBe(
+      false,
+    );
+  });
+
+  it("refuses to clear a marker another spawn owns, and never an ownerless one", () => {
+    const fs = createFakeFs();
+    writeFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      now,
+      owner: "spawn-b",
+      fs,
+    });
+
+    // The relaunch's own clear is the only one that may end a window (round 4).
+    const foreign = clearFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      owner: "spawn-a",
+      fs,
+    });
+    expect(foreign).toHaveProperty("ok", false);
+    if (foreign.ok) return;
+    expect(foreign.error).toContain("spawn-b");
+    expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+    expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", now, fs })).toBe(
+      true,
+    );
+
+    // A hand-written or pre-owner marker still opens a window, so it must survive too:
+    // a spawner that cannot prove it wrote it must not delete it.
+    fs.files.set(
+      markerPath("bd-15"),
+      JSON.stringify({ schemaVersion: 1, taskId: "bd-15", startedAt: now }),
+    );
+    const ownerless = clearFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-15",
+      owner: "spawn-a",
+      fs,
+    });
+    expect(ownerless).toHaveProperty("ok", false);
+    if (ownerless.ok) return;
+    expect(ownerless.error).toContain("absent");
+    expect(fs.files.has(markerPath("bd-15"))).toBe(true);
+    expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-15", now, fs })).toBe(
+      true,
+    );
+  });
+
+  it("reads an unparsable marker file as no window instead of throwing", () => {
+    const fs = createFakeFs();
+    fs.files.set(markerPath("bd-12"), "{ not json");
+
+    expect(
+      readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs }),
+    ).toBeUndefined();
+    // A corrupt marker is a hand edit, never a permanent window: the member's own git
+    // evidence decides (bd-233).
+    expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", now, fs })).toBe(
+      false,
+    );
+  });
+
+  it("clears the marker after a successful spawn and after a thrown one", async () => {
+    const successful = createFakeFs();
+    let inFlightDuringSpawn = false;
+    const spawned = await withFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      now,
+      fs: successful,
+      spawn: async () => {
+        inFlightDuringSpawn = fleetSpawnInFlight({
+          gitCommonDir: commonDir,
+          fleetId,
+          taskId: "bd-12",
+          now,
+          fs: successful,
+        });
+        return "session-1";
+      },
+    });
+    expect(spawned).toEqual({ ok: true, value: "session-1" });
+    expect(inFlightDuringSpawn).toBe(true);
+    expect(successful.files.has(markerPath("bd-12"))).toBe(false);
+
+    const failing = createFakeFs();
+    await expect(
+      withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-15",
+        now,
+        fs: failing,
+        spawn: async () => {
+          throw new Error("spawn failed");
+        },
+      }),
+    ).rejects.toThrow("spawn failed");
+    expect(failing.files.has(markerPath("bd-15"))).toBe(false);
+  });
+
+  it("refuses to spawn when the window cannot be recorded", async () => {
+    const readOnly = createFakeFs();
+    readOnly.writeFileSync = () => {
+      throw new Error("EROFS");
+    };
+    let spawned = false;
+    const result = await withFleetLaunchMarker({
+      gitCommonDir: commonDir,
+      fleetId,
+      taskId: "bd-12",
+      now,
+      fs: readOnly,
+      spawn: async () => {
+        spawned = true;
+        return "never";
+      },
+    });
+    expect(result).toHaveProperty("ok", false);
+    expect(spawned).toBe(false);
+  });
+
+  it("W1: refreshes a live spawn's marker past twice the grace", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.setSystemTime(now);
+      const fs = createFakeFs();
+      const inFlight: boolean[] = [];
+      let release: (value: string) => void = () => undefined;
+      const held = new Promise<string>((resolve) => {
+        release = resolve;
+      });
+      const spawner = withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now: Date.now(),
+        clock: () => Date.now(),
+        fs,
+        spawn: () => held,
+      });
+
+      const steps = Math.ceil(
+        (2 * FLEET_MEMBER_SPAWN_GRACE_MS) / FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS,
+      );
+      for (let step = 0; step < steps; step += 1) {
+        vi.advanceTimersByTime(FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS);
+        inFlight.push(
+          fleetSpawnInFlight({
+            gitCommonDir: commonDir,
+            fleetId,
+            taskId: "bd-12",
+            now: Date.now(),
+            fs,
+          }),
+        );
+      }
+      // A spawn that began more than two graces ago is still inside its window, because
+      // every refresh re-stamps it: the old fixed-window shape would have expired here.
+      expect(Date.now() - now).toBeGreaterThanOrEqual(2 * FLEET_MEMBER_SPAWN_GRACE_MS);
+      expect(inFlight.every(Boolean)).toBe(true);
+
+      release("session-1");
+      expect(await spawner).toEqual({ ok: true, value: "session-1" });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(fs.files.has(markerPath("bd-12"))).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("S3: a failed marker clear keeps the spawn and carries the reason", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const fs = createFakeFs();
+      fs.unlinkSync = () => {
+        throw new Error("EACCES");
+      };
+      const spawned = await withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now,
+        fs,
+        spawn: async () => "session-1",
+      });
+      // Best effort: the launch succeeds, the marker expires with the grace, and the
+      // launch outcome carries why the slot frees late instead of only a console line.
+      expect(spawned).toHaveProperty("ok", true);
+      if (!spawned.ok) return;
+      expect(spawned.warning).toContain("could not be cleared");
+      expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("W1 (round 4): reports degraded protection when refreshes fail", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      vi.setSystemTime(now);
+      const fs = createFakeFs();
+      // The initial window write succeeds; every refresh write then fails.
+      let writes = 0;
+      const realWrite = fs.writeFileSync;
+      fs.writeFileSync = (path, content) => {
+        writes += 1;
+        if (writes > 1) throw new Error("ENOSPC");
+        realWrite(path, content);
+      };
+      let release: (value: string) => void = () => undefined;
+      const held = new Promise<string>((resolve) => {
+        release = resolve;
+      });
+      const spawner = withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now: Date.now(),
+        clock: () => Date.now(),
+        fs,
+        spawn: () => held,
+      });
+
+      const failures = 3;
+      for (let step = 0; step < failures; step += 1) {
+        vi.advanceTimersByTime(FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS);
+      }
+      release("session-1");
+      const spawned = await spawner;
+      expect(spawned).toHaveProperty("ok", true);
+      if (!spawned.ok) return;
+      // Not console-only: the spawn outcome carries the degraded window and its cause.
+      expect(spawned.warning).toContain("spawn window protection degraded");
+      expect(spawned.warning).toContain("3 marker refresh attempt(s) failed");
+      expect(spawned.warning).toContain("ENOSPC");
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("W1 (round 4): a stale spawn's clear never deletes a newer spawn's marker", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      vi.setSystemTime(now);
+      const fs = createFakeFs();
+      let releaseA: (value: string) => void = () => undefined;
+      let releaseB: (value: string) => void = () => undefined;
+      const heldA = new Promise<string>((resolve) => {
+        releaseA = resolve;
+      });
+      const heldB = new Promise<string>((resolve) => {
+        releaseB = resolve;
+      });
+      const base = {
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now,
+        clock: () => Date.now(),
+        fs,
+      };
+      // A relaunch (B) overwrites A's marker with its own owner token.
+      const spawnerA = withFleetLaunchMarker({ ...base, spawn: () => heldA });
+      const spawnerB = withFleetLaunchMarker({ ...base, spawn: () => heldB });
+      const ownerAfterRelaunch = readFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        fs,
+      })?.owner;
+      expect(ownerAfterRelaunch).toBeDefined();
+
+      // A's next refresh must not steal the window back from B.
+      vi.advanceTimersByTime(FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS);
+      expect(
+        readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs })?.owner,
+      ).toBe(ownerAfterRelaunch);
+
+      releaseA("session-a");
+      const spawnedA = await spawnerA;
+      expect(spawnedA).toHaveProperty("ok", true);
+      if (!spawnedA.ok) return;
+      // A's refresh stopped and its clear refused: the marker on disk belongs to B.
+      expect(spawnedA.warning).toContain("spawn window protection degraded");
+      expect(spawnedA.warning).toContain("another spawn");
+      expect(
+        fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", now, fs }),
+      ).toBe(true);
+
+      releaseB("session-b");
+      expect(await spawnerB).toEqual({ ok: true, value: "session-b" });
+      expect(fs.files.has(markerPath("bd-12"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("W1: a marker with no refresh expires, and the timer never leaks", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.setSystemTime(now);
+      const unrefreshed = createFakeFs();
+      writeFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-15",
+        now,
+        owner: "spawn-a",
+        fs: unrefreshed,
+      });
+      vi.advanceTimersByTime(2 * FLEET_MEMBER_SPAWN_GRACE_MS);
+      // No wrapper, so nothing refreshed it: a full grace with no write is abandonment.
+      expect(
+        fleetSpawnInFlight({
+          gitCommonDir: commonDir,
+          fleetId,
+          taskId: "bd-15",
+          now: Date.now(),
+          fs: unrefreshed,
+        }),
+      ).toBe(false);
+
+      // Success, throw, and a refused marker write all leave no interval behind.
+      const success = await withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now: Date.now(),
+        clock: () => Date.now(),
+        fs: createFakeFs(),
+        spawn: async () => "session-1",
+      });
+      expect(success).toHaveProperty("ok", true);
+      expect(vi.getTimerCount()).toBe(0);
+
+      await expect(
+        withFleetLaunchMarker({
+          gitCommonDir: commonDir,
+          fleetId,
+          taskId: "bd-15",
+          now: Date.now(),
+          clock: () => Date.now(),
+          fs: createFakeFs(),
+          spawn: async () => {
+            throw new Error("spawn failed");
+          },
+        }),
+      ).rejects.toThrow("spawn failed");
+      expect(vi.getTimerCount()).toBe(0);
+
+      const readOnly = createFakeFs();
+      readOnly.writeFileSync = () => {
+        throw new Error("EROFS");
+      };
+      const refused = await withFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now: Date.now(),
+        clock: () => Date.now(),
+        fs: readOnly,
+        spawn: async () => "never",
+      });
+      expect(refused).toHaveProperty("ok", false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("spawn grace derivation (bd-233)", () => {
+  it("derives the grace from the waits one spawn actually allows", () => {
+    // The window must outlive the dependency install it protects, or a cold
+    // `wt switch`/`pnpm install` would look like an abandoned spawn.
+    expect(FLEET_MEMBER_SPAWN_GRACE_MS).toBe(
+      WORKTREE_READY_TIMEOUT_MS + FLEET_SPAWN_RPC_ALLOWANCE_MS + FLEET_SPAWN_GRACE_MARGIN_MS,
+    );
+    expect(FLEET_MEMBER_SPAWN_GRACE_MS).toBeGreaterThan(WORKTREE_READY_TIMEOUT_MS);
+
+    // Three refreshes per grace: two consecutive late refreshes (a blocked event loop)
+    // still leave the marker inside the window, and every grace contains a refresh.
+    expect(FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS * 2).toBeLessThan(FLEET_MEMBER_SPAWN_GRACE_MS);
+    expect(FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS * 3).toBeGreaterThanOrEqual(
+      FLEET_MEMBER_SPAWN_GRACE_MS,
+    );
+  });
+});
+
+// ── Marker id containment (bd-233 review round 3) ─────────────────────
+
+describe("fleet launch marker ids (bd-233 W3)", () => {
+  it("refuses every id that does not name one file under launch/", () => {
+    for (const bad of ["..", ".", "a/b", ""]) {
+      expect(fleetLaunchMarkerPath(commonDir, fleetId, bad)).toHaveProperty("ok", false);
+    }
+  });
+
+  it("keeps a valid bead id and builds the marker under launch/", () => {
+    const resolved = fleetLaunchMarkerPath(commonDir, fleetId, "bd-12");
+    expect(resolved).toHaveProperty("ok", true);
+    if (!resolved.ok) return;
+    expect(resolved.path).toBe(join(commonDir, "belayd", "fleet", fleetId, "launch", "bd-12"));
+  });
+
+  it("reads a bad id as no marker and reports why instead of throwing", () => {
+    const fs = createFakeFs();
+    const warnings: string[] = [];
+    expect(
+      readFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "..",
+        fs,
+        onWarning: (message) => warnings.push(message),
+      }),
+    ).toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("..");
+    expect(warnings[0]).toContain("no spawn window");
+  });
+
+  it("refuses to write or clear under a bad id", () => {
+    const fs = createFakeFs();
+    expect(
+      writeFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: ".",
+        now: 1,
+        owner: "spawn-a",
+        fs,
+      }),
+    ).toHaveProperty("ok", false);
+    expect(
+      clearFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "..",
+        owner: "spawn-a",
+        fs,
+      }),
+    ).toHaveProperty("ok", false);
   });
 });

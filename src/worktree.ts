@@ -378,6 +378,14 @@ function expectsPnpmDependencies(worktreePath: string): boolean {
 }
 
 /**
+ * Default bound on {@link awaitWorktreeReady}.
+ *
+ * Exported so the fleet spawn grace is derived from the wait it actually allows,
+ * instead of restating the number (bd-233 W1).
+ */
+export const WORKTREE_READY_TIMEOUT_MS = 60_000;
+
+/**
  * Wait for a worktree's dependencies to be installed.
  *
  * `wt switch` returns once the worktree is registered, but until this was
@@ -393,7 +401,7 @@ export async function awaitWorktreeReady(
   worktreePath: string,
   options: { timeoutInMs?: number; pollIntervalInMs?: number } = {},
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const timeoutInMs = options.timeoutInMs ?? 60_000;
+  const timeoutInMs = options.timeoutInMs ?? WORKTREE_READY_TIMEOUT_MS;
   const pollIntervalInMs = options.pollIntervalInMs ?? 200;
 
   // Non-pnpm projects have no dependency install to wait for; treating them as

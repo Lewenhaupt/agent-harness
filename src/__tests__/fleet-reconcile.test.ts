@@ -24,7 +24,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { describeFleetCapacity } from "../fleet-capacity.js";
+import { FLEET_SUPERVISOR_HEARTBEAT_STALE_MS } from "../fleet-heartbeat.js";
+import { collectFleetLaunchContext, validateFleetLaunch } from "../fleet-launch.js";
 import type { FleetMergeGitRunner } from "../fleet-merge.js";
 import { FLEET_MERGE_ORPHAN_LOCK_GRACE_MS } from "../fleet-merge.js";
 import {
@@ -32,8 +35,18 @@ import {
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
   type RunFleetReconcileOptions,
   reconcileAuthority,
+  reportMemberLiveness,
   runFleetReconcile,
+  supervisorProvablyDead,
+  supervisorRecordFingerprint,
+  supervisorRecordMatches,
 } from "../fleet-reconcile.js";
+import {
+  finishFleetRun,
+  memberWorktreeExisted,
+  recordRunMemberStopped,
+  startFleetRun,
+} from "../fleet-run.js";
 import type { FleetMemberLeaseProbe, FleetProcessScan } from "../fleet-sessions.js";
 import type { FleetMergeQueue, FleetStateFs } from "../fleet-state.js";
 import {
@@ -43,11 +56,17 @@ import {
   fleetMergeLockDir,
   readFleetIntent,
   readFleetMergeQueue,
+  withFleetLaunchMarker,
   writeFleetIntent,
+  writeFleetLaunchMarker,
   writeFleetMergeQueue,
 } from "../fleet-state.js";
 import type { FleetIntent } from "../fleet-status.js";
-import { FLEET_SCHEMA_VERSION } from "../fleet-status.js";
+import {
+  FLEET_MEMBER_SPAWN_GRACE_MS,
+  FLEET_SCHEMA_VERSION,
+  fleetSpawnInFlight,
+} from "../fleet-status.js";
 import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
@@ -247,6 +266,15 @@ async function reconcile(
     scan?: FleetProcessScan;
     /** Worktree lease per member, the pi-web orchestrator's only liveness evidence. */
     leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
+    /** The member's worktree, when one still resolves (same probe as status). */
+    memberWorktreeFor?: (taskId: string) => string | undefined;
+    /** Whether anything in the worktree proves the member's session existed. */
+    memberRanFor?: (taskId: string) => boolean;
+    /** Whether the member's worktree provably existed (bd-233: deleted tree). */
+    worktreeExistedFor?: (taskId: string) => boolean;
+    retryMembers?: readonly string[];
+    /** Recovery evidence: its fingerprint guards the prune against a concurrent re-arm. */
+    recovery?: RunFleetReconcileOptions["recovery"];
     pruneDeadMembers?: boolean;
     supervisorAlive?: boolean;
     /** bd ordering-gate seam (bd-158): a prune must resolve the removed member's gates. */
@@ -267,6 +295,15 @@ async function reconcile(
     selfPid: process.pid,
     ...(options.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
     ...(options.leaseFor === undefined ? {} : { leaseFor: options.leaseFor }),
+    ...(options.memberWorktreeFor === undefined
+      ? {}
+      : { memberWorktreeFor: options.memberWorktreeFor }),
+    ...(options.memberRanFor === undefined ? {} : { memberRanFor: options.memberRanFor }),
+    ...(options.worktreeExistedFor === undefined
+      ? {}
+      : { memberWorktreeExistedFor: options.worktreeExistedFor }),
+    ...(options.retryMembers === undefined ? {} : { retryMembers: options.retryMembers }),
+    ...(options.recovery === undefined ? {} : { recovery: options.recovery }),
     ...(options.orderingGates === undefined ? {} : { orderingGates: options.orderingGates }),
     ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
@@ -814,7 +851,12 @@ describe("runFleetReconcile: supervision", () => {
     const fixture = tempCommonDir("supervision");
     seedIntent(fixture.commonDir, fixture.fleetId);
 
-    const result = await reconcile(fixture, { scan: live });
+    const result = await reconcile(fixture, {
+      scan: live,
+      // A launched member leaves its branch behind, so the deleted-tree proof makes a
+      // missing worktree `absent` instead of `unknown` (bd-233).
+      worktreeExistedFor: () => true,
+    });
     expect(result.text).toContain("supervisor: none recorded");
     expect(result.text).toContain("member bd-12: orchestrator live (pid 700)");
     expect(result.text).toContain("member bd-15: orchestrator not running");
@@ -841,6 +883,7 @@ describe("runFleetReconcile: supervision", () => {
       scan: live,
       pruneDeadMembers: true,
       supervisorAlive: true,
+      worktreeExistedFor: () => true,
     });
 
     expect(pruned.text).toContain("supervisor: live");
@@ -868,7 +911,11 @@ describe("runFleetReconcile: supervision", () => {
       supervisor: { sessionId: "supervisor-session", pid: 4242 },
     });
 
-    const result = await reconcile(fixture, { scan: live, supervisorAlive: true });
+    const result = await reconcile(fixture, {
+      scan: live,
+      supervisorAlive: true,
+      worktreeExistedFor: () => true,
+    });
 
     expect(result.repairs).toEqual([]);
     expect(result.text).toContain("member bd-15: orchestrator not running");
@@ -944,6 +991,7 @@ describe("runFleetReconcile: supervision", () => {
       scan: noMembers,
       pruneDeadMembers: true,
       supervisorAlive: true,
+      worktreeExistedFor: () => true,
       orderingGates: {
         resolve: async (gates) => {
           resolved.push([...gates]);
@@ -976,6 +1024,7 @@ describe("runFleetReconcile: supervision", () => {
       scan: noMembers,
       pruneDeadMembers: true,
       supervisorAlive: true,
+      worktreeExistedFor: () => true,
       orderingGates: {
         resolve: async () => ({
           ok: false,
@@ -993,6 +1042,9 @@ describe("runFleetReconcile: supervision", () => {
     });
 
     expect(result.warnings.join("\n")).toContain("could not resolve the ordering gate(s)");
+    // S4: the warning names the retry owner, so an operator knows the record is kept
+    // for the always-on tick rather than forgotten.
+    expect(result.warnings.join("\n")).toContain("next tick or reconcile retries");
     // The member is still pruned, but the record stays so a later tick can retry
     // instead of forgetting an open gate.
     expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual([]);
@@ -1012,6 +1064,7 @@ describe("runFleetReconcile: supervision", () => {
     const result = await reconcile(fixture, {
       scan: noMembers,
       pruneDeadMembers: true,
+      worktreeExistedFor: () => true,
       leaseFor: (taskId) =>
         taskId === "bd-12" ? { state: "live", heartbeatAt: 99_000 } : { state: "absent" },
     });
@@ -1297,7 +1350,7 @@ describe("reconcileAuthority (bd-166)", () => {
   it("allows a supervisor to repair its own fleet", () => {
     expect(
       reconcileAuthority({ ...base, targetFleetId: "default", ownFleetId: "default" }),
-    ).toEqual({ ok: true, crossFleet: false });
+    ).toEqual({ ok: true, crossFleet: false, recovery: false });
   });
 
   it("allows a named fleet when the session supervises some fleet in the repository", () => {
@@ -1310,7 +1363,7 @@ describe("reconcileAuthority (bd-166)", () => {
         ownFleetId: "wave2",
         supervisedFleetIds: ["wave2"],
       }),
-    ).toEqual({ ok: true, crossFleet: true });
+    ).toEqual({ ok: true, crossFleet: true, recovery: false });
     expect(
       reconcileAuthority({
         ...base,
@@ -1319,7 +1372,7 @@ describe("reconcileAuthority (bd-166)", () => {
         supervisedFleetIds: ["wave2"],
         pruneDeadMembers: false,
       }),
-    ).toEqual({ ok: true, crossFleet: true });
+    ).toEqual({ ok: true, crossFleet: true, recovery: false });
   });
 
   it("refuses a cross-fleet prune, naming the owning supervisor path (bd-166)", () => {
@@ -1345,7 +1398,7 @@ describe("reconcileAuthority (bd-166)", () => {
         ownFleetId: "default",
         pruneDeadMembers: true,
       }),
-    ).toEqual({ ok: true, crossFleet: false });
+    ).toEqual({ ok: true, crossFleet: false, recovery: false });
   });
 
   it("refuses a named fleet when this session supervises none, naming the reason", () => {
@@ -1355,5 +1408,784 @@ describe("reconcileAuthority (bd-166)", () => {
     expect(refused.error).toContain("supervises no fleet in this repository");
     expect(refused.error).toContain("wave1");
     expect(refused.error).toContain("default, wave1, wave2");
+  });
+});
+
+// ── Recovery authority and member retry (bd-233) ──────────────────────
+
+const deadSupervisor = { sessionId: "dead-session", pid: 4_242, pidStartTime: "1234" };
+
+function beatAt(heartbeatAt: number, sessionId = "dead-session") {
+  return { schemaVersion: 1 as const, fleetId: "default", sessionId, pid: 4_242, heartbeatAt };
+}
+
+function runRecord(taskIds: readonly string[], stoppedTaskId?: string) {
+  const run = startFleetRun({
+    now: 1_000,
+    accept: false,
+    members: taskIds.map((taskId) => ({ taskId })),
+  });
+  return stoppedTaskId === undefined
+    ? run
+    : recordRunMemberStopped({
+        run,
+        taskId: stoppedTaskId,
+        reason: "orchestrator-missing",
+        detail: "no live orchestrator lease holds the worktree",
+        now: 2_000,
+      });
+}
+
+describe("supervisorProvablyDead (bd-233)", () => {
+  const now = 1_000_000;
+
+  function intent(overrides: Partial<FleetIntent> = {}): FleetIntent {
+    return {
+      schemaVersion: FLEET_SCHEMA_VERSION,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      baseBranch: "main",
+      publish: { mode: "local" },
+      supervisor: deadSupervisor,
+      run: runRecord(["bd-12"]),
+      ...overrides,
+    };
+  }
+  const alive = { isPidAlive: () => true };
+  const dead = { isPidAlive: () => false };
+
+  it("is not dead for a live pid with a fresh beat", () => {
+    expect(
+      supervisorProvablyDead({ intent: intent(), beat: beatAt(now - 1_000), now, liveness: alive }),
+    ).toEqual({ dead: false, reason: "fresh-beat" });
+  });
+
+  it("W6: a fresh beat refutes a dead recorded pid", () => {
+    // Some loop is ticking this run right now, so a recorded pid that looks gone (or was
+    // reused) must not license a repair against a live run — even when the beat names a
+    // different session.
+    expect(
+      supervisorProvablyDead({ intent: intent(), beat: beatAt(now - 1_000), now, liveness: dead }),
+    ).toEqual({ dead: false, reason: "fresh-beat" });
+    expect(
+      supervisorProvablyDead({
+        intent: intent(),
+        beat: beatAt(now - 1_000, "another-session"),
+        now,
+        liveness: dead,
+      }),
+    ).toEqual({ dead: false, reason: "fresh-beat" });
+  });
+
+  it("is dead for a dead pid once its beat is cold", () => {
+    expect(
+      supervisorProvablyDead({
+        intent: intent(),
+        beat: beatAt(now - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS),
+        now,
+        liveness: dead,
+      }),
+    ).toEqual({ dead: true, reason: "pid-dead", sessionId: "dead-session" });
+  });
+
+  it("is dead for a stale beat when the process probe cannot see the pid", () => {
+    expect(
+      supervisorProvablyDead({
+        intent: intent(),
+        beat: beatAt(now - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS),
+        now,
+        // An unreadable /proc is "cannot see": the beat is then the only evidence,
+        // and a cold one proves the loop is gone.
+        liveness: { isPidAlive: () => true, pidStartTime: () => undefined },
+      }),
+    ).toEqual({ dead: true, reason: "cold-beat", sessionId: "dead-session" });
+  });
+
+  it("is dead when a run-mode fleet has no beat at all", () => {
+    expect(
+      supervisorProvablyDead({ intent: intent(), beat: undefined, now, liveness: alive }),
+    ).toEqual({ dead: true, reason: "missing-beat", sessionId: "dead-session" });
+  });
+
+  it("ignores a fresh beat from another session but not a cold one", () => {
+    expect(
+      supervisorProvablyDead({
+        intent: intent(),
+        beat: beatAt(now - 1_000, "another-session"),
+        now,
+        liveness: alive,
+      }),
+    ).toEqual({ dead: false, reason: "fresh-beat" });
+    expect(
+      supervisorProvablyDead({
+        intent: intent(),
+        beat: beatAt(now - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS - 1, "another-session"),
+        now,
+        liveness: alive,
+      }),
+    ).toEqual({ dead: true, reason: "other-session", sessionId: "dead-session" });
+  });
+
+  it("is never dead for a fleet with no record, or an explicit fleet with a live pid", () => {
+    // Nothing to recover: no supervisor to replace and no beat that applies.
+    expect(
+      supervisorProvablyDead({
+        intent: intent({ supervisor: undefined, run: undefined }),
+        beat: undefined,
+        now,
+        liveness: alive,
+      }),
+    ).toEqual({ dead: false, reason: "no-record" });
+    expect(
+      supervisorProvablyDead({
+        intent: intent({ run: undefined }),
+        beat: undefined,
+        now,
+        liveness: alive,
+      }),
+    ).toEqual({ dead: false, reason: "no-beat-signal" });
+  });
+});
+
+describe("reconcileAuthority recovery arm (bd-233)", () => {
+  const base = {
+    targetFleetId: "wave1",
+    supervisedFleetIds: [] as readonly string[],
+    repoFleetIds: ["wave1"],
+    sessionId: "operator-session",
+    supervisorDead: { dead: true as const, reason: "cold-beat" as const },
+  };
+
+  it("AC1: allows a named fleet whose supervisor is provably dead", () => {
+    expect(reconcileAuthority(base)).toEqual({ ok: true, crossFleet: true, recovery: true });
+  });
+
+  it("AC1: allows a prune under recovery authority", () => {
+    // The cross-fleet prune refusal protects another *live* supervisor's capacity
+    // decision; a provably dead supervisor has none to protect.
+    expect(reconcileAuthority({ ...base, pruneDeadMembers: true })).toEqual({
+      ok: true,
+      crossFleet: true,
+      recovery: true,
+    });
+  });
+
+  it("still refuses a cross-fleet prune while the target's supervisor is live", () => {
+    const refused = reconcileAuthority({
+      ...base,
+      supervisedFleetIds: ["wave2"],
+      supervisorDead: { dead: false, reason: "no-beat-signal" },
+      pruneDeadMembers: true,
+    });
+    expect(refused).toHaveProperty("ok", false);
+  });
+
+  it("keeps own-fleet precedence, so a dead verdict cannot widen it", () => {
+    // Owning the fleet is already the strongest authority, and it is not a recovery: the
+    // audit must not claim one for a fleet the session supervises.
+    expect(
+      reconcileAuthority({
+        ...base,
+        targetFleetId: "default",
+        ownFleetId: "default",
+        pruneDeadMembers: true,
+      }),
+    ).toEqual({ ok: true, crossFleet: false, recovery: false });
+  });
+});
+
+describe("runFleetReconcile: member retry and pruned stops (bd-233)", () => {
+  it("AC3: clears a recorded stop, audits it, and reports what the loop will do", async () => {
+    const fixture = tempCommonDir("retry-stop");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      run: runRecord(["bd-12"], "bd-12"),
+    });
+
+    const result = await reconcile(fixture, { retryMembers: ["bd-12"] });
+
+    expect(result.repairs).toContain("member-retry:bd-12");
+    expect(result.text).toContain("retrying bd-12");
+    expect(result.text).toContain("next tick");
+    expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("member-retry");
+    expect(readIntent(fixture.commonDir, fixture.fleetId).run?.stopped ?? []).toEqual([]);
+
+    // Idempotent: the stop is already gone, so the second call says so.
+    const again = await reconcile(fixture, { retryMembers: ["bd-12"] });
+    expect(again.repairs).toEqual([]);
+    expect(again.text).toContain("had no recorded stop");
+  });
+
+  it("warns about an id that is not a member instead of silently ignoring it", async () => {
+    const fixture = tempCommonDir("retry-unknown");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      run: runRecord(["bd-12"], "bd-12"),
+    });
+
+    const result = await reconcile(fixture, { retryMembers: ["bd-12", "bd-99"] });
+
+    expect(result.warnings.join("\n")).toContain("not a member");
+    expect(result.warnings.join("\n")).toContain("bd-99");
+    expect(result.repairs).toEqual(["member-retry:bd-12"]);
+  });
+
+  it("drops the stop of a member it prunes", async () => {
+    const fixture = tempCommonDir("prune-stop");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12", "bd-15"],
+      run: runRecord(["bd-12", "bd-15"], "bd-15"),
+    });
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: () => true,
+    });
+
+    expect(result.repairs).toEqual(["member-pruned:bd-12", "member-pruned:bd-15"]);
+    const intent = readIntent(fixture.commonDir, fixture.fleetId);
+    expect(intent.taskIds).toEqual([]);
+    // A fleet must not keep reporting "needs a human" for a member it removed.
+    expect(intent.run?.stopped ?? []).toEqual([]);
+  });
+});
+
+describe("bd-233 regression: a dead supervisor wedges nothing", () => {
+  it("re-arms, recovers, prunes, and frees all three slots", async () => {
+    const fixture = tempCommonDir("bd-233-dead-supervisor");
+    const now = 10_000_000;
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-188", "bd-189", "bd-173"],
+      supervisor: deadSupervisor,
+      run: runRecord(["bd-188", "bd-189", "bd-173"], "bd-188"),
+    });
+    const beat = beatAt(now - FLEET_SUPERVISOR_HEARTBEAT_STALE_MS);
+    // The incident: pid 1481 gone, last beat 21:32:03Z, members with no worktree and
+    // no lease. The branches survive the deleted worktrees, which is the proof that
+    // turns `unknown` into the honest `absent`.
+    const worktreeExistedFor = (taskId: string): boolean =>
+      memberWorktreeExisted({
+        taskId,
+        branchExists: true,
+        worktreeListed: false,
+        spawnInFlight: fleetSpawnInFlight({
+          gitCommonDir: fixture.commonDir,
+          fleetId: fixture.fleetId,
+          taskId,
+          now,
+        }),
+      });
+    const dead = { isPidAlive: () => false };
+
+    // (1) Launch may re-arm instead of refusing "already a member of fleet default".
+    const context = collectFleetLaunchContext({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      liveness: dead,
+      supervisorBeat: () => beat,
+      now,
+    });
+    expect(context.fleets[0]?.supervisor).toEqual({ kind: "dead", sessionId: "dead-session" });
+    const launch = validateFleetLaunch({
+      fleets: context.fleets,
+      targetFleetId: fixture.fleetId,
+      sessionId: "operator-session",
+      taskIds: ["bd-188", "bd-189", "bd-173"],
+    });
+    expect(launch).toHaveProperty("ok", true);
+    if (!launch.ok) return;
+    expect(launch.rearm).toBe(true);
+
+    // (2) A session that is not the supervisor may reconcile the named fleet, and the
+    // recovery arm may prune.
+    const authority = reconcileAuthority({
+      targetFleetId: fixture.fleetId,
+      supervisedFleetIds: [],
+      repoFleetIds: [fixture.fleetId],
+      sessionId: "operator-session",
+      pruneDeadMembers: true,
+      supervisorDead: supervisorProvablyDead({
+        intent: readIntent(fixture.commonDir, fixture.fleetId),
+        beat,
+        now,
+        liveness: dead,
+      }),
+    });
+    expect(authority).toEqual({ ok: true, crossFleet: true, recovery: true });
+
+    const report = reportMemberLiveness({
+      members: ["bd-188", "bd-189", "bd-173"],
+      scan: noMembers,
+      worktreeExistedFor,
+    });
+    expect(report.map((member) => member.liveness.kind)).toEqual(["absent", "absent", "absent"]);
+
+    const pruned = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor,
+    });
+    expect(pruned.repairs).toEqual([
+      "member-pruned:bd-188",
+      "member-pruned:bd-189",
+      "member-pruned:bd-173",
+    ]);
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual([]);
+    expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("member-pruned-dead");
+
+    // (3) Capacity: 0 of 3 slots held, and no member left `unknown`.
+    const capacity = describeFleetCapacity({
+      ceiling: 3,
+      fleets: [
+        {
+          fleetId: fixture.fleetId,
+          supervisor: "dead",
+          members: report.map((member) => ({ taskId: member.taskId, liveness: member.liveness })),
+        },
+      ],
+    });
+    expect(capacity).toHaveProperty("counted", 0);
+    expect(capacity).toHaveProperty("free", 3);
+    expect(capacity.contributors[0]).toHaveProperty("unknown", 0);
+    expect(capacity.contributors[0]).toHaveProperty("absent", 3);
+  });
+});
+
+describe("reconcile guards from review round 2 (bd-233)", () => {
+  it("CRITICAL: a ticking run's deleted worktree is still absent", async () => {
+    // `persistFleetRun` rewrites `intent.updatedAt` every 15 s, so a window keyed on
+    // it was permanently open and pruned nothing on a live run. The window is now the
+    // member's own launch marker: no marker means no window, whatever the record says.
+    const now = 100_000; // reconcile()'s clock
+    const fixture = tempCommonDir("ticking-run-absent");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      // Ticked five seconds ago; the member was launched an hour ago.
+      updatedAt: now - 5_000,
+      run: {
+        ...startFleetRun({
+          now: now - 5_000,
+          accept: false,
+          members: [{ taskId: "bd-12" }],
+        }),
+        updatedAt: now - 5_000,
+        ticks: 240,
+        members: [{ taskId: "bd-12", launchedAt: now - 3_600_000 }],
+      },
+    });
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: (taskId) =>
+        memberWorktreeExisted({
+          taskId,
+          branchExists: true,
+          worktreeListed: false,
+          spawnInFlight: fleetSpawnInFlight({
+            gitCommonDir: fixture.commonDir,
+            fleetId: fixture.fleetId,
+            taskId,
+            now,
+          }),
+        }),
+    });
+
+    expect(result.repairs).toEqual(["member-pruned:bd-12"]);
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual([]);
+  });
+
+  it("W2: refuses to prune a member whose spawn marker is live", async () => {
+    // A relaunch reuses the surviving branch, so the branch alone would classify as
+    // absence while the new worktree is still being created. Only that member's marker
+    // holds its slot; nothing about the fleet record does.
+    const now = 100_000; // reconcile()'s clock
+    const worktreeExistedFor =
+      (gitCommonDir: string, fleetId: string) =>
+      (taskId: string): boolean =>
+        memberWorktreeExisted({
+          taskId,
+          branchExists: true,
+          worktreeListed: false,
+          spawnInFlight: fleetSpawnInFlight({ gitCommonDir, fleetId, taskId, now }),
+        });
+
+    const fresh = tempCommonDir("spawn-window-fresh");
+    seedIntent(fresh.commonDir, fresh.fleetId, { taskIds: ["bd-12"], updatedAt: 1 });
+    writeFleetLaunchMarker({
+      gitCommonDir: fresh.commonDir,
+      fleetId: fresh.fleetId,
+      taskId: "bd-12",
+      owner: "test-spawn",
+      now: now - 5_000,
+    });
+    const inside = await reconcile(fresh, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: worktreeExistedFor(fresh.commonDir, fresh.fleetId),
+    });
+    expect(inside.repairs).toEqual([]);
+    expect(inside.text).toContain("liveness unknown");
+    expect(readIntent(fresh.commonDir, fresh.fleetId).taskIds).toEqual(["bd-12"]);
+
+    // A marker older than the grace is an abandoned spawn, not a window.
+    const stale = tempCommonDir("spawn-window-stale");
+    seedIntent(stale.commonDir, stale.fleetId, { taskIds: ["bd-12"], updatedAt: 1 });
+    writeFleetLaunchMarker({
+      gitCommonDir: stale.commonDir,
+      fleetId: stale.fleetId,
+      taskId: "bd-12",
+      owner: "test-spawn",
+      now: now - FLEET_MEMBER_SPAWN_GRACE_MS - 1,
+    });
+    const after = await reconcile(stale, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: worktreeExistedFor(stale.commonDir, stale.fleetId),
+    });
+    expect(after.repairs).toEqual(["member-pruned:bd-12"]);
+    expect(readIntent(stale.commonDir, stale.fleetId).taskIds).toEqual([]);
+  });
+
+  it("W1: a spawn that outlives twice the grace while refreshing is still not pruned", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      vi.setSystemTime(100_000);
+      const fixture = tempCommonDir("spawn-window-refresh");
+      seedIntent(fixture.commonDir, fixture.fleetId, { taskIds: ["bd-12"], updatedAt: 1 });
+      let release: (value: string) => void = () => undefined;
+      const held = new Promise<string>((resolve) => {
+        release = resolve;
+      });
+      const spawner = withFleetLaunchMarker({
+        gitCommonDir: fixture.commonDir,
+        fleetId: fixture.fleetId,
+        taskId: "bd-12",
+        now: Date.now(),
+        clock: () => Date.now(),
+        spawn: () => held,
+      });
+
+      // The spawn began two graces ago and is still running; every refresh re-stamped
+      // its marker, so expiry means "no refresh for a grace", not "old spawn".
+      vi.advanceTimersByTime(2 * FLEET_MEMBER_SPAWN_GRACE_MS);
+      const result = await reconcile(fixture, {
+        scan: noMembers,
+        pruneDeadMembers: true,
+        worktreeExistedFor: (taskId) =>
+          memberWorktreeExisted({
+            taskId,
+            branchExists: true,
+            worktreeListed: false,
+            spawnInFlight: fleetSpawnInFlight({
+              gitCommonDir: fixture.commonDir,
+              fleetId: fixture.fleetId,
+              taskId,
+              now: Date.now(),
+            }),
+          }),
+      });
+
+      expect(result.repairs).toEqual([]);
+      expect(result.text).toContain("liveness unknown");
+      expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12"]);
+
+      release("session-1");
+      expect(await spawner).toHaveProperty("ok", true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("W3/W5: refuses the whole recovery pass when a re-arm rewrote the record", async () => {
+    const fixture = tempCommonDir("prune-rearm-race");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      updatedAt: 1,
+      supervisor: deadSupervisor,
+    });
+    const verdictIntent = readIntent(fixture.commonDir, fixture.fleetId);
+    const fingerprint = supervisorRecordFingerprint(verdictIntent);
+    expect(fingerprint).toBeDefined();
+    if (fingerprint === undefined) return;
+
+    // The documented runbook says "prune, then re-arm". A second session re-armed in
+    // between: no write of this pass may touch the record the new supervisor just wrote.
+    writeFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      intent: {
+        ...verdictIntent,
+        updatedAt: 9_000,
+        supervisor: { sessionId: "new-session", pid: process.pid, armToken: "new-token" },
+      },
+    });
+
+    const gateCalls: string[] = [];
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: () => true,
+      retryMembers: ["bd-12"],
+      recovery: { fingerprint, reason: "cold-beat" },
+      orderingGates: {
+        resolve: async (gates) => {
+          gateCalls.push(...gates.map((gate) => gate.gateId));
+          return { ok: true, resolved: [...gates], remaining: [] };
+        },
+        reapByPrefix: async (input) => {
+          gateCalls.push(...input.beadIds);
+          return { ok: true, resolved: [], warnings: [] };
+        },
+      },
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    expect(result.repairs).toEqual([]);
+    expect(result.text).toContain("changed since the recovery verdict");
+    expect(result.text).toContain("re-run");
+    expect(readIntent(fixture.commonDir, fixture.fleetId).taskIds).toEqual(["bd-12"]);
+    // W4: bd is touched only after a successful CAS, so a refused pass leaves the
+    // member's ordering gates alone.
+    expect(gateCalls).toEqual([]);
+    expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("reconcile-refused");
+  });
+
+  it("W4: resolves bd gates only for members the CAS actually removed", async () => {
+    const fixture = tempCommonDir("prune-gates-after-cas");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12", "bd-15"],
+      updatedAt: 1,
+      supervisor: deadSupervisor,
+      orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" }],
+    });
+    const gateCalls: string[] = [];
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      // Only bd-12 is absent; bd-15 is live, so only bd-12 may be pruned and only its
+      // gates may be resolved.
+      worktreeExistedFor: (taskId) => taskId === "bd-12",
+      orderingGates: {
+        resolve: async (gates) => {
+          gateCalls.push(...gates.map((gate) => gate.gateId));
+          return { ok: true, resolved: [...gates], remaining: [] };
+        },
+        reapByPrefix: async (input) => {
+          gateCalls.push(...input.beadIds);
+          return { ok: true, resolved: [], warnings: [] };
+        },
+      },
+    });
+
+    expect(result.repairs).toEqual(["member-pruned:bd-12"]);
+    // The gate still records bd-15 (a live member), but its bd record was resolved only
+    // after the prune committed.
+    expect(gateCalls).toEqual(["bd-901", "bd-12"]);
+    const intent = readIntent(fixture.commonDir, fixture.fleetId);
+    expect(intent.taskIds).toEqual(["bd-15"]);
+    expect(intent.orderingGates ?? []).toEqual([]);
+  });
+
+  it("W2: a re-arm between the prune and the gate drop keeps the gate records", async () => {
+    const fixture = tempCommonDir("gate-drop-rearm-race");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      updatedAt: 1,
+      supervisor: deadSupervisor,
+      orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" }],
+    });
+    const verdictIntent = readIntent(fixture.commonDir, fixture.fleetId);
+    const fingerprint = supervisorRecordFingerprint(verdictIntent);
+    if (fingerprint === undefined) throw new Error("fingerprint missing");
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: () => true,
+      recovery: { fingerprint, reason: "cold-beat" },
+      orderingGates: {
+        resolve: async (gates) => {
+          // The re-arm lands inside the bd round-trips: after the prune CAS committed and
+          // before the gate-drop CAS. The stale pass must not restamp that record.
+          writeFleetIntent({
+            gitCommonDir: fixture.commonDir,
+            fleetId: fixture.fleetId,
+            intent: {
+              ...readIntent(fixture.commonDir, fixture.fleetId),
+              updatedAt: 9_000,
+              supervisor: { sessionId: "new-session", pid: process.pid, armToken: "new-token" },
+            },
+          });
+          return { ok: true, resolved: [...gates], remaining: [] };
+        },
+        reapByPrefix: async () => ({ ok: true, resolved: [], warnings: [] }),
+      },
+    });
+
+    const after = readIntent(fixture.commonDir, fixture.fleetId);
+    // The prune committed before the re-arm, so the dead member is gone.
+    expect(result.repairs).toEqual(["member-pruned:bd-12"]);
+    expect(after.taskIds).toEqual([]);
+    // The gate records survive and the new supervisor's clock is untouched.
+    expect(after.orderingGates ?? []).toEqual([
+      { blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" },
+    ]);
+    expect(after.supervisor?.sessionId).toBe("new-session");
+    expect(after.supervisor?.armToken).toBe("new-token");
+    expect(after.updatedAt).toBe(9_000);
+    expect(result.warnings.join("\n")).toContain("kept their ordering-gate record(s)");
+  });
+});
+
+describe("kept ordering-gate records (bd-233 W1)", () => {
+  it("W1: the kept-records warning names the always-on tick and the reconcile retry", async () => {
+    const fixture = tempCommonDir("kept-gates-warning");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      updatedAt: 1,
+      supervisor: deadSupervisor,
+      orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-901" }],
+    });
+    const verdictIntent = readIntent(fixture.commonDir, fixture.fleetId);
+    const fingerprint = supervisorRecordFingerprint(verdictIntent);
+    if (fingerprint === undefined) throw new Error("fingerprint missing");
+
+    const result = await reconcile(fixture, {
+      scan: noMembers,
+      pruneDeadMembers: true,
+      worktreeExistedFor: () => true,
+      recovery: { fingerprint, reason: "cold-beat" },
+      orderingGates: {
+        resolve: async (gates) => {
+          // A re-arm lands during the bd round-trips, so the drop CAS is refused.
+          writeFleetIntent({
+            gitCommonDir: fixture.commonDir,
+            fleetId: fixture.fleetId,
+            intent: {
+              ...readIntent(fixture.commonDir, fixture.fleetId),
+              updatedAt: 9_000,
+              supervisor: { sessionId: "new-session", pid: process.pid, armToken: "new-token" },
+            },
+          });
+          return { ok: true, resolved: [...gates], remaining: [] };
+        },
+        reapByPrefix: async () => ({ ok: true, resolved: [], warnings: [] }),
+      },
+    });
+
+    const warning = result.warnings.join("\n");
+    expect(warning).toContain("the next tick or reconcile resolves them");
+  });
+});
+
+describe("supervisorRecordMatches (bd-233 W5)", () => {
+  function intent(): FleetIntent {
+    return {
+      schemaVersion: FLEET_SCHEMA_VERSION,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      baseBranch: "main",
+      publish: { mode: "local" },
+      supervisor: { sessionId: "dead-session", pid: 4_242, armToken: "token-a" },
+    };
+  }
+
+  it("matches the exact record and refuses every anchor change", () => {
+    const base = intent();
+    const fingerprint = supervisorRecordFingerprint(base);
+    expect(fingerprint).toBeDefined();
+    if (fingerprint === undefined) return;
+    expect(supervisorRecordMatches(base, fingerprint)).toBe(true);
+    expect(
+      supervisorRecordMatches(
+        { ...base, supervisor: { sessionId: "new-session", pid: 4_242, armToken: "token-b" } },
+        fingerprint,
+      ),
+    ).toBe(false);
+    expect(supervisorRecordMatches({ ...base, updatedAt: 2 }, fingerprint)).toBe(false);
+  });
+
+  it("accepts a revision this pass itself stamped", () => {
+    const base = intent();
+    const fingerprint = supervisorRecordFingerprint(base);
+    if (fingerprint === undefined) throw new Error("fingerprint missing");
+    expect(
+      supervisorRecordMatches({ ...base, updatedAt: 100_000 }, fingerprint, {
+        alsoAllowUpdatedAt: 100_000,
+      }),
+    ).toBe(true);
+    // A re-arm still fails: the anchors move with it.
+    expect(
+      supervisorRecordMatches(
+        {
+          ...base,
+          updatedAt: 100_000,
+          supervisor: { sessionId: "new-session", pid: 4_242, armToken: "token-b" },
+        },
+        fingerprint,
+        { alsoAllowUpdatedAt: 100_000 },
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("supervisorRecordFingerprint without a record (bd-233 W5)", () => {
+  it("has no fingerprint, and matches nothing, when the intent names no supervisor", () => {
+    // A fingerprint is what licenses a recovery prune; no record must mint none, or a
+    // fleet with nothing to recover would look recoverable.
+    const bare: FleetIntent = {
+      schemaVersion: FLEET_SCHEMA_VERSION,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      baseBranch: "main",
+      publish: { mode: "local" },
+    };
+    expect(supervisorRecordFingerprint(bare)).toBeUndefined();
+
+    const recorded = supervisorRecordFingerprint({
+      ...bare,
+      supervisor: { sessionId: "dead-session", pid: 4_242 },
+    });
+    if (recorded === undefined) throw new Error("fingerprint missing");
+    // ...and a record that lost its supervisor can never satisfy a verdict it never had.
+    expect(supervisorRecordMatches(bare, recorded)).toBe(false);
+  });
+});
+
+describe("retryStoppedMembers on an inactive run (bd-233 W3)", () => {
+  it("W3: leaves the stop intact and warns instead of promising a next tick", async () => {
+    const fixture = tempCommonDir("retry-inactive-run");
+    const stopped = runRecord(["bd-12"], "bd-12");
+    seedIntent(fixture.commonDir, fixture.fleetId, {
+      taskIds: ["bd-12"],
+      run: finishFleetRun({ run: stopped, now: 3_000, outcome: "partial" }),
+    });
+
+    const result = await reconcile(fixture, { retryMembers: ["bd-12"] });
+
+    expect(result.repairs).toEqual([]);
+    expect(result.warnings.join("\n")).toContain("bd-12 was not retried");
+    expect(result.warnings.join("\n")).toContain("Re-arm the fleet");
+    expect(result.text).not.toContain("next tick reconsiders");
+    expect(auditActions(fixture.commonDir, fixture.fleetId)).not.toContain("member-retry");
+    // The human-facing record survives: nothing will plan the member, so nothing hides it.
+    expect(readIntent(fixture.commonDir, fixture.fleetId).run?.stopped).toEqual([
+      {
+        taskId: "bd-12",
+        reason: "orchestrator-missing",
+        detail: "no live orchestrator lease holds the worktree",
+        at: 2_000,
+      },
+    ]);
   });
 });

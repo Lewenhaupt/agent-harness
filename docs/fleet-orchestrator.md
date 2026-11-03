@@ -85,7 +85,7 @@ The supervisor is a scheduler.
 operator (/fleet bd-12 bd-15 bd-19)
   │   supervisor session, cwd = main repo root, no process gate
   ├── fleet state: <git-common-dir>/belayd/fleet/<fleetId>/
-  │     fleet.json  inbox/  events/  merge-queue.json  audit.log
+  │     fleet.json  inbox/  events/  launch/  merge-queue.json  audit.log
   ├── member bd-12:  worktree <repo>.feat-bd-12  (normal orchestrator + gate)
   ├── member bd-15:  worktree <repo>.feat-bd-15  (normal orchestrator + gate)
   └── member bd-19:  worktree <repo>.feat-bd-19  (normal orchestrator + gate)
@@ -102,8 +102,17 @@ operator (/fleet bd-12 bd-15 bd-19)
 | `fleet.json` | Operator intent: fleet id, task ids, requested concurrency ceiling, paused flag, the required base branch this fleet lands on (frozen at launch), the publish contract (`local`/`pr`/`push`, frozen at launch; `local` is the inert default), supervisor record (`sessionId`, `pid`, `pidStartTime`, `armToken`), note, the (P3) `deferred` members with the reason each waits, and the (P2/P4) `park` record (`reason`, `stashRef`, `recordedAt`) | P1/P3 (`belayd_fleet_launch` / `/fleet`), P2 (`parkFleet`), P4 (`belayd_fleet_pause` / `belayd_fleet_resume` / `belayd_fleet_reconcile`); P0 only reads it |
 | `inbox/` | Member → supervisor notes, drained by `belayd_fleet_inbox` | P1 |
 | `events/` | Supervisor → member notifications (base moved, rebase due, sibling landed, pause/resume), drained at the member's turn start. One file **per recipient**: a broadcast is fanned out at enqueue time | P1 |
+| `launch/` | Per-member spawn markers (bd-233). A marker exists only while that member's spawn is in flight: written immediately before the worktree is created, **refreshed while the spawn lives**, cleared once the session is spawn-committed or the attempt failed (owner-scoped: a stale spawn's clear never deletes a newer spawn's marker), and ignored after a full grace with no refresh (`FLEET_MEMBER_SPAWN_GRACE_MS`, 150 s, refreshed every 50 s). It keeps a relaunched member `unknown` (counted, not prunable) for its own spawn only — never for the whole run | P1/P6 (`withFleetLaunchMarker`) |
 | `merge-queue.json` | Single-flight merge queue (entries + one lease holder) | P2 (`belayd_fleet_merge`) |
 | `audit.log` | Append-only audit of every cross-tree authority action (launch, re-arm, per-member launch attempt, prune, note, inbox drain, events ack, merge acquire/release/stash/restore/gates/broadcast, P3's `schedule-planned`/`member-deferred`/`capacity-blocked`, and P4's `fleet-paused`/`fleet-resumed`/`fleet-unparked`/`member-stopped`/`advance`/`queue-*`/`member-pruned-dead`) | P1/P2/P3/P4 |
+
+`launch/` markers are **advisory** and readable by any session, supervisor or
+not: they exist only to keep liveness classification honest, so a session that is
+not the supervisor may read them (status, launch preflight, and reconcile all do).
+An expired marker means **no window** — the member's own git evidence decides. A
+live marker says only "a spawner is working on this member right now": nothing may
+act on it beyond liveness classification (never prune it, never start a second
+spawn for it, never treat it as authority to launch or release).
 
 The publish contract is resolved once at launch from `--publish*` flags, then
 `<repo-root>/.belayd/config.json` (`{"publish": {...}}` or the shorthand
@@ -513,7 +522,7 @@ complete set:
 | `schedule-planned` / `member-deferred` / `capacity-blocked` | once per launch or advance: the plan, and one per deferred member with its reason |
 | `ordering-gates` | once per launch that created (or adopted) bd ordering gates, naming each `blocker->blocked (gate)` |
 | `ordering-gates-adopted` | once per tick/reconcile sweep that wrote a record for a gate bd already had (the crash window between `bd gate create` and the intent write), naming each `blocker->blocked (gate)` |
-| `ordering-gates-resolved` | once per landing / closed-bead / pruned-member resolve, naming the gate ids bd confirmed resolved (bd-158) |
+| `ordering-gates-resolved` | once per landing / closed-bead resolve, naming the gate ids bd confirmed resolved (bd-158) |
 | `ordering-gate-unresolved` | once when a landing merged but bd refused the gate resolve: the record stays and the next tick retries (bd-158) |
 | `fleet-landed` | once per landing, with the member and base branch |
 | `fleet-paused` / `fleet-pause-failed` | once per pause attempt (applied / refused or failed to write) |

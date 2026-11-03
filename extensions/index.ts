@@ -37,6 +37,7 @@ import { claimRegistrationOnce } from "../src/claim-registry.js";
 import {
   ALL_PHASE_NAMES,
   awaitWorktreeReady,
+  branchExists,
   checkToolAllowed,
   collectHandoffDefault,
   extractOutlineSymbols,
@@ -401,6 +402,7 @@ export default function belaydAgentHarness(
     scanProcesses,
     resolveGitCommonDir,
     resolveWorktreePath,
+    branchExists,
     readWorktreeBranch,
     updateFleetIntent,
     readFleetStatus,

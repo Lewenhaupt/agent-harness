@@ -24,14 +24,18 @@ same engines these tools use, and every action is audited (`fleet-landed`,
   - [Resume a fleet](#resume-a-fleet)
   - [Advance the next wave](#advance-the-next-wave)
   - [Reconcile after a crash](#reconcile-after-a-crash)
+    - [Recovering from a dead supervisor](#recovering-from-a-dead-supervisor)
 - [How to Verify](#how-to-verify)
 
 ## How to Use
 
-All four tools are **supervisor-only**: they require `fleet.json` to name this
-session as the live supervisor (`sessionId` + unchanged process identity + the arm
-token this session minted). A record left by a dead process does not count; start a
-supervisor with `/fleet` or `belayd_fleet_launch`.
+All four tools are **supervisor-only**, with one documented exception: a fleet
+whose supervisor is **provably dead** may be reconciled by any session in the
+repository (bd-233, [Recovering from a dead supervisor](#recovering-from-a-dead-supervisor)).
+Otherwise they require `fleet.json` to name this session as the live supervisor
+(`sessionId` + unchanged process identity + the arm token this session minted). A
+record left by a dead process does not count; start a supervisor with `/fleet` or
+`belayd_fleet_launch`.
 
 ### Pause a fleet
 
@@ -166,43 +170,70 @@ deferrals advance as soon as a slot frees.
 belayd_fleet_reconcile { }
 belayd_fleet_reconcile { "pruneDeadMembers": true }
 belayd_fleet_reconcile { "fleetId": "wave1", "pruneDeadMembers": true }
+belayd_fleet_reconcile { "retryMembers": ["bd-42"] }
 ```
 
 `fleetId` names another fleet in the same repository — the leaderless one a
 hand edit used to be the only way to repair (bd-166). Naming a fleet never grants
-authority by itself: the call is accepted only when this session supervises *some*
-fleet in the repository (same authority rule as launch), and the cross-fleet
-target is audited as `reconcile-cross-fleet`. Without `fleetId` the call targets
-this session's own fleet, exactly as before.
+authority by itself: the call is accepted when this session supervises *some*
+fleet in the repository (same authority rule as launch) **or** when the named
+fleet's supervisor is provably dead (bd-233, see
+[Recovering from a dead supervisor](#recovering-from-a-dead-supervisor)). The arm
+taken is audited: `reconcile-cross-fleet` for the supervised arm,
+`reconcile-recovery` for the dead-supervisor arm. Without `fleetId` the call
+targets this session's own fleet — or, when this session holds no fleet, the one
+fleet in the repository if its supervisor is provably dead.
 
-A cross-fleet call repairs the **queue and park** (and reports liveness); it
-refuses `pruneDeadMembers: true` for a fleet that is not the caller's own, because
-a prune erases another fleet's members from the capacity arithmetic. To prune such
-a fleet, re-arm it (`/fleet <ids> --fleet <id>`) and run the reconcile — or
-`belayd_fleet_release <taskId>` — from that session; both are supervisor-only for
-that fleet, so the refusing session cannot reach them. Pruning the session's own
-fleet is unchanged.
+A cross-fleet call normally repairs the **queue and park** (and reports
+liveness) and refuses `pruneDeadMembers: true`, because a prune erases another
+fleet's members from the capacity arithmetic. Two exceptions, both documented
+below: recovery authority over a provably dead fleet may prune, and to prune a
+*live* fleet you re-arm it (`/fleet <ids> --fleet <id>`) and run the reconcile —
+or `belayd_fleet_release <taskId>` — from that session.
 
 The prune parameter is **`pruneDeadMembers`** (the JSON key the tool schema
 declares). The reconcile report hints at it in prose as `prune-dead-members`;
 that phrase is not a parameter name.
 
+`retryMembers` is the documented way back from "needs a human" (bd-233). It
+clears the named members' `run.stopped` entries — nothing else — and audits one
+`member-retry` entry per id. Only an **active** run has a next tick to promise: on a
+finished or halted run the stops are left intact and each id is reported as a
+warning that names the re-arm step. When the run is active, the next tick
+reconsiders those members: it lands work that finished, and stops them again if
+their orchestrator is still gone. A member whose worktree no longer exists needs
+`pruneDeadMembers: true` plus a fresh launch instead; the report says so.
+
 Pruning is gated on the **member's** evidence, never on the supervisor's: a member
 is removed only when the completed scan shows no process carrying
-`belayd-<taskId>` (a positive `absent` verdict). A live supervisor is the normal
-caller and may prune; `unknown` liveness is never pruned, and the worktree,
-transcript, and bead are left alone.
+`belayd-<taskId>`, no live worktree lease, and no worktree that still exists (a
+positive `absent` verdict). A live supervisor is the normal caller and may prune;
+`unknown` liveness is never pruned, and the worktree, transcript, and bead are
+left alone. A prune also drops the pruned members' `run.stopped` entries, because
+a fleet must not keep reporting "needs a human" for a member it just removed.
 
-**One deliberate divergence from the capacity count.** A member with no worktree is
-`absent` here (prunable) and `unknown` in the capacity count (`docs/fleet-orchestrator.md`,
-`src/fleet-capacity.ts`). Both are right for the question each one answers. For
-capacity — "could a slot be in use?" — a missing worktree is unclassifiable: a
-launch records the member *before* it creates the tree, so the absence may be a
-spawn in flight, and counting it is the safe direction. For reconcile — "is this
-record provably dead?" — the missing worktree *is* the positive evidence (the thing
-being probed does not exist), and refusing to prune on it would leave the record
-unreachable by any tool. The same split does not apply to an existing tree: an
-unreadable lease or an unreadable `/proc` is `unknown` in both. Capacity's run
+A pruned member's ordering-gate record is resolved in bd and then dropped from the
+intent. If that second write is refused (a concurrent re-arm, or a failed drop),
+the record is kept and the warning says who retries it: the **next tick** or the
+next reconcile. The tick is the always-on owner: every tick resolves and drops any
+recorded gate whose blocker or blocked bead is no longer a member, with no audit
+entry for that drop, so no operator action depends on one particular reconcile call.
+A reconcile that prunes also resolves the pruned beads' gates through the same
+prune path, and the reconcile tool then sweeps every member plus the beads that
+pass pruned (`reapReconciledMemberGates`) inside the audited reconcile call — the
+prune is audited as `member-pruned-dead`, gate adoptions as
+`ordering-gates-adopted`, while the post-pass's own orphan drop adds no separate
+`ordering-gates-resolved` entry. A later reconcile tool call reaps anything still
+left by a refused drop.
+
+**A missing worktree is absence only when something proves the tree existed.** A
+launch writes the member into `taskIds` *before* it creates the branch and the
+worktree, so "no worktree" alone is a spawn in flight and stays `unknown`
+(counted, never pruned). A deleted worktree leaves its `feat/<taskId>` branch
+behind, and that (or a listed worktree) is the proof: the member resolves to
+`absent`, is prunable, and stops holding a slot. Reconcile and the capacity view
+classify this with the same classifier and the same injected evidence, so a
+repair cannot disagree with what `belayd_fleet_status` prints. Capacity's run
 manifest evidence is execution-scoped too — only a manifest that postdates the
 worktree's creation (and the run's recorded `launchedAt`) counts, so an inherited
 same-task manifest copied into a fresh worktree cannot free a slot mid-spawn
@@ -215,6 +246,46 @@ branch while the root moved away), and holds the **existing** merge lock
 (`merge.lock.d`) for its repairs, so it can never interleave with a merge or with a
 second reconcile. It never discards work: a failed restore leaves the stash
 untouched and the fleet parked.
+
+#### Recovering from a dead supervisor
+
+No step here needs the dead supervisor's session, and none needs a hand edit of
+`fleet.json`. A supervisor is **provably dead** along one of two paths, and which one
+applies depends on the record:
+
+- a **run-mode** record's `pid` is the shared pi-web daemon (`pid: process.pid` at
+  arm), so the pid probe cannot prove the session gone while the daemon lives: this
+  path waits for `supervisor.json`'s beat to go cold (up to
+  `FLEET_SUPERVISOR_HEARTBEAT_STALE_MS`, 10 minutes) or go missing;
+- an **explicit** (non-run) or legacy record whose pid is the supervisor process
+  itself is provably dead as soon as that pid is gone or reused, with no beat wait.
+
+So a fresh beat refutes death on the beat path (some loop is ticking), while a dead
+pid refutes it on the pid path. Recovery never takes the supervisor role: the
+record is untouched, and no session becomes the supervisor by reconciling.
+
+1. **Reconcile the dead fleet by id.** `belayd_fleet_reconcile { "fleetId": "<id>" }`
+   from any session in the repository. In a repository with exactly one fleet,
+   `{ }` is enough. This arm is audited as `reconcile-recovery`; it grants repair
+   authority only and never writes the supervisor record, so no session silently
+   becomes the supervisor.
+2. **Prune the members that are provably gone.** Re-run it with
+   `{ "fleetId": "<id>", "pruneDeadMembers": true }`. Under recovery authority a
+   prune is allowed — the cross-fleet refusal protects another *live* supervisor's
+   capacity decision, and a provably dead supervisor has none to protect. Members
+   whose worktree was deleted resolve to `absent` (their `feat/<taskId>` branch is
+   the proof) and free their slots. The report names each pruned id and audits
+   `member-pruned-dead`.
+3. **Retry the members you want to keep.** `{ "fleetId": "<id>", "retryMembers": ["bd-42"] }`
+   clears their recorded stop (`member-retry`); the run's next tick reconsiders
+   them. Only an **active** run has a next tick: on a finished or halted run the
+   stops are left intact and each requested id gets a warning telling you to re-arm
+   first. If a retried member's worktree is gone, it is stopped again — prune it in
+   step 2 and launch it fresh.
+4. **Re-arm or relaunch.** `/fleet <ids> --fleet <id>` (or `belayd_fleet_launch`)
+   rewrites the supervisor record, preserves the surviving members, and restarts
+   the run loop. A fleet whose members were all pruned needs a launch for the new
+   work, not a re-arm of a finished run.
 
 #### Repair table
 
@@ -233,9 +304,9 @@ untouched and the fleet parked.
 | Parked fleet, root is a linked worktree | `rev-parse --absolute-git-dir` differs from `--git-common-dir` | **blocked before any stash work** | A linked worktree can hold the base branch while the root moved away; restoring there would leave the root with neither the work nor the pointer. Run reconcile from the repository root |
 | Parked fleet, root not on the base branch | git shows another branch checked out | **blocked, report the exact steps** | Applying onto another branch would move the operator's work into the wrong checkout. The stash ref and the branch to check out are printed |
 | Parked fleet, stash no longer resolves or conflicts | git refuses the apply | **blocked, stash untouched** | The conflict is reset out of the checkout and the fleet stays parked with the ref in `park` |
-| Member orchestrator absent | a process table that was read shows no process carrying `belayd-<taskId>`, and the member's worktree is gone or holds no fresh lease | **report**; **prune** with `pruneDeadMembers: true` | Removes phantom members whose records are unreachable otherwise. A live supervisor may prune — it is the entity that needs the record gone. The worktree, transcript, and bead are untouched |
+| Member orchestrator absent | a process table that was read shows no process carrying `belayd-<taskId>`, no live worktree lease, and the worktree is gone although one provably existed (its branch survives) | **report**; **prune** with `pruneDeadMembers: true` | Removes phantom members whose records are unreachable otherwise and frees their capacity slots. A live supervisor may prune — it is the entity that needs the record gone — and so may recovery authority over a provably dead fleet. The worktree, transcript, and bead are untouched |
 | Member orchestrator live | a process carries the token | **leave alone** | The work is advancing; only a dead supervisor needs re-arming with `/fleet <ids> --fleet <id>` |
-| Member liveness unknown | `/proc` unreadable / scan over its cap | **never prune**, warn | "Cannot see" is not "gone". Every member stays in the capacity count, even when the supervisor is live and asks to prune |
+| Member liveness unknown | no worktree and no proof one ever existed (a launch may be creating it), `/proc` unreadable, scan over its cap, or an unreadable lease | **never prune**, warn | "Cannot see" is not "gone". Every member stays in the capacity count, even when the supervisor is live and asks to prune |
 
 **Why reset to `queued` rather than mark the entry `failed`.** A crash is not a
 failed merge: the merge may not even have started, and the branch is untouched. A
@@ -266,13 +337,14 @@ supervisor for the same fleet.
 
 #### After a prune: relaunching the pruned bead
 
-A pruned member's worktree and `.belayd/workflow.json` are still on disk, and the
-bd-119 ownership preflight (`docs/owned-worktree.md`) refuses a second
-orchestrator for a worktree that already records workflow state. So a pruned dead
-member is not relaunched with `belayd_fleet_launch`; resume that workflow the way
-the single-bead runbook says (`/belayd` handoff / `pi --resume belayd-<taskId>`), or
-remove the worktree if the work is abandoned. Pruning only changes which sessions
-the fleet counts — it never deletes anything.
+A pruned member's bead is untouched, and whether it can simply be relaunched
+depends on the worktree. If the worktree still exists with
+`.belayd/workflow.json`, the bd-119 ownership preflight (`docs/owned-worktree.md`)
+refuses a second orchestrator, so resume that workflow the way the single-bead
+runbook says (`/belayd` handoff / `pi --resume belayd-<taskId>`). If the worktree is
+gone — the bd-233 case — `belayd_fleet_launch` sets up a fresh one from the
+surviving branch and starts the member normally. Pruning only changes which
+sessions the fleet counts; it never deletes anything.
 
 #### Idempotence
 
@@ -317,21 +389,43 @@ second orchestrator on the same worktree.
 still evidence. Reconcile takes one `/proc/<pid>/cmdline` snapshot (bounded,
 numeric pids only) and combines it with the lease per member:
 
-| Lease | Process | Result | Consequence |
-|---|---|---|---|
-| fresh | either | `live` | never pruned; the work is running |
-| cold/absent | exact `belayd-<taskId>` argv | `live` | never pruned (CLI-spawned member) |
-| cold/absent | nothing, scan completed | `absent` | report; prunable with `pruneDeadMembers: true` |
-| unreadable | either | `unknown` | never pruned; warning |
-| cold/absent | scan could not read `/proc` | `unknown` | never pruned; warning |
+| Lease | Process | Worktree | Result | Consequence |
+|---|---|---|---|---|
+| fresh | either | present | `live` | never pruned; the work is running |
+| cold/absent | exact `belayd-<taskId>` argv | either | `live` | never pruned (CLI-spawned member) |
+| cold/absent | nothing, scan completed | present, with evidence it ran | `absent` | report; prunable with `pruneDeadMembers: true` |
+| cold/absent | nothing, scan completed | gone, but the tree provably existed | `absent` | report; prunable; frees the capacity slot (bd-233) |
+| cold/absent | nothing, scan completed | gone, no proof it ever existed | `unknown` | a launch may be creating it; never pruned |
+| cold/absent | nothing, scan completed | present, no evidence it ran | `unknown` | bare worktree = spawn in flight; never pruned |
+| unreadable | either | either | `unknown` | never pruned; warning |
+| cold/absent | scan could not read `/proc` | either | `unknown` | never pruned; warning |
 
 The combination is a heuristic in one direction only: a false `live` costs nothing
 (a dead member keeps a slot until its evidence says otherwise), while a false
 `absent` removes a running member — which is why an unreadable lease or an
-unreadable `/proc` is `unknown`, never `absent`, in both reconcile and the capacity
-count. Capacity and pruning still differ in what they do with an `absent` verdict:
-capacity stops counting it (the slot comes back), prune removes the record when the
-operator asks (the member stops being addressable).
+unreadable `/proc` is `unknown`, never `absent`, and why "no worktree" without
+proof the tree existed is `unknown` too. Capacity and pruning agree on every
+verdict: capacity stops counting an `absent` member (the slot comes back), and a
+prune removes the record when the operator asks (the member stops being
+addressable).
+
+Two details of the "gone, but the tree provably existed" row:
+
+- a worktree that `git worktree list` still reports although its directory was
+  deleted (`rm -rf`, not `wt rm`) resolves to `absent` directly: the listing is the
+  proof, and no `git worktree prune` is needed to free the slot (bd-233 W1);
+- a **relaunch** reuses the surviving `feat/<taskId>` branch, so the proof is
+  suppressed only while **that member's own launch marker** is live
+  (`<fleet dir>/launch/<taskId>`) — the spawner creates it immediately before
+  spawning, **refreshes it while the spawn lives**, and removes it once the session
+  is spawn-committed or the attempt failed, so nothing periodic can hold a window
+  open: a ticking run never keeps its members `unknown`. The grace is
+  `FLEET_MEMBER_SPAWN_GRACE_MS` = `WORKTREE_READY_TIMEOUT_MS` (60 s) +
+  `FLEET_SPAWN_RPC_ALLOWANCE_MS` (60 s) + `FLEET_SPAWN_GRACE_MARGIN_MS` (30 s) =
+  150 s, refreshed every `FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS` (50 s). Only a
+  member inside its own window is `unknown` (counted, never pruned); a marker with
+  no refresh for a full grace is an abandoned spawn and the member is `absent`
+  again.
 
 ## How to Verify
 
@@ -353,9 +447,25 @@ operator asks (the member stops being addressable).
 5. **No liveness guessing.** Stop a member session, run reconcile: it reports
    `orchestrator not running` and does not prune unless asked. With
    `"pruneDeadMembers": true` it removes that member and audits `member-pruned-dead`
-   — this works from a live supervisor too (the realistic case), and a scan that
-   cannot run (`unknown`) prunes nothing even with the flag.
-6. **No background loop.** Trigger no tool call and watch `audit.log`: nothing new
+   — this works from a live supervisor too (the realistic case), even while its run
+   ticks: only a member whose own launch marker is still live keeps its slot. A scan
+   that cannot run (`unknown`) prunes nothing even with the flag.
+6. **A dead supervisor is not a dead end (bd-233).** For a run-mode fleet, kill the
+   supervisor session and leave its `supervisor.json` beat untouched: the loop stops
+   beating, so the fleet becomes provably dead once the beat is cold (up to 10
+   minutes). For an explicit fleet whose record names the supervisor process, the
+   dead pid is proof immediately. Then run
+   `belayd_fleet_reconcile { "fleetId": "<id>", "pruneDeadMembers": true }` from an
+   unrelated session: it is accepted, audits `reconcile-recovery` (only because it
+   repaired something), removes the members whose worktrees are gone, and
+   `belayd_fleet_status` then shows `unknown: 0` and the slots free. A prune is
+   allowed under recovery authority; the supervisor record is untouched.
+   `src/__tests__/fleet-reconcile.test.ts` pins this scenario end to end.
+7. **Retry is a tool call.** With a member in `run.stopped`, call
+   `belayd_fleet_reconcile { "retryMembers": ["<id>"] }`: the stop is cleared and
+   audited `member-retry`, and the run's next tick reconsiders the member. An id
+   that is not a member is reported as a warning, not ignored.
+8. **No background loop.** Trigger no tool call and watch `audit.log`: nothing new
    appears. Waves, pauses, and repairs only ever happen in response to a call.
 
 ## Related documentation

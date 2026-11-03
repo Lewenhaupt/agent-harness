@@ -35,6 +35,8 @@
  */
 
 import * as nodeFs from "node:fs";
+import type { SupervisorHeartbeat } from "./fleet-heartbeat.js";
+import { isFleetLoopProvablyDead } from "./fleet-heartbeat.js";
 import type { FleetMergeGitRunner } from "./fleet-merge.js";
 import {
   acquireFleetMerge,
@@ -42,7 +44,7 @@ import {
   releaseFleetMerge,
   restoreRecordedStash,
 } from "./fleet-merge.js";
-import type { FleetSupervisorState } from "./fleet-mode.js";
+import type { FleetSupervisorLiveness, FleetSupervisorState } from "./fleet-mode.js";
 import { classifyFleetSupervisor } from "./fleet-mode.js";
 import type {
   FleetOrderingGate,
@@ -50,12 +52,13 @@ import type {
   ReapFleetOrderingGatesResult,
   ResolveFleetOrderingGatesResult,
 } from "./fleet-ordering-gates.js";
+import { isFleetRunActive, retryRunMembers } from "./fleet-run.js";
 import type {
   FleetMemberLeaseProbe,
   FleetMemberLiveness,
   FleetProcessScan,
 } from "./fleet-sessions.js";
-import { classifyMemberLivenessFromScan } from "./fleet-sessions.js";
+import { classifyMemberLivenessInWorktree } from "./fleet-sessions.js";
 import type { FleetMergeQueue, FleetMergeQueueEntry, FleetStateFs } from "./fleet-state.js";
 import {
   appendFleetAuditEntry,
@@ -363,6 +366,12 @@ export interface RunFleetReconcileOptions {
    * it is running — the bd-37 double-orchestrator failure.
    */
   leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
+  /** The member's worktree, when one still resolves (same probe as status/launch). */
+  memberWorktreeFor?: (taskId: string) => string | undefined;
+  /** Whether anything in the worktree proves the member's session existed. */
+  memberRanFor?: (taskId: string) => boolean;
+  /** Whether the member's worktree provably existed (bd-233: deleted tree). */
+  memberWorktreeExistedFor?: (taskId: string) => boolean;
   leaseInMs?: number;
   orphanGraceInMs?: number;
   /**
@@ -372,6 +381,22 @@ export interface RunFleetReconcileOptions {
    * count sees, so it is never implicit.
    */
   pruneDeadMembers?: boolean;
+  /**
+   * Members whose recorded stop a human asked to clear (bd-233).
+   *
+   * The documented way back from "stopped for a human": the run's next tick plans
+   * the member again instead of treating it as finished. Unknown ids are reported as
+   * warnings, never silently ignored.
+   */
+  retryMembers?: readonly string[];
+  /**
+   * The recovery evidence that licensed this pass (bd-233).
+   *
+   * Present only when a non-supervisor is repairing a fleet whose supervisor is
+   * provably dead. The fingerprint guards the prune's compare-and-replace: if a
+   * re-arm landed between the verdict and the write, nothing is pruned (W5).
+   */
+  recovery?: SupervisorRecovery;
   /**
    * bd ordering-gate lifecycle (bd-158), injected so this module stays bd-free.
    *
@@ -728,19 +753,32 @@ export interface MemberLivenessReport {
  * Classify every member's orchestrator session from one process snapshot.
  *
  * Pure: the snapshot is taken once by the caller, so the report is internally
- * consistent (two members cannot see two different process tables).
+ * consistent (two members cannot see two different process tables). The worktree
+ * evidence is injected for the same reason the status view injects it — reconcile
+ * must reach the same verdict as status, especially for a member whose worktree was
+ * deleted (bd-233): a surviving branch proves the tree existed, so no lease and no
+ * process is `absent` (prunable) instead of `unknown` (counted forever).
  */
 export function reportMemberLiveness(options: {
   members: readonly string[];
   scan: FleetProcessScan;
   selfPid?: number;
+  /** The member's worktree, when one still resolves. */
+  worktreeFor?: (taskId: string) => string | undefined;
   /** Worktree lease per member, when the caller can read one. */
   leaseFor?: (taskId: string) => FleetMemberLeaseProbe | undefined;
+  /** Whether anything in the worktree proves the member's session existed. */
+  memberRanFor?: (taskId: string) => boolean;
+  /** Whether the member's worktree provably existed (deleted tree, surviving branch). */
+  worktreeExistedFor?: (taskId: string) => boolean;
 }): readonly MemberLivenessReport[] {
   return options.members.map((taskId) => ({
     taskId,
-    liveness: classifyMemberLivenessFromScan({
+    liveness: classifyMemberLivenessInWorktree({
       taskId,
+      worktreePath: options.worktreeFor?.(taskId),
+      memberRanEvidence: options.memberRanFor?.(taskId) === true,
+      worktreeExisted: options.worktreeExistedFor?.(taskId) === true,
       scan: options.scan,
       ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
       ...(options.leaseFor === undefined ? {} : { lease: options.leaseFor(taskId) }),
@@ -771,11 +809,327 @@ function describeSupervisor(supervisor: FleetSupervisorState, fleetId: string): 
     case "dead":
       return (
         `- supervisor: not running (recorded session ${supervisor.sessionId}: its pid is gone or ` +
-        `was reused); re-arm with \`/fleet <ids> --fleet ${fleetId}\``
+        `was reused); repair it with \`belayd_fleet_reconcile {"fleetId":"${fleetId}"}\` (a ` +
+        `provably dead supervisor needs no re-arm), then re-arm with \`/fleet <ids> --fleet ${fleetId}\``
       );
     case "none":
       return "- supervisor: none recorded";
   }
+}
+
+/** Why a fleet's recorded supervisor is provably gone. */
+export type SupervisorDeadReason = "pid-dead" | "cold-beat" | "missing-beat" | "other-session";
+
+/** Why a fleet's supervisor is *not* provably gone. Closed union, never free text. */
+export type SupervisorAliveReason = "fresh-beat" | "no-record" | "no-beat-signal";
+
+/** The recovery verdict for one fleet: provably dead, or not provable. */
+export type SupervisorDeadVerdict =
+  | { dead: true; reason: SupervisorDeadReason; sessionId?: string }
+  | { dead: false; reason: SupervisorAliveReason };
+
+/**
+ * The supervisor record plus intent revision a recovery verdict was based on (W5).
+ *
+ * A prune is a cross-tree write that can land after a re-arm rewrote the record, so
+ * the decision that licensed it must be checkable against the record the prune's
+ * compare-and-replace actually sees.
+ */
+export interface SupervisorRecordFingerprint {
+  sessionId: string;
+  pid: number;
+  pidStartTime?: string;
+  armToken?: string;
+  /** `intent.updatedAt`: any writer that re-arms or edits the fleet moves this. */
+  updatedAt: number;
+}
+
+/** The evidence that licensed a recovery repair, carried into the pass (bd-233). */
+export interface SupervisorRecovery {
+  fingerprint: SupervisorRecordFingerprint;
+  reason: SupervisorDeadReason;
+  lastBeatAt?: number;
+}
+
+/** The fingerprint of a fleet's supervisor record, or undefined when it has none. */
+export function supervisorRecordFingerprint(
+  intent: FleetIntent,
+): SupervisorRecordFingerprint | undefined {
+  const supervisor = intent.supervisor;
+  if (supervisor === undefined) return undefined;
+  return {
+    sessionId: supervisor.sessionId,
+    pid: supervisor.pid,
+    ...(supervisor.pidStartTime === undefined ? {} : { pidStartTime: supervisor.pidStartTime }),
+    ...(supervisor.armToken === undefined ? {} : { armToken: supervisor.armToken }),
+    updatedAt: intent.updatedAt,
+  };
+}
+
+/**
+ * Whether a fresh intent still carries the exact supervisor record the verdict saw.
+ *
+ * The supervisor anchors are compared in full (session, pid, start time, arm token):
+ * any re-arm mints a new token and usually a new session/pid, so a record that was
+ * re-armed reads as changed. `updatedAt` is compared too, because it moves on *any*
+ * write, but the recovery pass itself writes the intent (an unpark) — so the caller
+ * can pass its own clock as `alsoAllowUpdatedAt` and a revision it just stamped
+ * still counts as unchanged.
+ */
+export function supervisorRecordMatches(
+  intent: FleetIntent,
+  expected: SupervisorRecordFingerprint,
+  options: { alsoAllowUpdatedAt?: number } = {},
+): boolean {
+  const supervisor = intent.supervisor;
+  if (supervisor === undefined) return false;
+  if (
+    supervisor.sessionId !== expected.sessionId ||
+    supervisor.pid !== expected.pid ||
+    supervisor.pidStartTime !== expected.pidStartTime ||
+    supervisor.armToken !== expected.armToken
+  ) {
+    return false;
+  }
+  return intent.updatedAt === expected.updatedAt || intent.updatedAt === options.alsoAllowUpdatedAt;
+}
+
+/**
+ * Whether a fleet's supervisor is **provably** gone, so a non-supervisor may repair
+ * it (bd-233).
+ *
+ * This is the escape hatch the incident lacked: every repair tool was supervisor-only
+ * and liveness came from a 10-minute beat window, so a cancelled supervisor wedged
+ * the fleet for ten minutes with no operator action available. The order is
+ * strongest-evidence-first:
+ *
+ * 1. a **fresh beat refutes death**, whichever session it names: some loop is ticking
+ *    this run right now, so a recorded pid that looks gone (or was reused) must not
+ *    license a repair against a live run (W6);
+ * 2. the recorded pid is dead (or was reused: `classifyFleetSupervisor`) — the
+ *    fast path, and the only path for an explicit fleet whose pid is the supervisor
+ *    process itself;
+ * 3. for a run-mode fleet, the beat is missing, cold, or belongs to a session the
+ *    record no longer names — the same rule launch applies when it decides whether a
+ *    re-arm is safe. A run-mode record's pid is the shared pi-web daemon, so this
+ *    beat path is what actually retires a dead run-mode supervisor.
+ *
+ * A fleet with no record is **not** dead (there is nothing to recover: no supervisor,
+ * no capacity decision to undo), and neither is an explicit fleet with a live pid
+ * (beats never apply there, so nothing proves death). Reconcile never takes the
+ * supervisor role — this only grants repair authority.
+ */
+export function supervisorProvablyDead(options: {
+  intent: FleetIntent;
+  beat: SupervisorHeartbeat | undefined;
+  now: number;
+  liveness: FleetSupervisorLiveness;
+  staleAfterInMs?: number;
+}): SupervisorDeadVerdict {
+  const supervisor = options.intent.supervisor;
+  if (supervisor === undefined) return { dead: false, reason: "no-record" };
+  const sessionId = supervisor.sessionId;
+  const beat = options.beat;
+  if (options.intent.run !== undefined && beat !== undefined) {
+    const cold = isFleetLoopProvablyDead({
+      beat,
+      now: options.now,
+      ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
+    });
+    if (!cold) return { dead: false, reason: "fresh-beat" };
+  }
+  if (classifyFleetSupervisor({ supervisor, liveness: options.liveness }).kind === "dead") {
+    return { dead: true, reason: "pid-dead", sessionId };
+  }
+  // Only a run-mode fleet beats; an explicit fleet's live pid is the whole record, so
+  // there is no second signal that could prove it gone.
+  if (options.intent.run === undefined) return { dead: false, reason: "no-beat-signal" };
+  if (beat === undefined) return { dead: true, reason: "missing-beat", sessionId };
+  if (beat.sessionId !== sessionId) return { dead: true, reason: "other-session", sessionId };
+  return { dead: true, reason: "cold-beat", sessionId };
+}
+
+/**
+ * Refuse every retry of an inactive run, naming the real next step (bd-233 W3).
+ */
+function warnInactiveRunRetries(options: {
+  run: ReconcileRun;
+  fleetId: string;
+  requested: readonly string[];
+}): void {
+  for (const taskId of options.requested) {
+    options.run.warnings.push(
+      `${taskId} was not retried: fleet \`${options.fleetId}\`'s run is finished or halted, so ` +
+        "no tick will plan it again. Re-arm the fleet (/fleet <ids> --fleet " +
+        `${options.fleetId}) and run the reconcile again, or prune the member and launch it ` +
+        "fresh.",
+    );
+  }
+}
+
+/** Report a retry refused because a re-arm rewrote the record (bd-233 review round 2). */
+function warnRetryRecordChanged(options: {
+  run: ReconcileRun;
+  reconcile: RunFleetReconcileOptions;
+  fs: FleetStateFs;
+  requested: readonly string[];
+}): void {
+  const warning =
+    `fleet \`${options.reconcile.fleetId}\` changed while reconciling (a new supervisor may ` +
+    "have re-armed it); no recorded stop was cleared — re-run the reconcile";
+  options.run.warnings.push(warning);
+  const auditWarning = auditReconcile({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    sessionId: options.reconcile.sessionId,
+    now: options.reconcile.now,
+    action: "member-retry-refused",
+    taskIds: [...options.requested],
+    detail: warning,
+    fs: options.fs,
+  });
+  if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
+}
+
+/**
+ * Clear the recorded stops of the members a reconcile call asked to retry (bd-233).
+ *
+ * Validation is loud on purpose: an id that is not a member, a member that was not
+ * stopped, a fleet with no run record, and a **finished or halted run** are all
+ * reported rather than answered with a silent no-op. The inactive-run case keeps the
+ * stop intact: clearing it would promise a tick that will never come, so the warning
+ * names the real next step instead and the next tick cannot surprise the operator.
+ *
+ * When the run is active the durable line states what the loop will actually do — the
+ * next tick only *reconsiders* the member; a member whose worktree is gone is stopped
+ * again, so that case needs a prune plus a fresh launch.
+ */
+async function retryStoppedMembers(options: {
+  run: ReconcileRun;
+  reconcile: RunFleetReconcileOptions;
+  fs: FleetStateFs;
+  retryMembers: readonly string[];
+}): Promise<void> {
+  const loaded = loadIntent({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    fs: options.fs,
+  });
+  if (!loaded.ok) {
+    options.run.warnings.push(`could not read the fleet intent to retry members (${loaded.error})`);
+    return;
+  }
+  const members = new Set(loaded.intent.taskIds);
+  const unknown = options.retryMembers.filter((taskId) => !members.has(taskId));
+  if (unknown.length > 0) {
+    options.run.warnings.push(
+      `not a member of fleet \`${options.reconcile.fleetId}\`, so not retried: ${unknown.join(", ")}`,
+    );
+  }
+  const requested = options.retryMembers.filter((taskId) => members.has(taskId));
+  if (requested.length === 0) return;
+  const run = loaded.intent.run;
+  if (run === undefined) {
+    options.run.lines.push(
+      `- members: cannot retry ${requested.join(", ")} — fleet \`${options.reconcile.fleetId}\` ` +
+        "has no run record, so a stop was never recorded. Launch the member again " +
+        "(belayd_fleet_launch) or run the fleet with a run.",
+    );
+    return;
+  }
+  if (!isFleetRunActive(run)) {
+    warnInactiveRunRetries({ run: options.run, fleetId: options.reconcile.fleetId, requested });
+    return;
+  }
+  const stopped = new Set((run.stopped ?? []).map((entry) => entry.taskId));
+  const notStopped = requested.filter((taskId) => !stopped.has(taskId));
+  if (notStopped.length > 0) {
+    options.run.lines.push(
+      `- members: ${notStopped.join(", ")} had no recorded stop; nothing to retry for them`,
+    );
+  }
+  let retried: readonly string[] = [];
+  let runEndedWhileRetrying = false;
+  // Set inside the CAS updater when a re-arm rewrote the supervisor record since the
+  // recovery verdict: the new supervisor's freshly recorded stops must survive
+  // (bd-233 review round 2, same guard as the prune).
+  let recordChanged = false;
+  const written = updateFleetIntent({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    fs: options.fs,
+    update: (current) => {
+      if (current === undefined || current.run === undefined) {
+        return { refuse: `no run record for \`${options.reconcile.fleetId}\` to retry` };
+      }
+      const recovery = options.reconcile.recovery;
+      if (
+        recovery !== undefined &&
+        !supervisorRecordMatches(current, recovery.fingerprint, {
+          alsoAllowUpdatedAt: options.reconcile.now,
+        })
+      ) {
+        recordChanged = true;
+        return {
+          refuse:
+            `fleet \`${options.reconcile.fleetId}\` changed while reconciling (its supervisor ` +
+            "record was rewritten); no stop was cleared",
+        };
+      }
+      // The run may have finished between the read above and this write; only an
+      // active run has a next tick to promise.
+      if (!isFleetRunActive(current.run)) {
+        runEndedWhileRetrying = true;
+        return { refuse: `fleet \`${options.reconcile.fleetId}\`'s run ended while retrying` };
+      }
+      const cleared = retryRunMembers({
+        run: current.run,
+        taskIds: requested,
+        now: options.reconcile.now,
+      });
+      retried = cleared.retried;
+      return cleared.retried.length === 0 ? current : { ...current, run: cleared.run };
+    },
+  });
+  if (!written.ok) {
+    if (recordChanged) {
+      warnRetryRecordChanged({
+        run: options.run,
+        reconcile: options.reconcile,
+        fs: options.fs,
+        requested,
+      });
+      return;
+    }
+    options.run.warnings.push(
+      runEndedWhileRetrying
+        ? `${options.reconcile.fleetId}'s run ended while retrying; no stop was cleared. Re-arm ` +
+            "the fleet and retry from the live run"
+        : `could not clear the recorded stop(s) (${written.error})`,
+    );
+    return;
+  }
+  if (retried.length === 0) return;
+  options.run.repairs.push(...retried.map((taskId) => `member-retry:${taskId}`));
+  options.run.lines.push(
+    `- members: retrying ${retried.join(", ")} (cleared the recorded stop); the run's next tick ` +
+      "reconsiders them and lands any work that finished, and stops them again if their " +
+      "orchestrator is still gone. A member whose worktree is gone needs " +
+      "prune-dead-members plus a fresh launch (belayd_fleet_launch).",
+  );
+  const auditWarning = auditReconcile({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    sessionId: options.reconcile.sessionId,
+    now: options.reconcile.now,
+    action: "member-retry",
+    taskIds: retried,
+    detail:
+      "operator retry: the recorded stop was cleared so the run's next tick plans the " +
+      "member again",
+    fs: options.fs,
+  });
+  if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
 }
 
 /**
@@ -791,11 +1145,12 @@ function describeSupervisor(supervisor: FleetSupervisorState, fleetId: string): 
  * transcript, and bead are untouched — pruning changes which sessions the fleet
  * *counts*, not what exists on disk.
  *
- * The member's bd ordering gates are resolved here, before its records go: a
- * pruned member can never land, so its open gates would be orphans nothing else
- * could resolve (bd-158). The module stays bd-free by taking the resolver as an
- * injected seam, and an absent seam keeps the records (a caller that does not own
- * gates must not be told they were resolved).
+ * The member's bd ordering gates are resolved **after** the intent CAS succeeds, for
+ * the members actually removed: a pruned member can never land, so its open gates
+ * would be orphans nothing else could resolve (bd-158), but a refused prune must leave
+ * bd untouched (bd-233 review round 2). The module stays bd-free by taking the
+ * resolver as an injected seam, and an absent seam keeps the records (a caller that
+ * does not own gates must not be told they were resolved).
  */
 async function pruneDeadMembers(options: {
   run: ReconcileRun;
@@ -804,8 +1159,10 @@ async function pruneDeadMembers(options: {
   deadMembers: readonly string[];
 }): Promise<void> {
   const dead = new Set(options.deadMembers);
-  const resolvedGateIds = await resolveGatesOfPrunedMembers({ ...options }, dead);
   let pruned: readonly string[] = [];
+  // Set inside the CAS updater when the supervisor record changed since the verdict
+  // that licensed this recovery prune (W5).
+  let recordChanged = false;
   const written = updateFleetIntent({
     gitCommonDir: options.reconcile.gitCommonDir,
     fleetId: options.reconcile.fleetId,
@@ -814,33 +1171,92 @@ async function pruneDeadMembers(options: {
       if (current === undefined) {
         return { refuse: `no fleet intent for \`${options.reconcile.fleetId}\` to prune` };
       }
+      // The recovery verdict was read before this pass started. A re-arm that landed
+      // in between rewrote the supervisor record and preserved its members; pruning
+      // them here would erase the record a live supervisor just wrote (W5).
+      const recovery = options.reconcile.recovery;
+      if (
+        recovery !== undefined &&
+        !supervisorRecordMatches(current, recovery.fingerprint, {
+          // This same pass may have just unparked the fleet, which stamps its clock.
+          alsoAllowUpdatedAt: options.reconcile.now,
+        })
+      ) {
+        recordChanged = true;
+        return {
+          refuse:
+            `fleet \`${options.reconcile.fleetId}\` changed while reconciling (its supervisor ` +
+            "record was rewritten); nothing was pruned",
+        };
+      }
       const removed = current.taskIds.filter((taskId) => dead.has(taskId));
       if (removed.length === 0) return current;
       pruned = removed;
-      const kept = {
+      // A pruned member cannot need a human any more: leaving its stop behind makes
+      // the run keep reporting "needs a human" for a member the fleet just removed
+      // (bd-233).
+      const clearedRun =
+        current.run === undefined
+          ? undefined
+          : retryRunMembers({
+              run: current.run,
+              taskIds: removed,
+              now: options.reconcile.now,
+            }).run;
+      return {
         ...current,
         taskIds: current.taskIds.filter((taskId) => !dead.has(taskId)),
         ...(current.released === undefined
           ? {}
           : { released: current.released.filter((entry) => !dead.has(entry.taskId)) }),
+        ...(clearedRun === undefined ? {} : { run: clearedRun }),
         updatedAt: options.reconcile.now,
       };
-      return resolvedGateIds.length === 0
-        ? kept
-        : dropFleetOrderingGates(kept, resolvedGateIds, options.reconcile.now);
     },
   });
   if (!written.ok) {
+    if (recordChanged) {
+      const warning =
+        `fleet \`${options.reconcile.fleetId}\` changed while reconciling (a new supervisor may ` +
+        "have re-armed it); nothing was pruned — re-run the reconcile";
+      options.run.warnings.push(warning);
+      const auditWarning = auditReconcile({
+        gitCommonDir: options.reconcile.gitCommonDir,
+        fleetId: options.reconcile.fleetId,
+        sessionId: options.reconcile.sessionId,
+        now: options.reconcile.now,
+        action: "member-prune-refused",
+        taskIds: [...options.deadMembers],
+        detail: warning,
+        fs: options.fs,
+      });
+      if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
+      return;
+    }
     options.run.warnings.push(
       `could not prune dead members from the fleet intent (${written.error})`,
     );
     return;
   }
   if (pruned.length === 0) return;
+  // bd is mutated only now, against members that are actually gone (bd-158, W4).
+  // The gate records are dropped by a second CAS write; if it fails, the member stays
+  // pruned and the record stays for the tick's retry, exactly as before.
+  const resolvedGateIds = await resolveGatesOfPrunedMembers({ ...options }, new Set(pruned));
+  if (resolvedGateIds.length > 0) {
+    dropGatesOfPrunedMembers({
+      run: options.run,
+      reconcile: options.reconcile,
+      fs: options.fs,
+      pruned,
+      gateIds: resolvedGateIds,
+    });
+  }
   options.run.repairs.push(...pruned.map((taskId) => `member-pruned:${taskId}`));
   options.run.lines.push(
-    `- members: pruned ${pruned.join(", ")} (no orchestrator process carries the member session ` +
-      "token); worktrees, transcripts, and beads are untouched",
+    `- members: pruned ${pruned.join(", ")} (no lease, no orchestrator process, and a worktree ` +
+      "that provably existed is gone); any recorded stop of theirs was cleared too, and the " +
+      "worktrees, transcripts, and beads are untouched",
   );
   const auditWarning = auditReconcile({
     gitCommonDir: options.reconcile.gitCommonDir,
@@ -850,11 +1266,66 @@ async function pruneDeadMembers(options: {
     action: "member-pruned-dead",
     taskIds: pruned,
     detail:
-      "no orchestrator process carries the member session token; removed from the intent so the " +
-      "capacity count is not held by dead sessions",
+      "no lease, no orchestrator process, and no worktree although one provably existed; " +
+      "removed from the intent so the capacity count is not held by dead sessions",
     fs: options.fs,
   });
   if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
+}
+
+/**
+ * Drop the ordering-gate records of the members a prune just removed (bd-233 W2).
+ *
+ * A second CAS write after the prune committed, so it carries the same
+ * supervisor-record guard as the prune itself: a re-arm that landed during the bd
+ * round-trips must keep its gate records, and the warning says the tick's reaper or a
+ * later reconcile will resolve them. A refused drop never un-prunes the members.
+ */
+function dropGatesOfPrunedMembers(options: {
+  run: ReconcileRun;
+  reconcile: RunFleetReconcileOptions;
+  fs: FleetStateFs;
+  pruned: readonly string[];
+  gateIds: readonly string[];
+}): void {
+  // Set inside the CAS updater when a re-arm rewrote the record during the bd
+  // round-trips that resolved these gates (W2).
+  let recordChanged = false;
+  const dropped = updateFleetIntent({
+    gitCommonDir: options.reconcile.gitCommonDir,
+    fleetId: options.reconcile.fleetId,
+    fs: options.fs,
+    update: (current) => {
+      if (current === undefined) {
+        return { refuse: `no fleet intent for \`${options.reconcile.fleetId}\` to drop gates` };
+      }
+      const recovery = options.reconcile.recovery;
+      if (
+        recovery !== undefined &&
+        !supervisorRecordMatches(current, recovery.fingerprint, {
+          // This same pass may have just stamped the prune's clock.
+          alsoAllowUpdatedAt: options.reconcile.now,
+        })
+      ) {
+        recordChanged = true;
+        return {
+          refuse:
+            `fleet \`${options.reconcile.fleetId}\` changed while reconciling (its supervisor ` +
+            "record was rewritten); kept the ordering-gate record(s)",
+        };
+      }
+      return dropFleetOrderingGates(current, options.gateIds, options.reconcile.now);
+    },
+  });
+  if (dropped.ok) return;
+  options.run.warnings.push(
+    recordChanged
+      ? `pruned ${options.pruned.join(", ")} but fleet \`${options.reconcile.fleetId}\` changed ` +
+          "while reconciling (a new supervisor may have re-armed it); kept their " +
+          "ordering-gate record(s) — the next tick or reconcile resolves them"
+      : `pruned ${options.pruned.join(", ")} but could not drop their ordering-gate ` +
+          `record(s) (${dropped.error}); the next tick or reconcile retries`,
+  );
 }
 
 /**
@@ -886,7 +1357,8 @@ async function resolveGatesOfPrunedMembers(
     resolved.push(...result.resolved.map((gate) => gate.gateId));
     if (!result.ok) {
       options.run.warnings.push(
-        `could not resolve the ordering gate(s) of the pruned member(s): ${result.error}`,
+        `could not resolve the ordering gate(s) of the pruned member(s) (${result.error}); ` +
+          "the unresolved records are kept and the next tick or reconcile retries",
       );
     }
   }
@@ -898,7 +1370,8 @@ async function resolveGatesOfPrunedMembers(
   resolved.push(...prefix.resolved.map((gate) => gate.gateId));
   if (!prefix.ok) {
     options.run.warnings.push(
-      `could not reap every ordering gate of the pruned member(s): ${prefix.error}`,
+      `could not reap every ordering gate of the pruned member(s) (${prefix.error}); ` +
+        "any unresolved records are kept and the next tick or reconcile retries",
     );
   }
   return resolved;
@@ -925,7 +1398,14 @@ async function reconcileSupervision(options: {
     members: intent.taskIds,
     scan: reconcile.scan,
     ...(reconcile.selfPid === undefined ? {} : { selfPid: reconcile.selfPid }),
+    ...(reconcile.memberWorktreeFor === undefined
+      ? {}
+      : { worktreeFor: reconcile.memberWorktreeFor }),
     ...(reconcile.leaseFor === undefined ? {} : { leaseFor: reconcile.leaseFor }),
+    ...(reconcile.memberRanFor === undefined ? {} : { memberRanFor: reconcile.memberRanFor }),
+    ...(reconcile.memberWorktreeExistedFor === undefined
+      ? {}
+      : { worktreeExistedFor: reconcile.memberWorktreeExistedFor }),
   });
   run.lines.push(
     ...(liveness.length === 0
@@ -955,8 +1435,9 @@ async function reconcileSupervision(options: {
   if (reconcile.pruneDeadMembers !== true) {
     if (deadMembers.length > 0) {
       run.lines.push(
-        `- members: ${deadMembers.join(", ")} have no orchestrator process; ` +
-          "re-run with prune-dead-members to remove them from the intent (worktrees stay)",
+        `- members: ${deadMembers.join(", ")} have no orchestrator lease or process and no ` +
+          "worktree that still exists; re-run with prune-dead-members to remove them from the " +
+          "intent (worktrees stay)",
       );
     }
     return;
@@ -1246,12 +1727,24 @@ export interface ReconcileAuthorityOptions {
   sessionId: string;
   /** The call asks to remove members (`pruneDeadMembers: true`). */
   pruneDeadMembers?: boolean;
+  /**
+   * The target fleet's supervisor is provably dead (bd-233). Only a `dead: true`
+   * verdict grants the recovery arm; anything else keeps the ordinary rules.
+   */
+  supervisorDead?: SupervisorDeadVerdict;
 }
 
-export type ReconcileAuthority = { ok: true; crossFleet: boolean } | { ok: false; error: string };
+export type ReconcileAuthority =
+  | {
+      ok: true;
+      crossFleet: boolean;
+      /** True when the authority came from a provably dead supervisor (bd-233). */
+      recovery: boolean;
+    }
+  | { ok: false; error: string };
 
 /**
- * Who may reconcile which fleet (bd-166).
+ * Who may reconcile which fleet (bd-166, bd-233).
  *
  * A supervisor may always repair its own fleet. Repairing a *named* fleet — the
  * leaderless one whose stale slots nobody could clear without a hand edit — is
@@ -1259,28 +1752,43 @@ export type ReconcileAuthority = { ok: true; crossFleet: boolean } | { ok: false
  * authority rule as launch, where a session that owns a fleet is the operator's
  * agent for the rest of that repo. Naming a fleet never grants authority by
  * itself, and the caller audits the cross-fleet target.
+ *
+ * **Recovery (bd-233).** A fleet whose supervisor is provably dead (dead pid, cold
+ * or missing beat) may be reconciled by session id alone, because otherwise the only
+ * repair tool for a dead supervisor was itself supervisor-only and the fleet was
+ * wedged until the beat window expired. In that arm a prune is allowed: the
+ * cross-fleet prune refusal exists to protect another *live* supervisor's capacity
+ * decisions, and here no live supervisor exists to decide. This grants repair
+ * authority only — reconcile never writes the supervisor record, so it cannot take
+ * the fleet over.
  */
 export function reconcileAuthority(options: ReconcileAuthorityOptions): ReconcileAuthority {
   if (options.ownFleetId !== undefined && options.ownFleetId === options.targetFleetId) {
-    return { ok: true, crossFleet: false };
+    return { ok: true, crossFleet: false, recovery: false };
+  }
+  if (options.supervisorDead?.dead === true) {
+    return { ok: true, crossFleet: true, recovery: true };
   }
   // Cross-fleet authority covers repair (queue, park, liveness report), never
   // destructive removal: a prune erases another fleet's members from the capacity
   // arithmetic, and only that fleet's own supervisor (or the explicit per-member
   // `belayd_fleet_release`) should decide that. Queue/park repair is still the
-  // leaderless-fleet escape hatch this feature exists for.
+  // leaderless-fleet escape hatch this feature exists for; a provably dead
+  // supervisor is handled by the recovery arm above.
   if (options.pruneDeadMembers === true) {
     return {
       ok: false,
       error:
         `Fleet reconcile refused: pruneDeadMembers is only allowed on this session's own ` +
-        `fleet. \`${options.targetFleetId}\` is owned by its own supervisor: re-arm it ` +
-        `(/fleet <ids> --fleet ${options.targetFleetId}) and run the reconcile (or ` +
-        `belayd_fleet_release) from that session. Cross-fleet reconcile still repairs ` +
-        "the queue and park without pruning.",
+        `fleet, or on a fleet whose supervisor is provably dead. \`${options.targetFleetId}\` ` +
+        `is owned by its own supervisor: re-arm it (/fleet <ids> --fleet ` +
+        `${options.targetFleetId}) and run the reconcile (or belayd_fleet_release) from that ` +
+        "session. Cross-fleet reconcile still repairs the queue and park without pruning.",
     };
   }
-  if (options.supervisedFleetIds.length > 0) return { ok: true, crossFleet: true };
+  if (options.supervisedFleetIds.length > 0) {
+    return { ok: true, crossFleet: true, recovery: false };
+  }
   const known = options.repoFleetIds.length === 0 ? "none" : options.repoFleetIds.join(", ");
   return {
     ok: false,
@@ -1288,7 +1796,9 @@ export function reconcileAuthority(options: ReconcileAuthorityOptions): Reconcil
       `Fleet reconcile refused: this session (${options.sessionId}) supervises no fleet in this ` +
       `repository, so it cannot repair \`${options.targetFleetId}\`. Fleets found here: ${known}. ` +
       "Launch or re-arm a fleet from this session first (/fleet <ids> --fleet <fleetId>), then " +
-      "reconcile the named fleet.",
+      "reconcile the named fleet. If that fleet's supervisor is provably dead, name the fleet " +
+      `explicitly (belayd_fleet_reconcile {"fleetId":"${options.targetFleetId}"}): a provably ` +
+      "dead supervisor does not need to be re-armed to be repaired.",
   };
 }
 
@@ -1320,8 +1830,41 @@ export async function runFleetReconcile(
     };
   }
 
+  // Recovery authority was licensed by a verdict read before this call. If the
+  // supervisor record changed since then (a second session re-armed the fleet), no
+  // write of this pass — queue, park, retry, prune — may be applied to the record the
+  // new supervisor just wrote (bd-233 review round 2). The per-write CAS guards below
+  // stay as the second line for a re-arm that lands mid-pass.
+  const recovery = options.recovery;
+  if (recovery !== undefined && !supervisorRecordMatches(loaded.intent, recovery.fingerprint)) {
+    const warning =
+      `fleet \`${options.fleetId}\` changed since the recovery verdict (a new supervisor may ` +
+      "have re-armed it); nothing was repaired — re-run the reconcile";
+    const auditWarning = auditReconcile({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      sessionId: options.sessionId,
+      now: options.now,
+      action: "reconcile-refused",
+      taskIds: [],
+      detail: warning,
+      fs,
+    });
+    return {
+      ok: false,
+      text: warning,
+      warnings: auditWarning === undefined ? [warning] : [warning, auditWarning],
+      repairs: [],
+    };
+  }
+
   await reconcileQueueAndPark({ run, reconcile: options, intent: loaded.intent, fs });
   await reconcileSupervision({ run, reconcile: options, intent: loaded.intent, fs });
+  if (options.retryMembers !== undefined && options.retryMembers.length > 0) {
+    // After the prune: a member pruned in this pass is no longer a member, and the
+    // retry pass must report that instead of clearing a stop nothing will plan.
+    await retryStoppedMembers({ run, reconcile: options, fs, retryMembers: options.retryMembers });
+  }
 
   const repaired = run.repairs.length;
   const lines = [

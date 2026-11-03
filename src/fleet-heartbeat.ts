@@ -192,6 +192,14 @@ export function classifySupervisorBeat(options: {
  *
  * `unknown` (an explicit fleet) keeps the pid-based verdict untouched, so this
  * upgrade cannot make a live explicit fleet re-armable.
+ *
+ * A **dead supervisor process** closes the beat's stale window (bd-233): a beat is
+ * only refreshed by a live loop, so a 10-minute-old beat from a cancelled session
+ * used to keep a dead fleet "live" until the window expired while every repair tool
+ * refused in the meantime. A `pid` that is provably gone (or was reused) is the
+ * stronger evidence and wins over a merely fresh beat, because nothing can refresh
+ * a beat from a process that no longer exists. Without a probe the verdict is
+ * exactly the beat's — the documented behaviour before this bead.
  */
 export function effectiveSupervisorState(options: {
   state: FleetSupervisorState;
@@ -199,6 +207,13 @@ export function effectiveSupervisorState(options: {
   beat: SupervisorHeartbeat | undefined;
   now: number;
   staleAfterInMs?: number;
+  /** The recorded supervisor, required for the process probe. */
+  supervisor?: FleetSupervisorRecord;
+  /**
+   * Process probe for the recorded pid. Absent means "the beat is the only
+   * evidence" (the pre-bd-233 rule).
+   */
+  liveness?: FleetSupervisorLiveness;
 }): FleetSupervisorState {
   const verdict = classifySupervisorBeat({
     runMode: options.runMode,
@@ -209,9 +224,17 @@ export function effectiveSupervisorState(options: {
   });
   if (verdict === "unknown") return options.state;
   if (options.state.kind === "none") return options.state;
-  return verdict === "live"
-    ? { kind: "live", sessionId: options.state.sessionId }
-    : { kind: "dead", sessionId: options.state.sessionId };
+  if (verdict === "live") {
+    const supervisor = options.supervisor;
+    const deadProcess =
+      supervisor !== undefined &&
+      options.liveness !== undefined &&
+      classifyFleetSupervisor({ supervisor, liveness: options.liveness }).kind === "dead";
+    return deadProcess
+      ? { kind: "dead", sessionId: options.state.sessionId }
+      : { kind: "live", sessionId: options.state.sessionId };
+  }
+  return { kind: "dead", sessionId: options.state.sessionId };
 }
 
 /** Why a fleet that names this session is still not re-adopted. */

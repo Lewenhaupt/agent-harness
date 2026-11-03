@@ -24,6 +24,8 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FleetForceStopSeams } from "../../extensions/index.js";
+import { writeFleetLaunchMarker } from "../fleet-state.js";
+import { readFleetLaunchMarker } from "../fleet-status.js";
 import type { HandoffPacket } from "../handoff.js";
 import {
   buildFleetNote,
@@ -81,6 +83,18 @@ const worktree = vi.hoisted(() => ({
    * "bd-12's worktree here, bd-13's not created yet".
    */
   byBranch: undefined as Record<string, string> | undefined,
+  /**
+   * Branches that exist, for the deleted-worktree proof (bd-233): the real probe
+   * shells out to git, and every git call in this file is stubbed to fail.
+   */
+  existingBranches: undefined as Set<string> | undefined,
+  /**
+   * Runs inside the spawn, right after the worktree is created.
+   *
+   * The only seam that observes the launch *while* it runs, which is what the
+   * per-member spawn window has to cover (bd-233).
+   */
+  onSetup: undefined as ((branch: string) => void) | undefined,
 }));
 
 /** Force the next N intent writes to lose their CAS race (a two-attempt failure). */
@@ -128,6 +142,7 @@ vi.mock("../../src/index.js", async (importOriginal) => {
       // that returned one path for every branch would refuse the second member.
       const path = join(worktree.path, options.branch.replace(/\//g, "-"));
       mkdirSync(path, { recursive: true });
+      worktree.onSetup?.(options.branch);
       return path;
     },
     awaitWorktreeReady: async () => ({ ok: true as const }),
@@ -142,6 +157,8 @@ vi.mock("../../src/index.js", async (importOriginal) => {
       if (byBranch !== undefined) return byBranch[branch];
       return worktree.branchPath === "" ? undefined : worktree.branchPath;
     },
+    // A surviving branch is the proof a deleted worktree leaves behind (bd-233).
+    branchExists: (_cwd: string, branch: string) => worktree.existingBranches?.has(branch) === true,
     readWorktreeBranch: () =>
       worktree.branch === ""
         ? { ok: false as const, reason: "unavailable" as const, error: "git stubbed" }
@@ -581,6 +598,8 @@ describe("fleet supervisor mode", () => {
     worktree.branchPath = "";
     worktree.branch = "";
     worktree.byBranch = undefined;
+    worktree.existingBranches = undefined;
+    worktree.onSetup = undefined;
     mkdirSync(worktree.path, { recursive: true });
     daemon.calls = [];
     daemon.failWith = undefined;
@@ -1803,16 +1822,85 @@ describe("fleet supervisor mode", () => {
           taskIds: ["bd-31"],
           createdAt: 1,
           updatedAt: 1,
-          supervisor: { sessionId: "dead-wave1-session", pid: 999_999 },
+          supervisor: { sessionId: "dead-wave1-session", pid: 2_147_483_646 },
         }),
       );
     }
+
+    it("AC1: recovers a sole provably dead fleet without naming it", async () => {
+      // The operator shape the incident needed: one fleet in the repository, its
+      // supervisor's pid gone, and a session that supervises nothing. Naming the fleet is
+      // optional when it is the only one and provably dead (bd-233).
+      const mock = await loadFleetExtension();
+      writeIntent({
+        taskIds: ["bd-12"],
+        supervisor: { sessionId: "dead-default-session", pid: 2_147_483_646 },
+      });
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const recovered = await tool.execute(
+        "reconcile-1",
+        {},
+        undefined,
+        undefined,
+        makeCtx(cwd, "unarmed-session"),
+      );
+      expect(recovered.details).toHaveProperty("exitCode", 0);
+      // Repair authority only: the record keeps its own (dead) supervisor.
+      const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(intent).toHaveProperty("ok", true);
+      if (!intent.ok) return;
+      expect(intent.intent?.supervisor?.sessionId).toBe("dead-default-session");
+    });
+
+    it("refuses an unnamed target when more than one fleet exists, naming the escape hatch", async () => {
+      // Ambiguity is not evidence of death: with two fleets the tool must not guess which
+      // one the operator meant, and the refusal has to name how to say it.
+      const mock = await loadFleetExtension();
+      writeIntent({
+        taskIds: ["bd-12"],
+        supervisor: { sessionId: "dead-default-session", pid: 2_147_483_646 },
+      });
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const refused = await tool.execute(
+        "reconcile-1",
+        {},
+        undefined,
+        undefined,
+        makeCtx(cwd, "unarmed-session"),
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      const text = textOf(refused as ToolResult);
+      expect(text).toContain("supervisor-only");
+      expect(text).toContain('belayd_fleet_reconcile {"fleetId":"<id>"}');
+      expect(text).toContain("wave1");
+    });
 
     it("repairs a named fleet's queue/park and audits the target", async () => {
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "supervisor-session");
       await arm(mock, ctx);
       writeDeadFleet();
+      // Give the dead fleet something to repair, so recovery authority is exercised with
+      // a real repair and the S1 audit fires.
+      writeFleetMergeQueue({
+        gitCommonDir: commonDir,
+        fleetId: "wave1",
+        queue: {
+          ...createFleetMergeQueue(1),
+          lock: {
+            holder: "dead-wave1-session",
+            taskId: "bd-31",
+            pid: 2_147_483_646,
+            acquiredAt: 1,
+            leaseExpiresAt: 9_999_999_999_999,
+          },
+        },
+      });
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
@@ -1832,8 +1920,12 @@ describe("fleet supervisor mode", () => {
         .split("\n")
         .filter((line) => line !== "")
         .map((line) => JSON.parse(line) as { action: string; detail?: string });
-      const crossFleet = entries.find((entry) => entry.action === "reconcile-cross-fleet");
-      expect(crossFleet?.detail).toContain("default");
+      // bd-233: the stronger signal wins — a fleet whose supervisor is provably dead
+      // is audited as a recovery, even when this session also supervises a fleet here.
+      // S1: only because this pass actually repaired something.
+      const recovery = entries.find((entry) => entry.action === "reconcile-recovery");
+      expect(recovery?.detail).toContain("pid-dead");
+      expect(recovery?.detail).toContain("repair(s)");
       // Repair does not touch the record: pruning another fleet needs its own
       // supervisor (bd-166).
       const repaired = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
@@ -1842,11 +1934,81 @@ describe("fleet supervisor mode", () => {
       expect(repaired.intent?.taskIds).toEqual(["bd-31"]);
     });
 
-    it("refuses pruneDeadMembers for a fleet this session does not supervise", async () => {
+    it("S1: a no-op recovery repair leaves no recovery claim in the target's audit log", async () => {
+      const mock = await loadFleetExtension();
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1" },
+        undefined,
+        undefined,
+        makeCtx(cwd, "unarmed-session"),
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
+      const actions = existsSync(auditPath)
+        ? readFileSync(auditPath, "utf8")
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => (JSON.parse(line) as { action: string }).action)
+        : [];
+      expect(actions).not.toContain("reconcile-recovery");
+    });
+
+    it("AC1: prunes a provably dead fleet from a session that supervises another one", async () => {
+      // bd-233: this used to be refused ("only allowed on this session's own fleet"),
+      // which left a dead supervisor's phantom members holding capacity forever. The
+      // refusal protects a *live* fleet's capacity decision; here nobody is live.
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "supervisor-session");
       await arm(mock, ctx);
       writeDeadFleet();
+      worktree.existingBranches = new Set(["feat/bd-31"]);
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const pruned = await tool.execute(
+        "reconcile-1",
+        { fleetId: "wave1", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(pruned.details).toHaveProperty("exitCode", 0);
+      const emptied = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(emptied).toHaveProperty("ok", true);
+      if (!emptied.ok) return;
+      expect(emptied.intent?.taskIds).toEqual([]);
+      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
+      const actions = existsSync(auditPath)
+        ? readFileSync(auditPath, "utf8")
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => (JSON.parse(line) as { action: string }).action)
+        : [];
+      expect(actions).toContain("member-pruned-dead");
+      expect(actions).toContain("reconcile-recovery");
+    });
+
+    it("still refuses a cross-fleet prune while the target's supervisor is live", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      writeDeadFleet();
+      writeFileSync(
+        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: "wave1",
+          taskIds: ["bd-31"],
+          createdAt: 1,
+          updatedAt: 1,
+          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+        }),
+      );
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
@@ -1865,10 +2027,38 @@ describe("fleet supervisor mode", () => {
       expect(untouched.intent?.taskIds).toEqual(["bd-31"]);
     });
 
-    it("prunes its own fleet when the id is named explicitly", async () => {
+    it("CRITICAL/W1: prunes a member with a deleted worktree on a ticking run", async () => {
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "supervisor-session");
       await arm(mock, ctx);
+      // The production shape: a run that is ticking right now, members launched long ago,
+      // and their worktrees deleted. `intent.updatedAt` is rewritten by every tick, so the
+      // spawn window must not be keyed on it (review round 2, Critical).
+      worktree.existingBranches = new Set(["feat/bd-12", "feat/bd-15"]);
+      const launchedAt = Date.now() - 3_600_000;
+      const ticking = updateFleetIntent({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        update: (current) =>
+          current === undefined
+            ? { refuse: "no intent" }
+            : {
+                ...current,
+                updatedAt: Date.now(),
+                run: {
+                  schemaVersion: 1,
+                  mode: "until-complete",
+                  startedAt: launchedAt,
+                  updatedAt: Date.now(),
+                  ticks: 240,
+                  members: [
+                    { taskId: "bd-12", launchedAt },
+                    { taskId: "bd-15", launchedAt },
+                  ],
+                },
+              },
+      });
+      expect(ticking).toHaveProperty("ok", true);
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
@@ -1896,26 +2086,235 @@ describe("fleet supervisor mode", () => {
       expect(actions).not.toContain("reconcile-cross-fleet");
     });
 
-    it("refuses a named fleet from a session that supervises none", async () => {
+    it("W1: prunes a member whose listed worktree directory was deleted", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      // `git worktree list` still reports the worktree, but `rm -rf` removed the
+      // directory: the listing is proof it existed, not proof it is there now. No
+      // ageing: the spawn window is this member's marker, and there is none.
+      worktree.byBranch = { "feat/bd-12": join(cwd, "vanished-member-bd-12") };
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      const pruned = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(pruned).toHaveProperty("ok", true);
+      if (!pruned.ok) return;
+      // bd-12 is absent (listing + deleted dir). bd-15 has neither a worktree nor a
+      // branch, so it stays unknown and counted.
+      expect(pruned.intent?.taskIds).toEqual(["bd-15"]);
+    });
+
+    it("W1/W2: a listed worktree on disk and a live spawn marker are both unknown", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      const memberDir = join(cwd, "bare-member-bd-12");
+      mkdirSync(memberDir, { recursive: true });
+      worktree.byBranch = { "feat/bd-12": memberDir };
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(after).toHaveProperty("ok", true);
+      if (!after.ok) return;
+      expect(after.intent?.taskIds).toEqual(["bd-12", "bd-15"]);
+    });
+
+    it("W2/b: a member whose spawn marker is live is kept unknown and not pruned", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      worktree.existingBranches = new Set(["feat/bd-12", "feat/bd-15"]);
+      // A relaunch of bd-12 is in flight right now; bd-15 has no marker.
+      writeFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        taskId: "bd-12",
+        owner: "test-spawn",
+        now: Date.now(),
+      });
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(after).toHaveProperty("ok", true);
+      if (!after.ok) return;
+      // bd-12's own marker holds its slot; bd-15 (same fleet, same record) is pruned.
+      expect(after.intent?.taskIds).toEqual(["bd-12"]);
+    });
+
+    it("AC2/W2: a launch writes the member's spawn marker for exactly as long as it spawns", async () => {
+      // The marker is the only thing that keeps a member whose worktree is still being
+      // created out of the `absent` verdict, so the launch path must own it: created
+      // before the worktree exists, gone once the spawn returns (bd-233).
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      const inside: Array<{ taskId: string; marker: boolean }> = [];
+      worktree.onSetup = (branch) => {
+        const taskId = branch.replace(/^feat\//, "");
+        inside.push({
+          taskId,
+          marker:
+            readFleetLaunchMarker({
+              gitCommonDir: commonDir,
+              fleetId: "default",
+              taskId,
+            }) !== undefined,
+        });
+      };
+
+      await arm(mock, ctx);
+
+      expect(inside.map((entry) => entry.taskId)).toEqual(["bd-12", "bd-15"]);
+      expect(inside.every((entry) => entry.marker)).toBe(true);
+      for (const entry of inside) {
+        expect(
+          readFleetLaunchMarker({
+            gitCommonDir: commonDir,
+            fleetId: "default",
+            taskId: entry.taskId,
+          }),
+        ).toBeUndefined();
+      }
+    });
+
+    it("W2/d: a failed spawn leaves no launch marker behind", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      worktree.failWith = "wt switch failed";
+      await arm(mock, ctx, "bd-12");
+      expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain("NOT launched");
+      // The marker exists only while the spawn runs; a thrown/failed launch must not
+      // leave the member looking in flight forever.
+      expect(
+        readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId: "default", taskId: "bd-12" }),
+      ).toBeUndefined();
+    });
+
+    it("AC3: clears a recorded stop through retryMembers and audits it", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      const seeded = updateFleetIntent({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        update: (current) =>
+          current === undefined
+            ? { refuse: "no intent" }
+            : {
+                ...current,
+                run: {
+                  ...startFleetRun({
+                    now: 1,
+                    accept: false,
+                    members: [{ taskId: "bd-12" }],
+                  }),
+                  stopped: [
+                    {
+                      taskId: "bd-12",
+                      reason: "orchestrator-missing" as const,
+                      detail: "no live orchestrator lease holds the worktree",
+                      at: 1,
+                    },
+                  ],
+                },
+              },
+      });
+      expect(seeded).toHaveProperty("ok", true);
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const retried = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", retryMembers: ["bd-12"] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(retried.details).toHaveProperty("exitCode", 0);
+      expect(textOf(retried)).toContain("retrying bd-12");
+      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
+      const actions = existsSync(auditPath)
+        ? readFileSync(auditPath, "utf8")
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => (JSON.parse(line) as { action: string }).action)
+        : [];
+      expect(actions).toContain("member-retry");
+      const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(after).toHaveProperty("ok", true);
+      if (!after.ok) return;
+      expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    });
+
+    it("AC1: recovers a named fleet whose supervisor is provably dead from a session that supervises none", async () => {
+      // bd-233: this used to be refused ("supervises no fleet in this repository"),
+      // which is exactly the deadlock — repair was supervisor-only while the only
+      // repair tool for a dead supervisor was itself supervisor-only.
       const mock = await loadFleetExtension();
       writeDeadFleet();
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
-      const refused = await tool.execute(
+      const recovered = await tool.execute(
         "reconcile-1",
         { fleetId: "wave1" },
         undefined,
         undefined,
         makeCtx(cwd, "unarmed-session"),
       );
-      expect(refused.details).toHaveProperty("exitCode", 1);
-      expect(textOf(refused as ToolResult)).toContain("supervises no fleet in this repository");
+      expect(recovered.details).toHaveProperty("exitCode", 0);
+      // S1: this pass repaired nothing, so it leaves no recovery claim behind (the
+      // dedicated test above asserts that; here the point is the authority itself).
+      // Repair authority only: the record still names its own (dead) supervisor.
+      const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(intent).toHaveProperty("ok", true);
+      if (!intent.ok) return;
+      expect(intent.intent?.supervisor?.sessionId).toBe("dead-wave1-session");
+      expect(intent.intent?.taskIds).toEqual(["bd-31"]);
     });
 
     it("refuses cross-fleet repair from a resumed session whose anchors no longer match", async () => {
       const mock = await loadFleetExtension();
       writeDeadFleet();
+      // A *live* target supervisor, so bd-233's recovery arm cannot apply: this case
+      // is about inherited authority, not about a provably dead fleet.
+      writeFileSync(
+        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: "wave1",
+          taskIds: ["bd-31"],
+          createdAt: 1,
+          updatedAt: 1,
+          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+        }),
+      );
       // The record names this session id, but the process and token are stale: a
       // resumed session must not inherit cross-fleet authority from it.
       writeIntent({

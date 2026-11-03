@@ -44,6 +44,7 @@ process gate, worktree, and `.belayd/` directory. Cross-tree state lives in
 ```text
 fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, orderingGates, run record, supervisor record
 supervisor.json    run-mode supervisor heartbeat (re-arm eligibility)
+launch/            one file per member whose spawn is in flight (bd-233 spawn window)
 orchestrator.json  in each member worktree: the one-orchestrator lease
 audit.log          append-only: every cross-tree action
 inbox/             member → supervisor notes      (belayd_fleet_inbox drains + acks)
@@ -436,14 +437,21 @@ the worktree's `git status` before you relaunch anything.
 ```text
 belayd_fleet_reconcile { }
 belayd_fleet_reconcile { "pruneDeadMembers": true }   // also remove provably-dead members
+belayd_fleet_reconcile { "fleetId": "<id>" }          // a fleet whose supervisor is dead
+belayd_fleet_reconcile { "retryMembers": ["bd-42"] }  // clear a recorded stop
 ```
 
-Run it in the repository root, in a session that is the fleet's live supervisor
-(re-arm first if the old supervisor is gone). Reconcile repairs the queue
+Run it in the repository root. From the fleet's live supervisor it needs no
+`fleetId`; from any other session, a fleet whose supervisor is **provably dead**
+may be reconciled by naming it (bd-233). Which signal proves it depends on the
+record: an **explicit/legacy** record names the supervisor process, so a gone or
+reused pid retires it at once; a **run-mode** record's pid is the shared pi-web
+daemon, so its beat must go missing or cold (up to the 10-minute staleness window).
+Reconcile repairs the queue
 (expired lease, record without its primitive, orphaned directory past the grace
 window, entry frozen mid-flight), retries a parked root restore from the recorded
-sha, and reports supervisor + member liveness from the process table. It is
-idempotent: a second run reports `nothing to repair`.
+sha, and reports supervisor + member liveness from the worktree lease plus the
+process table. It is idempotent: a second run reports `nothing to repair`.
 
 Operational limits, at the point you hit them:
 
@@ -458,14 +466,23 @@ Operational limits, at the point you hit them:
 - **Pruning changes the count, not the worktree.** With `pruneDeadMembers`, a
   member whose orchestrator is provably absent is removed from `taskIds`; its
   worktree, transcript, and bead stay. "Provably absent" now means **no live
-  worktree lease AND no matching process** (a completed process-table scan found
-  no `belayd-<taskId>` argv): a pi-web orchestrator never appears in the process
-  table, so the lease is what keeps a running member from being pruned — the
-  bd-37 incident pruned a live member 25 s after its launch, which freed a slot
-  and started a second orchestrator on one worktree. `unknown` liveness
-  (unreadable `/proc`, an unreadable lease) is never pruned. The parameter is
-  `pruneDeadMembers` (camelCase) — the refusal hint in the report says "re-run
-  with prune-dead-members", which is prose, not the parameter name.
+  worktree lease AND no matching process AND no worktree that still exists** (a
+  completed process-table scan found no `belayd-<taskId>` argv): a pi-web
+  orchestrator never appears in the process table, so the lease is what keeps a
+  running member from being pruned — the bd-37 incident pruned a live member 25 s
+  after its launch, which freed a slot and started a second orchestrator on one
+  worktree. A member whose worktree was **deleted** resolves to `absent` because
+  its `feat/<taskId>` branch proves the tree existed (bd-233); one whose tree has
+  not been created yet stays `unknown`, because a launch may be mid-spawn. Liveness
+  that cannot be read (unreadable `/proc`, an unreadable lease) is never pruned.
+  The parameter is `pruneDeadMembers` (camelCase) — the refusal hint in the report
+  says "re-run with prune-dead-members", which is prose, not the parameter name.
+  A prune also drops the pruned members' `run.stopped` entries, so the run stops
+  reporting a member it removed as needing a human.
+- **Retrying a stopped member is a tool call.** `retryMembers: ["<id>"]` clears the
+  recorded stop (audited `member-retry`); the run's next tick reconsiders the
+  member and lands any work that finished. A member whose worktree is gone is
+  stopped again, so prune it and launch it fresh instead.
 - **Capacity counts liveness, and a prune removes the record.** Since bd-166 the
   launch counts a member only while its orchestrator is `live` or `unknown`; an
   `absent` member stops consuming a slot without being removed, and a `released`
@@ -547,8 +564,9 @@ worktree lease — is in `docs/fleet-run.md`.
 | Come back | `belayd_fleet_resume` | clears `paused`/`park`, `resume` notes |
 | Repair after a crash | `belayd_fleet_reconcile` | queue/park repair, liveness report |
 | Give one member's slot back (keep the bead and worktree) | `belayd_fleet_release` | a `released` entry on the intent, `member-released` audit |
-| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease and no process from `taskIds` (never `unknown`) |
-| Repair a fleet whose supervisor died | `belayd_fleet_reconcile` `fleetId: "<id>"` | queue/park repair in that fleet; accepted only when this session supervises some fleet in this repo (audited `reconcile-cross-fleet`). `pruneDeadMembers` is refused for a fleet that is not this session's own |
+| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease, no process, and no surviving worktree from `taskIds` (never `unknown`) |
+| Bring a stopped member back | `belayd_fleet_reconcile` `retryMembers: ["<id>"]` | clears the member's `run.stopped` entry (`member-retry` audit); the next tick reconsiders it. A member whose worktree is gone needs prune + a fresh launch |
+| Repair a fleet whose supervisor died | `belayd_fleet_reconcile` `fleetId: "<id>"` | queue/park repair, liveness report, prune and retry in that fleet. Accepted when this session supervises some fleet in this repo (audited `reconcile-cross-fleet`) or when that fleet's supervisor is **provably dead** (audited `reconcile-recovery`; a prune is allowed there, bd-233). Never takes the supervisor role |
 | Accept one member's work (close its bead) | a run with `accept: true` (or `/fleet … --accept`) | bead status, audited; the merged worktree is removed on landing either way |
 | Accept the work without the loop | `wt merge`, `bd close` | bead status — `belayd_fleet_merge` itself never touches a bead |
 
@@ -558,12 +576,17 @@ fleet (the supervisor writes `events/`, a member writes `inbox/`). `belayd_fleet
 `belayd_fleet_advance`, `belayd_fleet_reconcile`, and `belayd_fleet_release` are
 **supervisor-only**: they refuse unless `fleet.json` names this session as the live
 supervisor, and a record left by a dead process does not count — re-arm with
-`/fleet` first. A reconcile that names another `fleetId` additionally requires this
-session to supervise *some* fleet in the repository (same session/process/token
-anchors as own-fleet mode; a legacy record with no anchors falls back to the
-session id), audits the cross-fleet target, and repairs only the queue/park —
-`pruneDeadMembers` on another fleet is refused (re-arm that fleet and run
-reconcile or `belayd_fleet_release` from its own session).
+`/fleet` first. The one exception is `belayd_fleet_reconcile`, which also accepts a
+named fleet whose supervisor is **provably dead** from any session in the repository
+(a gone/reused pid on an explicit or legacy record, or a missing/cold beat on a
+run-mode one), audited `reconcile-recovery`; that arm may prune (bd-233) and never
+writes the supervisor record. A reconcile that names
+another fleet additionally requires this session to supervise *some* fleet in the
+repository (same session/process/token anchors as own-fleet mode; a legacy record
+with no anchors falls back to the session id), audits the cross-fleet target, and
+normally repairs only the queue/park — `pruneDeadMembers` on a **live** fleet that
+is not this session's own is refused (re-arm that fleet and run reconcile or
+`belayd_fleet_release` from its own session).
 
 ### Failure recovery
 
@@ -572,8 +595,8 @@ reconcile or `belayd_fleet_release` from its own session).
 | `Fleet \`default\` is paused (<park reason>); resume it with belayd_fleet_resume before launching more members (run belayd_fleet_reconcile first if the root work is parked)` | P2 stashed your dirty root, landed the merge, and could not restore the stash cleanly. Your work is in the stash | `belayd_fleet_reconcile` restores the recorded sha, verifies it, drops it, and unparks — or reports exactly what blocks it (root is a linked worktree, root moved off the base branch, sha gone, apply conflict). Then `belayd_fleet_resume` if the pause is still set. `resume force` clears the pause and leaves the stash, naming the ref. Never delete the stash by hand first. A run-mode ticker that halted as `parked` does not restart on resume: re-arm with `/fleet <ids> --fleet <id>` |
 | `merge lock is held by … until …` | Another drain (or a dead supervisor's lease) owns the queue | Wait, or let the lease expire — the expiry is the only takeover authority, the recorded pid is diagnostic. `belayd_fleet_reconcile` takes over an expired lease for you |
 | `<lockDir> exists without a lock record (acquisition in progress, or a holder crashed before writing its lease); retry after 30s or remove the directory by hand` | A holder crashed between `mkdir` and writing its lease, or is inside that window | Retry after ~30 s (grace window); reconcile reclaims it past the grace. Removing `merge.lock.d` by hand is safe only when no drain is running |
-| Supervisor is gone; every fleet tool says `supervisor-only` | The supervisor session died. Its lease and run record survive on disk, and a run-mode fleet's recorded pid is the shared daemon, so only the supervisor heartbeat can say it is gone | `/fleet <its ids> --fleet <id>` in a new session: re-arm rewrites the supervisor record, preserves the members, and (because the intent has a `run`) starts the loop again — a new run record when the old one finished or halted. Then `belayd_fleet_status`; `belayd_fleet_reconcile` if the queue or root was left mid-flight |
-| A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause. The member stays in the fleet (`taskIds` plus `run.stopped`), so `belayd_fleet_status` still shows it with its worktree; the loop never relaunches it by itself, but it does land it if its own retry finished the work. The run waits for that retry only while it is observably alive (live lease) — if the run has already finished or halted, relaunch (re-arm) or land the bead explicitly. `belayd_fleet_reconcile` `pruneDeadMembers` forgets a provably-dead member's capacity slot (removes its id from `taskIds`) and resolves its ordering gates; its `run.stopped` line and the run outcome stay, because a prune does not rewrite history |
+| Supervisor is gone; every fleet tool says `supervisor-only` | The supervisor session died. Its lease and run record survive on disk, and a run-mode fleet's recorded pid is the shared daemon, so only the supervisor heartbeat can say it is gone | Repair it without taking over: `belayd_fleet_reconcile { "fleetId": "<id>", "pruneDeadMembers": true }` from any session once the fleet is provably dead — a cold/missing beat on a run-mode record (up to 10 minutes), or a gone pid on an explicit record (bd-233). It audits `reconcile-recovery` when it repaired something, and the members whose worktrees are gone free their slots. Then `/fleet <its ids> --fleet <id>` in a new session: re-arm rewrites the supervisor record, preserves the surviving members, and (because the intent has a `run`) starts the loop again — a new run record when the old one finished or halted. Then `belayd_fleet_status` |
+| A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause, then `belayd_fleet_reconcile { "retryMembers": ["<id>"] }`: it clears the recorded stop so the next tick reconsiders the member and lands any work that finished. Retry only works while the run is active — on a finished or halted run the stop is left intact and the tool warns you to re-arm first. A member whose worktree is gone is stopped again: run `pruneDeadMembers` and launch it fresh. The member stays addressable (`taskIds`) until it is pruned or lands |
 | `ordering gates open: …` in the status header | This fleet still holds ordering-gate records: **normal** while the blocker has not landed, since an open gate is exactly what is holding the dependent back. When the blocker *has* landed the records should be gone, so it then names a landing whose resolve hit a transient bd failure | Nothing while the blocker is still working: the gate is doing its job. After the blocker landed, nothing either — the next tick retries the resolve and drops the record. If it stays, `bd gate resolve <gate-id>` and the record goes on the following tick |
 | `Refusing to launch … live orchestrator lease` | The worktree already has a live orchestrator session (its lease is fresh) | One orchestrator per worktree: finish or stop that session. If it is really gone, the lease goes cold after ~3 min and the next launch takes it over (the old record is archived, and the takeover is reported) |
 | Launch refused with `dependency-cycle` and a closed path (`bd-12 → bd-15 → bd-12`) | bd's `blocks` edges form a cycle; no valid order exists | `bd dep remove`, then relaunch. Nothing was created, so there is nothing to clean up |

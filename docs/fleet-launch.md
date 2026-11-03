@@ -118,7 +118,30 @@ the graph cannot be read (no bd, timeout, non-JSON), the launch still runs in
   Neither is removed from `taskIds`: status, mail, and a later landing still see
   them. `unknown` is still counted, because a member of a dead-supervisor fleet may
   be a detached orchestrator that is still running and a missing probe is not
-  proof; under-counting is the unsafe direction. If any fleet's `fleet.json`
+  proof; under-counting is the unsafe direction. "No worktree" is `unknown` only
+  while nothing proves the tree ever existed (a launch may be mid-spawn); a
+  deleted worktree whose `feat/<taskId>` branch survives is `absent` and frees the
+  slot (bd-233), except while **that member's own launch marker** is live
+  (`<fleet dir>/launch/<taskId>`) — a relaunch reuses the surviving branch, so its
+  slot is held only for its own spawn, never for the whole run. The spawner
+  **refreshes the marker** while the spawn lives, so the grace measures "no refresh
+  for a full grace", not "the spawn began more than a grace ago": a live spawn holds
+  the slot however slow it is (cold `wt switch`/install, a slow daemon RPC), and an
+  abandoned one frees it a full grace after its last refresh. The grace is derived
+  from the declared waits, not restated: `FLEET_MEMBER_SPAWN_GRACE_MS` =
+  `WORKTREE_READY_TIMEOUT_MS` (60 s) + `FLEET_SPAWN_RPC_ALLOWANCE_MS` (60 s) +
+  `FLEET_SPAWN_GRACE_MARGIN_MS` (30 s) = 150 s, refreshed every
+  `FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS` (**50 s**). A **degraded window** means a
+  refresh write failed: the spawn is still live, but its protection reverts to one
+  grace after the last successful stamp (so a concurrent prune may classify it
+  `absent` sooner than the spawn deserves). That degradation is reported on the
+  launch outcome's warning channel — "spawn window protection degraded … marker
+  refresh attempt(s) failed, last at …" — never only on the console. Each spawn mints
+  its own owner token into the marker, and the `finally` clear only deletes a marker
+  whose owner matches: a slow spawner whose window a relaunch already overwrote stops
+  refreshing it and leaves that newer marker in place, reporting both the degraded
+  window and the refused clear.
+  If any fleet's `fleet.json`
   cannot be read the count is unknown and the whole launch is refused. The
   count is re-read **inside** the intent's compare-and-replace and the launch is
   refused (nothing recorded, nothing started) if a concurrent launch spent the
@@ -320,6 +343,11 @@ injected (the block counts it and leaves it on disk).
   one bead is exactly the invariant bd-119 exists to protect. A member of a fleet
   whose supervisor is dead is either preserved by a re-arm of *that* fleet or
   refused with a split-brain message — never silently launched into a second one.
+  "Not running" is decided by the fleet's own signal (bd-233): an **explicit or
+  legacy** record names the supervisor process, so a gone or reused pid proves it
+  dead at once; a **run-mode** record's pid is the shared pi-web daemon, so its loop
+  is retired by a cold or missing beat (up to the 10-minute staleness window), and a
+  fresh beat refutes death either way.
 - **No second orchestrator on a worktree.** The spawner takes the worktree lease
   before the session exists; a worktree whose lease is still fresh is refused
   (`live orchestrator lease`) instead of getting a competitor
@@ -332,7 +360,7 @@ injected (the block counts it and leaves it on disk).
 | `Fleet launch needs a git repository: …` | `/fleet` was run outside a git checkout (or `git` is unavailable). Run it in the repository root. |
 | `- bd-12: NOT launched — Worktree creation failed…` | `wt` (Worktrunk) is missing or the directory could not be created. The id was pruned, so `/fleet bd-12` can retry it. |
 | `- bd-12: NOT launched — Session daemon rejected the orchestrator request…` | the pi-web session daemon is not running. The fleet intent and audit still record the attempt. |
-| `already a member of fleet \`default\`, supervised by live session …` | that bead is in a live fleet already. P1 has no member removal; re-arm that fleet, or prune a provably-dead member with `belayd_fleet_reconcile` and `pruneDeadMembers: true`. |
+| `already a member of fleet \`default\`, supervised by live session …` | that bead is in a live fleet already. P1 has no member removal; re-arm that fleet, or prune a provably-dead member with `belayd_fleet_reconcile` and `pruneDeadMembers: true`. A run-mode supervisor's recorded pid is the shared daemon, so only its beat can retire it (cold or missing, up to 10 minutes); an explicit record's gone pid retires it at once (bd-233). |
 | `already driven by a standalone orchestrator … use that orchestrator's session, or re-arm the fleet` | a worktree for that bead already has same-task `.belayd/workflow.json` (a `/belayd` launch, even a dead one). Launching a fleet member there would put two orchestrators on one bead. Use that session, or re-arm *this* fleet (a re-arm preserves the member). W-D |
 | `this session already supervises fleet \`default\` …` | one session supervises one fleet. Keep scheduling `default`, or launch the other fleet from a different session. W-B |
 | `already a member of fleet \`x\`, whose supervisor is not running… re-arm that fleet` | the bead belongs to a dead fleet. Run `/fleet <its ids> --fleet x` there instead of launching it into a second fleet — otherwise its notes go to a mailbox no live supervisor drains. |

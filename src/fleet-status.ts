@@ -26,11 +26,13 @@ import {
   FLEET_RUN_STALE_TICK_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FleetRunSchema,
+  fleetMemberBranch,
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
   memberEvidenceCutoff,
   memberRanEvidence,
+  memberWorktreeExisted,
   runsBelongingToMember,
   worktreeCreatedAtFromStat,
 } from "./fleet-run.js";
@@ -55,11 +57,15 @@ import {
 import type { RunManifest, RunManifestFs } from "./run-manifest.js";
 import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
 import { isValidTaskId } from "./session-naming.js";
-import { DEFAULT_BASE_BRANCH } from "./stack-rebase.js";
+import { DEFAULT_BASE_BRANCH, branchExists as readBranchExists } from "./stack-rebase.js";
 import type { WorkflowState } from "./workflow-state.js";
 import { parseWorkflowState, workflowStateFilePath } from "./workflow-state.js";
 import type { GitCommonDirResult, WorktreeListEntry } from "./worktree.js";
-import { listWorktrees as defaultListWorktrees, resolveGitCommonDir } from "./worktree.js";
+import {
+  listWorktrees as defaultListWorktrees,
+  resolveGitCommonDir,
+  WORKTREE_READY_TIMEOUT_MS,
+} from "./worktree.js";
 
 /**
  * `schemaVersion` of the `fleet.json` intent record. The merge queue and the
@@ -369,6 +375,170 @@ export function fleetAuditLogPath(gitCommonDir: string, fleetId: string): string
   return join(fleetStateDir(gitCommonDir, fleetId), "audit.log");
 }
 
+/**
+ * `<fleetDir>/launch/` — per-member spawn markers (bd-233).
+ *
+ * One file per member whose spawn is in flight. A marker exists only while a
+ * spawner is inside `launchWorktreeWorkflow`; unlike the intent, nothing refreshes it
+ * periodically, so it cannot be mistaken for a live member (the round-1 grace keyed
+ * on `intent.updatedAt` was re-stamped by every 15 s tick and held every slot of a
+ * running fleet forever).
+ */
+export function fleetLaunchMarkerDir(gitCommonDir: string, fleetId: string): string {
+  return join(fleetStateDir(gitCommonDir, fleetId), "launch");
+}
+
+/**
+ * The marker file for one member's spawn.
+ *
+ * Refuses rather than sanitises into place: a task id that does not round-trip
+ * through the replacement (or that is `.`/`..`/empty) would name a file outside
+ * `launch/` or the fleet directory itself. Callers must handle the refusal — a
+ * write fails the spawn, a read reports "no marker" and says why (bd-233 W3).
+ */
+export function fleetLaunchMarkerPath(
+  gitCommonDir: string,
+  fleetId: string,
+  taskId: string,
+): { ok: true; path: string } | { ok: false; error: string } {
+  const fileName = taskId.replace(/[^A-Za-z0-9._-]/g, "_");
+  if (fileName === "" || fileName !== taskId || fileName === "." || fileName === "..") {
+    return {
+      ok: false,
+      error:
+        `\`${taskId}\` cannot name a launch marker: a marker must be one file name directly ` +
+        "under launch/ (only letters, digits, '.', '_' and '-'), never '.' or '..'",
+    };
+  }
+  return { ok: true, path: join(fleetLaunchMarkerDir(gitCommonDir, fleetId), fileName) };
+}
+
+/** Allowance for the daemon RPC + lease + prompt half of one spawn (see the grace). */
+export const FLEET_SPAWN_RPC_ALLOWANCE_MS = 60_000;
+
+/** Slack over the declared waits, so a late refresh cannot expire a live marker. */
+export const FLEET_SPAWN_GRACE_MARGIN_MS = 30_000;
+
+/**
+ * How long a spawn marker keeps its member out of the `absent` verdict.
+ *
+ * Derived from what one spawn legitimately waits for, not restated as a bare number:
+ *
+ * - `WORKTREE_READY_TIMEOUT_MS` — `awaitWorktreeReady` gives the tree's dependency
+ *   install (a cold `wt switch`/clone plus `pnpm install`) up to 60 s;
+ * - `FLEET_SPAWN_RPC_ALLOWANCE_MS` — the session-daemon `POST /sessions` call, the
+ *   pending-lease write, the model route, and the prompt POST after that wait (the
+ *   daemon request carries no timeout of its own);
+ * - `FLEET_SPAWN_GRACE_MARGIN_MS` — slack for a refresh landing late on a busy event
+ *   loop, so the window never closes on a live spawner between two refreshes.
+ *
+ * The marker is refreshed while the spawn is in flight, so expiry means "no refresh
+ * for a full grace", not "the spawn began more than a grace ago" (bd-233 W1).
+ */
+export const FLEET_MEMBER_SPAWN_GRACE_MS =
+  WORKTREE_READY_TIMEOUT_MS + FLEET_SPAWN_RPC_ALLOWANCE_MS + FLEET_SPAWN_GRACE_MARGIN_MS;
+
+/**
+ * How often `withFleetLaunchMarker` re-stamps a live spawn's marker.
+ *
+ * Three refreshes per grace: two consecutive late refreshes (a blocked event loop)
+ * still leave the marker inside the window, while a spawner that died expires one
+ * full grace after its last write instead of one grace after it started.
+ */
+export const FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS = Math.floor(FLEET_MEMBER_SPAWN_GRACE_MS / 3);
+
+/** Schema version of the per-member spawn marker. */
+export const FLEET_LAUNCH_MARKER_SCHEMA_VERSION = 1;
+
+const FleetLaunchMarkerSchema = z.object({
+  schemaVersion: z.literal(FLEET_LAUNCH_MARKER_SCHEMA_VERSION),
+  taskId: z.string().min(1).max(128),
+  /** Epoch ms of the last write; the window is measured from here. */
+  startedAt: z.number().finite(),
+  /**
+   * The spawn that wrote it (bd-233 round 4).
+   *
+   * Optional so a hand-written or older marker still parses and still opens a
+   * window; only a clear compares it, and an ownerless marker is never deleted by a
+   * spawner that cannot prove it wrote it. Reads stay owner-agnostic.
+   */
+  owner: z.string().min(1).optional(),
+});
+
+export type FleetLaunchMarker = z.infer<typeof FleetLaunchMarkerSchema>;
+
+export function parseFleetLaunchMarker(raw: unknown): FleetLaunchMarker | undefined {
+  const parsed = FleetLaunchMarkerSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * Whether a marker still puts its member inside the spawn window (pure).
+ *
+ * An expired marker is **not** an error: a spawner that died computes as "no window",
+ * so the member's git evidence decides (and a held slot becomes prunable again). A
+ * malformed marker reads as no marker for the same reason — it can only be a hand
+ * edit, and treating it as permanent would re-create the leak it exists to bound.
+ */
+export function isFleetSpawnInFlight(options: {
+  marker: FleetLaunchMarker | undefined;
+  now: number;
+}): boolean {
+  if (options.marker === undefined) return false;
+  return options.now - options.marker.startedAt < FLEET_MEMBER_SPAWN_GRACE_MS;
+}
+
+/**
+ * Read one member's spawn marker.
+ *
+ * Absent, unparsable, or an unusable id all mean "no window": the member's git
+ * evidence decides. An unusable id additionally reaches `onWarning`, because a
+ * marker that cannot be addressed must not look like a silent absence (bd-233 W3).
+ */
+export function readFleetLaunchMarker(options: {
+  gitCommonDir: string;
+  fleetId: string;
+  taskId: string;
+  fs?: FleetStatusFs;
+  /**
+   * Where an unusable marker id is reported. A bad id is *no marker* (the git
+   * evidence decides), never `unknown`-as-`absent`: the caller's existing warning
+   * channel names the id so the operator hears why no window applied (bd-233 W3).
+   */
+  onWarning?: (message: string) => void;
+}): FleetLaunchMarker | undefined {
+  const fs = options.fs ?? fleetStatusFs;
+  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
+  if (!resolved.ok) {
+    options.onWarning?.(
+      `spawn marker for ${options.taskId} is unusable (${resolved.error}); reading it as "no ` +
+        "spawn window\" and never as absence, so this member's own git evidence decides",
+    );
+    return undefined;
+  }
+  try {
+    if (!fs.existsSync(resolved.path)) return undefined;
+    return parseFleetLaunchMarker(JSON.parse(fs.readFileSync(resolved.path)));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a live spawn marker holds this member out of the `absent` verdict. */
+export function fleetSpawnInFlight(options: {
+  gitCommonDir: string;
+  fleetId: string;
+  taskId: string;
+  now: number;
+  fs?: FleetStatusFs;
+  onWarning?: (message: string) => void;
+}): boolean {
+  return isFleetSpawnInFlight({
+    marker: readFleetLaunchMarker(options),
+    now: options.now,
+  });
+}
+
 // ── Derived member state ──────────────────────────────────────────────
 
 /** What the worktree's `.belayd/workflow.json` turned out to be. */
@@ -523,6 +693,7 @@ export const FLEET_WARNING_KINDS = [
   "stale-member",
   "capacity-held",
   "run-not-ticking",
+  "unusable-spawn-marker",
 ] as const;
 
 export type FleetWarningKind = (typeof FLEET_WARNING_KINDS)[number];
@@ -1914,6 +2085,14 @@ export interface ReadFleetStatusOptions {
   ) => FleetMemberLeaseProbe | undefined;
   /** Supervisor liveness probes, for `capacity-held`; injected in tests. */
   supervisorLiveness?: FleetSupervisorLiveness;
+  /**
+   * Whether a member's `feat/<taskId>` branch still exists (bd-233).
+   *
+   * The proof a deleted worktree leaves behind: `git worktree list` no longer names
+   * it, but the branch does. Injected because the default shells out to git; absent
+   * means "ask git in `cwd`", and a failure there is conservatively `false`.
+   */
+  branchExists?: (taskId: string) => boolean;
   /** Clock for lease freshness, the capacity view, and `run-not-ticking`. */
   now?: number;
 }
@@ -2121,7 +2300,11 @@ function readFleetCapacity(options: {
   scan: FleetProcessScan;
   now: number;
   leaseFor: (taskId: string, worktreePath: string | undefined) => FleetMemberLeaseProbe | undefined;
+  /** Whether a member's branch still exists, for the deleted-worktree verdict (bd-233). */
+  branchExistsFor: (taskId: string) => boolean;
   supervisorLiveness: FleetSupervisorLiveness;
+  /** Where an unusable spawn-marker id is reported (bd-233 W3). */
+  onWarning?: (message: string, taskId: string) => void;
 }): FleetCapacityInput {
   const fleets: FleetCapacityFleetInput[] = [];
   let sawTarget = false;
@@ -2136,11 +2319,16 @@ function readFleetCapacity(options: {
     fleets.push(
       capacityFleetInput({
         fleetId,
+        gitCommonDir: options.gitCommonDir,
         intent,
         worktrees: options.worktrees,
         scan: options.scan,
+        now: options.now,
         leaseFor: options.leaseFor,
+        branchExistsFor: options.branchExistsFor,
         supervisorLiveness: options.supervisorLiveness,
+        fs: options.fs,
+        ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
       }),
     );
   }
@@ -2151,11 +2339,16 @@ function readFleetCapacity(options: {
     fleets.push(
       capacityFleetInput({
         fleetId: options.targetFleetId,
+        gitCommonDir: options.gitCommonDir,
         intent: options.targetIntent,
         worktrees: options.worktrees,
         scan: options.scan,
+        now: options.now,
         leaseFor: options.leaseFor,
+        branchExistsFor: options.branchExistsFor,
         supervisorLiveness: options.supervisorLiveness,
+        fs: options.fs,
+        ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
       }),
     );
   }
@@ -2165,26 +2358,57 @@ function readFleetCapacity(options: {
 /** One fleet's recorded membership, classified for the capacity arithmetic. */
 function capacityFleetInput(options: {
   fleetId: string;
+  gitCommonDir: string;
   intent: FleetIntent;
   worktrees: ReadonlyMap<string, FleetWorktreeEvidence>;
   scan: FleetProcessScan;
+  now: number;
   leaseFor: (taskId: string, worktreePath: string | undefined) => FleetMemberLeaseProbe | undefined;
+  branchExistsFor: (taskId: string) => boolean;
   supervisorLiveness: FleetSupervisorLiveness;
+  fs: FleetStatusFs;
+  onWarning?: (message: string, taskId: string) => void;
 }): FleetCapacityFleetInput {
   const released = new Set((options.intent.released ?? []).map((entry) => entry.taskId));
   const stopped = new Set((options.intent.run?.stopped ?? []).map((entry) => entry.taskId));
   const members = options.intent.taskIds.map((taskId): FleetCapacityMemberInput => {
     const worktree = options.worktrees.get(taskId);
-    const lease = options.leaseFor(taskId, worktree?.path);
+    // `git worktree list` keeps reporting a worktree whose directory was deleted, so
+    // the listing is proof the tree existed, not proof it is there now (bd-233 W1).
+    const presentPath =
+      worktree !== undefined && options.fs.existsSync(worktree.path) ? worktree.path : undefined;
+    const lease = options.leaseFor(taskId, presentPath);
+    const onWarning = options.onWarning;
     return {
       taskId,
-      // Same rule as the launch probe: no worktree, or a worktree with no lease and
-      // no evidence this member's own execution ran, is a spawn in flight — unknown
-      // and counted, never absent (bd-166).
+      // Same rule as the launch probe: a worktree with no lease and no evidence this
+      // member's own execution ran is a spawn in flight — unknown and counted, never
+      // absent (bd-166). A worktree that provably existed and is gone now is absent
+      // instead, so a deleted tree stops holding a slot forever (bd-233) — unless that
+      // member's own spawn marker is live, where a relaunch reuses the surviving branch
+      // (W2). The marker is per member, so a ticking run never holds a slot open.
       liveness: classifyMemberLivenessInWorktree({
         taskId,
-        worktreePath: worktree?.path,
-        memberRanEvidence: memberRanInWorktree({ intent: options.intent, taskId, worktree }),
+        worktreePath: presentPath,
+        memberRanEvidence:
+          presentPath === undefined
+            ? false
+            : memberRanInWorktree({ intent: options.intent, taskId, worktree }),
+        worktreeExisted: memberWorktreeExisted({
+          taskId,
+          branchExists: worktree !== undefined || options.branchExistsFor(taskId),
+          worktreeListed: worktree !== undefined,
+          spawnInFlight: fleetSpawnInFlight({
+            gitCommonDir: options.gitCommonDir,
+            fleetId: options.fleetId,
+            taskId,
+            now: options.now,
+            fs: options.fs,
+            ...(onWarning === undefined
+              ? {}
+              : { onWarning: (message: string) => onWarning(message, taskId) }),
+          }),
+        }),
         scan: options.scan,
         ...(lease === undefined ? {} : { lease }),
       }),
@@ -2246,6 +2470,29 @@ export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatu
     options.memberLeaseFor ??
     ((_taskId: string, worktreePath: string | undefined) => leaseProbeOf(worktreePath, now));
 
+  // A member id that cannot name a launch marker is reported in the view's warning
+  // channel; without this the marker silently reads as "no window" (bd-233 W3).
+  const markerWarnings: FleetWarning[] = [];
+  const capacity = readFleetCapacity({
+    fs,
+    gitCommonDir: commonDirResult.commonDir,
+    targetFleetId: fleetId,
+    targetIntent: intent,
+    worktrees: worktreeEvidenceByTaskId(worktreeResult.entries, members),
+    scan: scan(),
+    now,
+    leaseFor,
+    branchExistsFor:
+      options.branchExists ??
+      ((taskId: string) => readBranchExists(options.cwd, fleetMemberBranch(taskId))),
+    supervisorLiveness: options.supervisorLiveness ?? {
+      isPidAlive: isProcessAlive,
+      pidStartTime: readProcessStartTime,
+    },
+    onWarning: (message, taskId) =>
+      markerWarnings.push({ kind: "unusable-spawn-marker", taskId, message }),
+  });
+
   return {
     ok: true,
     value: buildFleetStatus({
@@ -2253,21 +2500,8 @@ export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatu
       requestedFleetId,
       intent,
       members,
-      worktreeWarnings,
-      capacity: readFleetCapacity({
-        fs,
-        gitCommonDir: commonDirResult.commonDir,
-        targetFleetId: fleetId,
-        targetIntent: intent,
-        worktrees: worktreeEvidenceByTaskId(worktreeResult.entries, members),
-        scan: scan(),
-        now,
-        leaseFor,
-        supervisorLiveness: options.supervisorLiveness ?? {
-          isPidAlive: isProcessAlive,
-          pidStartTime: readProcessStartTime,
-        },
-      }),
+      worktreeWarnings: [...worktreeWarnings, ...markerWarnings],
+      capacity,
       now,
     }),
   };

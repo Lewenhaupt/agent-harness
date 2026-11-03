@@ -114,6 +114,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: undefined,
         memberRanEvidence: false,
+        worktreeExisted: false,
         scan: emptyScan,
       }),
     ).toMatchObject({ kind: "unknown" });
@@ -126,6 +127,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: undefined,
         memberRanEvidence: false,
+        worktreeExisted: false,
         scan: { ok: true, processes: [snapshot(700, orchestratorArgv("bd-12"))] },
       }),
     ).toEqual({ kind: "live", pids: [700] });
@@ -141,6 +143,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: false,
+        worktreeExisted: false,
         scan: emptyScan,
       }),
     ).toMatchObject({ kind: "unknown" });
@@ -150,6 +153,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: false,
+        worktreeExisted: false,
         scan: { ok: true, processes: [snapshot(700, orchestratorArgv("bd-12"))] },
       }),
     ).toEqual({ kind: "live", pids: [700] });
@@ -165,9 +169,76 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: true,
+        worktreeExisted: false,
         scan: emptyScan,
       }),
     ).toEqual({ kind: "absent" });
+  });
+
+  it("AC2: resolves a worktree that provably existed and is gone to absent", () => {
+    // A deleted worktree leaves its branch behind, which is proof the member was real:
+    // no lease and no process is then absence (frees the slot, prunable) rather than
+    // unknown (counted forever) — the bd-233 capacity leak.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        worktreeExisted: true,
+        scan: emptyScan,
+      }),
+    ).toEqual({ kind: "absent" });
+  });
+
+  it("AC2: keeps a no-worktree member with no proof it ever existed unknown", () => {
+    // The bd-166 spawn window: a launch writes the intent before the branch and the
+    // worktree exist, so `worktreeExisted: false` must never free the slot.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        worktreeExisted: false,
+        scan: emptyScan,
+      }),
+    ).toMatchObject({ kind: "unknown" });
+  });
+
+  it("AC2: positive evidence still wins over a missing worktree", () => {
+    // A live lease or a live argv token is evidence something is running the member,
+    // wherever its tree went, so it outranks the deleted-tree verdict.
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        worktreeExisted: true,
+        scan: emptyScan,
+        lease: { state: "live", heartbeatAt: 1_000 },
+      }),
+    ).toEqual({ kind: "live", pids: [], leaseHeartbeatAt: 1_000 });
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        worktreeExisted: true,
+        scan: { ok: true, processes: [snapshot(700, orchestratorArgv("bd-12"))] },
+      }),
+    ).toEqual({ kind: "live", pids: [700] });
+  });
+
+  it("AC2: never prunes on a corrupt lease even when the worktree is gone", () => {
+    expect(
+      classifyMemberLivenessInWorktree({
+        taskId: "bd-12",
+        worktreePath: undefined,
+        memberRanEvidence: false,
+        worktreeExisted: true,
+        scan: emptyScan,
+        lease: { state: "corrupt", error: "not a lease" },
+      }),
+    ).toMatchObject({ kind: "unknown" });
   });
 
   it("never turns an unreadable or corrupt lease into absence", () => {
@@ -176,6 +247,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: true,
+        worktreeExisted: false,
         scan: emptyScan,
         lease: { state: "corrupt", error: "not a lease" },
       }),
@@ -185,6 +257,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: true,
+        worktreeExisted: false,
         scan: { ok: false, reason: "no procfs" },
       }),
     ).toMatchObject({ kind: "unknown" });
@@ -196,6 +269,7 @@ describe("classifyMemberLivenessInWorktree (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: false,
+        worktreeExisted: false,
         scan: emptyScan,
         lease: { state: "live", heartbeatAt: 1_000 },
       }),
@@ -237,6 +311,7 @@ describe("classifyMemberLease (bd-166)", () => {
         taskId: "bd-12",
         worktreePath: "/repo.feat-bd-12",
         memberRanEvidence: true,
+        worktreeExisted: false,
         scan: { ok: true, processes: [] },
         lease: stale,
       }),

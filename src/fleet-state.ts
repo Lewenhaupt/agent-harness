@@ -7,6 +7,7 @@
  *   fleet.json        operator intent (one record, one schema)
  *   inbox/            member → supervisor notes, drained at turn start
  *   events/           supervisor → member notifications, drained at turn start
+ *   launch/           per-member spawn markers (bd-233; emptied by the spawner)
  *   merge-queue.json  single-flight merge queue (P2)
  *   audit.log         append-only audit of cross-tree authority
  *
@@ -19,7 +20,7 @@
  * reader/writer takes an injected {@link FleetStateFs} seam.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -28,15 +29,21 @@ import { defaultFleetPublish } from "./fleet-publish.js";
 import type { FleetIntent } from "./fleet-status.js";
 import {
   FLEET_INTENT_ORDERING_GATES_MAX,
+  FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS,
+  FLEET_LAUNCH_MARKER_SCHEMA_VERSION,
   FLEET_SCHEMA_VERSION,
+  type FleetLaunchMarker,
   fleetAuditLogPath,
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
   fleetIntentWriteRefusal,
+  fleetLaunchMarkerDir,
+  fleetLaunchMarkerPath,
   fleetMergeQueueFilePath,
   fleetStateDir,
   parseFleetIntent,
+  readFleetLaunchMarker,
   sanitizeFleetId,
 } from "./fleet-status.js";
 import { DEFAULT_BASE_BRANCH } from "./stack-rebase.js";
@@ -51,6 +58,8 @@ export {
   fleetEventsDir,
   fleetInboxDir,
   fleetIntentFilePath,
+  fleetLaunchMarkerDir,
+  fleetLaunchMarkerPath,
   fleetMergeQueueFilePath,
 };
 
@@ -776,6 +785,251 @@ export function readRecentFleetAuditEntries(
     entries.push(entry);
   }
   return entries;
+}
+
+// ── Spawn markers (launch/) ────────────────────────────────────────────
+
+/**
+ * Record that a member's spawn is in flight (bd-233).
+ *
+ * Written immediately before the spawner creates the worktree and re-stamped while the
+ * spawn lives by {@link withFleetLaunchMarker}. Only removal — that helper's `finally`
+ * — or a full grace with no refresh ends the window, so nothing else that ticks can
+ * keep it alive.
+ *
+ * `owner` is the spawn token {@link withFleetLaunchMarker} mints for this spawn: every
+ * write and refresh carries it, and a clear only deletes a marker whose owner matches,
+ * so a slow spawner cannot erase a newer spawn's window for the same member (bd-233
+ * round 4).
+ */
+export function writeFleetLaunchMarker(options: {
+  gitCommonDir: string;
+  fleetId: string;
+  taskId: string;
+  now: number;
+  owner: string;
+  fs?: FleetStateFs;
+}): { ok: true; marker: FleetLaunchMarker } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
+  if (!resolved.ok) return resolved;
+  const marker: FleetLaunchMarker = {
+    schemaVersion: FLEET_LAUNCH_MARKER_SCHEMA_VERSION,
+    taskId: options.taskId,
+    startedAt: options.now,
+    owner: options.owner,
+  };
+  const written = atomicWriteJson(resolved.path, marker, fs);
+  return written.ok ? { ok: true, marker } : written;
+}
+
+/**
+ * Clear a member's spawn marker; an absent marker is success (idempotent).
+ *
+ * Owner-scoped (bd-233 round 4): the on-disk marker is deleted only when its owner
+ * matches the caller's spawn token. A relaunch overwrites the marker with its own
+ * token, so the older spawn's `finally` must leave that newer window alone — it
+ * reports the refusal (best effort, never throws, never deletes a foreign marker). An
+ * unreadable or ownerless marker is treated the same way: not provably ours.
+ */
+export function clearFleetLaunchMarker(options: {
+  gitCommonDir: string;
+  fleetId: string;
+  taskId: string;
+  owner: string;
+  fs?: FleetStateFs;
+}): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? nodeFsSeam;
+  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
+  if (!resolved.ok) return resolved;
+  try {
+    if (!fs.existsSync(resolved.path)) return { ok: true };
+    const onDisk = readFleetLaunchMarker({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      taskId: options.taskId,
+      fs,
+    });
+    if (onDisk?.owner !== options.owner) {
+      return {
+        ok: false,
+        error:
+          `the marker on disk belongs to another spawn (owner ${onDisk?.owner ?? "absent"}), ` +
+          "so this spawn's clear left it in place",
+      };
+    }
+    fs.unlinkSync(resolved.path);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * The interval handle the configured timer returns (`number` under a DOM lib,
+ * `Timeout` under Node), so the seam needs no cast either way.
+ */
+type FleetTimerHandle = ReturnType<typeof setInterval>;
+
+/**
+ * Clear one interval handle.
+ *
+ * The project's lib set types the handle as `number | Timeout`, and whichever
+ * implementation produced it, `clearInterval` accepts it: no per-shape branch is
+ * needed.
+ */
+function clearTimerHandle(handle: FleetTimerHandle): void {
+  clearInterval(handle);
+}
+
+/**
+ * Run one member spawn inside a launch marker (bd-233).
+ *
+ * The one helper every member-spawn path goes through, so none of them can forget
+ * the window: `belayd_fleet_launch`, `belayd_fleet_advance`, and any run-loop
+ * relaunch all reach `launchWorktreeWorkflow` through this wrapper. The marker is
+ * removed in a `finally`, so a thrown launch can neither leak it nor keep a dead
+ * member's slot held; it also covers the failure path, where the member is pruned
+ * from the intent by the engine and nothing should look "in flight" any more.
+ *
+ * The marker is refreshed for as long as the spawn lives, so the grace measures "no
+ * refresh for a full grace", not "the spawn began more than a grace ago": a cold
+ * `wt switch`/install or a slow daemon RPC legitimately outlives the declared waits,
+ * and its member must stay counted (never `absent`, so never pruned) meanwhile. The
+ * timer is unref'd and local to this call, and cleared in the `finally`.
+ *
+ * Every spawn mints its own `owner` token. It is written into every refresh and is
+ * required by the clear, so a slow spawner whose marker was overwritten by a relaunch
+ * cannot delete the newer spawn's window (bd-233 round 4).
+ *
+ * Residual race, documented not hidden (the `updateFleetIntent` W6 precedent): the
+ * refresh's owner check is check-then-write, not atomic. A refresh can read `owner: A`,
+ * then B's initial write lands, then A's refresh rewrites A's token over B's fresh
+ * marker; B then refuses its own clear and stops refreshing, so B's window reverts to a
+ * fixed grace while B still runs. Closing the gap needs an atomic primitive (an
+ * `O_EXCL` sidecar), not another check here, and it is reachable only in an
+ * already-degraded double-spawn.
+ *
+ * A marker that cannot be written refuses the spawn: without it a concurrent
+ * recount could classify the member `absent` while its worktree is being created,
+ * so the safe direction is to start nothing.
+ */
+export async function withFleetLaunchMarker<T>(options: {
+  gitCommonDir: string;
+  fleetId: string;
+  taskId: string;
+  now: number;
+  /** Clock for the refreshes; the cadence is the module constant. */
+  clock?: () => number;
+  /** Timer seam so a test can drive the cadence without a real wait. */
+  setIntervalFn?: (callback: () => void, intervalInMs: number) => FleetTimerHandle;
+  clearIntervalFn?: (handle: FleetTimerHandle) => void;
+  fs?: FleetStateFs;
+  spawn: () => Promise<T>;
+}): Promise<{ ok: true; value: T; warning?: string } | { ok: false; error: string }> {
+  // Per-spawn, not per-member: a relaunch must be a different owner so the old
+  // spawn's clear cannot erase the new window.
+  const owner = randomUUID();
+  const writeMarker = (now: number) =>
+    writeFleetLaunchMarker({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      taskId: options.taskId,
+      now,
+      owner,
+      ...(options.fs === undefined ? {} : { fs: options.fs }),
+    });
+  const written = writeMarker(options.now);
+  if (!written.ok) {
+    return {
+      ok: false,
+      error:
+        `could not record the spawn window for ${options.taskId} (${written.error}), so it was ` +
+        "not spawned: an unrecorded spawn could be counted as absent mid-flight",
+    };
+  }
+  const clock = options.clock ?? Date.now;
+  const setIntervalFn =
+    options.setIntervalFn ??
+    ((callback: () => void, intervalInMs: number): FleetTimerHandle =>
+      setInterval(callback, intervalInMs));
+  const clearIntervalFn = options.clearIntervalFn ?? clearTimerHandle;
+  let refreshFailures = 0;
+  let lastRefreshFailure: { at: number; error: string } | undefined;
+  // Set once the marker is no longer ours: rewriting it would steal a newer spawn's
+  // window, and this spawn's later clear would then delete that window.
+  let markerNotOurs = false;
+  const refresh = setIntervalFn(() => {
+    if (markerNotOurs) return;
+    const onDisk = readFleetLaunchMarker({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      taskId: options.taskId,
+      ...(options.fs === undefined ? {} : { fs: options.fs }),
+    });
+    if (onDisk?.owner !== owner) {
+      markerNotOurs = true;
+      refreshFailures += 1;
+      lastRefreshFailure = {
+        at: clock(),
+        error: `the marker belongs to ${onDisk?.owner === undefined ? "nobody (absent or unreadable)" : `another spawn (owner ${onDisk.owner})`}, so this spawn stopped refreshing it`,
+      };
+      console.warn(`[belayd-harness] ${lastRefreshFailure.error}`);
+      return;
+    }
+    const rewritten = writeMarker(clock());
+    if (!rewritten.ok) {
+      // A failing refresh degrades the sliding window to a fixed one: the member is
+      // protected only until a grace after the last successful stamp, even though the
+      // spawn is still live. That is reported on the spawn outcome below (not only
+      // here), so the launch report can warn instead of the protection silently
+      // weakening (bd-233 round 4 W1).
+      refreshFailures += 1;
+      lastRefreshFailure = { at: clock(), error: rewritten.error };
+      console.warn(
+        `[belayd-harness] could not refresh the spawn marker for ${options.taskId}: ` +
+          `${rewritten.error}; its slot frees one grace after the last successful write`,
+      );
+    }
+  }, FLEET_LAUNCH_MARKER_REFRESH_INTERVAL_MS);
+  // `number` handles only exist under a DOM lib; Node's own handle is unref'd so a
+  // spawn in flight never keeps the process alive by itself.
+  if (typeof refresh !== "number") refresh.unref();
+  const warnings: string[] = [];
+  let value: T;
+  try {
+    value = await options.spawn();
+  } finally {
+    clearIntervalFn(refresh);
+    const cleared = clearFleetLaunchMarker({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      taskId: options.taskId,
+      owner,
+      ...(options.fs === undefined ? {} : { fs: options.fs }),
+    });
+    if (!cleared.ok) {
+      // Best effort: a leaked marker expires with the grace window, so the slot is
+      // delayed at worst, never held forever. A refusal is the two-spawner case: the
+      // newer spawn owns the marker now, and this clear must not delete it.
+      const clearWarning =
+        `the spawn marker for ${options.taskId} could not be cleared (${cleared.error}); the ` +
+        "member keeps its slot until the grace expires, then its own git evidence decides";
+      warnings.push(clearWarning);
+      console.warn(`[belayd-harness] ${clearWarning}`);
+    }
+  }
+  if (lastRefreshFailure !== undefined) {
+    warnings.unshift(
+      `spawn window protection degraded for ${options.taskId}: ${refreshFailures} marker ` +
+        `refresh attempt(s) failed, last at ${new Date(lastRefreshFailure.at).toISOString()} ` +
+        `(${lastRefreshFailure.error}); the member holds its slot only until one grace after ` +
+        "the last successful stamp",
+    );
+  }
+  return warnings.length === 0
+    ? { ok: true, value }
+    : { ok: true, value, warning: warnings.join("; ") };
 }
 
 // ── Mailbox (inbox/ and events/) ──────────────────────────────────────

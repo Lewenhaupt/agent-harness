@@ -85,12 +85,19 @@ import type {
   FleetPublishStackComposition,
 } from "../../src/fleet-publish.js";
 import { readFleetPublishConfig, resolveFleetPublish } from "../../src/fleet-publish.js";
-import { reconcileAuthority, runFleetReconcile } from "../../src/fleet-reconcile.js";
+import type { SupervisorRecovery } from "../../src/fleet-reconcile.js";
+import {
+  reconcileAuthority,
+  runFleetReconcile,
+  supervisorProvablyDead,
+  supervisorRecordFingerprint,
+} from "../../src/fleet-reconcile.js";
 import {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
   FLEET_RUN_DETAIL_MAX_LENGTH,
+  FLEET_RUN_MEMBERS_MAX,
   FLEET_RUN_TICK_INTERVAL_MS,
   type FleetGateNotice,
   type FleetGateNoticePlan,
@@ -101,10 +108,12 @@ import {
   type FleetTickAction,
   type FleetWorkflowProgressSnapshot,
   finishFleetRun,
+  fleetMemberBranch,
   fleetTickProgress,
   isFleetRunActive,
   memberEvidenceCutoff,
   memberRanEvidence,
+  memberWorktreeExisted,
   planFleetTick,
   planGateNotices,
   planOutsideFleetLandings,
@@ -145,6 +154,7 @@ import {
   readFleetMergeQueue,
   readRecentFleetAuditEntries,
   retireFleetDeferral,
+  withFleetLaunchMarker,
 } from "../../src/fleet-state.js";
 import {
   applyFleetBeadEngagement,
@@ -157,6 +167,7 @@ import {
   type FleetMemberView,
   type FleetStatus,
   fleetBeadTaskIds,
+  fleetSpawnInFlight,
   formatBeadOwnership,
   formatFleetStatus,
   sanitizeFleetId,
@@ -280,6 +291,7 @@ export interface FleetDeps {
   scanProcesses: typeof import("../../src/fleet-sessions.js").scanProcesses;
   resolveGitCommonDir: typeof import("../../src/worktree.js").resolveGitCommonDir;
   resolveWorktreePath: typeof import("../../src/worktree.js").resolveWorktreePath;
+  branchExists: typeof import("../../src/stack-rebase.js").branchExists;
   readWorktreeBranch: typeof import("../../src/owned-worktree.js").readWorktreeBranch;
   updateFleetIntent: typeof import("../../src/fleet-state.js").updateFleetIntent;
   readFleetStatus: typeof import("../../src/fleet-status.js").readFleetStatus;
@@ -462,6 +474,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     scanProcesses,
     resolveGitCommonDir,
     resolveWorktreePath,
+    branchExists,
     readWorktreeBranch,
     updateFleetIntent,
     readFleetStatus,
@@ -992,26 +1005,162 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * `taskId → launchedAt` from one fleet's run record.
+   * One fleet's run evidence for the liveness probes (bd-166).
    *
-   * An unreadable or absent fleet simply records no launch: the worktree creation
-   * instant is still a cutoff, and no cutoff keeps the member counted (bd-166).
+   * Only `run.members[].launchedAt` (the evidence cutoff). The spawn window is
+   * strictly per-member and comes from `launch/<taskId>` markers, never from a
+   * fleet-record revision: `intent.updatedAt` is rewritten by every 15 s tick, so
+   * keying a window on it kept every member of a running fleet `unknown` forever
+   * (bd-233 review round 2).
    */
-  function recordedLaunches(options: {
+  interface FleetRunEvidence {
+    launches: ReadonlyMap<string, number>;
+  }
+
+  function recordedRunEvidence(options: {
     gitCommonDir: string | undefined;
     fleetId: string;
-  }): ReadonlyMap<string, number> {
+  }): FleetRunEvidence {
     const launches = new Map<string, number>();
-    if (options.gitCommonDir === undefined) return launches;
+    if (options.gitCommonDir === undefined) return { launches };
     const loaded = readFleetIntent({
       gitCommonDir: options.gitCommonDir,
       fleetId: options.fleetId,
     });
-    if (!loaded.ok || loaded.intent === undefined) return launches;
+    if (!loaded.ok || loaded.intent === undefined) return { launches };
     for (const member of loaded.intent.run?.members ?? []) {
       launches.set(member.taskId, member.launchedAt);
     }
-    return launches;
+    return { launches };
+  }
+
+  /** The per-member evidence a liveness verdict is built from, derived once (bd-166/bd-233). */
+  interface MemberEvidenceProbe {
+    worktreeFor: (taskId: string) => string | undefined;
+    leaseFor: (taskId: string) => FleetMemberLeaseProbe | undefined;
+    memberRanFor: (fleetId: string, taskId: string) => boolean;
+    worktreeExistedFor: (fleetId: string, taskId: string) => boolean;
+  }
+
+  /**
+   * The one derivation of "where is this member's worktree, what does its lease say,
+   * did its session ever run, did the worktree provably exist, and is a launch still
+   * in flight". Launch, status and reconcile all inject these facts into
+   * `classifyMemberLivenessInWorktree`, so a repair cannot disagree with the capacity
+   * view about what is running.
+   *
+   * Two facts the probe must normalise here, because no caller may re-derive them:
+   *
+   * - a worktree that `git worktree list` still reports but whose directory is gone
+   *   (`rm -rf`, not `wt rm`) is *not* a worktree now. It resolves `worktreePath:
+   *   undefined` with `worktreeExisted: true` — the git listing is the proof — so the
+   *   member reaches `absent` without waiting for `git worktree prune` (bd-233 W1);
+   * - a surviving branch outlives a relaunch, so that member's spawn marker keeps the
+   *   proof suppressed while the new tree is being created (bd-233 W2).
+   */
+  function memberEvidenceProbe(options: {
+    ctx: ExtensionContext;
+    /** `<git-common-dir>` for the launch cutoff's intent reads; both callers have it. */
+    gitCommonDir: string | undefined;
+    /** Clock for the lease and the spawn window (the caller's, not ambient). */
+    now: number;
+  }): MemberEvidenceProbe {
+    const evidenceFor = memberRunEvidenceReader(options.gitCommonDir);
+    // One git probe per task id: the probe is asked for the worktree, the lease, the
+    // evidence and the deleted-tree verdict of the same member.
+    interface ResolvedWorktree {
+      /** The branch's registered worktree, whether or not it exists on disk. */
+      path: string | undefined;
+      /** Whether that directory is actually there now. */
+      present: boolean;
+    }
+    const worktrees = new Map<string, ResolvedWorktree>();
+    const resolveFor = (taskId: string): ResolvedWorktree => {
+      const cached = worktrees.get(taskId);
+      if (cached !== undefined) return cached;
+      const path = resolveWorktreePath(options.ctx.cwd, fleetMemberBranch(taskId));
+      const resolved: ResolvedWorktree = { path, present: path !== undefined && existsSync(path) };
+      worktrees.set(taskId, resolved);
+      return resolved;
+    };
+    const presentWorktreeFor = (taskId: string): string | undefined => {
+      const resolved = resolveFor(taskId);
+      return resolved.present ? resolved.path : undefined;
+    };
+    return {
+      worktreeFor: presentWorktreeFor,
+      leaseFor: (taskId: string): FleetMemberLeaseProbe | undefined => {
+        const worktreePath = presentWorktreeFor(taskId);
+        return worktreePath === undefined ? undefined : leaseProbeFor(worktreePath, options.now);
+      },
+      memberRanFor: (fleetId: string, taskId: string): boolean => {
+        // A worktree with no evidence its session existed is a launch mid-spawn (the
+        // state is persisted after the worktree is ready), so absence only means gone
+        // once the member has something proving it was real (bd-166). Completion
+        // deletes the state file, so the evidence is that file *or* a run manifest this
+        // execution wrote — never an inherited same-task manifest, hence the cutoff.
+        const worktreePath = presentWorktreeFor(taskId);
+        if (worktreePath === undefined) return false;
+        const since = memberSince({
+          worktreePath,
+          launchedAt: evidenceFor(fleetId).launches.get(taskId),
+        });
+        return memberRanEvidence({
+          taskId,
+          workflowStatePresent: existsSync(workflowStateFilePath(worktreePath)),
+          runs: listRuns({ cwd: worktreePath }),
+          ...(since === undefined ? {} : { since }),
+        });
+      },
+      worktreeExistedFor: (fleetId: string, taskId: string): boolean => {
+        // A *listed* worktree is the proof even when its directory was deleted; the
+        // branch is what a completed removal leaves behind (bd-233 W1).
+        const listed = resolveFor(taskId).path !== undefined;
+        return memberWorktreeExisted({
+          taskId,
+          branchExists: listed || branchExists(options.ctx.cwd, fleetMemberBranch(taskId)),
+          worktreeListed: listed,
+          // The window is this member's own spawn marker, never a fleet-record stamp:
+          // `intent.updatedAt` is rewritten by every tick, so it would hold every
+          // member of a running fleet `unknown` forever (bd-233 review round 2).
+          spawnInFlight:
+            options.gitCommonDir !== undefined &&
+            fleetSpawnInFlight({
+              gitCommonDir: options.gitCommonDir,
+              fleetId,
+              taskId,
+              now: options.now,
+              // An unusable id is "no window", not `unknown`-as-`absent`: say so on
+              // this module's warning channel instead of hiding it (bd-233 W3).
+              onWarning: (message) => console.warn(`[belayd-harness] ${message}`),
+            }),
+        });
+      },
+    };
+  }
+
+  /**
+   * The reconcile options rendered from one evidence probe.
+   *
+   * Reconcile must reach the same verdict as the capacity view, so it takes the same
+   * probe rather than a second wiring: only the fleet id (for the run cutoff) is bound
+   * here.
+   */
+  function memberLivenessSeams(
+    evidence: MemberEvidenceProbe,
+    fleetId: string,
+  ): {
+    memberWorktreeFor: (taskId: string) => string | undefined;
+    leaseFor: (taskId: string) => FleetMemberLeaseProbe | undefined;
+    memberRanFor: (taskId: string) => boolean;
+    memberWorktreeExistedFor: (taskId: string) => boolean;
+  } {
+    return {
+      memberWorktreeFor: evidence.worktreeFor,
+      leaseFor: evidence.leaseFor,
+      memberRanFor: (taskId: string) => evidence.memberRanFor(fleetId, taskId),
+      memberWorktreeExistedFor: (taskId: string) => evidence.worktreeExistedFor(fleetId, taskId),
+    };
   }
 
   /**
@@ -1021,11 +1170,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * process tables — plus each member's own worktree lease, because a pi-web
    * orchestrator is a session inside the daemon and never appears in argv. The
    * classification is the reconcile path's, reused rather than re-derived, so the
-   * capacity count and a repair read the same evidence. They deliberately differ on
-   * one verdict: a member with no worktree is `unknown` (counted) here, because a
-   * launch may be creating it, while reconcile needs positive `absent` evidence
-   * before it prunes (it reads such a member as absent, which is its documented
-   * escape hatch). Capacity errs to counted; pruning errs to keeping the record.
+   * capacity count and a repair read the same evidence. A member whose worktree is
+   * gone resolves to `absent` once something proves the tree existed (a surviving
+   * branch), so a deleted worktree stops holding a slot forever (bd-233); with no
+   * such proof it stays `unknown` (counted), because a launch may be creating it.
    */
   function memberLivenessProbe(
     ctx: ExtensionContext,
@@ -1033,56 +1181,39 @@ export function createFleet(deps: FleetDeps): FleetApi {
     gitCommonDir: string | undefined,
   ): (fleetId: string, taskId: string) => FleetMemberLiveness {
     const scan = scanProcesses();
-    const launchedAtFor = memberLaunchReader(gitCommonDir);
+    const evidence = memberEvidenceProbe({ ctx, gitCommonDir, now: Date.now() });
     return (fleetId: string, taskId: string): FleetMemberLiveness => {
-      // The worktree is keyed by the task id; the fleet id keys the recorded launch
-      // that bounds the evidence cutoff.
-      const worktreePath = resolveWorktreePath(ctx.cwd, `feat/${taskId}`);
-      // A worktree with no evidence its session existed is a launch mid-spawn (the
-      // state is persisted after the worktree is ready), so absence only means gone
-      // once the member has something proving it was real (bd-166). Completion
-      // deletes the state file, so the evidence is that file *or* a run manifest this
-      // execution wrote — never an inherited same-task manifest, hence the cutoff.
-      const since = memberSince({
-        worktreePath,
-        launchedAt: launchedAtFor(fleetId, taskId),
-      });
-      const memberRan =
-        worktreePath !== undefined &&
-        memberRanEvidence({
-          taskId,
-          workflowStatePresent: existsSync(workflowStateFilePath(worktreePath)),
-          runs: listRuns({ cwd: worktreePath }),
-          ...(since === undefined ? {} : { since }),
-        });
+      const lease = evidence.leaseFor(taskId);
       return classifyMemberLivenessInWorktree({
         taskId,
-        worktreePath,
-        memberRanEvidence: memberRan,
+        worktreePath: evidence.worktreeFor(taskId),
+        memberRanEvidence: evidence.memberRanFor(fleetId, taskId),
+        worktreeExisted: evidence.worktreeExistedFor(fleetId, taskId),
         scan,
         selfPid: process.pid,
-        ...(worktreePath === undefined ? {} : { lease: leaseProbeFor(worktreePath, Date.now()) }),
+        ...(lease === undefined ? {} : { lease }),
       });
     };
   }
 
   /**
-   * `launchedAt` per recorded member, read once per fleet for the evidence cutoff.
+   * One fleet's run evidence, read once per probe.
    *
    * The plan read and the in-write recount both ask about the same members, so each
    * fleet's `fleet.json` is read once per probe rather than once per member. A fleet
    * that cannot be read simply has no recorded launch: the worktree's creation
    * instant is still a cutoff, and no cutoff at all keeps the member counted.
    */
-  function memberLaunchReader(
+  function memberRunEvidenceReader(
     gitCommonDir: string | undefined,
-  ): (fleetId: string, taskId: string) => number | undefined {
-    const byFleet = new Map<string, ReadonlyMap<string, number>>();
-    return (fleetId: string, taskId: string): number | undefined => {
+  ): (fleetId: string) => FleetRunEvidence {
+    const byFleet = new Map<string, FleetRunEvidence>();
+    return (fleetId: string): FleetRunEvidence => {
       const cached = byFleet.get(fleetId);
-      const launches = cached ?? recordedLaunches({ gitCommonDir, fleetId });
-      if (cached === undefined) byFleet.set(fleetId, launches);
-      return launches.get(taskId);
+      if (cached !== undefined) return cached;
+      const evidence = recordedRunEvidence({ gitCommonDir, fleetId });
+      byFleet.set(fleetId, evidence);
+      return evidence;
     };
   }
 
@@ -1172,7 +1303,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       (member) => member.taskId === options.taskId,
     )?.launchedAt;
     const launched = launchedAt === undefined ? {} : { launchedAt };
-    const worktreePath = resolveWorktreePath(options.cwd, `feat/${options.taskId}`);
+    const worktreePath = resolveWorktreePath(options.cwd, fleetMemberBranch(options.taskId));
     if (worktreePath === undefined) {
       return {
         taskId: options.taskId,
@@ -1571,12 +1702,12 @@ export function createFleet(deps: FleetDeps): FleetApi {
     now: number;
   }): Promise<{ ok: boolean; text: string }> {
     const { ctx, mode, taskId } = options;
-    const worktreePath = resolveWorktreePath(ctx.cwd, `feat/${taskId}`);
+    const worktreePath = resolveWorktreePath(ctx.cwd, fleetMemberBranch(taskId));
     const branch = readWorktreeBranch(worktreePath ?? ctx.cwd);
     const accepted = await acceptLandedMember({
       rootCwd: ctx.cwd,
       taskId,
-      branch: branch.ok ? branch.branch : `feat/${taskId}`,
+      branch: branch.ok ? branch.branch : fleetMemberBranch(taskId),
       worktreePath: worktreePath ?? "",
       baseBranch: mode.intent.baseBranch,
       closeBead: options.accept,
@@ -3216,7 +3347,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * yet and is reusable; anything else is refused with the bd-119 wording.
    */
   function fleetMemberOwnershipError(root: string, taskId: string): string | undefined {
-    const worktreePath = resolveWorktreePath(root, `feat/${taskId}`);
+    const worktreePath = resolveWorktreePath(root, fleetMemberBranch(taskId));
     if (worktreePath === undefined) return undefined;
     const persisted = readWorkflowState({ cwd: worktreePath });
     if (persisted === undefined) return undefined;
@@ -3255,7 +3386,39 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * worktree, handoff packet, workflow state, and daemon session. The fleet only
    * decides *which* members to launch and records the outcome.
    */
+  /**
+   * Spawn one member through the fleet's launch marker (bd-233).
+   *
+   * The marker is this member's only spawn-window signal: created before the worktree
+   * exists, refreshed while the spawn lives, and cleared in a `finally` once the session
+   * is spawn-committed or the attempt failed. Every member-spawn path
+   * (`belayd_fleet_launch`, `belayd_fleet_advance`, and any run-loop relaunch) reaches
+   * the spawner through the engine's `launchMember` seam, which is this function.
+   *
+   * A marker that cannot be cleared does not fail a started launch: the outcome carries
+   * the reason so the launch report shows why the member's slot frees a grace later.
+   */
   async function launchFleetMember(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    gitCommonDir: string;
+    fleetId: string;
+    base?: string;
+  }): Promise<FleetMemberLaunchOutcome> {
+    const spawned = await withFleetLaunchMarker({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      taskId: options.taskId,
+      now: Date.now(),
+      spawn: () => spawnFleetMember(options),
+    });
+    if (!spawned.ok) return { taskId: options.taskId, ok: false, detail: spawned.error };
+    if (spawned.warning === undefined) return spawned.value;
+    return { ...spawned.value, warning: spawned.warning };
+  }
+
+  /** The bare spawn, with no spawn-window bookkeeping (owned by `launchFleetMember`). */
+  async function spawnFleetMember(options: {
     ctx: ExtensionContext;
     taskId: string;
     base?: string;
@@ -3272,7 +3435,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         ctx,
         taskId,
         workflowType: resolution.type,
-        branch: `feat/${taskId}`,
+        branch: fleetMemberBranch(taskId),
         ...(options.base === undefined ? {} : { base: options.base }),
         resolutionSource: resolution.source,
         ...(resolution.matchedLabel === undefined ? {} : { matchedLabel: resolution.matchedLabel }),
@@ -3615,7 +3778,14 @@ export function createFleet(deps: FleetDeps): FleetApi {
         : { requestedConcurrency: options.requestedConcurrency }),
       ...(options.origin === undefined ? {} : { origin: options.origin }),
       probeOwnership: (taskId) => fleetMemberOwnershipError(ctx.cwd, taskId),
-      launchMember: (taskId) => launchFleetMember({ ctx, taskId, base: input.baseBranch }),
+      launchMember: (taskId) =>
+        launchFleetMember({
+          ctx,
+          taskId,
+          gitCommonDir: input.gitCommonDir,
+          fleetId: options.fleetId,
+          base: input.baseBranch,
+        }),
       // P3 ordering: one batched, read-only `bd show --brief-deps`. Any failure
       // degrades to "no known edges" inside the seam, never to a crashed launch.
       lookupDependencies: async (taskIds) => {
@@ -3930,7 +4100,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     rootCwd: string,
     taskId: string,
   ): { ok: true; branch: string; worktreePath: string } | { ok: false; error: string } {
-    const worktreePath = resolveWorktreePath(rootCwd, `feat/${taskId}`);
+    const worktreePath = resolveWorktreePath(rootCwd, fleetMemberBranch(taskId));
     if (worktreePath === undefined) {
       return {
         ok: false,
@@ -4302,8 +4472,55 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
+   * Whether a fleet's supervisor is provably dead, plus the fingerprint the prune must
+   * match (bd-233).
+   *
+   * The one place reconcile derives the recovery verdict. It reads the same three
+   * signals launch does — the recorded pid, the beat, and whether a run exists — and
+   * hands the pure decision to `supervisorProvablyDead`. It audits nothing: the audit
+   * belongs to the pass that actually repairs, so a no-op call leaves no recovery
+   * claim in another fleet's log (S1).
+   */
+  function supervisorRecoveryFor(options: {
+    gitCommonDir: string;
+    fleetId: string;
+    now: number;
+  }): SupervisorRecovery | undefined {
+    const loaded = readFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) return undefined;
+    const beat = readSupervisorHeartbeat({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    const verdict = supervisorProvablyDead({
+      intent: loaded.intent,
+      beat,
+      now: options.now,
+      liveness: {
+        isPidAlive: isProcessAlive,
+        pidStartTime: readProcessStartTime,
+      },
+    });
+    if (!verdict.dead) return undefined;
+    const fingerprint = supervisorRecordFingerprint(loaded.intent);
+    if (fingerprint === undefined) return undefined;
+    return {
+      fingerprint,
+      reason: verdict.reason,
+      ...(beat === undefined ? {} : { lastBeatAt: beat.heartbeatAt }),
+    };
+  }
+
+  /**
    * Refuse a cross-fleet repair unless this session supervises some fleet (bd-166),
-   * and audit the named target when it may proceed.
+   * or the target's supervisor is provably dead (bd-233).
+   *
+   * The supervised arm is audited here (it is a decision, not a repair). The recovery
+   * arm is returned to the caller so the audit happens after the pass actually repairs
+   * something.
    */
   function reconcileAuthorityRefusal(options: {
     ctx: ExtensionContext;
@@ -4311,8 +4528,13 @@ export function createFleet(deps: FleetDeps): FleetApi {
     own: FleetMode | undefined;
     targetFleetId: string;
     pruneDeadMembers: boolean;
-  }): string | undefined {
+  }): { ok: true; recovery?: SupervisorRecovery } | { ok: false; text: string } {
     const supervised = sessionSupervisedFleetIds(options.ctx, options.gitCommonDir);
+    const recovery = supervisorRecoveryFor({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.targetFleetId,
+      now: Date.now(),
+    });
     const authority = reconcileAuthority({
       targetFleetId: options.targetFleetId,
       ...(options.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
@@ -4320,9 +4542,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       supervisedFleetIds: supervised,
       repoFleetIds: listFleetIds({ gitCommonDir: options.gitCommonDir }),
       sessionId: options.ctx.sessionManager.getSessionId(),
+      ...(recovery === undefined
+        ? {}
+        : { supervisorDead: { dead: true as const, reason: recovery.reason } }),
     });
-    if (!authority.ok) return authority.error;
-    if (!authority.crossFleet) return undefined;
+    if (!authority.ok) return { ok: false, text: authority.error };
+    if (authority.recovery) {
+      return recovery === undefined ? { ok: true } : { ok: true, recovery };
+    }
+    if (!authority.crossFleet) return { ok: true };
     auditFleetAction({
       ctx: options.ctx,
       gitCommonDir: options.gitCommonDir,
@@ -4331,7 +4559,114 @@ export function createFleet(deps: FleetDeps): FleetApi {
       taskIds: [],
       detail: `target \`${options.targetFleetId}\`; session supervises ${supervised.join(", ")}`,
     });
-    return undefined;
+    return { ok: true };
+  }
+
+  /**
+   * Audit a repair that recovery authority actually applied (bd-233, S1).
+   *
+   * The degradation is deliberate and loud: repair authority over a fleet whose
+   * supervisor died, never the supervisor role itself (fleet.json is untouched). A
+   * call that repaired nothing writes nothing, so a no-op reconcile can never leave a
+   * recovery claim in another fleet's log.
+   */
+  function auditReconcileRecovery(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    targetFleetId: string;
+    recovery: SupervisorRecovery;
+    repairs: number;
+  }): void {
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.targetFleetId,
+      action: "reconcile-recovery",
+      taskIds: [],
+      detail:
+        `recovery: the supervisor is provably dead (${options.recovery.reason}), pid ` +
+        `${options.recovery.fingerprint.pid}` +
+        (options.recovery.lastBeatAt === undefined
+          ? ""
+          : `, last beat ${new Date(options.recovery.lastBeatAt).toISOString()}`) +
+        `; session ${options.ctx.sessionManager.getSessionId()} applied ` +
+        `${options.repairs} repair(s) without taking the supervisor role`,
+    });
+  }
+
+  /** The reconcile target plus the recovery evidence that licensed it, if any. */
+  type ReconcileTarget =
+    | { ok: true; mode: FleetMode; recovery?: SupervisorRecovery }
+    | { ok: false; text: string };
+
+  /** The default target when the caller names no fleet and holds none (bd-233). */
+  function resolveDefaultReconcileTarget(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    pruneDeadMembers: boolean;
+  }): ReconcileTarget {
+    // A single-fleet repository whose supervisor is provably dead may be reconciled
+    // without naming it: the operator is staring at the one fleet the tools used to
+    // refuse (bd-233). More than one fleet stays ambiguous, so the refusal names the
+    // explicit escape hatch instead of guessing.
+    const sole = soleProvablyDeadFleet({ gitCommonDir: options.gitCommonDir });
+    const mode =
+      sole === undefined
+        ? undefined
+        : fleetModeForId({ gitCommonDir: options.gitCommonDir, fleetId: sole });
+    if (sole === undefined || mode === undefined) {
+      return { ok: false, text: reconcileSupervisorOnlyRefusal(options.gitCommonDir) };
+    }
+    const authority = reconcileAuthorityRefusal({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      own: undefined,
+      targetFleetId: sole,
+      pruneDeadMembers: options.pruneDeadMembers,
+    });
+    return authority.ok
+      ? {
+          ok: true,
+          mode,
+          ...(authority.recovery === undefined ? {} : { recovery: authority.recovery }),
+        }
+      : { ok: false, text: authority.text };
+  }
+
+  /** A named-fleet target: ownership is checked, then the mode is resolved (bd-166). */
+  function resolveNamedReconcileTarget(options: {
+    ctx: ExtensionContext;
+    gitCommonDir: string;
+    own: FleetMode | undefined;
+    requestedFleetId: string | undefined;
+    pruneDeadMembers: boolean;
+  }): ReconcileTarget {
+    const targetFleetId = sanitizeFleetId(
+      options.requestedFleetId ?? options.own?.fleetId ?? DEFAULT_FLEET_ID,
+    );
+    const mode = fleetModeForId({ gitCommonDir: options.gitCommonDir, fleetId: targetFleetId });
+    if (mode === undefined) {
+      return {
+        ok: false,
+        text:
+          `No fleet intent for \`${targetFleetId}\` under ${options.gitCommonDir}; nothing to ` +
+          "reconcile.",
+      };
+    }
+    const authority = reconcileAuthorityRefusal({
+      ctx: options.ctx,
+      gitCommonDir: options.gitCommonDir,
+      own: options.own,
+      targetFleetId,
+      pruneDeadMembers: options.pruneDeadMembers,
+    });
+    return authority.ok
+      ? {
+          ok: true,
+          mode,
+          ...(authority.recovery === undefined ? {} : { recovery: authority.recovery }),
+        }
+      : { ok: false, text: authority.text };
   }
 
   /** Which fleet this reconcile call may repair, or the refusal text. */
@@ -4339,37 +4674,63 @@ export function createFleet(deps: FleetDeps): FleetApi {
     ctx: ExtensionContext;
     requested: string | undefined;
     pruneDeadMembers: boolean;
-  }): { ok: true; mode: FleetMode } | { ok: false; text: string } {
+  }): ReconcileTarget {
+    const common = gitCommonDirFor(options.ctx.cwd);
+    if (!common.ok) {
+      return { ok: false, text: `Fleet reconcile needs a git repository: ${common.error}` };
+    }
     const own = fleetModeFor(options.ctx);
     const requestedFleetId =
       options.requested === undefined || options.requested.trim() === ""
         ? undefined
         : options.requested.trim();
     if (own === undefined && requestedFleetId === undefined) {
-      return { ok: false, text: fleetSupervisorOnly("belayd_fleet_reconcile") };
+      return resolveDefaultReconcileTarget({
+        ctx: options.ctx,
+        gitCommonDir: common.gitCommonDir,
+        pruneDeadMembers: options.pruneDeadMembers,
+      });
     }
-    const common = gitCommonDirFor(options.ctx.cwd);
-    if (!common.ok) {
-      return { ok: false, text: `Fleet reconcile needs a git repository: ${common.error}` };
-    }
-    const targetFleetId = sanitizeFleetId(requestedFleetId ?? own?.fleetId ?? DEFAULT_FLEET_ID);
-    const mode = fleetModeForId({ gitCommonDir: common.gitCommonDir, fleetId: targetFleetId });
-    if (mode === undefined) {
-      return {
-        ok: false,
-        text:
-          `No fleet intent for \`${targetFleetId}\` under ${common.gitCommonDir}; nothing to ` +
-          "reconcile.",
-      };
-    }
-    const refusal = reconcileAuthorityRefusal({
+    return resolveNamedReconcileTarget({
       ctx: options.ctx,
       gitCommonDir: common.gitCommonDir,
       own,
-      targetFleetId,
+      requestedFleetId,
       pruneDeadMembers: options.pruneDeadMembers,
     });
-    return refusal === undefined ? { ok: true, mode } : { ok: false, text: refusal };
+  }
+
+  /**
+   * The one fleet in this repository whose supervisor is provably dead, if there is
+   * exactly one.
+   *
+   * Deliberately silent about why: the caller only uses this to pick a default target,
+   * and any refusal path names the explicit `{"fleetId":"<id>"}` escape hatch instead.
+   */
+  function soleProvablyDeadFleet(options: { gitCommonDir: string }): string | undefined {
+    const fleetIds = listFleetIds({ gitCommonDir: options.gitCommonDir });
+    if (fleetIds.length !== 1) return undefined;
+    const directoryId = fleetIds[0];
+    if (directoryId === undefined) return undefined;
+    const fleetId = sanitizeFleetId(directoryId);
+    const dead = supervisorRecoveryFor({
+      gitCommonDir: options.gitCommonDir,
+      fleetId,
+      now: Date.now(),
+    });
+    return dead === undefined ? undefined : fleetId;
+  }
+
+  /** The reconcile-specific supervisor-only refusal, naming the recovery escape hatch. */
+  function reconcileSupervisorOnlyRefusal(gitCommonDir: string): string {
+    const fleetIds = listFleetIds({ gitCommonDir });
+    const known = fleetIds.length === 0 ? "none" : fleetIds.map(sanitizeFleetId).join(", ");
+    return (
+      `${fleetSupervisorOnly("belayd_fleet_reconcile")} If the fleet's supervisor is dead, ` +
+      "name it explicitly in the tool call: `belayd_fleet_reconcile {" +
+      '"fleetId":"<id>"}` — a provably dead supervisor does not need to be re-armed to be ' +
+      `repaired. Fleets found here: ${known}.`
+    );
   }
 
   /** A release request's decision, or the refusal text (bd-166). */
@@ -5748,6 +6109,59 @@ export function createFleet(deps: FleetDeps): FleetApi {
     },
   });
 
+  /**
+   * Reap the ordering gates a reconcile pass left behind (bd-158).
+   *
+   * A repair is not a tick: sweep every member *and* the members the pass just pruned
+   * (a pruned bead is no longer a member, so only a full pass still asks bd about the
+   * gates that block it). One rotating bead would leave the rest of the fleet unswept
+   * while the output claimed otherwise.
+   */
+  async function reapReconciledMemberGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    repairs: readonly string[];
+  }): Promise<void> {
+    // Re-read the intent: the reconcile may have just pruned a member.
+    const reconciled = readFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+    });
+    if (!reconciled.ok || reconciled.intent === undefined) return;
+    const pruned = options.repairs
+      .filter((repair) => repair.startsWith("member-pruned:"))
+      .map((repair) => repair.slice("member-pruned:".length))
+      .filter((taskId) => taskId !== "");
+    const reaped = await reapOrderingGates({
+      ctx: options.ctx,
+      mode: options.mode,
+      intent: reconciled.intent,
+      now: Date.now(),
+      tick: 0,
+      sweep: "all",
+      extraBeads: pruned,
+    });
+    for (const warning of reaped.warnings) options.ctx.ui.notify(warning, "warning");
+  }
+
+  /** Record the recovery claim only for a pass that actually repaired something (S1). */
+  function auditRecoveryIfRepaired(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    target: ReconcileTarget & { ok: true };
+    repairs: number;
+  }): void {
+    const recovery = options.target.recovery;
+    if (recovery === undefined || options.repairs === 0) return;
+    auditReconcileRecovery({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      targetFleetId: options.mode.fleetId,
+      recovery,
+      repairs: options.repairs,
+    });
+  }
+
   pi.registerTool({
     name: "belayd_fleet_reconcile",
     label: "Belayd fleet reconcile",
@@ -5764,15 +6178,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "worktree lease (a member session renews `.belayd/orchestrator.json`; the process table " +
       "cannot see a pi-web session) plus the process table for CLI-spawned runs; " +
       "prune-dead-members=true removes members whose orchestrator is provably gone (no live " +
-      "lease AND no matching process — `unknown` is never pruned, and a live supervisor may " +
-      "prune); worktrees, transcripts, and beads stay. A second run finds nothing to do. " +
-      "Targets this session's own fleet by default; fleetId names another fleet in this " +
-      "repository, which is accepted only when this session supervises some fleet there " +
-      "(audited), so a fleet whose supervisor died can be repaired without editing " +
-      "fleet.json. A cross-fleet call repairs the queue and park; pruneDeadMembers is " +
-      "refused unless the named fleet is this session's own (re-arm that fleet and run " +
-      "reconcile from its own session). Supervisor sessions only; acts in this " +
-      "session's root checkout.",
+      "lease AND no matching process AND no worktree that still exists — `unknown` is never " +
+      "pruned); worktrees, transcripts, and beads stay. retryMembers clears the recorded stop " +
+      "of members a human wants retried, so the run's next tick plans them again. A second run " +
+      "finds nothing to do. Targets this session's own fleet by default; fleetId names another " +
+      "fleet in this repository, accepted when this session supervises some fleet there " +
+      "(audited) or when that fleet's supervisor is provably dead (a dead pid or a cold beat), " +
+      "in which case a prune is allowed too — repair authority only, never the supervisor role. " +
+      "Supervisor sessions only, except for a provably dead fleet; acts in this session's root " +
+      "checkout.",
     parameters: Type.Object({
       pruneDeadMembers: Type.Optional(
         Type.Boolean({
@@ -5784,8 +6198,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
       fleetId: Type.Optional(
         Type.String({
           description:
-            "Fleet to repair, when it is not this session's own (a fleet whose supervisor died). " +
-            "Accepted only when this session supervises some fleet in this repository",
+            "Fleet to repair, when it is not this session's own (a fleet whose supervisor is " +
+            "not running). Accepted when this session supervises some fleet in this repository, " +
+            "or when the named fleet's supervisor is provably dead",
+        }),
+      ),
+      retryMembers: Type.Optional(
+        Type.Array(Type.String(), {
+          maxItems: FLEET_RUN_MEMBERS_MAX,
+          description:
+            "Members whose recorded stop-for-human to clear, so the run's next tick plans them " +
+            'again (e.g. ["bd-42"]). A member whose worktree is gone needs ' +
+            "prune-dead-members plus a launch instead",
         }),
       ),
     }),
@@ -5799,26 +6223,37 @@ export function createFleet(deps: FleetDeps): FleetApi {
       if (!target.ok) return textToolResult(target.text, 1);
       const mode = target.mode;
 
+      const now = Date.now();
       const result = await runFleetReconcile({
         gitCommonDir: mode.gitCommonDir,
         fleetId: mode.fleetId,
         sessionId: extensionCtx.sessionManager.getSessionId(),
         pid: process.pid,
         rootCwd: extensionCtx.cwd,
-        now: Date.now(),
+        now,
         scan: scanProcesses(),
         git: defaultFleetMergeGitRunner,
         isPidAlive: isProcessAlive,
         pidStartTime: readProcessStartTime,
         selfPid: process.pid,
-        // The worktree lease is the only liveness evidence a pi-web-hosted
-        // orchestrator produces; without it every live member looks absent and
-        // gets pruned, which is what started a second bd-37 orchestrator.
-        leaseFor: (taskId) => {
-          const worktreePath = resolveWorktreePath(extensionCtx.cwd, `feat/${taskId}`);
-          return worktreePath === undefined ? undefined : leaseProbeFor(worktreePath, Date.now());
-        },
+        // The worktree lease, run evidence, and deleted-worktree proof are the only
+        // liveness evidence a pi-web-hosted orchestrator produces; without them every
+        // live member looks absent and gets pruned, which is what started a second
+        // bd-37 orchestrator. The wiring is the launch/status probe's, reused so a
+        // repair cannot disagree with the capacity view (bd-166, bd-233).
+        ...memberLivenessSeams(
+          memberEvidenceProbe({
+            ctx: extensionCtx,
+            gitCommonDir: mode.gitCommonDir,
+            now,
+          }),
+          mode.fleetId,
+        ),
+        ...(target.recovery === undefined ? {} : { recovery: target.recovery }),
         ...(params.pruneDeadMembers === true ? { pruneDeadMembers: true } : {}),
+        ...(params.retryMembers === undefined || params.retryMembers.length === 0
+          ? {}
+          : { retryMembers: params.retryMembers }),
         // bd-158: a prune removes members, so their ordering gates must be
         // resolved by the same repair — otherwise only a later tick could.
         orderingGates: {
@@ -5840,34 +6275,19 @@ export function createFleet(deps: FleetDeps): FleetApi {
         extensionCtx.ui.notify(warning, "warning");
         console.warn(`[belayd-harness] ${warning}`);
       }
-      // A prune removes a member, which orphans its bd ordering gates (bd-158):
-      // reap them here so a repair leaves no open gate behind. Re-read the intent,
-      // because the reconcile may have just pruned a member.
-      const reconciled = readFleetIntent({
-        gitCommonDir: mode.gitCommonDir,
-        fleetId: mode.fleetId,
+      // Only a pass that actually repaired something claims recovery authority in the
+      // target's audit log (S1).
+      auditRecoveryIfRepaired({
+        ctx: extensionCtx,
+        mode,
+        target,
+        repairs: result.repairs.length,
       });
-      const pruned = result.repairs
-        .filter((repair) => repair.startsWith("member-pruned:"))
-        .map((repair) => repair.slice("member-pruned:".length))
-        .filter((taskId) => taskId !== "");
-      // A repair is not a tick: sweep every member *and* the members it just pruned
-      // (a pruned bead is no longer a member, so only a full pass still asks bd
-      // about the gates that block it). One rotating bead would leave the rest of
-      // the fleet unswept while the output claimed otherwise.
-      const reaped =
-        reconciled.ok && reconciled.intent !== undefined
-          ? await reapOrderingGates({
-              ctx: extensionCtx,
-              mode,
-              intent: reconciled.intent,
-              now: Date.now(),
-              tick: 0,
-              sweep: "all",
-              extraBeads: pruned,
-            })
-          : { warnings: [], gateNoticeIds: [] };
-      for (const warning of reaped.warnings) extensionCtx.ui.notify(warning, "warning");
+      await reapReconciledMemberGates({
+        ctx: extensionCtx,
+        mode,
+        repairs: result.repairs,
+      });
       return textToolResult(result.text, result.ok ? 0 : 1);
     },
   });

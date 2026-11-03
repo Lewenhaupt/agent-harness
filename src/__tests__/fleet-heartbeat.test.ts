@@ -174,6 +174,72 @@ describe("effectiveSupervisorState", () => {
       }),
     ).toEqual({ kind: "none" });
   });
+
+  it("AC1: a provably dead pid closes the fresh-beat window immediately", () => {
+    // The incident: the beat was five minutes old and the process gone, yet the fleet
+    // counted live for the full 10-minute window while every repair tool refused.
+    const supervisor = {
+      sessionId: "session-a",
+      pid: 4_242,
+      pidStartTime: "1234",
+      armToken: "token-a",
+    };
+    const beat: SupervisorHeartbeat = {
+      schemaVersion: 1,
+      fleetId: "default",
+      sessionId: "session-a",
+      pid: 4_242,
+      heartbeatAt: 1_000,
+    };
+    const deadPid: FleetSupervisorLiveness = { isPidAlive: () => false };
+    expect(
+      effectiveSupervisorState({
+        state: live,
+        runMode: true,
+        beat,
+        now: 1_100,
+        supervisor,
+        liveness: deadPid,
+      }),
+    ).toEqual(dead);
+    // A recycled pid (start time mismatch) is dead too.
+    expect(
+      effectiveSupervisorState({
+        state: live,
+        runMode: true,
+        beat,
+        now: 1_100,
+        supervisor,
+        liveness: { isPidAlive: () => true, pidStartTime: () => "9999" },
+      }),
+    ).toEqual(dead);
+    // A live pid with a fresh beat stays live.
+    expect(
+      effectiveSupervisorState({
+        state: live,
+        runMode: true,
+        beat,
+        now: 1_100,
+        supervisor,
+        liveness: { isPidAlive: () => true },
+      }),
+    ).toEqual(live);
+    // Without the probe the beat verdict is final, exactly as before this bead.
+    expect(
+      effectiveSupervisorState({ state: live, runMode: true, beat, now: 1_100, supervisor }),
+    ).toEqual(live);
+    // And an explicit fleet still returns the pid-based state untouched.
+    expect(
+      effectiveSupervisorState({
+        state: live,
+        runMode: false,
+        beat,
+        now: 1_100,
+        supervisor,
+        liveness: deadPid,
+      }),
+    ).toEqual(live);
+  });
 });
 
 describe("isFleetLoopProvablyDead", () => {

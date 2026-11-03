@@ -67,7 +67,7 @@ node_modules/.bin/vitest run --config vitest.integration.config.ts test/fleet-st
 | Terminal release / halt / pause split, idempotence | `src/__tests__/fleet-run.test.ts`, `src/__tests__/extension-fleet-p1.test.ts` | `releaseRunMembers (bd-166)` (5 cases); `releases a finished run's unlanded member without pruning it (bd-166)`, `releases a halted run's unlanded members (bd-166)`, `does not release members when a run merely pauses (bd-166)` |
 | Advance records members + beats the heartbeat | `src/__tests__/extension-fleet-p1.test.ts` | `records an advance-launched member in the live run and beats the heartbeat (bd-166)` |
 | Outside-fleet landing (closed bead **and** git ancestor) | `src/__tests__/fleet-run.test.ts`, `src/__tests__/extension-fleet-p1.test.ts` | `planOutsideFleetLandings (bd-166)` (three cases incl. `requires both facts: a closed bead alone or an ancestor alone is not a landing`); `lands a member whose bead is closed and whose branch is already on the base (bd-166)`, `sweeps one member bead per tick, rotating with the run ticks (bd-166)` |
-| Named-fleet reconcile, cross-fleet prune refused | `src/__tests__/fleet-reconcile.test.ts`, `src/__tests__/extension-fleet-p1.test.ts` | `reconcileAuthority (bd-166)`; `cross-fleet reconcile (bd-166)` → `repairs a named fleet's queue/park and audits the target`, `refuses pruneDeadMembers for a fleet this session does not supervise` |
+| Named-fleet reconcile, cross-fleet prune refused | `src/__tests__/fleet-reconcile.test.ts`, `src/__tests__/extension-fleet-p1.test.ts` | `reconcileAuthority (bd-166)`; `cross-fleet reconcile (bd-166)` → `repairs a named fleet's queue/park and audits the target`. bd-233 changed the refusal: `still refuses a cross-fleet prune while the target's supervisor is live`, `AC1: prunes a provably dead fleet from a session that supervises another one` |
 | `belayd_fleet_release` | `src/__tests__/extension-fleet-p1.test.ts` | `release (bd-166)` → `gives a member's slot back while keeping it a member`, `refuses an id that is not a member of this fleet`, `refuses to release a member whose orchestrator is live` |
 | `released[]` schema, per-fleet keying, cleared by landing | `src/__tests__/fleet-status.test.ts`, `src/__tests__/fleet-launch.test.ts`, `src/__tests__/fleet-state.test.ts` | `rejects an unknown release reason, like the deferred reason enum (bd-166)`; `frees an abandoned fleet's slots once its members are absent`, `does not count a released member of another fleet`; `drops a landed member's release entry (bd-166)` |
 
@@ -473,8 +473,15 @@ node_modules/.bin/vitest run src/__tests__/extension-fleet-p1.test.ts \
 
 ### 9. Repair a named fleet, and see the prune refused
 
+> **Superseded by bd-233.** The demo below records bd-166's rule: a cross-fleet
+> prune was refused outright. bd-233 adds recovery authority — the fleets here name
+> a provably dead pid, so the same prune is now *allowed* and audited
+> `reconcile-recovery`. The current rule and the ordered recovery path are in
+> `docs/fleet-reconcile.md` ("Recovering from a dead supervisor").
+
 Cross-fleet **repair** is allowed when this session supervises some fleet in the
-repository; cross-fleet **prune** is not.
+repository; cross-fleet **prune** is not (bd-166; superseded for a provably dead
+fleet by bd-233).
 
 ```bash
 cross=/tmp/bd166-cross
@@ -594,11 +601,19 @@ the worktree's creation and the run's recorded `launchedAt`. A bare worktree
 mid-spawn, a manifest inherited from a copy, and a member with no worktree at all
 are all `unknown`, and unknown counts.
 
+> **Updated by bd-233.** "No worktree at all" is `unknown` only while nothing
+> proves the tree ever existed. Once a launch has created the branch, deleting the
+> worktree leaves `feat/<taskId>` behind, and that is proof: the member resolves to
+> `absent`, frees its slot, and is prunable. The demo above still holds because
+> bd-17 never had a branch either; the incident that motivated bd-233 had three
+> members with surviving branches and a deleted tree, which used to hold every slot
+> forever.
+
 ### The three new warnings
 
 | Warning | Trigger | What to do |
 |---|---|---|
-| `fleet <id> still records <taskId>, but no worktree holds feat/<taskId>; release it with belayd_fleet_release <taskId> (or reconcile --prune-dead-members) if its work is gone` (`stale-member`) | A recorded member has no worktree, and is not released | Its liveness is `unknown` (no worktree is no proof nothing is spawning), so it holds a slot. `belayd_fleet_release <taskId>` frees the slot and keeps everything; `belayd_fleet_reconcile` `pruneDeadMembers` from that fleet's own supervisor erases the record |
+| `fleet <id> still records <taskId>, but no worktree holds feat/<taskId>; release it with belayd_fleet_release <taskId> (or reconcile --prune-dead-members) if its work is gone` (`stale-member`) | A recorded member has no worktree, and is not released | Its liveness is `unknown` (no worktree and no proof one existed is no proof nothing is spawning), so it holds a slot. `belayd_fleet_release <taskId>` frees the slot and keeps everything; `belayd_fleet_reconcile` `pruneDeadMembers` erases the record — from that fleet's own supervisor, or (bd-233) from any session when the fleet's supervisor is provably dead. With a surviving `feat/<taskId>` branch it is `absent` and already frees the slot |
 | `fleet <id> counts N member(s) against the ceiling of 3 but has no live supervisor (recorded supervisor: dead); re-arm it or release the members` (`capacity-held`) | A fleet with no live supervisor still counts slots | Re-arm it (`/fleet <ids> --fleet <id>`), release the members you know are done, or reconcile it by name from a session that supervises any fleet here |
 | `fleet <id> has an active run whose last tick was at <ISO> (n tick(s), … ago, bound 10); nothing will land or advance until a session resumes the loop …` (`run-not-ticking`) | The run record is still active but nothing has ticked for > 2.5 min | The ticker is a timer inside the supervisor session: the session is busy or gone. Re-arm the fleet (or land/release the members); the run will not finish on its own |
 

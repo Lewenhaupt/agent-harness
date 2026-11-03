@@ -196,6 +196,15 @@ export function classifyMemberLivenessFromScan(options: {
  * the caller injects `memberRanEvidence` (state file present **or** a run manifest
  * of this task); keying on the state file alone would count a finished member
  * forever (bd-166).
+ *
+ * A worktree that is *gone* is a different question from one that does not exist
+ * yet, and bd-233 is the leak that came from conflating them: a member whose tree
+ * was deleted stayed `unknown` (counted, never prunable) forever. `worktreeExisted`
+ * is the injected answer — a surviving `feat/<taskId>` branch or a listed
+ * worktree — so "no worktree now, but one provably existed" resolves to `absent`.
+ * While a spawn window is in flight (that member's launch marker, see
+ * `fleetSpawnInFlight`) the caller injects it as false, which keeps the bd-166
+ * invariant for a relaunch: its surviving branch is not proof of absence yet.
  */
 export function classifyMemberLivenessInWorktree(options: {
   taskId: string;
@@ -211,24 +220,38 @@ export function classifyMemberLivenessInWorktree(options: {
    * otherwise-`absent` member with an existing worktree.
    */
   memberRanEvidence: boolean;
+  /**
+   * Whether the member's worktree provably existed (`memberWorktreeExisted`,
+   * `fleet-run.ts`): a surviving branch or a listed worktree. Only consulted when
+   * no worktree path resolves now.
+   */
+  worktreeExisted: boolean;
   scan: FleetProcessScan;
   selfPid?: number;
   /** Classified lease for that worktree, when the caller could read one. */
   lease?: FleetMemberLeaseProbe;
 }): FleetMemberLiveness {
   if (options.worktreePath === undefined) {
-    // An argv token is evidence on its own (a CLI-spawned orchestrator), so a live
-    // process still wins when the worktree cannot be resolved. Otherwise the member
-    // is unclassifiable, never absent: the launch may still be creating the tree.
+    // Positive evidence still wins: a live argv token (a CLI-spawned orchestrator)
+    // or a live lease means something is running the member, wherever the tree is.
     const fromScan = classifyMemberLivenessFromScan({
       taskId: options.taskId,
       scan: options.scan,
       ...(options.selfPid === undefined ? {} : { selfPid: options.selfPid }),
+      ...(options.lease === undefined ? {} : { lease: options.lease }),
     });
     if (fromScan.kind === "live") return fromScan;
+    // A failed scan or an unreadable lease is "cannot see", never "gone": it must not
+    // become `absent` just because the tree disappeared (bd-166/bd-233).
+    if (fromScan.kind === "unknown") return fromScan;
+    // A tree that provably existed and is gone now is absence, not ignorance: this
+    // is the verdict that frees the slot and licenses a prune (bd-233).
+    if (options.worktreeExisted) return { kind: "absent" };
     return {
       kind: "unknown",
-      reason: `no worktree for ${options.taskId} yet (a launch may still be creating it)`,
+      reason:
+        `no worktree for ${options.taskId}, and no proof one ever existed ` +
+        "(a launch may still be creating it)",
     };
   }
   const fromScan = classifyMemberLivenessFromScan({

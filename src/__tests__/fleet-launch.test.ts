@@ -574,6 +574,28 @@ describe("runFleetLaunch", () => {
     expect(actions).toEqual(["schedule-planned", "launch", "member-launch", "member-launch"]);
   });
 
+  it("S3: a post-spawn warning rides the launch report", async () => {
+    const fs = createFakeFleetFs();
+
+    const result = await runFleetLaunch({
+      ...base,
+      taskIds: ["bd-12"],
+      requestedConcurrency: 5,
+      probeOwnership: () => undefined,
+      launchMember: async (taskId) => ({
+        taskId,
+        ok: true,
+        detail: `/repo.feat-${taskId}`,
+        warning: `${taskId}: the spawn marker could not be cleared (EACCES)`,
+      }),
+      fs,
+    });
+
+    expect(result.ok).toBe(true);
+    // The launch's existing warning channel is what `applyFleetLaunchResult` notifies.
+    expect(result.warnings).toContain("bd-12: the spawn marker could not be cleared (EACCES)");
+  });
+
   it("refuses an invalid request with zero side effects", async () => {
     const fs = createFakeFleetFs();
     let launched = 0;
@@ -1715,6 +1737,7 @@ describe("runFleetLaunch: liveness-aware capacity and releases (bd-166)", () => 
       taskId: "bd-30",
       worktreePath: "/repo.feat-bd-30",
       memberRanEvidence: false,
+      worktreeExisted: false,
       scan: { ok: true, processes: [] },
     });
     expect(midSpawn.kind).toBe("unknown");

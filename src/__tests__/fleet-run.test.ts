@@ -26,6 +26,7 @@ import {
   FLEET_RUN_START_GRACE_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
   finishFleetRun,
+  fleetMemberBranch,
   fleetMemberSignature,
   fleetMemberSignatures,
   fleetProgressChanged,
@@ -35,6 +36,7 @@ import {
   isFleetRunActive,
   memberEvidenceCutoff,
   memberRanEvidence,
+  memberWorktreeExisted,
   planFleetTick,
   planGateNotices,
   planOutsideFleetLandings,
@@ -45,6 +47,7 @@ import {
   recordRunMemberStopped,
   recordRunTick,
   releaseRunMembers,
+  retryRunMembers,
   runsBelongingToMember,
   startFleetRun,
   worktreeCreatedAtFromStat,
@@ -2058,5 +2061,120 @@ describe("idle accounting by member progress", () => {
       now: 3,
     });
     expect(halted.action).toMatchObject({ kind: "halt", reason: "stalled" });
+  });
+});
+
+// ── Member retry and deleted-worktree evidence (bd-233) ────────────────
+
+describe("fleetMemberBranch (bd-233)", () => {
+  it("is the one naming rule launch, status, and the branch probe share", () => {
+    // Worktree path resolution, launch's branch, and the deleted-worktree proof all key
+    // on this, so a divergence would make one caller look at another branch's tree.
+    for (const taskId of ["bd-12", "bd-233.1", "bd-9"]) {
+      expect(fleetMemberBranch(taskId)).toBe(`feat/${taskId}`);
+    }
+  });
+});
+
+describe("memberWorktreeExisted (bd-233)", () => {
+  it("counts a surviving branch or a listed worktree as proof the tree existed", () => {
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: true,
+        worktreeListed: false,
+        spawnInFlight: false,
+      }),
+    ).toBe(true);
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: false,
+        worktreeListed: true,
+        spawnInFlight: false,
+      }),
+    ).toBe(true);
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: false,
+        worktreeListed: false,
+        spawnInFlight: false,
+      }),
+    ).toBe(false);
+    expect(
+      memberWorktreeExisted({
+        taskId: "",
+        branchExists: true,
+        worktreeListed: true,
+        spawnInFlight: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("W2: an in-flight spawn marker is not proof of absence", () => {
+    // A relaunch reuses the surviving branch, so `branchExists` is already true while
+    // the new worktree is being created. The member-scoped marker keeps it `unknown`
+    // (counted, never pruned) until the spawner clears it or it expires.
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: true,
+        worktreeListed: false,
+        spawnInFlight: true,
+      }),
+    ).toBe(false);
+    // No branch at all is unchanged: not even a candidate for absence.
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: false,
+        worktreeListed: false,
+        spawnInFlight: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("retryRunMembers (bd-233)", () => {
+  function runWithStops(taskIds: readonly string[], stopped: readonly string[]): FleetRun {
+    return {
+      ...startFleetRun({
+        now: 1_000,
+        accept: false,
+        members: taskIds.map((taskId) => ({ taskId })),
+      }),
+      stopped: stopped.map((taskId) => ({
+        taskId,
+        reason: "orchestrator-missing" as const,
+        detail: "no live lease",
+        at: 1_000,
+      })),
+    };
+  }
+
+  it("clears only the requested members' stops and advances the run clock", () => {
+    const run = runWithStops(["bd-12", "bd-15"], ["bd-15"]);
+    const retried = retryRunMembers({ run, taskIds: ["bd-15"], now: 5_000 });
+
+    expect(retried.retried).toEqual(["bd-15"]);
+    expect(retried.run.stopped ?? []).toEqual([]);
+    expect(retried.run.updatedAt).toBe(5_000);
+  });
+
+  it("keeps the stops it was not asked about", () => {
+    const run = runWithStops(["bd-12", "bd-15"], ["bd-12", "bd-15"]);
+    const retried = retryRunMembers({ run, taskIds: ["bd-15"], now: 5_000 });
+
+    expect(retried.retried).toEqual(["bd-15"]);
+    expect((retried.run.stopped ?? []).map((entry) => entry.taskId)).toEqual(["bd-12"]);
+  });
+
+  it("is a no-op that returns the same record when nothing matches", () => {
+    const run = runWithStops(["bd-12"], []);
+    const retried = retryRunMembers({ run, taskIds: ["bd-12"], now: 5_000 });
+
+    expect(retried.retried).toEqual([]);
+    expect(retried.run).toBe(run);
   });
 });

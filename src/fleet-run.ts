@@ -482,6 +482,51 @@ export function memberRanEvidence(options: {
 }
 
 /**
+ * The branch a fleet member's worktree is checked out on.
+ *
+ * One home for the naming rule: launch creates it, status reads it, and
+ * {@link memberWorktreeExisted} asks whether it outlived the worktree.
+ */
+export function fleetMemberBranch(taskId: string): string {
+  return `feat/${taskId}`;
+}
+
+/**
+ * Whether a member's worktree provably existed (bd-233).
+ *
+ * The capacity leak this closes: a member whose worktree was deleted used to be
+ * classified `unknown` forever, and `unknown` holds a slot. Two facts prove the
+ * tree existed even when no path resolves now — a local branch of this member
+ * still exists (removing a worktree does not delete its branch), or git still
+ * lists a worktree for it.
+ *
+ * Injected booleans, never a probe: the caller reads them through the git seam it
+ * already has (launch, status, reconcile) and this module stays free of git.
+ *
+ * `false` is not "gone" in two cases, both handled by the caller:
+ *
+ * - a first spawn has neither a branch nor a worktree yet;
+ * - a relaunch reuses the surviving branch, so `branchExists` is already true while
+ *   the new tree is still being created. `spawnInFlight` is the member-scoped answer
+ *   (`fleetSpawnInFlight`, `fleet-status.ts`): it comes from that member's launch
+ *   marker, never from a periodically rewritten fleet record, so a ticking run
+ *   cannot keep every member's window open.
+ */
+export function memberWorktreeExisted(options: {
+  taskId: string;
+  /** A local branch of this member exists (its worktree may have been removed). */
+  branchExists: boolean;
+  /** `git worktree list` carries a worktree for this member. */
+  worktreeListed: boolean;
+  /** A spawn marker for this member is still inside its grace window. */
+  spawnInFlight: boolean;
+}): boolean {
+  if (options.taskId === "") return false;
+  if (!options.branchExists && !options.worktreeListed) return false;
+  return !options.spawnInFlight;
+}
+
+/**
  * The cutoff {@link memberRanEvidence} needs: the newest instant this execution can
  * have started at.
  *
@@ -1198,6 +1243,37 @@ export function recordRunMemberLanded(options: {
     // A member that landed no longer needs a human, so a stop it carried while its
     // retry finished must not survive into the run's outcome.
     stopped: (options.run.stopped ?? []).filter((entry) => entry.taskId !== options.taskId),
+  };
+}
+
+/**
+ * Clear the recorded stops of the members an operator asked to retry (bd-233).
+ *
+ * Dropping a `stopped` entry is the only documented way back from "needs a human":
+ * `planFleetTick` filters members through `isStopped`, so clearing it puts the
+ * member in front of the next tick again — which either lands the work it
+ * delivered or stops it again for the same (still true) reason. Members not named
+ * here keep their stops, and a run with nothing to clear is returned untouched so
+ * the write path stays a no-op.
+ */
+export function retryRunMembers(options: {
+  run: FleetRun;
+  taskIds: readonly string[];
+  now: number;
+}): { run: FleetRun; retried: readonly string[] } {
+  const requested = new Set(options.taskIds);
+  const stopped = options.run.stopped ?? [];
+  const retried = stopped
+    .filter((entry) => requested.has(entry.taskId))
+    .map((entry) => entry.taskId);
+  if (retried.length === 0) return { run: options.run, retried: [] };
+  return {
+    run: {
+      ...options.run,
+      updatedAt: options.now,
+      stopped: stopped.filter((entry) => !requested.has(entry.taskId)),
+    },
+    retried,
   };
 }
 

@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import { FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "../fleet-capacity.js";
 import { countActiveFleetOrchestrators } from "../fleet-launch.js";
 import { DEFAULT_FLEET_PUBLISH } from "../fleet-publish.js";
+import { reportMemberLiveness } from "../fleet-reconcile.js";
 import { FLEET_RUN_STALE_TICK_MS, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { classifyMemberLease, classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
 import {
@@ -25,6 +26,7 @@ import {
   DEFAULT_FLEET_ID,
   deriveFleetMemberState,
   FLEET_INTENT_MEMBERS_MAX,
+  FLEET_MEMBER_SPAWN_GRACE_MS,
   FLEET_MEMBER_STATES,
   FLEET_SCHEMA_VERSION,
   type FleetBeadEngagement,
@@ -40,6 +42,7 @@ import {
   fleetInboxDir,
   fleetIntentFilePath,
   fleetIntentWriteRefusal,
+  fleetLaunchMarkerPath,
   fleetMergeQueueFilePath,
   fleetStateDir,
   formatBeadOwnership,
@@ -225,7 +228,12 @@ function createFakeFs(
       if (createdAt === undefined) throw new Error(`ENOENT: ${path}`);
       return { birthtimeMs: createdAt, mtimeMs: createdAt };
     },
-    existsSync: (path) => files.has(path),
+    existsSync: (path) =>
+      files.has(path) ||
+      worktrees.has(path) ||
+      // A directory exists when a file was written inside it (the fixtures only seed
+      // files), so a worktree with a workflow state or manifest is present on disk.
+      [...files.keys()].some((file) => file.startsWith(`${path}/`)),
     readFileSync: (path) => {
       const content = files.get(path);
       if (content === undefined) throw new Error(`ENOENT: ${path}`);
@@ -1889,6 +1897,7 @@ describe("capacity arithmetic (bd-166)", () => {
       taskId: "bd-12",
       worktreePath: "/repo.feat-bd-12",
       memberRanEvidence: true,
+      worktreeExisted: false,
       scan: { ok: true, processes: [] },
       lease: stalePending,
     });
@@ -2229,6 +2238,237 @@ describe("readFleetStatus", () => {
     expect(result.value.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["own-plan"]);
     expect(result.value.members[0]).toHaveProperty("interruptedRunCount", 0);
     expect(formatFleetStatus(result.value)).toContain("latest runs: plan=completed");
+  });
+
+  it("AC2: a member whose worktree is gone but whose branch survives is absent, not unknown", () => {
+    // The capacity leak: the tree was deleted, so nothing can be probed, and the member
+    // stayed `unknown` (which holds a slot) forever. Its branch outlives the worktree,
+    // which proves the tree existed, so the honest verdict is `absent`.
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-15"] }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: (taskId) => taskId === "bd-15",
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({
+      ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+      counted: 0,
+      free: FLEET_MAX_CONCURRENT_ORCHESTRATORS,
+    });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({
+      members: 1,
+      absent: 1,
+      unknown: 0,
+    });
+
+    // Reconcile classifies the same evidence with the same classifier, so a repair and
+    // the capacity view cannot disagree about a deleted worktree (bd-233).
+    const report = reportMemberLiveness({
+      members: ["bd-15"],
+      scan: { ok: true, processes: [] },
+      leaseFor: () => ({ state: "absent" }),
+      worktreeExistedFor: (taskId) => taskId === "bd-15",
+    });
+    expect(report[0]?.liveness.kind).toBe("absent");
+  });
+
+  it("W1: treats a listed worktree whose directory is gone as absent, not unknown", () => {
+    // `git worktree list` keeps reporting a worktree after `rm -rf` (until `git
+    // worktree prune`), so resolving a path is not proof the tree is there. The listing
+    // is proof it existed, which is the `absent` verdict bd-233 documents.
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-12"], updatedAt: 2_000 }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      branchExists: () => false,
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 0, free: 3 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ absent: 1, unknown: 0 });
+
+    // Reconcile reaches the same verdict from the same evidence.
+    const report = reportMemberLiveness({
+      members: ["bd-12"],
+      scan: { ok: true, processes: [] },
+      leaseFor: () => ({ state: "absent" }),
+      worktreeExistedFor: () => true,
+      worktreeFor: () => undefined,
+    });
+    expect(report[0]?.liveness.kind).toBe("absent");
+  });
+
+  it("W1: a listed worktree that is still on disk keeps the bare-tree verdict", () => {
+    // The normalisation must not turn a mid-spawn tree (present, no evidence it ran)
+    // into absence: it is `unknown` and counted, exactly as before.
+    const fs = createFakeFs(
+      {
+        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+          sampleIntent({ taskIds: ["bd-12"], updatedAt: 2_000 }),
+        ),
+      },
+      { "/repo.feat-bd-12": 1_000 },
+    );
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      branchExists: () => false,
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 1, free: 2 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ unknown: 1, absent: 0 });
+  });
+
+  it("CRITICAL: a ticking run's deleted worktree is absent, not held by updatedAt", () => {
+    // `persistFleetRun` rewrites `intent.updatedAt` every 15 s. A window keyed on it
+    // kept every member of a live run counted forever; the window is now the member's
+    // own `launch/<taskId>` marker, so an absent member frees its slot.
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({
+          taskIds: ["bd-15"],
+          updatedAt: 95_000, // five seconds before "now": the run is ticking
+        }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: (taskId) => taskId === "bd-15",
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 0, free: 3 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({ absent: 1, unknown: 0 });
+  });
+
+  it("W2: only that member's live spawn marker holds its slot", () => {
+    const marker = fleetLaunchMarkerPath(commonDir, fleetId, "bd-15");
+    if (!marker.ok) throw new Error(marker.error);
+    const markerPath = marker.path;
+    const fresh = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-15"], updatedAt: 95_000 }),
+      ),
+      [markerPath]: JSON.stringify({ schemaVersion: 1, taskId: "bd-15", startedAt: 95_000 }),
+    });
+
+    const inside = readFleetStatus({
+      cwd,
+      fleetId,
+      fs: fresh,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: (taskId) => taskId === "bd-15",
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+    expect(inside.ok).toBe(true);
+    if (!inside.ok) return;
+    expect(inside.value.capacity).toMatchObject({ counted: 1, free: 2 });
+    expect(inside.value.capacity?.contributors[0]).toMatchObject({ unknown: 1, absent: 0 });
+
+    // The same marker past the grace is an abandoned spawn: the member is absent again.
+    const stale = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-15"], updatedAt: 95_000 }),
+      ),
+      [markerPath]: JSON.stringify({
+        schemaVersion: 1,
+        taskId: "bd-15",
+        startedAt: 100_000 - FLEET_MEMBER_SPAWN_GRACE_MS - 1,
+      }),
+    });
+    const expired = readFleetStatus({
+      cwd,
+      fleetId,
+      fs: stale,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: (taskId) => taskId === "bd-15",
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+    expect(expired.ok).toBe(true);
+    if (!expired.ok) return;
+    expect(expired.value.capacity).toMatchObject({ counted: 0, free: 3 });
+  });
+
+  it("W3: reports a member id that cannot name a launch marker instead of hiding it", () => {
+    // A hand-edited intent can carry an id the marker path refuses. That id has no spawn
+    // window, so the git evidence decides — but the operator must hear why no window
+    // applied instead of finding a silent absence (bd-233 W3).
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd/12"] }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: () => true,
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const marker = result.value.warnings.find((entry) => entry.kind === "unusable-spawn-marker");
+    expect(marker).toBeDefined();
+    expect(marker?.taskId).toBe("bd/12");
+    expect(marker?.message).toContain("no spawn window");
+    // The unusable id is reported, not treated as evidence either way: the surviving
+    // branch still frees the slot.
+    expect(result.value.capacity).toMatchObject({ counted: 0, free: 3 });
   });
 
   it("frees the slot of a member whose completion cleared the state file (bd-166)", () => {
