@@ -11,7 +11,11 @@ import {
   parseCapacityWindows,
   probeFromCooldownStore,
 } from "../capacity-cache.js";
-import { type CooldownFs, createModelCooldownStore } from "../model-cooldown.js";
+import {
+  COOLDOWN_REFRESH_MAX_AGE_MS,
+  type CooldownFs,
+  createModelCooldownStore,
+} from "../model-cooldown.js";
 
 /** Minimal in-memory fs seam so two stores can share one "file" without disk I/O. */
 function createFakeFs(initial: Record<string, string> = {}): CooldownFs & {
@@ -229,12 +233,17 @@ describe("probeFromCooldownStore", () => {
     // three members each re-probed the same exhausted provider.
     const fs = createFakeFs();
     const filePath = "/tmp/model-cooldowns.json";
-    const thisProcess = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
-    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    let now = 1_000_000;
+    const thisProcess = createModelCooldownStore({ now: () => now, filePath, fs });
+    const otherMember = createModelCooldownStore({ now: () => now, filePath, fs });
 
     expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([]);
 
     otherMember.markProviderCooldown("opencode-go", 6 * 60 * 60, "GoUsageLimitError");
+    // The probe shares the bounded refresh window with candidate selection, so
+    // it re-reads the file only once that window has elapsed (one file parse per
+    // spawn is the point; cross-process freshness stays sub-second).
+    now += COOLDOWN_REFRESH_MAX_AGE_MS;
 
     expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([
       {

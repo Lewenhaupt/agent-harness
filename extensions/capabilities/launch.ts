@@ -372,6 +372,12 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     current: string | undefined,
   ): Promise<string | undefined> {
     if (!modelRouting.enabled || current === undefined) return undefined;
+    // A cooldown another fleet member persisted after this process created its
+    // store must be visible before the routing decision: the capacity TTL alone
+    // can hide it for minutes, and a launch on a spent provider dies on its
+    // first turn (bd-234). `refresh` is unbounded here — a refusal must be sure.
+    modelRouting.cooldownStore.refresh();
+    modelRouting.cooldownStore.prune();
     await modelRouting.capacity.refreshIfStale();
     const plan = planModelRoute({ current, isBlocked: candidateBlocked });
     if (plan.available.length > 0) return undefined;
@@ -435,6 +441,10 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     callerModel: string | undefined;
   }): Promise<{ ok: true; model?: string; previous?: string } | { ok: false; error: string }> {
     if (!modelRouting.enabled) return { ok: true };
+    // Same freshness rule as the preflight: the child's model must be judged
+    // against the current shared store, not this process's creation snapshot.
+    modelRouting.cooldownStore.refresh();
+    modelRouting.cooldownStore.prune();
     await modelRouting.capacity.refreshIfStale();
     const current = (await readSessionModel(options.sessionId, options.cwd)) ?? options.callerModel;
     if (current === undefined) return { ok: true };

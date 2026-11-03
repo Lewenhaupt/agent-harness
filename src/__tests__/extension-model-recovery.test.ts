@@ -265,6 +265,23 @@ describe("in-session model recovery", () => {
     expect(result.every((value) => value === undefined)).toBe(true);
   });
 
+  it("sees a provider another process cooled after the store was created (bd-234)", async () => {
+    // The session's store loaded the shared file at registration; a fleet member
+    // spending opencode-go afterwards must still be skipped when the switch
+    // target is chosen, or the one continuation lands on a dead provider.
+    const { pi, emit } = setup({});
+    const otherMember = createModelCooldownStore({ filePath: cooldownFile });
+    otherMember.markProviderCooldown("opencode-go", 3600, "quota", { cause: "quota" });
+
+    await emit("message_end", errorMessage(BILLING_ERROR), KNOWN_MODELS[0] as ModelRef);
+    await emit("agent_before_settle", BOUNDARY, KNOWN_MODELS[0] as ModelRef);
+
+    expect(pi.setModel.mock.calls[0]?.[0]).toEqual({
+      provider: "commandcode",
+      id: "deepseek/deepseek-v4.1-flash",
+    });
+  });
+
   it("stops switching at the per-session cap instead of walking the class forever", async () => {
     const { pi, emit } = setup({});
     // Each provider serves the frontier candidate list in turn; after three

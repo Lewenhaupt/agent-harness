@@ -562,10 +562,12 @@ prefix never matches a window (exhaustion is provider-scoped).
 **When the variable is unset** the probe reads the persisted cooldown store
 (`probeFromCooldownStore`), so capacity still reflects provider limits learned
 from earlier 429s and survives orchestrator restarts. The probe re-reads that
-file first (`ModelCooldownStore.refresh`), because every process — including
-each fleet member — owns its own store and loads the file only once at creation;
-without the re-read a cooldown another member just wrote stays invisible until
-the next orchestrator restart. The merge orders per key by *when the window was
+file first (`ModelCooldownStore.refreshIfStale` with the same 1 s
+`COOLDOWN_REFRESH_MAX_AGE_MS` window candidate selection uses, so one spawn
+parses the file once), because every process — including each fleet member —
+owns its own store and loads the file only once at creation; without the
+re-read a cooldown another member just wrote stays invisible until the next
+orchestrator restart. The merge orders per key by *when the window was
 marked* (`lastMarkedAt`), never by how long it is, so the newest observation
 wins in both directions; a `lastMarkedAt` tie keeps the longer window, ladder
 ties keep the higher count, and expired entries are pruned. Entries written
@@ -595,8 +597,28 @@ independent of the capacity probe.
 
 ### 2. What you observe at dispatch time
 
-Before the first attempt of every `spawnAgentWithFallback` call, the harness
-refreshes the cached capacity signal (TTL permitting) and then:
+Before the first attempt of every `spawnAgentWithFallback` call two things
+happen, in this order:
+
+1. **The persisted cooldown store is re-read** —
+   `ModelCooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS)` followed by
+   `prune()`. This is deliberately *not* gated by the capacity TTL and happens
+   even when the capacity probe is an endpoint probe: every process loads
+   `~/.pi/agent/model-cooldowns.json` once at store creation, so without the
+   re-read the picker dispatches onto a provider another fleet member (or a
+   previous lifecycle) already spent, and only recovers after paying a failed
+   spawn in the fallback loop (bd-234). The bounded
+   `COOLDOWN_REFRESH_MAX_AGE_MS` window (1 s, far below the capacity TTL) lets
+   step 2 reuse the same read instead of parsing the file twice per spawn.
+   `refreshIfStale` merges per key by mark time, never throws, and is a no-op
+   for an in-memory store, so library callers that pass no `filePath` are
+   unaffected. A missing refresh stamp and a *regressed* clock both count as
+   stale (a negative elapsed time cannot prove freshness), so a backwards clock
+   change re-reads instead of suppressing reads until wall time catches up.
+   Callers that need certainty (orchestrator launch preflight, in-session
+   recovery) still use the unbounded `refresh()`.
+
+2. **The cached capacity signal is refreshed** (TTL permitting), and then it:
 
 - **Reorders candidates:** candidates whose provider has an unexpired window
   move behind the healthy ones, each group keeping its original relative order
@@ -622,8 +644,52 @@ refreshes the cached capacity signal (TTL permitting) and then:
   endpoint-specific and must not reorder that provider's other models.
 
 Reactive cooldown skips (`(cooldown)`, `(provider X exhausted)`) are unchanged
-and keep their original slot in the attempt trail; the capacity cache is the
-mechanism that pre-empts the *first* attempt.
+and keep their original slot in the attempt trail; the capacity cache is what
+pre-empts the *first* attempt, and the store re-read above makes those skips
+correct on the first attempt instead of reactive discovery.
+
+- **Cooldown/capacity skips do not consume `maxAttempts`.** The cap bounds
+  *spawned* attempts: `maxAttempts: 1` with a cooling first candidate still
+  spawns the first healthy candidate further down the list, and
+  `maxAttempts: 0` returns the empty exhausted result without spawning.
+- **The kill switch still honours cooldowns.** `BELAYD_MODEL_FALLBACK=0` means
+  "no fallback", not "ignore the store": the single configured model is
+  refused when it is skipped before dispatch, with one skip row (so the trail
+  and the manifest show why nothing ran). The refusal copy is cause-aware, reusing
+  the skip row's own phrase: a genuine cooldown keeps the all-cooling sentence,
+  while a provider with no API key (or an endpoint outside a capacity window)
+  reads `Refusing to dispatch <model>: <reason>` so a missing credential is not
+  misreported as a spent quota:
+
+  ```text
+  All candidate models are in cooldown (<model>); retry later.
+  Refusing to dispatch <model>: Provider <provider> has no API key configured; …
+  ```
+- **An abort is reported as an abort.** When the signal is already aborted and
+  no candidate was dispatched, the result text is
+  `Run aborted before any candidate could be dispatched.` rather than the
+  all-cooling wording; the cooldown sentence is reserved for a run that really
+  found every candidate cooling. The same holds for the `maxAttempts: 0` /
+  empty-candidate early exit, and an empty candidate list never prints an empty
+  parenthesis list (`All candidate models are in cooldown; retry later.`).
+- **The run manifest records the outcome, not just the intent.** `model` names
+  the model that actually served the run (the spawn layer's `details.model`
+  when present, else the last spawned attempt), `requestedModel` keeps the
+  pre-dispatch pick, and `skippedModels` lists every candidate skipped before
+  dispatch with its reason (`cooling down …`, `capacity reset window`, `no API
+  key configured`); the key is **absent** — not an empty array — when nothing
+  was skipped. `model` is **absent** when nothing ran — an all-skipped,
+  capacity-exhausted, or aborted run has no serving model, and the running
+  manifest writes only `requestedModel` before the spawn.
+  `setRunModelSelection` does the read-modify-write, so `belayd_status`/fleet
+  latest-run views name the provider that ran instead of the one that was
+  requested.
+- **Gate retries fold into the same manifest.** A quality-gate fix-up goes
+  through the same spawn loop (`onSelection` from `RunQualityGateOptions`), and
+  `mergeRunModelSelections` folds it into the run's recorded selection: the last
+  spawned model wins, skipped rows accumulate (de-duplicated), and a retry that
+  spawned nothing keeps the earlier serving model. The retry's text also carries
+  the `[belayd model fallback]` trail.
 
 ### 3. Phase-class routing change
 
@@ -732,10 +798,12 @@ What changed:
   order follows the mark event time. The mark API takes an options object:
   `markProviderCooldown(provider, seconds, reason, { hinted, nowMs })`;
   model-scoped marks never escalate.
-- **Cross-process cooldown visibility.** `probeFromCooldownStore` calls the new
-  `ModelCooldownStore.refresh()` before reading `providerEntries()`, so a
-  cooldown another fleet member persisted is visible on the next capacity probe
-  instead of after an orchestrator restart. `refresh()` and the lock-protected
+- **Cross-process cooldown visibility.** `probeFromCooldownStore` calls
+  `ModelCooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS)` before reading
+  `providerEntries()`, and candidate selection does the same, so a cooldown
+  another fleet member persisted is visible on the next spawn (and capacity
+  probe) instead of after an orchestrator restart — without parsing the file
+  twice for one spawn. `refresh`/`refreshIfStale` and the lock-protected
   `persist()` apply the *same* ordering rule per key — newest `lastMarkedAt`
   wins, never the longer `until` — so neither direction can shorten a live
   escalated window from a stale file (nor lengthen it back from an old guess),
@@ -1092,6 +1160,7 @@ import {
   CAPACITY_PROBE_URL_ENV,
   COOLDOWN_ESCALATION_FACTOR,
   COOLDOWN_ESCALATION_MEMORY_MS,
+  COOLDOWN_REFRESH_MAX_AGE_MS,
   DEFAULT_CAPACITY_BODY_LIMIT_BYTES,
   DEFAULT_CAPACITY_PROBE_TIMEOUT_MS,
   DEFAULT_CAPACITY_TTL_MS,
@@ -1137,9 +1206,15 @@ const capacity = createCapacityCache({
 });
 
 await capacity.refreshIfStale();               // never rejects
-// The probe itself re-reads the shared cooldown file, so an explicit
-// cooldownStore.refresh() is only needed when reading the store directly.
-cooldownStore.refresh(); // merge other processes' cooldowns; no-op in-memory
+// Candidate selection refreshes the store itself: `spawnAgentWithFallback`
+// calls cooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS) + prune()
+// before picking a candidate, on every spawn (TTL-independent, and independent
+// of the capacity probe). probeFromCooldownStore uses the same bounded window,
+// so one spawn reads the file at most once. Call the unbounded refresh()
+// yourself when a decision needs certainty and the store may predate the entry
+// (orchestrator launch preflight, in-session recovery).
+cooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS); // shared with the probe
+cooldownStore.refresh(); // unconditional merge; no-op in-memory
 capacity.record({ provider: "opencode-go", resetAt: Date.now() + 3_600_000, reason: "429" });
 capacity.isModelExhausted("opencode-go/mimo-v2.6-flash"); // true
 orderCandidatesByCapacity(["opencode-go/a", "llmgateway/a"], (c) =>
@@ -1158,13 +1233,18 @@ check entirely (the spawned-attempt ordinal rule still applies); omitting
 `formatModelTelemetrySummary`, `modelTelemetryPath`; session-scoped plumbing:
 `createModelSessionState`, `flushModelTelemetry`,
 `flushAndResetModelTelemetry`, `resetModelSessionState`. Run manifests:
-`setRunTelemetry`, `readRunManifest`, `listRuns`, `RunTelemetryTotals`.
+`setRunTelemetry`, `setRunModelSelection`, `mergeRunModelSelections`,
+`deriveRunModelSelection`, `readRunManifest`, `listRuns`, `RunTelemetryTotals`.
 
 ## Known limits
 
 - **Capacity is only as fresh as the last probe or 429.** A window can be
   stale by up to one TTL (5 minutes), and a provider that recovers inside a
   window is still avoided until the window expires or a probe replaces it.
+  This bounds the *endpoint* capacity signal only: candidate selection re-reads
+  the persisted cooldown store on every spawn (bounded to one read per second),
+  so a provider another fleet member cooled is skipped immediately even when a
+  capacity window has not refreshed yet.
 - **Reset times are epoch milliseconds, relative seconds, or a reset-hint
   string.** Any other unit is read wrong rather than rejected: a body reporting
   Unix *seconds* in `resetAt` is read as epoch ms, i.e. a time in 1970, which

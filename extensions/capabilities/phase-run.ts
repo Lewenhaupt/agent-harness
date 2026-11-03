@@ -37,6 +37,7 @@ import {
 import {
   RunStatus,
   readRunManifest,
+  setRunModelSelection,
   setRunStatus,
   setRunTelemetry,
   writeRunManifest,
@@ -46,7 +47,12 @@ import {
   computeSubagentSessionName,
   resolveProjectSessionExists,
 } from "../../src/session-naming.js";
-import type { SpawnAttempt, SpawnWithFallbackOptions } from "../../src/spawn-with-fallback.js";
+import type {
+  RunModelSelection,
+  SpawnAttempt,
+  SpawnWithFallbackOptions,
+} from "../../src/spawn-with-fallback.js";
+import { mergeRunModelSelections } from "../../src/spawn-with-fallback.js";
 import { getNextPhase, type Phase } from "../../src/workflow-phases.js";
 import type { WORKFLOW_REGISTRY } from "../../src/workflow-registry.js";
 import {
@@ -110,9 +116,12 @@ export interface PhaseRunnerDeps {
    */
   workflowRegistry: typeof WORKFLOW_REGISTRY;
   /** Injected: the extension tests replace it through `src/index.js`. */
-  spawnAgentWithFallback: (
-    options: SpawnWithFallbackOptions,
-  ) => Promise<{ result: SpawnResult; attempts: SpawnAttempt[] }>;
+  spawnAgentWithFallback: (options: SpawnWithFallbackOptions) => Promise<{
+    result: SpawnResult;
+    attempts: SpawnAttempt[];
+    /** Derived by the spawn layer; absent on narrower test seams. */
+    selection?: RunModelSelection;
+  }>;
   runQualityGate: (options: RunQualityGateOptions) => Promise<SpawnResult | null | undefined>;
   /**
    * Open a human gate for a review that reported findings (bd-175). Injected so
@@ -223,7 +232,7 @@ export function createPhaseRunner(deps: PhaseRunnerDeps): PhaseRunnerApi {
     runId: string;
     phaseName: string;
     subagentSessionName: string;
-    model: string;
+    requestedModel: string;
   }): void {
     if (!options.state.gateActive || options.state.currentTaskId === "") return;
     const writeResult = writeRunManifest({
@@ -236,12 +245,55 @@ export function createPhaseRunner(deps: PhaseRunnerDeps): PhaseRunnerApi {
         sessionName: options.subagentSessionName,
         status: RunStatus.Running,
         startedAt: Date.now(),
-        model: options.model,
+        // `model` is reserved for the model that actually served the run, so the
+        // pre-dispatch pick lands here and stays truthful if nothing spawns.
+        requestedModel: options.requestedModel,
       },
     });
     if (!writeResult.ok) {
       console.warn(`[belayd-harness] failed to persist run manifest: ${writeResult.error}`);
     }
+  }
+
+  /**
+   * Record which model actually served the run, plus the pre-dispatch pick and
+   * the candidates skipped before dispatch. A phase whose first candidate is
+   * cooling down would otherwise leave a manifest naming a model that never ran.
+   *
+   * A later dispatch (a quality-gate retry) folds into the previous selection
+   * with `mergeRunModelSelections`: the last spawned model wins, skipped rows
+   * accumulate. `model` is written only when something actually spawned, so an
+   * all-skipped or aborted run names no serving model at all.
+   */
+  function recordModelSelection(options: {
+    state: CoreSessionState;
+    manifestCwd: string;
+    runId: string;
+    previous: RunModelSelection | undefined;
+    next: RunModelSelection;
+  }): RunModelSelection {
+    const selection =
+      options.previous === undefined
+        ? options.next
+        : mergeRunModelSelections(options.previous, options.next);
+    // Same workflow scope as the running manifest: a post-completion rework run
+    // has no manifest of its own to amend, and gate-less runs own no state.
+    if (!options.state.gateActive || options.state.currentTaskId === "") return selection;
+    const result = setRunModelSelection({
+      cwd: options.manifestCwd,
+      runId: options.runId,
+      ...(selection.servedModel !== undefined ? { model: selection.servedModel } : {}),
+      requestedModel: selection.requestedModel,
+      // A healthy run persists no key at all: `skippedModels: []` reads as "the
+      // schema requires the field", and keeps a key whose only content is "no".
+      ...(selection.skipped.length > 0 ? { skippedModels: selection.skipped } : {}),
+    });
+    if (!result.ok) {
+      // A run that has not persisted its manifest yet is not a failure: the
+      // spawn result still belongs to the caller.
+      console.warn(`[belayd-harness] failed to record the served model: ${result.error}`);
+    }
+    return selection;
   }
 
   /** Resolve a phase's effective capability tier from agent + workflow overrides. */
@@ -561,7 +613,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       runId,
       phaseName,
       subagentSessionName,
-      model: effectiveModel,
+      requestedModel: effectiveModel,
     });
 
     recordMetric(
@@ -582,6 +634,19 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     // that owns persistence and logging.
     const runTelemetry = createModelTelemetryStore();
     const runTelemetrySink = combineModelTelemetryStores(modelState.telemetry, runTelemetry);
+
+    // The run's recorded selection across its dispatches: the phase spawn first,
+    // then each quality-gate retry, folded by `recordModelSelection`.
+    let recordedSelection: RunModelSelection | undefined;
+    const recordSelection = (next: RunModelSelection): void => {
+      recordedSelection = recordModelSelection({
+        state,
+        manifestCwd: cwd,
+        runId,
+        previous: recordedSelection,
+        next,
+      });
+    };
 
     const abortController = new AbortController();
 
@@ -735,7 +800,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
           phase: phaseName,
           telemetry: runTelemetrySink,
           capacity: modelState.capacity,
-        }).then((r) => withFallbackNote(r.result, r.attempts)),
+        }).then((r) => {
+          if (r.selection !== undefined) recordSelection(r.selection);
+          return withFallbackNote(r.result, r.attempts);
+        }),
       );
     };
 
@@ -769,6 +837,10 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         tools: effectiveTools,
         sessionName: subagentSessionName,
         telemetry: runTelemetrySink,
+        // A gate retry may be served by (and skip) different candidates than the
+        // phase spawn; folding it in keeps the manifest truthful about the
+        // attempt that actually produced the delivered result.
+        onSelection: recordSelection,
         // Emitted as gate_result; undefined outside a gate-owned workflow.
         taskId: state.currentTaskId === "" ? undefined : state.currentTaskId,
         runId,
@@ -877,6 +949,9 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     const runStillRelevant = (): boolean =>
       state.planningActive && state.planningTarget === targetAtStart;
 
+    // Planning runs persist no manifest, but a skipped/cooling candidate still
+    // has to reach the operator's delivery: a scout that never tried its
+    // requested provider must not look like it ran on it.
     const spawnAgent = (): Promise<SpawnResult> =>
       spawnAgentWithFallback({
         model: resolveModelSpec(spec).model,
@@ -893,7 +968,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
         phase: phaseName,
         telemetry: modelState.telemetry,
         capacity: modelState.capacity,
-      }).then((r) => r.result);
+      }).then((r) => withFallbackNote(r.result, r.attempts));
 
     const handle = spawnDetachedRun({
       runId,

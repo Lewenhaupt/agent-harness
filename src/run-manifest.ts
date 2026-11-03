@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { ModelTelemetryTotalsSchema } from "./model-telemetry.js";
+import type { SkippedModel } from "./spawn-with-fallback.js";
 import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
 export enum RunStatus {
@@ -33,6 +34,18 @@ const SCHEMA_VERSION = 1;
  */
 export type RunTelemetryTotals = z.infer<typeof ModelTelemetryTotalsSchema>;
 
+/**
+ * A candidate skipped before dispatch (cooldown, capacity window, missing key).
+ * Kept in the manifest so a run that never tried its requested model explains
+ * itself without parsing the agent's fallback note. The shape is owned by the
+ * spawn layer (`SkippedModel`) so the manifest cannot drift from the selection
+ * it records.
+ */
+const SkippedModelSchema: z.ZodType<SkippedModel> = z.object({
+  model: z.string(),
+  reason: z.string(),
+});
+
 const RunManifestSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
   runId: z.string(),
@@ -44,6 +57,13 @@ const RunManifestSchema = z.object({
   completedAt: z.number().finite().optional(),
   exitCode: z.number().finite().optional(),
   model: z.string().optional(),
+  /**
+   * The pre-dispatch pick. `model` records the model that actually served the
+   * run, so a fallback win is visible as `requestedModel !== model`.
+   */
+  requestedModel: z.string().optional(),
+  /** Candidates skipped before dispatch, in preference order, with the reason. */
+  skippedModels: z.array(SkippedModelSchema).optional(),
   /** Why a failed run failed; absent on completed/interrupted manifests. */
   failureReason: z.string().optional(),
   /** Report text fed back by `/belayd-complete`; absent on normal runs. */
@@ -120,6 +140,22 @@ export interface SetRunTelemetryOptions {
   cwd: string;
   runId: string;
   telemetry: RunTelemetryTotals;
+  fs?: RunManifestFs;
+}
+
+export interface SetRunModelSelectionOptions {
+  cwd: string;
+  runId: string;
+  /**
+   * The model that actually served the run; written to the manifest's `model`.
+   * Omitted when nothing was dispatched, so the manifest never names a model
+   * that executed nothing.
+   */
+  model?: string;
+  /** The model the picker requested before dispatch. */
+  requestedModel: string;
+  /** Candidates skipped before dispatch (possibly empty). */
+  skippedModels?: SkippedModel[];
   fs?: RunManifestFs;
 }
 
@@ -273,6 +309,34 @@ export function setRunTelemetry(
   return writeRunManifest({
     cwd: options.cwd,
     manifest: { ...existing, telemetry: options.telemetry },
+    fs,
+  });
+}
+
+/**
+ * Record which model actually served a run (plus the pre-dispatch pick and any
+ * candidates skipped before dispatch). Read-modify-write like `setRunStatus`, so
+ * status/startedAt/telemetry written earlier survive; an unknown run id is an
+ * error value, never a throw.
+ */
+export function setRunModelSelection(
+  options: SetRunModelSelectionOptions,
+): { ok: true } | { ok: false; error: string } {
+  const fs = options.fs ?? runManifestFs;
+  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
+  if (existing === undefined) {
+    return { ok: false, error: `No run manifest found for ${options.runId}` };
+  }
+  return writeRunManifest({
+    cwd: options.cwd,
+    manifest: {
+      ...existing,
+      // `model` means "the model that served this run", so a run that spawned
+      // nothing leaves it as it was rather than inventing a server.
+      ...(options.model !== undefined ? { model: options.model } : {}),
+      requestedModel: options.requestedModel,
+      ...(options.skippedModels !== undefined ? { skippedModels: options.skippedModels } : {}),
+    },
     fs,
   });
 }

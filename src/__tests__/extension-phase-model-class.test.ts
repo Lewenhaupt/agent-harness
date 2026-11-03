@@ -26,11 +26,13 @@
  * behavior (retry receives modelClass undefined alongside the override model).
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { defaultModelCooldownPath } from "../model-cooldown.js";
+import { listRuns, RunStatus, writeRunManifest } from "../run-manifest.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
@@ -106,6 +108,16 @@ vi.mock("node:child_process", async (importOriginal) => {
 // Capture every spawnAgentWithFallback call the extension makes; everything
 // else from the library stays real (registries, phase order, detached runs).
 const mockSpawnAgentWithFallback = vi.hoisted(() => vi.fn());
+
+// The fallback loop's only process boundary. One test drives the REAL
+// `spawnAgentWithFallback` (selection-time cooldown refresh included) so this
+// mock keeps that path off the disk; the others use the mocked spawn entirely.
+const mockSpawnAgentProcess = vi.hoisted(() => vi.fn());
+
+vi.mock("../spawn.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../spawn.js")>()),
+  spawnAgentProcess: mockSpawnAgentProcess,
+}));
 
 vi.mock("../../src/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/index.js")>();
@@ -231,6 +243,7 @@ describe("extension modelClass threading", () => {
     gateState.testFailuresRemaining = 0;
     registryState.featureOverrides = undefined;
     mockSpawnAgentWithFallback.mockReset();
+    mockSpawnAgentProcess.mockReset();
     mockSpawnAgentWithFallback.mockImplementation((options: { model: string }) =>
       Promise.resolve(fallbackResult(options.model)),
     );
@@ -265,6 +278,157 @@ describe("extension modelClass threading", () => {
     expect(options?.model).toBe("llmgateway/mimo-v2.6-flash");
     expect(options?.modelClass).toBe("fast");
     expect(options?.detached).toBe(true);
+  });
+
+  it("persists no skippedModels key when a run skips nothing", async () => {
+    // bd-234 review S1: an empty skip list must not become `skippedModels: []`
+    // in every healthy run's manifest. The selection still has to be written,
+    // which `model` proves — assert the KEY is absent, not merely empty.
+    mockSpawnAgentWithFallback.mockImplementation((options: { model: string }) =>
+      Promise.resolve({
+        ...fallbackResult(options.model),
+        selection: { servedModel: options.model, requestedModel: options.model, skipped: [] },
+      }),
+    );
+
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("mc-manifest", workDir);
+    await commands.get("belayd")?.handler("bd-95 feature --no-worktree", ctx);
+
+    const scout = tools.get("belayd_scout");
+    expect(scout).toBeDefined();
+    await scout?.execute("call-6", { task: "recon the repo" }, undefined, undefined, ctx);
+
+    await vi.waitFor(() => {
+      const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
+      expect(run?.model).toBe("llmgateway/mimo-v2.6-flash");
+    });
+
+    const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
+    expect(run).not.toHaveProperty("skippedModels");
+  });
+
+  it("serves a phase run through the fallback loop and records the served model", async () => {
+    // End-to-end-ish: the extension's own phase spawn runs the real fallback
+    // loop (only the pi process is mocked) against a file-backed cooldown store,
+    // seeded with bd-234's observed state after this process loaded it, and the
+    // run manifest must name the provider that actually served the run.
+    const realSpawn = await vi.importActual<typeof import("../spawn-with-fallback.js")>(
+      "../spawn-with-fallback.js",
+    );
+    mockSpawnAgentWithFallback.mockImplementation(realSpawn.spawnAgentWithFallback);
+    mockSpawnAgentProcess.mockResolvedValueOnce(
+      fallbackResult("commandcode/xiaomi/mimo-v2.6-flash").result,
+    );
+
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    const ctx = makeCtx("mc-fallback", workDir);
+    await commands.get("belayd")?.handler("bd-234 feature --no-worktree", ctx);
+
+    // Another fleet member's view: opencode-go 24h, llmgateway 5.6h,
+    // commandcode clean. Marked through the extension's own file-backed store
+    // so the seed lands in the shared cooldown file the way a peer's write
+    // would (the cross-process write-after-creation path is pinned separately).
+    const cooldownPath = defaultModelCooldownPath();
+    const { modelCooldown, modelState } = await import("../../extensions/capabilities/model.js");
+    try {
+      // The capacity probe answers from its 5-minute cache, so it is primed
+      // while every provider is healthy: this run's ordering is then decided by
+      // the cooldown store, which is the interleaving that produces skip rows
+      // instead of silently reordering the candidates.
+      await modelState.capacity.refreshIfStale();
+      modelCooldown.markProviderCooldown("opencode-go", 24 * 3600, "quota", { cause: "quota" });
+      modelCooldown.markProviderCooldown("llmgateway", 5.6 * 3600, "quota", { cause: "quota" });
+      const persisted = JSON.parse(readFileSync(cooldownPath, "utf8")) as {
+        providers: Record<string, { until: number }>;
+      };
+      expect(Object.keys(persisted.providers)).toEqual(
+        expect.arrayContaining(["llmgateway", "opencode-go"]),
+      );
+      expect(persisted.providers.commandcode).toBeUndefined();
+
+      const scout = tools.get("belayd_scout");
+      expect(scout).toBeDefined();
+      await scout?.execute("call-fb", { task: "recon the repo" }, undefined, undefined, ctx);
+
+      await vi.waitFor(() => {
+        const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
+        expect(run?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
+      });
+
+      const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
+      // `model` = what served the run, `requestedModel` = the pre-dispatch pick,
+      // and the skip rows stay in class preference order (llmgateway first for
+      // the fast class primary, then opencode-go).
+      expect(run).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
+      expect(run?.skippedModels).toEqual([
+        {
+          model: "llmgateway/mimo-v2.6-flash",
+          reason:
+            "Provider llmgateway is cooling down after a quota failure; skipping remaining models on it.",
+        },
+        {
+          model: "opencode-go/mimo-v2.6-flash",
+          reason:
+            "Provider opencode-go is cooling down after a quota failure; skipping remaining models on it.",
+        },
+      ]);
+      // One spawn, on the one healthy provider: no wasted attempt on a cooldown.
+      expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+      const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model?: string } | undefined;
+      expect(spawned?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
+    } finally {
+      rmSync(cooldownPath, { force: true });
+    }
+  });
+
+  it("renders a requestedModel-only manifest in belayd_status without inventing a model", async () => {
+    // A run that spawned nothing has `requestedModel` but no `model`: the run
+    // history table must render its row and leave the model cell empty rather
+    // than crash or print `undefined`.
+    const { api, commands, tools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+    const ctx = makeCtx("mc-status", workDir);
+    await commands.get("belayd")?.handler("bd-235 feature --no-worktree", ctx);
+
+    const written = writeRunManifest({
+      cwd: workDir,
+      manifest: {
+        schemaVersion: 1,
+        runId: "pending-run",
+        taskId: "bd-235",
+        phase: "scout",
+        sessionName: "belayd-bd-235-sub-scout",
+        status: RunStatus.Running,
+        startedAt: 1_000,
+        requestedModel: "llmgateway/mimo-v2.6-flash",
+        skippedModels: [
+          {
+            model: "llmgateway/mimo-v2.6-flash",
+            reason: "Provider llmgateway is cooling down after a quota failure.",
+          },
+        ],
+      },
+    });
+    expect(written).toEqual({ ok: true });
+
+    const status = (await tools
+      .get("belayd_status")
+      ?.execute("call-status", {}, undefined, undefined, ctx)) as {
+      content: Array<{ type: string; text: string }>;
+    };
+    const text = status.content[0]?.text ?? "";
+
+    expect(text).toContain("Run history");
+    expect(text).toContain("| `pending-run` | scout | running |");
+    expect(text).not.toContain("undefined");
   });
 
   it("passes modelClass undefined for a workflow model override without a class, including gate retries", async () => {

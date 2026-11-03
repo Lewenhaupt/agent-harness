@@ -118,6 +118,17 @@ export const COOLDOWN_ESCALATION_MEMORY_MS = 7 * 86_400_000;
 /** Which cooldown scope is blocking a model, when one is. */
 export type CooldownScope = "provider" | "model";
 
+/**
+ * Window within which a second `refreshIfStale` is skipped.
+ *
+ * One spawn reads the store twice — once at candidate selection and again via
+ * the capacity probe when its TTL expired — and a synchronous file read plus
+ * JSON parse per read is pure waste. The window is far below
+ * `DEFAULT_CAPACITY_TTL_MS`, so a cooldown another fleet member writes is still
+ * seen effectively immediately; callers that need certainty use `refresh()`.
+ */
+export const COOLDOWN_REFRESH_MAX_AGE_MS = 1_000;
+
 export interface CooldownMarkOptions {
   /** Epoch-ms clock override (test seam). Defaults to the store clock. */
   nowMs?: number;
@@ -167,6 +178,12 @@ export interface ModelCooldownStore {
    * untouched rather than throwing, so a probe refresh can never fail a spawn.
    */
   refresh(nowMs?: number): void;
+  /**
+   * `refresh()` unless the file was already read within `maxAgeInMs` (default 0,
+   * i.e. always). The timestamp is per-store closure state, never module state;
+   * an in-memory store is a no-op and keeps no clock.
+   */
+  refreshIfStale(maxAgeInMs?: number, nowMs?: number): void;
   /** The scope blocking a model, or undefined when it is not cooling down. */
   cooldownScope(model: string, nowMs?: number): CooldownScope | undefined;
   /** Snapshot of model-scoped entries (test seam). */
@@ -618,6 +635,8 @@ export function createModelCooldownStore(
 
   const state = filePath === undefined ? emptyState() : loadState(fs, filePath);
   if (filePath !== undefined) pruneState(state, now());
+  /** Epoch ms of the last file read by this store; undefined until one happens. */
+  let lastRefreshAt: number | undefined;
 
   /** Replace the in-memory state with `source` (already merged and pruned). */
   function adopt(source: CooldownState): void {
@@ -672,6 +691,22 @@ export function createModelCooldownStore(
     return undefined;
   }
 
+  /** Re-read the persisted file into memory and record when that happened. */
+  function refreshState(nowMs?: number): void {
+    if (filePath === undefined) return;
+    // `loadState` already maps a missing, unreadable, or corrupt file to empty
+    // state, so a refresh can never throw at a caller like the capacity probe.
+    const onDisk = loadState(fs, filePath);
+    mergeEntryMaps(state.providers, onDisk.providers);
+    mergeEntryMaps(state.models, onDisk.models);
+    mergeEscalationMaps(state.escalations, onDisk.escalations);
+    // Keep the cached raw file object in step with what was just read: a later
+    // serialize must not resurrect unknown fields from the pre-refresh file.
+    state.extras = onDisk.extras;
+    pruneState(state, nowMs ?? now());
+    lastRefreshAt = nowMs ?? now();
+  }
+
   return {
     isCoolingDown(model, nowMs) {
       return scopeOf(model, nowMs) !== undefined;
@@ -723,17 +758,24 @@ export function createModelCooldownStore(
       pruneState(state, nowMs ?? now());
     },
     refresh(nowMs) {
+      refreshState(nowMs);
+    },
+    refreshIfStale(maxAgeInMs, nowMs) {
       if (filePath === undefined) return;
-      // `loadState` already maps a missing, unreadable, or corrupt file to empty
-      // state, so a refresh can never throw at a caller like the capacity probe.
-      const onDisk = loadState(fs, filePath);
-      mergeEntryMaps(state.providers, onDisk.providers);
-      mergeEntryMaps(state.models, onDisk.models);
-      mergeEscalationMaps(state.escalations, onDisk.escalations);
-      // Keep the cached raw file object in step with what was just read: a later
-      // serialize must not resurrect unknown fields from the pre-refresh file.
-      state.extras = onDisk.extras;
-      pruneState(state, nowMs ?? now());
+      const at = nowMs ?? now();
+      // A missing stamp and a regressed clock both mean "cannot prove freshness":
+      // the first call must read (a store created before the entry existed must
+      // not look fresh), and a clock that moved backwards would otherwise keep
+      // suppressing reads until wall time overtook the stale stamp — exactly
+      // when fresh data matters most.
+      if (
+        lastRefreshAt !== undefined &&
+        lastRefreshAt <= at &&
+        at - lastRefreshAt < (maxAgeInMs ?? 0)
+      ) {
+        return;
+      }
+      refreshState(at);
     },
     cooldownScope(model, nowMs) {
       return scopeOf(model, nowMs);

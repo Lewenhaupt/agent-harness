@@ -24,6 +24,7 @@ import { orderCandidatesByCapacity } from "./capacity-cache.js";
 import type { ModelClass } from "./model-classes.js";
 import { candidatesForModel, providerOf } from "./model-classes.js";
 import {
+  COOLDOWN_REFRESH_MAX_AGE_MS,
   createModelCooldownStore,
   type ModelCooldownStore,
   type ProviderCooldownCause,
@@ -50,9 +51,28 @@ export interface SpawnAttempt {
   cost?: number;
 }
 
+/** One candidate skipped before it was spawned, with the reason recorded for it. */
+export interface SkippedModel {
+  model: string;
+  reason: string;
+}
+
+/**
+ * How the run's model was actually selected: the model that served it (absent
+ * when nothing was dispatched), the pre-dispatch pick, and every candidate
+ * skipped before dispatch.
+ */
+export interface RunModelSelection {
+  servedModel?: string;
+  requestedModel: string;
+  skipped: SkippedModel[];
+}
+
 export interface SpawnWithFallbackResult {
   result: SpawnResult;
   attempts: SpawnAttempt[];
+  /** Derived selection; callers persist it instead of re-deriving from `attempts`. */
+  selection: RunModelSelection;
 }
 
 export interface SpawnWithFallbackOptions extends SpawnOptions {
@@ -66,7 +86,12 @@ export interface SpawnWithFallbackOptions extends SpawnOptions {
   classify?: (details: SpawnDetails) => FailureClassification;
   /** Set false to disable fallback (kill switch). Defaults to true. */
   enabled?: boolean;
-  /** Cap on the number of candidates to attempt (default: all candidates). */
+  /**
+   * Cap on the number of SPAWNED attempts (default: all candidates). A
+   * candidate skipped for cooldown/capacity never consumes the cap: it was never
+   * tried, and counting it would fail the run while a healthy candidate waits
+   * further down the preference list.
+   */
   maxAttempts?: number;
   /** Phase name for telemetry grouping (e.g. "plan", "implement"). */
   phase?: string;
@@ -107,11 +132,51 @@ function withAggregatedUsage(
 }
 
 function exhaustedResult(models: string[]): SpawnResult {
+  // No candidates at all is a configuration outcome, not a cooldown: printing
+  // an empty parenthesis list reads like a formatting bug to an operator.
+  const named = models.length > 0 ? ` (${models.join(", ")})` : "";
   return {
     content: [
       {
         type: "text" as const,
-        text: `All candidate models are in cooldown (${models.join(", ")}); retry later.`,
+        text: `All candidate models are in cooldown${named}; retry later.`,
+      },
+    ],
+    details: { messages: [], usage: zeroUsage(), exitCode: 1 },
+  };
+}
+
+/**
+ * Refusal result for a kill-switch candidate skipped before dispatch.
+ *
+ * The skip row records the real cause, so the copy reuses it instead of
+ * labelling every refusal a cooldown: a provider with no API key is an operator
+ * fix, not a spent quota to wait out. The all-cooling wording is kept for a
+ * genuine cooldown (a quota-spent provider, an untagged legacy entry, or a
+ * model-scoped endpoint window).
+ */
+function refusalResult(
+  attempt: SpawnAttempt,
+  cause: ProviderCooldownCause | undefined,
+): SpawnResult {
+  const cooldownScoped =
+    attempt.skippedCapacity === undefined &&
+    (attempt.skippedCooldown === true || cause === undefined || cause === "quota");
+  if (cooldownScoped) return exhaustedResult([attempt.model]);
+  const reason = attempt.classification.reason ?? attempt.classification.kind;
+  return {
+    content: [{ type: "text" as const, text: `Refusing to dispatch ${attempt.model}: ${reason}` }],
+    details: { messages: [], usage: zeroUsage(), exitCode: 1 },
+  };
+}
+
+/** Result for a run cancelled before any candidate was dispatched. */
+function abortedResult(): SpawnResult {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: "Run aborted before any candidate could be dispatched.",
       },
     ],
     details: { messages: [], usage: zeroUsage(), exitCode: 1 },
@@ -145,6 +210,66 @@ function capacityExhaustedResult(
       },
     ],
     details: { messages: [], usage: zeroUsage(), exitCode: 1 },
+  };
+}
+
+/** True when the attempt row records a candidate that was never spawned. */
+function isSkippedAttempt(attempt: SpawnAttempt): boolean {
+  return (
+    attempt.skippedCooldown === true ||
+    attempt.skippedProvider !== undefined ||
+    attempt.skippedCapacity !== undefined
+  );
+}
+
+/**
+ * Derive a run's model selection from the fallback outcome.
+ *
+ * `servedModel` prefers the spawn layer's own `details.model` (what pi actually
+ * ran), then the last spawned attempt. It stays ABSENT when nothing spawned —
+ * an all-skipped, capacity-exhausted, or aborted run must not be reported as
+ * having run on the requested model, or the manifest would name a model that
+ * executed nothing.
+ */
+export function deriveRunModelSelection(
+  requestedModel: string,
+  attempts: readonly SpawnAttempt[],
+  servedModel?: string,
+): RunModelSelection {
+  const spawned = attempts.filter((attempt) => !isSkippedAttempt(attempt));
+  const served =
+    servedModel !== undefined && servedModel !== "" ? servedModel : spawned.at(-1)?.model;
+  return {
+    ...(served !== undefined ? { servedModel: served } : {}),
+    requestedModel,
+    skipped: attempts.filter(isSkippedAttempt).map((attempt) => ({
+      model: attempt.model,
+      reason: attempt.classification.reason ?? attempt.classification.kind,
+    })),
+  };
+}
+
+/**
+ * Fold a later dispatch's selection into the run's recorded one.
+ *
+ * A quality-gate retry can run on a different candidate than the phase's own
+ * spawn, and the manifest must describe the attempt that actually served the
+ * run: the LAST spawned model wins (a later spawn with nothing dispatched keeps
+ * the earlier served model). Skipped rows accumulate, de-duplicated, because
+ * each dispatch re-skips the same cooling providers and the trail should not
+ * repeat them.
+ */
+export function mergeRunModelSelections(
+  current: RunModelSelection,
+  next: RunModelSelection,
+): RunModelSelection {
+  const seen = new Set(current.skipped.map((row) => `${row.model}\u0000${row.reason}`));
+  const added = next.skipped.filter((row) => !seen.has(`${row.model}\u0000${row.reason}`));
+  const served = next.servedModel ?? current.servedModel;
+  return {
+    ...(served !== undefined ? { servedModel: served } : {}),
+    requestedModel: next.requestedModel,
+    skipped: [...current.skipped, ...added],
   };
 }
 
@@ -230,6 +355,7 @@ async function runCandidate(
 
 interface LoopDeps {
   candidates: string[];
+  requestedModel: string;
   spawnOptions: SpawnOptions;
   classifyFn: (details: SpawnDetails) => FailureClassification;
   store: ModelCooldownStore;
@@ -237,6 +363,8 @@ interface LoopDeps {
   phase: string;
   telemetry?: ModelTelemetryStore;
   capacity?: CapacityCache;
+  /** Cap on SPAWNED attempts; skipped candidates never consume it. */
+  maxSpawnedAttempts?: number;
 }
 
 /** Record one spawned attempt's outcome in the telemetry store. */
@@ -400,6 +528,10 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
 
   for (const candidate of deps.candidates) {
     if (deps.signal?.aborted) break;
+    // The cap bounds spawns, not candidates: a skipped candidate was never
+    // tried, so `maxAttempts: 1` must still reach the first healthy candidate
+    // rather than fast-failing on a skip row alone.
+    if (deps.maxSpawnedAttempts !== undefined && spawnedAttempts >= deps.maxSpawnedAttempts) break;
 
     deps.store.prune();
     const skip = skipCandidate(candidate, deps.store);
@@ -439,6 +571,11 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
           outcome.result.details.usage.toolCalls,
         ),
         attempts,
+        selection: deriveRunModelSelection(
+          deps.requestedModel,
+          attempts,
+          outcome.result.details.model,
+        ),
       };
     }
 
@@ -446,13 +583,17 @@ async function runCandidateLoop(deps: LoopDeps): Promise<SpawnWithFallbackResult
     recordCapacityFromFailure(deps.capacity, provider, outcome.classification);
   }
 
+  const endedByAbort = (deps.signal?.aborted ?? false) && lastResult === undefined;
   return {
     result: withAggregatedUsage(
-      lastResult ?? exhaustedResult(deps.candidates),
+      // A cancelled run must not claim every candidate was cooling down: the
+      // wording reaches the operator through the manifest and the delivery.
+      lastResult ?? (endedByAbort ? abortedResult() : exhaustedResult(deps.candidates)),
       totalUsage,
       lastResult?.details.usage.toolCalls ?? 0,
     ),
     attempts,
+    selection: deriveRunModelSelection(deps.requestedModel, attempts, lastResult?.details.model),
   };
 }
 
@@ -474,26 +615,59 @@ export async function spawnAgentWithFallback(
   const classifyFn = classify ?? classifySpawnFailure;
   const store = cooldownStore ?? createModelCooldownStore();
   const resolved = candidates ?? candidatesForModel(options.model, modelClass);
-  const modelCandidates = resolved.slice(0, maxAttempts);
 
-  const firstModel = modelCandidates[0];
-  if (firstModel === undefined) {
-    return { result: exhaustedResult([]), attempts: [] };
+  const firstModel = resolved[0];
+  if (firstModel === undefined || maxAttempts === 0) {
+    // A cancelled run must not be reported as "everything is cooling down", and
+    // that is true for the zero-cap/empty-candidate path too: the caller sees
+    // the same wording as the in-loop abort.
+    return {
+      result: options.signal?.aborted === true ? abortedResult() : exhaustedResult([]),
+      attempts: [],
+      selection: deriveRunModelSelection(options.model, []),
+    };
   }
 
+  // Candidate selection must see the PERSISTED cooldown store, not the snapshot
+  // this process loaded at import time: a provider spent by another fleet member
+  // (or by an earlier lifecycle) is otherwise discovered reactively, after
+  // paying a failed spawn in the fallback loop. This runs before the kill-switch
+  // branch too — no fallback does not mean "ignore a known-dead provider".
+  // Deliberately TTL-independent: the capacity probe caches for 5 minutes and
+  // skips the store refresh entirely when an endpoint probe answers. The bounded
+  // window keeps the capacity probe from re-reading the same file in one spawn.
+  store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS);
+  store.prune();
+
   // Kill switch: try the single configured model and surface its result as-is.
+  // One model only — a skip is refused rather than fallen back from, because
+  // spawning against a provider known to be spent would burn a request, a
+  // `-fallback-N`-less session, and the leaseless run that follows it.
   if (!(enabled ?? true)) {
+    const skip = skipCandidate(firstModel, store);
+    if (skip !== undefined) {
+      const attempts: SpawnAttempt[] = [skip];
+      return {
+        result: refusalResult(skip, store.providerEntries().get(providerOf(firstModel))?.cause),
+        attempts,
+        selection: deriveRunModelSelection(options.model, attempts),
+      };
+    }
     const result = await spawnAgentProcess({ ...spawnOptions, model: firstModel });
+    const attempts: SpawnAttempt[] = [
+      { model: firstModel, classification: classifyFn(result.details) },
+    ];
     return {
       result,
-      attempts: [{ model: firstModel, classification: classifyFn(result.details) }],
+      attempts,
+      selection: deriveRunModelSelection(options.model, attempts, result.details.model),
     };
   }
 
   // Pre-flight capacity check: refresh the cached signal once per TTL, then
   // move candidates on known-exhausted providers behind the healthy ones.
   if (capacity !== undefined) await capacity.refreshIfStale();
-  const orderedCandidates = orderCandidatesByCapacity(modelCandidates, (candidate) =>
+  const orderedCandidates = orderCandidatesByCapacity(resolved, (candidate) =>
     isCapacityExhausted(candidate, capacity),
   );
 
@@ -510,14 +684,18 @@ export async function spawnAgentWithFallback(
     const relevantWindows = capacity
       .windows()
       .filter((window) => candidateProviders.has(window.provider));
+    const attempts = orderedCandidates.map(capacitySkipAttempt);
     return {
       result: capacityExhaustedResult(orderedCandidates, relevantWindows),
-      attempts: orderedCandidates.map(capacitySkipAttempt),
+      attempts,
+      selection: deriveRunModelSelection(options.model, attempts),
     };
   }
 
   return runCandidateLoop({
     candidates: orderedCandidates,
+    requestedModel: options.model,
+    maxSpawnedAttempts: maxAttempts,
     spawnOptions,
     classifyFn,
     store,

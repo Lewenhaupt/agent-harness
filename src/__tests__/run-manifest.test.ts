@@ -12,6 +12,7 @@ import {
   readRunManifest,
   runManifestPath,
   scanForInterruptedRuns,
+  setRunModelSelection,
   setRunStatus,
   setRunTelemetry,
   writeRunManifest,
@@ -462,5 +463,146 @@ describe("run manifest", () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("No run manifest");
+  });
+
+  it("setRunModelSelection records the served model, the request and the skips", () => {
+    const fs = createFakeFs();
+    // The running manifest names the pre-dispatch pick only: it must never claim
+    // a model served the run before anything was spawned.
+    writeRunManifest({
+      cwd,
+      manifest: {
+        ...sampleManifest(),
+        model: undefined,
+        requestedModel: "llmgateway/mimo-v2.6-flash",
+      },
+      fs,
+    });
+    setRunTelemetry({
+      cwd,
+      runId: "abc123",
+      telemetry: { attempts: 2, fallbacks: 1, quotaFailures: 1, noOps: 0, cost: 0.5 },
+      fs,
+    });
+
+    const result = setRunModelSelection({
+      cwd,
+      runId: "abc123",
+      model: "commandcode/xiaomi/mimo-v2.6-flash",
+      requestedModel: "llmgateway/mimo-v2.6-flash",
+      skippedModels: [
+        { model: "llmgateway/mimo-v2.6-flash", reason: "Provider llmgateway is cooling down" },
+      ],
+      fs,
+    });
+
+    expect(result).toEqual({ ok: true });
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    // `model` is the one that actually served the run; the pre-dispatch pick is
+    // preserved separately so the fallback stays visible.
+    expect(reloaded).toHaveProperty("model", "commandcode/xiaomi/mimo-v2.6-flash");
+    expect(reloaded).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
+    expect(reloaded?.skippedModels).toEqual([
+      { model: "llmgateway/mimo-v2.6-flash", reason: "Provider llmgateway is cooling down" },
+    ]);
+    // Read-modify-write: nothing else moves.
+    expect(reloaded).toHaveProperty("status", RunStatus.Running);
+    expect(reloaded).toHaveProperty("startedAt", 1_000);
+    expect(reloaded).toHaveProperty("phase", "plan");
+    expect(reloaded).toHaveProperty("telemetry.attempts", 2);
+  });
+
+  it("setRunModelSelection omits an empty skippedModels list", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: sampleManifest(), fs });
+
+    setRunModelSelection({
+      cwd,
+      runId: "abc123",
+      model: "commandcode/z-ai/glm-5.3-flash",
+      requestedModel: "commandcode/z-ai/glm-5.3-flash",
+      fs,
+    });
+
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    expect(reloaded).toHaveProperty("model", "commandcode/z-ai/glm-5.3-flash");
+    expect(reloaded).not.toHaveProperty("skippedModels");
+  });
+
+  it("setRunModelSelection leaves `model` absent when nothing was dispatched", () => {
+    const fs = createFakeFs();
+    writeRunManifest({ cwd, manifest: { ...sampleManifest(), model: undefined }, fs });
+
+    setRunModelSelection({
+      cwd,
+      runId: "abc123",
+      requestedModel: "commandcode/z-ai/glm-5.3-flash",
+      skippedModels: [{ model: "llmgateway/mimo-v2.6-flash", reason: "cooling down" }],
+      fs,
+    });
+
+    const reloaded = readRunManifest({ cwd, runId: "abc123", fs });
+    // No spawn means no serving model: the pre-dispatch pick stays in
+    // `requestedModel` and the skips explain why nothing ran.
+    expect(reloaded).not.toHaveProperty("model");
+    expect(reloaded).toHaveProperty("requestedModel", "commandcode/z-ai/glm-5.3-flash");
+    expect(reloaded?.skippedModels).toEqual([
+      { model: "llmgateway/mimo-v2.6-flash", reason: "cooling down" },
+    ]);
+  });
+
+  it("setRunModelSelection returns an error for an unknown run id", () => {
+    const fs = createFakeFs();
+    const result = setRunModelSelection({
+      cwd,
+      runId: "missing",
+      model: "commandcode/z-ai/glm-5.3-flash",
+      requestedModel: "llmgateway/mimo-v2.6-flash",
+      fs,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No run manifest");
+  });
+
+  it("parses a manifest written before the model-selection fields existed", () => {
+    const legacy = {
+      schemaVersion: 1,
+      runId: "legacy",
+      taskId: "bd-42",
+      phase: "implement",
+      sessionName: "belayd-bd-42-sub-implement-legacy",
+      status: "completed",
+      startedAt: 1_000,
+      model: "opencode-go/deepseek-v4-flash",
+    };
+
+    expect(parseRunManifest(legacy)).toEqual(legacy);
+  });
+
+  it("lists a run that records only the pre-dispatch pick", () => {
+    // A run cancelled or all-skipped before dispatch has `requestedModel` and
+    // `skippedModels` but no `model`: the reader and `listRuns` must surface it
+    // without inventing a serving model.
+    const fs = createFakeFs();
+    writeRunManifest({
+      cwd,
+      manifest: {
+        ...sampleManifest(),
+        runId: "pending-run",
+        model: undefined,
+        requestedModel: "llmgateway/mimo-v2.6-flash",
+        skippedModels: [
+          { model: "llmgateway/mimo-v2.6-flash", reason: "Provider llmgateway is cooling down." },
+        ],
+      },
+      fs,
+    });
+
+    const runs = listRuns({ cwd, fs });
+
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
+    expect(runs[0]).not.toHaveProperty("model");
+    expect(runs[0]?.skippedModels).toHaveLength(1);
   });
 });

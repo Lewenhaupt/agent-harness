@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  COOLDOWN_REFRESH_MAX_AGE_MS,
   type CooldownFs,
   createModelCooldownStore,
   MAX_ESCALATED_COOLDOWN_SECONDS,
@@ -706,6 +707,73 @@ describe("model cooldown store (refresh)", () => {
     store.markProviderCooldown("opencode-go", 300, "quota");
 
     expect(() => store.refresh()).not.toThrow();
+    expect(store.providerEntries().get("opencode-go")).toHaveProperty("until", 1_300_000);
+  });
+});
+
+describe("model cooldown store refreshIfStale", () => {
+  const filePath = "/tmp/model-cooldowns.json";
+
+  it("reads the file once for two reads inside the window", () => {
+    const fs = createFakeFs();
+    const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 300, "quota");
+
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+
+    // A second member's mark inside the window is deliberately not re-read: one
+    // spawn must not parse the same file twice (selection + capacity probe).
+    otherMember.markProviderCooldown("llmgateway", 300, "quota");
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_200);
+    expect(store.providerEntries().has("llmgateway")).toBe(false);
+  });
+
+  it("re-reads the file once the window has elapsed", () => {
+    const fs = createFakeFs();
+    const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000);
+
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    otherMember.markProviderCooldown("llmgateway", 300, "quota");
+
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000 + COOLDOWN_REFRESH_MAX_AGE_MS);
+    expect(store.isCoolingDown("llmgateway/glm-5.3")).toBe(true);
+  });
+
+  it("re-reads when the clock regresses instead of trusting the stale stamp", () => {
+    const fs = createFakeFs();
+    const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000);
+
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 300, "quota");
+
+    // `at - lastRefreshAt` is negative here, which an elapsed-time comparison
+    // alone would read as "fresh" until wall time caught up.
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 999_999);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+  });
+
+  it("always reads on the first call, even for an old store", () => {
+    // The store loaded the file at creation; a cooldown written afterwards must
+    // not look "fresh" just because the process is new.
+    const fs = createFakeFs();
+    const store = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 300, "quota");
+
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000);
+    expect(store.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+  });
+
+  it("is a no-op for an in-memory store", () => {
+    const store = createModelCooldownStore(() => 1_000_000);
+    store.markProviderCooldown("opencode-go", 300, "quota");
+
+    expect(() => store.refreshIfStale()).not.toThrow();
+    expect(() => store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS, 1_000_000)).not.toThrow();
     expect(store.providerEntries().get("opencode-go")).toHaveProperty("until", 1_300_000);
   });
 });

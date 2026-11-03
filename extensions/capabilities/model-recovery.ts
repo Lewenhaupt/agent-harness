@@ -107,6 +107,13 @@ export function registerModelRecovery(deps: ModelRecoveryDeps): void {
     if (current === undefined) return;
     state.tried.add(current);
 
+    // A provider another fleet member cooled after this store was created must
+    // be blocked before the switch target is chosen: the capacity TTL can hide
+    // it, and switching onto it spends the one continuation on a dead provider
+    // (bd-234). Unbounded refresh: this decision has one shot per turn.
+    routing.cooldownStore.refresh();
+    routing.cooldownStore.prune();
+
     // Candidates the session already ran on are blocked too: the cooldown store
     // may not know them yet when the failure was endpoint-scoped, and retrying
     // the model that just failed would spend a request to relearn the same thing.

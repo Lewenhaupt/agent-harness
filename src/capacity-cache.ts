@@ -24,6 +24,7 @@
 
 import { providerOf } from "./model-classes.js";
 import type { CooldownEntry, ModelCooldownStore, ProviderCooldownCause } from "./model-cooldown.js";
+import { COOLDOWN_REFRESH_MAX_AGE_MS } from "./model-cooldown.js";
 import { parseQuotaResetSeconds } from "./quota-failure.js";
 
 /** One provider's known exhaustion window. */
@@ -118,8 +119,10 @@ export function probeFromCooldownStore(store: ModelCooldownStore): CapacityProbe
     // The store loads its file once at creation, and every fleet member owns its
     // own store: without a re-read the probe would serve a creation-time
     // snapshot and miss a provider cooldown another member just persisted. The
-    // refresh is a no-op for an in-memory store and never throws.
-    store.refresh();
+    // bounded window lets candidate selection and this probe share one read per
+    // spawn instead of parsing the same file twice; the call is a no-op for an
+    // in-memory store and never throws.
+    store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS);
     return {
       windows: [...store.providerEntries()]
         .filter(([, entry]) => isCapacityCause(entry))

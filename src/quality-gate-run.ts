@@ -12,7 +12,11 @@ import { type ModelClass, resolveModelSpec } from "./model-classes.js";
 import type { ModelCooldownStore } from "./model-cooldown.js";
 import type { ModelTelemetryStore } from "./model-telemetry.js";
 import { gateRetrySession } from "./session-naming.js";
-import type { SpawnAttempt, SpawnWithFallbackOptions } from "./spawn-with-fallback.js";
+import type {
+  RunModelSelection,
+  SpawnAttempt,
+  SpawnWithFallbackOptions,
+} from "./spawn-with-fallback.js";
 import type { Phase } from "./workflow-phases.js";
 import {
   resolveQualityGate,
@@ -44,6 +48,8 @@ export interface QualityGateRunnerDeps {
   spawnAgentWithFallback: (options: SpawnWithFallbackOptions) => Promise<{
     result: SpawnResult;
     attempts: SpawnAttempt[];
+    /** Derived by the spawn layer; absent on narrower test seams. */
+    selection?: RunModelSelection;
   }>;
   routing: QualityGateRouting;
   /** Metrics sink for one attempt; the composer wires this to the metrics log. */
@@ -80,6 +86,12 @@ export interface RunQualityGateOptions {
   taskId?: string;
   /** Run id the gate verdict belongs to; emitted as `gate_result.runId`. */
   runId: string;
+  /**
+   * Receives each gate-retry spawn's selection, so the caller can fold it into
+   * the run manifest (the retry may be served by a different candidate than the
+   * phase's own spawn). Called once per retry, in order.
+   */
+  onSelection?: (selection: RunModelSelection) => void;
 }
 
 /** Maximum number of agent passes over the quality gate (1 initial + retries). */
@@ -128,6 +140,8 @@ interface GateRetryOptions {
   phaseName: string;
   /** Telemetry sink for this run; defaults to the workflow store. */
   telemetry?: ModelTelemetryStore;
+  /** Called with the retry spawn's selection (see `RunQualityGateOptions`). */
+  onSelection?: (selection: RunModelSelection) => void;
   /** The phase's original task prompt, prepended on a fresh epoch. */
   originalTask: string;
   /** Every gate verdict so far, oldest first. */
@@ -183,7 +197,13 @@ function spawnGateRetry(
       telemetry: options.telemetry ?? deps.routing.telemetry,
       capacity: deps.routing.capacity,
     })
-    .then((r) => r.result);
+    .then((r) => {
+      // The retry has its own attempt trail: a gate fix-up that skipped a cooling
+      // provider must say so in the delivery and in the manifest, not just in the
+      // phase spawn's record.
+      if (r.selection !== undefined) options.onSelection?.(r.selection);
+      return withFallbackNote(r.result, r.attempts);
+    });
 }
 
 /**
@@ -307,6 +327,7 @@ export function createQualityGateRunner(
           env: options.env,
           phaseName,
           telemetry: options.telemetry,
+          onSelection: options.onSelection,
           originalTask: task,
           feedbackHistory,
         },

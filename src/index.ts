@@ -1131,6 +1131,7 @@ export type {
 export {
   COOLDOWN_ESCALATION_FACTOR,
   COOLDOWN_ESCALATION_MEMORY_MS,
+  COOLDOWN_REFRESH_MAX_AGE_MS,
   createModelCooldownStore,
   defaultModelCooldownPath,
   MAX_ESCALATED_COOLDOWN_SECONDS,
@@ -1487,6 +1488,7 @@ export {
   runManifestPath,
   runsDir,
   scanForInterruptedRuns,
+  setRunModelSelection,
   setRunStatus,
   setRunTelemetry,
   writeRunManifest,
@@ -1519,11 +1521,18 @@ export {
   spawnAgentProcess,
 } from "./spawn.js";
 export type {
+  RunModelSelection,
+  SkippedModel,
   SpawnAttempt,
   SpawnWithFallbackOptions,
   SpawnWithFallbackResult,
 } from "./spawn-with-fallback.js";
-export { recordFailureCooldown, spawnAgentWithFallback } from "./spawn-with-fallback.js";
+export {
+  deriveRunModelSelection,
+  mergeRunModelSelections,
+  recordFailureCooldown,
+  spawnAgentWithFallback,
+} from "./spawn-with-fallback.js";
 export type {
   GitExec,
   StackNode,

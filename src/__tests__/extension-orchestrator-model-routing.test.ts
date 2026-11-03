@@ -19,7 +19,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLaunch } from "../../extensions/capabilities/launch.js";
-import { createCapacityCache } from "../capacity-cache.js";
+import { type CapacityCache, createCapacityCache } from "../capacity-cache.js";
 import { buildHandoff } from "../handoff.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
 import { workflowStateFilePath } from "../workflow-state.js";
@@ -49,13 +49,18 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const daemon = vi.hoisted(() => {
   const calls: Array<{ method: string; path: string; body: string }> = [];
-  const state = { sessionModel: undefined as { provider: string; id: string } | undefined };
+  const state = {
+    sessionModel: undefined as { provider: string; id: string } | undefined,
+    /** Hook a test can install to act between session creation and routing. */
+    onCreateSession: undefined as (() => void) | undefined,
+  };
   return {
     calls,
     state,
     clear: () => {
       calls.length = 0;
       state.sessionModel = undefined;
+      state.onCreateSession = undefined;
     },
   };
 });
@@ -72,6 +77,7 @@ const mockHttpRequest = vi.hoisted(() =>
       const path = opts.path ?? "";
       let data = "{}";
       if (opts.method === "POST" && path === "/sessions") {
+        daemon.state.onCreateSession?.();
         data = JSON.stringify({ id: "sess-child" });
       } else if (opts.method === "GET" && path.startsWith("/sessions/sess-child/status")) {
         data = JSON.stringify(
@@ -137,22 +143,24 @@ function writeCooldowns(providers: readonly string[], resetInMinutes = 120): voi
 /**
  * A launch whose routing state is per-test (no shared module state): the
  * capacity cache probes the cooldown store, which is the same wiring the
- * composer uses.
+ * composer uses. `capacity` can be injected to isolate one signal.
  */
-function createTestLaunch(options: { enabled?: boolean } = {}) {
+function createTestLaunch(options: { enabled?: boolean; capacity?: CapacityCache } = {}) {
   const cooldownStore = createModelCooldownStore({ filePath: cooldownPath });
-  const capacity = createCapacityCache({
-    probe: () => {
-      cooldownStore.refresh();
-      return {
-        windows: [...cooldownStore.providerEntries()].map(([provider, entry]) => ({
-          provider,
-          resetAt: entry.until,
-          reason: entry.reason,
-        })),
-      };
-    },
-  });
+  const capacity =
+    options.capacity ??
+    createCapacityCache({
+      probe: () => {
+        cooldownStore.refresh();
+        return {
+          windows: [...cooldownStore.providerEntries()].map(([provider, entry]) => ({
+            provider,
+            resetAt: entry.until,
+            reason: entry.reason,
+          })),
+        };
+      },
+    });
   const launch = createLaunch({
     pi: { sendMessage: vi.fn() } as unknown as ExtensionAPI,
     getSessionState: () =>
@@ -245,6 +253,83 @@ describe("orchestrator launch model routing", () => {
     expect(result.ok).toBe(true);
     expect(pathIndex("/model")).toBe(-1);
     expect(pathIndex("/prompt")).toBeGreaterThan(-1);
+  });
+
+  it("sees a cooldown another process wrote after the store was created", async () => {
+    // The capacity signal reports nothing, so only the cooldown store can block
+    // a candidate here. The store is created first and the file is written
+    // afterwards: on a creation-time snapshot llmgateway looks healthy and the
+    // launch would be refused, so this pins the preflight refresh (bd-234).
+    const capacity = createCapacityCache({ probe: () => ({ windows: [] }) });
+    const { launch } = createTestLaunch({ capacity });
+    writeCooldowns(["llmgateway"]);
+    daemon.state.sessionModel = LLM;
+    const { ctx } = createCtx(LLM);
+
+    const result = await launch.launchWorktreeWorkflow({
+      ctx,
+      taskId: "bd-229",
+      workflowType: "bugfix",
+      branch: "feat/bd-229",
+    });
+
+    expect(result.ok).toBe(true);
+    const modelCall = daemon.calls.find((call) => call.path === "/sessions/sess-child/model");
+    const body = JSON.parse(modelCall?.body ?? "{}") as { provider?: string };
+    expect(body.provider).toBe("opencode-go");
+  });
+
+  it("refuses before any side effect when another process spent every provider after the store loaded", async () => {
+    // The store is created (empty snapshot) before the file is written, and the
+    // capacity signal is isolated, so only the preflight's own refresh can see
+    // the cooldowns. Without it this launch would create a session that cannot
+    // serve a single turn.
+    const capacity = createCapacityCache({ probe: () => ({ windows: [] }) });
+    const { launch } = createTestLaunch({ capacity });
+    writeCooldowns(ALL_PROVIDERS);
+    daemon.state.sessionModel = LLM;
+    const { ctx } = createCtx(LLM);
+
+    const result = await launch.launchWorktreeWorkflow({
+      ctx,
+      taskId: "bd-234",
+      workflowType: "bugfix",
+      branch: "feat/bd-234",
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("Refusing to launch");
+    expect(result.error).toContain("llmgateway");
+    // Nothing was created: the refusal precedes every side effect.
+    expect(daemon.calls.some((call) => call.method === "POST" && call.path === "/sessions")).toBe(
+      false,
+    );
+  });
+
+  it("re-checks the shared cooldown store when routing the created child", async () => {
+    // Preflight runs while every provider is healthy; the operator's fleet spends
+    // llmgateway between session creation and the post-create check. The capacity
+    // probe is isolated, so only `routeOrchestratorModel`'s own refresh can move
+    // the child off the provider that just went away.
+    const capacity = createCapacityCache({ probe: () => ({ windows: [] }) });
+    const { launch } = createTestLaunch({ capacity });
+    daemon.state.sessionModel = LLM;
+    daemon.state.onCreateSession = () => writeCooldowns(["llmgateway"]);
+    const { ctx } = createCtx(LLM);
+
+    const result = await launch.launchWorktreeWorkflow({
+      ctx,
+      taskId: "bd-234",
+      workflowType: "bugfix",
+      branch: "feat/bd-234",
+    });
+
+    expect(result.ok).toBe(true);
+    const modelCall = daemon.calls.find((call) => call.path === "/sessions/sess-child/model");
+    const body = JSON.parse(modelCall?.body ?? "{}") as { provider?: string };
+    expect(body.provider).toBe("opencode-go");
+    expect(pathIndex("/model")).toBeLessThan(pathIndex("/prompt"));
   });
 
   it("routes even when the caller's model differs from the child's", async () => {

@@ -55,7 +55,7 @@ import {
 } from "../fleet-status.js";
 import { ORCHESTRATOR_CLAIM_STALE_MS } from "../orchestrator-claim.js";
 import type { RunManifest } from "../run-manifest.js";
-import { RunStatus, runManifestPath } from "../run-manifest.js";
+import { parseRunManifest, RunStatus, runManifestPath } from "../run-manifest.js";
 import { isValidTaskId } from "../session-naming.js";
 import type { WorkflowState } from "../workflow-state.js";
 import { workflowStateFilePath } from "../workflow-state.js";
@@ -600,6 +600,45 @@ describe("buildFleetStatus", () => {
       idle: 0,
       "missing-state": 0,
     });
+  });
+
+  it("derives a member view from a manifest that records only the pre-dispatch pick", () => {
+    // bd-234: a run cannot name a serving model until something was dispatched,
+    // so `model` is absent while `requestedModel`/`skippedModels` are present.
+    // The fleet view must derive from it exactly like any other manifest.
+    const run = parseRunManifest({
+      schemaVersion: 1,
+      runId: "run-9",
+      taskId: "bd-12",
+      phase: "plan",
+      sessionName: "belayd-bd-12-sub-plan",
+      status: "running",
+      startedAt: 1_500,
+      requestedModel: "llmgateway/mimo-v2.6-flash",
+      skippedModels: [
+        { model: "llmgateway/mimo-v2.6-flash", reason: "Provider llmgateway is cooling down." },
+      ],
+    });
+    expect(run).toBeDefined();
+    if (run === undefined) return;
+
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent(),
+      members: [sampleMember({ runs: [run] })],
+    });
+
+    expect(status.members[0]?.latestRuns).toEqual([
+      {
+        phase: "plan",
+        runId: "run-9",
+        status: RunStatus.Running,
+        startedAt: 1_500,
+        completedAt: undefined,
+      },
+    ]);
+    expect(status.members[0]).toHaveProperty("interruptedRunCount", 0);
+    expect(status.counts.active).toBe(1);
   });
 
   it("skips the main checkout until it holds workflow state", () => {

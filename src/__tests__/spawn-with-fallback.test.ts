@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import type { SpawnResult, SpawnUsage } from "../agent-registry.js";
+import { DEFAULT_AGENTS } from "../agent-registry.js";
 import { createCapacityCache, probeFromCooldownStore } from "../capacity-cache.js";
-import { createModelCooldownStore } from "../model-cooldown.js";
+import { type ModelClass, primaryModelOf, providerOf, resolveModelSpec } from "../model-classes.js";
+import { type CooldownFs, createModelCooldownStore } from "../model-cooldown.js";
 import { createModelTelemetryStore } from "../model-telemetry.js";
 import { withFallbackNote } from "../quality-gate-run.js";
 import {
@@ -11,7 +14,12 @@ import {
   DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
   type FailureClassification,
 } from "../quota-failure.js";
-import { spawnAgentWithFallback } from "../spawn-with-fallback.js";
+import {
+  deriveRunModelSelection,
+  mergeRunModelSelections,
+  type SpawnAttempt,
+  spawnAgentWithFallback,
+} from "../spawn-with-fallback.js";
 
 const mockSpawnAgentProcess = vi.hoisted(() => vi.fn());
 
@@ -22,6 +30,67 @@ vi.mock("../spawn.js", () => ({
 beforeEach(() => {
   mockSpawnAgentProcess.mockReset();
 });
+
+interface FakeCooldownFs extends CooldownFs {
+  files: Map<string, string>;
+}
+
+/**
+ * A node-style fs error. `NodeJS.ErrnoException` already carries the optional
+ * `code`, so the fake needs no cast to behave like the real seam.
+ */
+function fsError(code: "ENOENT" | "EEXIST", path: string): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(`${code}: ${path}`);
+  error.code = code;
+  return error;
+}
+
+/** In-memory `CooldownFs` seam, so no cooldown test touches the real disk. */
+function createFakeCooldownFs(initial: Record<string, string> = {}): FakeCooldownFs {
+  const files = new Map(Object.entries(initial));
+  return {
+    files,
+    existsSync(path) {
+      return files.has(path);
+    },
+    readFileSync(path) {
+      const content = files.get(path);
+      if (content === undefined) throw fsError("ENOENT", path);
+      return content;
+    },
+    writeFileSync(path, data, options) {
+      if (options?.flag === "wx" && files.has(path)) throw fsError("EEXIST", path);
+      files.set(path, data);
+    },
+    renameSync(oldPath, newPath) {
+      const content = files.get(oldPath);
+      if (content === undefined) throw fsError("ENOENT", oldPath);
+      files.delete(oldPath);
+      files.set(newPath, content);
+    },
+    mkdirSync() {
+      // In-memory fs has no directory hierarchy to create.
+    },
+    unlinkSync(path) {
+      files.delete(path);
+    },
+  };
+}
+
+/** The persisted file's shape, validated at the boundary instead of cast. */
+const PersistedCooldownStateSchema = z.object({
+  providers: z.record(z.string(), z.object({ until: z.number(), reason: z.string() })),
+  models: z.record(z.string(), z.object({ until: z.number(), reason: z.string() })),
+});
+
+function readPersistedCooldowns(
+  fs: FakeCooldownFs,
+  path: string,
+): z.infer<typeof PersistedCooldownStateSchema> {
+  const raw = fs.files.get(path);
+  if (raw === undefined) throw new Error(`missing persisted cooldown file ${path}`);
+  return PersistedCooldownStateSchema.parse(JSON.parse(raw));
+}
 
 function zeroUsage(): SpawnUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 0 };
@@ -329,6 +398,133 @@ describe("spawnAgentWithFallback", () => {
 
     expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
     expect(attempts).toHaveLength(1);
+  });
+
+  it("refuses the kill-switch model when it is cooling down", async () => {
+    // `enabled: false` means "no fallback", not "ignore a spent provider":
+    // spawning here would burn a request against a provider already known dead.
+    const store = createModelCooldownStore(() => 0);
+    store.markProviderCooldown("opencode-go", 900, "quota", { cause: "quota" });
+
+    const { result, attempts, selection } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      enabled: false,
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toHaveProperty("skippedProvider", "opencode-go");
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      expect.stringContaining("opencode-go/mimo-v2.6-flash"),
+    );
+    expect(result.content[0]).toHaveProperty("text", expect.stringContaining("cooldown"));
+    // Nothing ran, so no model is reported as having served the run.
+    expect(selection).not.toHaveProperty("servedModel");
+  });
+
+  it("refuses the kill-switch model when it has no API key configured", async () => {
+    // A missing credential is an operator fix, not a spent quota: the refusal
+    // must name the real cause instead of reusing the cooldown sentence.
+    const store = createModelCooldownStore(() => 0);
+    store.markProviderCooldown("commandcode", 3600, "no key", { cause: "unconfigured" });
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "commandcode/z-ai/glm-5.3-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      enabled: false,
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts[0]).toHaveProperty("skippedProvider", "commandcode");
+    expect(result.content[0]).toHaveProperty("text", expect.stringContaining("no API key"));
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      expect.stringContaining("Refusing to dispatch"),
+    );
+    expect(result.content[0]).not.toHaveProperty("text", expect.stringContaining("in cooldown"));
+  });
+
+  it("reports an aborted run distinctly from an all-cooling one", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      candidates: ["a", "b"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      signal: controller.signal,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts).toEqual([]);
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      "Run aborted before any candidate could be dispatched.",
+    );
+  });
+
+  it("never replaces a spawned attempt's result with the abort wording", async () => {
+    // A cancellation that lands DURING the spawn must not mask the attempt that
+    // really ran: the caller has to see the provider's result (and its exit
+    // code), not "aborted before dispatch".
+    const controller = new AbortController();
+    mockSpawnAgentProcess.mockImplementationOnce(() => {
+      controller.abort();
+      return Promise.resolve(makeResult("opencode-go/a", 1));
+    });
+
+    const { result, attempts, selection } = await spawnAgentWithFallback({
+      model: "opencode-go/a",
+      candidates: ["opencode-go/a", "commandcode/b"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      signal: controller.signal,
+      classify: seqClassifier("quota"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(attempts).toHaveLength(1);
+    expect(result.content[0]).toHaveProperty("text", "result-from-opencode-go/a");
+    expect(result.content[0]).not.toHaveProperty("text", expect.stringContaining("aborted"));
+    expect(result.details).toHaveProperty("exitCode", 1);
+    expect(selection).toHaveProperty("servedModel", "opencode-go/a");
+  });
+
+  it("keeps the cooldown wording when every candidate is cooling and nothing spawned", async () => {
+    const store = createModelCooldownStore(() => 0);
+    store.markProviderCooldown("opencode-go", 900, "quota");
+    store.markProviderCooldown("llmgateway", 900, "quota");
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      candidates: ["opencode-go/a", "llmgateway/b"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts.every((attempt) => attempt.skippedProvider !== undefined)).toBe(true);
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      expect.stringContaining("All candidate models are in cooldown"),
+    );
   });
 
   it("end-to-end: a real 429 details object triggers a fallback", async () => {
@@ -1093,6 +1289,36 @@ describe("spawnAgentWithFallback", () => {
     expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
     expect(attempts).toEqual([]);
     expect(result.details.exitCode).toBe(1);
+    // No candidates is a configuration outcome, not a cooldown: the copy must
+    // not print an empty parenthesis list.
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      "All candidate models are in cooldown; retry later.",
+    );
+  });
+
+  it("reports an abort when maxAttempts: 0 wins the early exit during cancellation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      maxAttempts: 0,
+      signal: controller.signal,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts).toEqual([]);
+    // Same wording as the in-loop abort, so a cancelled run never reads as an
+    // all-cooling run.
+    expect(result.content[0]).toHaveProperty(
+      "text",
+      "Run aborted before any candidate could be dispatched.",
+    );
   });
 });
 
@@ -1284,5 +1510,406 @@ describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
       now + (7 * 3600 + 57 * 60) * 1000,
     );
     expect(store.providerEntries().get("opencode-go")).not.toHaveProperty("escalations");
+  });
+});
+
+describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
+  const cooldownFilePath = "/tmp/model-cooldowns.json";
+  const nowMs = 1_000_000;
+  const now = (): number => nowMs;
+
+  it("consults the persisted cooldown file at selection time, not the process snapshot", async () => {
+    const fs = createFakeCooldownFs();
+    // Created BEFORE any cooldown exists on disk: its in-memory maps are the
+    // stale snapshot the picker used to trust for a whole process lifetime.
+    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    // Another fleet member spends opencode-go and llmgateway afterwards.
+    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota");
+    otherMember.markProviderCooldown("llmgateway", 5.6 * 3600, "quota");
+
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/xiaomi/mimo-v2.6-flash"));
+
+    const { attempts, selection } = await spawnAgentWithFallback({
+      model: "llmgateway/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model: string } | undefined;
+    expect(providerOf(spawned?.model ?? "")).toBe("commandcode");
+    // The skip rows keep their preference order ahead of the spawn.
+    expect(attempts.map((a) => a.skippedProvider ?? "spawned")).toEqual([
+      "llmgateway",
+      "opencode-go",
+      "spawned",
+    ]);
+    expect(selection).toHaveProperty("servedModel", "commandcode/xiaomi/mimo-v2.6-flash");
+    expect(selection).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
+    expect(selection.skipped.map((row) => row.model)).toEqual([
+      "llmgateway/mimo-v2.6-flash",
+      "opencode-go/mimo-v2.6-flash",
+    ]);
+    expect(selection.skipped[0]?.reason).toContain("cooling down");
+    // The run's own selection-time refresh is what taught this store: after the
+    // spawn it must know the cooldown it was blind to at construction. This is
+    // the assertion that fails on the pre-fix picker (bd-234 review W5).
+    expect(store.cooldownScope("llmgateway/anything")).toBe("provider");
+  });
+
+  it("picks the one available provider for every phase agent and class primary", async () => {
+    // Seeded through the SHARED FILE after the picker's store was created, so
+    // only a selection-time refresh can explain the commandcode pick: a
+    // creation-time snapshot still sees three healthy providers. (Re-anchored by
+    // the bd-234 review: this test previously marked the shared store in memory
+    // and therefore passed on the pre-fix picker as a store-layer guard.)
+    const fs = createFakeCooldownFs();
+    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota");
+    otherMember.markProviderCooldown("llmgateway", 5.6 * 3600, "quota");
+
+    const classPrimaries: { model: string; modelClass: ModelClass }[] = (
+      ["frontier", "standard", "fast"] as const
+    ).map((modelClass) => ({ model: primaryModelOf(modelClass), modelClass }));
+    const specs = [...DEFAULT_AGENTS.map((agent) => resolveModelSpec(agent)), ...classPrimaries];
+
+    for (const spec of specs) {
+      mockSpawnAgentProcess.mockReset();
+      mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/served"));
+
+      const { attempts } = await spawnAgentWithFallback({
+        model: spec.model,
+        modelClass: spec.modelClass,
+        tools: [],
+        systemPrompt: "t",
+        task: "t",
+        cooldownStore: store,
+        classify: seqClassifier("success"),
+      });
+
+      expect(mockSpawnAgentProcess, spec.model).toHaveBeenCalledTimes(1);
+      const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model: string } | undefined;
+      expect(providerOf(spawned?.model ?? ""), spec.model).toBe("commandcode");
+      // Exactly one attempt spawned, and it is the commandcode one: the cooled
+      // candidates may be reported but never tried.
+      const spawnedAttempts = attempts.filter(
+        (attempt) => attempt.skippedProvider === undefined && attempt.skippedCooldown !== true,
+      );
+      expect(
+        spawnedAttempts.map((attempt) => providerOf(attempt.model)),
+        spec.model,
+      ).toEqual(["commandcode"]);
+    }
+  });
+
+  it("persists a quota cooldown before the next candidate is chosen", async () => {
+    const fs = createFakeCooldownFs();
+    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    // Another process's store, created BEFORE the first run learns anything:
+    // only its selection-time refresh can make it skip llmgateway. (Re-anchored
+    // by the bd-234 review: created after the write, this passed pre-fix as a
+    // store-layer guard because construction already loaded the entry.)
+    const blindStore = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    mockSpawnAgentProcess
+      .mockResolvedValueOnce(makeResult("llmgateway/a"))
+      .mockImplementationOnce(() => {
+        // The failed provider must already be on disk when the retry candidate
+        // is picked, not just in this process's memory.
+        expect(
+          readPersistedCooldowns(fs, cooldownFilePath).providers,
+          "llmgateway cooldown persisted before the retry",
+        ).toHaveProperty("llmgateway.until", nowMs + 900 * 1000);
+        return Promise.resolve(makeResult("commandcode/b"));
+      });
+
+    const first = await spawnAgentWithFallback({
+      model: "llmgateway/a",
+      candidates: ["llmgateway/a", "commandcode/b"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      classify: seqClassifier("quota", "success"),
+    });
+    expect(first.selection).toHaveProperty("servedModel", "commandcode/b");
+
+    // A second run in a fresh process (store from before the write, same file)
+    // must not pay the failed attempt again.
+    mockSpawnAgentProcess.mockReset();
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/b"));
+    const second = await spawnAgentWithFallback({
+      model: "llmgateway/a",
+      candidates: ["llmgateway/a", "commandcode/b"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: blindStore,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model: string } | undefined;
+    expect(spawned?.model).toBe("commandcode/b");
+    expect(second.attempts[0]).toHaveProperty("skippedProvider", "llmgateway");
+  });
+
+  it("does not spend the maxAttempts cap on a cooldown skip", async () => {
+    mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/b"));
+    const store = createModelCooldownStore(() => 0);
+    store.markProviderCooldown("opencode-go", 900, "quota");
+
+    const { result, attempts } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      candidates: ["opencode-go/a", "commandcode/b", "commandcode/c"],
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      maxAttempts: 1,
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    expect(attempts[0]).toHaveProperty("skippedProvider", "opencode-go");
+    expect(attempts[1]).toHaveProperty("model", "commandcode/b");
+    // The cap still stops the loop after one spawn: the third candidate is not
+    // reached, skip row or not.
+    expect(attempts).toHaveLength(2);
+    expect(result.content[0]).toHaveProperty("text", "result-from-commandcode/b");
+  });
+
+  it("refuses a cooling kill-switch model discovered on the shared file", async () => {
+    // The kill-switch branch sits AFTER the selection-time refresh on purpose:
+    // "no fallback" must not mean "spawn on a provider another fleet member
+    // already spent". Seeding the shared file (not the handed-in store) is what
+    // makes the refresh, rather than construction, the reason it is seen.
+    const fs = createFakeCooldownFs();
+    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota", { cause: "quota" });
+
+    const { result, attempts, selection } = await spawnAgentWithFallback({
+      model: "opencode-go/mimo-v2.6-flash",
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      enabled: false,
+      cooldownStore: store,
+      classify: seqClassifier("success"),
+    });
+
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toHaveProperty("skippedProvider", "opencode-go");
+    expect(result.details).toHaveProperty("exitCode", 1);
+    expect(result.content[0]).toHaveProperty("text", expect.stringContaining("cooldown"));
+    expect(selection).not.toHaveProperty("servedModel");
+  });
+
+  it("spawns nothing and does not spin when every candidate is cooling and no cap is set", async () => {
+    const store = createModelCooldownStore(() => 0);
+    const candidates = ["a", "b", "c", "d", "e"];
+    for (const model of candidates) store.markCooldown(model, 900, "quota");
+    const telemetry = createModelTelemetryStore();
+
+    const { result, attempts, selection } = await spawnAgentWithFallback({
+      model: "unknown/x",
+      candidates,
+      tools: [],
+      systemPrompt: "t",
+      task: "t",
+      cooldownStore: store,
+      telemetry,
+      phase: "plan",
+      classify: seqClassifier("success"),
+    });
+
+    // One pass over the candidates, no dispatch, and no telemetry row for a
+    // candidate that was never tried (so no fallback was counted either).
+    expect(mockSpawnAgentProcess).not.toHaveBeenCalled();
+    expect(attempts.map((attempt) => attempt.model)).toEqual(candidates);
+    expect(attempts.every((attempt) => attempt.skippedCooldown === true)).toBe(true);
+    expect(telemetry.stats()).toEqual([]);
+    expect(result.details).toHaveProperty("exitCode", 1);
+    expect(selection).not.toHaveProperty("servedModel");
+    expect(selection.skipped).toHaveLength(candidates.length);
+  });
+});
+
+describe("withFallbackNote copy (bd-234)", () => {
+  it("keeps the existing trail wording for every skip cause", () => {
+    const attempts: SpawnAttempt[] = [
+      {
+        model: "llmgateway/a",
+        classification: { kind: "other", reason: "Provider llmgateway is cooling down." },
+        skippedProvider: "llmgateway",
+      },
+      {
+        model: "opencode-go/a",
+        classification: { kind: "other", reason: "Model opencode-go/a is cooling down." },
+        skippedCooldown: true,
+      },
+      {
+        model: "commandcode/a",
+        classification: { kind: "other", reason: "weekly limit" },
+        skippedCapacity: "commandcode",
+      },
+      { model: "openrouter/a", classification: { kind: "quota" } },
+    ];
+
+    const noted = withFallbackNote(makeResult("openrouter/a"), attempts);
+
+    // Adding the skip row must not rewrite the trail an operator already reads.
+    expect(noted.content[0]).toHaveProperty(
+      "text",
+      "result-from-openrouter/a\n\n[belayd model fallback] llmgateway/a (provider llmgateway exhausted) → opencode-go/a (cooldown) → commandcode/a (provider commandcode capacity-exhausted) → openrouter/a (quota)",
+    );
+  });
+
+  it("leaves a single-attempt result untouched", () => {
+    // A run whose first candidate served it has no trail to trail.
+    const result = makeResult("commandcode/a");
+
+    expect(
+      withFallbackNote(result, [{ model: "commandcode/a", classification: { kind: "success" } }]),
+    ).toBe(result);
+  });
+});
+
+describe("deriveRunModelSelection", () => {
+  const skippedRow = (model: string, reason: string): SpawnAttempt => ({
+    model,
+    classification: { kind: "other", reason },
+    skippedProvider: providerOf(model),
+  });
+  const spawnedRow = (model: string): SpawnAttempt => ({
+    model,
+    classification: { kind: "success" },
+  });
+
+  it("prefers the model the spawn layer reported as served", () => {
+    const attempts = [skippedRow("llmgateway/a", "cooling down"), spawnedRow("commandcode/b")];
+    const selection = deriveRunModelSelection("llmgateway/a", attempts, "commandcode/served");
+
+    expect(selection).toHaveProperty("servedModel", "commandcode/served");
+    expect(selection).toHaveProperty("requestedModel", "llmgateway/a");
+  });
+
+  it("falls back to the last spawned attempt when no served model is reported", () => {
+    const attempts = [skippedRow("llmgateway/a", "cooling down"), spawnedRow("commandcode/b")];
+    const selection = deriveRunModelSelection("llmgateway/a", attempts);
+
+    // The first attempt row is the skip row, so the served model cannot be
+    // read off `attempts[0]`.
+    expect(selection).toHaveProperty("servedModel", "commandcode/b");
+  });
+
+  it("maps every skip row to its recorded reason and leaves spawned rows out", () => {
+    const attempts: SpawnAttempt[] = [
+      {
+        model: "llmgateway/a",
+        classification: { kind: "other", reason: "r1" },
+        skippedProvider: "llmgateway",
+      },
+      {
+        model: "opencode-go/a",
+        classification: { kind: "other", reason: "r2" },
+        skippedCooldown: true,
+      },
+      {
+        model: "commandcode/a",
+        classification: { kind: "other", reason: "r3" },
+        skippedCapacity: "commandcode",
+      },
+      spawnedRow("commandcode/b"),
+    ];
+    const selection = deriveRunModelSelection("llmgateway/a", attempts);
+
+    expect(selection.skipped).toEqual([
+      { model: "llmgateway/a", reason: "r1" },
+      { model: "opencode-go/a", reason: "r2" },
+      { model: "commandcode/a", reason: "r3" },
+    ]);
+  });
+
+  it("reports no served model when nothing was spawned", () => {
+    const selection = deriveRunModelSelection("llmgateway/a", [
+      skippedRow("llmgateway/a", "cooling down"),
+    ]);
+
+    // A skip-only run must not claim the requested model executed anything.
+    expect(selection).not.toHaveProperty("servedModel");
+    expect(selection).toHaveProperty("requestedModel", "llmgateway/a");
+    expect(selection.skipped).toHaveLength(1);
+  });
+
+  it("reports no skips and no served model for an empty attempt trail", () => {
+    expect(deriveRunModelSelection("commandcode/b", [])).toEqual({
+      requestedModel: "commandcode/b",
+      skipped: [],
+    });
+  });
+});
+
+describe("mergeRunModelSelections", () => {
+  const selection = (
+    servedModel: string | undefined,
+    skipped: { model: string; reason: string }[],
+  ) => ({
+    ...(servedModel === undefined ? {} : { servedModel }),
+    requestedModel: "llmgateway/a",
+    skipped,
+  });
+
+  it("lets the last spawned model win and accumulates skipped rows", () => {
+    const merged = mergeRunModelSelections(
+      selection("opencode-go/b", [{ model: "llmgateway/a", reason: "cooling down" }]),
+      selection("commandcode/c", [{ model: "opencode-go/b", reason: "cooling down" }]),
+    );
+
+    expect(merged).toHaveProperty("servedModel", "commandcode/c");
+    expect(merged.skipped).toEqual([
+      { model: "llmgateway/a", reason: "cooling down" },
+      { model: "opencode-go/b", reason: "cooling down" },
+    ]);
+  });
+
+  it("keeps the earlier served model when the later dispatch spawned nothing", () => {
+    const merged = mergeRunModelSelections(
+      selection("opencode-go/b", []),
+      selection(undefined, [{ model: "commandcode/c", reason: "cooling down" }]),
+    );
+
+    expect(merged).toHaveProperty("servedModel", "opencode-go/b");
+    expect(merged.skipped).toHaveLength(1);
+  });
+
+  it("does not repeat an identical skip row across dispatches", () => {
+    const skipped = [{ model: "llmgateway/a", reason: "cooling down" }];
+    const merged = mergeRunModelSelections(
+      selection("opencode-go/b", skipped),
+      selection("opencode-go/b", skipped),
+    );
+
+    expect(merged.skipped).toEqual(skipped);
+  });
+
+  it("stays bounded across ten gate retries that skip the same provider", () => {
+    // Every gate retry re-skips the same cooling providers, and the phase run
+    // folds each retry into the manifest: without de-duplication a ten-retry run
+    // would persist ten identical rows.
+    const skipped = [{ model: "llmgateway/a", reason: "cooling down" }];
+    let merged = selection("opencode-go/b", skipped);
+    for (let retry = 0; retry < 10; retry += 1) {
+      merged = mergeRunModelSelections(merged, selection("opencode-go/b", skipped));
+    }
+
+    expect(merged.skipped).toEqual(skipped);
+    expect(merged).toHaveProperty("servedModel", "opencode-go/b");
   });
 });
