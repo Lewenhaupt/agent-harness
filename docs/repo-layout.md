@@ -248,6 +248,7 @@ order so pi hook/tool order is unchanged.
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
 | `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
+| `unslop.ts` | `belayd_unslop` UI-design tool (`belayd-unslop` agent, out of `DEFAULT_AGENTS`) |
 | `review.ts` | Review scoping/build (`buildReviewTask`), bounded review delivery, review↔fix guidance |
 | `session-state.ts` | Per-session state store (generic over the composed type), ask-hold, beads-actor attribution, run tracking, status formatting |
 | `model.ts` | Model-routing state (bd-116): capacity cache, per-workflow telemetry store, cooldown store, flush/reset rules, and the shared model-state store + provider-wrapper registration (bd-187) |
@@ -345,6 +346,8 @@ deliberately and say why.
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |
+| `docs/unslop-skill.md` | unslop UI-design skill: pinned router, `$UNSLOP_HOME`, wrappers, `belayd_unslop` |
+| `docs/bd-253-userguide.md` | operator walkthrough for the unslop skill (bd-253): when to reach for it, the two-pass flow, the degrade paths, the verification commands |
 | `docs/fleet.md` (+ `fleet-run/status/launch/merge/reconcile.md`) | fleet supervisor |
 | `docs/github-primary.md`, `docs/bd-180-userguide.md` | GitHub-primary authority, bead ↔ issue map, drift, readiness, append-only policy |
 | `docs/aws-credential-isolation.md` | sandbox + credential broker |

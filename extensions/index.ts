@@ -94,6 +94,7 @@ import {
 } from "./capabilities/session-state.js";
 import { registerSupervisionTools } from "./capabilities/supervision.js";
 import { registerTaskStartTools, registerTaskStopTools } from "./capabilities/task-control.js";
+import { registerUnslop } from "./capabilities/unslop.js";
 import { registerWorkflowCommands } from "./capabilities/workflow-commands.js";
 import { registerWorkflowContext } from "./capabilities/workflow-context.js";
 import { createWorkflowCore } from "./capabilities/workflow-core.js";
@@ -361,6 +362,9 @@ export default function belaydAgentHarness(
   });
 
   registerHumanGate(pi, humanGateDeps);
+
+  // bd-253: `belayd-unslop` is out of DEFAULT_AGENTS, so this is its only registration.
+  registerUnslop(pi, { spawnAgentWithFallback, modelRouting });
 
   registerMetrics(pi);
 

@@ -35,6 +35,7 @@
           system = pkgs.stdenv.hostPlatform.system;
           belaydPkgs = self.inputs.nixpkgs.legacyPackages.${system};
           archify = self.packages.${system}.archify;
+          unslop = self.packages.${system}.unslop;
           pi-web = self.packages.${system}.pi-web;
           pi-web-runtime-env = self.packages.${system}.pi-web-runtime-env;
           belayd-shell = self.packages.${system}.belayd-shell;
@@ -98,6 +99,9 @@
             # Spawned agent sessions see this; the archify wrapper exports it
             # too, but the runtime env is what reaches the agent's shell.
             "ARCHIFY_HOME=${archify}/libexec/archify"
+            # Same contract for the unslop UI-design skill: the router skill in
+            # .agents/skills/unslop reads upstream SKILL.md + references in place.
+            "UNSLOP_HOME=${unslop}/libexec/unslop"
             # Node_modules tree for the third-party pi extensions. bin/pi builds
             # its -e list from ./package.json pi.extensions plus the
             # nix/pi-extensions manifest, resolved against this directory, so
@@ -578,6 +582,62 @@
           '';
         };
 
+        # unslop — UI-design skill (github.com/heydamir/unslop, CC BY 4.0,
+        # Damir Sokolovsky) used through the thin router skill in
+        # .agents/skills/unslop. The router reads $UNSLOP_HOME/SKILL.md in place
+        # instead of vendoring 31 KB of upstream prose plus 1.4 MB of reference
+        # images, so a version bump is this rev + hash and nothing else.
+        #
+        # Re-pin: bump `rev`, build once with `lib.fakeHash` as the hash, then
+        # `nix build .#unslop` and copy the reported `got:` hash back here. The
+        # pinned upstream commit is a6f121eee5f29c2f74976b75456feae8b66afb3a
+        # (`version` keeps its short form so the store path names the pin).
+        unslop = pkgs.stdenv.mkDerivation rec {
+          pname = "unslop";
+          version = "a6f121e";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "heydamir";
+            repo = "unslop";
+            rev = "a6f121eee5f29c2f74976b75456feae8b66afb3a";
+            hash = "sha256-fvidc1KPQlh3N+sPJ+yKANCASRmmwTBVGZqquWwgkYs=";
+          };
+
+          phases = [ "installPhase" ];
+
+          # Both upstream scripts resolve Playwright with
+          # createRequire(join(process.cwd(), "package.json"))("playwright-core"),
+          # which from a /nix/store script path only works through NODE_PATH
+          # (their first `import("playwright")` attempt inside an ESM module
+          # never consults NODE_PATH and fails silently). Hence the wrappers:
+          # they point NODE_PATH at this install's playwright-core, the same
+          # derivation bound to PLAYWRIGHT_BROWSERS_PATH, so no revision guard
+          # can fail.
+          installPhase = ''
+            mkdir -p $out/libexec/unslop $out/lib/node_modules
+            cp -r ${src}/skills/unslop/. $out/libexec/unslop/
+            # Upstream SKILL.md and references/refs.md name
+            # examples/dashboard.html relative to the skill folder, so the
+            # examples live inside it instead of beside it.
+            cp -r ${src}/examples $out/libexec/unslop/examples
+            cp -r ${pkgs.playwright-driver}/. $out/lib/node_modules/playwright-core/
+
+            mkdir -p $out/bin
+            cat > $out/bin/unslop-snapshot <<WRAPPER
+            #!${pkgs.bash}/bin/bash
+            export NODE_PATH="$out/lib/node_modules"
+            exec "${pkgs.nodejs_24}/bin/node" "$out/libexec/unslop/scripts/snapshot.mjs" "\$@"
+            WRAPPER
+            chmod +x $out/bin/unslop-snapshot
+            cat > $out/bin/unslop-story <<WRAPPER
+            #!${pkgs.bash}/bin/bash
+            export NODE_PATH="$out/lib/node_modules"
+            exec "${pkgs.nodejs_24}/bin/node" "$out/libexec/unslop/scripts/story.mjs" "\$@"
+            WRAPPER
+            chmod +x $out/bin/unslop-story
+          '';
+        };
+
         devShellTools = [
           pkgs.bash
           # nodejs_24 here is 24.18.0; pi-agent-browser-native declares
@@ -608,6 +668,10 @@
           pkgs.duckdb
           playwright-cli
           archify
+          unslop
+          # scripts/story.mjs hard-fails without ffmpeg (it renders the unslop
+          # story video); nothing in the harness shells out to it otherwise.
+          pkgs.ffmpeg
           # belayd_outline extraction backends: universal-ctags is the
           # multi-language symbol extractor (`ctags --output-format=json`, one
           # process per file set) and ast-grep supplies the structured
@@ -1112,6 +1176,7 @@
             belayd-harness
             belayd-shell
             archify
+            unslop
             ;
         }
         // pkgs.lib.mapAttrs' (
@@ -1145,6 +1210,9 @@
             # Stable path to the upstream agent skill, schemas, examples, and
             # references bundled with the pinned archify release.
             export ARCHIFY_HOME="${archify}/libexec/archify"
+            # Stable path to the pinned unslop skill, its references and
+            # examples; the router skill reads them in place.
+            export UNSLOP_HOME="${unslop}/libexec/unslop"
             # Local pi wrapper (bin/pi): spawned belayd agents resolve their pi
             # binary via this var (src/spawn.ts) and would otherwise pick the
             # global /run/current-system/sw/bin/pi and dual-load extensions.

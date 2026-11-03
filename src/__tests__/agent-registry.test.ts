@@ -11,6 +11,9 @@ import {
   PROOF_VERIFIER_TOOLS,
   RESEARCHER_SYSTEM_PROMPT,
   RESEARCHER_TOOLS,
+  UNSLOP_AGENT,
+  UNSLOP_SYSTEM_PROMPT,
+  UNSLOP_TOOLS,
 } from "../agent-registry.js";
 import { phaseCommentHeader } from "../bead-comments.js";
 import { MODEL_CLASS_SPECS } from "../model-classes.js";
@@ -388,6 +391,54 @@ describe("PROOF_VERIFIER_AGENT", () => {
 
   it("lists the expected tool names", () => {
     expect(PROOF_VERIFIER_TOOLS).toEqual(["read", "describe_image"]);
+  });
+});
+
+describe("UNSLOP_AGENT (bd-253)", () => {
+  it("is not registered in DEFAULT_AGENTS (no auto phase tool)", () => {
+    expect(DEFAULT_AGENTS.some((a) => a.name === "belayd-unslop")).toBe(false);
+  });
+
+  it("is callable from the implementer allowlist", () => {
+    const impl = DEFAULT_AGENTS.find((a) => a.name === "belayd-implementer");
+    expect(impl?.tools).toContain("belayd_unslop");
+  });
+
+  it("declares the frontier class and the design-pass tool set", () => {
+    expect(UNSLOP_AGENT.name).toBe("belayd-unslop");
+    expect(UNSLOP_AGENT.modelClass).toBe("frontier");
+    expect(UNSLOP_AGENT.tools).toEqual(UNSLOP_TOOLS);
+    expect(UNSLOP_TOOLS).toContain("describe_image");
+    expect(UNSLOP_TOOLS).toContain("edit");
+    expect(UNSLOP_TOOLS).toContain("bash");
+    // bd-114: the browser prompt section costs ~8.7k tokens every turn, and
+    // unslop-snapshot already renders the screen.
+    expect(UNSLOP_TOOLS).not.toContain("agent_browser");
+  });
+
+  it("carries the two-pass protocol and the skill route", () => {
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("$UNSLOP_HOME/SKILL.md");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("## Audit");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("## Direction");
+    // A child has no ask_user, so pass 1 must stop and hand the direction back.
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("STOP");
+    // ...and it must not edit before that answer, or the audit is moot.
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("Pass 1 must not edit any file");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("describe_image");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("unslop-snapshot");
+  });
+
+  it("scopes the agent to the named screen", () => {
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("Never run quality gates");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("never commit");
+  });
+
+  it("carries the shared stale-worktree rebase guidance", () => {
+    // Regression guard: UNSLOP_AGENT is excluded from DEFAULT_AGENTS, so the
+    // loop over DEFAULT_AGENTS never asserts this prompt inherits the block.
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("git rebase main");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("check `main` before duplicating work");
+    expect(UNSLOP_SYSTEM_PROMPT).toContain("belayd_stack_rebase");
   });
 });
 

@@ -4,7 +4,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { DEFAULT_AGENTS, PROOF_VERIFIER_AGENT } from "../../src/agent-registry.js";
+import { DEFAULT_AGENTS, PROOF_VERIFIER_AGENT, UNSLOP_AGENT } from "../../src/agent-registry.js";
 import { resolvePiBinaryResolution } from "../../src/spawn.js";
 import { formatDoctorReport } from "../../src/tool-audit.js";
 import { emptyUsage } from "./context.js";
@@ -45,7 +45,7 @@ export function registerDoctor(pi: ExtensionAPI, deps: DoctorDeps): void {
         : state.planningActive
           ? "planning orchestrator"
           : "interactive";
-      const agents = [...DEFAULT_AGENTS, PROOF_VERIFIER_AGENT].map((agent) => ({
+      const agents = [...DEFAULT_AGENTS, PROOF_VERIFIER_AGENT, UNSLOP_AGENT].map((agent) => ({
         name: agent.name,
         tools: agent.tools,
       }));

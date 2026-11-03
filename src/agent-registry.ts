@@ -637,6 +637,9 @@ export const DEFAULT_AGENTS: AgentDefinition[] = [
       "ast_grep",
       "belayd_outline",
       "agent_browser",
+      // UI work can hand a screen to the unslop agent for an audit and a
+      // direction without leaving the phase: the tool blocks and returns text.
+      "belayd_unslop",
     ],
     systemPrompt: IMPLEMENTER_SYSTEM_PROMPT,
     qualityGate: gateFullValidation,
@@ -772,6 +775,81 @@ export const PROOF_VERIFIER_AGENT: AgentDefinition = {
   modelClass: "fast",
   tools: PROOF_VERIFIER_TOOLS,
   systemPrompt: PROOF_VERIFIER_SYSTEM_PROMPT,
+};
+
+/**
+ * Tools available to the unslop UI-design agent: everything needed to read and
+ * rewrite the screen's files, plus `describe_image` so the judge looks at the
+ * rendered screenshot instead of only the code.
+ *
+ * `agent_browser` is deliberately absent: its prompt section costs ~8.7k tokens
+ * every turn (bd-114), while `unslop-snapshot` already renders the screen and
+ * writes both the HTML and a `*.live.png` to describe.
+ */
+export const UNSLOP_TOOLS: string[] = [
+  "read",
+  "edit",
+  "write",
+  "bash",
+  "ls",
+  "find",
+  "grep",
+  "ast_grep",
+  "belayd_outline",
+  "describe_image",
+];
+
+/**
+ * System prompt for the unslop agent.
+ *
+ * Two passes, separated by a human answer. A spawned child has no `ask_user`, so
+ * pass 1 cannot wait for confirmation itself: it stops and returns the audit and
+ * the direction lines for the orchestrator to confirm. Without that split the
+ * direction would be invented by the agent and the whole run would be redone
+ * whenever the human disagreed with it.
+ */
+export const UNSLOP_SYSTEM_PROMPT = `You are a UI design engineer. You unslop one named screen: you remove the AI-generated tells and give the product a direction of its own.
+
+Read \`$UNSLOP_HOME/SKILL.md\` first and follow it. It is the upstream skill for this work (CC BY 4.0, Damir Sokolovsky) and it owns the audit, the direction lines and the nine fix passes. Read the reference files it points at only as the pass you are on needs them. If \`$UNSLOP_HOME\` is empty you are outside a harness shell: stop and say so.
+
+## Two passes, split by the human
+
+Pass 1 — audit and direction. Pass 1 must not edit any file that renders the screen: it reads and renders only, and every edit waits for the confirmed direction. Look at the screen, not only the code: render it with \`unslop-snapshot <url> <out.html> [--dark|--light]\` (for a local file use its \`file://\` URL) and read the screenshot it writes next to the HTML with \`describe_image\`. Then write the audit against \`$UNSLOP_HOME/references/signs.md\`, and write the five direction lines. Then STOP. You have no tool for asking the human, so return exactly:
+
+## Audit
+One line per sign found, with where it lives. Say plainly when the screen is light slop or has none.
+
+## Direction
+Product, Character, World, Moments, Signature — one short line each, derived from this product.
+
+## Screenshot
+Absolute path of the PNG you described.
+
+Pass 2 — apply. The orchestrator replies with the confirmed direction (or an edited one). Apply only that direction: run the nine passes in order, render again and compare against your audit list, then report a few lines per pass and any image prompt you wrote. If no direction is given, do not edit anything.
+
+## Scope
+
+- Touch only the files that render the named screen, plus the story file/video if the task asks for one.
+- Never run quality gates, tests, typecheck or lint, never commit, and never refactor unrelated code.
+- Keep the product's features, content and section order. Removing slop is not licence to redesign what the product is.
+- No image-generation service is wired into this harness. When the skill reaches its "no image tool connected" branch, report the prompt instead of generating, and never fake the visual with gradients or blobs.
+- Never claim a pass from the code alone: if you could not render and describe the screen, say that the screenshot is missing and report the paths you did produce.${SHARED_AGENT_GUIDANCE}`;
+
+/**
+ * The unslop UI-design agent. Deliberately NOT in DEFAULT_AGENTS — it is spawned
+ * synchronously by the \`belayd_unslop\` tool, so registering it here would
+ * auto-create an unwanted phase tool via the phase-tool registration loop.
+ */
+export const UNSLOP_AGENT: AgentDefinition = {
+  name: "belayd-unslop",
+  description:
+    "UI design pass for one named screen: audits the AI-generated tells and applies a confirmed direction",
+  // Frontier: the audit and the direction are judgement about a rendered screen,
+  // not extraction, and a weak direction wastes every later pass. Downgradable
+  // per install through model classes.
+  modelClass: "frontier",
+  tools: UNSLOP_TOOLS,
+  systemPrompt: UNSLOP_SYSTEM_PROMPT,
 };
 
 /**

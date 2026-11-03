@@ -425,7 +425,9 @@ and any consult phase tool of the workflow, plus `belayd_start_followup`,
 
 Still callable, so the session can ask again, report, and be stopped:
 `belayd_ask_human`, `belayd_status`, `belayd_doctor`, `belayd_stop_task`,
-`read`, `grep`, `find`, `ls`, `bash`, `bd`, `belayd_outline`, `belayd_archify`.
+`read`, `grep`, `find`, `ls`, `bash`, `bd`, `belayd_outline`, `belayd_archify`,
+`belayd_unslop` (bd-253: consult tools are not phase tools, so the same rule keeps
+them callable).
 
 ### Degradation (fail-closed)
 

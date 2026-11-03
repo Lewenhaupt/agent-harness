@@ -25,6 +25,7 @@ it instead of carrying all of it in every session.
 | Which agent wrote a bead, and who is it assigned to? | `docs/beads-actor.md` |
 | How do I operate pi-web / AWS sandbox / containers? | `docs/pi-web-service.md`, `docs/aws-credential-isolation.md`, `docs/arion.md` |
 | Fleet (`/fleet`), proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
+| UI design pass (unslop skill, `belayd_unslop`, `$UNSLOP_HOME`) | `docs/unslop-skill.md` |
 
 ## Build and acceptance
 

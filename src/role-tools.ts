@@ -41,11 +41,25 @@ export const WORKFLOW_CONTROL_TOOLS: readonly string[] = [
 ];
 
 /**
- * Read-only consult tools that stay callable during a workflow but are never a
- * required step. Kept out of the phase list on purpose: they do not gate
- * progress and do not advance completion.
+ * Consult tools that stay callable during a workflow but are never a required
+ * step. Kept out of the phase list on purpose: they do not gate progress and do
+ * not advance completion.
+ *
+ * They are not "read-only": `belayd_archify` writes diagram files and
+ * `belayd_unslop` edits the files that render the screen. What they share is the
+ * role — a side errand the orchestrator starts itself, whose result stays out of
+ * the phase ledger — not a write restriction.
+ *
+ * `belayd_unslop` (bd-253) is here for the same reason as `belayd_archify`: the
+ * workflow orchestrator is the caller that runs its two passes (audit → human
+ * confirmation → apply), and `pi.setActiveTools(workflowGateToolSet(...))` would
+ * otherwise deny the tool for the whole gated session.
  */
-export const CONSULT_TOOLS: readonly string[] = ["belayd_outline", "belayd_archify"];
+export const CONSULT_TOOLS: readonly string[] = [
+  "belayd_outline",
+  "belayd_archify",
+  "belayd_unslop",
+];
 
 /**
  * Fleet tools a *member* orchestrator may need while its own process gate is
@@ -119,7 +133,7 @@ export interface WorkflowToolSetInput {
 
 /**
  * The gated surface for one workflow: its own phase tools (required and
- * consult), the control tools, the read-only consult tools, and nothing else.
+ * consult), the control tools, the consult tools, and nothing else.
  *
  * A phase tool the workflow never runs is omitted, so a bugfix session is not
  * offered `belayd_userguide`, and no session is offered `belayd_documenter`

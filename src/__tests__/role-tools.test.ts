@@ -70,8 +70,9 @@ describe("workflowGateToolSet", () => {
       // The pre-bd-133 surface was 35 tools (10 phase + 15 control/fleet/consult
       // + 5 browse + 5 assorted). Anything above this bound means a family
       // crept back into the gated set. The bound moved 24 → 25 for
-      // belayd_ask_human (bd-152), a deliberate one-tool exception.
-      expect(toolSetSize(setFor(type)), `${type} declares too many tools`).toBeLessThanOrEqual(25);
+      // belayd_ask_human (bd-152) and 25 → 26 for belayd_unslop (bd-253), both
+      // deliberate one-tool exceptions.
+      expect(toolSetSize(setFor(type)), `${type} declares too many tools`).toBeLessThanOrEqual(26);
     }
   });
 
