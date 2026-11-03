@@ -83,8 +83,9 @@ this worktree; the outputs shown are the real ones.
      `keys every provider override to a model that has a class` — the
      guardrails for adding an exception (see "Add a new provider exception").
    - `pins the override models to their preferred provider` — exact pins for
-     `research`/`documentation`/`hotfix`, plus every `agentOverrides[*].model`
-     provider equals `providerPreferenceFor(model)[0]`.
+     `documentation`/`hotfix` (and research/plan asserted to carry no pin),
+     plus every `agentOverrides[*].model` provider equals
+     `providerPreferenceFor(model)[0]`.
 
 3. Print the resolved primaries and the effective preference order. The
    one-liner imports the compiled library, so build first:
@@ -171,10 +172,13 @@ this worktree; the outputs shown are the real ones.
    Expected (one line per pin; no pin keeps a stale `opencode-go/` prefix):
 
    ```text
-   research/plan llmgateway/glm-5.3 preferred: llmgateway
    documentation/implement llmgateway/deepseek-v4-flash preferred: llmgateway
    hotfix/implement llmgateway/deepseek-v4-flash preferred: llmgateway
    ```
+
+   `research/plan` is absent on purpose: it carries `tools` and `systemPrompt`
+   overrides but no `model`, so it routes by the planner's `frontier` class
+   (bd-237).
 
 6. End-to-end check on a real run: start a feature workflow
    (`/belayd bd-X feature`, or `/belayd bd-X feature --no-worktree`) and read
@@ -245,8 +249,11 @@ resolveModelSpec({ model: "vendor/x" });
 To pin a workflow phase, use a workflow override (`src/workflow-registry.ts`,
 or a `WorkflowSubTypeConfig["agentOverrides"]` value in the library) — for
 example the `documentation` and `hotfix` workflows pin `implement` to
-`llmgateway/deepseek-v4-flash`, and `research` pins `plan` to
-`llmgateway/glm-5.3`. If the pin and the model's preferred provider disagree,
+`llmgateway/deepseek-v4-flash`. Pin only where the pin names a provider outlet
+for a model the class primary is not — `research` used to pin `plan` to
+`llmgateway/glm-5.3` and no longer does (bd-237: the pin spent the expensive
+frontier model on every research run instead of letting the class primary run).
+If the pin and the model's preferred provider disagree,
 that disagreement is deliberate and belongs in the pin; if it is an accident,
 step 5 of the verification checks above catches it (`pins the override models
 to their preferred provider`).

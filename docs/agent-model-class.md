@@ -244,7 +244,10 @@ The documentation workflow overrides its implement model to
 `modelClass`, its class is derived from the override model (`fast`), not copied
 from the implementer agent's default (`frontier`). The same behavior applies
 to the implement override in the `hotfix` workflow. The default feature
-workflow, which has neither override, uses each agent's declared class.
+workflow, which has neither override, uses each agent's declared class. The
+`research` workflow's `plan` override is the same shape as the default: it
+overrides only `tools` and `systemPrompt`, so it routes by the planner's
+`frontier` class (bd-237 removed the old `llmgateway/glm-5.3` pin).
 
 ## How to Use
 

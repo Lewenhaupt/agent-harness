@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { providerOf, providerPreferenceFor } from "../model-classes.js";
+import { getAgent } from "../agent-registry.js";
+import {
+  primaryModelOf,
+  providerOf,
+  providerPreferenceFor,
+  resolveModelSpec,
+} from "../model-classes.js";
 import { gateStaticValidation } from "../quality-gates.js";
 import {
   getPhasesForType,
@@ -146,13 +152,36 @@ describe("WORKFLOW_REGISTRY", () => {
     expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.tools).toContain("bash");
   });
 
+  it("routes the research plan phase by class instead of a hard-pinned model", () => {
+    // bd-237: research planning used to pin llmgateway/glm-5.3, the expensive
+    // frontier model, on every research run. Without a pin the phase inherits
+    // the plan agent's class, so it starts on that class's primary model and
+    // falls back within the class like every other phase.
+    const override = WORKFLOW_REGISTRY.research.agentOverrides?.plan;
+    expect(override).toBeDefined();
+    expect(override?.model).toBeUndefined();
+    expect(override?.modelClass).toBeUndefined();
+
+    // Phase-tool → agent mapping (extensions/capabilities/phase-tools.ts).
+    const planAgent = getAgent("belayd-planner");
+    if (planAgent === undefined) throw new Error("belayd-planner agent is missing");
+    expect(resolveModelSpec(planAgent)).toEqual({
+      model: primaryModelOf("frontier"),
+      modelClass: "frontier",
+    });
+    expect(primaryModelOf("frontier")).not.toBe("llmgateway/glm-5.3");
+  });
+
   it("pins the override models to their preferred provider", () => {
     // bd-147: only deepseek-v4.1-flash prefers opencode-go; every other model
     // bills per-token on llmgateway. A registry pin that keeps the old
     // opencode-go prefix would silently spawn on the subscription bucket for a
     // model that does not belong there, so assert the exact pins AND that each
     // pin agrees with the model's own preference order.
-    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan?.model).toBe("llmgateway/glm-5.3");
+    //
+    // bd-237: research/plan carries no pin — it inherits the planner's class so
+    // the expensive glm-5.3 is not chosen on every research run.
+    expect(WORKFLOW_REGISTRY.research.agentOverrides?.plan).not.toHaveProperty("model");
     expect(WORKFLOW_REGISTRY.documentation.agentOverrides?.implement?.model).toBe(
       "llmgateway/deepseek-v4-flash",
     );

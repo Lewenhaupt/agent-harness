@@ -102,8 +102,12 @@ export const WORKFLOW_REGISTRY: Record<WorkflowSubType, WorkflowSubTypeConfig> =
     phases: ["scout", "plan", "commit"],
     proofRequired: false,
     agentOverrides: {
+      // bd-237: no model pin. Research planning used to hard-pin the expensive
+      // frontier model (llmgateway/glm-5.3, $1.20/$4.00 per MTok) while every
+      // other phase routed by class; inheriting the planner's `frontier` class
+      // yields the class primary (opencode-go/deepseek-v4.1-flash) and keeps
+      // the normal fallback chain.
       plan: {
-        model: "llmgateway/glm-5.3",
         tools: RESEARCHER_TOOLS,
         systemPrompt: RESEARCHER_SYSTEM_PROMPT,
       },
