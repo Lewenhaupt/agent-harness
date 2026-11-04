@@ -1,14 +1,20 @@
 /**
- * Model cooldown store with optional file persistence.
+ * Routing's cooldown view over the one shared model-state store (bd-256).
  *
- * When a model or provider hits a quota/rate limit it is marked unhealthy for a
- * period, and the fallback loop skips cooled-down candidates on subsequent
- * spawns. State lives in a closure rather than at module scope — callers own a
- * store instance (created once per orchestrator session) and pass it across
- * spawns, matching the repo's no-global-mutable-state rule.
+ * bd-38/bd-116 kept cooldowns in `~/.pi/agent/model-cooldowns.json`, shared
+ * between fleet members by a same-machine lockfile. bd-187 added the SQLite
+ * {@link ModelStateStore} for the provider wrapper, but left the JSON store in
+ * place: routing read one, the wrapper wrote the other, and neither could see
+ * the other's verdict. This module is the adapter that collapses them —
+ * `ModelCooldownStore` is now a thin typed view over `ModelStateStore`, so a
+ * quota failure the wrapper records steers the next spawn, and a cooldown the
+ * routing path records blocks the next wrapped dispatch.
  *
- * Cooldowns are scoped at two granularities, mirroring how failures actually
- * behave:
+ * Everything above the persistence stays where it was: the capacity cache, the
+ * telemetry store, `quota-failure` classification and the fallback loop all keep
+ * their semantics. Only the storage moved.
+ *
+ * Cooldowns keep two granularities, mirroring how failures actually behave:
  *
  * - **provider** (`opencode-go`): a quota/credit/rate limit (402/429) exhausts
  *   the provider's whole quota bucket, so every model on it is dead until reset;
@@ -17,52 +23,54 @@
  * - **model** (`opencode-go/mimo-v2.6-flash`): a transient failure (5xx, network),
  *   or a model id the endpoint retired (404/410), is endpoint-specific — the same
  *   bare model id may still be healthy on another provider, so only this exact
- *   endpoint is cooled.
- *
- * `isCoolingDown(model)` reports true when either the model's provider or the
- * model endpoint itself is cooling down.
- *
- * Without a `filePath` the store is in-memory only (the historical behaviour,
- * still the default, so tests and callers that manage their own persistence are
- * unaffected). With a `filePath`, entries survive orchestrator restarts: the map
- * is loaded on creation (expired entries pruned), and every mark re-writes the
- * file atomically — temp file + rename in the same directory — behind a
- * same-machine lockfile, following the pattern in pi-gateway's state.ts.
- *
- * The file is shared between processes (fleet members each run their own
- * orchestrator), so `refresh()` re-reads it and merges it into memory. The
- * capacity probe calls it before reading, which is what makes a provider
- * cooldown written by another member visible without an orchestrator restart.
- * `refresh()` and `persist()` share one ordering rule (see `preferEntry`), so
- * neither direction can shorten or lengthen a window the other produced.
+ *   endpoint is cooled. A model id with no provider is stored
+ *   provider-agnostically, which is how it stays visible to every provider's
+ *   readers.
  *
  * Repeated *unhinted* provider cooldowns escalate (see
- * `COOLDOWN_ESCALATION_FACTOR`): a guessed window that already expired while the
- * provider was still exhausted must cost more the next time, or a weekly limit
- * gets re-probed on the same cadence forever. The ladder lives in its own map
- * (`escalations`) so it survives the entry's expiry and a restart; a *hinted*
- * reset is authoritative and clears it.
+ * {@link COOLDOWN_ESCALATION_FACTOR}): a guessed window that already expired
+ * while the provider was still exhausted must cost more the next time, or a
+ * weekly limit gets re-probed on the same cadence forever. The ladder lives in
+ * the store's `cooldown_ladder` table so it survives the window and a restart;
+ * a *hinted* reset is authoritative and clears it. Model-scoped windows never
+ * escalate.
+ *
+ * The retired JSON file is imported once, on first use, so an operator who set
+ * `BELAYD_MODEL_COOLDOWN_FILE` (or who has windows from an older build) does not
+ * silently lose them. It is never written again: {@link defaultModelCooldownPath}
+ * is now only a *source*. The import is remembered by a `.imported` marker next
+ * to the file, and the user's file is left untouched.
  */
 
-import { randomBytes } from "node:crypto";
-import * as nodeFs from "node:fs";
-import * as nodeOs from "node:os";
-import * as nodePath from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import { providerOf } from "./model-classes.js";
+import type {
+  CooldownCause,
+  CooldownRow,
+  CooldownScope,
+  ModelStateSeeder,
+  ModelStateStore,
+} from "./model-state-store.js";
+import {
+  cooldownProviderKey,
+  modelStateSeederFor,
+  openModelStateStore,
+  PROVIDER_SCOPE_MODEL,
+  sharedModelStateStore,
+} from "./model-state-store.js";
 
-/**
- * Stable cause tag for a provider-wide cooldown, persisted on the entry.
- *
- * `reason` is display text and must never be branched on (a merge can pair it
- * with a window another mark produced), so consumers that need to know *why* a
- * provider is cooling read this instead: the capacity probe must not treat a
- * missing credential as spent capacity, and the fallback loop's skip rows
- * report which of the two causes skipped the provider.
- */
-export type ProviderCooldownCause = "quota" | "unconfigured";
+export type { CooldownCause as ProviderCooldownCause, CooldownScope } from "./model-state-store.js";
+export {
+  COOLDOWN_ESCALATION_FACTOR,
+  COOLDOWN_ESCALATION_MEMORY_MS,
+  MAX_ESCALATED_COOLDOWN_SECONDS,
+} from "./model-state-store.js";
 
+/** One cooldown window, shaped for the routing readers. */
 export interface CooldownEntry {
   /** Epoch ms until which the target should not be attempted. */
   until: number;
@@ -73,57 +81,26 @@ export interface CooldownEntry {
   reason: string;
   /**
    * Stable cause tag, set for provider-scoped marks. Absent on model-scoped
-   * marks, on entries other builds wrote before the field existed, and on any
-   * caller that did not supply one; consumers must treat absent as "unknown or
-   * capacity" rather than assuming a cause.
+   * marks and on any caller that did not supply one; consumers must treat
+   * absent as "unknown or capacity" rather than assuming a cause.
    */
-  cause?: ProviderCooldownCause;
+  cause?: CooldownCause;
   /**
    * How many consecutive unhinted marks produced this window (absent on hinted
-   * windows). Mirrors the escalation ladder so a persisted file is diagnosable
-   * and a merge can keep the higher count.
+   * windows). Mirrors the store's escalation ladder so a skip row is
+   * diagnosable without reading the ladder table.
    */
   escalations?: number;
-  /**
-   * Epoch ms of the mark that produced this window.
-   *
-   * Merges order by this, never by `until`: a stale file must not lengthen *or*
-   * shorten a window this process marked more recently, and a fresh short hint
-   * must beat an older long guess. A file written before this field existed has
-   * no stamp, and so does every entry an older-build fleet member still writes;
-   * an unstamped entry is therefore *not* treated as old — when the stamps are
-   * not comparable the merge falls back to `preferEntry`'s tie ordering.
-   */
+  /** Epoch ms of the mark that produced this window. */
   lastMarkedAt?: number;
 }
-
-/**
- * Each repeated unhinted cooldown doubles the window: a guess that already
- * proved too short must not be reused verbatim.
- */
-export const COOLDOWN_ESCALATION_FACTOR = 2;
-/**
- * Ceiling on an escalated window (24 h). A single day bounds the damage of a
- * wrong guess: the provider is re-probed at least daily even if escalation ran
- * long, so an operator never has to hand-edit `model-cooldowns.json`.
- */
-export const MAX_ESCALATED_COOLDOWN_SECONDS = 24 * 60 * 60;
-/**
- * How long the escalation ladder is remembered after the last mark (7 days). A
- * weekly bucket that resets and re-exhausts inside a week is the same limit
- * escalating, not a fresh one.
- */
-export const COOLDOWN_ESCALATION_MEMORY_MS = 7 * 86_400_000;
-
-/** Which cooldown scope is blocking a model, when one is. */
-export type CooldownScope = "provider" | "model";
 
 /**
  * Window within which a second `refreshIfStale` is skipped.
  *
  * One spawn reads the store twice — once at candidate selection and again via
- * the capacity probe when its TTL expired — and a synchronous file read plus
- * JSON parse per read is pure waste. The window is far below
+ * the capacity probe when its TTL expired — and invalidating the store's read
+ * cache twice in one spawn is pure waste. The window is far below
  * `DEFAULT_CAPACITY_TTL_MS`, so a cooldown another fleet member writes is still
  * seen effectively immediately; callers that need certainty use `refresh()`.
  */
@@ -145,7 +122,7 @@ export interface CooldownMarkOptions {
    * reader does not have to match the human-readable `reason`. Ignored for
    * model-scoped marks, which are always endpoint-specific.
    */
-  cause?: ProviderCooldownCause;
+  cause?: CooldownCause;
 }
 
 export interface ModelCooldownStore {
@@ -172,453 +149,257 @@ export interface ModelCooldownStore {
   ): void;
   prune(nowMs?: number): void;
   /**
-   * Re-read the persisted file and merge it into memory using the shared
-   * mark-time ordering (see `preferEntry`), pruning expired entries. No-op for an
-   * in-memory store; a missing, corrupt, or unreadable file leaves memory
-   * untouched rather than throwing, so a probe refresh can never fail a spawn.
+   * Force the next read to observe another process's write.
+   *
+   * Launch pre-flight and in-session recovery need certainty before they refuse
+   * a model, so this bypasses the store's bounded read cache. A missing or
+   * unreadable store leaves every read permissive rather than throwing, so a
+   * refresh can never fail a spawn.
    */
   refresh(nowMs?: number): void;
   /**
-   * `refresh()` unless the file was already read within `maxAgeInMs` (default 0,
-   * i.e. always). The timestamp is per-store closure state, never module state;
-   * an in-memory store is a no-op and keeps no clock.
+   * `refresh()` unless this store was already refreshed within `maxAgeInMs`
+   * (default 0, i.e. always). The timestamp is per-store closure state, never
+   * module state.
    */
   refreshIfStale(maxAgeInMs?: number, nowMs?: number): void;
   /** The scope blocking a model, or undefined when it is not cooling down. */
   cooldownScope(model: string, nowMs?: number): CooldownScope | undefined;
-  /** Snapshot of model-scoped entries (test seam). */
+  /** Snapshot of model-scoped entries, keyed by model (test seam). */
   entries(): ReadonlyMap<string, CooldownEntry>;
   /** Snapshot of provider-scoped entries (test seam). */
   providerEntries(): ReadonlyMap<string, CooldownEntry>;
 }
 
-/**
- * Subset of node:fs sync operations the store needs. Tests inject an in-memory
- * implementation so no real disk I/O happens; production uses the node:fs
- * wrappers below.
- */
-export interface CooldownFs {
-  existsSync(path: string): boolean;
-  readFileSync(path: string): string;
-  writeFileSync(path: string, data: string, options?: { flag?: string }): void;
-  renameSync(oldPath: string, newPath: string): void;
-  mkdirSync(path: string, options?: { recursive?: boolean }): void;
-  unlinkSync(path: string): void;
-}
+/** Resolve the shared truth lazily, so constructing a store opens nothing. */
+export type ModelStateStoreProvider = () => ModelStateStore | null;
 
 export interface ModelCooldownStoreOptions {
   /** Epoch-ms clock (test seam). Defaults to Date.now. */
   now?: () => number;
-  /** JSON file to persist cooldowns to. Omit to keep the store in-memory only. */
-  filePath?: string;
-  /** Filesystem seam (test seam). Defaults to node:fs sync wrappers. */
-  fs?: CooldownFs;
+  /**
+   * The one cooldown truth. Omitted means the process-wide shared store
+   * (`sharedModelStateStore()`, path from `resolveModelStatePath()`), so a caller
+   * that forgets the option can never fork a second truth. Pass `null` for a
+   * permissive no-op, `"memory"` for a private in-memory store (tests and
+   * callers that explicitly manage their own persistence), or a function when the
+   * shared instance must be resolved lazily.
+   */
+  store?: ModelStateStore | null | "memory" | ModelStateStoreProvider;
+  /**
+   * Retired JSON cooldown file to import on first use. This never selects the
+   * store path: the path always comes from `resolveModelStatePath()` (see
+   * `store`), so the adapter and the rest of the process cannot disagree about
+   * where the one truth lives. Setting it only names the migration source.
+   *
+   * A function defers the lookup to first use, so a caller that resolves the
+   * source from the environment (`defaultModelCooldownPath()`) does not capture a
+   * stale value at module load.
+   */
+  filePath?: string | (() => string);
 }
 
-const FILE_VERSION = 1;
-/** A lock older than this is treated as abandoned (its owner died mid-write). */
-const LOCK_STALE_MS = 30_000;
-/** Lock acquisition is bounded; the critical section is a single rename. */
-const MAX_LOCK_ATTEMPTS = 100;
-
 /**
- * On-disk shapes. `.passthrough()` keeps unknown keys from a newer/older version
- * alive through a read-modify-write (see `serialize`), and `z.infer` derives the
- * write types so reader and writer cannot drift apart.
+ * On-disk shape of the retired file. Only the fields the import replays are
+ * read: the file is never rewritten.
  */
-const PersistedEntrySchema = z
-  .object({
-    until: z.number().finite(),
-    reason: z.string(),
-    // Stable cause tag; a value this build does not know is dropped rather than
-    // carried into the typed entry (consumers would have to re-validate it).
-    cause: z.enum(["quota", "unconfigured"]).optional(),
-    // Zero is meaningless on an entry (the ladder map is the authority for the
-    // count and carries the timestamp), so a stored 0 normalizes to absent.
-    escalations: z.number().int().positive().optional(),
-    lastMarkedAt: z.number().finite().optional(),
-  })
-  .passthrough();
+const LegacyEntrySchema = z.object({
+  until: z.number().finite(),
+  reason: z.string(),
+  cause: z.enum(["quota", "unconfigured"]).optional(),
+  // Present on an unhinted ladder window, absent on a hinted one. The rung is
+  // replayed from the ladder map; this field only keeps the row diagnosable.
+  escalations: z.number().int().positive().optional(),
+  lastMarkedAt: z.number().finite().optional(),
+});
 
-const EscalationRecordSchema = z
-  .object({
-    // Zero *is* meaningful here: a hinted mark records "ladder cleared" as a
-    // count-0 event whose timestamp still has to win the merge.
-    count: z.number().int().nonnegative(),
-    lastMarkedAt: z.number().finite(),
-  })
-  .passthrough();
+const LegacyLadderSchema = z.object({
+  // Zero is meaningful: the old store recorded a hinted reset as count 0.
+  count: z.number().int().nonnegative(),
+  lastMarkedAt: z.number().finite(),
+});
 
-/**
- * A scope map is validated per entry rather than as a whole, so one malformed
- * entry is skipped instead of discarding every healthy sibling.
- */
-const ScopeMapSchema = z.record(z.string(), z.unknown());
-
-const CooldownFileSchema = z
+const LegacyFileSchema = z
   .object({
     version: z.number().optional(),
-    providers: ScopeMapSchema.optional(),
-    models: ScopeMapSchema.optional(),
-    escalations: ScopeMapSchema.optional(),
+    providers: z.record(z.string(), z.unknown()).optional(),
+    models: z.record(z.string(), z.unknown()).optional(),
+    escalations: z.record(z.string(), z.unknown()).optional(),
   })
   .passthrough();
 
-type PersistedEntry = z.infer<typeof PersistedEntrySchema>;
-
-/** The escalation ladder for one provider, kept across window expiry. */
-type EscalationRecord = z.infer<typeof EscalationRecordSchema>;
+type LegacyEntry = z.infer<typeof LegacyEntrySchema>;
+type LegacyLadder = z.infer<typeof LegacyLadderSchema>;
 
 /**
- * In-memory state, also the on-disk shape (`providers`/`models` entries plus the
- * provider escalation ladders). `extras` is the raw file object of the last
- * load, adopt or refresh, kept so unknown keys written by another version
- * survive the next rewrite; `serialize` reads it, so any new path that writes
- * the file must refresh `extras` (or reload) first.
+ * One parsed legacy file.
+ *
+ * `present` separates "there was a file and it yielded nothing" (mark the
+ * migration done) from "there is no file yet" (leave the migration pending), so
+ * a corrupt or fully expired file is not re-parsed on every open while a
+ * restored file is still imported.
  */
-interface CooldownState {
-  providers: Map<string, CooldownEntry>;
-  models: Map<string, CooldownEntry>;
-  escalations: Map<string, EscalationRecord>;
-  extras: Record<string, unknown>;
+interface LegacyCooldowns {
+  present: boolean;
+  providers: Map<string, LegacyEntry>;
+  models: Map<string, LegacyEntry>;
+  escalations: Map<string, LegacyLadder>;
 }
 
-const nodeFsSeam: CooldownFs = {
-  existsSync: (path) => nodeFs.existsSync(path),
-  readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
-  mkdirSync: (path, options) => nodeFs.mkdirSync(path, options),
-  unlinkSync: (path) => nodeFs.unlinkSync(path),
-};
-
-/** Default on-disk location, overridable via BELAYD_MODEL_COOLDOWN_FILE. */
+/** Default location of the retired JSON file, overridable via BELAYD_MODEL_COOLDOWN_FILE. */
 export function defaultModelCooldownPath(): string {
   const override = process.env.BELAYD_MODEL_COOLDOWN_FILE;
   if (override !== undefined && override !== "") return override;
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? nodeOs.homedir();
-  return nodePath.join(home, ".pi", "agent", "model-cooldowns.json");
-}
-
-function emptyState(): CooldownState {
-  return { providers: new Map(), models: new Map(), escalations: new Map(), extras: {} };
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? homedir();
+  return join(home, ".pi", "agent", "model-cooldowns.json");
 }
 
 /** A JSON object, or an empty one — never a throw. */
 function asRecord(value: unknown): Record<string, unknown> {
-  const parsed = ScopeMapSchema.safeParse(value);
-  return parsed.success ? parsed.data : {};
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
 /** Parse one scope map; a malformed entry is skipped, not fatal. */
-function parseEntryMap(value: unknown): Map<string, CooldownEntry> {
-  const entries = new Map<string, CooldownEntry>();
+function parseLegacyEntries(value: unknown): Map<string, LegacyEntry> {
+  const entries = new Map<string, LegacyEntry>();
   for (const [key, candidate] of Object.entries(asRecord(value))) {
-    const parsed = PersistedEntrySchema.safeParse(candidate);
+    const parsed = LegacyEntrySchema.safeParse(candidate);
     if (!parsed.success) continue;
-    const entry: CooldownEntry = { until: parsed.data.until, reason: parsed.data.reason };
-    if (parsed.data.cause !== undefined) entry.cause = parsed.data.cause;
-    if (parsed.data.escalations !== undefined) entry.escalations = parsed.data.escalations;
-    if (parsed.data.lastMarkedAt !== undefined) entry.lastMarkedAt = parsed.data.lastMarkedAt;
-    entries.set(key, entry);
+    entries.set(key, parsed.data);
   }
   return entries;
 }
 
-/** Parse the escalation map; a malformed record is skipped, not fatal. */
-function parseEscalationMap(value: unknown): Map<string, EscalationRecord> {
-  const records = new Map<string, EscalationRecord>();
-  for (const [key, candidate] of Object.entries(asRecord(value))) {
-    const parsed = EscalationRecordSchema.safeParse(candidate);
+/** Parse the escalation ladder map; a malformed rung is skipped, not fatal. */
+function parseLegacyLadders(value: unknown): Map<string, LegacyLadder> {
+  const ladders = new Map<string, LegacyLadder>();
+  for (const [provider, candidate] of Object.entries(asRecord(value))) {
+    const parsed = LegacyLadderSchema.safeParse(candidate);
     if (!parsed.success) continue;
-    records.set(key, { count: parsed.data.count, lastMarkedAt: parsed.data.lastMarkedAt });
+    ladders.set(provider, parsed.data);
   }
-  return records;
+  return ladders;
 }
 
-/** Parse the persisted file; a corrupt file yields empty state, never a throw. */
-function parseCooldownFile(text: string): CooldownState {
+/**
+ * Read the retired file, keeping only windows that are still active.
+ *
+ * A missing file is reported as not present (the migration stays pending); an
+ * unreadable or corrupt one is present-but-empty, so the migration is recorded
+ * instead of re-parsing it forever. Never throws: an unreadable legacy file must
+ * not stop a spawn.
+ */
+function readLegacyCooldowns(filePath: string, nowMs: number): LegacyCooldowns {
+  const absent: LegacyCooldowns = {
+    present: false,
+    providers: new Map(),
+    models: new Map(),
+    escalations: new Map(),
+  };
+  if (!existsSync(filePath)) return absent;
+  let text: string;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch {
+    return { ...absent, present: true };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return emptyState();
+    return { ...absent, present: true };
   }
-  const file = CooldownFileSchema.safeParse(parsed);
-  if (!file.success) return emptyState();
+  const file = LegacyFileSchema.safeParse(parsed);
+  if (!file.success) return { ...absent, present: true };
+  const active = (entries: Map<string, LegacyEntry>): Map<string, LegacyEntry> => {
+    const kept = new Map<string, LegacyEntry>();
+    for (const [key, entry] of entries) {
+      if (entry.until > nowMs) kept.set(key, entry);
+    }
+    return kept;
+  };
   return {
-    providers: parseEntryMap(file.data.providers),
-    models: parseEntryMap(file.data.models),
-    escalations: parseEscalationMap(file.data.escalations),
-    extras: { ...file.data },
+    present: true,
+    providers: active(parseLegacyEntries(file.data.providers)),
+    models: active(parseLegacyEntries(file.data.models)),
+    escalations: parseLegacyLadders(file.data.escalations),
   };
 }
 
-function loadState(fs: CooldownFs, filePath: string): CooldownState {
-  if (!fs.existsSync(filePath)) return emptyState();
-  let text: string;
-  try {
-    text = fs.readFileSync(filePath);
-  } catch {
-    return emptyState(); // unreadable file: treat as empty, never crash the store
-  }
-  return parseCooldownFile(text);
+/** The on-disk name of the "already imported" marker, next to the legacy file. */
+function importedMarkerPath(filePath: string): string {
+  return `${filePath}.imported`;
 }
-
-function pruneMap(entries: Map<string, CooldownEntry>, nowMs: number): void {
-  for (const [key, entry] of entries) {
-    if (entry.until <= nowMs) entries.delete(key);
-  }
-}
-
-function pruneEscalations(escalations: Map<string, EscalationRecord>, nowMs: number): void {
-  for (const [key, record] of escalations) {
-    if (nowMs - record.lastMarkedAt > COOLDOWN_ESCALATION_MEMORY_MS) escalations.delete(key);
-  }
-}
-
-function pruneState(state: CooldownState, nowMs: number): void {
-  pruneMap(state.providers, nowMs);
-  pruneMap(state.models, nowMs);
-  pruneEscalations(state.escalations, nowMs);
-}
-
-function toRecord(entries: ReadonlyMap<string, CooldownEntry>): Record<string, PersistedEntry> {
-  const record: Record<string, PersistedEntry> = {};
-  for (const [key, entry] of entries) {
-    const persisted: PersistedEntry = { until: entry.until, reason: entry.reason };
-    if (entry.cause !== undefined) persisted.cause = entry.cause;
-    if ((entry.escalations ?? 0) > 0) persisted.escalations = entry.escalations;
-    if (entry.lastMarkedAt !== undefined) persisted.lastMarkedAt = entry.lastMarkedAt;
-    record[key] = persisted;
-  }
-  return record;
-}
-
-/** Fields this module owns per entry; anything else is carried over verbatim. */
-const ENTRY_KEYS: ReadonlySet<string> = new Set([
-  "until",
-  "reason",
-  "cause",
-  "escalations",
-  "lastMarkedAt",
-]);
-const ESCALATION_KEYS: ReadonlySet<string> = new Set(["count", "lastMarkedAt"]);
 
 /**
- * Rebuild one persisted map from this process's entries, carrying over unknown
- * keys that sit next to a known one (see `.passthrough()` above). Known fields
- * always come from the entry, so a field the entry omits disappears — a hinted
- * window must not inherit the previous entry's stale `escalations`. Keys absent
- * here are dropped: which entries exist is owned by the in-memory state, not by
- * a stale file.
+ * Remember that the legacy file was imported, best effort.
+ *
+ * The marker is defence in depth: the import is an upsert that keeps the longer
+ * window, so a second run would be harmless. `wx` keeps two concurrent
+ * first-opens from rewriting it, and the parent directory is created because the
+ * retired file may live in a `~/.pi/agent` this process has not touched yet.
  */
-function withEntryExtras<T extends object>(
-  raw: unknown,
-  entries: Record<string, T>,
-  knownKeys: ReadonlySet<string>,
-): Record<string, unknown> {
-  const extras = asRecord(raw);
-  const result: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(entries)) {
-    const previous = extras[key];
-    const carried: Record<string, unknown> = {};
-    if (typeof previous === "object" && previous !== null) {
-      for (const [field, value] of Object.entries(previous)) {
-        if (!knownKeys.has(field)) carried[field] = value;
-      }
-    }
-    result[key] = { ...carried, ...entry };
+function writeImportedMarker(filePath: string, nowMs: number): void {
+  const markerPath = importedMarkerPath(filePath);
+  try {
+    mkdirSync(dirname(markerPath), { recursive: true });
+    writeFileSync(markerPath, String(nowMs), { flag: "wx" });
+  } catch {
+    /* already imported, or not ours to write */
   }
-  return result;
 }
 
-function serialize(state: CooldownState): string {
-  const body: Record<string, unknown> = {
-    ...state.extras,
-    version: FILE_VERSION,
-    providers: withEntryExtras(state.extras.providers, toRecord(state.providers), ENTRY_KEYS),
-    models: withEntryExtras(state.extras.models, toRecord(state.models), ENTRY_KEYS),
-    escalations: withEntryExtras(
-      state.extras.escalations,
-      Object.fromEntries(state.escalations),
-      ESCALATION_KEYS,
-    ),
+/** One resolved `store` option, or "use the process-wide shared store". */
+type ConfiguredStoreChoice =
+  | { kind: "store"; store: ModelStateStore | null }
+  | { kind: "pending" }
+  | { kind: "default" };
+
+/**
+ * Interpret the `store` option without opening anything implicitly.
+ *
+ * `"memory"` is the explicit isolation escape hatch (tests, callers managing
+ * their own persistence); `null` is the explicit permissive no-op. A provider
+ * returning null stays "pending" so it is re-invoked, never memoized as absent.
+ */
+function resolveConfiguredStore(
+  configured: ModelStateStore | null | "memory" | ModelStateStoreProvider | undefined,
+  now: () => number,
+): ConfiguredStoreChoice {
+  if (configured === undefined) return { kind: "default" };
+  if (configured === null) return { kind: "store", store: null };
+  if (configured === "memory") {
+    const opened = openModelStateStore({ path: ":memory:", now });
+    return { kind: "store", store: opened.ok ? opened.store : null };
+  }
+  if (typeof configured === "function") {
+    const provided = configured();
+    return provided === null ? { kind: "pending" } : { kind: "store", store: provided };
+  }
+  return { kind: "store", store: configured };
+}
+
+/** Split a model id into the store's (provider, model) pair. */
+function splitModel(model: string): { provider: string; model: string } {
+  const provider = providerOf(model);
+  if (provider === "") return { provider: "", model };
+  return { provider, model: model.slice(provider.length + 1) };
+}
+
+/** Rebuild the routing-facing key for a stored row. */
+function modelKey(row: CooldownRow): string {
+  return row.provider === PROVIDER_SCOPE_MODEL ? row.model : `${row.provider}/${row.model}`;
+}
+
+/** The routing-facing entry for one stored row. */
+function toEntry(row: CooldownRow): CooldownEntry {
+  return {
+    until: row.untilMs,
+    reason: row.reason,
+    ...(row.cause === undefined ? {} : { cause: row.cause }),
+    ...(row.escalations === undefined ? {} : { escalations: row.escalations }),
+    ...(row.lastMarkedAt <= 0 ? {} : { lastMarkedAt: row.lastMarkedAt }),
   };
-  return JSON.stringify(body, null, 2);
-}
-
-/** Write atomically: temp file in the same directory, then rename over the target. */
-function writeState(fs: CooldownFs, filePath: string, state: CooldownState): void {
-  fs.mkdirSync(nodePath.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  try {
-    fs.writeFileSync(tmpPath, serialize(state));
-    fs.renameSync(tmpPath, filePath);
-  } catch (error) {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch {
-      /* ignore */
-    }
-    throw error;
-  }
-}
-
-/** Known mark time, or an explicit "unknown" — never a sentinel time. */
-type MarkStamp = { readonly stamped: true; readonly at: number } | { readonly stamped: false };
-
-function markStampOf(entry: CooldownEntry): MarkStamp {
-  return entry.lastMarkedAt === undefined
-    ? { stamped: false }
-    : { stamped: true, at: entry.lastMarkedAt };
-}
-
-/** The safer of two windows when mark order cannot decide. */
-function saferEntry(a: CooldownEntry, b: CooldownEntry): CooldownEntry {
-  if (a.until !== b.until) return a.until > b.until ? a : b;
-  return (a.escalations ?? 0) >= (b.escalations ?? 0) ? a : b;
-}
-
-/**
- * The ordering rule shared by `refresh()` and `persist()`: compare *when a window
- * was marked*, never how long it is.
- *
- * Ordering by `until` made the two directions disagree — refresh kept the
- * longer window while persist kept this process's — so a stale file could
- * silently shorten or lengthen a live window depending on which path ran. With
- * mark times, the newest observation of a key always wins in both directions,
- * and a shorter *fresh* hint beats an older longer guess because it is newer,
- * not because it is short.
- *
- * A three-way rule, because stamp presence is not evidence of recency:
- *
- * 1. **Both stamped** and the times differ: the later mark wins, in both
- *    directions (this is the decisive case).
- * 2. **Exactly one stamped**: the stamps are not comparable — a fleet member
- *    still running an older build writes genuinely *fresh* entries with no
- *    `lastMarkedAt`, so treating "unstamped" as old would make this build
- *    ignore that member's newest windows and clobber them on the next write.
- *    Fall through to the tie ordering instead.
- * 3. **Neither stamped** (two pre-mark-time files): also the tie ordering.
- *
- * The tie ordering is the safer window — the longer `until`, then the higher
- * escalation count. Two marks whose order cannot be proven do not justify
- * cooling less, and a ceiling-clamped ladder can make two rungs share one
- * `until`.
- */
-function preferEntry(a: CooldownEntry, b: CooldownEntry): CooldownEntry {
-  const aStamp = markStampOf(a);
-  const bStamp = markStampOf(b);
-  if (aStamp.stamped && bStamp.stamped && aStamp.at !== bStamp.at) {
-    return aStamp.at > bStamp.at ? a : b;
-  }
-  return saferEntry(a, b);
-}
-
-/**
- * Merge `incoming` into `target` per key, keeping the *whole* winning entry.
- *
- * The winner's `until`, `reason`, `cause`, `escalations` and `lastMarkedAt` travel
- * together on purpose: pairing one side's window with the other side's reason or
- * escalation count would describe a mark that never happened, and a `cause`
- * borrowed from a losing mark would misreport why the provider is cooling. A
- * ladder count is only forgotten here when a newer mark superseded it, which is
- * exactly what a hinted reset is; the ladder map itself merges separately and
- * never loses a count on a tie (see `mergeEscalationMaps`).
- */
-function mergeEntryMaps(
-  target: Map<string, CooldownEntry>,
-  incoming: ReadonlyMap<string, CooldownEntry>,
-): void {
-  for (const [key, entry] of incoming) {
-    const current = target.get(key);
-    target.set(key, current === undefined ? entry : preferEntry(current, entry));
-  }
-}
-
-/**
- * Merge escalation ladders by event order: the later mark wins, because a hinted
- * reset replaces an earlier ladder rather than being out-voted by it.
- *
- * A tie cannot prove the ladder was cleared (two members may mark the same
- * provider within clock skew), so the higher count wins in *both* directions
- * instead of depending on which side happened to be `incoming`.
- */
-function mergeEscalationMaps(
-  target: Map<string, EscalationRecord>,
-  incoming: ReadonlyMap<string, EscalationRecord>,
-): void {
-  for (const [key, record] of incoming) {
-    const current = target.get(key);
-    if (current === undefined) {
-      target.set(key, record);
-      continue;
-    }
-    if (record.lastMarkedAt > current.lastMarkedAt) {
-      target.set(key, record);
-      continue;
-    }
-    if (record.lastMarkedAt < current.lastMarkedAt) continue;
-    if (record.count > current.count) target.set(key, record);
-  }
-}
-
-function isErrno(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
-}
-
-function lockIsStale(fs: CooldownFs, lockPath: string, nowMs: number): boolean {
-  if (!fs.existsSync(lockPath)) return true;
-  let created: number;
-  try {
-    created = Number.parseInt(fs.readFileSync(lockPath), 10);
-  } catch {
-    return true;
-  }
-  if (!Number.isFinite(created)) return true;
-  return nowMs - created > LOCK_STALE_MS;
-}
-
-/**
- * Acquire the lockfile via an exclusive "wx" write. Returns true when held;
- * falls back to proceeding without it (the atomic rename still keeps the file
- * uncorrupted) rather than throwing — a cooldown write must never fail a spawn.
- */
-function acquireLock(fs: CooldownFs, lockPath: string, nowMs: number): boolean {
-  for (let attempt = 0; attempt < MAX_LOCK_ATTEMPTS; attempt++) {
-    try {
-      fs.writeFileSync(lockPath, String(nowMs), { flag: "wx" });
-      return true;
-    } catch (error) {
-      if (!isErrno(error, "EEXIST")) return false;
-    }
-    if (lockIsStale(fs, lockPath, nowMs)) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        /* ignore — raced with the releaser */
-      }
-    }
-  }
-  return false;
-}
-
-function releaseLock(fs: CooldownFs, lockPath: string): void {
-  try {
-    fs.unlinkSync(lockPath);
-  } catch {
-    /* ignore */
-  }
-}
-
-function withLock<T>(fs: CooldownFs, lockPath: string, nowMs: number, body: () => T): T {
-  const held = acquireLock(fs, lockPath, nowMs);
-  try {
-    return body();
-  } finally {
-    if (held) releaseLock(fs, lockPath);
-  }
 }
 
 export function createModelCooldownStore(): ModelCooldownStore;
@@ -629,145 +410,218 @@ export function createModelCooldownStore(
 ): ModelCooldownStore {
   const options: ModelCooldownStoreOptions = typeof arg === "function" ? { now: arg } : arg;
   const now = options.now ?? Date.now;
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = options.filePath;
-  const lockPath = filePath === undefined ? undefined : `${filePath}.lock`;
-
-  const state = filePath === undefined ? emptyState() : loadState(fs, filePath);
-  if (filePath !== undefined) pruneState(state, now());
-  /** Epoch ms of the last file read by this store; undefined until one happens. */
+  // Resolved once, on first use: a thunk lets the extension read
+  // `BELAYD_MODEL_COOLDOWN_FILE` lazily without freezing it at import time.
+  const legacyPathOption = options.filePath;
+  let resolvedLegacyPath: string | undefined;
+  function legacyFilePath(): string | undefined {
+    if (resolvedLegacyPath !== undefined) return resolvedLegacyPath;
+    resolvedLegacyPath =
+      typeof legacyPathOption === "function" ? legacyPathOption() : legacyPathOption;
+    return resolvedLegacyPath;
+  }
+  /**
+   * The cached store; undefined until a genuinely usable one is resolved.
+   *
+   * Invariant: this only ever holds a store that can actually answer a read.
+   * The transient facade never lands here (see {@link resolveStore}).
+   */
+  let resolved: ModelStateStore | undefined;
+  /** True once the legacy import was actually settled against a real store. */
+  let legacyImported = false;
+  /** The store the import was last attempted against, settled or not. */
+  let legacyAttemptedFor: ModelStateStore | undefined;
+  /** Epoch ms of the last explicit refresh by this adapter. */
   let lastRefreshAt: number | undefined;
+  /** Epoch ms of the last garbage-collection pass (see `prune`). */
+  let lastPruneAt: number | undefined;
 
-  /** Replace the in-memory state with `source` (already merged and pruned). */
-  function adopt(source: CooldownState): void {
-    state.providers.clear();
-    state.models.clear();
-    state.escalations.clear();
-    for (const [key, entry] of source.providers) state.providers.set(key, entry);
-    for (const [key, entry] of source.models) state.models.set(key, entry);
-    for (const [key, record] of source.escalations) state.escalations.set(key, record);
-    state.extras = source.extras;
+  /**
+   * Run the one-time legacy import the first time a usable store is available.
+   *
+   * Two flags on purpose: the import is attempted once per *store instance*
+   * (a read path must not stat the retired file on every cooldown read), but it
+   * is only latched as done once it actually settled. A facade or a read-only
+   * store cannot accept the rows, so latching there would drop the migration for
+   * the whole adapter even after the store recovers.
+   */
+  function importOnce(store: ModelStateStore | null): ModelStateStore | null {
+    if (store !== null && !legacyImported && legacyAttemptedFor !== store) {
+      legacyAttemptedFor = store;
+      legacyImported = importLegacy(store);
+    }
+    return store;
   }
 
   /**
-   * Re-write the full state under the lock, merging with the file through the
-   * same `mergeEntryMaps`/`mergeEscalationMaps` rules `refresh` uses. Those rules
-   * order by *mark time* when both sides have one, so this process cannot
-   * overwrite a key it did not mark more recently — a stale file cannot shorten a
-   * live escalated window, and a fresh hinted window is not reset back to an
-   * older guess. Unstamped sides fall back to the safer window, so a mixed-version
-   * fleet member's fresh entry is not clobbered just for lacking a stamp.
+   * Accept a store for caching, or serve a facade without caching it.
+   *
+   * Invariant: `resolved` only ever holds a store that is genuinely usable, so
+   * the transient facade is served (it queues marks) but never memoized —
+   * whichever branch produced it. The extension's provider thunk can hand back
+   * `sharedModelStateStoreInstance()`'s facade exactly like the default branch
+   * can, and caching it would pin "nothing is cooling down" for the session
+   * while the wrapper recovers: the two-truths bug bd-256 removed.
    */
-  function persist(): void {
-    if (filePath === undefined || lockPath === undefined) return;
-    // Best-effort: the in-memory state is already correct, so a disk error must
-    // not fail a sub-agent spawn — persistence is swallowed, not propagated.
-    try {
-      withLock(fs, lockPath, now(), () => {
-        const merged = loadState(fs, filePath);
-        mergeEntryMaps(merged.providers, state.providers);
-        mergeEntryMaps(merged.models, state.models);
-        mergeEscalationMaps(merged.escalations, state.escalations);
-        pruneState(merged, now());
-        writeState(fs, filePath, merged);
-        // Keep memory in step with what was written: another process may hold
-        // entries or ladders our snapshot never saw.
-        adopt(merged);
-      });
-    } catch {
-      /* ignore */
-    }
+  function acceptStore(store: ModelStateStore | null): ModelStateStore | null {
+    if (store === null) return null;
+    if (store.pendingFlush === true) return store;
+    resolved = store;
+    return importOnce(store);
   }
 
-  function scopeOf(model: string, nowMs?: number): CooldownScope | undefined {
-    const t = nowMs ?? now();
-    const provider = providerOf(model);
-    if (provider !== "") {
-      const entry = state.providers.get(provider);
-      if (entry && entry.until > t) return "provider";
-    }
-    const entry = state.models.get(model);
-    if (entry && entry.until > t) return "model";
-    return undefined;
+  /**
+   * Resolve the one truth for this adapter.
+   *
+   * Omitting `store` is the process-wide shared store: a caller that forgets the
+   * option must not get a private per-call copy, which is exactly the amnesia
+   * bd-256 removed. `null` and `"memory"` stay available as explicit escape
+   * hatches (permissive no-op and test isolation), never as the default.
+   */
+  function resolveStore(): ModelStateStore | null {
+    if (resolved !== undefined) return importOnce(resolved);
+    const choice = resolveConfiguredStore(options.store, now);
+    // A provider that yields null is retried on the next read: the shared
+    // accessor may still be inside its post-failure backoff window.
+    if (choice.kind === "pending") return null;
+    if (choice.kind === "store") return acceptStore(choice.store);
+    // The adapter clock is forwarded so the accessor's retry window and the
+    // facade's queue run on the same time source as this adapter's marks.
+    return acceptStore(sharedModelStateStore(now));
   }
 
-  /** Re-read the persisted file into memory and record when that happened. */
-  function refreshState(nowMs?: number): void {
-    if (filePath === undefined) return;
-    // `loadState` already maps a missing, unreadable, or corrupt file to empty
-    // state, so a refresh can never throw at a caller like the capacity probe.
-    const onDisk = loadState(fs, filePath);
-    mergeEntryMaps(state.providers, onDisk.providers);
-    mergeEntryMaps(state.models, onDisk.models);
-    mergeEscalationMaps(state.escalations, onDisk.escalations);
-    // Keep the cached raw file object in step with what was just read: a later
-    // serialize must not resurrect unknown fields from the pre-refresh file.
-    state.extras = onDisk.extras;
-    pruneState(state, nowMs ?? now());
-    lastRefreshAt = nowMs ?? now();
+  /**
+   * Import the retired file into the shared store, once.
+   *
+   * The window is replayed exactly as the previous build observed it
+   * (`seedCooldown`: absolute window end, longer-wins, the 24 h ceiling for an
+   * escalated window) and its escalation ladder is replayed separately
+   * (`seedCooldownLadder`). Importing a window as a "hinted" mark would delete
+   * the ladder, so an already-escalated weekly bucket would restart at rung 1 —
+   * the bd-38 re-probe churn the feature exists to prevent. A legacy entry with
+   * no `escalations` field came from a hinted window (or a model window), whose
+   * ladder was legitimately cleared at that time; the ladder map carries the
+   * `count: 0` reset event for it.
+   *
+   * Returns true only when the migration is settled (nothing left to replay), so
+   * the adapter can keep retrying it after a transient unavailable store.
+   */
+  function importLegacy(store: ModelStateStore): boolean {
+    const legacyPath = legacyFilePath();
+    // No source configured: there is nothing this adapter could ever import.
+    if (legacyPath === undefined) return true;
+    const nowMs = now();
+    if (existsSync(importedMarkerPath(legacyPath))) return true;
+    const seeder = modelStateSeederFor(store);
+    // A read-only/unavailable store cannot accept the migration; the marker
+    // stays absent so a writable process still imports the windows.
+    if (seeder === null) return false;
+    const legacy = readLegacyCooldowns(legacyPath, nowMs);
+    // No file yet: leave the migration pending so a restored file still imports.
+    if (!legacy.present) return false;
+    const laddersSeeded = seedLegacyLadders({
+      seeder,
+      escalations: legacy.escalations,
+      nowMs,
+    });
+    const providersSeeded = seedLegacyProviders({
+      seeder,
+      providers: legacy.providers,
+      nowMs,
+    });
+    const modelsSeeded = seedLegacyModels({ seeder, models: legacy.models, nowMs });
+    // A read-only or failing store keeps the marker absent, so the migration is
+    // not recorded as done for a process that can actually write it. A file that
+    // yields no windows is still marked, so a corrupt or fully expired file is
+    // not re-parsed on every open.
+    if (!laddersSeeded || !providersSeeded || !modelsSeeded) return false;
+    writeImportedMarker(legacyPath, nowMs);
+    return true;
+  }
+
+  /** The active cooldown for one model id, or null when none (or unreadable). */
+  function activeCooldown(model: string, nowMs?: number): CooldownRow | null {
+    const store = resolveStore();
+    if (store === null) return null;
+    const target = splitModel(model);
+    // `cooldownFor` answers the scope question but not the row the routing
+    // readers need (cause, ladder), so the row is taken from `listCooldowns`.
+    // That read is one indexed query and keeps the adapter honest: every reader
+    // sees the same rows the wrapper wrote.
+    const rows = store.listCooldowns({ nowMs: nowMs ?? now() });
+    if (!rows.ok) return null;
+    let best: CooldownRow | null = null;
+    let bestRank = Number.POSITIVE_INFINITY;
+    for (const row of rows.value) {
+      const rank = rowRank(row, cooldownProviderKey(target.provider), target.model);
+      if (rank === undefined || rank >= bestRank) continue;
+      best = row;
+      bestRank = rank;
+    }
+    return best;
   }
 
   return {
     isCoolingDown(model, nowMs) {
-      return scopeOf(model, nowMs) !== undefined;
+      return activeCooldown(model, nowMs) !== null;
     },
     markCooldown(model, durationSeconds, reason, markOptions) {
-      const t = markOptions?.nowMs ?? now();
-      // Model scope never escalates, by design: a transient fault or a retired id
-      // is endpoint-specific (the same bare id is usually still served by another
-      // provider), so laddering a model window would only prolong hiding a
-      // healthy candidate. `escalations` stays a provider-only field, and the
-      // `hinted` flag is ignored here.
-      state.models.set(model, {
-        until: t + durationSeconds * 1000,
+      const store = resolveStore();
+      if (store === null) return;
+      const target = splitModel(model);
+      store.markCooldown({
+        ...(target.provider === "" ? {} : { provider: target.provider }),
+        model: target.model,
+        durationMs: Math.round(durationSeconds * 1_000),
         reason,
-        lastMarkedAt: t,
+        // The adapter clock is the single time source: forwarding only an
+        // explicit markOptions.nowMs let a deterministic caller write real-time
+        // windows while reading with its injected clock.
+        nowMs: markOptions?.nowMs ?? now(),
       });
-      persist();
     },
     markProviderCooldown(provider, durationSeconds, reason, markOptions) {
-      const t = markOptions?.nowMs ?? now();
-      const cause = markOptions?.cause;
-      const previousCount = state.escalations.get(provider)?.count ?? 0;
-      if (markOptions?.hinted === true) {
-        // A provider-supplied reset window is authoritative: set it exactly (even
-        // when a previous guess escalated past it) and record the reset as the
-        // latest ladder event, so a stale escalated ladder cannot out-vote it.
-        state.escalations.set(provider, { count: 0, lastMarkedAt: t });
-        state.providers.set(provider, {
-          until: t + durationSeconds * 1000,
-          reason,
-          ...(cause !== undefined ? { cause } : {}),
-          lastMarkedAt: t,
-        });
-        persist();
-        return;
-      }
-      const count = previousCount + 1;
-      state.escalations.set(provider, { count, lastMarkedAt: t });
-      state.providers.set(provider, {
-        until: escalatedUntil(durationSeconds, count, t),
+      const store = resolveStore();
+      if (store === null) return;
+      store.markCooldown({
+        provider,
+        durationMs: Math.round(durationSeconds * 1_000),
         reason,
-        ...(cause !== undefined ? { cause } : {}),
-        escalations: count,
-        lastMarkedAt: t,
+        hinted: markOptions?.hinted === true,
+        ...(markOptions?.cause === undefined ? {} : { cause: markOptions.cause }),
+        nowMs: markOptions?.nowMs ?? now(),
       });
-      persist();
     },
     prune(nowMs) {
-      pruneState(state, nowMs ?? now());
+      const store = resolveStore();
+      if (store === null) return;
+      const at = nowMs ?? now();
+      // The fallback loop prunes before every candidate. Expired rows are
+      // already invisible to every reader, so the delete is garbage collection:
+      // running it per candidate would turn one spawn into a write transaction
+      // per candidate and contend with every other daemon's marks.
+      if (
+        lastPruneAt !== undefined &&
+        lastPruneAt <= at &&
+        at - lastPruneAt < COOLDOWN_REFRESH_MAX_AGE_MS
+      ) {
+        return;
+      }
+      lastPruneAt = at;
+      store.prune(at);
     },
     refresh(nowMs) {
-      refreshState(nowMs);
+      const store = resolveStore();
+      store?.invalidateCooldownCache();
+      lastRefreshAt = nowMs ?? now();
     },
     refreshIfStale(maxAgeInMs, nowMs) {
-      if (filePath === undefined) return;
+      const store = resolveStore();
+      if (store === null) return;
       const at = nowMs ?? now();
       // A missing stamp and a regressed clock both mean "cannot prove freshness":
-      // the first call must read (a store created before the entry existed must
-      // not look fresh), and a clock that moved backwards would otherwise keep
-      // suppressing reads until wall time overtook the stale stamp — exactly
-      // when fresh data matters most.
+      // the first call must read, and a clock that moved backwards would
+      // otherwise keep suppressing reads until wall time overtook the stamp.
       if (
         lastRefreshAt !== undefined &&
         lastRefreshAt <= at &&
@@ -775,30 +629,125 @@ export function createModelCooldownStore(
       ) {
         return;
       }
-      refreshState(at);
+      store.invalidateCooldownCache();
+      lastRefreshAt = at;
     },
     cooldownScope(model, nowMs) {
-      return scopeOf(model, nowMs);
+      const row = activeCooldown(model, nowMs);
+      if (row === null) return undefined;
+      return row.model === PROVIDER_SCOPE_MODEL ? "provider" : "model";
     },
     entries() {
-      return state.models;
+      const entries = new Map<string, CooldownEntry>();
+      const store = resolveStore();
+      if (store === null) return entries;
+      const rows = store.listCooldowns({ nowMs: now() });
+      if (!rows.ok) return entries;
+      for (const row of rows.value) {
+        if (row.model === PROVIDER_SCOPE_MODEL) continue;
+        entries.set(modelKey(row), toEntry(row));
+      }
+      return entries;
     },
     providerEntries() {
-      return state.providers;
+      const entries = new Map<string, CooldownEntry>();
+      const store = resolveStore();
+      if (store === null) return entries;
+      const rows = store.listCooldowns({ nowMs: now() });
+      if (!rows.ok) return entries;
+      for (const row of rows.value) {
+        if (row.model !== PROVIDER_SCOPE_MODEL || row.provider === PROVIDER_SCOPE_MODEL) continue;
+        entries.set(row.provider, toEntry(row));
+      }
+      return entries;
     },
   };
 }
 
+/** Replay the legacy escalation ladder; true when every rung write succeeded. */
+function seedLegacyLadders(input: {
+  seeder: ModelStateSeeder;
+  escalations: ReadonlyMap<string, LegacyLadder>;
+  nowMs: number;
+}): boolean {
+  let allWritten = true;
+  for (const [provider, ladder] of input.escalations) {
+    // `"*"` is not a provider; a bare model row never feeds a ladder.
+    if (cooldownProviderKey(provider) === PROVIDER_SCOPE_MODEL) continue;
+    const seeded = input.seeder.seedCooldownLadder({
+      provider,
+      escalations: ladder.count,
+      lastMarkedAt: ladder.lastMarkedAt,
+      nowMs: input.nowMs,
+    });
+    if (!seeded.ok) allWritten = false;
+  }
+  return allWritten;
+}
+
 /**
- * Epoch ms the `count`-th consecutive unhinted mark cools the provider until.
- * Doubling from the *requested* duration (rather than from the previous
- * remaining time) keeps the ladder monotonic even when the caller's guess
- * changes between marks, and the ceiling bounds a wrong guess at one day.
+ * Replay the legacy provider windows; true when every write succeeded.
+ *
+ * `seedCooldown` keeps the longer window and never touches the ladder, so a
+ * longer file window can replace a shorter escalated one without losing the rung
+ * the process had already recorded.
  */
-function escalatedUntil(durationSeconds: number, count: number, nowMs: number): number {
-  const escalatedSeconds = Math.min(
-    durationSeconds * COOLDOWN_ESCALATION_FACTOR ** (count - 1),
-    MAX_ESCALATED_COOLDOWN_SECONDS,
-  );
-  return nowMs + escalatedSeconds * 1000;
+function seedLegacyProviders(input: {
+  seeder: ModelStateSeeder;
+  providers: ReadonlyMap<string, LegacyEntry>;
+  nowMs: number;
+}): boolean {
+  let allWritten = true;
+  for (const [provider, entry] of input.providers) {
+    const seeded = input.seeder.seedCooldown({
+      provider,
+      untilMs: entry.until,
+      reason: entry.reason,
+      ...(entry.cause === undefined ? {} : { cause: entry.cause }),
+      // Present only on an unhinted (laddered) window; the old store omitted it
+      // on hinted windows, whose ladder was cleared.
+      ...(entry.escalations === undefined ? {} : { escalations: entry.escalations }),
+      ...(entry.lastMarkedAt === undefined ? {} : { lastMarkedAt: entry.lastMarkedAt }),
+      nowMs: input.nowMs,
+    });
+    if (!seeded.ok) allWritten = false;
+  }
+  return allWritten;
+}
+
+/** Replay the legacy endpoint windows; true when every write succeeded. */
+function seedLegacyModels(input: {
+  seeder: ModelStateSeeder;
+  models: ReadonlyMap<string, LegacyEntry>;
+  nowMs: number;
+}): boolean {
+  let allWritten = true;
+  for (const [model, entry] of input.models) {
+    const target = splitModel(model);
+    const seeded = input.seeder.seedCooldown({
+      provider: target.provider,
+      model: target.model,
+      untilMs: entry.until,
+      reason: entry.reason,
+      ...(entry.lastMarkedAt === undefined ? {} : { lastMarkedAt: entry.lastMarkedAt }),
+      nowMs: input.nowMs,
+    });
+    if (!seeded.ok) allWritten = false;
+  }
+  return allWritten;
+}
+
+/**
+ * Rank a stored row against a model id: 0 provider-wide, 1 exact endpoint, 2
+ * provider-agnostic bare model, undefined when the row does not block it.
+ *
+ * A provider-wide window outranks the endpoint one, matching the store's
+ * `cooldownFor`: a spent credential blocks every model on it, so that is the
+ * stronger diagnosis and the one a skip row should carry.
+ */
+function rowRank(row: CooldownRow, provider: string, model: string): number | undefined {
+  if (row.provider === provider && row.model === PROVIDER_SCOPE_MODEL) return 0;
+  if (row.provider === provider && row.model === model) return 1;
+  if (row.provider === PROVIDER_SCOPE_MODEL && row.model === model) return 2;
+  return undefined;
 }

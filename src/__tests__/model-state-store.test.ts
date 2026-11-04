@@ -1,18 +1,35 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { COOLDOWN_ESCALATION_MEMORY_MS } from "../model-cooldown.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { COOLDOWN_ESCALATION_MEMORY_MS, createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelStateStore, SqliteDatabaseLike } from "../model-state-store.js";
 import {
+  classifyStoreFailure,
   defaultModelStatePath,
+  LEGACY_COOLDOWN_FILE_ENV,
+  MAX_PENDING_COOLDOWN_AGE_MS,
+  MAX_PENDING_COOLDOWN_MARKS,
   MODEL_STATE_FILE_ENV,
   MODEL_STATE_SCHEMA_VERSION,
   openModelStateStore,
   PROVIDER_SCOPE_MODEL,
+  resetSharedModelStateStore,
   resolveModelStatePath,
+  SHARED_MODEL_STATE_RETRY_MS,
+  sharedModelStateStore,
 } from "../model-state-store.js";
+import { createProviderPolicy } from "../provider-policy.js";
 
 const sqliteProbe = spawnSync(process.execPath, ["-e", "require('node:sqlite')"], {
   encoding: "utf8",
@@ -37,6 +54,7 @@ interface RawStatement {
 }
 
 interface RawDatabase {
+  exec(sql: string): void;
   prepare(sql: string): RawStatement;
   close(): void;
 }
@@ -75,6 +93,25 @@ describe("model state path", () => {
     );
   });
 
+  it("keeps the retired cooldown file's location as the state store (bd-256)", () => {
+    // An operator who set BELAYD_MODEL_COOLDOWN_FILE keeps one store, beside the
+    // file whose windows are imported into it — not a second XDG store plus a
+    // stale legacy file. BELAYD_MODEL_STATE_FILE still wins.
+    expect(
+      resolveModelStatePath({
+        env: { [LEGACY_COOLDOWN_FILE_ENV]: "/state/model-cooldowns.json" },
+      }),
+    ).toBe("/state/model-cooldowns.sqlite");
+    expect(
+      resolveModelStatePath({
+        env: {
+          [LEGACY_COOLDOWN_FILE_ENV]: "/state/model-cooldowns.json",
+          [MODEL_STATE_FILE_ENV]: "/state/explicit.sqlite",
+        },
+      }),
+    ).toBe("/state/explicit.sqlite");
+  });
+
   it("resolves the production path from the process environment", () => {
     expect(defaultModelStatePath()).toContain("model-state.sqlite");
   });
@@ -101,7 +138,7 @@ describeSqlite("model state store (bd-187)", () => {
     raw.close();
   });
 
-  it("uses the bead's cooldown column names", () => {
+  it("uses the bead's cooldown column names plus the v2 diagnostics columns", () => {
     const path = tempDbPath();
     const opened = openModelStateStore({ path });
     expect(opened.ok).toBe(true);
@@ -113,8 +150,161 @@ describeSqlite("model state store (bd-187)", () => {
       .prepare("SELECT name FROM pragma_table_info('cooldown')")
       .all()
       .map((row) => recordOf(row).name);
-    expect(columns).toEqual(["provider", "model", "until_ms", "reason", "retry_after_ms"]);
+    expect(columns).toEqual([
+      "provider",
+      "model",
+      "until_ms",
+      "reason",
+      "retry_after_ms",
+      "cause",
+      "escalations",
+      "last_mark_ms",
+    ]);
     raw.close();
+  });
+
+  it("migrates a v1 cooldown table in place instead of reading a store it cannot write", () => {
+    const path = tempDbPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const raw = rawOpen(path);
+    raw.exec(`
+      CREATE TABLE cooldown (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        until_ms INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        retry_after_ms INTEGER NOT NULL,
+        PRIMARY KEY (provider, model)
+      );
+      INSERT INTO cooldown VALUES ('llmgateway', '*', 999999, 'quota', 1000);
+      PRAGMA user_version = 1;
+    `);
+    raw.close();
+
+    const opened = openModelStateStore({ path, now: () => 0 });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    // The pre-existing row is readable, and a new mark can write the v2 fields.
+    expect(
+      opened.store.cooldownFor({ provider: "llmgateway", model: "m", nowMs: 0 }),
+    ).toMatchObject({ ok: true, value: { scope: "provider", reason: "quota" } });
+    opened.store.markCooldown({
+      provider: "llmgateway",
+      durationMs: 1_000,
+      reason: "quota",
+      cause: "quota",
+      nowMs: 0,
+    });
+    const rows = opened.store.listCooldowns({ nowMs: 0 });
+    expect(rows).toMatchObject({
+      ok: true,
+      value: [{ cause: "quota", escalations: 1, lastMarkedAt: 0 }],
+    });
+    opened.store.close();
+  });
+
+  it("lets two connections open the same v1 file without racing the migration", () => {
+    // Two fleet members can open the same v1 file at once (bd-256 review). The
+    // migration is one BEGIN IMMEDIATE transaction, so the second opener sees a
+    // complete schema instead of racing the same ALTER.
+    const path = tempDbPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const raw = rawOpen(path);
+    raw.exec(`
+      CREATE TABLE cooldown (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        until_ms INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        retry_after_ms INTEGER NOT NULL,
+        PRIMARY KEY (provider, model)
+      );
+      INSERT INTO cooldown VALUES ('llmgateway', '*', 999999, 'quota', 1000);
+      PRAGMA user_version = 1;
+    `);
+    raw.close();
+
+    const first = openModelStateStore({ path, now: () => 0 });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    // The second connection opens while the first is still live.
+    const second = openModelStateStore({ path, now: () => 0 });
+    expect(second.ok).toBe(true);
+    if (!second.ok) {
+      first.store.close();
+      return;
+    }
+    expect(
+      second.store.cooldownFor({ provider: "llmgateway", model: "m", nowMs: 0 }),
+    ).toMatchObject({ ok: true, value: { scope: "provider", reason: "quota" } });
+    second.store.close();
+    first.store.close();
+  });
+
+  it("tolerates a partially migrated v1 table", () => {
+    // A migration that committed one ALTER before dying leaves a mix of v1 and
+    // v2 columns with user_version still 1. Reopening must finish it, not fail.
+    const path = tempDbPath();
+    mkdirSync(dirname(path), { recursive: true });
+    const raw = rawOpen(path);
+    raw.exec(`
+      CREATE TABLE cooldown (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        until_ms INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        retry_after_ms INTEGER NOT NULL,
+        cause TEXT,
+        PRIMARY KEY (provider, model)
+      );
+      INSERT INTO cooldown VALUES ('llmgateway', '*', 999999, 'quota', 1000, 'quota');
+      PRAGMA user_version = 1;
+    `);
+    raw.close();
+
+    const opened = openModelStateStore({ path, now: () => 0 });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(opened.store.listCooldowns({ nowMs: 0 })).toMatchObject({
+      ok: true,
+      value: [{ cause: "quota" }],
+    });
+    opened.store.close();
+
+    const reopened = rawOpen(path);
+    const columns = reopened
+      .prepare("SELECT name FROM pragma_table_info('cooldown')")
+      .all()
+      .map((row) => recordOf(row).name);
+    const version = recordOf(reopened.prepare("PRAGMA user_version").get());
+    reopened.close();
+    expect(columns).toEqual(expect.arrayContaining(["cause", "escalations", "last_mark_ms"]));
+    expect(version.user_version).toBe(MODEL_STATE_SCHEMA_VERSION);
+  });
+
+  it("does not re-run the migration on an already-v2 file", () => {
+    const path = tempDbPath();
+    const first = openModelStateStore({ path, now: () => 0 });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    first.store.markCooldown({
+      provider: "llmgateway",
+      durationMs: 60_000,
+      reason: "429",
+      cause: "quota",
+      nowMs: 0,
+    });
+    first.store.close();
+
+    const reopened = openModelStateStore({ path, now: () => 0 });
+    expect(reopened.ok).toBe(true);
+    if (!reopened.ok) return;
+    // A migration replayed over v2 would lose the diagnostics columns' values.
+    expect(reopened.store.listCooldowns({ nowMs: 0 })).toMatchObject({
+      ok: true,
+      value: [{ cause: "quota", escalations: 1 }],
+    });
+    reopened.store.close();
   });
 
   it("upserts and reads a model-scoped cooldown, then prunes it after expiry", () => {
@@ -773,5 +963,477 @@ describeSqlite("model state store lease renewal (bd-187 W1)", () => {
 
     owner.store.close();
     intruder.store.close();
+  });
+});
+
+describe("store failure classification (bd-256 review)", () => {
+  function codeError(code: string, message: string): Error & { code: string } {
+    const error = new Error(message) as Error & { code: string };
+    error.code = code;
+    return error;
+  }
+
+  it.each([
+    ["SQLITE_BUSY: database is locked", "transient"],
+    ["SQLITE_LOCKED: database table is locked", "transient"],
+    ["SQLITE_BUSY_SNAPSHOT: database is locked (snapshot)", "transient"],
+    ["SQLITE_PROTOCOL: locking protocol", "transient"],
+    ["SQLITE_IOERR: disk I/O error", "transient"],
+    ["disk I/O error", "transient"],
+    ["SQLITE_IOERR_SHMOPEN: unable to open shared memory", "transient"],
+    ["SQLITE_FULL: database or disk is full", "transient"],
+    ["database or disk is full", "transient"],
+    ["SQLITE_NOMEM: out of memory", "transient"],
+    ["SQLITE_INTERRUPT: interrupted", "transient"],
+    ["database is busy", "transient"],
+    ["EIO: i/o error", "transient"],
+    ["EINTR: interrupted system call", "transient"],
+    ["ENOMEM: not enough memory", "transient"],
+    ["ENOTDIR: not a directory, mkdir '/tmp/x/blocker/nested'", "permanent"],
+    ["EACCES: permission denied, mkdir '/root/state'", "permanent"],
+    ["EROFS: read-only file system", "permanent"],
+    ["node:sqlite unavailable: Cannot find module", "permanent"],
+    ["unable to open database file", "permanent"],
+    ["file is not a database", "permanent"],
+    ["SQLITE_READONLY: attempt to write a readonly database", "permanent"],
+    ["something nobody has seen before", "permanent"],
+  ])("classifies %s as %s", (message, expected) => {
+    expect(classifyStoreFailure(new Error(message))).toBe(expected);
+  });
+
+  it("reads a structured error code as well as the message", () => {
+    expect(classifyStoreFailure(codeError("SQLITE_BUSY", "whatever"))).toBe("transient");
+    expect(classifyStoreFailure(codeError("EACCES", "whatever"))).toBe("permanent");
+  });
+
+  it("classifies node:sqlite's numeric errcode (extended codes masked)", () => {
+    // node:sqlite reports `code: "ERR_SQLITE_ERROR"` plus a numeric `errcode`
+    // and the bare errstr, so the text alone is not always enough.
+    function sqliteError(errcode: number, message: string): Error & { errcode: number } {
+      const error = new Error(message) as Error & { errcode: number; code: string };
+      error.code = "ERR_SQLITE_ERROR";
+      error.errcode = errcode;
+      return error;
+    }
+    // 10 = SQLITE_IOERR, 517 = SQLITE_IOERR_BUSY_SNAPSHOT-style extended code.
+    expect(classifyStoreFailure(sqliteError(10, "disk I/O error"))).toBe("transient");
+    expect(classifyStoreFailure(sqliteError(5 | (2 << 8), "database is locked"))).toBe("transient");
+    // 0 is SQLITE_OK: nonsense as a failure, so it falls through to permanent.
+    expect(classifyStoreFailure(sqliteError(0, "nobody knows"))).toBe("permanent");
+  });
+
+  it("lets a permanent classification win over a transient word in the message", () => {
+    expect(
+      classifyStoreFailure(new Error("SQLITE_NOTADB: file is not a database (busy lock)")),
+    ).toBe("permanent");
+  });
+});
+
+describeSqlite("schema retry policy (bd-256 review)", () => {
+  interface FakeSchemaDatabase extends SqliteDatabaseLike {
+    beginAttempts(): number;
+  }
+
+  /** A database whose first `BEGIN IMMEDIATE` calls fail with the given messages. */
+  function fakeSchemaDatabase(failures: readonly string[]): FakeSchemaDatabase {
+    let attempts = 0;
+    const columns = [
+      "provider",
+      "model",
+      "until_ms",
+      "reason",
+      "retry_after_ms",
+      "cause",
+      "escalations",
+      "last_mark_ms",
+    ];
+    return {
+      beginAttempts: () => attempts,
+      exec(sql) {
+        if (sql !== "BEGIN IMMEDIATE") return;
+        const failure = failures[attempts];
+        attempts += 1;
+        if (failure !== undefined) throw new Error(failure);
+      },
+      prepare(sql) {
+        return {
+          run: () => ({ changes: 1, lastInsertRowid: 1 }),
+          get: () => undefined,
+          all: () => (sql.includes("pragma_table_info") ? columns.map((name) => ({ name })) : []),
+        };
+      },
+      close: () => undefined,
+    };
+  }
+
+  it("fails on the first attempt for a permanent error", () => {
+    const database = fakeSchemaDatabase([
+      "SQLITE_NOTADB: file is not a database",
+      "this attempt must never run",
+    ]);
+    const attempts: number[] = [];
+    const opened = openModelStateStore({
+      path: "/tmp/belayd-fake-state.sqlite",
+      database,
+      onSchemaAttempt: (attempt) => attempts.push(attempt),
+    });
+
+    expect(opened.ok).toBe(false);
+    expect(attempts).toEqual([1]);
+    expect(database.beginAttempts()).toBe(1);
+  });
+
+  it("retries a busy error and succeeds", () => {
+    const database = fakeSchemaDatabase(["SQLITE_BUSY: database is locked"]);
+    const attempts: number[] = [];
+    const opened = openModelStateStore({
+      path: "/tmp/belayd-fake-state.sqlite",
+      database,
+      onSchemaAttempt: (attempt) => attempts.push(attempt),
+    });
+
+    expect(opened.ok).toBe(true);
+    expect(attempts).toEqual([1, 2]);
+    if (opened.ok) opened.store.close();
+  });
+});
+
+describeSqlite("shared store failure handling (bd-256 review)", () => {
+  const ENV_KEYS = [MODEL_STATE_FILE_ENV, LEGACY_COOLDOWN_FILE_ENV, "XDG_STATE_HOME"] as const;
+  const savedEnv = new Map<string, string | undefined>();
+  const openedStores: ModelStateStore[] = [];
+
+  beforeEach(() => {
+    for (const key of ENV_KEYS) savedEnv.set(key, process.env[key]);
+    delete process.env[LEGACY_COOLDOWN_FILE_ENV];
+    process.env.XDG_STATE_HOME = join(tempDirForReview(), "xdg");
+    resetSharedModelStateStore();
+  });
+
+  afterEach(() => {
+    resetSharedModelStateStore();
+    for (const store of openedStores.splice(0)) store.close();
+    for (const key of ENV_KEYS) {
+      const value = savedEnv.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    savedEnv.clear();
+  });
+
+  function tempDirForReview(): string {
+    const dir = mkdtempSync(join(tmpdir(), "belayd-shared-store-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  function openTempStore(path: string, now: () => number): ModelStateStore {
+    const opened = openModelStateStore({ path, now });
+    if (!opened.ok) throw new Error(opened.error);
+    openedStores.push(opened.store);
+    return opened.store;
+  }
+
+  it("stops retrying a permanent failure and warns once", () => {
+    const dir = tempDirForReview();
+    const blocker = join(dir, "blocker");
+    writeFileSync(blocker, "not a directory");
+    process.env[MODEL_STATE_FILE_ENV] = join(blocker, "nested", "state.sqlite");
+    resetSharedModelStateStore();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      expect(sharedModelStateStore()).toBeNull();
+      // Many accesses across many retry windows: a permanent failure is not
+      // retried, so the warning cannot repeat every 30 s forever.
+      for (let step = 1; step <= 5; step += 1) {
+        vi.setSystemTime(t0 + step * SHARED_MODEL_STATE_RETRY_MS * 2);
+        expect(sharedModelStateStore()).toBeNull();
+      }
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("not retrying");
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("does not capture marks for a permanent failure", () => {
+    const dir = tempDirForReview();
+    const blocker = join(dir, "blocker");
+    writeFileSync(blocker, "not a directory");
+    process.env[MODEL_STATE_FILE_ENV] = join(blocker, "nested", "state.sqlite");
+    resetSharedModelStateStore();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      createModelCooldownStore().markProviderCooldown("commandcode", 600, "quota");
+    } finally {
+      warn.mockRestore();
+    }
+
+    // A later healthy access must not resurrect the dropped mark.
+    const path = join(tempDirForReview(), "recovered.sqlite");
+    process.env[MODEL_STATE_FILE_ENV] = path;
+    resetSharedModelStateStore();
+    const adapter = createModelCooldownStore();
+    expect(adapter.providerEntries().size).toBe(0);
+  });
+
+  it("queues a mark across a transient outage and flushes it before serving reads", () => {
+    const path = join(tempDirForReview(), "state.sqlite");
+    process.env[MODEL_STATE_FILE_ENV] = path;
+    resetSharedModelStateStore();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      const transient = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "database is locked" }),
+      });
+      expect(transient?.pendingFlush).toBe(true);
+
+      // Both write paths record into the facade while persistence is gone.
+      const policy = createProviderPolicy({ store: () => sharedModelStateStore() });
+      policy.recordFailure({
+        provider: "llmgateway",
+        model: "mimo-v2.6-flash",
+        classification: {
+          kind: "quota",
+          model: "mimo-v2.6-flash",
+          reason: "quota",
+          cooldownSeconds: 900,
+          cooldownHinted: false,
+        },
+      });
+      const routing = createModelCooldownStore();
+      routing.markProviderCooldown("opencode-go", 600, "quota", { cause: "quota" });
+
+      // Nothing is durable yet, so reads stay permissive (and report degraded).
+      expect(
+        policy.decideDispatch({ provider: "llmgateway", model: "mimo-v2.6-flash" }),
+      ).toMatchObject({ allowed: true, degraded: true });
+      expect(routing.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(false);
+
+      // The lock clears; the next access after the retry window opens, and the
+      // flush happens before the store serves the read.
+      vi.setSystemTime(t0 + SHARED_MODEL_STATE_RETRY_MS + 1);
+      const recovered = openTempStore(path, () => Date.now());
+      const opened = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: true, store: recovered }),
+      });
+      expect(opened).toBe(recovered);
+
+      expect(
+        policy.decideDispatch({ provider: "llmgateway", model: "mimo-v2.6-flash" }),
+      ).toMatchObject({ allowed: false, scope: "provider" });
+      expect(routing.isCoolingDown("opencode-go/mimo-v2.6-flash")).toBe(true);
+      expect(routing.providerEntries().get("opencode-go")).toHaveProperty("cause", "quota");
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("bounds the pending queue to the most recent marks", () => {
+    const path = join(tempDirForReview(), "state.sqlite");
+    process.env[MODEL_STATE_FILE_ENV] = path;
+    resetSharedModelStateStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const facade = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "SQLITE_BUSY: database is locked" }),
+      });
+      if (facade === null) throw new Error("expected the transient facade");
+      for (let index = 0; index < MAX_PENDING_COOLDOWN_MARKS + 8; index += 1) {
+        facade.markCooldown({ provider: `provider-${index}`, durationMs: 60_000, reason: "quota" });
+      }
+
+      // Past the retry window, so the next access really opens (and flushes).
+      vi.setSystemTime(Date.now() + SHARED_MODEL_STATE_RETRY_MS + 1);
+      const flushPath = join(tempDirForReview(), "flush.sqlite");
+      const recovered = openTempStore(flushPath, () => Date.now());
+      sharedModelStateStore(() => Date.now(), { open: () => ({ ok: true, store: recovered }) });
+
+      const rows = recovered.listCooldowns({ nowMs: Date.now() });
+      expect(rows.ok).toBe(true);
+      if (!rows.ok) return;
+      expect(rows.value).toHaveLength(MAX_PENDING_COOLDOWN_MARKS);
+      expect(rows.value.map((row) => row.provider)).not.toContain("provider-0");
+      expect(rows.value.map((row) => row.provider)).toContain(
+        `provider-${MAX_PENDING_COOLDOWN_MARKS + 7}`,
+      );
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("drops a pending mark whose window already elapsed", () => {
+    process.env[MODEL_STATE_FILE_ENV] = join(tempDirForReview(), "state.sqlite");
+    resetSharedModelStateStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      const facade = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "database is locked" }),
+      });
+      if (facade === null) throw new Error("expected the transient facade");
+      facade.markCooldown({ provider: "opencode-go", durationMs: 60_000, reason: "quota" });
+
+      vi.setSystemTime(t0 + MAX_PENDING_COOLDOWN_AGE_MS + 1);
+      const path = join(tempDirForReview(), "flush.sqlite");
+      const recovered = openTempStore(path, () => Date.now());
+      sharedModelStateStore(() => Date.now(), { open: () => ({ ok: true, store: recovered }) });
+
+      const rows = recovered.listCooldowns({ nowMs: Date.now() });
+      expect(rows).toMatchObject({ ok: true, value: [] });
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("replays a live long window queued during an outage longer than the age bound", () => {
+    process.env[MODEL_STATE_FILE_ENV] = join(tempDirForReview(), "state.sqlite");
+    resetSharedModelStateStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      const facade = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "SQLITE_BUSY: database is locked" }),
+      });
+      if (facade === null) throw new Error("expected the transient facade");
+      // A laddered weekly bucket and a hinted 20-minute reset, both queued while
+      // persistence is gone. Both are still live after an 11-minute outage, so
+      // dropping them by queue age would re-probe a provider already spent.
+      facade.markCooldown({
+        provider: "commandcode",
+        durationMs: 24 * 3_600_000,
+        reason: "weekly limit",
+      });
+      facade.markCooldown({
+        provider: "opencode-go",
+        durationMs: 1_200_000,
+        reason: "Resets in 20min",
+        hinted: true,
+      });
+
+      vi.setSystemTime(t0 + MAX_PENDING_COOLDOWN_AGE_MS + 60_000);
+      const path = join(tempDirForReview(), "flush.sqlite");
+      const recovered = openTempStore(path, () => Date.now());
+      sharedModelStateStore(() => Date.now(), { open: () => ({ ok: true, store: recovered }) });
+
+      const rows = recovered.listCooldowns({ nowMs: Date.now() });
+      expect(rows.ok).toBe(true);
+      if (!rows.ok) return;
+      expect(rows.value.map((row) => row.provider).sort()).toEqual(["commandcode", "opencode-go"]);
+      const policy = createProviderPolicy({ store: () => recovered });
+      expect(policy.decideDispatch({ provider: "commandcode", model: "glm-5.3" })).toMatchObject({
+        allowed: false,
+        scope: "provider",
+      });
+      expect(
+        policy.decideDispatch({ provider: "opencode-go", model: "mimo-v2.6-flash" }),
+      ).toMatchObject({ allowed: false, scope: "provider" });
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("evicts a stale and a duplicate mark before a live provider's window", () => {
+    process.env[MODEL_STATE_FILE_ENV] = join(tempDirForReview(), "state.sqlite");
+    resetSharedModelStateStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      const facade = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "SQLITE_BUSY: database is locked" }),
+      });
+      if (facade === null) throw new Error("expected the transient facade");
+
+      // A zero-length window is already stale; a second, longer mark for the
+      // same row supersedes the shorter one.
+      for (let index = 0; index < MAX_PENDING_COOLDOWN_MARKS - 3; index += 1) {
+        facade.markCooldown({ provider: `filler-${index}`, durationMs: 60_000, reason: "quota" });
+      }
+      facade.markCooldown({ provider: "stale-go", durationMs: 0, reason: "quota" });
+      facade.markCooldown({
+        provider: "llmgateway",
+        model: "mimo-v2.6-flash",
+        durationMs: 60_000,
+        reason: "short",
+      });
+      facade.markCooldown({
+        provider: "llmgateway",
+        model: "mimo-v2.6-flash",
+        durationMs: 6 * 3_600_000,
+        reason: "long",
+      });
+
+      // Two overflow pushes: the stale mark goes first, then the superseded
+      // duplicate. Neither may evict the oldest live mark (filler-0).
+      facade.markCooldown({ provider: "filler-last", durationMs: 60_000, reason: "quota" });
+      facade.markCooldown({ provider: "filler-last-2", durationMs: 60_000, reason: "quota" });
+
+      vi.setSystemTime(t0 + SHARED_MODEL_STATE_RETRY_MS + 1);
+      const path = join(tempDirForReview(), "flush.sqlite");
+      const recovered = openTempStore(path, () => Date.now());
+      sharedModelStateStore(() => Date.now(), { open: () => ({ ok: true, store: recovered }) });
+
+      const rows = recovered.listCooldowns({ nowMs: Date.now() });
+      expect(rows.ok).toBe(true);
+      if (!rows.ok) return;
+      const providers = rows.value.map((row) => row.provider);
+      expect(providers).not.toContain("stale-go");
+      expect(providers).toContain("filler-0");
+      expect(providers).toContain("filler-last-2");
+      const llmgateway = rows.value.find((row) => row.provider === "llmgateway");
+      // The longer window of the duplicate pair is the one that survived.
+      expect(llmgateway).toHaveProperty("reason", "long");
+      expect(rows.value).toHaveLength(MAX_PENDING_COOLDOWN_MARKS);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
+  });
+
+  it("treats SQLITE_IOERR at first open as transient and recovers", () => {
+    const recoveredPath = join(tempDirForReview(), "ioerr.sqlite");
+    process.env[MODEL_STATE_FILE_ENV] = recoveredPath;
+    resetSharedModelStateStore();
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const t0 = Date.now();
+      // node:sqlite reports a bare "disk I/O error" with code ERR_SQLITE_ERROR;
+      // classifying that as permanent would switch cooldown tracking off for
+      // the process after a single storage hiccup.
+      const facade = sharedModelStateStore(() => Date.now(), {
+        open: () => ({ ok: false, error: "SQLITE_IOERR: disk I/O error" }),
+      });
+      expect(facade?.pendingFlush).toBe(true);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("queued and retried");
+
+      vi.setSystemTime(t0 + SHARED_MODEL_STATE_RETRY_MS + 1);
+      const recovered = sharedModelStateStore(() => Date.now());
+      expect(recovered).not.toBeNull();
+      expect(recovered?.pendingFlush).toBeUndefined();
+      expect(recovered?.path).toBe(recoveredPath);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      warn.mockRestore();
+    }
   });
 });

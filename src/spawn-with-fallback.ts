@@ -404,7 +404,7 @@ function skipCandidate(candidate: string, store: ModelCooldownStore): SpawnAttem
       model: candidate,
       // The skip row carries the cause the cooldown entry recorded, so an
       // operator can tell "bucket spent" from "no key configured" without
-      // cross-referencing ~/.pi/agent/model-cooldowns.json.
+      // cross-referencing the shared model-state store.
       classification: skippedProviderClassification(
         provider,
         store.providerEntries().get(provider)?.cause,
@@ -621,6 +621,10 @@ export async function spawnAgentWithFallback(
     ...spawnOptions
   } = options;
   const classifyFn = classify ?? classifySpawnFailure;
+  // Omitting the store must resolve to the process-wide shared truth (bd-256),
+  // never a private per-copy store: a library caller that forgets the option
+  // would otherwise lose every cooldown recorded by the wrapper and by earlier
+  // spawns. Tests that need isolation pass `{ store: "memory" }` explicitly.
   const store = cooldownStore ?? createModelCooldownStore();
   const resolved = candidates ?? candidatesForModel(options.model, modelClass);
 

@@ -120,12 +120,12 @@ pnpm typecheck && pnpm lint && pnpm build
 Expected: all three exit 0. `pnpm build` also produces the `dist/src/*.js` files
 the manual check below imports.
 
-### 3. Manual end-to-end: watch the window in a real cooldown file
+### 3. Manual end-to-end: watch the window in the real cooldown store
 
 These commands drive the real classifier (`classifySpawnFailure`) and the real
-persisted store, over a scratch file, so you can read the state back with `jq`.
-Each command is a separate process — like a separate fleet member or a later
-workflow run.
+persisted store, over a scratch state file, so you can read the rows back through
+the store API. Each command is a separate process — like a separate fleet member
+or a later workflow run.
 
 The body is the one opencode-go actually returned:
 
@@ -134,19 +134,21 @@ The body is the one opencode-go actually returned:
 ```
 
 ```bash
-rm -f /tmp/bd38-cooldowns.json
+rm -f /tmp/bd38-model-state.sqlite*
 
 mark_unhinted() {
-  BELAYD_MODEL_COOLDOWN_FILE=/tmp/bd38-cooldowns.json node --input-type=module -e '
+  BELAYD_MODEL_STATE_FILE=/tmp/bd38-model-state.sqlite node --input-type=module -e '
 import { classifySpawnFailure } from "./dist/src/quota-failure.js";
-import { createModelCooldownStore, defaultModelCooldownPath } from "./dist/src/model-cooldown.js";
+import { createModelCooldownStore } from "./dist/src/model-cooldown.js";
 const errorMessage = String.raw`429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}`;
 const c = classifySpawnFailure({
   messages: [{ role: "assistant", content: [], model: "opencode-go/mimo-v2.6-flash", stopReason: "error", errorMessage }],
   usage: {},
   exitCode: 0,
 });
-const store = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+// No `filePath`: the shared store resolved from BELAYD_MODEL_STATE_FILE, and
+// no retired JSON file is read or marked in this scratch run.
+const store = createModelCooldownStore();
 store.markProviderCooldown("opencode-go", c.cooldownSeconds, c.reason, { hinted: c.cooldownHinted === true });
 const entry = store.providerEntries().get("opencode-go");
 console.log(`requested ${c.cooldownSeconds}s (hinted=${c.cooldownHinted}) -> until in ${((entry.until - Date.now()) / 3_600_000).toFixed(2)}h, escalations=${entry.escalations ?? 0}`);
@@ -170,19 +172,28 @@ requested 21600s (hinted=false) -> until in 24.00h, escalations=4
 ```
 
 That is behaviour 1 (6 h, not 15 min) and behaviour 2 (doubling, then clamped at
-24 h) in one run. Now inspect the file:
+24 h) in one run. Now inspect the rows:
 
 ```bash
-jq '{providers, escalations}' /tmp/bd38-cooldowns.json
+BELAYD_MODEL_STATE_FILE=/tmp/bd38-model-state.sqlite node -e '(async () => {
+const m = await import(`${process.cwd()}/dist/src/model-cooldown.js`);
+const s = await import(`${process.cwd()}/dist/src/model-state-store.js`);
+console.log("state store:", s.resolveModelStatePath({ env: process.env }));
+console.log(m.createModelCooldownStore().providerEntries());
+})()'
 ```
 
-Expected shape — this is the whole `model-cooldowns.json` format
-(default `~/.pi/agent/model-cooldowns.json`, override with
-`BELAYD_MODEL_COOLDOWN_FILE`), with every field documented:
+Since bd-256 the rows live in the scratch state file
+(`/tmp/bd38-model-state.sqlite`, from `BELAYD_MODEL_STATE_FILE`). The retired
+JSON file below is only an **import source**: the extension passes
+`defaultModelCooldownPath()` and the first use replays the file's windows and
+ladder, then writes `model-cooldowns.json.imported` beside it. Its shape
+(default `~/.pi/agent/model-cooldowns.json`, override
+`BELAYD_MODEL_COOLDOWN_FILE`) is:
 
 ```jsonc
 {
-  "version": 1,                      // optional on read; always rewritten as 1
+  "version": 1,                      // optional on read; this build never rewrites the file
   "providers": {                     // optional; provider-scoped windows (quota/429)
     "opencode-go": {
       "until": 1793192473942,        // required, epoch ms: the window end
@@ -200,57 +211,57 @@ Expected shape — this is the whole `model-cooldowns.json` format
 
 - `version`, `escalations` (both maps), `escalations` (entry) and `lastMarkedAt`
   are **optional**. A file from an older build — no version, no ladder, no
-  stamps — loads unchanged; a missing stamp only means the merge cannot order
-  that entry against this process's and falls back to the safer window (longer
-  `until`, then higher count). A malformed single entry is skipped while its
-  healthy siblings load; a corrupt file reads as empty and is rewritten on the
-  next mark. Unknown keys are carried through a read-modify-write.
-- `until <= now` means expired; expired entries are pruned on load, `refresh()`,
-  `persist()`. The ladder outlives the window for
-  `COOLDOWN_ESCALATION_MEMORY_MS` (7 days) after its last mark.
+  stamps — imports unchanged: the rung is replayed from the ladder map, and a
+  missing stamp only means the replayed row is stamped with the migration time.
+  A malformed single entry is skipped while its healthy siblings import; a
+  corrupt file imports nothing and still records the migration. This build never
+  rewrites the file, so unknown keys stay where they are.
+- `until <= now` means expired; an expired window is not imported. The ladder
+  outlives the window for `COOLDOWN_ESCALATION_MEMORY_MS` (7 days) after its
+  last mark, and a rung older than that is ignored by the import.
 - A hinted reset is recorded as `count: 0` in the ladder map — "cleared at this
-  time" still needs a timestamp to win the merge.
+  time" is replayed as a rung-0 event, so the next unhinted mark starts at
+  rung 1.
 
 Next, the hinted body overrides both the window and the ladder
 (`Weekly usage limit reached. Resets in 20min.`):
 
 ```bash
-BELAYD_MODEL_COOLDOWN_FILE=/tmp/bd38-cooldowns.json node --input-type=module -e '
+BELAYD_MODEL_STATE_FILE=/tmp/bd38-model-state.sqlite node --input-type=module -e '
 import { classifySpawnFailure } from "./dist/src/quota-failure.js";
-import { createModelCooldownStore, defaultModelCooldownPath } from "./dist/src/model-cooldown.js";
+import { createModelCooldownStore } from "./dist/src/model-cooldown.js";
 const errorMessage = String.raw`429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 20min."}`;
 const c = classifySpawnFailure({
   messages: [{ role: "assistant", content: [], model: "opencode-go/mimo-v2.6-flash", stopReason: "error", errorMessage }],
   usage: {},
   exitCode: 0,
 });
-const store = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+const store = createModelCooldownStore();
 store.markProviderCooldown("opencode-go", c.cooldownSeconds, c.reason, { hinted: c.cooldownHinted === true });
 const entry = store.providerEntries().get("opencode-go");
 console.log(`requested ${c.cooldownSeconds}s (hinted=${c.cooldownHinted}) -> until in ${((entry.until - Date.now()) / 60_000).toFixed(2)}min, escalations=${entry.escalations ?? 0}`);
 '
-jq -c '.escalations' /tmp/bd38-cooldowns.json
+# With a sqlite3 binary, the ladder is a separate table:
+sqlite3 /tmp/bd38-model-state.sqlite "SELECT * FROM cooldown_ladder;"
 ```
 
 Expected the 24 h escalated window to be replaced by the hinted 20 minutes, and
-the ladder to be cleared:
+the ladder row to be deleted (so the next unhinted mark is rung 1):
 
 ```text
 requested 1200s (hinted=true) -> until in 20.00min, escalations=0
-{"opencode-go":{"count":0,"lastMarkedAt":1793106077939}}
 ```
 
-Finally the fleet case (behaviour 3): a store created while the file was empty
-must see a cooldown another store wrote afterwards, through the probe:
+Finally the fleet case (behaviour 3): a second member sees a cooldown another
+member wrote, on the same shared store and without a restart:
 
 ```bash
-rm -f /tmp/bd38-fleet.json
-BELAYD_MODEL_COOLDOWN_FILE=/tmp/bd38-fleet.json node --input-type=module -e '
-import { createModelCooldownStore, defaultModelCooldownPath } from "./dist/src/model-cooldown.js";
+rm -f /tmp/bd38-fleet.sqlite*
+BELAYD_MODEL_STATE_FILE=/tmp/bd38-fleet.sqlite node --input-type=module -e '
+import { createModelCooldownStore } from "./dist/src/model-cooldown.js";
 import { probeFromCooldownStore } from "./dist/src/capacity-cache.js";
-const filePath = defaultModelCooldownPath();
-const member = createModelCooldownStore({ filePath });   // fleet member B, started when the file was empty
-const sibling = createModelCooldownStore({ filePath });  // fleet member A
+const member = createModelCooldownStore();   // fleet member B, opened before the write
+const sibling = createModelCooldownStore();  // fleet member A, same shared store
 sibling.markProviderCooldown("opencode-go", 21_600, "quota");
 console.log("B provider entries before its probe:", member.providerEntries().size);
 console.log("B probe windows:", (await probeFromCooldownStore(member)()).windows);
@@ -258,10 +269,11 @@ console.log("B provider entries after its probe:", member.providerEntries().size
 '
 ```
 
-Expected:
+Expected — one truth, so the row is visible immediately (there is no
+per-process snapshot to refresh):
 
 ```text
-B provider entries before its probe: 0
+B provider entries before its probe: 1
 B probe windows: [
   { provider: 'opencode-go', resetAt: 1793127681900, reason: 'quota' }
 ]
@@ -271,7 +283,7 @@ B provider entries after its probe: 1
 Clean up:
 
 ```bash
-rm -f /tmp/bd38-cooldowns.json /tmp/bd38-fleet.json
+rm -f /tmp/bd38-model-state.sqlite* /tmp/bd38-fleet.sqlite*
 ```
 
 The one thing this recipe cannot do is make a live provider return a 429 on
@@ -354,10 +366,12 @@ flag (see `recordCooldown` in `src/spawn-with-fallback.ts`).
 ### Mark a provider cooldown (hinted vs escalating)
 
 ```typescript
-import { createModelCooldownStore, defaultModelCooldownPath } from "belayd-agent-harness";
+import { createModelCooldownStore } from "belayd-agent-harness";
 
-// Persistent store shared by every spawn in one orchestrator session.
-const store = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+// The process-wide shared store — the same row the provider wrapper reads and
+// writes (bd-256). Omit `store` to get it; `{ store: "memory" }` is the
+// explicit test-only escape hatch.
+const store = createModelCooldownStore();
 
 // Unhinted mark: a harness guess, so it escalates a provider already cooling.
 store.markProviderCooldown("opencode-go", 21_600, "GoUsageLimitError");
@@ -382,35 +396,36 @@ store.markProviderCooldown("opencode-go", 1_200, "Resets in 20min", { hinted: tr
 ```typescript
 import { createCapacityCache, createFallbackCapacityProbe, probeFromCooldownStore } from "belayd-agent-harness";
 
-const store = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+const store = createModelCooldownStore();
 
-// probeFromCooldownStore refreshes the file itself — this is what makes a fleet
-// member's freshly written 429 visible on the next capacity probe.
+// probeFromCooldownStore drops the store's bounded read cache — this is what
+// makes a fleet member's freshly written 429 visible on the next capacity probe.
 const capacity = createCapacityCache({ probe: createFallbackCapacityProbe(probeFromCooldownStore(store)) });
 
 await capacity.refreshIfStale();                 // never rejects
 capacity.isModelExhausted("opencode-go/mimo-v2.6-flash"); // true after a 429 elsewhere
 
-// Reading the store directly (not through the probe) needs an explicit refresh;
-// it is a no-op for an in-memory store and never throws.
+// The adapter's reads are uncached row reads; `refresh()` is for callers that
+// want the store's own `cooldownFor` cache dropped (it never throws and is a
+// no-op without a store).
 store.refresh();
 store.providerEntries().get("opencode-go"); // { until, reason, escalations, lastMarkedAt }
 ```
 
-`refresh()` and the lock-protected `persist()` share one ordering rule per key:
-the **newer `lastMarkedAt`** wins in both directions, never the longer `until`. If
-exactly one side carries a stamp — a pre-bd-38 file, or a fleet member still on an
-older build — the stamps are incomparable and the merge falls back to the tie
-ordering (longer `until`, then higher escalation count). A hinted reset from a
-later mark therefore survives a stale longer guess, and a stale file cannot
-shorten a live escalated window.
+`refresh()` only governs the store's bounded read cache: the row itself is the
+truth, so an unhinted repeat escalates it, a hinted mark replaces it exactly and
+clears the ladder, and no merge can shorten a live window. A row written by
+another fleet member is visible on the next uncached read (or immediately after
+that member's own write in this process).
 
 ### Point the store at a different file
 
-`BELAYD_MODEL_COOLDOWN_FILE` overrides the default
-`~/.pi/agent/model-cooldowns.json`; it is read by
-`defaultModelCooldownPath()` (exported), so set it before starting `pi` or before
-constructing the store:
+Since bd-256 the cooldown rows live in the shared model-state store. Use
+`BELAYD_MODEL_STATE_FILE` to move it outright. The older
+`BELAYD_MODEL_COOLDOWN_FILE` still works as a location: it relocates the store
+beside the retired JSON path (`/tmp/scratch-cooldowns.json` →
+`/tmp/scratch-cooldowns.sqlite`) and that file's still-active windows are
+imported once. Set either before starting `pi` or constructing the store:
 
 ```bash
 BELAYD_MODEL_COOLDOWN_FILE=/tmp/scratch-cooldowns.json pi

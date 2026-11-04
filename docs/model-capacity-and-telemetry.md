@@ -52,8 +52,8 @@ Run these commands from the repository root. Run each command to completion.
      src/__tests__/extension-model-telemetry.test.ts
    ```
 
-   Expected: 6 files / 124 tests passed (33 capacity-cache, 21 model-telemetry,
-   9 model-session-state, 33 spawn-with-fallback, 26 run-manifest, 2
+   Expected: 6 files / 158 tests passed (37 capacity-cache, 21 model-telemetry,
+   9 model-session-state, 63 spawn-with-fallback, 26 run-manifest, 2
    extension-model-telemetry).
 
    > Known flake unrelated to bd-116: `belayd-direnv-setup (unit) > sweeps a
@@ -71,8 +71,8 @@ Run these commands from the repository root. Run each command to completion.
      src/__tests__/spawn-with-fallback.test.ts
    ```
 
-   Expected: 4 files / 151 tests passed (50 quota-failure, 35 model-cooldown,
-   33 capacity-cache, 33 spawn-with-fallback). Names to look for — the
+   Expected: 4 files / 195 tests passed (72 quota-failure, 23 model-cooldown,
+   37 capacity-cache, 63 spawn-with-fallback). Names to look for — the
    behaviours those names assert are listed in
    [Unhinted provider usage limits and cooldown escalation (bd-38)](#unhinted-provider-usage-limits-and-cooldown-escalation-bd-38):
 
@@ -84,20 +84,21 @@ Run these commands from the repository root. Run each command to completion.
      quota wording at all`.
    - `model-cooldown.test.ts`: `doubles an unhinted provider window that is
      still cooling`, `clamps the escalated window at the hard ceiling`,
-     `treats a hinted reset as authoritative and clears the ladder`, `keeps one
-     complete mark per key, preferring the longer window on a tie`, `keeps the
-     higher ladder count on a mark-time tie in both directions`, `loads a
-     version-1 file written before escalation existed`, `skips only the
-     malformed entries of a hand-edited file`.
+     `treats a hinted reset as authoritative and clears the ladder`,
+     `leaves model-scoped marks un-escalated and out of the provider ladder`,
+     `sees another adapter's mark over the same store without a refresh`,
+     `imports still-active windows once and leaves the user's file untouched`,
+     `does not import again on a later open, even if the legacy file changed`,
+     `skips malformed legacy entries instead of discarding the file`.
    - `capacity-cache.test.ts`: `sees a cooldown written by another store instance
-     sharing the same file`, `never throws and yields no windows for a missing
+     sharing the same store`, `never throws and yields no windows for a missing
      or corrupt file`.
    - `spawn-with-fallback.test.ts`: `cools the provider for hours, so 15 minutes
      later it is still skipped`, `escalates the provider window on a repeated
      unhinted 429`, `does not apply the long provider window on a model-scoped
      failure`.
 
-   Then run the real thing against a scratch cooldown file: see
+   Then run the real thing against a scratch state file: see
    [Manual recipe: the long provider window, its ladder, and cross-process
    visibility](#manual-recipe-the-long-provider-window-its-ladder-and-cross-process-visibility-bd-38).
 
@@ -269,7 +270,7 @@ so the variable must be set before `pi` starts.
    retry hits the same fast-fail instead of minting `-fallback-N` sessions.
 
 5. **Misconfiguration warning.** Point the variable at a dead port and confirm
-   the fallback to the persisted cooldown store, throttled to about one warning
+   the fallback to the shared cooldown rows, throttled to about one warning
    per 5 minutes:
 
    ```bash
@@ -285,10 +286,11 @@ so the variable must be set before `pi` starts.
 ### Manual recipe: the long provider window, its ladder, and cross-process visibility (bd-38)
 
 This drives the real classifier and the real cooldown store — not a stub — over a
-scratch cooldown file, so the persisted state can be read back with `jq`. It is
-the fastest way to see the three bd-38 behaviours by hand; the spawn-level skip
-is covered by `spawn-with-fallback.test.ts` (see above), because reproducing a
-live opencode-go exhaustion is not something a recipe can schedule.
+scratch state file, so every window is the one the harness actually recorded. It
+is the fastest way to see the three bd-38 behaviours by hand; the spawn-level
+skip is covered by `spawn-with-fallback.test.ts` (see above), because
+reproducing a live opencode-go exhaustion is not something a recipe can
+schedule.
 
 1. Build the library output the script imports (the extension itself runs from
    `src/`, but a throwaway `node` script needs `dist/`):
@@ -303,10 +305,10 @@ live opencode-go exhaustion is not something a recipe can schedule.
    ```bash
    cat > bd38-check.mjs <<'EOF'
    // Scratch verification script for bd-38 — run from the repo root after `pnpm build`.
-   import { readFileSync } from "node:fs";
    import { setTimeout as sleep } from "node:timers/promises";
    import { classifySpawnFailure } from "./dist/src/quota-failure.js";
-   import { createModelCooldownStore, defaultModelCooldownPath } from "./dist/src/model-cooldown.js";
+   import { createModelCooldownStore } from "./dist/src/model-cooldown.js";
+   import { openModelStateStore, resolveModelStatePath } from "./dist/src/model-state-store.js";
    import { probeFromCooldownStore } from "./dist/src/capacity-cache.js";
 
    const UNHINTED = '429: {"type":"GoUsageLimitError","message":"Go usage limit exceeded"}';
@@ -327,7 +329,7 @@ live opencode-go exhaustion is not something a recipe can schedule.
      exitCode: 0,
    });
 
-   // Mirrors recordCooldown() in src/spawn-with-fallback.ts.
+   // Mirrors recordFailureCooldown() in src/spawn-with-fallback.ts.
    const applyFailure = async (store, body) => {
      const classification = classifySpawnFailure(detailsOf(body));
      await sleep(5); // keep mark timestamps distinct, as they are in a real workflow
@@ -348,44 +350,56 @@ live opencode-go exhaustion is not something a recipe can schedule.
      console.log(`${label}: until ~${hoursOut(entry)}h out, escalations=${entry.escalations ?? 0}`);
    };
 
-   const file = defaultModelCooldownPath();
-   const store = createModelCooldownStore({ filePath: file });
-   const otherMember = createModelCooldownStore({ filePath: file });
-   console.log("cooldown file:", file);
+   // The one path the harness uses. The run below points BELAYD_MODEL_STATE_FILE
+   // at /tmp, so this is a scratch store. Each "member" gets its own connection,
+   // which is exactly what a second process has.
+   const statePath = resolveModelStatePath({ env: process.env });
+   const openMember = () => {
+     const opened = openModelStateStore({ path: statePath });
+     if (!opened.ok) throw new Error(opened.error);
+     // No `filePath`: this scratch run imports no retired JSON file and writes no
+     // marker under ~/.pi/agent. The migration itself is covered by tests.
+     return createModelCooldownStore({ store: opened.store });
+   };
+   const store = openMember();
+   const otherMember = openMember();
+   console.log("scratch state store:", statePath);
 
    for (const attempt of [1, 2, 3, 4]) {
      const { cooldownSeconds } = await applyFailure(store, UNHINTED);
      show(`unhinted #${attempt} (${cooldownSeconds}s requested)`, store);
    }
 
-   console.log("\nfile after four unhinted failures:");
-   console.log(readFileSync(file, "utf8"));
-
    console.log("hinted failure (20 min, authoritative):");
    const hinted = await applyFailure(store, HINTED);
    console.log(`cooldownHinted=${hinted.cooldownHinted}`);
    show("hinted", store);
-   console.log("escalation ladder in the file:", JSON.parse(readFileSync(file, "utf8")).escalations);
 
-   console.log("\nsecond store over the same file, before its probe:", otherMember.providerEntries().size);
+   console.log(
+     "\nsecond process (one truth, no snapshot):",
+     otherMember.providerEntries().size,
+     "provider row(s)",
+   );
    const { windows } = await probeFromCooldownStore(otherMember)();
    console.log("probe windows:", windows);
    EOF
    ```
 
-3. Run it against a scratch file, so the real
-   `~/.pi/agent/model-cooldowns.json` is untouched (`defaultModelCooldownPath()`
-   honours `BELAYD_MODEL_COOLDOWN_FILE`):
+3. Run it against a scratch state file, so the default store reported by
+   `resolveModelStatePath()` (`~/.local/state/belayd/model-state.sqlite` unless
+   overridden) and everything under `~/.pi/agent` are untouched
+   (`BELAYD_MODEL_STATE_FILE` overrides the path; a set
+   `BELAYD_MODEL_COOLDOWN_FILE` relocates it beside that file instead):
 
    ```bash
-   rm -f /tmp/bd38-cooldowns.json
-   BELAYD_MODEL_COOLDOWN_FILE=/tmp/bd38-cooldowns.json node bd38-check.mjs
+   rm -f /tmp/bd38-model-state.sqlite*
+   BELAYD_MODEL_STATE_FILE=/tmp/bd38-model-state.sqlite node bd38-check.mjs
    ```
 
    Expected output — 6 h, then doubling, then clamped at 24 h:
 
    ```text
-   cooldown file: /tmp/bd38-cooldowns.json
+   scratch state store: /tmp/bd38-model-state.sqlite
    unhinted #1 (21600s requested): until ~6.00h out, escalations=1
    unhinted #2 (21600s requested): until ~12.00h out, escalations=2
    unhinted #3 (21600s requested): until ~24.00h out, escalations=3
@@ -393,28 +407,37 @@ live opencode-go exhaustion is not something a recipe can schedule.
    ```
 
    Then the hinted mark, which overrides the escalated window and clears the
-   ladder (the ladder record survives with `count: 0`, which is how "cleared at
-   this time" is recorded):
+   ladder (the `cooldown_ladder` row is deleted, which is how "cleared at this
+   time" is recorded — so the row carries no `escalations` field):
 
    ```text
    hinted failure (20 min, authoritative):
    cooldownHinted=true
    hinted: until ~0.33h out, escalations=0
-   escalation ladder in the file: { 'opencode-go': { count: 0, lastMarkedAt: ... } }
    ```
 
-   And the fleet case — a store created *before* the mark saw nothing until its
-   probe refreshed the file:
+   And the fleet case — since bd-256 there is no per-process snapshot to
+   refresh: a second store over the same file sees the row immediately.
 
    ```text
-   second store over the same file, before its probe: 0
-   probe windows: [ { provider: 'opencode-go', resetAt: ..., reason: 'Quota/credit/rate limit (HTTP 429).' } ]
+   second process (one truth, no snapshot): 1 provider row(s)
+   probe windows: [ { provider: 'opencode-go', resetAt: ..., reason: 'Weekly usage limit reached. Resets in 20min.' } ]
    ```
 
-4. **The persisted file.** After four unhinted failures it looks like this —
-   this is the whole `model-cooldowns.json` shape (default path
-   `~/.pi/agent/model-cooldowns.json`, override with
-   `BELAYD_MODEL_COOLDOWN_FILE`):
+4. **Where the row lives.** The window is a row in the shared
+   `cooldown(provider, model, until_ms, reason, retry_after_ms, cause,
+   escalations, last_mark_ms)` table — provider-wide rows use `model = '*'`,
+   endpoint rows a bare model id, and a provider-agnostic bare model row uses
+   `provider = '*'`. `escalations` is the ladder rung an unhinted provider-wide
+   mark used (NULL on hinted and model rows), and `last_mark_ms` is when the row
+   was marked. The ladder itself is a separate `cooldown_ladder(provider,
+   escalations, last_mark_ms)` row, remembered for
+   `COOLDOWN_ESCALATION_MEMORY_MS` (7 days) after the last mark and pruned
+   afterwards. Expired rows are invisible to every reader and deleted by
+   `prune()`.
+
+5. **The retired JSON file (import source only).** Earlier builds persisted the
+   same windows here instead:
 
    ```jsonc
    {
@@ -434,44 +457,69 @@ live opencode-go exhaustion is not something a recipe can schedule.
    }
    ```
 
-   Field notes:
+   This build **never writes it**. When the adapter is constructed with a
+   `filePath` (the extension passes `defaultModelCooldownPath()`), the first use
+   imports the file's still-active `providers`/`models` windows and its
+   `escalations` ladder: the longer window wins on conflict, the rung is
+   replayed (so an escalated weekly bucket continues from where it was instead of
+   restarting at rung 1), and the migration is recorded in
+   `model-cooldowns.json.imported`. The user's file is left untouched. A file
+   written by an older build with no `version`, `escalations`, or
+   `lastMarkedAt` imports unchanged; a malformed entry is skipped and its
+   healthy siblings import; a corrupt file imports nothing instead of throwing.
 
-   | Field | Required | Meaning |
-   | --- | --- | --- |
-   | `version` | no | always rewritten as `1`; a file without it loads fine |
-   | `providers` / `models` | no | scope maps; each entry needs `until` + `reason` |
-   | `until` | yes | epoch ms. `<= now` means expired; expired entries are pruned on load, refresh, and persist |
-   | `reason` | yes | free text from the classification (`Quota/credit/rate limit (HTTP 429).`), for humans only |
-   | `escalations` (entry) | no | ladder rung that produced this window; absent for hinted and model-scoped windows |
-   | `lastMarkedAt` (entry) | no | epoch ms of the mark. Merge order uses this, never `until` |
-   | `escalations` (map) | no | per-provider `{ count, lastMarkedAt }`; `count: 0` records a hinted reset. Remembered for `COOLDOWN_ESCALATION_MEMORY_MS` (7 days) after the last mark, then pruned |
-
-   Backward compatibility: a file written by an older build — no `version`, no
-   `escalations`, no `lastMarkedAt` — loads unchanged; the missing stamp only
-   means the merge cannot order it against this process's entry and falls back
-   to the safer window (longer `until`, then higher count). Unknown keys written
-   by another version (or by hand) are carried through a read-modify-write. A
-   malformed single entry is skipped and its healthy siblings load; a corrupt
-   file reads as empty rather than throwing.
-
-5. **Read the live file on a real machine.** The same numbers without the
-   script:
+6. **Read the live rows on a real machine.** The same numbers without the
+   script, through the library:
 
    ```bash
-   jq -r '.providers | to_entries[]
-     | "\(.key)\t\(((.value.until/1000 - now)/3600*10|round)/10)h\t\(.value.reason)"' \
-     ~/.pi/agent/model-cooldowns.json
-   jq -c '.escalations' ~/.pi/agent/model-cooldowns.json
+   node -e '(async () => {
+   const c = await import("./dist/src/model-cooldown.js");
+   const s = await import("./dist/src/model-state-store.js");
+   const path = s.resolveModelStatePath({ env: process.env });
+   const opened = s.openModelStateStore({ path });
+   if (!opened.ok) throw new Error(opened.error);
+   const store = c.createModelCooldownStore({ store: opened.store });   // no filePath: no import
+   console.log("state store:", path);
+   for (const [p, e] of store.providerEntries())
+     console.log(p, ((e.until - Date.now()) / 3600_000).toFixed(1) + "h", e.escalations ?? 0, e.reason);
+   })()'
+   ```
+
+   `resolveModelStatePath()` is authoritative: it honours
+   `BELAYD_MODEL_STATE_FILE` first, then the retired
+   `BELAYD_MODEL_COOLDOWN_FILE` (`x.json` → `x.sqlite`), then
+   `${XDG_STATE_HOME:-~/.local/state}/belayd/model-state.sqlite`. Derive the same
+   path in the shell for the `sqlite3` variant — do not hard-code the default, or
+   an env override makes the two read-backs disagree. `state_path()` below
+   mirrors `resolveModelStatePath()` and `modelStatePathForCooldownFile()`
+   exactly: the `.json` strip is case-insensitive, like `/\.json$/i`, and an
+   unset `HOME` falls back to the passwd home directory rather than `/`:
+
+   ```bash
+   state_path() {
+     if [ -n "${BELAYD_MODEL_STATE_FILE:-}" ]; then
+       printf '%s' "$BELAYD_MODEL_STATE_FILE"
+     elif [ -n "${BELAYD_MODEL_COOLDOWN_FILE:-}" ]; then
+       # `s///I`: the TypeScript rule strips /\.json$/i, not only lowercase.
+       printf '%s.sqlite' "$(printf '%s' "$BELAYD_MODEL_COOLDOWN_FILE" | sed 's/\.json$//I')"
+     else
+       home=${HOME:-$(cd ~ && pwd)}
+       printf '%s/belayd/model-state.sqlite' "${XDG_STATE_HOME:-$home/.local/state}"
+     fi
+   }
+   sqlite3 -header -column "$(state_path)" \
+     "SELECT provider, model, datetime(until_ms/1000,'unixepoch') AS until, escalations, reason
+        FROM cooldown ORDER BY provider, model;"
    ```
 
    Expected after one unhinted `GoUsageLimitError`: an `opencode-go` row about
-   `6h` out and an `escalations` record with `count: 1` — not a 15-minute
-   window. Two failures an hour apart: about `12h` and `count: 2`.
+   `6h` out with `escalations = 1` — not a 15-minute window. Two failures an
+   hour apart: about `12h` and `escalations = 2`.
 
-6. Clean up:
+7. Clean up:
 
    ```bash
-   rm -f bd38-check.mjs /tmp/bd38-cooldowns.json
+   rm -f bd38-check.mjs /tmp/bd38-model-state.sqlite*
    ```
 
 ### What you should see in the logs (the fleet symptom bd-38 fixes)
@@ -559,24 +607,18 @@ An entry with no resolvable reset time is ignored; in the list shape an entry
 without a `provider` is also ignored. A bare model id with no `provider/`
 prefix never matches a window (exhaustion is provider-scoped).
 
-**When the variable is unset** the probe reads the persisted cooldown store
+**When the variable is unset** the probe reads the shared cooldown rows
 (`probeFromCooldownStore`), so capacity still reflects provider limits learned
-from earlier 429s and survives orchestrator restarts. The probe re-reads that
-file first (`ModelCooldownStore.refreshIfStale` with the same 1 s
-`COOLDOWN_REFRESH_MAX_AGE_MS` window candidate selection uses, so one spawn
-parses the file once), because every process — including each fleet member —
-owns its own store and loads the file only once at creation; without the
-re-read a cooldown another member just wrote stays invisible until the next
-orchestrator restart. The merge orders per key by *when the window was
-marked* (`lastMarkedAt`), never by how long it is, so the newest observation
-wins in both directions; a `lastMarkedAt` tie keeps the longer window, ladder
-ties keep the higher count, and expired entries are pruned. Entries written
-before that field existed — including entries a fleet member still running an
-older build writes *right now* — carry no stamp, and stamp absence is not
-evidence of age: when only one side of a merge is stamped, the merge falls back
-to the tie ordering (longer `until`, then higher escalation count) instead of
-treating the unstamped window as old. It is a no-op for an in-memory store and
-never throws on a missing, corrupt, or unreadable file.
+from earlier 429s and survives orchestrator restarts. Since bd-256 those rows
+are in the one SQLite store the provider wrapper writes, not a per-process JSON
+file: the probe calls `ModelCooldownStore.refreshIfStale` with the same 1 s
+`COOLDOWN_REFRESH_MAX_AGE_MS` window candidate selection uses, which drops the
+store's bounded read cache so a row another fleet member just wrote is seen
+without an orchestrator restart. There is no merge any more — the row *is* the
+truth, ordered by the store's own upsert and escalation rules (a hinted reset
+replaces the window and clears the ladder; an unhinted repeat doubles it).
+Expired rows are invisible to the probe and deleted by `prune()`, and the probe
+never throws on a missing, unreadable, or degraded store.
 **When it is set but the
 endpoint yields nothing** (non-200, malformed JSON, timeout, oversized body,
 zero windows, request failure) the probe falls back to those same cooldown
@@ -600,23 +642,23 @@ independent of the capacity probe.
 Before the first attempt of every `spawnAgentWithFallback` call two things
 happen, in this order:
 
-1. **The persisted cooldown store is re-read** —
+1. **The shared cooldown rows are re-read** —
    `ModelCooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS)` followed by
-   `prune()`. This is deliberately *not* gated by the capacity TTL and happens
-   even when the capacity probe is an endpoint probe: every process loads
-   `~/.pi/agent/model-cooldowns.json` once at store creation, so without the
-   re-read the picker dispatches onto a provider another fleet member (or a
-   previous lifecycle) already spent, and only recovers after paying a failed
-   spawn in the fallback loop (bd-234). The bounded
-   `COOLDOWN_REFRESH_MAX_AGE_MS` window (1 s, far below the capacity TTL) lets
-   step 2 reuse the same read instead of parsing the file twice per spawn.
-   `refreshIfStale` merges per key by mark time, never throws, and is a no-op
-   for an in-memory store, so library callers that pass no `filePath` are
-   unaffected. A missing refresh stamp and a *regressed* clock both count as
+   `prune()`. Since bd-256 this is the *same* SQLite store the provider wrapper
+   writes (`ModelCooldownStore` is a thin adapter over `ModelStateStore`), so
+   "re-read" means dropping the store's 1 s read cache, not parsing a second
+   file. It is deliberately *not* gated by the capacity TTL and happens
+   even when the capacity probe is an endpoint probe: without it the picker
+   dispatches onto a provider another fleet member (or the wrapped dispatch in
+   this same process) already spent, and only recovers after paying a failed
+   spawn in the fallback loop (bd-234). `refreshIfStale` never throws and is a
+   no-op without a store, so a degraded store leaves candidate selection
+   permissive. A missing refresh stamp and a *regressed* clock both count as
    stale (a negative elapsed time cannot prove freshness), so a backwards clock
    change re-reads instead of suppressing reads until wall time catches up.
    Callers that need certainty (orchestrator launch preflight, in-session
-   recovery) still use the unbounded `refresh()`.
+   recovery) still use the unbounded `refresh()`, which clears the cache
+   outright.
 
 2. **The cached capacity signal is refreshed** (TTL permitting), and then it:
 
@@ -729,8 +771,8 @@ What changed:
   phrasings observed live from llmgateway/openrouter). It is fallback-worthy and
   cooled down for `DEFAULT_MODEL_UNAVAILABLE_COOLDOWN_SECONDS` (6 h),
   **endpoint-scoped**: `llmgateway/mimo-v2.5` cools, `llmgateway/glm-5.3` does
-  not. The entry expires so a provider rollback recovers without editing
-  `~/.pi/agent/model-cooldowns.json`.
+  not. The entry expires so a provider rollback recovers on its own, without
+  editing the shared store.
 - **One exhaustive `isFallbackWorthy(kind)` switch** replaces the old negative
   `kind !== "quota" && kind !== "transient"` stop predicate, so adding a failure
   kind cannot silently turn into "stop the phase".
@@ -770,7 +812,7 @@ costing real sessions. opencode-go returned
 with **no reset hint** (the same error sometimes carries
 `Weekly usage limit reached. Resets in 7hr 57min.`, sometimes not). The
 classifier fell back to the 15-minute default,
-`~/.pi/agent/model-cooldowns.json` got `until = now + 15min`, and a **weekly**
+the provider's cooldown entry got `until = now + 15min`, and a **weekly**
 bucket was re-probed every 15 minutes forever. Three fleet members each spent a
 `-fallback-1` session rediscovering the same exhausted provider.
 
@@ -802,29 +844,26 @@ What changed:
   `ModelCooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS)` before reading
   `providerEntries()`, and candidate selection does the same, so a cooldown
   another fleet member persisted is visible on the next spawn (and capacity
-  probe) instead of after an orchestrator restart — without parsing the file
-  twice for one spawn. `refresh`/`refreshIfStale` and the lock-protected
-  `persist()` apply the *same* ordering rule per key — newest `lastMarkedAt`
-  wins, never the longer `until` — so neither direction can shorten a live
-  escalated window from a stale file (nor lengthen it back from an old guess),
-  and a fresh shorter hint from another writer is respected. A side without a
-  stamp (a pre-mark-time file, or a member on an older build) is not assumed
-  old: the merge then falls back to the safer window. Ties keep the longer
-  window; escalation ladders merge by event time, keeping the higher count on a
-  tie. Missing, corrupt, or unreadable file → no throw; in-memory store →
-  no-op. A disk error never fails a spawn.
+  probe) instead of after an orchestrator restart. Since bd-256 there is no
+  second file and no per-process merge: the row *is* the truth, so a hinted mark
+  replaces it exactly and clears the ladder, an unhinted repeat escalates it, and
+  `refresh()` merely drops the store's bounded read cache. A missing, corrupt, or
+  unreadable legacy file imports nothing; a missing store makes every reader
+  permissive (nothing cooling) rather than throwing. A disk error never fails a
+  spawn.
 
 Named tests: `src/__tests__/quota-failure.test.ts` →
 `parses the reset hint out of the live GoUsageLimitError body`,
 `uses the long provider window for an unhinted GoUsageLimitError body`,
 `lets a parsed hint win over the long provider window`; `src/__tests__/model-cooldown.test.ts`
-→ `doubles an unhinted provider window that is still cooling`, `clamps the escalated window at the hard ceiling`,
+→ `doubles an unhinted provider window that is still cooling`,
+`clamps the escalated window at the hard ceiling`,
 `treats a hinted reset as authoritative and clears the ladder`,
-`loads a version-1 file written before escalation existed`,
-`keeps one complete mark per key, preferring the longer window on a tie`,
-`keeps the higher ladder count on a mark-time tie in both directions`;
+`replays an escalated legacy ladder so the next unhinted mark continues it`,
+`ignores a legacy ladder older than the escalation memory`,
+`lets a longer legacy window replace a shorter escalated window without clearing its rung`;
 `src/__tests__/capacity-cache.test.ts` →
-`sees a cooldown written by another store instance sharing the same file`; and
+`sees a cooldown written by another store instance sharing the same store`; and
 `src/__tests__/spawn-with-fallback.test.ts` →
 `cools the provider for hours, so 15 minutes later it is still skipped`.
 
@@ -865,7 +904,7 @@ What changed:
 - **Short, expiring window.** `DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS`
   (10 min) because the fix is an operator action (`COMMAND_CODE_API_KEY` in the
   service env, or `/login`). The provider entry expires, so a key added later is
-  picked up without editing `~/.pi/agent/model-cooldowns.json`; a repeated
+  picked up without editing the shared store; a repeated
   unconfigured mark escalates like any other unhinted provider guess, capped by
   `MAX_ESCALATED_COOLDOWN_SECONDS`.
 
@@ -950,8 +989,11 @@ refusal wording, wire-id splitting);
 
 ### Shared model-state store and provider wrapper (bd-187)
 
-bd-38/bd-116/bd-229/bd-234 above are still live; bd-187 adds a second,
-additive layer that a follow-up bead will migrate them onto.
+bd-38/bd-116/bd-229/bd-234 above are still live. bd-187 introduced the shared
+SQLite state store and the provider wrapper; **bd-256 finished the migration** —
+there is one cooldown truth, the routing layer reads it through an adapter, and
+the JSON file below is only a legacy import source. See
+[One cooldown truth](#one-cooldown-truth-bd-256) in this section.
 
 **What it is.** A pi-ai **provider wrapper** (`src/provider-wrapper.ts`) over a
 shared **SQLite** state file (`src/model-state-store.ts`), with the policy in
@@ -960,17 +1002,26 @@ only `stream`/`streamSimple`; every other member is forwarded untouched and the
 provider **id never changes** (pi `model_change` entries and pi-durable
 `pi.agent` documents store provider ids, so a rename orphans conversations).
 
-**Path.** `$XDG_STATE_HOME/belayd/model-state.sqlite`, or
-`~/.local/state/belayd/model-state.sqlite` without `XDG_STATE_HOME`.
-`BELAYD_MODEL_STATE_FILE` overrides it (same precedent as
-`BELAYD_MODEL_COOLDOWN_FILE`). WAL, busy timeout, schema marker in
-`PRAGMA user_version`, and a short synchronous read cache (1 000 ms).
+**Path.** `resolveModelStatePath()` is the one rule:
+`BELAYD_MODEL_STATE_FILE` first, else the retired `BELAYD_MODEL_COOLDOWN_FILE`
+(`model-cooldowns.json` → `model-cooldowns.sqlite`), else
+`$XDG_STATE_HOME/belayd/model-state.sqlite` (or
+`~/.local/state/belayd/model-state.sqlite` without `XDG_STATE_HOME`). The
+adapter's default store and the wrapper's policy both use that path; the retired
+JSON file is an import source, never a second store. WAL, busy timeout, schema
+marker in `PRAGMA user_version` (now **2**; v1 files are migrated in place
+inside one `BEGIN IMMEDIATE` transaction, idempotently and with a bounded
+retry), and a short synchronous read cache (1 000 ms).
 
-**Tables.** `cooldown(provider, model, until_ms, reason, retry_after_ms)`
-(`model = '*'` means provider-wide), `capacity(provider, class, limit, in_use)`,
-`lease(lease_id, provider, class, daemon_pid, host, expires_ms)` and
-`spend(ts, provider, model, phase, task_id, input, output, cache_read,
-cache_write, cost)`. Reserve/release are short `BEGIN IMMEDIATE` transactions
+**Tables.** `cooldown(provider, model, until_ms, reason, retry_after_ms, cause,
+escalations, last_mark_ms)` (`model = '*'` is either a provider-wide window or,
+with `provider = '*'`, a provider-agnostic bare model id; `cause` is `quota` or
+`unconfigured` on provider-wide rows; `escalations` is the rung on an unhinted
+provider-wide row and NULL on hinted/model rows), `capacity(provider, class,
+limit, in_use)`, `lease(lease_id, provider, class, daemon_pid, host,
+expires_ms)` and `spend(ts, provider, model, phase, task_id, input, output,
+cache_read, cache_write, cost)`. Reserve/release are short `BEGIN IMMEDIATE`
+transactions
 that recompute `in_use` from the lease table. Expiry is time-based
 (`expires_ms`), never pid-based, so a SIGKILLed daemon cannot hold capacity;
 the unhinted cooldown ladder lives in `cooldown_ladder` so a 6 h guess still
@@ -980,6 +1031,114 @@ repeat release is an idempotent no-op. The database file and its `-wal`/`-shm`
 sidecars are chmod'd 0600 (directory 0700) after every write — including lease
 renewals, which share the release path's post-commit duties — so the shared
 budget state is not world-readable on a multi-user host.
+
+`cooldownFor({ provider, model })` answers one endpoint: a provider-wide row
+outranks an exact `(provider, model)` row, and a provider-agnostic `'*'` row
+matches any provider. `listCooldowns()` returns every still-active row (that is
+what the routing adapter enumerates), and `prune()` deletes expired rows, the
+ladder after its 7-day memory, and expired leases.
+
+### One cooldown truth (bd-256)
+
+`src/model-cooldown.ts` is now a thin adapter (`ModelCooldownStore`) over the
+same `ModelStateStore` instance the provider policy uses
+(`extensions/capabilities/model.ts` builds both from
+`sharedModelStateStoreInstance()`). One write is visible to every reader:
+
+- A quota failure the wrapper classifies and records (`observeTerminal` →
+  `ProviderPolicy.recordFailure` → `store.markCooldown`) is read back by
+  `isCoolingDown`/`cooldownScope`/`providerEntries`, so the next
+  `spawnAgentWithFallback` skips it and launch preflight/in-session recovery
+  (`planModelRoute`) refuse it. No JSON file is written.
+- A cooldown the routing path marks (`recordFailureCooldown` →
+  `ModelCooldownStore.markProviderCooldown`/`markCooldown`) is the row
+  `policy.decideDispatch` reads, so the next wrapped dispatch is denied with a
+  `ProviderPolicyRefusalError` instead of calling a spent provider.
+
+The adapter keeps the routing-facing semantics unchanged: provider-scoped
+unhinted marks escalate ×2 (24 h cap, 7-day ladder memory), hinted marks set an
+exact window and clear the ladder, model-scoped marks never escalate, and
+`cooldownScope` still answers `"provider" | "model"` for skip rows and launch
+routing.
+
+**The default store is the shared one.** `createModelCooldownStore()` (and the
+`now`-only overload) resolves `sharedModelStateStore()`, whose path is
+`resolveModelStatePath()`: `BELAYD_MODEL_STATE_FILE`, else the retired
+`BELAYD_MODEL_COOLDOWN_FILE` (`x.json` → `x.sqlite`), else XDG. A caller that
+omits `store` therefore cannot fork a second truth — the
+`spawnAgentWithFallback` default included. `{ store: "memory" }` is the explicit
+private-store escape hatch (tests); `{ store: null }` is the explicit permissive
+no-op. A `filePath` names the legacy import source only; it never selects the
+store path.
+
+**Open failures are classified, and marks are never silently dropped.** A
+failed shared open is not memoized for the session. `classifyStoreFailure`
+splits it:
+
+- **transient** (SQLITE_BUSY/LOCKED, an in-flight migration, momentary IO or
+  storage pressure — the errno *and* the SQLite-class spellings, plus node's
+  numeric `errcode`): warn once per failure class, return a read-only facade
+  that degrades capacity/lease/spend to "dispatch without a lease", and retry
+  after `SHARED_MODEL_STATE_RETRY_MS` (30 s). The facade still records cooldown
+  marks: they are queued with their failure-time clock, capped at
+  `MAX_PENDING_COOLDOWN_MARKS` = 32, and the first successful open replays them
+  into the store *before* it serves a read. A queued mark is replayed for as
+  long as its window is still live — a hinted 20-minute reset or a laddered
+  weekly bucket must not be dropped because the outage lasted longer than the
+  queue-age bound (`MAX_PENDING_COOLDOWN_AGE_MS`, 10 min) — so a 402 seen during
+  the outage still steers the next spawn and the next wrapped dispatch. Only
+  marks that were already expired when the store came back fall under the age
+  bound, and the entry cap (not the age bound) bounds memory. Under the cap,
+  eviction drops an already-expired mark first, then the shorter of two queued
+  marks for the same row, and only then the oldest mark, so a hammering
+  fallback loop cannot evict the provider the fleet is actively failing on.
+- **permanent** (no `node:sqlite`, ENOTDIR/EACCES/EROFS, a non-sqlite file,
+  corruption): warn once, stop retrying, stay permissive with `null`. The
+  warning names the error and says cooldown tracking is off until restart, so
+  the diagnosis is actionable. No queue is kept: a store that can never open
+  must not accumulate marks.
+
+The adapter's lazy provider re-invokes the accessor on every use, and that
+covers **both** branches: the default store *and* a caller-supplied provider
+thunk (the extension passes `() => sharedModelStateStoreInstance()`) may hand
+back the facade during an outage, and `resolveStore()` only ever caches a store
+that is genuinely usable. A facade is served (it queues marks) but never
+memoized, so recovery is picked up by `modelStatePolicy()` and the capacity
+probe without a restart, and the legacy import is only latched once a real
+seeder accepted it — a facade cannot swallow the migration. The schema
+migration shares the classifier: a busy/locked migration is retried (bounded),
+anything else fails on the first attempt so the permanent path is reached
+immediately.
+
+**Legacy import replays the ladder.** The retired
+`~/.pi/agent/model-cooldowns.json` is read once on first adapter use when a
+`filePath` is supplied (the extension passes a thunk, so
+`defaultModelCooldownPath()` is read on first use rather than at module load):
+still-active windows are seeded with their absolute `until` (longer wins, 24 h
+ceiling on an escalated window, `lastMarkedAt` preserved) and the file's
+`escalations` map is replayed into `cooldown_ladder` (later mark wins, count 0
+keeps meaning "hinted reset", rungs older than 7 days are dropped). An escalated
+weekly bucket therefore continues from its rung instead of restarting at rung 1.
+The migration is remembered by a `.imported` marker beside the file (its parent
+directory is created if needed) and is recorded even when the file yields no
+active windows; a missing file leaves it pending. The user's file is never
+rewritten or deleted, and a read-only or failing store leaves the migration
+pending.
+
+Named tests: `src/__tests__/model-cooldown.test.ts` (adapter scopes, entry
+shape, prune, degradation, escalation parity, default-store path matrix,
+one-time legacy import with ladder replay, and a provider thunk that returns
+facade-then-real — the facade is served but not cached, and the import runs
+only after recovery) and
+`src/__tests__/model-cooldown-adapter.test.ts` (`wrapper → routing` refusal of
+the next spawn **with the default store** and of the launch plan with no JSON
+write; `routing → wrapper` denial and `ProviderPolicyRefusalError`;
+escalation/hint parity through the wrapper's own write path; a failed first open
+that recovers after the retry window, including one where the extension-shaped
+adapter was *built* during the outage and still sees both directions after it).
+`src/__tests__/model-state-store.test.ts` pins the classifier table (SQLite-class
+and errno spellings plus node's `errcode`), long-window replay, the eviction
+order and the pending-mark cap.
 
 **Capacity is on the production path.** Every wrapped dispatch reserves a lease
 before calling the real provider and releases it when the stream settles
@@ -1066,7 +1225,13 @@ reuse the holder, so stale labels cannot survive a task cycle.
 
 **Retry amplification is two layers.** The wrapper adds **no** retry for a
 quota-class failure: it classifies, records the cooldown and surfaces the
-failure, so provider calls equal the caller's attempt count. For a transient
+failure, so provider calls are **at most** the caller's attempt count — and
+fewer once the first failure has written a cooldown row, because the later
+attempts are refused locally by `decideDispatch` before reaching the provider
+(the no-store configuration is where the count equals the attempts). The
+safety invariant is the upper bound, enforced by `MAX_ATTEMPTS_PER_DISPATCH`; a
+broader wording pass over this measurement is tracked by bd-249 and is not part
+of bd-256. For a transient
 synchronous dispatch throw it may spend one extra attempt
 (`TRANSIENT_RETRY_BUDGET = 1`), bounded by `MAX_ATTEMPTS_PER_DISPATCH = 2` per
 caller attempt. The second, **unenforced** layer is pi's own retry:
@@ -1081,8 +1246,12 @@ capacity and both dispatch. That is a proxy feature, and the gateway design was
 explicitly rejected (bd-188), so the store deliberately does not pretend to do
 it.
 
-Named tests: `src/__tests__/model-state-store.test.ts` (schema/WAL, cooldown
-upsert/prune, capacity reserve/release, lease ownership, lease renewal and
+Named tests: `src/__tests__/model-state-store.test.ts` (schema/WAL, v1→v2
+cooldown-column migration, failure classification (transient vs permanent),
+schema-retry policy (busy retried, permanent fails on the first attempt),
+permanent-failure single warning, transient pending-mark queue/flush and its
+bound/staleness rules, cooldown upsert/prune/list, capacity
+reserve/release, lease ownership, lease renewal and
 expired-renewal refusal, renewal cache invalidation and mode re-tightening,
 0600/0700 modes, expired lease, spend reconcile,
 read-only and unopenable stores, read cache),
@@ -1104,7 +1273,11 @@ warning content, lazy-provider deferral, one warning for a permanently missing
 lazy provider, mid-session materialisation reconcile, per-session failure
 warning count),
 `src/__tests__/extension-provider-registration.test.ts` (a throwing registry
-leaves the rest of `session_start` running), and
+leaves the rest of `session_start` running),
+`src/__tests__/model-cooldown.test.ts` and
+`src/__tests__/model-cooldown-adapter.test.ts` (the routing adapter and the two
+directions of the one truth — see [One cooldown truth](#one-cooldown-truth-bd-256)),
+and
 `test/model-state-cross-process.integration.test.ts` (two processes see one
 window, a live child renews its lease past the original TTL so a second
 connection is still refused and succeeds only after release, SIGKILLed lease
@@ -1333,13 +1506,19 @@ import {
   createEndpointCapacityProbe,
   createFallbackCapacityProbe,
   createModelCooldownStore,
+  openModelStateStore,
   orderCandidatesByCapacity,
   parseCapacityWindows,
   probeFromCooldownStore,
+  resetSharedModelStateStore,
+  resolveModelStatePath,
   resolveQuotaCooldown,
+  sharedModelStateStore,
 } from "belayd-agent-harness";
 
 // Capacity windows are plain data, so parsing and ordering are testable alone.
+// The no-argument store is the process-wide shared truth (path from
+// resolveModelStatePath()); { store: "memory" } is the explicit test isolation.
 const cooldownStore = createModelCooldownStore();
 
 // Cooldown resolution for a 429 body: hint → provider usage-limit window → default.
@@ -1404,8 +1583,9 @@ check entirely (the spawned-attempt ordinal rule still applies); omitting
   stale by up to one TTL (5 minutes), and a provider that recovers inside a
   window is still avoided until the window expires or a probe replaces it.
   This bounds the *endpoint* capacity signal only: candidate selection re-reads
-  the persisted cooldown store on every spawn (bounded to one read per second),
-  so a provider another fleet member cooled is skipped immediately even when a
+  the shared cooldown rows on every spawn (one indexed query; the adapter's
+  bounded refresh only governs the store's 1 s cache), so a provider another
+  fleet member cooled is skipped immediately even when a
   capacity window has not refreshed yet.
 - **Reset times are epoch milliseconds, relative seconds, or a reset-hint
   string.** Any other unit is read wrong rather than rejected: a body reporting

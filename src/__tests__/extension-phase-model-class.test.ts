@@ -26,20 +26,24 @@
  * behavior (retry receives modelClass undefined alongside the override model).
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { defaultModelCooldownPath } from "../model-cooldown.js";
 import { listRuns, RunStatus, writeRunManifest } from "../run-manifest.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────────
 
-// Isolate the extension's persistent cooldown store and proof base from the
-// real user directories. Both are resolved when the extension module loads
-// (dynamic import below), so they must be set first.
-process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-mc-cooldowns.json");
+// Isolate the extension's persistent model state (the one cooldown truth since
+// bd-256) and proof base from the real user directories. The state store lives
+// beside the retired cooldown path; a unique directory keeps a previous run's
+// windows from steering this one. Both are resolved when the extension module
+// loads (dynamic import below), so they must be set first.
+process.env.BELAYD_MODEL_COOLDOWN_FILE = join(
+  mkdtempSync(join(tmpdir(), "belayd-test-mc-")),
+  "model-cooldowns.json",
+);
 process.env.BELAYD_PROOF_DIR = join(tmpdir(), "belayd-test-mc-proof");
 
 // Gate outcome control: how many remaining "pnpm test" runs must fail.
@@ -332,60 +336,50 @@ describe("extension modelClass threading", () => {
     await commands.get("belayd")?.handler("bd-234 feature --no-worktree", ctx);
 
     // Another fleet member's view: opencode-go 24h, llmgateway 5.6h,
-    // commandcode clean. Marked through the extension's own file-backed store
-    // so the seed lands in the shared cooldown file the way a peer's write
-    // would (the cross-process write-after-creation path is pinned separately).
-    const cooldownPath = defaultModelCooldownPath();
+    // commandcode clean. Marked through the extension's own store, i.e. the one
+    // cooldown truth the fallback loop reads (bd-256).
     const { modelCooldown, modelState } = await import("../../extensions/capabilities/model.js");
-    try {
-      // The capacity probe answers from its 5-minute cache, so it is primed
-      // while every provider is healthy: this run's ordering is then decided by
-      // the cooldown store, which is the interleaving that produces skip rows
-      // instead of silently reordering the candidates.
-      await modelState.capacity.refreshIfStale();
-      modelCooldown.markProviderCooldown("opencode-go", 24 * 3600, "quota", { cause: "quota" });
-      modelCooldown.markProviderCooldown("llmgateway", 5.6 * 3600, "quota", { cause: "quota" });
-      const persisted = JSON.parse(readFileSync(cooldownPath, "utf8")) as {
-        providers: Record<string, { until: number }>;
-      };
-      expect(Object.keys(persisted.providers)).toEqual(
-        expect.arrayContaining(["llmgateway", "opencode-go"]),
-      );
-      expect(persisted.providers.commandcode).toBeUndefined();
+    // The capacity probe answers from its 5-minute cache, so it is primed
+    // while every provider is healthy: this run's ordering is then decided by
+    // the cooldown store, which is the interleaving that produces skip rows
+    // instead of silently reordering the candidates.
+    await modelState.capacity.refreshIfStale();
+    modelCooldown.markProviderCooldown("opencode-go", 24 * 3600, "quota", { cause: "quota" });
+    modelCooldown.markProviderCooldown("llmgateway", 5.6 * 3600, "quota", { cause: "quota" });
+    const persisted = modelCooldown.providerEntries();
+    expect([...persisted.keys()]).toEqual(expect.arrayContaining(["llmgateway", "opencode-go"]));
+    expect(persisted.has("commandcode")).toBe(false);
 
-      const scout = tools.get("belayd_scout");
-      expect(scout).toBeDefined();
-      await scout?.execute("call-fb", { task: "recon the repo" }, undefined, undefined, ctx);
+    const scout = tools.get("belayd_scout");
+    expect(scout).toBeDefined();
+    await scout?.execute("call-fb", { task: "recon the repo" }, undefined, undefined, ctx);
 
-      await vi.waitFor(() => {
-        const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
-        expect(run?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
-      });
-
+    await vi.waitFor(() => {
       const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
-      // `model` = what served the run, `requestedModel` = the pre-dispatch pick,
-      // and the skip rows stay in class preference order (llmgateway first for
-      // the fast class primary, then opencode-go).
-      expect(run).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
-      expect(run?.skippedModels).toEqual([
-        {
-          model: "llmgateway/mimo-v2.6-flash",
-          reason:
-            "Provider llmgateway is cooling down after a quota failure; skipping remaining models on it.",
-        },
-        {
-          model: "opencode-go/mimo-v2.6-flash",
-          reason:
-            "Provider opencode-go is cooling down after a quota failure; skipping remaining models on it.",
-        },
-      ]);
-      // One spawn, on the one healthy provider: no wasted attempt on a cooldown.
-      expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
-      const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model?: string } | undefined;
-      expect(spawned?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
-    } finally {
-      rmSync(cooldownPath, { force: true });
-    }
+      expect(run?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
+    });
+
+    const run = listRuns({ cwd: workDir }).find((entry) => entry.requestedModel !== undefined);
+    // `model` = what served the run, `requestedModel` = the pre-dispatch pick,
+    // and the skip rows stay in class preference order (llmgateway first for
+    // the fast class primary, then opencode-go).
+    expect(run).toHaveProperty("requestedModel", "llmgateway/mimo-v2.6-flash");
+    expect(run?.skippedModels).toEqual([
+      {
+        model: "llmgateway/mimo-v2.6-flash",
+        reason:
+          "Provider llmgateway is cooling down after a quota failure; skipping remaining models on it.",
+      },
+      {
+        model: "opencode-go/mimo-v2.6-flash",
+        reason:
+          "Provider opencode-go is cooling down after a quota failure; skipping remaining models on it.",
+      },
+    ]);
+    // One spawn, on the one healthy provider: no wasted attempt on a cooldown.
+    expect(mockSpawnAgentProcess).toHaveBeenCalledTimes(1);
+    const spawned = mockSpawnAgentProcess.mock.calls[0]?.[0] as { model?: string } | undefined;
+    expect(spawned?.model).toBe("commandcode/xiaomi/mimo-v2.6-flash");
   });
 
   it("renders a requestedModel-only manifest in belayd_status without inventing a model", async () => {

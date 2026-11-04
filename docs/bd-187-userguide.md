@@ -202,7 +202,7 @@ else is stable):
 
 ```text
 resolved store path: /tmp/bd187-state.sqlite
-journal_mode: wal  user_version: 1
+journal_mode: wal  user_version: 2
 tables: capacity, cooldown, cooldown_ladder, lease, spend
 -rw------- 1 hugo users  4096 nov  3 14:18 /tmp/bd187-state.sqlite
 -rw------- 1 hugo users 32768 nov  3 14:18 /tmp/bd187-state.sqlite-shm
@@ -225,9 +225,11 @@ file mode after close: 600 (octal), sidecars left behind: 0
 
 Read those lines as the whole contract:
 
-- **One window, two stores.** The rival saw `null`, then `null` again inside the
+- **One window, one store.** The rival saw `null`, then `null` again inside the
   1 000 ms read cache, then the writer's exact `until_ms` after the cache lapsed
   — and a third connection (the raw `node:sqlite` reader) sees the same row.
+  Since bd-256 this is also the row the routing layer reads and writes, so there
+  is no second cooldown file whose lapsed cache could disagree with it.
 - **A lease is exclusive and owned.** The rival's reservation is
   `capacity-exhausted` (not an error), its attempt to free the writer's lease is
   `lease-not-owned`, and after the owner's release the same bucket grants the
@@ -712,7 +714,7 @@ experiment: it keeps `/tmp` state out of the operator's real budget.
 BELAYD_MODEL_STATE_FILE=/tmp/bd187-state.sqlite node /tmp/bd187-recipe.mjs
 ```
 
-Store shape: `journal_mode = WAL`, `PRAGMA user_version = 1`, directory `0700`,
+Store shape: `journal_mode = WAL`, `PRAGMA user_version = 2`, directory `0700`,
 and the `.sqlite` plus its `-wal`/`-shm` sidecars `0600` — re-tightened after
 **every** write, including lease renewals and releases. Reads are cached per
 store instance for 1 000 ms (`MODEL_STATE_READ_CACHE_MAX_AGE_MS`); every write
@@ -723,16 +725,22 @@ and the row on the third.
 Tables, in the shapes you will query:
 
 ```text
-cooldown(provider, model, until_ms, reason, retry_after_ms)   model = '*' means provider-wide
+cooldown(provider, model, until_ms, reason, retry_after_ms, cause, escalations, last_mark_ms)
+                                                              model = '*' means provider-wide
+                                                              provider = '*' means a bare model id
 cooldown_ladder(provider, escalations, last_mark_ms)          unhinted escalation ladder
 capacity(provider, class, limit, in_use)
 lease(lease_id, provider, class, daemon_pid, host, expires_ms)
 spend(ts, provider, model, phase, task_id, input, output, cache_read, cache_write, cost)
 ```
 
-`cooldown` has no count column, so the unhinted-escalation ladder lives in
-`cooldown_ladder`; an unhinted provider-wide mark doubles per rung up to the 24 h
-ceiling, a hinted mark replaces the window exactly and clears the ladder.
+The `cooldown_ladder` table is the escalation authority (an unhinted provider-wide
+mark doubles per rung up to the 24 h ceiling; a hinted mark replaces the window
+exactly and clears the ladder). `cooldown.escalations` mirrors the rung that
+produced the row (`NULL` on hinted and model rows) and `cooldown.cause`
+(`quota` | `unconfigured`) is what the capacity probe and the fallback skip rows
+read instead of matching display text. Those three columns arrived in bd-256
+(schema v2); a v1 file is migrated in place on open.
 
 ### Capacity: `BELAYD_MODEL_CAPACITY_LIMIT`
 
@@ -988,12 +996,16 @@ Cooldowns and spend are the only durable state, and both are safe to discard:
 # 1. stop every daemon/child that dispatches through the store. A live lease
 #    held by a running stream is the one thing deletion can confuse.
 pgrep -fa "pi --skill"          # pi sessions; also stop fleet daemons/children
-# 2. delete the file AND its sidecars (a stale -wal replays into a new file)
-ls ~/.local/state/belayd/
-rm -f "$HOME/.local/state/belayd/model-state.sqlite" \
-      "$HOME/.local/state/belayd/model-state.sqlite-wal" \
-      "$HOME/.local/state/belayd/model-state.sqlite-shm"
-# 3. the next dispatch recreates it (dir 0700, file 0600, WAL, user_version 1)
+# 2. delete the file AND its sidecars (a stale -wal replays into a new file).
+#    Resolve the path instead of hard-coding the default, so an override is
+#    honoured: BELAYD_MODEL_STATE_FILE, else BELAYD_MODEL_COOLDOWN_FILE's
+#    .sqlite sibling, else the XDG state home.
+STATE="$(node --input-type=module -e '
+const m = await import(`${process.cwd()}/dist/src/model-state-store.js`);
+process.stdout.write(m.resolveModelStatePath({ env: process.env }));')"
+ls "$(dirname "$STATE")"
+rm -f "$STATE" "$STATE-wal" "$STATE-shm"
+# 3. the next dispatch recreates it (dir 0700, file 0600, WAL, user_version 2)
 ```
 
 On this host there is no store file yet, so step 2 is a no-op and that is what
@@ -1004,7 +1016,7 @@ $ ls ~/.local/state/belayd/
 aws-audit.jsonl
 metrics
 proof
-$ rm -f "$HOME/.local/state/belayd/model-state.sqlite" "$HOME/.local/state/belayd/model-state.sqlite-wal" "$HOME/.local/state/belayd/model-state.sqlite-shm"; echo "rm -f exit: $?"
+$ STATE="$(node --input-type=module -e 'const m = await import(`${process.cwd()}/dist/src/model-state-store.js`); process.stdout.write(m.resolveModelStatePath({ env: process.env }));')"; rm -f "$STATE" "$STATE-wal" "$STATE-shm"; echo "rm -f exit: $?"
 rm -f exit: 0
 $ ls ~/.local/state/belayd/
 aws-audit.jsonl
@@ -1033,13 +1045,15 @@ supported form.
    capacity and both dispatch; the store bounds and records concurrency, it does
    not deduplicate live requests. If you need "only one request for this prompt
    across the fleet", that is a proxy, and it is out of scope here (bd-188).
-2. **Nothing is deleted yet.** `capacity-cache.ts`, `model-cooldown.ts`, the
-   `spawn-with-fallback` loop, `model-session-state.ts` and telemetry still run
-   beside this layer, and old and new paths can disagree until the follow-up bead
-   migrates them. The legacy cooldown store keeps its own file at
-   `~/.pi/agent/model-cooldowns.json` (override `BELAYD_MODEL_COOLDOWN_FILE`), and
-   it is not synchronised with `model-state.sqlite`: on this host it holds live
-   rows (`opencode-go` and `llmgateway` provider windows). If you see a cooldown
-   in `~/.pi/agent/model-cooldowns.json` that `model-state.sqlite` does not have,
-   that is the expected transitional state — read both before concluding a
-   provider is healthy.
+2. **Nothing is deleted (the routing layer stays).** `capacity-cache.ts`,
+   `model-cooldown.ts`, the `spawn-with-fallback` loop, `model-session-state.ts`
+   and telemetry still run beside this layer — and that is deliberate: bd-256
+   only moved *cooldown persistence* onto this store. `model-cooldown.ts` is now
+   a thin adapter over `ModelStateStore` (bd-256), so routing and the wrapper
+   share one truth; the retired JSON file at `~/.pi/agent/model-cooldowns.json`
+   (override `BELAYD_MODEL_COOLDOWN_FILE`) is read **once** on first use to
+   import still-active windows (marked by a `.imported` file beside it) and is
+   never written again. If a window exists only in that JSON file, it is
+   pre-migration state: the import will adopt it, but nothing reads it directly
+   afterwards. Read `model-state.sqlite` (or `providerEntries()`), not the JSON
+   file, to conclude whether a provider is healthy.

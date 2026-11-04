@@ -7,10 +7,11 @@
  * already observed as exhausted — e.g. an opencode-go weekly limit whose reset
  * window `parseQuotaResetSeconds` extracted from the 429 body (bd-38).
  *
- * Windows come from a probe. By default the probe reads the persisted cooldown
- * store's provider entries (re-reading the shared file first, so cooldowns
- * written by other processes are visible); when `BELAYD_CAPACITY_PROBE_URL` is
- * set the extension instead probes that usage/reset endpoint. Probe results are
+ * Windows come from a probe. By default the probe reads the shared cooldown
+ * store's provider entries (the same rows the provider wrapper writes since
+ * bd-256, so cooldowns written by other processes are visible); when
+ * `BELAYD_CAPACITY_PROBE_URL` is set the extension instead probes that
+ * usage/reset endpoint. Probe results are
  * cached for `ttlInMs` (default {@link DEFAULT_CAPACITY_TTL_MS}) so a 6-phase
  * workflow re-probes at most once per TTL rather than once per phase.
  * Mid-workflow 429s are fed back in via `record`, so the cache stays fresh
@@ -116,12 +117,12 @@ function isCapacityCause(entry: CooldownEntry): boolean {
 /** Default probe: treat persisted provider cooldowns as capacity windows. */
 export function probeFromCooldownStore(store: ModelCooldownStore): CapacityProbe {
   return () => {
-    // The store loads its file once at creation, and every fleet member owns its
-    // own store: without a re-read the probe would serve a creation-time
-    // snapshot and miss a provider cooldown another member just persisted. The
-    // bounded window lets candidate selection and this probe share one read per
-    // spawn instead of parsing the same file twice; the call is a no-op for an
-    // in-memory store and never throws.
+    // The store has a bounded read cache, and every fleet member owns its own
+    // connection: without the refresh below the probe could serve a cached miss
+    // and report a provider cooldown another member just wrote as capacity. The
+    // bounded window lets candidate selection and this probe share one cache
+    // drop per spawn instead of two; the call is a no-op without a store and
+    // never throws.
     store.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS);
     return {
       windows: [...store.providerEntries()]

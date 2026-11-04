@@ -249,7 +249,7 @@ COMMAND_CODE_API_KEY (or legacy COMMANDCODE_API_KEY), or configure
 
 The window is `DEFAULT_UNCONFIGURED_PROVIDER_COOLDOWN_SECONDS` (10 min) — short
 because the fix is an operator action (env var or `/login`) — and it expires, so
-the provider is probed again without editing `~/.pi/agent/model-cooldowns.json`.
+the provider is probed again without editing the shared cooldown store.
 The reason recorded on the entry is `Provider has no API key configured.` on both
 paths. The rule only matches text with **no** status code, so a process/stderr
 line carrying 401/403 stays `auth` and one carrying 429 stays `quota`.

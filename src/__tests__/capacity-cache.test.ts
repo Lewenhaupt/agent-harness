@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { CapacityProbeResult } from "../capacity-cache.js";
 import {
@@ -11,50 +14,49 @@ import {
   parseCapacityWindows,
   probeFromCooldownStore,
 } from "../capacity-cache.js";
-import {
-  COOLDOWN_REFRESH_MAX_AGE_MS,
-  type CooldownFs,
-  createModelCooldownStore,
-} from "../model-cooldown.js";
+import { createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelStateStore } from "../model-state-store.js";
+import { openModelStateStore } from "../model-state-store.js";
 
-/** Minimal in-memory fs seam so two stores can share one "file" without disk I/O. */
-function createFakeFs(initial: Record<string, string> = {}): CooldownFs & {
-  files: Map<string, string>;
+const tempDirs: string[] = [];
+const openedStores: ModelStateStore[] = [];
+
+afterEach(() => {
+  for (const store of openedStores.splice(0)) store.close();
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "belayd-capacity-cache-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+/** A retired cooldown path used only as the legacy import source. */
+function tempCooldownFile(): string {
+  return join(tempDir(), "model-cooldowns.json");
+}
+
+/** Open one connection to a test-owned state store (never the shared default). */
+function openStore(
+  now: () => number,
+  path = join(tempDir(), "model-state.sqlite"),
+): ModelStateStore {
+  const opened = openModelStateStore({ path, now });
+  if (!opened.ok) throw new Error(opened.error);
+  openedStores.push(opened.store);
+  return opened.store;
+}
+
+/** Two adapters over two connections: the shape of two processes, one truth. */
+function sharedStores(now: () => number): {
+  store: ReturnType<typeof createModelCooldownStore>;
+  otherMember: ReturnType<typeof createModelCooldownStore>;
 } {
-  const files = new Map(Object.entries(initial));
-  const enoent = (path: string): Error => {
-    const error = new Error(`ENOENT: ${path}`) as Error & { code: string };
-    error.code = "ENOENT";
-    return error;
-  };
+  const path = join(tempDir(), "model-state.sqlite");
   return {
-    files,
-    existsSync: (path) => files.has(path),
-    readFileSync: (path) => {
-      const content = files.get(path);
-      if (content === undefined) throw enoent(path);
-      return content;
-    },
-    writeFileSync: (path, data, options) => {
-      if (options?.flag === "wx" && files.has(path)) {
-        const error = new Error(`EEXIST: ${path}`) as Error & { code: string };
-        error.code = "EEXIST";
-        throw error;
-      }
-      files.set(path, data);
-    },
-    renameSync: (oldPath, newPath) => {
-      const content = files.get(oldPath);
-      if (content === undefined) throw enoent(oldPath);
-      files.delete(oldPath);
-      files.set(newPath, content);
-    },
-    mkdirSync: () => {
-      // No directory hierarchy in the in-memory seam.
-    },
-    unlinkSync: (path) => {
-      files.delete(path);
-    },
+    store: createModelCooldownStore({ now, store: openStore(now, path) }),
+    otherMember: createModelCooldownStore({ now, store: openStore(now, path) }),
   };
 }
 
@@ -154,7 +156,7 @@ describe("createCapacityCache", () => {
 
 describe("probeFromCooldownStore", () => {
   it("maps persisted provider cooldowns to capacity windows", async () => {
-    const store = createModelCooldownStore(() => 1_000);
+    const store = createModelCooldownStore({ now: () => 1_000, store: "memory" });
     store.markProviderCooldown("opencode-go", 3_600, "quota", { cause: "quota" });
 
     const result = await probeFromCooldownStore(store)();
@@ -169,7 +171,7 @@ describe("probeFromCooldownStore", () => {
     // it as a capacity window would make the all-exhausted fast-fail claim the
     // provider is "out of capacity, retrying after reset" — a wrong diagnosis,
     // and it would hide the real fix (setting the key).
-    const store = createModelCooldownStore(() => 1_000);
+    const store = createModelCooldownStore({ now: () => 1_000, store: "memory" });
     store.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
       cause: "unconfigured",
     });
@@ -191,7 +193,7 @@ describe("probeFromCooldownStore", () => {
   it("treats an entry without a cause tag as capacity (legacy files)", async () => {
     // `quota` was the only provider-scoped cause before the tag existed, so an
     // untagged window from an older build must keep driving the capacity signal.
-    const store = createModelCooldownStore(() => 1_000);
+    const store = createModelCooldownStore({ now: () => 1_000, store: "memory" });
     store.markProviderCooldown("opencode-go", 3_600, "Weekly usage limit reached.");
 
     expect((await probeFromCooldownStore(store)()).windows).toHaveLength(1);
@@ -199,12 +201,13 @@ describe("probeFromCooldownStore", () => {
 
   it("keeps a tagged entry from a legacy-shaped providers map out of the signal", async () => {
     // The inverse of the case above: a tag already present in a file this build
-    // did not write must survive parsing. If the loader dropped tags it did not
-    // produce, an `unconfigured` entry read from an older-shaped `providers` map
-    // would silently become capacity again — the W1 bug via the read path.
-    const filePath = "/tmp/model-cooldowns.json";
-    const fs = createFakeFs({
-      [filePath]: JSON.stringify({
+    // did not write must survive the one-time import. If the importer dropped
+    // tags it did not produce, an `unconfigured` entry read from an older-shaped
+    // `providers` map would silently become capacity again.
+    const filePath = tempCooldownFile();
+    writeFileSync(
+      filePath,
+      JSON.stringify({
         version: 1,
         providers: {
           commandcode: {
@@ -215,8 +218,12 @@ describe("probeFromCooldownStore", () => {
           "opencode-go": { until: 2_000, reason: "Weekly usage limit reached." },
         },
       }),
+    );
+    const store = createModelCooldownStore({
+      now: () => 1_000,
+      store: openStore(() => 1_000),
+      filePath,
     });
-    const store = createModelCooldownStore({ now: () => 1_000, filePath, fs });
 
     // The cooldown itself is still read (it stays reactively visible), just not
     // as shared capacity.
@@ -226,24 +233,16 @@ describe("probeFromCooldownStore", () => {
     ]);
   });
 
-  it("sees a cooldown written by another store instance sharing the same file", async () => {
-    // Fleet members each own a store and load the shared file once at creation,
-    // so a cooldown written by a member after this one was created is invisible
-    // without a re-read. That is the cross-process freshness case bd-38 fixes:
-    // three members each re-probed the same exhausted provider.
-    const fs = createFakeFs();
-    const filePath = "/tmp/model-cooldowns.json";
-    let now = 1_000_000;
-    const thisProcess = createModelCooldownStore({ now: () => now, filePath, fs });
-    const otherMember = createModelCooldownStore({ now: () => now, filePath, fs });
+  it("sees a cooldown written by another store instance sharing the same store", async () => {
+    // Fleet members each own a store over the same shared truth, so a cooldown
+    // written by a member after this one was created must be visible on the
+    // probe. That is the cross-process freshness case bd-38 fixes: three
+    // members each re-probed the same exhausted provider.
+    const { store: thisProcess, otherMember } = sharedStores(() => 1_000_000);
 
     expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([]);
 
     otherMember.markProviderCooldown("opencode-go", 6 * 60 * 60, "GoUsageLimitError");
-    // The probe shares the bounded refresh window with candidate selection, so
-    // it re-reads the file only once that window has elapsed (one file parse per
-    // spawn is the point; cross-process freshness stays sub-second).
-    now += COOLDOWN_REFRESH_MAX_AGE_MS;
 
     expect((await probeFromCooldownStore(thisProcess)()).windows).toEqual([
       {
@@ -258,10 +257,7 @@ describe("probeFromCooldownStore", () => {
     // The `cause` tag is persisted, so the filter still works across fleet
     // members: a window another process wrote is read back with its cause and
     // must not become capacity.
-    const fs = createFakeFs();
-    const filePath = "/tmp/model-cooldowns.json";
-    const thisProcess = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
-    const otherMember = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+    const { store: thisProcess, otherMember } = sharedStores(() => 1_000_000);
 
     otherMember.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
       cause: "unconfigured",
@@ -279,38 +275,39 @@ describe("probeFromCooldownStore", () => {
   it("never throws and yields no windows for a missing or corrupt file", async () => {
     // The probe runs on every pre-dispatch refresh, so a hand-edited or
     // half-written file must degrade to capacity ignorance, never fail a spawn.
-    const filePath = "/tmp/model-cooldowns.json";
+    const missingPath = tempCooldownFile();
     const missing = createModelCooldownStore({
       now: () => 1_000_000,
-      filePath,
-      fs: createFakeFs(),
+      store: openStore(() => 1_000_000),
+      filePath: missingPath,
     });
     await expect(Promise.resolve(probeFromCooldownStore(missing)())).resolves.toEqual({
       windows: [],
     });
 
+    const corruptPath = tempCooldownFile();
+    writeFileSync(corruptPath, "{ broken");
     const corrupt = createModelCooldownStore({
       now: () => 1_000_000,
-      filePath,
-      fs: createFakeFs({ [filePath]: "{ broken" }),
+      store: openStore(() => 1_000_000),
+      filePath: corruptPath,
     });
     await expect(Promise.resolve(probeFromCooldownStore(corrupt)())).resolves.toEqual({
       windows: [],
     });
   });
 
-  it("keeps the longest window when both stores marked the same provider", async () => {
-    const fs = createFakeFs();
-    const filePath = "/tmp/model-cooldowns.json";
-    const first = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
-    const second = createModelCooldownStore({ now: () => 1_000_000, filePath, fs });
+  it("reports the current window for a provider that two members marked", async () => {
+    // One truth, so the second unhinted mark escalates the shared ladder instead
+    // of being merged with an in-memory guess the way the retired JSON store did.
+    const { store: first, otherMember: second } = sharedStores(() => 1_000_000);
 
     first.markProviderCooldown("opencode-go", 60, "quota");
     second.markProviderCooldown("opencode-go", 7_200, "weekly limit");
 
     const windows = (await probeFromCooldownStore(first)()).windows;
     expect(windows).toHaveLength(1);
-    expect(windows[0]).toHaveProperty("resetAt", 1_000_000 + 7_200_000);
+    expect(windows[0]).toHaveProperty("resetAt", 1_000_000 + 2 * 7_200_000);
     expect(windows[0]).toHaveProperty("reason", "weekly limit");
   });
 });

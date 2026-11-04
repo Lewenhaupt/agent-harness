@@ -15,6 +15,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerModelRecovery } from "../../extensions/capabilities/model-recovery.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelStateStore } from "../model-state-store.js";
+import { openModelStateStore } from "../model-state-store.js";
 
 const OPENCODE = "opencode-go/deepseek-v4.1-flash";
 const COMMANDCODE = "commandcode/deepseek/deepseek-v4.1-flash";
@@ -84,15 +86,26 @@ const KNOWN_MODELS: ModelRef[] = [
   { provider: "openrouter", id: "deepseek/deepseek-v4.1-flash" },
 ];
 
-let cooldownFile: string;
 let dir: string;
+/** The session's store, and a second connection standing in for a peer process. */
+let stateStore: ModelStateStore;
+let otherConnection: ModelStateStore;
+
+function openTestStore(): ModelStateStore {
+  const opened = openModelStateStore({ path: join(dir, "model-state.sqlite") });
+  if (!opened.ok) throw new Error(opened.error);
+  return opened.store;
+}
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "belayd-model-recovery-"));
-  cooldownFile = join(dir, "cooldowns.json");
+  stateStore = openTestStore();
+  otherConnection = openTestStore();
 });
 
 afterEach(() => {
+  stateStore.close();
+  otherConnection.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -102,7 +115,7 @@ function setup(options: {
   isSubAgent?: boolean;
   enabled?: boolean;
 }) {
-  const store = createModelCooldownStore({ filePath: cooldownFile });
+  const store = createModelCooldownStore({ store: stateStore });
   const pi = createPi({
     knownModels: options.knownModels ?? KNOWN_MODELS,
     ...(options.setModelOk === undefined ? {} : { setModelOk: options.setModelOk }),
@@ -270,7 +283,7 @@ describe("in-session model recovery", () => {
     // spending opencode-go afterwards must still be skipped when the switch
     // target is chosen, or the one continuation lands on a dead provider.
     const { pi, emit } = setup({});
-    const otherMember = createModelCooldownStore({ filePath: cooldownFile });
+    const otherMember = createModelCooldownStore({ store: otherConnection });
     otherMember.markProviderCooldown("opencode-go", 3600, "quota", { cause: "quota" });
 
     await emit("message_end", errorMessage(BILLING_ERROR), KNOWN_MODELS[0] as ModelRef);

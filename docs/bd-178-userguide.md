@@ -215,11 +215,25 @@ command output rather than re-run here.
      expiry (`until` is epoch ms):
 
      ```bash
-     jq '.providers.commandcode' ~/.pi/agent/model-cooldowns.json
+     node -e '(async () => {
+     const m = await import(`${process.cwd()}/dist/src/model-cooldown.js`);
+     const s = await import(`${process.cwd()}/dist/src/model-state-store.js`);
+     // The extension's store is the process-wide shared one; resolveModelStatePath()
+     // is the authoritative path (BELAYD_MODEL_STATE_FILE wins).
+     const path = s.resolveModelStatePath({ env: process.env });
+     const opened = s.openModelStateStore({ path });
+     if (!opened.ok) throw new Error(opened.error);
+     console.log("state store:", path);
+     // No `filePath`: a read-back must not trigger (or mark) a legacy import.
+     console.log(m.createModelCooldownStore({ store: opened.store }).providerEntries().get("commandcode"));
+     })()'
      ```
 
-     Expected `{"until": <now + ~600000>, "reason": "Provider has no API key
-     configured.", "cause": "unconfigured", "escalations": 1, …}`.
+     Expected `{ until: <now + ~600000>, reason: "Provider has no API key
+     configured.", cause: "unconfigured", escalations: 1, … }` in the state
+     store printed above. The retired `~/.pi/agent/model-cooldowns.json` is only
+     an import source since bd-256; reading the row through the beside-JSON store
+     would show an empty table in the default configuration.
 
    - No capacity signal: the run must **not** contain the fast-fail text
      `All candidate models are on capacity-exhausted providers …; retry after
@@ -241,15 +255,22 @@ command output rather than re-run here.
 
 8. **Plan-gated model** (**needs network + a key whose plan excludes the model**).
    Run a workflow whose `standard` primary the plan refuses, then check the
-   cooldown file:
+   cooldown rows:
 
    ```bash
-   jq '.models["commandcode/z-ai/glm-5.3-flash"], .providers.commandcode' ~/.pi/agent/model-cooldowns.json
+   node -e '(async () => {
+   const m = await import(`${process.cwd()}/dist/src/model-cooldown.js`);
+   const s = await import(`${process.cwd()}/dist/src/model-state-store.js`);
+   const opened = s.openModelStateStore({ path: s.resolveModelStatePath({ env: process.env }) });
+   if (!opened.ok) throw new Error(opened.error);
+   const store = m.createModelCooldownStore({ store: opened.store });
+   console.log(store.entries().get("commandcode/z-ai/glm-5.3-flash"), store.providerEntries().get("commandcode"));
+   })()'
    ```
 
    Expected: a **model** entry with a ~6-hour window (`until` ≈ now +
    21 600 000 ms) from the 403 `MODEL_NOT_IN_PLAN` / `upgrade_required` body, and
-   `.providers.commandcode` **absent** — the bucket stays usable, only that
+   no `commandcode` provider entry — the bucket stays usable, only that
    endpoint is cooled. The fallback note shows
    `commandcode/z-ai/glm-5.3-flash (unavailable) → llmgateway/glm-5.3-flash (success)`,
    so the class keeps its capability level. The classification itself is pinned

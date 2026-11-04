@@ -1,11 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { z } from "zod";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SpawnResult, SpawnUsage } from "../agent-registry.js";
 import { DEFAULT_AGENTS } from "../agent-registry.js";
 import { createCapacityCache, probeFromCooldownStore } from "../capacity-cache.js";
 import { type ModelClass, primaryModelOf, providerOf, resolveModelSpec } from "../model-classes.js";
-import { type CooldownFs, createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelCooldownStore } from "../model-cooldown.js";
+import { createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelStateStore } from "../model-state-store.js";
+import { openModelStateStore, resetSharedModelStateStore } from "../model-state-store.js";
 import { createModelTelemetryStore } from "../model-telemetry.js";
 import { withFallbackNote } from "../quality-gate-run.js";
 import {
@@ -27,70 +32,27 @@ vi.mock("../spawn.js", () => ({
   spawnAgentProcess: mockSpawnAgentProcess,
 }));
 
+const stateDirs: string[] = [];
+let previousStateFile: string | undefined;
+
 beforeEach(() => {
   mockSpawnAgentProcess.mockReset();
+  // Omitting `cooldownStore` now resolves the process-wide shared truth
+  // (bd-256). Isolate it per test so ambient windows never steer a spawn that
+  // is not about cooldowns.
+  previousStateFile = process.env.BELAYD_MODEL_STATE_FILE;
+  const dir = mkdtempSync(join(tmpdir(), "belayd-spawn-fallback-state-"));
+  stateDirs.push(dir);
+  process.env.BELAYD_MODEL_STATE_FILE = join(dir, "model-state.sqlite");
+  resetSharedModelStateStore();
 });
 
-interface FakeCooldownFs extends CooldownFs {
-  files: Map<string, string>;
-}
-
-/**
- * A node-style fs error. `NodeJS.ErrnoException` already carries the optional
- * `code`, so the fake needs no cast to behave like the real seam.
- */
-function fsError(code: "ENOENT" | "EEXIST", path: string): NodeJS.ErrnoException {
-  const error: NodeJS.ErrnoException = new Error(`${code}: ${path}`);
-  error.code = code;
-  return error;
-}
-
-/** In-memory `CooldownFs` seam, so no cooldown test touches the real disk. */
-function createFakeCooldownFs(initial: Record<string, string> = {}): FakeCooldownFs {
-  const files = new Map(Object.entries(initial));
-  return {
-    files,
-    existsSync(path) {
-      return files.has(path);
-    },
-    readFileSync(path) {
-      const content = files.get(path);
-      if (content === undefined) throw fsError("ENOENT", path);
-      return content;
-    },
-    writeFileSync(path, data, options) {
-      if (options?.flag === "wx" && files.has(path)) throw fsError("EEXIST", path);
-      files.set(path, data);
-    },
-    renameSync(oldPath, newPath) {
-      const content = files.get(oldPath);
-      if (content === undefined) throw fsError("ENOENT", oldPath);
-      files.delete(oldPath);
-      files.set(newPath, content);
-    },
-    mkdirSync() {
-      // In-memory fs has no directory hierarchy to create.
-    },
-    unlinkSync(path) {
-      files.delete(path);
-    },
-  };
-}
-
-/** The persisted file's shape, validated at the boundary instead of cast. */
-const PersistedCooldownStateSchema = z.object({
-  providers: z.record(z.string(), z.object({ until: z.number(), reason: z.string() })),
-  models: z.record(z.string(), z.object({ until: z.number(), reason: z.string() })),
+afterEach(() => {
+  resetSharedModelStateStore();
+  if (previousStateFile === undefined) delete process.env.BELAYD_MODEL_STATE_FILE;
+  else process.env.BELAYD_MODEL_STATE_FILE = previousStateFile;
+  for (const dir of stateDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
-
-function readPersistedCooldowns(
-  fs: FakeCooldownFs,
-  path: string,
-): z.infer<typeof PersistedCooldownStateSchema> {
-  const raw = fs.files.get(path);
-  if (raw === undefined) throw new Error(`missing persisted cooldown file ${path}`);
-  return PersistedCooldownStateSchema.parse(JSON.parse(raw));
-}
 
 function zeroUsage(): SpawnUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, toolCalls: 0 };
@@ -125,7 +87,7 @@ describe("spawnAgentWithFallback", () => {
       .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"))
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "opencode-go/mimo-v2.6-flash",
       tools: [],
@@ -170,7 +132,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("openrouter/xiaomi/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "llmgateway/mimo-v2.5",
       tools: [],
@@ -196,7 +158,7 @@ describe("spawnAgentWithFallback", () => {
       .mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"))
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result } = await spawnAgentWithFallback({
       model: "opencode-go/mimo-v2.6-flash",
       tools: [],
@@ -249,7 +211,7 @@ describe("spawnAgentWithFallback", () => {
   it("skips a cooled-down candidate", async () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("b"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markCooldown("a", 900, "quota");
 
     const { result, attempts } = await spawnAgentWithFallback({
@@ -322,7 +284,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const first = await spawnAgentWithFallback({
       model: "commandcode/z-ai/glm-5.3-flash",
       tools: [],
@@ -403,7 +365,7 @@ describe("spawnAgentWithFallback", () => {
   it("refuses the kill-switch model when it is cooling down", async () => {
     // `enabled: false` means "no fallback", not "ignore a spent provider":
     // spawning here would burn a request against a provider already known dead.
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("opencode-go", 900, "quota", { cause: "quota" });
 
     const { result, attempts, selection } = await spawnAgentWithFallback({
@@ -431,7 +393,7 @@ describe("spawnAgentWithFallback", () => {
   it("refuses the kill-switch model when it has no API key configured", async () => {
     // A missing credential is an operator fix, not a spent quota: the refusal
     // must name the real cause instead of reusing the cooldown sentence.
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("commandcode", 3600, "no key", { cause: "unconfigured" });
 
     const { result, attempts } = await spawnAgentWithFallback({
@@ -505,7 +467,7 @@ describe("spawnAgentWithFallback", () => {
   });
 
   it("keeps the cooldown wording when every candidate is cooling and nothing spawned", async () => {
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("opencode-go", 900, "quota");
     store.markProviderCooldown("llmgateway", 900, "quota");
 
@@ -616,7 +578,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/deepseek-v4.1-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "opencode-go/deepseek-v4.1-flash",
       modelClass: "frontier",
@@ -660,7 +622,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "commandcode/zai-org/GLM-5.3",
       modelClass: "frontier",
@@ -707,7 +669,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "commandcode/z-ai/glm-5.3-flash",
       tools: [],
@@ -744,7 +706,7 @@ describe("spawnAgentWithFallback", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/glm-5.3-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "commandcode/z-ai/glm-5.3-flash",
       tools: [],
@@ -792,7 +754,7 @@ describe("spawnAgentWithFallback", () => {
       .mockResolvedValueOnce(noKey("commandcode/z-ai/glm-5.3-flash", "commandcode"))
       .mockResolvedValueOnce(noKey("llmgateway/glm-5.3-flash", "llmgateway"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { result, attempts } = await spawnAgentWithFallback({
       model: "commandcode/z-ai/glm-5.3-flash",
       tools: [],
@@ -935,7 +897,7 @@ describe("spawnAgentWithFallback", () => {
 
   it("does not burn a -fallback-N session for a skipped candidate", async () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 2 }));
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markCooldown("a", 900, "quota");
 
     await spawnAgentWithFallback({
@@ -1061,7 +1023,7 @@ describe("spawnAgentWithFallback", () => {
       tools: [],
       systemPrompt: "t",
       task: "t",
-      cooldownStore: createModelCooldownStore(() => 0),
+      cooldownStore: createModelCooldownStore({ now: () => 0, store: "memory" }),
       capacity,
       classify: seqClassifier("success"),
     });
@@ -1139,7 +1101,7 @@ describe("spawnAgentWithFallback", () => {
     // Warning 1: the cooldown store is the production capacity probe. An
     // unconfigured provider must be skipped reactively (with its cause), never
     // reported as capacity-exhausted and never fast-failed.
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("commandcode", 600, "Provider has no API key configured.", {
       cause: "unconfigured",
     });
@@ -1175,7 +1137,7 @@ describe("spawnAgentWithFallback", () => {
     // index 1. It must still be attempt 1 with zero fallbacks.
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("b", 0, { toolCalls: 2 }));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markCooldown("a", 900, "quota");
     const telemetry = createModelTelemetryStore();
 
@@ -1263,7 +1225,7 @@ describe("spawnAgentWithFallback", () => {
       systemPrompt: "t",
       task: "t",
       candidates: ["opencode-go/a", "llmgateway/a"],
-      cooldownStore: createModelCooldownStore(() => 0),
+      cooldownStore: createModelCooldownStore({ now: () => 0, store: "memory" }),
       capacity,
       classify: seqClassifier("quota", "success"),
     });
@@ -1352,7 +1314,7 @@ describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
       .mockResolvedValueOnce(goLimitResult())
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const first = await spawnAgentWithFallback({
       model: "opencode-go/mimo-v2.6-flash",
       tools: [],
@@ -1415,7 +1377,7 @@ describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
       })
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const { attempts } = await spawnAgentWithFallback({
       model: "opencode-go/mimo-v2.6-flash",
       tools: [],
@@ -1439,7 +1401,7 @@ describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
 
   it("escalates the provider window on a repeated unhinted 429", async () => {
     let now = 0;
-    const store = createModelCooldownStore(() => now);
+    const store = createModelCooldownStore({ now: () => now, store: "memory" });
     mockSpawnAgentProcess
       .mockResolvedValueOnce(goLimitResult())
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"));
@@ -1514,17 +1476,43 @@ describe("spawnAgentWithFallback provider usage limits (bd-38)", () => {
 });
 
 describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
-  const cooldownFilePath = "/tmp/model-cooldowns.json";
   const nowMs = 1_000_000;
   const now = (): number => nowMs;
+  const tempDirs: string[] = [];
+  const openedStores: ModelStateStore[] = [];
 
-  it("consults the persisted cooldown file at selection time, not the process snapshot", async () => {
-    const fs = createFakeCooldownFs();
-    // Created BEFORE any cooldown exists on disk: its in-memory maps are the
-    // stale snapshot the picker used to trust for a whole process lifetime.
-    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+  afterEach(() => {
+    for (const store of openedStores.splice(0)) store.close();
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * Two adapters over two connections to one state file: the shape of two
+   * processes sharing the one cooldown truth (bd-256). A fresh connection is what
+   * a restarted process reads with.
+   */
+  function sharedCooldownStores(): {
+    store: ModelCooldownStore;
+    otherMember: ModelCooldownStore;
+    fresh: () => ModelCooldownStore;
+  } {
+    const dir = mkdtempSync(join(tmpdir(), "belayd-spawn-fallback-"));
+    tempDirs.push(dir);
+    const path = join(dir, "model-state.sqlite");
+    const adapter = (): ModelCooldownStore => {
+      const opened = openModelStateStore({ path, now });
+      if (!opened.ok) throw new Error(opened.error);
+      openedStores.push(opened.store);
+      return createModelCooldownStore({ now, store: opened.store });
+    };
+    return { store: adapter(), otherMember: adapter(), fresh: adapter };
+  }
+
+  it("consults the shared cooldown store at selection time, not the process snapshot", async () => {
+    // Created BEFORE any cooldown exists: its reads are the creation-time state
+    // the picker used to trust for a whole process lifetime.
+    const { store, otherMember } = sharedCooldownStores();
     // Another fleet member spends opencode-go and llmgateway afterwards.
-    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
     otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota");
     otherMember.markProviderCooldown("llmgateway", 5.6 * 3600, "quota");
 
@@ -1562,14 +1550,10 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
   });
 
   it("picks the one available provider for every phase agent and class primary", async () => {
-    // Seeded through the SHARED FILE after the picker's store was created, so
+    // Seeded through the SHARED STORE after the picker's adapter was created, so
     // only a selection-time refresh can explain the commandcode pick: a
-    // creation-time snapshot still sees three healthy providers. (Re-anchored by
-    // the bd-234 review: this test previously marked the shared store in memory
-    // and therefore passed on the pre-fix picker as a store-layer guard.)
-    const fs = createFakeCooldownFs();
-    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
-    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    // creation-time snapshot still sees three healthy providers.
+    const { store, otherMember } = sharedCooldownStores();
     otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota");
     otherMember.markProviderCooldown("llmgateway", 5.6 * 3600, "quota");
 
@@ -1608,22 +1592,18 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
   });
 
   it("persists a quota cooldown before the next candidate is chosen", async () => {
-    const fs = createFakeCooldownFs();
-    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
-    // Another process's store, created BEFORE the first run learns anything:
-    // only its selection-time refresh can make it skip llmgateway. (Re-anchored
-    // by the bd-234 review: created after the write, this passed pre-fix as a
-    // store-layer guard because construction already loaded the entry.)
-    const blindStore = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    const { store, fresh } = sharedCooldownStores();
+    // A restarted process's view, opened BEFORE the first run learns anything.
+    const blindStore = fresh();
     mockSpawnAgentProcess
       .mockResolvedValueOnce(makeResult("llmgateway/a"))
       .mockImplementationOnce(() => {
-        // The failed provider must already be on disk when the retry candidate
-        // is picked, not just in this process's memory.
+        // The failed provider must already be in the shared store when the retry
+        // candidate is picked, not just in this process's memory.
         expect(
-          readPersistedCooldowns(fs, cooldownFilePath).providers,
+          fresh().providerEntries().get("llmgateway"),
           "llmgateway cooldown persisted before the retry",
-        ).toHaveProperty("llmgateway.until", nowMs + 900 * 1000);
+        ).toHaveProperty("until", nowMs + 900 * 1000);
         return Promise.resolve(makeResult("commandcode/b"));
       });
 
@@ -1638,8 +1618,8 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
     });
     expect(first.selection).toHaveProperty("servedModel", "commandcode/b");
 
-    // A second run in a fresh process (store from before the write, same file)
-    // must not pay the failed attempt again.
+    // A second run in a fresh process (store from before the write, same store
+    // file) must not pay the failed attempt again.
     mockSpawnAgentProcess.mockReset();
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/b"));
     const second = await spawnAgentWithFallback({
@@ -1660,7 +1640,7 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
 
   it("does not spend the maxAttempts cap on a cooldown skip", async () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("commandcode/b"));
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("opencode-go", 900, "quota");
 
     const { result, attempts } = await spawnAgentWithFallback({
@@ -1683,14 +1663,12 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
     expect(result.content[0]).toHaveProperty("text", "result-from-commandcode/b");
   });
 
-  it("refuses a cooling kill-switch model discovered on the shared file", async () => {
+  it("refuses a cooling kill-switch model discovered in the shared store", async () => {
     // The kill-switch branch sits AFTER the selection-time refresh on purpose:
     // "no fallback" must not mean "spawn on a provider another fleet member
-    // already spent". Seeding the shared file (not the handed-in store) is what
-    // makes the refresh, rather than construction, the reason it is seen.
-    const fs = createFakeCooldownFs();
-    const store = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
-    const otherMember = createModelCooldownStore({ now, filePath: cooldownFilePath, fs });
+    // already spent". Seeding the shared store (not the handed-in adapter) is
+    // what makes the refresh, rather than construction, the reason it is seen.
+    const { store, otherMember } = sharedCooldownStores();
     otherMember.markProviderCooldown("opencode-go", 24 * 3600, "quota", { cause: "quota" });
 
     const { result, attempts, selection } = await spawnAgentWithFallback({
@@ -1712,7 +1690,7 @@ describe("spawnAgentWithFallback cooldown freshness (bd-234)", () => {
   });
 
   it("spawns nothing and does not spin when every candidate is cooling and no cap is set", async () => {
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const candidates = ["a", "b", "c", "d", "e"];
     for (const model of candidates) store.markCooldown(model, 900, "quota");
     const telemetry = createModelTelemetryStore();
@@ -1920,7 +1898,7 @@ describe("capacity refusal fallback (bd-187 W2)", () => {
       .mockResolvedValueOnce(makeResult("llmgateway/mimo-v2.6-flash"))
       .mockResolvedValueOnce(makeResult("openrouter/mimo-v2.6-flash"));
 
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     const telemetry = createModelTelemetryStore();
     const { attempts } = await spawnAgentWithFallback({
       model: "llmgateway/mimo-v2.6-flash",

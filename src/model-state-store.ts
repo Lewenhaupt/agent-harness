@@ -42,17 +42,49 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import {
-  COOLDOWN_ESCALATION_FACTOR,
-  COOLDOWN_ESCALATION_MEMORY_MS,
-  MAX_ESCALATED_COOLDOWN_SECONDS,
-} from "./model-cooldown.js";
-
 /** Override for the store path, matching the `BELAYD_MODEL_COOLDOWN_FILE` precedent. */
 export const MODEL_STATE_FILE_ENV = "BELAYD_MODEL_STATE_FILE";
 
-/** Schema marker written to `PRAGMA user_version`, so a future migration is possible. */
-export const MODEL_STATE_SCHEMA_VERSION = 1;
+/**
+ * Retired JSON cooldown file (bd-38/bd-116). Still honoured as a location: when
+ * it is set and no state path is, the state store lives beside it, so an
+ * operator who configured it keeps one store rather than silently moving.
+ */
+export const LEGACY_COOLDOWN_FILE_ENV = "BELAYD_MODEL_COOLDOWN_FILE";
+
+/**
+ * Schema marker written to `PRAGMA user_version`, so a future migration is possible.
+ *
+ * v2 added the cooldown diagnostics columns (`cause`, `escalations`,
+ * `last_mark_ms`) that the routing adapter needs; v1 databases are migrated in
+ * place by {@link migrateCooldownSchema}.
+ */
+export const MODEL_STATE_SCHEMA_VERSION = 2;
+
+/**
+ * Bounded retries for the schema/migration step. A concurrent fleet member
+ * opening the same v1 file holds the write lock; the loser waits inside the
+ * store's busy timeout and retries rather than reporting an unopenable store.
+ */
+const SCHEMA_MIGRATION_ATTEMPTS = 3;
+
+/**
+ * Each repeated unhinted cooldown doubles the window: a guess that already
+ * proved too short must not be reused verbatim.
+ */
+export const COOLDOWN_ESCALATION_FACTOR = 2;
+/**
+ * Ceiling on an escalated window (24 h). A single day bounds the damage of a
+ * wrong guess: the provider is re-probed at least daily even if escalation ran
+ * long.
+ */
+export const MAX_ESCALATED_COOLDOWN_SECONDS = 24 * 60 * 60;
+/**
+ * How long the escalation ladder is remembered after the last mark (7 days). A
+ * weekly bucket that resets and re-exhausts inside a week is the same limit
+ * escalating, not a fresh one.
+ */
+export const COOLDOWN_ESCALATION_MEMORY_MS = 7 * 86_400_000;
 
 /**
  * Read-cache window, mirroring `COOLDOWN_REFRESH_MAX_AGE_MS`: one dispatch reads
@@ -79,6 +111,25 @@ export const DEFAULT_CAPACITY_LEASE_TTL_MS = 10 * 60_000;
  * model name rather than a second table.
  */
 export const PROVIDER_SCOPE_MODEL = "*";
+
+/**
+ * Normalize a provider key: an absent or empty provider means "any provider",
+ * i.e. the window belongs to a bare model id and is stored provider-agnostically
+ * (`*`).
+ */
+export function cooldownProviderKey(provider: string | undefined): string {
+  return provider === undefined || provider === "" ? PROVIDER_SCOPE_MODEL : provider;
+}
+
+/**
+ * The state file that backs a legacy cooldown path: `model-cooldowns.json` ->
+ * `model-cooldowns.sqlite`. One rule, used by {@link resolveModelStatePath} and
+ * by the routing adapter's legacy import, so the two cannot disagree about
+ * where the single truth lives.
+ */
+export function modelStatePathForCooldownFile(filePath: string): string {
+  return `${filePath.replace(/\.json$/i, "")}.sqlite`;
+}
 
 /** A value SQLite can bind as an anonymous parameter. */
 export type SqlValue = string | number | bigint | null;
@@ -117,10 +168,43 @@ export interface CooldownRecord {
    * where the escalation ladder lives (the bead's schema has no count column).
    */
   retryAfterMs: number;
+  /** Stable cause tag, set on provider-wide windows only. */
+  cause?: CooldownCause;
+  /** The escalation rung this window used; absent on hinted and model windows. */
+  escalations?: number;
+  /** Epoch ms of the mark that produced this window. */
+  lastMarkedAt?: number;
 }
 
 /** Which cooldown scope is blocking a dispatch, when one is. */
 export type CooldownScope = "provider" | "model";
+
+/**
+ * Stable cause tag for a provider-wide cooldown.
+ *
+ * `reason` is display text and must never be branched on, so consumers that need
+ * to know *why* a provider is cooling read this instead: the capacity probe must
+ * not treat a missing credential as spent capacity, and the fallback loop's skip
+ * rows report which of the two causes skipped the provider.
+ */
+export type CooldownCause = "quota" | "unconfigured";
+
+/**
+ * One stored cooldown row. `listCooldowns` returns only rows that are still
+ * active at the caller's clock; the retired/expired ones are not interesting and
+ * `prune` deletes them.
+ */
+export interface CooldownRow {
+  provider: string;
+  /** {@link PROVIDER_SCOPE_MODEL} for a provider-wide or provider-agnostic row. */
+  model: string;
+  untilMs: number;
+  reason: string;
+  retryAfterMs: number;
+  cause?: CooldownCause;
+  escalations?: number;
+  lastMarkedAt: number;
+}
 
 /** The active cooldown affecting one provider/model pair. */
 export interface ActiveCooldown {
@@ -235,25 +319,74 @@ export interface SpendTotals {
 }
 
 export interface MarkCooldownInput {
-  provider: string;
+  /** Omitted or empty marks a bare model id, provider-agnostically. */
+  provider?: string;
   /** `undefined` marks the whole provider; a model id marks one endpoint. */
   model?: string;
   durationMs: number;
   reason: string;
   /** True when `durationMs` came from a provider reset hint (authoritative). */
   hinted?: boolean;
+  /** Stable cause tag, stored on provider-wide windows only. */
+  cause?: CooldownCause;
+  nowMs?: number;
+}
+
+/**
+ * One window replayed from the retired JSON store (bd-256).
+ *
+ * Unlike {@link MarkCooldownInput}, this carries an absolute `untilMs` and the
+ * escalation rung the legacy record already used: migration must reproduce the
+ * window the previous build observed, not re-derive it from a duration (which
+ * would reset an escalated weekly bucket to rung 1).
+ */
+export interface SeedCooldownInput {
+  provider: string;
+  /** `undefined` seeds a provider-wide row; a model id seeds one endpoint. */
+  model?: string;
+  /** Absolute epoch-ms window end from the legacy record. */
+  untilMs: number;
+  reason: string;
+  cause?: CooldownCause;
+  /**
+   * Ladder rung the legacy row carried. Present on an unhinted provider window,
+   * absent on a hinted window (whose ladder was cleared) and on model windows.
+   */
+  escalations?: number;
+  /** Epoch ms of the legacy mark; defaults to now for pre-timestamp files. */
+  lastMarkedAt?: number;
+  nowMs?: number;
+}
+
+/** One escalation ladder rung replayed from the retired JSON store. */
+export interface SeedCooldownLadderInput {
+  provider: string;
+  /** Zero is meaningful: the legacy file records a hinted reset as count 0. */
+  escalations: number;
+  lastMarkedAt: number;
   nowMs?: number;
 }
 
 export interface ModelStateStore {
   readonly path: string;
   readonly readOnly: boolean;
-  /** The active provider- or model-scoped cooldown, or null when none is active. */
+  /**
+   * The active cooldown for one provider/model pair, or null when none is
+   * active. Matches an exact endpoint row, a provider-wide row, and a
+   * provider-agnostic (bare model) row, in that precedence order.
+   */
   cooldownFor(input: {
     provider: string;
     model: string;
     nowMs?: number;
   }): ModelStateResult<ActiveCooldown | null>;
+  /** Every cooldown row still active at `nowMs`, for the routing adapter. */
+  listCooldowns(input?: { nowMs?: number }): ModelStateResult<CooldownRow[]>;
+  /**
+   * Drop the cooldown read cache, so the next read observes another process's
+   * write. Used by the routing adapter's unbounded `refresh()`.
+   */
+  invalidateCooldownCache(): void;
   /**
    * Upsert a cooldown window. An unhinted provider-wide mark doubles the
    * previous guess (capped at {@link MAX_ESCALATED_COOLDOWN_SECONDS}); a hinted
@@ -280,11 +413,56 @@ export interface ModelStateStore {
   recordSpend(row: SpendRow): ModelStateResult<null>;
   spendTotals(): ModelStateResult<SpendTotals>;
   /**
-   * Drop cooldowns past the escalation memory, their ladders, and expired
-   * leases.
+   * Drop expired cooldowns, ladders past their escalation memory, and expired
+   * leases. Expired rows are already invisible to every reader; this is the
+   * garbage collection the fallback loop calls before selecting a candidate.
    */
   prune(nowMs?: number): ModelStateResult<{ cooldowns: number; leases: number }>;
   close(): void;
+  /**
+   * True only on the facade returned while the shared store is transiently
+   * unavailable. Callers must not memoize such a store: the next access has to
+   * pick up the real one (and its pending-mark flush).
+   */
+  readonly pendingFlush?: boolean;
+}
+
+/**
+ * Migration-only write capability: replay absolute windows and ladder rungs from
+ * the retired JSON store.
+ *
+ * Deliberately **not** a member of {@link ModelStateStore}. Seeding an absolute
+ * window or resetting the ladder is a one-time migration concern, so ordinary
+ * store consumers must not be able to reach it through `openModelStateStore()`'
+ * result; the legacy importer obtains it from {@link modelStateSeederFor}.
+ */
+export interface ModelStateSeeder {
+  /**
+   * Replay one window. Longer window wins: an existing active row that ends
+   * later is kept (returns `written: false`), so a migration can never shorten a
+   * window another process already recorded. The unhinted ladder is replayed
+   * separately by {@link ModelStateSeeder.seedCooldownLadder}, so this never
+   * escalates or clears it.
+   */
+  seedCooldown(input: SeedCooldownInput): ModelStateResult<{ written: boolean }>;
+  /**
+   * Replay one escalation rung. Later mark wins (a hinted reset recorded as
+   * count 0 replaces an older rung); a rung older than
+   * {@link COOLDOWN_ESCALATION_MEMORY_MS} is dropped. Never touches a window.
+   */
+  seedCooldownLadder(input: SeedCooldownLadderInput): ModelStateResult<{ written: boolean }>;
+}
+
+/**
+ * The migration capability for one store, or null when the store cannot provide
+ * it (a read-only/unavailable facade). Held in a WeakMap so it is not enumerable
+ * on the public store object and dies with it.
+ */
+const seederByStore = new WeakMap<ModelStateStore, ModelStateSeeder>();
+
+/** Obtain the legacy-migration capability for a store. Migration code only. */
+export function modelStateSeederFor(store: ModelStateStore): ModelStateSeeder | null {
+  return seederByStore.get(store) ?? null;
 }
 
 export type ModelStateOpen = { ok: true; store: ModelStateStore } | { ok: false; error: string };
@@ -301,13 +479,17 @@ function nonEmpty(value: string | undefined): string | undefined {
 /**
  * Resolve the store path from an injected environment.
  *
- * `BELAYD_MODEL_STATE_FILE` wins; otherwise
+ * `BELAYD_MODEL_STATE_FILE` wins; otherwise the retired
+ * `BELAYD_MODEL_COOLDOWN_FILE` decides (its `.json` sibling becomes the one
+ * state file, so a configured location keeps working); otherwise
  * `${XDG_STATE_HOME:-~/.local/state}/belayd/model-state.sqlite`, the same state
  * root as proof, metrics and the AWS audit log.
  */
 export function resolveModelStatePath(options: ModelStateEnv): string {
   const override = nonEmpty(options.env[MODEL_STATE_FILE_ENV]);
   if (override !== undefined) return override;
+  const legacy = nonEmpty(options.env[LEGACY_COOLDOWN_FILE_ENV]);
+  if (legacy !== undefined) return modelStatePathForCooldownFile(legacy);
   const stateHome =
     nonEmpty(options.env.XDG_STATE_HOME) ??
     join(options.homeDir ?? options.env.HOME ?? homedir(), ".local", "state");
@@ -319,6 +501,288 @@ export function defaultModelStatePath(): string {
   return resolveModelStatePath({ env: process.env });
 }
 
+/**
+ * Retry window after a transient shared open failure.
+ *
+ * bd-256 made this store the *only* cooldown truth, so a transient first-open
+ * failure (a busy WAL writer, a migration in flight, a momentary IO error) must
+ * not be memoized as "no store for this session". A transient failure is retried
+ * no more often than this window; a permanent one stops retrying entirely.
+ */
+export const SHARED_MODEL_STATE_RETRY_MS = 30_000;
+
+/** Cap on cooldown marks captured while the shared store is unavailable. */
+export const MAX_PENDING_COOLDOWN_MARKS = 32;
+
+/**
+ * How long an *elapsed* captured mark may still be replayed after the store
+ * comes back.
+ *
+ * This is not the replay bound: a mark whose window is still live is replayed
+ * however long the outage lasted (a hinted 20-minute reset or a laddered weekly
+ * bucket must not be dropped because the store was down for 11 minutes). The
+ * bound only decides the fate of marks that were already expired when the open
+ * succeeded. Memory is bounded by {@link MAX_PENDING_COOLDOWN_MARKS}.
+ */
+export const MAX_PENDING_COOLDOWN_AGE_MS = 10 * 60_000;
+
+interface PendingCooldownMark {
+  /** The original mark, with its effective clock frozen at queue time. */
+  input: MarkCooldownInput;
+  queuedAtMs: number;
+}
+
+/** The absolute window end a queued mark implies, from its frozen clock. */
+function pendingUntilMs(mark: PendingCooldownMark): number {
+  const markedAt = mark.input.nowMs ?? mark.queuedAtMs;
+  return markedAt + Math.max(0, Math.round(mark.input.durationMs));
+}
+
+/** The store row a queued mark will write, as a comparable key. */
+function pendingRowKey(mark: PendingCooldownMark): string {
+  const provider = cooldownProviderKey(mark.input.provider);
+  return `${provider}\u0000${mark.input.model ?? PROVIDER_SCOPE_MODEL}`;
+}
+
+/** undefined = never attempted; null would be nonsense here since failure is flagged separately. */
+let sharedModelState: ModelStateStore | undefined;
+let sharedOpenFailedAt: number | undefined;
+/** Set once a failure is classified permanent: no further open attempts. */
+let sharedPermanentlyUnavailable = false;
+/** The failure class already warned about, so one outage logs once. */
+let sharedWarnedClass: StoreFailureClass | undefined;
+let pendingCooldownMarks: PendingCooldownMark[] = [];
+
+/**
+ * The store facade returned while the shared store is transiently unavailable.
+ *
+ * Reads stay permissive (nothing cooling) because persistence is gone for the
+ * moment; capacity/lease/spend bookkeeping is refused (`readOnly` is true, and
+ * every capacity method returns a store error), which the provider policy
+ * already degrades to "dispatch without a lease". Only cooldown marks are
+ * captured: a 402/429 observed during the outage is queued and replayed into the
+ * real store by the next successful open, so the first real cooldown is never
+ * lost.
+ */
+function pendingCooldownStore(path: string, now: () => number): ModelStateStore {
+  const unavailable = (operation: string): ModelStateResult<never> => ({
+    ok: false,
+    error: `model state store is unavailable (${operation})`,
+  });
+  const unavailableLease = (
+    operation: string,
+  ): { ok: false; reason: "store-error"; error: string } => ({
+    ok: false,
+    reason: "store-error",
+    error: `model state store is unavailable (${operation})`,
+  });
+  return {
+    path,
+    readOnly: true,
+    pendingFlush: true,
+    // Reads fail as values so the wrapper reports the decision as degraded
+    // rather than believing an empty store; routing treats both as permissive.
+    cooldownFor: () => unavailable("cooldownFor"),
+    listCooldowns: () => unavailable("listCooldowns"),
+    invalidateCooldownCache: () => undefined,
+    markCooldown: (input) => ({ ok: true, value: enqueuePendingCooldown(input, now()) }),
+    readCapacity: () => unavailable("readCapacity"),
+    reserveCapacity: () => unavailable("reserveCapacity"),
+    releaseCapacity: () => unavailableLease("releaseCapacity"),
+    renewLease: () => unavailableLease("renewLease"),
+    recordSpend: () => unavailable("recordSpend"),
+    spendTotals: () => unavailable("spendTotals"),
+    prune: () => unavailable("prune"),
+    close: () => undefined,
+  };
+}
+
+/**
+ * Capture one mark for the next successful open.
+ *
+ * The effective clock is frozen into the queued input so replay reproduces the
+ * window the failure actually implied, not a window starting at recovery time.
+ * The queue is capped at {@link MAX_PENDING_COOLDOWN_MARKS}: one mark per store
+ * row and a broken store hammered by a fallback loop would otherwise grow
+ * without bound.
+ */
+function enqueuePendingCooldown(input: MarkCooldownInput, atMs: number): CooldownRecord {
+  const markedAt = input.nowMs ?? atMs;
+  const durationMs = Math.max(0, Math.round(input.durationMs));
+  pendingCooldownMarks.push({ input: { ...input, nowMs: markedAt }, queuedAtMs: atMs });
+  if (pendingCooldownMarks.length > MAX_PENDING_COOLDOWN_MARKS) {
+    pendingCooldownMarks.splice(pendingEvictionIndex(atMs), 1);
+  }
+  return {
+    provider: cooldownProviderKey(input.provider),
+    model: input.model ?? PROVIDER_SCOPE_MODEL,
+    untilMs: markedAt + durationMs,
+    reason: input.reason,
+    retryAfterMs: durationMs,
+    lastMarkedAt: markedAt,
+    ...(input.cause === undefined ? {} : { cause: input.cause }),
+  };
+}
+
+/**
+ * Which pending mark to drop when the cap is reached.
+ *
+ * Plain FIFO drops the oldest mark, which under a hammering fallback loop can be
+ * the provider the fleet is actively failing on. Eviction order: a mark whose
+ * window already elapsed (it cannot steer anything), then a duplicate of a row
+ * queued with a longer window (the longer window is the truth), and only then
+ * the oldest mark.
+ */
+function pendingEvictionIndex(atMs: number): number {
+  const marks = pendingCooldownMarks;
+  const stale = marks.findIndex((mark) => pendingUntilMs(mark) <= atMs);
+  if (stale !== -1) return stale;
+  for (let index = 0; index < marks.length; index += 1) {
+    const mark = marks[index];
+    if (mark === undefined) continue;
+    const untilMs = pendingUntilMs(mark);
+    const key = pendingRowKey(mark);
+    const superseded = marks.some((other, otherIndex) => {
+      if (otherIndex === index || pendingRowKey(other) !== key) return false;
+      const otherUntilMs = pendingUntilMs(other);
+      return otherUntilMs > untilMs || (otherUntilMs === untilMs && otherIndex > index);
+    });
+    if (superseded) return index;
+  }
+  return 0;
+}
+
+/**
+ * Whether a captured mark is still worth replaying.
+ *
+ * A mark whose window is still live is replayed no matter how long the outage
+ * lasted: dropping it re-probes a provider the wrapper already spent (the bd-38
+ * churn). The queue-age bound only decides the fate of marks that were already
+ * expired when the store came back.
+ */
+function shouldReplayPendingCooldown(mark: PendingCooldownMark, atMs: number): boolean {
+  if (pendingUntilMs(mark) > atMs) return true;
+  return atMs - mark.queuedAtMs <= MAX_PENDING_COOLDOWN_AGE_MS;
+}
+
+/**
+ * Replay captured marks into the store, before the store serves any read.
+ *
+ * A mark the store refuses (read-only) is dropped: re-queueing it would keep an
+ * unbounded memory of marks a read-only file can never accept.
+ */
+function flushPendingCooldowns(store: ModelStateStore, atMs: number): void {
+  const queued = pendingCooldownMarks;
+  pendingCooldownMarks = [];
+  for (const mark of queued) {
+    if (!shouldReplayPendingCooldown(mark, atMs)) continue;
+    store.markCooldown(mark.input);
+  }
+}
+
+/** One warning per distinct failure class per process; a retry cycle never repeats it. */
+function warnSharedStoreFailure(failureClass: StoreFailureClass, error: string): void {
+  if (sharedWarnedClass === failureClass) return;
+  sharedWarnedClass = failureClass;
+  if (failureClass === "permanent") {
+    // A permanent failure is the one case an operator has to act on, so the
+    // single warning has to name the error and say what is switched off.
+    console.warn(
+      `[belayd-harness] shared model state store unavailable (${error}); ` +
+        "not retrying: cooldown tracking is off for this process until restart " +
+        "(reads stay permissive, so a spent provider can be retried).",
+    );
+    return;
+  }
+  const retrySeconds = Math.round(SHARED_MODEL_STATE_RETRY_MS / 1_000);
+  console.warn(
+    `[belayd-harness] shared model state store unavailable (${error}); ` +
+      `cooldown marks are queued and retried every ${retrySeconds}s.`,
+  );
+}
+
+/**
+ * Test seam for the shared open.
+ *
+ * Production passes nothing. The failure classification, the retry window and
+ * the pending-mark flush are otherwise only reachable by inducing real SQLite
+ * lock contention, so tests drive the open result directly.
+ */
+export interface SharedStoreOpenSeam {
+  open?: (path: string) => ModelStateOpen;
+}
+
+/**
+ * The process-wide shared store, opened lazily on first use.
+ *
+ * This is the module-level mutable state AGENTS.md exempts for this file: one
+ * instance per process keeps the routing adapter and the provider policy on one
+ * connection and one cache, which is what "one cooldown truth" means in-process.
+ * The path comes from {@link resolveModelStatePath}, so `BELAYD_MODEL_STATE_FILE`
+ * (then the retired cooldown path, then XDG) decides it once for every consumer.
+ *
+ * Failure handling:
+ * - **transient** (lock/busy/migration/IO): warn once, return a facade that
+ *   queues cooldown marks, and retry after {@link SHARED_MODEL_STATE_RETRY_MS};
+ *   the first successful open flushes the queue before serving reads.
+ * - **permanent** (no engine, bad path/permission, non-sqlite file, corruption):
+ *   warn once, stop retrying, return `null` (permissive).
+ */
+export function sharedModelStateStore(
+  now: () => number = Date.now,
+  seam?: SharedStoreOpenSeam,
+): ModelStateStore | null {
+  if (sharedModelState !== undefined) return sharedModelState;
+  if (sharedPermanentlyUnavailable) return null;
+  const atMs = now();
+  const path = defaultModelStatePath();
+  if (
+    sharedOpenFailedAt !== undefined &&
+    sharedOpenFailedAt <= atMs &&
+    atMs - sharedOpenFailedAt < SHARED_MODEL_STATE_RETRY_MS
+  ) {
+    // Still inside the retry window: keep capturing marks instead of dropping
+    // them for the rest of the outage.
+    return pendingCooldownStore(path, now);
+  }
+  const opened = seam?.open === undefined ? openModelStateStore({ path }) : seam.open(path);
+  if (!opened.ok) {
+    const failureClass = classifyStoreFailure(opened.error);
+    sharedOpenFailedAt = atMs;
+    sharedPermanentlyUnavailable = failureClass === "permanent";
+    warnSharedStoreFailure(failureClass, opened.error);
+    return failureClass === "transient" ? pendingCooldownStore(path, now) : null;
+  }
+  sharedModelState = opened.store;
+  sharedOpenFailedAt = undefined;
+  sharedPermanentlyUnavailable = false;
+  sharedWarnedClass = undefined;
+  // Before any read is served: replay what the outage captured.
+  flushPendingCooldowns(opened.store, atMs);
+  return sharedModelState;
+}
+
+/**
+ * Drop the process-wide store and anything captured for it.
+ *
+ * Tests use this to exercise the failure/retry path and to re-point
+ * `BELAYD_MODEL_STATE_FILE`; production opens the store once per process.
+ */
+export function resetSharedModelStateStore(): void {
+  const store = sharedModelState;
+  sharedModelState = undefined;
+  sharedOpenFailedAt = undefined;
+  sharedPermanentlyUnavailable = false;
+  sharedWarnedClass = undefined;
+  pendingCooldownMarks = [];
+  if (store === undefined) return;
+  try {
+    store.close();
+  } catch {
+    /* closing a handle we no longer use must not throw at reset */
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cooldown (
   provider TEXT NOT NULL,
@@ -326,6 +790,9 @@ CREATE TABLE IF NOT EXISTS cooldown (
   until_ms INTEGER NOT NULL,
   reason TEXT NOT NULL,
   retry_after_ms INTEGER NOT NULL,
+  cause TEXT,
+  escalations INTEGER,
+  last_mark_ms INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (provider, model)
 );
 CREATE INDEX IF NOT EXISTS cooldown_until ON cooldown (until_ms);
@@ -371,6 +838,169 @@ function errorMessage(error: unknown): string {
 }
 
 /**
+ * Whether a store failure can clear on its own.
+ *
+ * A transient failure (another process holds the write lock, a migration is in
+ * flight, a momentary IO hiccup) is worth retrying; a permanent one (no
+ * `node:sqlite`, a bad path or permission, a non-sqlite file, corruption) never
+ * fixes itself and must stop retrying so a broken install cannot produce an
+ * endless warning loop.
+ */
+export type StoreFailureClass = "transient" | "permanent";
+
+/**
+ * Errors that can clear without operator action: SQLite lock contention,
+ * momentary IO and transient storage pressure. Checked after the permanent
+ * patterns, so a message carrying both (a corrupt file reported while busy)
+ * still fails fast.
+ *
+ * Both spellings the runtime can emit are covered: the errno form (`EIO`,
+ * `EAGAIN`, `EBUSY`, ...) and the SQLite-class form (`SQLITE_IOERR: disk I/O
+ * error`, `SQLITE_FULL: database or disk is full`, `SQLITE_BUSY_SNAPSHOT`, ...).
+ * `node:sqlite` often reports only the bare errstr (`disk I/O error`) with
+ * `code: "ERR_SQLITE_ERROR"`, so the message text has to carry the diagnosis.
+ * Missing a transient here is expensive: the default is permanent, which turns
+ * cooldown tracking off for the rest of the process.
+ */
+const TRANSIENT_STORE_ERROR_PATTERN =
+  /SQLITE_BUSY|SQLITE_LOCKED|SQLITE_PROTOCOL|SQLITE_IOERR|SQLITE_FULL|SQLITE_NOMEM|SQLITE_INTERRUPT|database (?:table )?is locked|database is busy|disk I\/O error|database or disk is full|out of memory|interrupted|EIO\b|EINTR\b|EAGAIN|EBUSY|ENOMEM\b|ETXTBSY|temporar/i;
+
+/**
+ * SQLite primary result codes that can clear on retry, masked out of node:sqlite's
+ * extended `errcode`: BUSY(5), LOCKED(6), NOMEM(7), INTERRUPT(9), IOERR(10),
+ * FULL(13) and PROTOCOL(15). CANTOPEN(14) stays permanent: its message is
+ * "unable to open database file", i.e. a path/permission fault.
+ */
+const TRANSIENT_SQLITE_PRIMARY_CODES: ReadonlySet<number> = new Set([5, 6, 7, 9, 10, 13, 15]);
+
+/**
+ * SQLite primary codes that never fix themselves: READONLY(8), CORRUPT(11),
+ * CANTOPEN(14), SCHEMA(17) and NOTADB(26).
+ */
+const PERMANENT_SQLITE_PRIMARY_CODES: ReadonlySet<number> = new Set([8, 11, 14, 17, 26]);
+
+/**
+ * Errors that will not clear on retry: the engine is missing, the path or its
+ * parent cannot be used, the file is not a sqlite database, or the schema is
+ * corrupt/unexpected. `unable to open database file` is what SQLite reports for
+ * ENOTDIR/EISDIR/ENOENT parents, and `file is not a database` for SQLITE_NOTADB.
+ */
+const PERMANENT_STORE_ERROR_PATTERN =
+  /SQLITE_CORRUPT|SQLITE_NOTADB|SQLITE_READONLY|disk image is malformed|ENOTDIR|EACCES|EPERM|EROFS|ENOSPC|EISDIR|ENOENT|file is not a database|unable to open database file|node:sqlite (?:unavailable|does not expose)|does not exist/i;
+
+/** node:sqlite's numeric `errcode`, reduced to its primary (non-extended) code. */
+function sqlitePrimaryCode(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const errcode = (error as { errcode?: unknown }).errcode;
+  if (typeof errcode !== "number" || !Number.isInteger(errcode)) return undefined;
+  return errcode & 0xff;
+}
+
+/**
+ * Classify one store failure from its message/code.
+ *
+ * Permanent wins over transient so a corrupt or inaccessible store fails fast;
+ * an unrecognised error is treated as permanent because the cost of being wrong
+ * is a warning storm that never recovers — the single warning therefore names
+ * the error and says cooldown tracking is off, so the diagnosis is actionable.
+ */
+export function classifyStoreFailure(error: unknown): StoreFailureClass {
+  const code =
+    typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  const text = `${typeof code === "string" ? code : ""} ${errorMessage(error)}`;
+  if (PERMANENT_STORE_ERROR_PATTERN.test(text)) return "permanent";
+  const primary = sqlitePrimaryCode(error);
+  if (primary !== undefined) {
+    if (TRANSIENT_SQLITE_PRIMARY_CODES.has(primary)) return "transient";
+    if (PERMANENT_SQLITE_PRIMARY_CODES.has(primary)) return "permanent";
+  }
+  if (TRANSIENT_STORE_ERROR_PATTERN.test(text)) return "transient";
+  return "permanent";
+}
+
+/**
+ * Columns added to `cooldown` by schema v2, with the DDL needed to add each on
+ * an existing v1 database.
+ *
+ * The adapter reads all three: `cause` keeps "why is this provider cooling" out
+ * of the display `reason`; `escalations` mirrors the reconciliation ladder on the
+ * window itself; `last_mark_ms` orders windows by when they were observed.
+ */
+const COOLDOWN_V2_COLUMNS: readonly (readonly [string, string])[] = [
+  ["cause", "TEXT"],
+  ["escalations", "INTEGER"],
+  ["last_mark_ms", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+/** Column names of one table, read from the live schema. */
+function columnNames(database: SqliteDatabaseLike, table: string): Set<string> {
+  const names = new Set<string>();
+  for (const raw of database.prepare(`SELECT name FROM pragma_table_info('${table}')`).all()) {
+    const name = readString(asRow(raw) ?? {}, "name");
+    if (name !== "") names.add(name);
+  }
+  return names;
+}
+
+/**
+ * Create the schema and add the v2 cooldown columns to a database created by
+ * v1, all inside one `BEGIN IMMEDIATE` transaction.
+ *
+ * Two fleet members can open the same v1 file at the same time. Bare autocommit
+ * `ALTER TABLE` statements let both pass the `pragma_table_info` check and then
+ * race the same ALTER, and the loser's open fails — which, now that the JSON
+ * fallback store is gone, would remove the single cooldown truth for that
+ * session. The write transaction serialises the whole migration; the column
+ * re-read plus the duplicate-column tolerance keeps a partially migrated file
+ * (or a migration from a process that committed between our read and our ALTER)
+ * a success rather than a failure.
+ */
+function applySchemaOnce(database: SqliteDatabaseLike): void {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.exec(SCHEMA);
+    const existing = columnNames(database, "cooldown");
+    for (const [column, ddl] of COOLDOWN_V2_COLUMNS) {
+      if (existing.has(column)) continue;
+      try {
+        database.exec(`ALTER TABLE cooldown ADD COLUMN ${column} ${ddl}`);
+      } catch (error) {
+        // Another process may have added it between our read and this ALTER.
+        if (!columnNames(database, "cooldown").has(column)) throw error;
+      }
+    }
+    database.exec(`PRAGMA user_version = ${MODEL_STATE_SCHEMA_VERSION}`);
+    database.exec("COMMIT");
+  } catch (error) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      /* the transaction is already gone; the original error is what matters */
+    }
+    throw error;
+  }
+}
+
+/**
+ * Bounded retry for the schema step: only a retryable lock/busy failure is
+ * retried (a concurrent migration or a busy WAL writer); corruption, permission
+ * errors and malformed schema fail on the first attempt so the permanent-store
+ * path can stop retrying instead of delaying the diagnosis.
+ */
+function applySchema(database: SqliteDatabaseLike, onAttempt?: (attempt: number) => void): void {
+  for (let attempt = 1; ; attempt += 1) {
+    onAttempt?.(attempt);
+    try {
+      applySchemaOnce(database);
+      return;
+    } catch (error) {
+      if (attempt >= SCHEMA_MIGRATION_ATTEMPTS) throw error;
+      if (classifyStoreFailure(error) !== "transient") throw error;
+    }
+  }
+}
+
+/**
  * Tighten the database file and its WAL sidecars to 0600.
  *
  * WAL mode creates `-wal`/`-shm` next to the database on first write (and
@@ -407,6 +1037,15 @@ function readString(row: Record<string, unknown>, key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+/** A nullable INTEGER column, as a number or "not set". */
+function readOptionalNumber(row: Record<string, unknown>, key: string): number | undefined {
+  const value = row[key];
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  return undefined;
+}
+
 /** Locate `node:sqlite` lazily: an unavailable engine is a value, not a crash. */
 function loadSqlite(): ModelStateResult<{
   DatabaseSync: new (path: string, options?: unknown) => SqliteDatabaseLike;
@@ -440,14 +1079,29 @@ export interface ModelStateStoreOptions extends Partial<ModelStateEnv> {
   readCacheMaxAgeMs?: number;
   /** Inject a database (unit-test seam); when omitted the real file is opened. */
   database?: SqliteDatabaseLike;
+  /**
+   * Called once per schema attempt. Test seam for the retry policy: production
+   * callers have no reason to observe the migration loop.
+   */
+  onSchemaAttempt?: (attempt: number) => void;
 }
 
 function openDatabase(options: {
   path: string;
   readOnly: boolean;
   database?: SqliteDatabaseLike;
+  onSchemaAttempt?: (attempt: number) => void;
 }): ModelStateResult<SqliteDatabaseLike> {
-  if (options.database !== undefined) return { ok: true, value: options.database };
+  if (options.database !== undefined) {
+    // An injected database still runs the schema step, so the migration and its
+    // retry policy are exercised against the fake rather than bypassed.
+    try {
+      applySchema(options.database, options.onSchemaAttempt);
+      return { ok: true, value: options.database };
+    } catch (error) {
+      return { ok: false, error: `could not open ${options.path}: ${errorMessage(error)}` };
+    }
+  }
   try {
     if (!options.readOnly) {
       mkdirSync(dirname(options.path), { recursive: true, mode: 0o700 });
@@ -467,8 +1121,7 @@ function openDatabase(options: {
     database.exec("PRAGMA journal_mode = WAL");
     database.exec("PRAGMA synchronous = NORMAL");
     database.exec("PRAGMA busy_timeout = 5000");
-    database.exec(SCHEMA);
-    database.exec(`PRAGMA user_version = ${MODEL_STATE_SCHEMA_VERSION}`);
+    applySchema(database, options.onSchemaAttempt);
     // WAL sidecars appear with the first WAL write, not necessarily with the
     // journal_mode switch, so the modes are also tightened after each commit.
     tightenStoreFileModes(options.path);
@@ -489,7 +1142,12 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
     options.path ??
     resolveModelStatePath({ env: options.env ?? process.env, homeDir: options.homeDir });
   const readOnly = options.readOnly === true;
-  const opened = openDatabase({ path, readOnly, database: options.database });
+  const opened = openDatabase({
+    path,
+    readOnly,
+    database: options.database,
+    onSchemaAttempt: options.onSchemaAttempt,
+  });
   if (!opened.ok) return { ok: false, error: opened.error };
   const database = opened.value;
   const now = options.now ?? Date.now;
@@ -577,18 +1235,41 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
     model: string;
     atMs: number;
   }): ActiveCooldown | null => {
+    // Three row shapes can block one endpoint: the exact (provider, model),
+    // the whole provider (provider, `*`), and a bare model id cooled
+    // provider-agnostically (`*`, model). A provider-wide window outranks the
+    // endpoint one: a spent credential blocks every model on it, so it is the
+    // stronger (and the more useful) diagnosis.
     const row = asRow(
       database
         .prepare(
           `SELECT provider, model, until_ms, reason, retry_after_ms
              FROM cooldown
             WHERE until_ms > ?
-              AND provider = ?
-              AND (model = ? OR model = ?)
-            ORDER BY (model = ?) DESC, until_ms DESC
+              AND (
+                (provider = ? AND (model = ? OR model = ?))
+                OR (provider = ? AND model = ?)
+              )
+            ORDER BY CASE
+                       WHEN provider = ? AND model = ? THEN 0
+                       WHEN provider = ? AND model = ? THEN 1
+                       ELSE 2
+                     END,
+                     until_ms DESC
             LIMIT 1`,
         )
-        .get(input.atMs, input.provider, input.model, PROVIDER_SCOPE_MODEL, PROVIDER_SCOPE_MODEL),
+        .get(
+          input.atMs,
+          input.provider,
+          input.model,
+          PROVIDER_SCOPE_MODEL,
+          PROVIDER_SCOPE_MODEL,
+          input.model,
+          input.provider,
+          PROVIDER_SCOPE_MODEL,
+          input.provider,
+          input.model,
+        ),
     );
     if (row === undefined) return null;
     const scope: CooldownScope =
@@ -601,17 +1282,80 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
     };
   };
 
+  const seeder: ModelStateSeeder = {
+    seedCooldown(input) {
+      const atMs = input.nowMs ?? now();
+      const provider = cooldownProviderKey(input.provider);
+      const providerScoped = input.model === undefined && provider !== PROVIDER_SCOPE_MODEL;
+      const model = input.model ?? PROVIDER_SCOPE_MODEL;
+      return write<{ written: boolean }>("seedCooldown", () => ({
+        ok: true,
+        value: {
+          written: seedCooldownRow(database, {
+            provider,
+            model,
+            providerScoped,
+            atMs,
+            untilMs: input.untilMs,
+            reason: input.reason,
+            lastMarkedAt: input.lastMarkedAt,
+            cause: input.cause,
+            escalations: input.escalations,
+          }),
+        },
+      }));
+    },
+
+    seedCooldownLadder(input) {
+      const atMs = input.nowMs ?? now();
+      const provider = cooldownProviderKey(input.provider);
+      return write<{ written: boolean }>("seedCooldownLadder", () => {
+        // A rung older than the ladder memory is what the old store pruned: a
+        // weekly bucket that reset more than a week ago is a fresh limit.
+        if (atMs - input.lastMarkedAt > COOLDOWN_ESCALATION_MEMORY_MS) {
+          return { ok: true, value: { written: false } };
+        }
+        const existing = asRow(
+          database
+            .prepare("SELECT escalations, last_mark_ms FROM cooldown_ladder WHERE provider = ?")
+            .get(provider),
+        );
+        if (existing !== undefined) {
+          const currentMark = readNumber(existing, "last_mark_ms");
+          const currentCount = readNumber(existing, "escalations");
+          // Later mark wins (a count-0 reset replaces an older rung); an equal
+          // mark keeps the higher count, so neither side can downgrade the other.
+          const keepsCurrent =
+            currentMark > input.lastMarkedAt ||
+            (currentMark === input.lastMarkedAt && currentCount >= input.escalations);
+          if (keepsCurrent) return { ok: true, value: { written: false } };
+        }
+        database
+          .prepare(
+            `INSERT INTO cooldown_ladder (provider, escalations, last_mark_ms)
+             VALUES (?, ?, ?)
+             ON CONFLICT(provider) DO UPDATE SET
+               escalations = excluded.escalations,
+               last_mark_ms = excluded.last_mark_ms`,
+          )
+          .run(provider, Math.max(0, Math.round(input.escalations)), input.lastMarkedAt);
+        return { ok: true, value: { written: true } };
+      });
+    },
+  };
+
   const store: ModelStateStore = {
     path,
     readOnly,
 
     cooldownFor(input) {
       const atMs = input.nowMs ?? now();
-      const key = `${input.provider}\u0000${input.model}`;
+      const provider = cooldownProviderKey(input.provider);
+      const key = `${provider}\u0000${input.model}`;
       const cached = cooldownCache.get(key);
       if (cached !== undefined && atMs - cached.atMs <= cacheMaxAgeMs) return cached.value;
       const result = read("cooldownFor", () =>
-        activeCooldown({ provider: input.provider, model: input.model, atMs }),
+        activeCooldown({ provider, model: input.model, atMs }),
       );
       // Never cache a failed read: a transient SQLite error must not become a
       // one-second window in which the model looks healthy.
@@ -619,30 +1363,59 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
       return result;
     },
 
+    listCooldowns(input) {
+      const atMs = input?.nowMs ?? now();
+      return read("listCooldowns", () =>
+        database
+          .prepare(
+            `SELECT provider, model, until_ms, reason, retry_after_ms, cause, escalations, last_mark_ms
+               FROM cooldown
+              WHERE until_ms > ?
+              ORDER BY provider, model`,
+          )
+          .all(atMs)
+          .flatMap((raw) => {
+            const row = cooldownRowOf(raw);
+            return row === undefined ? [] : [row];
+          }),
+      );
+    },
+
+    invalidateCooldownCache() {
+      invalidateCache();
+    },
+
     markCooldown(input) {
       const atMs = input.nowMs ?? now();
       const hinted = input.hinted === true;
-      const providerScoped = input.model === undefined;
+      const provider = cooldownProviderKey(input.provider);
+      // Only a marker with a provider *and* no model is provider-wide. A bare
+      // model id (absent provider) is endpoint-specific and must not feed the
+      // provider's escalation ladder.
+      const providerScoped = input.model === undefined && provider !== PROVIDER_SCOPE_MODEL;
       const model = input.model ?? PROVIDER_SCOPE_MODEL;
       const requestedMs = Math.max(0, Math.round(input.durationMs));
       return write("markCooldown", () => {
         // Only a provider-wide, unhinted guess escalates. A hint is authoritative
         // and clears the ladder; a model-scoped window is endpoint-specific and
         // never escalates.
-        const escalations = providerScoped
-          ? applyEscalation({ database, provider: input.provider, atMs, hinted })
-          : 1;
+        const rung = providerScoped
+          ? applyEscalation({ database, provider, atMs, hinted })
+          : undefined;
         const ceilingMs = MAX_ESCALATED_COOLDOWN_SECONDS * 1_000;
         const windowMs =
-          providerScoped && !hinted
-            ? Math.min(requestedMs * COOLDOWN_ESCALATION_FACTOR ** (escalations - 1), ceilingMs)
+          providerScoped && !hinted && rung !== undefined
+            ? Math.min(requestedMs * COOLDOWN_ESCALATION_FACTOR ** (rung - 1), ceilingMs)
             : requestedMs;
         const record: CooldownRecord = {
-          provider: input.provider,
+          provider,
           model,
           untilMs: atMs + windowMs,
           reason: input.reason,
           retryAfterMs: windowMs,
+          lastMarkedAt: atMs,
+          ...(providerScoped && input.cause !== undefined ? { cause: input.cause } : {}),
+          ...(providerScoped && !hinted && rung !== undefined ? { escalations: rung } : {}),
         };
         upsertCooldown(database, record);
         return { ok: true, value: record };
@@ -831,9 +1604,11 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
     prune(nowMs) {
       const atMs = nowMs ?? now();
       return write("prune", () => {
-        const cooldowns = database
-          .prepare("DELETE FROM cooldown WHERE until_ms + ? <= ?")
-          .run(COOLDOWN_ESCALATION_MEMORY_MS, atMs);
+        // An expired window is invisible to every reader (`until_ms > now`), so
+        // retaining it for diagnostics would only grow the table between
+        // prunes. The ladder outlives its window by the escalation memory, which
+        // is what keeps a weekly limit from being re-probed on every reset.
+        const cooldowns = database.prepare("DELETE FROM cooldown WHERE until_ms <= ?").run(atMs);
         database
           .prepare("DELETE FROM cooldown_ladder WHERE last_mark_ms + ? <= ?")
           .run(COOLDOWN_ESCALATION_MEMORY_MS, atMs);
@@ -857,7 +1632,75 @@ export function openModelStateStore(options: ModelStateStoreOptions = {}): Model
     },
   };
 
+  seederByStore.set(store, seeder);
+
   return { ok: true, store };
+}
+
+/**
+ * Write one replayed window, honouring the two migration rules: an expired row is
+ * not created, and an existing row that ends later is kept, so a migration can
+ * never shorten a live window.
+ */
+function seedCooldownRow(
+  database: SqliteDatabaseLike,
+  input: {
+    provider: string;
+    model: string;
+    providerScoped: boolean;
+    atMs: number;
+    untilMs: number;
+    reason: string;
+    lastMarkedAt: number | undefined;
+    cause: CooldownCause | undefined;
+    escalations: number | undefined;
+  },
+): boolean {
+  if (input.untilMs <= input.atMs) return false;
+  const existing = asRow(
+    database
+      .prepare("SELECT until_ms FROM cooldown WHERE provider = ? AND model = ?")
+      .get(input.provider, input.model),
+  );
+  if (existing !== undefined && readNumber(existing, "until_ms") >= input.untilMs) return false;
+  const ceilingMs = input.atMs + MAX_ESCALATED_COOLDOWN_SECONDS * 1_000;
+  // An escalated (unhinted) window keeps the 24 h ceiling; a hinted or
+  // model-scoped window is authoritative and is replayed exactly.
+  const untilMs =
+    input.providerScoped && input.escalations !== undefined
+      ? Math.min(input.untilMs, ceilingMs)
+      : input.untilMs;
+  upsertCooldown(database, {
+    provider: input.provider,
+    model: input.model,
+    untilMs,
+    reason: input.reason,
+    retryAfterMs: untilMs - input.atMs,
+    lastMarkedAt: input.lastMarkedAt ?? input.atMs,
+    ...(input.providerScoped && input.cause !== undefined ? { cause: input.cause } : {}),
+    ...(input.providerScoped && input.escalations !== undefined
+      ? { escalations: input.escalations }
+      : {}),
+  });
+  return true;
+}
+
+/** One cooldown row from a database row, or undefined when it is unreadable. */
+function cooldownRowOf(raw: unknown): CooldownRow | undefined {
+  const row = asRow(raw);
+  if (row === undefined) return undefined;
+  const cause = readString(row, "cause");
+  const escalations = readOptionalNumber(row, "escalations");
+  return {
+    provider: readString(row, "provider"),
+    model: readString(row, "model"),
+    untilMs: readNumber(row, "until_ms"),
+    reason: readString(row, "reason"),
+    retryAfterMs: readNumber(row, "retry_after_ms"),
+    lastMarkedAt: readNumber(row, "last_mark_ms"),
+    ...(cause === "quota" || cause === "unconfigured" ? { cause } : {}),
+    ...(escalations === undefined ? {} : { escalations }),
+  };
 }
 
 function readCapacityRow(
@@ -941,14 +1784,26 @@ function applyEscalation(input: {
 function upsertCooldown(database: SqliteDatabaseLike, record: CooldownRecord): void {
   database
     .prepare(
-      `INSERT INTO cooldown (provider, model, until_ms, reason, retry_after_ms)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO cooldown (provider, model, until_ms, reason, retry_after_ms, cause, escalations, last_mark_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(provider, model) DO UPDATE SET
          until_ms = excluded.until_ms,
          reason = excluded.reason,
-         retry_after_ms = excluded.retry_after_ms`,
+         retry_after_ms = excluded.retry_after_ms,
+         cause = excluded.cause,
+         escalations = excluded.escalations,
+         last_mark_ms = excluded.last_mark_ms`,
     )
-    .run(record.provider, record.model, record.untilMs, record.reason, record.retryAfterMs);
+    .run(
+      record.provider,
+      record.model,
+      record.untilMs,
+      record.reason,
+      record.retryAfterMs,
+      record.cause ?? null,
+      record.escalations ?? null,
+      record.lastMarkedAt ?? 0,
+    );
 }
 
 function deleteLease(

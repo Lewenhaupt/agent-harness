@@ -90,7 +90,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | File | Purpose |
 |---|---|
 | `src/model-classes.ts` | Model classes — named capability tiers for Belayd sub-agents |
-| `src/model-cooldown.ts` | Model cooldown store with optional file persistence |
+| `src/model-cooldown.ts` | Routing's cooldown adapter over the shared model-state store, plus the one-time legacy JSON import (bd-256) |
 | `src/model-state-store.ts` | Shared model-state SQLite store — cooldown, capacity/lease (renewed, ownership-checked), spend (bd-187) |
 | `src/provider-policy.ts` | Dispatch cooldown, capacity leases (TTL env + heartbeat) and spend over the shared store, plus the retry budget and attribution holder |
 | `src/provider-wrapper.ts` | Structural pi-ai provider wrapper and runtime-agnostic `installProviderPolicy` (bd-187) |
@@ -102,7 +102,11 @@ barrel — a module whose symbols are not re-exported there is internal.
 
 The shared model-state store lives at
 `$XDG_STATE_HOME/belayd/model-state.sqlite` (`BELAYD_MODEL_STATE_FILE`
-overrides), WAL mode, alongside proof/metrics/audit state.
+overrides), WAL mode, alongside proof/metrics/audit state. It is the **one**
+cooldown truth (bd-256): the routing adapter (`src/model-cooldown.ts`) and the
+provider wrapper both read and write it. A set `BELAYD_MODEL_COOLDOWN_FILE`
+relocates the store beside that retired JSON path (`x.json` → `x.sqlite`) and
+the still-active windows are imported once.
 
 ### worktree
 

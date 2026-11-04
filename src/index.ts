@@ -1122,7 +1122,6 @@ export {
 } from "./model-classes.js";
 export type {
   CooldownEntry,
-  CooldownFs,
   CooldownMarkOptions,
   CooldownScope,
   ModelCooldownStore,
@@ -1161,6 +1160,7 @@ export type {
   MarkCooldownInput,
   ModelStateOpen,
   ModelStateResult,
+  ModelStateSeeder,
   ModelStateStore,
   ModelStateStoreOptions,
   ReleaseCapacityInput,
@@ -1177,7 +1177,9 @@ export {
   MODEL_STATE_SCHEMA_VERSION,
   openModelStateStore,
   PROVIDER_SCOPE_MODEL,
+  resetSharedModelStateStore,
   resolveModelStatePath,
+  sharedModelStateStore,
 } from "./model-state-store.js";
 export type {
   AppendModelTelemetryOptions,

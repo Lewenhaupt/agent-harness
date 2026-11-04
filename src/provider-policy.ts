@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 
 import { modelClassOf } from "./model-classes.js";
 import type {
+  CooldownCause,
   CooldownRecord,
   LeaseRenewal,
   ModelStateResult,
@@ -248,6 +249,18 @@ function isProviderScopedFailure(kind: FailureKind): boolean {
   return kind === "quota" || kind === "unconfigured";
 }
 
+/**
+ * Stable cause tag for a provider-wide failure, matching the spawn loop's
+ * `providerCooldownCause`. It is persisted on the window so routing's capacity
+ * probe and skip rows can distinguish a spent bucket from a missing credential
+ * without matching display text.
+ */
+function causeOf(kind: FailureKind): CooldownCause | undefined {
+  if (kind === "quota") return "quota";
+  if (kind === "unconfigured") return "unconfigured";
+  return undefined;
+}
+
 function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -320,12 +333,14 @@ export function recordFailure(options: {
   const providerScoped = isProviderScopedFailure(classification.kind) && options.provider !== "";
   const durationMs = Math.round(classification.cooldownSeconds * 1_000);
   const reason = classification.reason ?? classification.kind;
+  const cause = providerScoped ? causeOf(classification.kind) : undefined;
   return store.markCooldown({
     provider: options.provider,
     model: providerScoped ? undefined : options.model,
     durationMs,
     reason,
     hinted: classification.cooldownHinted === true,
+    ...(cause === undefined ? {} : { cause }),
     nowMs: options.nowMs,
   });
 }

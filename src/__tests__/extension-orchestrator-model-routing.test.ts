@@ -13,7 +13,7 @@
  * session, lease or workflow state exists.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,6 +22,8 @@ import { createLaunch } from "../../extensions/capabilities/launch.js";
 import { type CapacityCache, createCapacityCache } from "../capacity-cache.js";
 import { buildHandoff } from "../handoff.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
+import type { ModelStateStore } from "../model-state-store.js";
+import { modelStatePathForCooldownFile, openModelStateStore } from "../model-state-store.js";
 import { workflowStateFilePath } from "../workflow-state.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────────
@@ -113,31 +115,53 @@ const ALL_PROVIDERS = ["llmgateway", "opencode-go", "commandcode", "openrouter"]
 let projectRoot: string;
 let worktreePath: string;
 let cooldownPath: string;
+/** The launch's own connection; a peer write opens its own (see writeCooldowns). */
+let stateStore: ModelStateStore;
+
+function openStateStore(): ModelStateStore {
+  const opened = openModelStateStore({ path: modelStatePathForCooldownFile(cooldownPath) });
+  if (!opened.ok) throw new Error(opened.error);
+  return opened.store;
+}
 
 beforeEach(() => {
   projectRoot = mkdtempSync(join(tmpdir(), "belayd-launch-routing-"));
   worktreePath = `${projectRoot}.feat-bd-229`;
   mkdirSync(worktreePath, { recursive: true });
   cooldownPath = join(projectRoot, "cooldowns.json");
+  stateStore = openStateStore();
   daemon.clear();
 });
 
 afterEach(() => {
+  stateStore.close();
   rmSync(projectRoot, { recursive: true, force: true });
   rmSync(worktreePath, { recursive: true, force: true });
   mockHttpRequest.mockClear();
 });
 
-/** Write provider cooldowns in the shape the cooldown store persists. */
+/**
+ * Spend providers the way another process does: a second connection to the one
+ * shared model-state store (bd-256). The launch's own store is created first in
+ * the tests that need a write-after-creation, so only its preflight/in-session
+ * refresh can make the write visible.
+ */
 function writeCooldowns(providers: readonly string[], resetInMinutes = 120): void {
-  const until = Date.now() + resetInMinutes * 60_000;
-  const entries = Object.fromEntries(
-    providers.map((provider) => [
-      provider,
-      { until, reason: "Quota/credit/rate limit (HTTP 402).", cause: "quota" },
-    ]),
-  );
-  writeFileSync(cooldownPath, JSON.stringify({ version: 1, providers: entries, models: {} }));
+  const opened = openModelStateStore({ path: modelStatePathForCooldownFile(cooldownPath) });
+  if (!opened.ok) throw new Error(opened.error);
+  try {
+    for (const provider of providers) {
+      opened.store.markCooldown({
+        provider,
+        durationMs: resetInMinutes * 60_000,
+        reason: "Quota/credit/rate limit (HTTP 402).",
+        cause: "quota",
+        nowMs: Date.now(),
+      });
+    }
+  } finally {
+    opened.store.close();
+  }
 }
 
 /**
@@ -146,7 +170,7 @@ function writeCooldowns(providers: readonly string[], resetInMinutes = 120): voi
  * composer uses. `capacity` can be injected to isolate one signal.
  */
 function createTestLaunch(options: { enabled?: boolean; capacity?: CapacityCache } = {}) {
-  const cooldownStore = createModelCooldownStore({ filePath: cooldownPath });
+  const cooldownStore = createModelCooldownStore({ store: stateStore, filePath: cooldownPath });
   const capacity =
     options.capacity ??
     createCapacityCache({

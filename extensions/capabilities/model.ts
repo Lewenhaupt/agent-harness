@@ -24,7 +24,7 @@ import {
   shouldWarnFlushFailure,
 } from "../../src/model-session-state.js";
 import type { ModelStateStore } from "../../src/model-state-store.js";
-import { defaultModelStatePath, openModelStateStore } from "../../src/model-state-store.js";
+import { sharedModelStateStore } from "../../src/model-state-store.js";
 import { formatModelTelemetrySummary } from "../../src/model-telemetry.js";
 import type { ProviderPolicy } from "../../src/provider-policy.js";
 import {
@@ -40,15 +40,21 @@ import type {
 import { setDispatchAttribution, wrapProviderCollection } from "../../src/provider-wrapper.js";
 
 // limit, subsequent spawns in this session skip it until the cooldown lapses.
-// Persisted to disk so cooldowns survive orchestrator restarts; the file is
-// shared with other fleet members, so the capacity probe re-reads it (refresh)
-// and an unhinted quota window escalates on repeat instead of re-probing.
-// Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback entirely.
-export const modelCooldown = createModelCooldownStore({ filePath: defaultModelCooldownPath() });
+// One truth (bd-256): the cooldowns live in the shared model-state store, the
+// same one the provider wrapper writes, so a verdict from either path steers the
+// other. The retired JSON file is imported once on first use; it is never
+// written again. Kill switch: BELAYD_MODEL_FALLBACK=0 disables candidate fallback
+// entirely.
+export const modelCooldown = createModelCooldownStore({
+  store: () => sharedModelStateStoreInstance(),
+  // Lazy so the retired path is read when the import first runs, not at module
+  // load: tests (and a restarted session) may set the env var later.
+  filePath: () => defaultModelCooldownPath(),
+});
 // Pre-dispatch capacity signal. When a usage/reset endpoint is configured it
-// is probed directly; otherwise the persisted cooldown store's provider windows
-// stand in. Results are cached (TTL) so a multi-phase workflow re-probes at
-// most once per TTL, and mid-workflow 429s are recorded back into the cache.
+// is probed directly; otherwise the shared store's provider windows stand in.
+// Results are cached (TTL) so a multi-phase workflow re-probes at most once per
+// TTL, and mid-workflow 429s are recorded back into the cache.
 const capacityProbeUrl = process.env[CAPACITY_PROBE_URL_ENV];
 // Session-scoped model-routing state (bd-116): the pre-dispatch capacity
 // cache, the per-workflow telemetry store, and the per-destination telemetry
@@ -59,7 +65,7 @@ export const modelState = createModelSessionState({
     capacityProbeUrl !== undefined && capacityProbeUrl !== ""
       ? createCapacityCache({
           // A configured-but-unreachable endpoint must not silently disable the
-          // capacity signal: fall back to the persisted cooldown store and warn
+          // capacity signal: fall back to the shared cooldown windows and warn
           // (throttled inside the probe) that the endpoint is not delivering.
           probe: createFallbackCapacityProbe(
             createEndpointCapacityProbe({
@@ -99,29 +105,19 @@ export function createModelRouting(): {
 
 // ── Shared model-state store (bd-187) ─────────────────────────────────
 // Cooldown, capacity and spend live in one SQLite file so every repo daemon on
-// the host sees the same budget. The store is opened lazily on the first
-// dispatch decision, not at import time: extension tests load this module and
-// must not create the operator's state file. A store that cannot be opened (or
-// a read-only one) degrades to a permissive policy, never to a provider error.
+// the host sees the same budget. The store is opened lazily on first use (a
+// routing read or a dispatch decision), never at import time: extension tests
+// load this module and must not create the operator's state file. The accessor
+// lives in the library so the routing adapter's default store and the wrapper's
+// policy resolve the same instance; it retries a transient open failure with a
+// bounded backoff, because since bd-256 this store is the only cooldown truth
+// and memoizing one failure as `null` would switch off both paths for a session.
 export const MODEL_STATE_WRAPPER_ENV = "BELAYD_MODEL_STATE_WRAPPER";
 export const modelStateWrapperEnabled = process.env[MODEL_STATE_WRAPPER_ENV] !== "0";
 
-let sharedModelStateStore: ModelStateStore | null | undefined;
-
-/** The process-wide store, or null when it cannot be opened. */
+/** The process-wide store, or null when it cannot be opened (yet). */
 export function sharedModelStateStoreInstance(): ModelStateStore | null {
-  if (sharedModelStateStore === undefined) {
-    const opened = openModelStateStore({ path: defaultModelStatePath() });
-    if (!opened.ok) {
-      console.warn(
-        `[belayd-harness] shared model state store unavailable (${opened.error}); provider policy is permissive.`,
-      );
-      sharedModelStateStore = null;
-    } else {
-      sharedModelStateStore = opened.store;
-    }
-  }
-  return sharedModelStateStore;
+  return sharedModelStateStore();
 }
 
 /** One-time warned TTL resolver: one policy is built per wrapped provider. */

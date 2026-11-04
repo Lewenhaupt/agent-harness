@@ -72,7 +72,7 @@ describe("quality-gate retry model selection", () => {
     mockSpawnAgentProcess.mockResolvedValueOnce(makeResult("opencode-go/mimo-v2.6-flash"));
     const { agent, gateCalls } = agentWithFailingOnceGate();
     // The retry's requested model sits on a provider with an active cooldown.
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("llmgateway", 3600, "quota", { cause: "quota" });
     const onSelection = vi.fn();
     const recordAttempt = vi.fn();
@@ -137,7 +137,7 @@ describe("quality-gate retry model selection", () => {
       systemPrompt: "",
       qualityGate: gate,
     };
-    const store = createModelCooldownStore(() => 0);
+    const store = createModelCooldownStore({ now: () => 0, store: "memory" });
     store.markProviderCooldown("llmgateway", 3600, "quota", { cause: "quota" });
     const selections: RunModelSelection[] = [];
 
