@@ -49,7 +49,8 @@ const HUMAN_BLOCKED_CONTROL_TOOLS: readonly string[] = [
  * @param allowedExtraPhases - Phases whose tools stay callable but are not
  *   required steps (defaults to none)
  * @param awaitingHuman - Set while the workflow waits on a human answer
- *   (bd-152). Phase tools refuse until an answer resolves the bd gate.
+ *   (bd-152). Phase tools refuse until an answer resolves the bd gate, unless
+ *   the wait is publication-only (bd-252), which affects the PR body alone.
  * @returns `{ allowed: true, reason: undefined }` if allowed,
  *          `{ allowed: false, reason: string }` if blocked
  */
@@ -110,6 +111,10 @@ export function checkToolAllowed(
  * `belayd_ask_human`, `belayd_status`, `belayd_doctor`, `belayd_stop_task`,
  * read/grep/bd/… — stays callable, so the session can still ask again, report,
  * and be stopped.
+ *
+ * A publication-only wait (bd-252) refuses nothing: its answer changes what may
+ * appear in a PR body, and withholding is already the default, so refusing the
+ * fix loop bought no safety and stalled every review round that matched a rule.
  */
 function awaitingHumanRefusal(
   toolName: string,
@@ -117,6 +122,7 @@ function awaitingHumanRefusal(
   extras: readonly string[],
   awaitingHuman: AwaitingHuman,
 ): string | undefined {
+  if (awaitingHuman.publicationOnly === true) return undefined;
   const toolBase = toolName.startsWith("belayd_") ? toolName.slice(7) : "";
   const isWorkflowPhase = order.includes(toolBase) || extras.includes(toolBase);
   if (!isWorkflowPhase && !HUMAN_BLOCKED_CONTROL_TOOLS.includes(toolName)) return undefined;

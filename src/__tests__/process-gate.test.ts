@@ -964,6 +964,23 @@ describe("checkToolAllowed while awaiting a human answer (bd-152)", () => {
     expect(result).toEqual({ allowed: true });
   });
 
+  it("allows phase and control tools while the wait is publication-only (bd-252)", () => {
+    // The publication answer affects the PR body, and withholding is already the
+    // default, so refusing the fix loop bought no safety. The wait marker is the
+    // only difference from the plain ask above.
+    const publicationOnly = { beadId: "bd-183", askedAt, publicationOnly: true as const };
+    for (const tool of [
+      "belayd_implement",
+      "belayd_review",
+      "belayd_commit",
+      "belayd_start_followup",
+      "belayd_stack_rebase",
+      "belayd_proof_verifier",
+    ]) {
+      expect(check(tool, publicationOnly), `${tool} was refused`).toEqual({ allowed: true });
+    }
+  });
+
   it("explains a corrupt ask time instead of throwing", () => {
     const result = check("belayd_implement", { beadId: "bd-152", askedAt: Number.NaN });
     expect(result.allowed).toBe(false);

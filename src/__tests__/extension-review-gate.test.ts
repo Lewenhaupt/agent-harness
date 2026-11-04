@@ -21,6 +21,8 @@ import {
   type HumanGateDeps,
   humanAnswerGuidanceLines,
   humanAnswerMessage,
+  nextStepBlockLines,
+  reapHumanGateForTask,
   stopHumanAnswerPoll,
 } from "../../extensions/capabilities/human-gate.js";
 import {
@@ -659,13 +661,54 @@ describe("runCompleteLoopHint", () => {
     );
   });
 
-  it("withholds the directive only while a human wait is live", () => {
-    // A member blocked by `belayd_ask_human` (or the bd-183 publication gate)
-    // cannot call the next phase tool, so the run-complete content must not
-    // offer it. A gate is not a function of the review text.
+  it("withholds the directive while a blocking human wait is live", () => {
+    // A member blocked by `belayd_ask_human` cannot call the next phase tool, so
+    // the run-complete content must not offer it. A gate is not a function of the
+    // review text.
     const state = makeState();
     state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000 };
     expect(runCompleteLoopHint({ delivered, state })).toBe("");
+  });
+
+  it("keeps the directive for a publication-only wait (bd-252)", () => {
+    // The publication decision affects the PR body only, so the fix loop still
+    // runs. Withholding this hint was how a review round stalled waiting for an
+    // answer nobody needed before fixing anything.
+    const state = makeState();
+    state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000, publicationOnly: true };
+    const hint = runCompleteLoopHint({ delivered, state });
+    expect(hint).toContain("**When review findings remain:**");
+    expect(hint).toContain("belayd_test");
+  });
+});
+
+describe("publication-only wait guidance (bd-252)", () => {
+  const makeState = () => {
+    const state = createInitialSessionState();
+    state.gateActive = true;
+    state.currentTaskId = "bd-1";
+    return state;
+  };
+
+  it("keeps the next step and says the workflow continues", () => {
+    const state = makeState();
+    state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000, publicationOnly: true };
+    expect(nextStepBlockLines(state, "**Next:** belayd_implement")).toEqual([
+      "",
+      "**Next:** belayd_implement",
+    ]);
+    const guidance = humanAnswerGuidanceLines(state).join("\n");
+    expect(guidance).toContain("Publication choice pending for bd-1");
+    expect(guidance).toContain("the workflow continues");
+    expect(guidance).not.toContain("phase tools are refused");
+  });
+
+  it("keeps the blocking wording for a plain ask wait", () => {
+    const state = makeState();
+    state.awaitingHuman = { beadId: "bd-1", askedAt: 1_000 };
+    expect(nextStepBlockLines(state, "**Next:** belayd_implement")).toEqual([]);
+    const guidance = humanAnswerGuidanceLines(state).join("\n");
+    expect(guidance).toContain("phase tools are refused until the answer arrives");
   });
 });
 
@@ -902,6 +945,104 @@ describe("sensitive review findings (bd-183)", () => {
     ui: { notify: () => {} },
   } as unknown as ExtensionContext;
 
+  it("records a publication answer posted just before completion, then resolves the gate", async () => {
+    // bd-252: this wait no longer blocks phases, so completion can race the
+    // answer. Record first, resolve after; resolving first loses the wait key.
+    const state = makeState();
+    const deps = makeDeps(state);
+    const record = buildReviewFindingsRecord({ taskId: "bd-1", text: SENSITIVE_REVIEW });
+    if (record === undefined) throw new Error("expected a record");
+    mkdirSync(join(cwd, ".belayd"), { recursive: true });
+    writeFileSync(reviewFindingsRecordPath(cwd), JSON.stringify(record));
+    state.awaitingHuman = {
+      beadId: "bd-1",
+      askedAt: Date.parse("2026-10-26T20:00:00Z"),
+      gateId: "bd-160",
+      publicationOnly: true,
+      reviewFindings: { round: 1 },
+    };
+    bd.reply("gate list bd-1 --json", { stdout: openGate("2026-10-26T20:00:00Z") });
+    bd.reply("comments bd-1 --json", {
+      stdout: answerThread("2026-10-26T20:05:00Z", "publish it"),
+    });
+    bd.reply("gate resolve bd-160", { stdout: "resolved" });
+
+    await reapHumanGateForTask({ ctx, state, beadId: "bd-1", deps });
+
+    expect(readRecord().findings[0]?.publication).toMatchObject({
+      kind: "publish",
+      source: "human",
+    });
+    const commentIndex = bd.calls.findIndex(
+      (call) => bd.keyOf(call.argv) === "comments bd-1 --json",
+    );
+    const resolveIndex = bd.calls.findIndex(
+      (call) => bd.keyOf(call.argv) === "gate resolve bd-160",
+    );
+    expect(commentIndex).toBeGreaterThanOrEqual(0);
+    expect(resolveIndex).toBeGreaterThan(commentIndex);
+    expect(state.awaitingHuman).toBeUndefined();
+  });
+
+  it("resolves an unanswered publication gate at completion and leaves the record withheld", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const record = buildReviewFindingsRecord({ taskId: "bd-1", text: SENSITIVE_REVIEW });
+    if (record === undefined) throw new Error("expected a record");
+    mkdirSync(join(cwd, ".belayd"), { recursive: true });
+    writeFileSync(reviewFindingsRecordPath(cwd), JSON.stringify(record));
+    state.awaitingHuman = {
+      beadId: "bd-1",
+      askedAt: Date.parse("2026-10-26T20:00:00Z"),
+      gateId: "bd-160",
+      publicationOnly: true,
+      reviewFindings: { round: 1 },
+    };
+    bd.reply("gate list bd-1 --json", { stdout: openGate("2026-10-26T20:00:00Z") });
+    bd.reply("comments bd-1 --json", { stdout: "[]" });
+    bd.reply("gate resolve bd-160", { stdout: "resolved" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let noAnswerWarnings = 0;
+    try {
+      await reapHumanGateForTask({ ctx, state, beadId: "bd-1", deps });
+      noAnswerWarnings = warn.mock.calls.filter(
+        (args) => typeof args[0] === "string" && args[0].includes("without a publication answer"),
+      ).length;
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(readRecord().findings[0]?.publication).toBeUndefined();
+    expect(bd.calls.some((call) => bd.keyOf(call.argv) === "gate resolve bd-160")).toBe(true);
+    expect(noAnswerWarnings).toBe(1);
+    expect(state.awaitingHuman).toBeUndefined();
+  });
+
+  it("still resolves the gate when the completion answer check fails", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    state.awaitingHuman = {
+      beadId: "bd-1",
+      askedAt: Date.parse("2026-10-26T20:00:00Z"),
+      gateId: "bd-160",
+      publicationOnly: true,
+      reviewFindings: { round: 1 },
+    };
+    bd.reply("gate list bd-1 --json", { error: "bd: database unreachable" });
+    bd.reply("gate resolve bd-160", { stdout: "resolved" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(
+        reapHumanGateForTask({ ctx, state, beadId: "bd-1", deps }),
+      ).resolves.toBeUndefined();
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(bd.calls.some((call) => bd.keyOf(call.argv) === "gate resolve bd-160")).toBe(true);
+    expect(state.awaitingHuman).toBeUndefined();
+  });
+
   beforeEach(() => {
     cwd = mkdtempSync(join(tmpdir(), "belayd-review-gate-sensitive-"));
     bd.reset();
@@ -927,6 +1068,11 @@ describe("sensitive review findings (bd-183)", () => {
     });
     try {
       expect(outcome.gateOpened).toBe(true);
+      // bd-252: this wait decides the PR body, not whether the fix loop may run.
+      expect(state.awaitingHuman).toMatchObject({
+        publicationOnly: true,
+        reviewFindings: { round: 1 },
+      });
       const gateCall = bd.calls.find((call) => bd.keyOf(call.argv).startsWith("gate create"));
       expect(gateCall?.argv.join(" ")).toContain("sensitive findings (round 1)");
       expect(gateCall?.argv.join(" ")).toContain("publication decision");

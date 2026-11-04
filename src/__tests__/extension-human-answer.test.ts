@@ -1173,6 +1173,63 @@ describe("human wait discovery after a restart", () => {
       "hugo answered: option b, ship it",
     );
   });
+
+  it("re-arms a rediscovered review gate as publication-only (bd-252)", async () => {
+    // The title marker is all a restart has: without it the rebuilt wait would
+    // block the fix loop again. `reviewFindings` must stay unset, so an answer to
+    // a wait this process did not arm cannot release withheld findings (bd-183).
+    bd.reply(GATE_LIST_KEY, {
+      stdout: JSON.stringify([
+        {
+          id: "bd-159",
+          title: "belayd-review: bd-152 sensitive findings (round 1)",
+          status: "open",
+          issue_type: "gate",
+          await_type: "human",
+          created_at: "2026-10-26T20:00:00Z",
+        },
+      ]),
+    });
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+
+    const { getSessionState } = await import("../../extensions/index.js");
+    const state = getSessionState(ctx);
+    expect(state.awaitingHuman).toMatchObject({ beadId: "bd-152", publicationOnly: true });
+    expect(state.awaitingHuman?.reviewFindings).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
+    stopHumanAnswerPoll(state);
+  });
+
+  it("keeps a drifted or wrong-bead review title blocking (bd-252)", async () => {
+    // The full shape and the blocked bead id are both required; a bare-ish title
+    // must fail closed and keep refusing phase tools.
+    bd.reply(GATE_LIST_KEY, {
+      stdout: JSON.stringify([
+        {
+          id: "bd-159",
+          title: "belayd-review: bd-999 sensitive findings (round 1)",
+          status: "open",
+          issue_type: "gate",
+          await_type: "human",
+          created_at: "2026-10-26T20:00:00Z",
+        },
+      ]),
+    });
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+
+    const { getSessionState } = await import("../../extensions/index.js");
+    const state = getSessionState(ctx);
+    expect(state.awaitingHuman).toMatchObject({ beadId: "bd-152" });
+    expect(state.awaitingHuman?.publicationOnly).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
+    stopHumanAnswerPoll(state);
+  });
 });
 
 /**

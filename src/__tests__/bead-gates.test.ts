@@ -163,6 +163,7 @@ describe("parseOpenHumanGate", () => {
     expect(parseOpenHumanGate([openHumanGate], "bd-152")).toEqual({
       gateId: "bd-159",
       createdAt: "2026-10-26T20:14:26Z",
+      title: "Gate: human",
     });
   });
 
@@ -171,6 +172,7 @@ describe("parseOpenHumanGate", () => {
     expect(parseOpenHumanGate(openHumanGate, "bd-152")).toEqual({
       gateId: "bd-159",
       createdAt: "2026-10-26T20:14:26Z",
+      title: "Gate: human",
     });
     expect(parseOpenHumanGate([{ ...openHumanGate, status: "closed" }], "bd-152")).toBeUndefined();
   });
@@ -186,6 +188,21 @@ describe("parseOpenHumanGate", () => {
 
   it("never returns the blocked bead id as a gate id", () => {
     expect(parseOpenHumanGate([openHumanGate], "bd-159")).toBeUndefined();
+  });
+
+  it("carries the title so a restart can classify the wait (bd-252)", () => {
+    // The publication gate is the only wait whose answer does not block phase
+    // tools, and its title marker is the only durable discriminator a restart has.
+    expect(
+      parseOpenHumanGate(
+        [{ ...openHumanGate, title: "belayd-review: bd-152 sensitive findings (round 1)" }],
+        "bd-152",
+      ),
+    ).toMatchObject({ title: "belayd-review: bd-152 sensitive findings (round 1)" });
+    expect(parseOpenHumanGate([{ ...openHumanGate, title: undefined }], "bd-152")).toEqual({
+      gateId: "bd-159",
+      createdAt: "2026-10-26T20:14:26Z",
+    });
   });
 });
 
@@ -221,7 +238,7 @@ describe("lookupOpenHumanGate", () => {
     expect(result).toEqual({
       ok: true,
       status: "open",
-      gate: { gateId: "bd-159", createdAt: "2026-10-26T20:14:26Z" },
+      gate: { gateId: "bd-159", createdAt: "2026-10-26T20:14:26Z", title: "Gate: human" },
     });
     expect(calls[0]?.argv).toEqual(["gate", "list", "bd-152", "--json"]);
     expect(calls[0]?.options).toMatchObject({ cwd: "/repo", timeoutInMs: BEAD_READ_TIMEOUT_MS });

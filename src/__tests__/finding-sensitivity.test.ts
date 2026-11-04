@@ -30,16 +30,27 @@ describe("classifyFindingSensitivity — sensitive rows", () => {
   // firing does.
   it.each([
     ["auth topic", "the authorization check is bypassed on the reset route"],
-    ["auth topic (authentication)", "authentication failure is swallowed"],
-    ["bearer mention", "hand-copied `Bearer` headers are trusted"],
+    [
+      "auth topic (authentication) with bypass",
+      "authentication failure is swallowed, which bypasses the check",
+    ],
+    ["bearer mention with a bypass", "hand-copied `Bearer` headers bypass rotation"],
     ["crypto topic", "the HMAC comparison is not constant time"],
-    ["crypto topic (encrypt)", "encrypting with a reused IV"],
-    ["secrets topic", "secrets are written to stdout on startup"],
-    ["token topic", "the access token is never rotated"],
-    ["session topic", "the cookie is set without HttpOnly"],
-    ["env topic", "process.env is read at module load"],
+    [
+      "crypto topic (encrypt) exposing plaintext",
+      "encrypting with a reused IV exposes the plaintext",
+    ],
+    // Restored bd-183 pins: the credential sink/lifecycle family carries them
+    // without a bare risk word (bd-252 review).
+    ["secrets topic with a sink", "secrets are written to stdout on startup"],
+    ["token lifecycle break", "the access token is never rotated"],
+    ["session topic with XSS exposure", "the cookie is set without HttpOnly, enabling XSS theft"],
+    [
+      "env topic with a misconfiguration leak",
+      "process.env is read at module load, so a misconfiguration leaks it",
+    ],
     ["private key block", "-----BEGIN RSA PRIVATE KEY----- leaked into a fixture"],
-    ["api key topic", "the api key is logged on every request"],
+    ["api key logged", "the api key is logged"],
     ["github token", "committed ghp_16C7e42F292c6912E7710c838347Ae178B4a in a test"],
     [
       "jwt",
@@ -63,7 +74,11 @@ describe("classifyFindingSensitivity — borderline rows are sensitive", () => {
   // asserted so a row cannot pass for the wrong reason (e.g. a `deny-path` row
   // firing through a security topic).
   it.each<[string, string, FindingSensitivityReasonKind]>([
-    ["a bare Bearer mention", "the `Bearer` scheme is accepted on every route", "security-topic"],
+    [
+      "a Bearer mention with a bypass",
+      "the `Bearer` scheme is accepted on every route, bypassing auth",
+      "security-topic",
+    ],
     ["a workflow file", "`.github/workflows/ci.yml` publishes on every tag", "deny-path"],
     [
       "an assignment-shaped token",
@@ -86,7 +101,7 @@ describe("classifyFindingSensitivity — borderline rows are sensitive", () => {
   it("represents every reason kind across the table", () => {
     const kinds = new Set(
       [
-        "`src/auth/session.ts:42` — session token is stale",
+        "`src/auth/session.ts:42` — session token is stale and leaked",
         "token = 8f14e45fceea167a5a36dedd4bea2543",
         "`secrets/prod.yaml` is readable",
         "`src/prоof/x.png` is unreviewed",
@@ -110,7 +125,11 @@ describe("classifyFindingSensitivity — normalisation and the refuse rule", () 
   // pass existed.
   it.each<[string, string, FindingSensitivityReasonKind]>([
     ["fullwidth deny path", "ｓｒｃ/ａｕｔｈ/ｓｅｓｓｉｏｎ.ts:42", "deny-path"],
-    ["fullwidth topic", "ＡＵＴＨＯＲＩＺＡＴＩＯＮ handling is wrong", "security-topic"],
+    [
+      "fullwidth topic",
+      "ＡＵＴＨＯＲＩＺＡＴＩＯＮ is bypassed on the admin route",
+      "security-topic",
+    ],
     ["fullwidth dot in a deny path", "．ｅｎｖ", "deny-path"],
     [
       "fullwidth credential assignment",
@@ -130,7 +149,9 @@ describe("classifyFindingSensitivity — normalisation and the refuse rule", () 
   });
 
   it("records the normalised match, so the gate reason stays readable", () => {
-    const verdict = classifyFindingSensitivity("ＡＵＴＨＯＲＩＺＡＴＩＯＮ handling is wrong");
+    const verdict = classifyFindingSensitivity(
+      "ＡＵＴＨＯＲＩＺＡＴＩＯＮ is bypassed on the admin route",
+    );
     expect(verdict.reasons.map((reason) => reason.match)).toContain("AUTHORIZATION");
   });
 
@@ -222,7 +243,7 @@ describe("classifyFindingSensitivity — hidden joins (compact pass)", () => {
       "credential-shaped",
     ],
     ["an em dash in a topic word", "au—th bypasses the admin route", "security-topic"],
-    ["a section sign in a topic word", "tok§en never rotates", "security-topic"],
+    ["a section sign in a topic word", "tok§en leaks on every request", "security-topic"],
     ["a middle dot in a home directory", "~/.ss·h is world readable", "deny-path"],
     ["a middle dot in an ssh key name", "`id_rs·a` sits in the repository root", "deny-path"],
     ["a middle dot in a key extension", "`legacy.p·fx` is committed", "deny-path"],
@@ -442,13 +463,17 @@ describe("classifyFindingSensitivity — the whitespace-deleted reading", () => 
     // The restriction that keeps the third reading usable: a prose sentence is not
     // a string of joined words, so the match stays the single word the topic rule saw.
     for (const [finding, match] of [
-      ["secrets are handled elsewhere", "secrets"],
-      ["the session cookie is fine — see notes", "session"],
+      // "leaked" also gives the sink family a credential-shaped reason; the
+      // topic reason is still the single word the plain-space reading saw.
+      ["secrets are leaked elsewhere", "secrets"],
+      ["the session cookie is logged in plaintext", "session"],
     ] as const) {
-      expect(classifyFindingSensitivity(finding)).toEqual({
-        sensitive: true,
-        reasons: [{ kind: "security-topic", match }],
-      });
+      const verdict = classifyFindingSensitivity(finding);
+      expect(verdict.sensitive).toBe(true);
+      expect(verdict.reasons).toContainEqual({ kind: "security-topic", match });
+      expect(verdict.reasons.some((reason) => reason.match.includes("whitespace removed"))).toBe(
+        false,
+      );
     }
   });
 
@@ -468,18 +493,17 @@ describe("classifyFindingSensitivity — the whitespace-deleted reading", () => 
     }
   });
 
-  it("gates ordinary prose that names a bare token (documented trade)", () => {
-    // The round-7 widening that made `tok§en` classify: a bare `token` is a
-    // security topic. The cost is documented noise on prose that merely mentions
-    // one; relaxing it would reopen the split, so it is pinned here.
+  it("publishes ordinary prose that only names a token (bd-252)", () => {
+    // bd-252 replaces the round-7 widening: `token` is still a security topic, but a
+    // topic word alone is no longer a disclosure question. "token bucket rate
+    // limiter is too small" is a reliability finding, so it publishes without a
+    // human answer. The split protection is unchanged: a credential shape still
+    // classifies unconditionally (see the split-invariance suite).
     for (const finding of [
       "token bucket rate limiter is too small",
       "rename the token in the parser",
     ]) {
-      expect(classifyFindingSensitivity(finding)).toEqual({
-        sensitive: true,
-        reasons: [{ kind: "security-topic", match: "token" }],
-      });
+      expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
     }
   });
 });
@@ -494,15 +518,15 @@ describe("classifyFindingSensitivity — the compact pass leaves ordinary prose 
     expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
   });
 
-  it("keeps a prose `auth` mention sensitive, which predates the compact pass", () => {
-    // The round-7 probe list expected "the auth flow — see the note" to publish. It
-    // does not: `auth` is a security topic in the primary pass, and the round-6
-    // classifier already returned the same verdict (verified before this change).
-    // Relaxing it would be a classifier change, not a test fix, so the row is
-    // pinned as sensitive and the deviation is reported instead.
+  it("publishes a prose `auth` mention with no risk signal (bd-252)", () => {
+    // The round-7 probe list expected "the auth flow — see the note" to publish and
+    // the classifier gated it on the topic word alone. bd-252 restores that
+    // expectation: `auth` names an area of the code, and "see the note" is not a
+    // disclosure. A real signal ("auth bypass", "auth flow leaks tokens") still
+    // gates through the risk table.
     expect(classifyFindingSensitivity("the auth flow — see the note")).toEqual({
-      sensitive: true,
-      reasons: [{ kind: "security-topic", match: "auth" }],
+      sensitive: false,
+      reasons: [],
     });
   });
 });
@@ -545,13 +569,195 @@ describe("classifyFindingSensitivity — not sensitive rows", () => {
   });
 });
 
+describe("classifyFindingSensitivity — bd-252 risk floors", () => {
+  it.each([
+    ["a non-ASCII arrow", "the lock is taken → then released"],
+    ["a check mark", "the retry succeeds ✓ on the second attempt"],
+    ["a sessions map without a lock", "the sessions map is written without a lock"],
+    ["process.env read twice", "process.env is read twice during startup"],
+    ["a token bucket", "the token bucket refills too slowly under load"],
+    ["an auth flow", "the auth flow returns early on every retry"],
+  ])("publishes %s without a human answer", (_label, finding) => {
+    // bd-252: a stray symbol cannot spell a keyword, and a topic word alone names
+    // an area of the code. Both used to open a publication gate that refused the
+    // fix loop (bd-233, rounds 1 and 4).
+    expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
+  });
+
+  it.each([
+    ["session tokens are logged in plaintext", "session"],
+    ["auth bypass on the admin route", "auth"],
+    ["SQL injection in the token lookup", "token"],
+  ])("keeps %s sensitive through a security-topic reason naming %s", (finding, topic) => {
+    const verdict = classifyFindingSensitivity(finding);
+    expect(verdict.sensitive).toBe(true);
+    expect(verdict.reasons).toContainEqual({ kind: "security-topic", match: topic });
+  });
+
+  it.each([
+    ["an env file", "`/.env` is committed"],
+    ["an ssh key", "`id_rsa` sits in the repository root"],
+    ["a GitHub token", "committed ghp_16C7e42F292c6912E7710c838347Ae178B4a in a test"],
+    ["a password assignment", "password = hunter2hunter2 in the fixture"],
+    ["a PEM header", "-----BEGIN RSA PRIVATE KEY----- leaked into a fixture"],
+    ["a letter lookalike", "`src/prоof/x.png` is unreviewed"],
+  ])("keeps a secret-bearing finding sensitive: %s", (_label, finding) => {
+    // AC2 does not depend on the risk floor: credentials, deny paths, anchors and
+    // letter lookalikes are unconditional reasons.
+    expect(classifyFindingSensitivity(finding).sensitive).toBe(true);
+  });
+});
+
+describe("classifyFindingSensitivity — credential sink and lifecycle (bd-252 review)", () => {
+  it.each([
+    // Sensitive: the credential noun is the subject of the lifecycle break.
+    ["a token lifecycle break", "the access token is never rotated"],
+    // Sensitive: copula + sink verb adjacency means the secret reached stdout.
+    ["secrets written to stdout", "secrets are written to stdout on startup"],
+    // Sensitive: the api key itself is the sink subject.
+    ["a logged api key", "the api key is logged"],
+    // Sensitive: the password itself is the sink subject.
+    ["a password written to stdout", "the password is written to stdout"],
+    // Sensitive: past-tense sink verb after a copula is still the same leak.
+    ["a leaked access token", "the access token was leaked"],
+  ])("records %s as a credential-shaped reason", (_label, finding) => {
+    // A credential noun used as the sink/lifecycle subject is a real signal; the
+    // risk floor alone would publish these raw (bd-183 regression).
+    const verdict = classifyFindingSensitivity(finding);
+    expect(verdict.sensitive).toBe(true);
+    expect(verdict.reasons.map((reason) => reason.kind)).toContain("credential-shaped");
+  });
+
+  // Direction: sensitive. Each row is an auxiliary chain a reviewer writes instead
+  // of the bare copula, so the sink arm has to read the chain (bd-252 review 3).
+  // A grammar that accepts only one connector publishes them raw.
+  it.each([
+    ["progressive", "the access token is being logged"],
+    ["perfect", "the access token has been logged"],
+    ["future modality", "the access token will be logged"],
+    ["ability modality", "the access token can be logged"],
+    ["interposed adverb", "the access token is accidentally logged"],
+    ["adverb plus context", "the access token is currently logged at debug level"],
+    ["passive adverb", "the secret is apparently written to the console"],
+    ["progressive over a container noun", "the credential cache is being written to disk"],
+    ["perfect over the session-material idiom", "session material was printed to stderr"],
+  ])("reads an %s auxiliary chain as the same sink", (_label, finding) => {
+    // The noun still has to be the clause subject; only the verb chain widens.
+    const verdict = classifyFindingSensitivity(finding);
+    expect(verdict.sensitive).toBe(true);
+    expect(verdict.reasons.map((reason) => reason.kind)).toContain("credential-shaped");
+  });
+
+  // Direction: not sensitive. Negation is the lifecycle arm's signal (`never
+  // rotated`), never the sink arm's: `is never logged` says the credential did not
+  // escape, so gating it charged a human answer for an absence claim.
+  it.each([
+    ["a negated copula sink", "the api key is never logged"],
+    ["a plain negation", "the api key is not logged"],
+    ["a negated plural sink", "passwords are never logged in this module"],
+  ])("does not read %s as a disclosure", (_label, finding) => {
+    expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
+  });
+
+  it.each([
+    ["a negated leak", "the access token is never leaked"],
+    ["a bare negated leak", "the token never leaked"],
+  ])("does not read %s through the sink arm", (_label, finding) => {
+    // The sink arm must not fire on negation. These rows still gate, through the
+    // topic+risk floor (`token` + the risk word `leaked`) — a fail-closed pairing
+    // that predates the sink family and is deliberately untouched here: the risk
+    // floor answers "is this a disclosure question", not "did the sink arm match".
+    const verdict = classifyFindingSensitivity(finding);
+    expect(verdict.reasons.map((reason) => reason.kind)).toEqual(["security-topic"]);
+  });
+
+  it.each([
+    // Non-sensitive: "bucket" is the subject; "log" belongs to the later clause.
+    ["a token bucket tuning note", "token bucket tuning: log this later"],
+    // Non-sensitive: "usage" is the subject and the sink verb describes metrics.
+    ["token usage metrics", "token usage is logged for metrics"],
+    // Non-sensitive: the password modifies "reset flow", not the audit write.
+    ["a password reset flow", "the password reset flow writes two audit rows"],
+    // Non-sensitive: the debug output is the subject of the sink verb.
+    ["handled secrets", "secrets are handled elsewhere and the debug output is fine"],
+    // Non-sensitive: the helper is the subject of "never called".
+    ["a token rotate helper", "the token rotate helper is never called"],
+    // Non-sensitive: no credential noun for the lock to apply to.
+    ["a sessions map lock", "the sessions map is written without a lock"],
+    // Non-sensitive: a read/write race on sessions is not a credential sink.
+    ["a sessions read/write race", "the sessions map is read before the write completes"],
+    // Non-sensitive: process.env is an environment read, not a file leak.
+    ["an env read", "process.env is read twice"],
+    // Non-sensitive: "full" is not a sink or a lifecycle break.
+    ["a full token bucket", "the token bucket is full"],
+    // Non-sensitive: "rotate" is the auxiliary of a bare verb, not a sink.
+    ["a token rotation policy", "the token rotates on a schedule"],
+  ])("keeps %s non-sensitive without noun-as-subject adjacency", (_label, finding) => {
+    // These are the prose rows the round-2 review caught: the noun modifies a
+    // different subject, or the sink verb has no credential noun subject (AC1).
+    expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
+  });
+
+  it("stays linear on the sink grammar at the round-3 probe size", () => {
+    // The round-3 rewrite chains two bounded quantifiers, which is the shape a
+    // backtracking blowup hides in. These strings are made of the grammar's own
+    // pieces and then made to fail on the participle, so the scan has to give every
+    // bounded alternative a chance per position. No timing assertion (a slow CI box
+    // must not flake the suite); the timings are logged so a regression is visible.
+    const probes: Array<[string, string]> = [
+      ["aux chain that never reaches a sink", `${"the token is being ".repeat(1000)}x`],
+      ["adverbs that never reach a sink", `${"the api key is currently ".repeat(800)}x`],
+      ["nouns with no sink verb", `${"the access token ".repeat(1000)}x`],
+    ];
+    const timings: string[] = [];
+    for (const [label, text] of probes) {
+      const startedAt = performance.now();
+      const verdict = classifyFindingSensitivity(text);
+      const elapsed = performance.now() - startedAt;
+      timings.push(`${label}: ${elapsed.toFixed(2)}ms`);
+      expect(verdict, label).toEqual({ sensitive: false, reasons: [] });
+    }
+    console.log(`[bd-252 sink grammar] ${timings.join(", ")}`);
+  });
+});
+
+describe("classifyFindingSensitivity — process.env anchor boundary (bd-252 review 2)", () => {
+  it.each([
+    // Sensitive: glued junk before "process" must not dodge the .env anchor.
+    ["a glued x prefix", "xprocess.env is committed to the repo"],
+    // Sensitive: the same bypass with a different word prefix.
+    ["a glued my prefix", "myprocess.env is committed"],
+    // Sensitive: a real .env file reference is not a process.env lookup.
+    ["a plain .env file", "the .env file is committed"],
+    // Sensitive: a spaced process .env is not the code reference.
+    ["a spaced process .env", "reads process .env from disk"],
+    // Sensitive: a bare .env is still a deny path.
+    ["a bare .env", "`.env`"],
+    // Sensitive: a .env inside a sensitive directory stays deny-path.
+    ["secrets/.env", "`secrets/.env` is committed"],
+  ])("keeps %s sensitive", (_label, finding) => {
+    expect(classifyFindingSensitivity(finding).sensitive).toBe(true);
+  });
+
+  it.each([
+    // Non-sensitive: process.env at the string start is the code reference.
+    ["a leading process.env", "process.env is read twice"],
+    // Non-sensitive: a property on process.env is still the code reference.
+    ["a process.env property", "process.env.X is read twice"],
+    // Non-sensitive: a non-word boundary before process is still the code reference.
+    ["a quoted process.env", "`process.env` is read twice"],
+  ])("publishes %s", (_label, finding) => {
+    expect(classifyFindingSensitivity(finding)).toEqual({ sensitive: false, reasons: [] });
+  });
+});
+
 describe("classifyFindingSensitivity — adversarial input", () => {
   it("reports every rule family that fires, not just the first", () => {
     // No early exit after a matching family: the human reading the gate is told
     // every reason the finding was stopped for, so a single finding carrying a
     // topic, a credential and a deny path must report all three.
     const verdict = classifyFindingSensitivity(
-      "`src/auth/session.ts:42` — session token ghp_16C7e42F292c6912E7710c838347Ae178B4a is logged",
+      "`src/auth/session.ts:42` — session token ghp_16C7e42F292c6912E7710c838347Ae178B4a is logged in plaintext",
     );
     expect(verdict.sensitive).toBe(true);
     expect([...new Set(verdict.reasons.map((reason) => reason.kind))].sort()).toEqual([
@@ -564,7 +770,7 @@ describe("classifyFindingSensitivity — adversarial input", () => {
   it("is deterministic and de-duplicates a repeated match", () => {
     // The reasons are persisted, so the same text must produce the same verdict
     // twice — and a repeated match must not be recorded twice.
-    const finding = "auth is checked, auth again, and auth once more";
+    const finding = "auth is bypassed, auth again, and auth once more";
     const first = classifyFindingSensitivity(finding);
     expect(classifyFindingSensitivity(finding)).toEqual(first);
     expect(first.reasons).toEqual([{ kind: "security-topic", match: "auth" }]);

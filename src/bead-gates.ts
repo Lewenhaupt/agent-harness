@@ -212,6 +212,15 @@ export interface OpenHumanGate {
   gateId: string;
   /** bd's ISO creation timestamp; the answer baseline when present. */
   createdAt?: string;
+  /**
+   * The gate's own title, when bd stored one (bd-252).
+   *
+   * why: a restart finds the wait by listing gates, and only the title says
+   * whether a rediscovered gate is the review publication question (which must
+   * not block phase tools) or a plain ask (which must). The fleet-ordering
+   * classifier reads `record.title` the same way.
+   */
+  title?: string;
 }
 
 /**
@@ -409,9 +418,12 @@ export function openHumanGateFromRecord(
   if (typeof gateId !== "string" || gateId === "" || gateId === beadId) return undefined;
   if (record.status !== "open") return undefined;
   if (record.await_type !== HUMAN_GATE_TYPE) return undefined;
-  return typeof record.created_at === "string"
-    ? { gateId, createdAt: record.created_at }
-    : { gateId };
+  const title = typeof record.title === "string" && record.title !== "" ? record.title : undefined;
+  return {
+    gateId,
+    ...(typeof record.created_at === "string" ? { createdAt: record.created_at } : {}),
+    ...(title === undefined ? {} : { title }),
+  };
 }
 
 /**

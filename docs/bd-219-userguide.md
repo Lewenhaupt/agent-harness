@@ -60,7 +60,7 @@ What each test pins, by acceptance criterion:
 | `extension-review-gate` › `withholds by default when the gate is resolved without an answer` | resolving the sensitive gate with no reply publishes nothing |
 | `extension-review-gate` › `stays on the fast path for a clean review and writes nothing to bd` / `does not open a gate for a narration-only review` | clean and narration-only reviews stay silent |
 | `extension-review-gate` › `human escalation policy (bd-219)` › `names only the two escalation conditions and the do-not-ask list, in both blocks` | both guidance sites emit `HUMAN_ESCALATION_LINES` verbatim, exactly two bullets, no "always ask"/"ask whenever" |
-| `extension-review-gate` › `runCompleteLoopHint` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive only while a human wait is live` | the delivery names the next phase tool for a findings review, and only a live human wait suppresses it |
+| `extension-review-gate` › `runCompleteLoopHint` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive while a blocking human wait is live` / `keeps the directive for a publication-only wait (bd-252)` | the delivery names the next phase tool for a findings review; only a blocking human wait suppresses it, while a publication-only wait keeps it |
 | `review-flag-not-a-wait` (whole file) | `awaitingReviewResponse` changes nothing: fleet progress, fleet state, digest text, the run-complete directive and the human-wait guidance |
 | `fleet-run` › `keeps a post-review member running, not awaiting a human (bd-219)` / `is awaiting-human for an open human gate on the bead (bd-219)` | progress derives from `humanGateOpen`, not the phase flag |
 | `fleet-status` › `reads a post-review member as active, not awaiting-human (bd-219)` / `reads an open bd human gate as awaiting-human (bd-219)` | the status view's `state` |
@@ -336,7 +336,8 @@ round predates bd-219.
 - **The turn that can fix them is told how.** The run-complete delivery carries
   the `` **When review findings remain:** `` directive with the next phase tool,
   and the gate context repeats the fix-loop directive each turn. It is withheld
-  only while a human wait is live, because a blocked member could not act on it.
+  only while a blocking human wait is live, because a blocked member could not act
+  on it; a publication-only wait keeps the directive (bd-252).
 - **`awaiting review response: yes` in `belayd_fleet_status` is not a wait.** It
   is the persisted review phase flag, and the one thing it still drives is the
   gate context's per-turn next-step line (`Review findings need addressing. …`

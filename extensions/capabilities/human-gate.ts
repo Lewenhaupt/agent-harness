@@ -39,6 +39,7 @@ import {
   carryForwardSensitivity,
   formatReviewFindingsComment,
   hasSensitiveFindings,
+  isReviewFindingsGateTitle,
   nextReviewRound,
   type PublicationAnswerRefusalCause,
   REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
@@ -123,18 +124,21 @@ function channelLabel(channel: HumanAnswerChannel): string {
 }
 
 /**
- * The next-step block, or nothing while a human answer is pending.
+ * The next-step block, or nothing while a blocking human answer is pending.
  *
  * Split out of {@link gateContextMessage} so the prompt builder stays under the
  * complexity limit, and because "no next step" is the whole rule: a waiting
- * workflow must not be told to call a phase tool the gate will refuse.
+ * workflow must not be told to call a phase tool the gate will refuse. A
+ * publication-only wait (bd-252) refuses nothing, so it keeps the next step.
  */
 export function nextStepBlockLines(state: CoreSessionState, nextStepLine: string): string[] {
-  return state.awaitingHuman === undefined ? ["", nextStepLine] : [];
+  const blockingWait =
+    state.awaitingHuman !== undefined && state.awaitingHuman.publicationOnly !== true;
+  return blockingWait ? [] : ["", nextStepLine];
 }
 
 /**
- * Prompt guidance for the human answer channel (bd-152, bd-182, bd-219).
+ * Prompt guidance for the human answer channel (bd-152, bd-182, bd-219, bd-252).
  *
  * The ask line is the shared two-condition policy, repeated every turn because
  * the model reads it exactly when it feels blocked — which is the moment it is
@@ -143,11 +147,22 @@ export function nextStepBlockLines(state: CoreSessionState, nextStepLine: string
  * explanation is what makes a model retry or guess instead of waiting. The reply
  * line names the real channel, so a GitHub-primary wait never tells anyone to
  * answer in a place its poll does not read.
+ *
+ * A publication-only wait (bd-252) says what is true: the PR-body question is
+ * pending and the workflow continues; it must not claim phase tools are refused.
  */
 export function humanAnswerGuidanceLines(state: CoreSessionState): string[] {
   const lines = ["", ...HUMAN_ESCALATION_LINES];
   const awaiting = state.awaitingHuman;
   if (awaiting === undefined) return lines;
+  if (awaiting.publicationOnly === true) {
+    lines.push(
+      "",
+      `📝 **Publication choice pending for ${awaiting.beadId}** — sensitive review findings stay withheld from any PR body until it is answered; the workflow continues.`,
+      `Asked ${formatAskedAt(awaiting.askedAt)}. ${replyChannelLine(awaiting)}; the answer arrives in this session as a user message.`,
+    );
+    return lines;
+  }
   lines.push(
     "",
     `⏸ **Waiting for a human answer on ${awaiting.beadId}** — phase tools are refused until the answer arrives.`,
@@ -801,10 +816,18 @@ export function discoverHumanAnswerWait(options: {
     // Only a usable target is recorded: a broken map must not pin the wait to a
     // guessed bd channel, so `resolveChannel` retries on the next tick instead.
     const target = options.deps.resolveGithubAnswerTarget({ cwd: ctx.cwd }, beadId);
+    // A rediscovered publication gate stays publication-only (bd-252): its title
+    // is the only durable marker a restart has, and only the full title shape for
+    // this bead is accepted. A drifted or bare-prefix title stays blocking
+    // (fail-closed). Never set `reviewFindings` here — an answer to a wait the
+    // process did not arm must not release withheld findings (bd-183).
+    const publicationOnly =
+      found.gate.title !== undefined && isReviewFindingsGateTitle(found.gate.title, beadId);
     state.awaitingHuman = {
       beadId,
       gateId: found.gate.gateId,
       askedAt: Date.now(),
+      ...(publicationOnly ? { publicationOnly: true as const } : {}),
       ...(target.kind === "github" ? { channel: channelOf(target) } : {}),
     };
     startHumanAnswerPoll(state, ctx, options.deps);
@@ -814,11 +837,70 @@ export function discoverHumanAnswerWait(options: {
 }
 
 /**
+ * Record an answer that was posted just before completion reaped the gate
+ * (bd-252 review).
+ *
+ * A publication-only wait no longer blocks the fix loop, so the workflow can
+ * finish with the gate still open. If a human already answered, the choice must
+ * be written before the gate is resolved: resolving first loses the wait key and
+ * the answer can never be recorded. Every failure is contained here — completion
+ * must still resolve the gate and the hook must not throw.
+ */
+async function recordPublicationAnswerBeforeReap(options: {
+  ctx: ExtensionContext;
+  state: CoreSessionState;
+  awaiting: HumanAnswerWait;
+  deps: HumanGateDeps;
+}): Promise<void> {
+  try {
+    const observed = await observeHumanAnswer(
+      options.state,
+      options.awaiting,
+      options.ctx.cwd,
+      options.deps,
+    );
+    if (!isDeliverable(observed)) {
+      console.warn(
+        "[belayd-harness] publication gate reaped at workflow completion without a publication " +
+          "answer; sensitive findings stay withheld",
+      );
+      return;
+    }
+    // A resolved gate with no note is an out-of-band close, not a publication
+    // choice: writing a default withhold would fabricate a decision the human
+    // never made. The unanswered record is already fail-closed.
+    const answer = observed.kind === "answered" ? observed.text : observed.note;
+    if (answer === undefined) {
+      console.warn(
+        "[belayd-harness] publication gate reaped at workflow completion without a publication " +
+          "answer; sensitive findings stay withheld",
+      );
+      return;
+    }
+    recordPublicationChoice({
+      cwd: options.ctx.cwd,
+      answer,
+      waiting: options.awaiting,
+    });
+  } catch (error) {
+    console.warn(
+      `[belayd-harness] could not check the publication answer before reaping the gate: ` +
+        `${errorText(error)}; sensitive findings stay withheld`,
+    );
+  }
+}
+
+/**
  * Resolve a torn-down workflow's human gate (bd-152).
  *
  * An orphan gate keeps the bead blocked in bd/Scotty long after the workflow
  * stopped, so the gate goes with the workflow. Best-effort and bounded: a
  * teardown must never fail because bd did.
+ *
+ * A publication-only wait gets one answer check first (bd-252 review): completion
+ * no longer waits for the gate, so an answer posted in the race window is
+ * recorded before the gate is resolved. The plain ask-human wait keeps its
+ * original reap path.
  */
 export async function reapHumanGateForTask(options: {
   ctx: ExtensionContext;
@@ -827,6 +909,18 @@ export async function reapHumanGateForTask(options: {
   deps: HumanGateDeps;
 }): Promise<void> {
   const awaiting = options.state.awaitingHuman;
+  if (
+    awaiting?.publicationOnly === true &&
+    options.beadId !== "" &&
+    awaiting.beadId === options.beadId
+  ) {
+    await recordPublicationAnswerBeforeReap({
+      ctx: options.ctx,
+      state: options.state,
+      awaiting,
+      deps: options.deps,
+    });
+  }
   clearHumanAnswerWait(options.state);
   if (options.beadId === "") return;
   if (awaiting !== undefined && awaiting.beadId !== options.beadId) return;
@@ -1187,6 +1281,9 @@ export async function deliverReviewFindings(options: {
         askedAt,
         channel,
         ...(gate.gateId === undefined ? {} : { gateId: gate.gateId }),
+        // A publication answer decides only the PR body and withholding is the
+        // default, so this wait must not block phase tools (bd-252).
+        publicationOnly: true,
         // Only a sensitive review wait may record a publication decision; the ask
         // tool and restart discovery never set this marker.
         reviewFindings: { round: record.round },

@@ -25,20 +25,28 @@
  * 1. **Security topics** — word-boundary matches for the auth / crypto / secret
  *    / session / env vocabulary. Word boundaries are what keep `author` and
  *    `sessionless` out: a finding about authorship is not a security finding.
+ *    A topic word alone is not enough: it must be paired with a disclosure-risk
+ *    signal (bypass, injection, plaintext, exposure, …), because "the sessions
+ *    map is written without a lock" and "process.env is read twice" are
+ *    reliability findings, not publication questions (bd-252).
  * 2. **Credential-shaped strings** — private key blocks, cloud and forge token
- *    prefixes, JWTs, bearer headers, URI userinfo and `key = value` assignments.
- *    A documented placeholder (`xxxx`, `REDACTED`, `<token>`, `${VAR}`) is not a
- *    credential: those shapes appear in documentation, and flagging them would
- *    make the gate noise the operator learns to skip.
+ *    prefixes, JWTs, bearer headers, URI userinfo, `key = value` assignments and
+ *    a credential noun beside a sink or a broken lifecycle (`secrets are written
+ *    to stdout`, `the access token is never rotated`). A documented placeholder
+ *    (`xxxx`, `REDACTED`, `<token>`, `${VAR}`) is not a credential: those shapes
+ *    appear in documentation, and flagging them would make the gate noise the
+ *    operator learns to skip.
  * 3. **Deny paths** — the path tokens a finding names are checked against
  *    {@link FINDING_DENY_PATH_PATTERNS}; a bare filename is a candidate too, so
  *    `id_rsa` is caught without a directory prefix.
  * 4. **Unclassifiable text** — whatever is left outside printable ASCII after
- *    normalisation and outside {@link BENIGN_TYPOGRAPHY}. There is no reliable
- *    mapping for lookalikes, so the text is refused, not guessed (the doctrine
- *    `src/publish-gate.ts` applies to paths). Typography is exempt because
- *    punctuation cannot spell a keyword; refusing it would turn every ordinary
- *    finding into a disclosure question and hide the real one.
+ *    normalisation and outside {@link BENIGN_TYPOGRAPHY}, restricted to code
+ *    points that can carry a hidden word (Unicode letters, marks and numbers).
+ *    There is no reliable mapping for lookalikes, so letterlike text is refused,
+ *    not guessed (the doctrine `src/publish-gate.ts` applies to paths).
+ *    Typography and non-letterlike symbols are exempt because punctuation, an
+ *    arrow or an emoji cannot spell a keyword; refusing them would turn every
+ *    ordinary finding into a disclosure question and hide the real one (bd-252).
  *
  * **A separator is not an escape hatch, so the text is read three times.**
  * A separator between letters is a hidden join, not a word boundary: `pass·word`,
@@ -216,6 +224,258 @@ const SECURITY_TOPIC_RULES: readonly SecurityTopicRule[] = [
     // why: environment handling is where secrets live; `\benv\b` covers
     // `process.env` and "env var" without matching "envelope".
     pattern: /\b(?:env|environment(?:al|ally)?|dotenv)\b/iu,
+  },
+];
+
+/** One disclosure-risk signal: the word family and the regex that finds it. */
+interface DisclosureRiskRule {
+  id: string;
+  pattern: RegExp;
+}
+
+/**
+ * Words that turn a security *topic* into a disclosure question (bd-252).
+ *
+ * why a second table: a topic word alone describes an area of the code, not a
+ * leak. "the sessions map is written without a lock" is a concurrency defect,
+ * and gating it cost bd-233 two full workflow stalls. A risk word names what
+ * went wrong, so the pair is the signal that the PR body may expose something.
+ *
+ * Deliberately **excluded**: reliability and concurrency vocabulary (`race`,
+ * `lock`, `retry`, `timeout`, `deadlock`, `leak` of a goroutine/connection is
+ * covered only by the word itself, which is accepted over-match), generic
+ * logging verbs without a sink (`log`, `writes`), and severity words (`bug`,
+ * `failure`). They describe defects, not disclosure, and are the false positives
+ * this floor exists to remove. Credentials, deny paths and anchors stay
+ * unconditional: those *are* the real signal, so they do not need this table.
+ */
+const DISCLOSURE_RISK_RULES: readonly DisclosureRiskRule[] = [
+  {
+    id: "bypass",
+    // why: an auth-check bypass is a security defect regardless of the topic
+    // word that names it.
+    pattern: /\bbypass(?:es|ed|ing)?\b/iu,
+  },
+  {
+    id: "injection",
+    // why: SQL/command/header injection is where untrusted data crosses a trust
+    // boundary; the word names the defect, not the area.
+    pattern: /\binject(?:s|ed|ing|ion|ions)?\b/iu,
+  },
+  {
+    id: "web-vulnerability",
+    // why: XSS/CSRF/SSRF have no innocent reading in a review finding.
+    pattern: /\b(?:xss|csrf|ssrf)\b/iu,
+  },
+  {
+    id: "leak",
+    // why: "leaked" is the direct statement that material escaped; leakage is
+    // the same claim as a noun.
+    pattern: /\bleak(?:s|ed|ing|age|ages)?\b/iu,
+  },
+  {
+    id: "exposure",
+    // why: expose/exposed/exposure name the disclosure act itself.
+    pattern: /\bexpos(?:e|es|ed|ing|ure|ures)\b/iu,
+  },
+  {
+    id: "disclosure",
+    // why: disclose/disclosed/disclosure is the same act from the other side.
+    pattern: /\bdisclos(?:e|es|ed|ing|ure|ures)\b/iu,
+  },
+  {
+    id: "plaintext",
+    // why: a secret in plaintext/cleartext is exposed by definition.
+    pattern: /\b(?:plain|clear)[- ]?text\b/iu,
+  },
+  {
+    id: "in-the-clear",
+    // why: the idiomatic form carries the same claim as plaintext.
+    pattern: /\bin the clear\b/iu,
+  },
+  {
+    id: "hardcoded",
+    // why: a hard-coded key/password is committed material, not a topic mention.
+    pattern: /\bhard[- ]?cod(?:e|ed|es|ing)\b/iu,
+  },
+  {
+    id: "traversal",
+    // why: path traversal is an input-validation defect with a direct data-access
+    // consequence.
+    pattern: /\btraversal\b/iu,
+  },
+  {
+    id: "escalation",
+    // why: privilege escalation is an authorization defect; the topic word alone
+    // (auth) would not distinguish it from a naming finding.
+    pattern: /\bescalat(?:e|es|ed|ing|ion|ions)\b/iu,
+  },
+  {
+    id: "spoofing",
+    // why: spoof/spoofed names identity forgery, not a topic area.
+    pattern: /\bspoof(?:s|ed|ing)?\b/iu,
+  },
+  {
+    id: "vulnerability",
+    // why: vulnerable/vulnerability is how a security defect is reported.
+    pattern: /\bvulnerab(?:le|ility|ilities)\b/iu,
+  },
+  {
+    id: "exploit",
+    // why: an exploit is the concrete abuse path, not the code area.
+    pattern: /\bexploit(?:s|ed|ing|able|ables)?\b/iu,
+  },
+  {
+    id: "unauthenticated",
+    // why: unauthenticated access is an auth bypass in one word.
+    pattern: /\bunauthenticated\b/iu,
+  },
+  {
+    id: "unauthorized",
+    // why: unauthorized access is the consequence an auth finding publishes.
+    pattern: /\bunauthori[sz]ed\b/iu,
+  },
+  {
+    id: "misconfiguration",
+    // why: a misconfiguration is a concrete exposure path, unlike the config area
+    // itself (`env` alone).
+    pattern: /\bmisconfig(?:uration|urations|ured|ure|ures)?\b/iu,
+  },
+  {
+    id: "timing",
+    // why: a constant-time defect is a real crypto finding; the word pair names
+    // the attack, while `crypto` alone only names the module.
+    pattern: /\b(?:timing[- ]attack|constant[- ]time)\b/iu,
+  },
+  {
+    id: "replay",
+    // why: replay is a concrete token/session abuse path.
+    pattern: /\breplay(?:s|ed|ing)?\b/iu,
+  },
+  {
+    id: "exfiltration",
+    // why: exfiltration states that data left the boundary, which is disclosure.
+    pattern: /\bexfiltrat(?:e|es|ed|ing|ion)\b/iu,
+  },
+];
+
+/** One credential noun; the shared prefix every sink/lifecycle rule reads. */
+const CREDENTIAL_NOUN_SOURCE =
+  "(?:secrets?|credentials?|tokens?|api[-_ ]?keys?|passwords?|private keys?)";
+
+/**
+ * Containers that hold the credential itself, so the compound is still its subject.
+ *
+ * why closed: `the credential cache is written to disk` is the credential reaching
+ * disk, so it is a disclosure, while `token usage`/`token count`/`token bucket`
+ * describe metrics or state the credential is not the subject of. Only this list
+ * may sit between the noun and the sink verb.
+ */
+const CREDENTIAL_CONTAINER_SOURCE = "(?:cache|store|material|contents)";
+
+/**
+ * The subject a sink/lifecycle rule reads: the credential noun, or the credential
+ * noun plus its closed container noun (`credential cache`), or the
+ * `session material` idiom the topic table names the same way.
+ */
+const CREDENTIAL_SUBJECT_SOURCE =
+  `(?:${CREDENTIAL_NOUN_SOURCE}\\s+${CREDENTIAL_CONTAINER_SOURCE}` +
+  `|${CREDENTIAL_NOUN_SOURCE}` +
+  "|sessions?\\s+material)";
+
+/** One credential-sink rule: a credential noun beside a sink or lifecycle break. */
+interface CredentialSinkRule {
+  id: string;
+  pattern: RegExp;
+}
+
+/** One concrete sink verb: the participle a disclosure phrase ends on. */
+const SINK_PARTICIPLE_SOURCE =
+  "(?:written|logged|printed|echoed|dumped|leaked|exposed|revealed|swallowed)";
+
+/**
+ * Auxiliary verbs a sink phrase may chain before the participle — and only these.
+ *
+ * why bounded and closed: an open chain is a character window in disguise. No
+ * negation token is listed, so a negated sink can only reach the lifecycle arm.
+ */
+const SINK_AUXILIARY_SOURCE =
+  "(?:is|are|was|were|has|have|had|will|would|can|could|may|might|should|must|gets?|got|be|been|being)";
+
+/**
+ * Adverbs allowed between the auxiliary chain and the participle.
+ *
+ * why closed: `the token is accidentally logged` is the same disclosure as `is
+ * logged`, but a free adverb slot would let `is never logged` through again.
+ */
+const SINK_ADVERB_SOURCE =
+  "(?:silently|still|also|only|then|now|accidentally|apparently|currently|always|sometimes)";
+
+/**
+ * Credential nouns beside a concrete sink or a broken lifecycle (bd-252).
+ *
+ * why this family and not more risk words: the risk floor exists so a bare topic
+ * word (`sessions`, `env`) is not a disclosure question, but a credential noun
+ * used as the subject of "written to stdout", "logged", "swallowed" or
+ * "never rotated" is the bd-183 regression class — the secret is named and its
+ * handling says it escaped or was never contained. A bare output verb in the risk
+ * table would re-open AC1 (`the sessions map is written without a lock`), so the
+ * compound phrase is the signal instead.
+ *
+ * why literal adjacency and no character window (bd-252 round-2 review): a window
+ * lets any noun-ish subject plus any output verb in the same clause gate. The
+ * credential noun must be the sink's *subject*: no other word can sit between it
+ * and the verb beyond a bounded auxiliary chain and one closed adverb.
+ * `token usage is logged for metrics`, `the password reset flow writes audit rows`
+ * and `the token rotate helper is never called` therefore stay out, while the
+ * round-1 W1 pins stay in.
+ *
+ * why the two arms are separate grammars (bd-252 round-3 review): the sink arm has
+ * to accept auxiliary chains — `is being logged`, `has been logged`, `will be
+ * logged`, `can be logged` — or a critic's ordinary paraphrase of `is logged`
+ * walks back out as publishable. The lifecycle arm is the opposite: negation is
+ * the signal there (`never rotated` is a defect), so `never|not|no longer` lives
+ * only in that arm. In the sink arm a negated sink (`the api key is never logged`)
+ * is an *absence* claim, so putting negation in the sink arm gated exactly the
+ * findings that say the credential did not escape.
+ *
+ * Deliberately **excluded**: a sink verb whose subject is not the credential noun
+ * (the review's `token bucket`, `token usage`, `password reset flow`, `token
+ * rotate helper` rows), a sink verb with no credential noun in the same phrase
+ * (`the sessions map is written without a lock`), and generic lifecycle prose
+ * (`the token bucket is full`). Those are reliability findings, not disclosures.
+ * The reasons are `credential-shaped` because a named credential used as the
+ * subject of a sink or lifecycle break is the same real signal as a token shape.
+ */
+const CREDENTIAL_SINK_RULES: readonly CredentialSinkRule[] = [
+  {
+    id: "output",
+    // why: "secrets are written to stdout", "the api key is logged" and
+    // "the access token was leaked" say the credential itself reached an
+    // observer. An auxiliary chain (`is being`, `has been`, `will be`, `can be`)
+    // and up to two closed, non-negating adverbs may sit between the noun and
+    // the sink verb — nothing else, and no negation token.
+    pattern: new RegExp(
+      `\\b${CREDENTIAL_SUBJECT_SOURCE}\\b\\s+` +
+        `(?:${SINK_AUXILIARY_SOURCE}\\s+){0,3}` +
+        `(?:${SINK_ADVERB_SOURCE}\\s+){0,2}` +
+        `${SINK_PARTICIPLE_SOURCE}\\b`,
+      "iu",
+    ),
+  },
+  {
+    id: "lifecycle",
+    // why: a credential that is never rotated/expired/revoked is a lifecycle
+    // break even when no literal leaks in the finding. Only the negation form is
+    // accepted, so "the token rotate helper is never called" does not match: the
+    // noun must be the subject of the negated lifecycle verb.
+    pattern: new RegExp(
+      `\\b${CREDENTIAL_SUBJECT_SOURCE}\\b\\s+` +
+        "(?:(?:is|are|was|were|gets?|got|be|been)\\s+)?" +
+        "(?:never|no longer|not)\\s+" +
+        "(?:rotated|rotates|expires|expire|invalidated|revoked)\\b",
+      "iu",
+    ),
   },
 ];
 
@@ -717,6 +977,11 @@ const FRAMED_SEPARATOR_PATTERN = new RegExp(
  * in a path (`café.png`, `prоof/…`) takes the human route, which costs one
  * answer instead of publishing text nobody read.
  *
+ * Only letterlike code points reach the refusal: an arrow, emoji or math symbol
+ * cannot spell a keyword or spoof a letter, and refusing it gated ordinary
+ * findings on a stray `→` (bd-252). See
+ * {@link LETTERLIKE_CODE_POINT_PATTERN}.
+ *
  * why ASCII whitespace is exempt: a finding is multi-line markdown, so `\n` and
  * `\t` are layout, not evasion — a word interrupted by a newline is not the
  * word, so refusing `\n` would gate every review for no security gain.
@@ -728,6 +993,23 @@ const FRAMED_SEPARATOR_PATTERN = new RegExp(
  * Greek `μ`) is what the rules genuinely cannot map.
  */
 const NON_PRINTABLE_ASCII_PATTERN = /[^\x20-\x7E\t\n\r\f\v]/gu;
+
+/**
+ * Code points that can carry a hidden word: Unicode letters, marks and numbers.
+ *
+ * why only these (bd-252): the refuse rule exists to stop a lookalike from
+ * spelling a keyword the ASCII rules cannot read (`prоof`, `аuth`). An arrow, a
+ * check mark, an emoji or a math operator cannot spell a word nor spoof a letter,
+ * so refusing it only turns ordinary findings (`the lock is taken → then
+ * released`) into a disclosure question. Non-letterlike symbols outside the
+ * benign list are therefore exempt and recorded nowhere.
+ */
+const LETTERLIKE_CODE_POINT_PATTERN = /[\p{L}\p{M}\p{N}]/u;
+
+/** True when a code point can spell or spoof a letter, mark or digit. */
+function isLetterlikeCodePoint(character: string): boolean {
+  return LETTERLIKE_CODE_POINT_PATTERN.test(character);
+}
 
 /** How many distinct offending code points the recorded reason names. */
 const UNCLASSIFIABLE_DISTINCT_CAP = 8;
@@ -959,15 +1241,17 @@ function weldedClassificationText(compact: string): string {
 
 /**
  * The offending characters of an unclassifiable finding, deduped, capped and
- * escaped, or `null` when only ASCII and benign typography remain.
+ * escaped, or `null` when only ASCII, benign typography and non-letterlike
+ * symbols remain.
  *
  * Escaped rather than quoted because a lookalike pasted next to the text it
  * spoofs is unreadable in a gate comment; `\u{043E}` says exactly which code
- * point stopped the finding.
+ * point stopped the finding. Only letterlike code points can hide a word, so an
+ * arrow or emoji is not a disclosure question (bd-252).
  */
 function residualUnclassifiableMatch(text: string): string | null {
   const distinct = [...new Set(text.match(NON_PRINTABLE_ASCII_PATTERN) ?? [])].filter(
-    (character) => !isBenignTypography(character),
+    (character) => !isBenignTypography(character) && isLetterlikeCodePoint(character),
   );
   if (distinct.length === 0) return null;
   const escaped = distinct.slice(0, UNCLASSIFIABLE_DISTINCT_CAP).map(escapeCodePoint);
@@ -1124,6 +1408,29 @@ function reasonsOf(matches: readonly RuleReason[]): FindingSensitivityReason[] {
 }
 
 /**
+ * True for the benign `process.env` reference the `.env` anchor would catch.
+ *
+ * why: the anchor table is boundary-free on purpose so a split cannot hide a
+ * credential, but `.env` inside `process.env` names an environment lookup, not a
+ * credential path. Without this exemption every `process.env` reliability finding
+ * re-opens the bd-233 false positive (bd-252 review).
+ *
+ * why the left boundary (bd-252 round-2 review): matching only the seven literal
+ * characters before `.env` also exempts `xprocess.env` / `myprocess.env`, which a
+ * leaked path can use to dodge the deny-path anchor. `process` must start at the
+ * string or after a non-word character; a real file reference such as `the .env`
+ * or `secrets/.env` has no `process` prefix and stays deny-path.
+ */
+function isProcessEnvReference(text: string, index: number, match: string): boolean {
+  if (match.toLowerCase() !== ".env") return false;
+  const processStart = index - "process".length;
+  if (processStart < 0) return false;
+  if (text.slice(processStart, index).toLowerCase() !== "process") return false;
+  if (processStart === 0) return true;
+  return !/\w/u.test(text[processStart - 1] ?? "");
+}
+
+/**
  * Anchor reasons in one reading.
  *
  * why every occurrence: a finding can quote one token in a code span and a
@@ -1137,6 +1444,7 @@ function anchorReasons(text: string): RuleReason[] {
     const kind = CREDENTIAL_ANCHOR_KINDS.get(matched[0].toLowerCase());
     if (kind === undefined) continue;
     if (isPlaceholderAnchorOccurrence(text, index + matched[0].length)) continue;
+    if (isProcessEnvReference(text, index, matched[0])) continue;
     reasons.push({ reason: { kind, match: matched[0] }, rule: CREDENTIAL_ANCHOR_RULE });
   }
   return reasons;
@@ -1157,6 +1465,26 @@ function credentialReasons(text: string, options: { welded?: boolean } = {}): Ru
       reasons.push({
         reason: { kind: "credential-shaped", match: matched[0] },
         rule: `credential:${rule.id}`,
+      });
+    }
+  }
+  return reasons;
+}
+
+/**
+ * Credential-shaped reasons from the sink/lifecycle family (bd-252).
+ *
+ * why every occurrence: a finding can name one credential beside a leak and a
+ * second beside a lifecycle break; the record is what the human reads. The
+ * patterns are bounded per sentence so a match cannot span unrelated prose.
+ */
+function credentialSinkReasons(text: string): RuleReason[] {
+  const reasons: RuleReason[] = [];
+  for (const rule of CREDENTIAL_SINK_RULES) {
+    for (const matched of text.matchAll(asGlobal(rule.pattern))) {
+      reasons.push({
+        reason: { kind: "credential-shaped", match: matched[0] },
+        rule: `credential-sink:${rule.id}`,
       });
     }
   }
@@ -1319,6 +1647,12 @@ function shapeIdentity(reason: FindingSensitivityReason): string {
  * quotes a full `ghp_…` token, a PEM block or `id_rsa` reports the shape the
  * human can act on and the bare anchor behind it is suppressed. A split leaves
  * only the anchor, which is exactly the case the anchor rule exists for.
+ *
+ * why the sink family runs last: its match spans a whole phrase, so putting it
+ * after the specific shapes means it can never suppress an unrelated credential,
+ * path or anchor through containment. An earlier specific shape may still subsume
+ * a sink phrase, which is harmless — the shape reason is the more actionable one,
+ * and the family only adds a reason, never removes a verdict.
  */
 function matchShapeReasons(text: string, options: { welded?: boolean } = {}): RuleReason[] {
   return dedupeShapeContainment([
@@ -1326,6 +1660,7 @@ function matchShapeReasons(text: string, options: { welded?: boolean } = {}): Ru
     ...assignmentReasons(text),
     ...denyPathReasons(text),
     ...anchorReasons(text),
+    ...credentialSinkReasons(text),
   ]);
 }
 
@@ -1342,6 +1677,16 @@ function matchRuleReasons(text: string): RuleReason[] {
     }
   }
   return [...reasons, ...matchShapeReasons(text)];
+}
+
+/** True when any disclosure-risk word family appears in one reading. */
+function hasDisclosureRiskSignal(text: string): boolean {
+  return DISCLOSURE_RISK_RULES.some((rule) => rule.pattern.test(text));
+}
+
+/** Drop topic reasons when no risk signal turned them into a disclosure question. */
+function withoutSecurityTopicReasons(reasons: readonly RuleReason[]): RuleReason[] {
+  return reasons.filter((entry) => entry.reason.kind !== "security-topic");
 }
 
 /**
@@ -1535,6 +1880,14 @@ interface ClassificationPasses {
    * key-less assignment — so the only safe one-liner is `[redacted]` alone.
    */
   hasUnmaskableMarker: boolean;
+  /**
+   * True when any reading matched a disclosure-risk signal (bd-252).
+   *
+   * why: topic reasons are only recorded when this is true, so the risk floor
+   * covers the primary, separator and whitespace-free readings alike; a risk
+   * word split by a separator must still count.
+   */
+  hasDisclosureRisk: boolean;
 }
 
 /**
@@ -1564,11 +1917,16 @@ function classificationPasses(normalized: string): ClassificationPasses {
     hasUnmaskableMarker(normalized) ||
     (compact !== normalized && hasUnmaskableMarker(compact)) ||
     (welded !== normalized && hasUnmaskableMarker(welded));
+  const hasDisclosureRisk =
+    hasDisclosureRiskSignal(normalized) ||
+    (compact !== normalized && hasDisclosureRiskSignal(compact)) ||
+    (welded !== normalized && hasDisclosureRiskSignal(welded));
   return {
     primary,
     separated,
     whitespaceFree,
     hasUnmaskableMarker: hasUnmaskableMarkerInAnyReading,
+    hasDisclosureRisk,
   };
 }
 
@@ -1589,14 +1947,26 @@ function classificationPasses(normalized: string): ClassificationPasses {
  *
  * The unclassifiable check runs **after** the families, so a finding that both
  * matches a rule and carries lookalikes reports both and never short-circuits.
+ *
+ * A `security-topic` reason is recorded only when a disclosure-risk signal also
+ * matched (bd-252): the topic word names an area of the code, and only the risk
+ * word says that publishing the finding could expose something. Credential,
+ * deny-path and unclassifiable reasons stay unconditional — they are the real
+ * signal, so AC2 does not depend on this floor.
  */
 export function classifyFindingSensitivity(finding: string): FindingSensitivity {
   const text = normalizeFindingText(finding);
-  const { primary, separated, whitespaceFree } = classificationPasses(text);
+  const passes = classificationPasses(text);
+  const primary = passes.hasDisclosureRisk
+    ? passes.primary
+    : withoutSecurityTopicReasons(passes.primary);
+  const separated = passes.hasDisclosureRisk
+    ? passes.separated
+    : withoutSecurityTopicReasons(passes.separated);
   const reasons: FindingSensitivityReason[] = reasonsOf(primary);
   const unclassifiable = residualUnclassifiableMatch(text);
   if (unclassifiable !== null) reasons.push({ kind: "unclassifiable-text", match: unclassifiable });
-  reasons.push(...reasonsOf(separated), ...reasonsOf(whitespaceFree));
+  reasons.push(...reasonsOf(separated), ...reasonsOf(passes.whitespaceFree));
   const deduped = dedupeReasons(reasons);
   return { sensitive: deduped.length > 0, reasons: deduped };
 }

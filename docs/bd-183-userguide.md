@@ -15,12 +15,12 @@ finding text and a rule table, not of a prompt.
 
 | Piece | Where | What it does |
 | --- | --- | --- |
-| Classifier | `src/finding-sensitivity.ts` | `classifyFindingSensitivity` — security topics, credential-shaped strings, deny paths, unclassifiable text; text is NFKC-normalised first; borderline is sensitive. **Advisory**: it decides whether a human is asked, not whether text is safe to publish |
+| Classifier | `src/finding-sensitivity.ts` | `classifyFindingSensitivity` — security topics (only with a disclosure-risk signal), credential-shaped strings, deny paths, letterlike unclassifiable text; text is NFKC-normalised first; borderline is sensitive. **Advisory**: it decides whether a human is asked, not whether text is safe to publish |
 | Answer parsing | `src/finding-sensitivity.ts` | `parsePublicationAnswer` (withhold checked before the positive keywords), `redactFindingToOneLiner` |
 | Safety surface | `src/finding-publication.ts` | `projectFindingText`, `findProjectionViolations`, `findReassemblyViolations`, `selectPublishableFindings`, `evaluateDeferredFindingsGate`, `renderDeferredFindingsSection` |
 | Record | `src/review-findings.ts` | per-finding `sensitivity` / `publication`, `carryForwardSensitivity`, `recordPublicationAnswer`, `releasedPublicationIn` |
-| Gate wiring | `extensions/capabilities/human-gate.ts` | `deliverReviewFindings` (gate title/reason say "sensitive findings"), the `AwaitingHuman.reviewFindings` marker, and `recordPublicationChoice` at the single answer choke point — for both the bd comment and the GitHub issue channel |
-| Marker type | `src/workflow-phases.ts` | `AwaitingHuman.reviewFindings?: { round: number }` — set only by the review gate of a sensitive record, and only for its own round |
+| Gate wiring | `extensions/capabilities/human-gate.ts` | `deliverReviewFindings` (gate title/reason say "sensitive findings"), the `AwaitingHuman.publicationOnly` / `reviewFindings` markers, and `recordPublicationChoice` at the single answer choke point — for both the bd comment and the GitHub issue channel |
+| Marker types | `src/workflow-phases.ts` | `AwaitingHuman.reviewFindings?: { round: number }` — set only by the review gate of a sensitive record, and only for its own round; `AwaitingHuman.publicationOnly?: true` — marks that wait as PR-body-only, so it never refuses phase tools (bd-252) |
 
 Two things bd-183 deliberately does **not** do: it has no PR writer (bd-184 owns
 the `<!-- belayd:deferred -->` body section) and no `gh` invocation (bd-174.3 owns
@@ -88,10 +88,10 @@ pnpm test -t "does not read bare `as is` or bare `include` as publish permission
 node --input-type=module -e '
 const { classifyFindingSensitivity } = await import("./dist/src/finding-sensitivity.js");
 const cases = {
-  "auth-topic": "`src/a.ts:12` — the auth check is missing on the admin route",
-  "credential-shaped": "`src/a.ts:12` — the fixture prints token ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+  "auth-topic": "`src/a.ts:12` — the auth check is bypassed on the admin route",
+  "credential-shaped": "`src/a.ts:12` — the fixture leaks token ghp_16C7e42F292c6912E7710c838347Ae178B4a",
   "deny-path": "`src/a.ts:12` — ~/.ssh/id_rsa is committed to the repo",
-  "fullwidth": "`src/a.ts:12` — ＡＵＴＨＯＲＩＺＡＴＩＯＮ never runs",
+  "fullwidth": "`src/a.ts:12` — ＡＵＴＨＯＲＩＺＡＴＩＯＮ is bypassed on the admin route",
   "zero-width": "`src/a.ts:12` — pass\u200Bword=16C7e42F292c is logged",
   "homoglyph": "`src/a.ts:12` — src/pr\u043E\u043Ef/x.png is unreviewed",
   "benign typography": "\"src/a.ts:12\" — off-by-one in the loop bound",
@@ -119,10 +119,14 @@ clean               false []
 Read the six verdicts as the design:
 
 - **auth-topic** — the topic vocabulary, matched on a word boundary (`author` and
-  `sessionless` stay out).
+  `sessionless` stay out), plus a disclosure-risk word (`bypassed`). A topic word
+  alone is not sensitive (bd-252): "the sessions map is written without a lock"
+  and "process.env is read twice" are reliability findings. Credential shapes,
+  deny paths, anchors and letter lookalikes stay unconditional.
 - **credential-shaped** — the full token is reported, so the human sees what
-  fired, not just the prefix. `token` also fires the topic rule; a bare `token`
-  name is a credential mention.
+  fired, not just the prefix. `token` also fires the topic rule here because
+  `leaks` is the risk signal; a bare topic word alone no longer records one
+  (bd-252).
 - **deny-path** — the path token *and* the bare `.ssh` directory. A deny
   directory also matches a token that ends at it.
 - **fullwidth** — `ＡＵＴＨＯＲＩＺＡＴＩＯＮ` reaches the rules as `AUTHORIZATION`
@@ -133,7 +137,9 @@ Read the six verdicts as the design:
   `password=…` again.
 - **homoglyph** — a Cyrillic `о` has no NFKC fold, so it is **refused**, not
   guessed: `unclassifiable-text` with the offending code point escaped
-  (`\u{043E}`).
+  (`\u{043E}`). Only letterlike code points (Unicode letters, marks and numbers)
+  are refused; an arrow, check mark, emoji or math symbol cannot spell a keyword,
+  so `the lock is taken → then released` publishes without a question (bd-252).
 - **benign typography** and **clean** — straight quotes and an em dash around a
   path are punctuation, and `off-by-one in the loop bound` names no security topic,
   so both publish without a question.
@@ -240,7 +246,7 @@ publish after we rotate the key   {"ok":false,"reason":"sensitive-findings-withh
   node --input-type=module -e '
   const rf = await import("./dist/src/review-findings.js");
   const pub = await import("./dist/src/finding-publication.js");
-  const text = "## Warnings (should fix)\n- `src/a.ts:12` — the session cookie is never rotated";
+  const text = "## Warnings (should fix)\n- `src/a.ts:12` — the session cookie is logged in plaintext";
   const record = rf.buildReviewFindingsRecord({ taskId: "bd-183-demo", text });
   const answered = rf.applyPublicationAnswer(record, "publish a redacted one-liner");
   console.log(JSON.stringify(answered.findings[0].publication.oneLiner));
@@ -248,8 +254,8 @@ publish after we rotate the key   {"ok":false,"reason":"sensitive-findings-withh
   ```
 
   ```text
-  "[redacted] — the session cookie is never rotated"
-  "### Deferred findings\n- [redacted] - the session cookie is never rotated"
+  "[redacted] — the session cookie is logged in plaintext"
+  "### Deferred findings\n- [redacted] - the session cookie is logged in plaintext"
   ```
 
   Note the em dash: the projection folds benign typography to ASCII, so the
@@ -390,7 +396,12 @@ then writes the record, creates the gate, posts the `[belayd:review]` comment an
 arms the wait. What the bead shows:
 
 - gate title: `belayd-review: <bead> sensitive findings (round N)` (plus
-  `; previous decisions reset` when a re-review dropped a release);
+  `; previous decisions reset` when a re-review dropped a release). The full
+  title shape, including this bead id and the round, is what lets a restart
+  classify the wait as publication-only (bd-252); a bare prefix, a wrong bead id,
+  a truncated title or trailing prose stays a blocking wait (fail-closed). A gate
+  created by an older harness whose title drifted therefore blocks rather than
+  unblocks.
 - gate reason: the shared review wait plus `— sensitive findings need a
   publication decision: publish as-is, publish a redacted one-liner, or withhold
   (default)`;
@@ -398,6 +409,14 @@ arms the wait. What the bead shows:
   appended to each sensitive finding, plus the
   `### Sensitive findings — publication decision required` section naming the
   three options verbatim.
+
+This wait does **not** refuse phase tools (bd-252). Its answer changes only the PR
+body, and withholding is already the default, so `belayd_implement` and the rest of
+the fix loop keep running while the question is open; sensitive findings stay
+withheld from every PR body until an answer is recorded. If the workflow completes
+with the gate still open, one last answer check runs before the gate is reaped, so
+an answer posted just before completion is still recorded. An answer posted after
+the workflow has ended is not recorded and cannot publish anything, by design.
 
 Answer the gate (a comment on the bead, a comment on the mapped GitHub issue under
 GitHub-primary, or `bd gate resolve <gate> --reason "publish as-is"`). The session
@@ -655,8 +674,8 @@ meets; every row was run against this tree:
 
 | A gate opens for | Example | Why accepted |
 | --- | --- | --- |
-| any bare `token`/`secret`/`credential` noun | `the token bucket rate limiter is too small` → `security-topic: token` | without it the split `tok§en` / `tok en` is invisible; a placeholder (`password=<token>`, `${TOKEN}`, `{{ token }}`) is still exempt |
-| any anchor, wherever it appears | `risk-free retry` and `task-oriented split` → `credential-shaped: sk-`; a finding that merely names `ghp_` gates | an anchor is meaningless without a secret behind it, so its presence *is* the question |
+| a topic word paired with a real risk word | `session tokens are logged in plaintext` → `security-topic: session tokens`, `security-topic: session`, `credential-shaped: tokens are logged` | the topic word names the area and the risk word names the disclosure; a topic word alone (`the sessions map is written without a lock`, `the token bucket refills too slowly`) no longer gates (bd-252). A typographic split (`tok§en`) is still joined by the compact reading, so a risk word in the same finding keeps the topic reason; a placeholder (`password=<token>`, `${TOKEN}`, `{{ token }}`) is still exempt |
+| any anchor, wherever it appears | `risk-free retry` and `task-oriented split` → `credential-shaped: sk-`; a finding that merely names `ghp_` gates | an anchor is meaningless without a secret behind it, so its presence *is* the question. `process.env` and `process.env.X` code references are exempt only when `process` starts at the string or after a non-word character; a `.env`/`.env.*` file reference anywhere else stays deny-path (bd-252 review 2) |
 | a deny directory at the end of a token, and a bare dot-directory | `wiki/src/auth` → `deny-path: wiki/src/auth`; `the .ssh folder` → `deny-path: .ssh` | `~/.ssh` with no trailing slash otherwise evades `.ssh/` |
 | a wrapped line joining under the compact reading | `the item.p` + newline + `em class is wrong` → `deny-path: item.pem (separators removed)` | fail-closed against a missed `id_rs a`; the note is load-bearing, because the match is not verbatim |
 | a sentence welded by the whitespace-deleted reading | `line 42: the loop allocates 3 times` → `credential-shaped: :theloopallocates3times (whitespace removed)` | deleting every space is the only join no split can outgrow; the entropy test (a digit, an upper-case letter, `/`, `+` or `_`, plus at least one letter) keeps most prose out |
@@ -726,11 +745,14 @@ they publish as written.
 
 | Table | File: symbol | For |
 | --- | --- | --- |
-| security topics | `src/finding-sensitivity.ts`: `SECURITY_TOPIC_RULES` | a word-boundary match for the auth/crypto/secret/session/env vocabulary |
+| security topics | `src/finding-sensitivity.ts`: `SECURITY_TOPIC_RULES` | a word-boundary match for the auth/crypto/secret/session/env vocabulary; recorded only when a disclosure-risk signal also matches (bd-252) |
+| disclosure risk | `src/finding-sensitivity.ts`: `DISCLOSURE_RISK_RULES` | bypass, injection, XSS/CSRF/SSRF, leak, exposure, plaintext, hard-coded, traversal, escalation, spoofing, vulnerability, exploit, exfiltration and the rest of the table |
 | credential shapes | `src/finding-sensitivity.ts`: `CREDENTIAL_SHAPED_RULES` | a fixed-prefix token, a PEM block, a JWT, a bearer header, a URI userinfo, a `key = value` assignment |
+| credential sinks | `src/finding-sensitivity.ts`: `CREDENTIAL_SINK_RULES` | a credential noun beside written/logged/printed/echoed/dumped/leaked, a broken lifecycle (`never rotates`/`never expires`) or a comparable sink. The sink arm reads a bounded auxiliary chain, so `is being logged`, `has been logged` and `will be logged` are the same disclosure as `is logged`, and up to two closed, non-negating adverbs are allowed (`is accidentally logged`, and the stacked `is currently silently logged`); a credential container noun (`the credential cache is written to disk`) or the `session material` idiom keeps the credential as the subject. A **negated** sink (`the api key is never logged`) is an absence claim and is deliberately *not* a sink disclosure — negation stays in the lifecycle arm alone, where `never rotated` is the defect. A bare sink verb beside a non-credential subject (`token usage is logged`) is excluded |
 | deny paths | `src/finding-sensitivity.ts`: `FINDING_DENY_PATH_PATTERNS` | a path that is sensitive by location |
 | anchors | `src/finding-sensitivity.ts`: `FINDING_CREDENTIAL_ANCHORS` | a substring with no innocent reading; survives any split |
 | exempt typography | `src/finding-sensitivity.ts`: `BENIGN_TYPOGRAPHY` | punctuation only — nothing a reader could mistake for a letter or digit |
+| refused text | `src/finding-sensitivity.ts`: `LETTERLIKE_CODE_POINT_PATTERN` | Unicode letters, marks and numbers only; non-letterlike symbols (an arrow, an emoji, a math operator) are not a disclosure question (bd-252) |
 
 Every rule addition needs three things: a `// why` comment stating the evasion it
 closes, a row in the classifier table in **both** directions (a matching row and a

@@ -102,6 +102,25 @@ describe("sensitive deferrals block publication", () => {
     expect(renderDeferredFindingsSection(record)).toBe("");
   });
 
+  it.each([
+    ["an env file", "`/.env` is committed"],
+    ["an ssh key", "`id_rsa` sits in the repository root"],
+    ["a GitHub token", "committed ghp_16C7e42F292c6912E7710c838347Ae178B4a in a test"],
+    ["a password assignment", "password = hunter2hunter2 in the fixture"],
+    ["a PEM header", "-----BEGIN RSA PRIVATE KEY----- leaked into a fixture"],
+    ["a letter lookalike", "`src/prоof/x.png` is unreviewed"],
+  ])("still blocks %s with no recorded decision (bd-252 AC2)", (_label, finding) => {
+    // The risk floor only removes bare topic words; credentials, deny paths,
+    // anchors and letter lookalikes stay unconditional and still gate publishing.
+    const record = recordOf([deferredFinding(finding)]);
+    expect(classifyFindingSensitivity(finding).sensitive).toBe(true);
+    expect(evaluateDeferredFindingsGate(record)).toMatchObject({
+      ok: false,
+      reason: "sensitive-findings-awaiting-human",
+    });
+    expect(renderDeferredFindingsSection(record)).toBe("");
+  });
+
   it("renders the raw text only after a publish decision", () => {
     const record = applyPublicationAnswer(recordFor(SENSITIVE_REVIEW), "publish it");
     expect(evaluateDeferredFindingsGate(record).ok).toBe(true);

@@ -108,7 +108,7 @@ Case names worth knowing, by what they prove:
 | `extension-review-gate` › `keeps the gate and the wait when only the comment write fails` | gate is created first, so a failed comment still leaves a findable wait |
 | `extension-review-gate` › `opens exactly one gate when two sensitive deliveries settle concurrently` | the `reviewGatePending` reservation |
 | `extension-review-gate` › `records an increasing round across re-reviews without a gate` | `round` comes from the persisted record, not memory |
-| `extension-review-gate` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive only while a human wait is live` | `runCompleteLoopHint` |
+| `extension-review-gate` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive while a blocking human wait is live` / `keeps the directive for a publication-only wait (bd-252)` | `runCompleteLoopHint` suppresses the directive only for a blocking wait |
 | `review-findings` › `returns undefined for a clean review (the fast path writes nothing)` | no record for a clean review |
 | `review-findings` › `reports an error and leaves no temp file behind when the rename fails` | atomic temp-rename write |
 | `fleet-run` › `exempts an awaiting-human live wait from the idle cap (bd-175)` | 240 idle ticks on a lone live human wait is still `wait` |

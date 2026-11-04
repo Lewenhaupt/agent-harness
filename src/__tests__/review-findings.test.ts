@@ -21,6 +21,7 @@ import {
   formatReviewFindingsComment,
   hasReviewFindings,
   hasSensitiveFindings,
+  isReviewFindingsGateTitle,
   nextReviewRound,
   REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
   REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
@@ -390,6 +391,38 @@ describe("reviewFindingsGateTitle", () => {
     expect(reviewFindingsGateTitle({ taskId: "bd-1", round: 2, sensitive: false })).toBe(
       "belayd-review: bd-1 findings (round 2)",
     );
+  });
+
+  it("matches only the full title shape for the blocked bead (bd-252)", () => {
+    // A bare prefix, another bead, a truncation or trailing prose must stay a
+    // blocking wait: treating any `belayd-review:` title as publication-only is
+    // fail-open for phase tools.
+    const title = reviewFindingsGateTitle({ taskId: "bd-1", round: 2, sensitive: true });
+    expect(isReviewFindingsGateTitle(title, "bd-1")).toBe(true);
+    expect(
+      isReviewFindingsGateTitle(reviewFindingsGateTitle({ taskId: "bd-1", round: 2 }), "bd-1"),
+    ).toBe(true);
+    expect(
+      isReviewFindingsGateTitle(
+        reviewFindingsGateTitle({
+          taskId: "bd-1",
+          round: 2,
+          sensitive: true,
+          previousDecisionsReset: true,
+        }),
+        "bd-1",
+      ),
+    ).toBe(true);
+    for (const rejected of [
+      reviewFindingsGateTitle({ taskId: "bd-999", round: 1, sensitive: true }),
+      "belayd-review: bd-1 sensitive findings (round",
+      `${title} extra prose`,
+      "belayd-review:",
+      "belayd-review: bd-1 findings (round two)",
+      "Gate: human",
+    ]) {
+      expect(isReviewFindingsGateTitle(rejected, "bd-1"), rejected).toBe(false);
+    }
   });
 });
 

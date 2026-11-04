@@ -229,18 +229,24 @@ function reviewLoopHintFor(delivery: RunDelivery, state: CoreSessionState): stri
 /**
  * The loop hint a run-complete delivery carries.
  *
- * Withheld only while a human wait is live: a member blocked by `belayd_ask_human`
- * (or by the bd-183 publication gate) cannot call the next phase tool the hint
- * names, so offering it would only invite a refused call. A plain findings review
- * delivers no wait at all (bd-219), so it always carries the directive — the turn
- * that can fix the findings is told how. A clean review and a host with no seam
- * reach here the same way and keep the directive too.
+ * Withheld only while a blocking human wait is live: a member blocked by
+ * `belayd_ask_human` cannot call the next phase tool the hint names, so offering
+ * it would only invite a refused call. A publication-only wait (bd-252) refuses
+ * nothing — it decides the PR body, not whether the fix loop may run — so it
+ * keeps the directive. A plain findings review delivers no wait at all (bd-219),
+ * so it always carries the directive; a clean review and a host with no seam
+ * reach here the same way.
  */
 export function runCompleteLoopHint(options: {
   delivered: RunDelivery;
   state: CoreSessionState;
 }): string {
-  if (options.state.awaitingHuman !== undefined) return "";
+  if (
+    options.state.awaitingHuman !== undefined &&
+    options.state.awaitingHuman.publicationOnly !== true
+  ) {
+    return "";
+  }
   return reviewLoopHintFor(options.delivered, options.state);
 }
 

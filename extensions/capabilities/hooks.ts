@@ -150,7 +150,10 @@ export function registerHooks(deps: HookDeps): void {
 
       // A completed workflow must not leave a human gate blocking its bead:
       // comments carry answers, but close/merge is still the acceptance signal
-      // (bd-152), so the gate is resolved here rather than kept open.
+      // (bd-152), so the gate is resolved here rather than kept open. A
+      // publication-only wait gets one last answer check first, so an answer that
+      // landed just before completion is recorded before the gate is reaped
+      // (bd-252 review).
       await reapHumanGateForTask({ ctx, state, beadId: currentTaskId, deps: humanGateDeps });
 
       // Workflow complete: the persisted state file is no longer needed.

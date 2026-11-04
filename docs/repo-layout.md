@@ -40,7 +40,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/role-tools.ts` | Per-role tool surfaces |
 | `src/tool-audit.ts` | Tool-surface auditing for the harness |
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
-| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` and its `reviewFindings` round marker (bd-183) |
+| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` with its `reviewFindings` round marker (bd-183) and `publicationOnly` PR-body-only marker (bd-252) |
 | `src/workflow-registry.ts` | Workflow sub-type registry — defines 7 workflow types with phase sequences, |
 | `src/workflow-state.ts` | Belayd workflow state persistence |
 | `src/handoff.ts` | Handoff packets carried from a parent session into a spawned orchestrator |

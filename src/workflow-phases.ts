@@ -102,4 +102,18 @@ export interface AwaitingHuman {
    * behaviour: no marker means no recording and the record stays withheld.
    */
   reviewFindings?: { round: number };
+  /**
+   * Set when the wait asks only whether a review finding may be published
+   * (bd-252).
+   *
+   * why: the publication answer decides what may appear in a PR body, and
+   * withholding is already the default, so the answer cannot change whether
+   * phase work is safe. Refusing every phase tool until it arrives stalled the
+   * whole fix loop on findings that were not secret (bd-233). This marker scopes
+   * the wait to the publish step; every other wait keeps refusing phase tools.
+   *
+   * Deliberately separate from `reviewFindings`: that field is the recording key
+   * for a publication answer (bd-183) and must stay unset on restart discovery.
+   */
+  publicationOnly?: true;
 }

@@ -600,6 +600,62 @@ function isDefaultFixLoopDeferral(finding: ReviewFindingRecord): boolean {
   }
 }
 
+/**
+ * Prefix the review gate title carries, shared by its writer and the restart
+ * classifier (bd-252).
+ *
+ * why a marker at all: on restart the wait is rebuilt from `bd gate list`, which
+ * exposes the title but not the delivery context. Without one literal shared by
+ * both sides, a rediscovered publication gate had to be treated as a blocking
+ * ask, and the workflow lost the fix loop after every restart.
+ */
+export const REVIEW_FINDINGS_GATE_TITLE_PREFIX = "belayd-review:";
+
+/* Title fragments, shared by the builder and the shape matcher below. */
+const REVIEW_GATE_TITLE_KIND_SENSITIVE = "sensitive findings";
+const REVIEW_GATE_TITLE_KIND_PLAIN = "findings";
+const REVIEW_GATE_TITLE_ROUND_OPEN = " (round ";
+const REVIEW_GATE_TITLE_ROUND_CLOSE = ")";
+const REVIEW_GATE_TITLE_RESET_SUFFIX = "; previous decisions reset";
+
+/** `RegExp` metacharacters, for building the title shape from the constants. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/**
+ * The only title shape the builder emits, minus the prefix and the bead id.
+ *
+ * Built from the same fragments {@link reviewFindingsGateTitle} uses, so a title
+ * the builder changes is never accepted by a stale matcher (or vice versa).
+ */
+const REVIEW_GATE_TITLE_SHAPE = new RegExp(
+  `^(?:${escapeRegExp(REVIEW_GATE_TITLE_KIND_SENSITIVE)}|` +
+    `${escapeRegExp(REVIEW_GATE_TITLE_KIND_PLAIN)})` +
+    `${escapeRegExp(REVIEW_GATE_TITLE_ROUND_OPEN)}\\d+` +
+    `(?:${escapeRegExp(REVIEW_GATE_TITLE_RESET_SUFFIX)})?` +
+    `${escapeRegExp(REVIEW_GATE_TITLE_ROUND_CLOSE)}$`,
+  "u",
+);
+
+/**
+ * True only when a gate title is the full review-findings shape for `taskId`.
+ *
+ * why not a bare prefix (bd-252 review): a human gate titled `belayd-review: …`
+ * for another bead, a truncated title or `belayd-review: something` with trailing
+ * prose would otherwise be read as publication-only — fail-open for phase tools.
+ * The bead id must match the bead the gate blocks, and the round/reset tail must
+ * be exactly what {@link reviewFindingsGateTitle} emits.
+ *
+ * Residual: a gate created by an older harness whose title drifted stays a
+ * blocking wait (fail-closed); it is never reclassified as publication-only.
+ */
+export function isReviewFindingsGateTitle(title: string, taskId: string): boolean {
+  const prefix = `${REVIEW_FINDINGS_GATE_TITLE_PREFIX} ${taskId} `;
+  if (!title.startsWith(prefix)) return false;
+  return REVIEW_GATE_TITLE_SHAPE.test(title.slice(prefix.length));
+}
+
 /** The bd gate title, distinct from a fleet ordering gate or an ask question. */
 export function reviewFindingsGateTitle(options: {
   taskId: string;
@@ -611,9 +667,13 @@ export function reviewFindingsGateTitle(options: {
 }): string {
   // why: bd/needs-you shows the title only; a gate indistinguishable from a
   // normal review wait is the one place the publication question gets lost.
-  const kind = options.sensitive === true ? "sensitive findings" : "findings";
-  const reset = options.previousDecisionsReset === true ? "; previous decisions reset" : "";
-  return `belayd-review: ${options.taskId} ${kind} (round ${options.round}${reset})`;
+  const kind =
+    options.sensitive === true ? REVIEW_GATE_TITLE_KIND_SENSITIVE : REVIEW_GATE_TITLE_KIND_PLAIN;
+  const reset = options.previousDecisionsReset === true ? REVIEW_GATE_TITLE_RESET_SUFFIX : "";
+  return (
+    `${REVIEW_FINDINGS_GATE_TITLE_PREFIX} ${options.taskId} ${kind}` +
+    `${REVIEW_GATE_TITLE_ROUND_OPEN}${options.round}${reset}${REVIEW_GATE_TITLE_ROUND_CLOSE}`
+  );
 }
 
 /**
