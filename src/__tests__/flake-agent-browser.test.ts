@@ -124,6 +124,22 @@ describe("bd-68: agent-browser extension wiring", () => {
     expect(packageJsonContents).toContain('"pi-agent-browser-native": "pi-agent-browser"');
   });
 
+  it("points the discovered manifest at the entry file, not an upstream directory", () => {
+    if (flakeContents === null) {
+      throw new Error("could not read flake.nix");
+    }
+    // bd-275: discovery imports a `pi.extensions` entry verbatim, so a package
+    // whose upstream manifest declares a directory (pi-vision-tool 1.3.7:
+    // ["./extensions"], no index file) failed to load with "Cannot find
+    // module". The artifact therefore regenerates package.json from the
+    // validated piExtensions entry instead of symlinking the upstream one.
+    expect(flakeContents).toContain("nativeBuildInputs = [ pkgs.jq ]");
+    expect(flakeContents).toContain(`[ "$base" = package.json ] && continue`);
+    expect(flakeContents).toContain(`--arg entry`);
+    expect(flakeContents).toContain(`.pi = ((.pi // { }) | .extensions = [$entry])`);
+    expect(flakeContents).toContain(`"$pkg/package.json" > "$out/package.json"`);
+  });
+
   it("gives every third-party extension a pi-web directory name", () => {
     if (packageJsonContents === null) {
       throw new Error(`could not read package.json at ${packageJsonPath}`);

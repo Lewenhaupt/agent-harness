@@ -69,7 +69,15 @@ manifest:
 - `packages.<system>.pi-extension-<dirName>` — a store dir per package, holding
   symlinks to the package's top-level entries plus a `node_modules` link into
   the pi-extensions tree (so a loader that follows the symlink still resolves
-  the entry's runtime deps);
+  the entry's runtime deps), plus a **regenerated `package.json`** whose
+  `pi.extensions` is `["./<piExtensions entry>"]` and whose other `pi` fields
+  are copied from upstream. Discovery imports a manifest entry verbatim, so an
+  upstream manifest that declares a *directory* loads only when that directory
+  has an index file: `pi-vision-tool` 1.3.7 declares `["./extensions"]`, whose
+  only file is `vision-tool.ts`, which surfaced as `Failed to load extension:
+  Cannot find module .../pi-vision-tool/extensions` (bd-275). Pointing the
+  artifact at the entry file keeps `piExtensions` the single source of truth for
+  both consumers;
 - `legacyPackages.<system>.pi-web-extension-dirs` — the set pi-web needs, keyed
   by directory name: one artifact per third-party extension plus
   `belayd-harness` (whose own `package.json` carries the harness entry list).

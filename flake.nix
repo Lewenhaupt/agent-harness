@@ -955,7 +955,9 @@
             entryPath,
             dirName,
           }:
-          pkgs.runCommand "pi-extension-${dirName}" { } ''
+          pkgs.runCommand "pi-extension-${dirName}" {
+            nativeBuildInputs = [ pkgs.jq ];
+          } ''
             pkg="${thirdPartyExtensionsDir}/${name}"
             # Fail loudly if a future version drops an expected path, instead of
             # leaving a dangling symlink in the store.
@@ -970,9 +972,23 @@
             mkdir -p "$out"
             for item in "$pkg"/*; do
               base="$(basename "$item")"
+              # package.json is regenerated below; node_modules is re-pointed at
+              # the shared pi-extensions tree.
               [ "$base" = node_modules ] && continue
+              [ "$base" = package.json ] && continue
               ln -s "$item" "$out/$base"
             done
+            # Discovery imports a `pi.extensions` entry verbatim, so a package
+            # that declares a **directory** only loads if that directory has an
+            # index file: pi-vision-tool 1.3.7 declares ["./extensions"], whose
+            # only file is vision-tool.ts, and pi then fails with "Cannot find
+            # module …/pi-vision-tool/extensions". Point the discovered manifest
+            # at the entry file validated above instead — the same module the
+            # `-e` list loads, so `pi` and pi-web keep one source of truth
+            # (piExtensions) for both consumers.
+            jq --arg entry "./${entryPath}" \
+              '.pi = ((.pi // { }) | .extensions = [$entry])' \
+              "$pkg/package.json" > "$out/package.json"
             ln -s "${thirdPartyExtensionsDir}" "$out/node_modules"
           '';
 
