@@ -14,7 +14,6 @@ import { mirrorAssignee } from "../../src/beads-assignee.js";
 import type { CapacityCache } from "../../src/capacity-cache.js";
 import type { HandoffPacket } from "../../src/handoff.js";
 import { buildOrchestratorPrompt, taskIdFromBranch, writeHandoff } from "../../src/handoff.js";
-import type { ModelCooldownStore } from "../../src/model-cooldown.js";
 import {
   acquireOrchestratorClaim,
   assignOrchestratorClaimSession,
@@ -25,7 +24,6 @@ import {
 } from "../../src/orchestrator-claim.js";
 import {
   describeBlockedProviders,
-  type ProviderWindow,
   planModelRoute,
   splitModelRoute,
 } from "../../src/orchestrator-model.js";
@@ -50,6 +48,12 @@ import { isInsideWorktreeForBranch } from "../../src/worktree.js";
 import type { CoreSessionState } from "./context.js";
 import { errorText, reportAssigneeResult, runBdCommand, runBdForAssignee } from "./context.js";
 import { daemonRequest } from "./daemon.js";
+import {
+  candidateBlocked,
+  exhaustionWindows,
+  type ModelAvailabilityRouting,
+  refreshModelAvailability,
+} from "./model-availability.js";
 import type { SessionContext } from "./session-state.js";
 import type { WorkflowCoreApi } from "./workflow-core.js";
 
@@ -82,8 +86,7 @@ export interface LaunchDeps {
  * operator's global default model; the harness's own knowledge that a provider
  * is spent lives here, so the launch path has to consult it explicitly.
  */
-export interface LaunchModelRouting {
-  cooldownStore: ModelCooldownStore;
+export interface LaunchModelRouting extends ModelAvailabilityRouting {
   capacity: CapacityCache;
   /** `BELAYD_MODEL_FALLBACK=0` opts out of every routing decision, including this one. */
   enabled: boolean;
@@ -320,35 +323,11 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
 
   // ── Orchestrator model routing (bd-229) ────────────────────────────────
 
-  /**
-   * True when a candidate's provider (or its exact endpoint) is known to be
-   * unable to serve a turn: a reactive cooldown mark from an earlier failure, or
-   * a pre-dispatch capacity window.
-   */
-  function candidateBlocked(candidate: string): boolean {
-    if (modelRouting.cooldownStore.cooldownScope(candidate) !== undefined) return true;
-    return modelRouting.capacity.isModelExhausted(candidate);
-  }
-
-  /**
-   * Reset windows from both sources, so a refusal can name when a provider is
-   * back. The cooldown store is the reactive record; the capacity cache adds a
-   * configured usage endpoint's view of the same provider.
-   */
-  function exhaustionWindows(): ProviderWindow[] {
-    const windows: ProviderWindow[] = [];
-    for (const [provider, entry] of modelRouting.cooldownStore.providerEntries()) {
-      windows.push({ provider, resetAt: entry.until });
-    }
-    windows.push(...modelRouting.capacity.windows());
-    return windows;
-  }
-
   /** Refusal text naming every provider that cannot serve this launch. */
   function describeNoModelAvailable(blocked: readonly string[], detail?: string): string {
     const named = describeBlockedProviders({
       candidates: blocked,
-      windows: exhaustionWindows(),
+      windows: exhaustionWindows(modelRouting),
       nowMs: Date.now(),
     });
     return (
@@ -372,14 +351,14 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     current: string | undefined,
   ): Promise<string | undefined> {
     if (!modelRouting.enabled || current === undefined) return undefined;
-    // A cooldown another fleet member persisted after this process created its
-    // store must be visible before the routing decision: the capacity TTL alone
-    // can hide it for minutes, and a launch on a spent provider dies on its
-    // first turn (bd-234). `refresh` is unbounded here — a refusal must be sure.
-    modelRouting.cooldownStore.refresh();
-    modelRouting.cooldownStore.prune();
-    await modelRouting.capacity.refreshIfStale();
-    const plan = planModelRoute({ current, isBlocked: candidateBlocked });
+    // A launch on a spent provider dies on its first turn (bd-234), so this
+    // pre-flight may refresh the endpoint signal when the capacity cache is
+    // stale: it runs once, before any side effect, and a refusal must be sure.
+    await refreshModelAvailability(modelRouting, { probeCapacity: true });
+    const plan = planModelRoute({
+      current,
+      isBlocked: (candidate) => candidateBlocked(modelRouting, candidate),
+    });
     if (plan.available.length > 0) return undefined;
     return describeNoModelAvailable(plan.blocked);
   }
@@ -441,15 +420,17 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     callerModel: string | undefined;
   }): Promise<{ ok: true; model?: string; previous?: string } | { ok: false; error: string }> {
     if (!modelRouting.enabled) return { ok: true };
-    // Same freshness rule as the preflight: the child's model must be judged
-    // against the current shared store, not this process's creation snapshot.
-    modelRouting.cooldownStore.refresh();
-    modelRouting.cooldownStore.prune();
-    await modelRouting.capacity.refreshIfStale();
+    // Same freshness rule as the preflight, including the probe: the child's
+    // model must be judged against the current shared stores, not this
+    // process's creation snapshot.
+    await refreshModelAvailability(modelRouting, { probeCapacity: true });
     const current = (await readSessionModel(options.sessionId, options.cwd)) ?? options.callerModel;
     if (current === undefined) return { ok: true };
 
-    const plan = planModelRoute({ current, isBlocked: candidateBlocked });
+    const plan = planModelRoute({
+      current,
+      isBlocked: (candidate) => candidateBlocked(modelRouting, candidate),
+    });
     if (plan.currentUsable) return { ok: true };
 
     let lastError: string | undefined;

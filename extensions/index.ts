@@ -85,6 +85,7 @@ import { createPhaseRunner } from "./capabilities/phase-run.js";
 import { registerAgentPhaseTools, registerStatusTool } from "./capabilities/phase-tools.js";
 import { registerPlanningCommand, registerPlanningTools } from "./capabilities/planning.js";
 import { registerProof } from "./capabilities/proof.js";
+import { registerSessionModelRouting } from "./capabilities/session-model-routing.js";
 import {
   attributedBdArgv,
   createInitialSessionState,
@@ -128,6 +129,9 @@ function sessionNameOf(ctx: unknown): string | undefined {
     | undefined;
   return typeof manager?.getSessionName === "function" ? manager.getSessionName() : undefined;
 }
+
+/** True for a phase sub-agent session, whose model accounting belongs to the spawner. */
+const isPhaseSubAgent = (ctx: unknown): boolean => isSubAgentSession(sessionNameOf(ctx));
 
 // ── Extension factory ──────────────────────────────────────────────────
 
@@ -385,7 +389,7 @@ export default function belaydAgentHarness(
       if (!result.ok) return { ok: false, error: result.error };
       return { ok: true, authority: result.authority };
     },
-    isPhaseSession: (ctx) => isSubAgentSession(sessionNameOf(ctx)),
+    isPhaseSession: isPhaseSubAgent,
   });
 
   registerArchify(pi);
@@ -439,12 +443,8 @@ export default function belaydAgentHarness(
     humanGateDeps,
   });
 
-  // In-session model recovery (bd-229), last so it observes a settled run after
-  // every other hook has had its say. Phase sub-agents are skipped: their
-  // fallback lives in the spawner, which owns their model accounting.
-  registerModelRecovery({
-    pi,
-    routing: modelRouting,
-    isSubAgent: (ctx) => isSubAgentSession(sessionNameOf(ctx)),
-  });
+  // In-session recovery (bd-229) switches after a failed turn; the session
+  // pre-flight (bd-257) switches before the first, after the bd-187 wrapper hook.
+  registerModelRecovery({ pi, routing: modelRouting, isSubAgent: isPhaseSubAgent });
+  registerSessionModelRouting({ pi, routing: modelRouting, isSubAgent: isPhaseSubAgent });
 }

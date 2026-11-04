@@ -26,13 +26,18 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { CapacityCache } from "../../src/capacity-cache.js";
 import { providerOf } from "../../src/model-classes.js";
-import type { ModelCooldownStore } from "../../src/model-cooldown.js";
-import { planModelRoute, splitModelRoute } from "../../src/orchestrator-model.js";
+import { planModelRoute } from "../../src/orchestrator-model.js";
 import type { FailureClassification } from "../../src/quota-failure.js";
 import { classifyAssistantMessage, isFallbackWorthy } from "../../src/quota-failure.js";
 import { recordFailureCooldown } from "../../src/spawn-with-fallback.js";
+import {
+  candidateBlocked,
+  currentModelId,
+  type ModelAvailabilityRouting,
+  refreshModelAvailability,
+  switchToFirstUsableModel,
+} from "./model-availability.js";
 
 /**
  * How many model switches one session may make.
@@ -45,9 +50,7 @@ import { recordFailureCooldown } from "../../src/spawn-with-fallback.js";
 const MAX_SWITCHES_PER_SESSION = 3;
 
 /** Model-routing seams the composer owns (bd-116 session state). */
-export interface ModelRecoveryRouting {
-  cooldownStore: ModelCooldownStore;
-  capacity?: CapacityCache;
+export interface ModelRecoveryRouting extends ModelAvailabilityRouting {
   /** `BELAYD_MODEL_FALLBACK=0` opts out of every routing decision, including this one. */
   enabled: boolean;
 }
@@ -107,22 +110,21 @@ export function registerModelRecovery(deps: ModelRecoveryDeps): void {
     if (current === undefined) return;
     state.tried.add(current);
 
-    // A provider another fleet member cooled after this store was created must
-    // be blocked before the switch target is chosen: the capacity TTL can hide
-    // it, and switching onto it spends the one continuation on a dead provider
-    // (bd-234). Unbounded refresh: this decision has one shot per turn.
-    routing.cooldownStore.refresh();
-    routing.cooldownStore.prune();
+    // Candidates are judged against the shared store, which every cooldown read
+    // queries live, so a provider another fleet member cooled is blocked here
+    // (bd-234) without waiting on anything. Store only, no capacity probe: this
+    // continuation happens once and must not wait on an endpoint read.
+    await refreshModelAvailability(routing);
 
     // Candidates the session already ran on are blocked too: the cooldown store
     // may not know them yet when the failure was endpoint-scoped, and retrying
     // the model that just failed would spend a request to relearn the same thing.
     const plan = planModelRoute({
       current,
-      isBlocked: (candidate) => state.tried.has(candidate) || isBlocked(deps, candidate),
+      isBlocked: (candidate) => state.tried.has(candidate) || candidateBlocked(routing, candidate),
     });
 
-    const switched = await switchToFirstUsable(deps, ctx, plan.available);
+    const switched = await switchToFirstUsableModel(pi, ctx, plan.available);
     if (switched === undefined) return;
 
     state.switches += 1;
@@ -156,39 +158,4 @@ function logNotice(text: string, level: "info" | "warning"): void {
   const line = `[belayd-harness] ${text}`;
   if (level === "warning") console.warn(line);
   else console.log(line);
-}
-
-/** True when the candidate's provider or endpoint is known to be unable to serve. */
-function isBlocked(deps: ModelRecoveryDeps, candidate: string): boolean {
-  if (deps.routing.cooldownStore.cooldownScope(candidate) !== undefined) return true;
-  return deps.routing.capacity?.isModelExhausted(candidate) ?? false;
-}
-
-/**
- * Set the first candidate the session can actually run, and return its id.
- *
- * `pi.setModel` answers false when the provider has no credential, and the
- * session may be scoped to a subset of models, so the first available candidate
- * is not always settable — each rejection falls through to the next instead of
- * failing the whole recovery.
- */
-async function switchToFirstUsable(
-  deps: ModelRecoveryDeps,
-  ctx: ExtensionContext,
-  candidates: readonly string[],
-): Promise<string | undefined> {
-  for (const candidate of candidates) {
-    const route = splitModelRoute(candidate);
-    if (route === undefined) continue;
-    const model = ctx.modelRegistry.find(route.provider, route.modelId);
-    if (model === undefined) continue;
-    if (await deps.pi.setModel(model)) return candidate;
-  }
-  return undefined;
-}
-
-/** The session's current model as `provider/modelId`, or undefined when it has none. */
-function currentModelId(ctx: ExtensionContext): string | undefined {
-  const model = ctx.model;
-  return model === undefined ? undefined : `${model.provider}/${model.id}`;
 }

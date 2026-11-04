@@ -330,6 +330,9 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
   // before_agent_start runs every registered handler in pi; keep the full list
   // so the mock can emulate emitBeforeAgentStart faithfully (see `on`).
   const beforeAgentStartHandlers: Array<(...args: unknown[]) => void> = [];
+  // Same for `session_start`: handlers registered after the workflow commands
+  // (the bd-257 session model pre-flight) must run too, in registration order.
+  const sessionStartHandlers: Array<(...args: unknown[]) => void> = [];
   const messages: Array<{
     customType: string;
     content: string;
@@ -351,6 +354,13 @@ function createMockPi(sharedBus?: ReturnType<typeof createMockEventBus>): {
       commands.set(name, cmd);
     },
     on: (event: string, handler: (...args: unknown[]) => void) => {
+      if (event === "session_start") {
+        sessionStartHandlers.push(handler);
+        eventHandlers.set(event, (...args: unknown[]) => {
+          for (const registered of sessionStartHandlers) registered(...args);
+        });
+        return;
+      }
       if (event !== "before_agent_start") {
         eventHandlers.set(event, handler);
         return;

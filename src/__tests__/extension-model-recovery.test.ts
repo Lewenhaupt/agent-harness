@@ -14,6 +14,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerModelRecovery } from "../../extensions/capabilities/model-recovery.js";
+import { type CapacityCache, createCapacityCache } from "../capacity-cache.js";
 import { createModelCooldownStore } from "../model-cooldown.js";
 import type { ModelStateStore } from "../model-state-store.js";
 import { openModelStateStore } from "../model-state-store.js";
@@ -114,6 +115,7 @@ function setup(options: {
   setModelOk?: (m: ModelRef) => boolean;
   isSubAgent?: boolean;
   enabled?: boolean;
+  capacity?: CapacityCache;
 }) {
   const store = createModelCooldownStore({ store: stateStore });
   const pi = createPi({
@@ -123,7 +125,11 @@ function setup(options: {
   const notify = vi.fn();
   registerModelRecovery({
     pi: pi.api,
-    routing: { cooldownStore: store, enabled: options.enabled ?? true },
+    routing: {
+      cooldownStore: store,
+      ...(options.capacity === undefined ? {} : { capacity: options.capacity }),
+      enabled: options.enabled ?? true,
+    },
     isSubAgent: () => options.isSubAgent ?? false,
     notify,
   });
@@ -279,20 +285,40 @@ describe("in-session model recovery", () => {
   });
 
   it("sees a provider another process cooled after the store was created (bd-234)", async () => {
-    // The session's store loaded the shared file at registration; a fleet member
-    // spending opencode-go afterwards must still be skipped when the switch
-    // target is chosen, or the one continuation lands on a dead provider.
+    // The session's cooldown adapter holds no snapshot: every scope read goes
+    // through the shared ModelStateStore, so a fleet member spending opencode-go
+    // after registration must still be skipped when the switch target is chosen,
+    // or the one continuation lands on a dead provider.
     const { pi, emit } = setup({});
+    // Mark AFTER `message_end` has persisted this session's own llmgateway entry.
+    // Visibility is structural, not the effect of a refresh: every cooldown read
+    // is an uncached `listCooldowns` query against the shared store, so the peer's
+    // row is seen exactly as the continuation builds its plan.
+    await emit("message_end", errorMessage(BILLING_ERROR), KNOWN_MODELS[0] as ModelRef);
     const otherMember = createModelCooldownStore({ store: otherConnection });
     otherMember.markProviderCooldown("opencode-go", 3600, "quota", { cause: "quota" });
 
-    await emit("message_end", errorMessage(BILLING_ERROR), KNOWN_MODELS[0] as ModelRef);
     await emit("agent_before_settle", BOUNDARY, KNOWN_MODELS[0] as ModelRef);
 
     expect(pi.setModel.mock.calls[0]?.[0]).toEqual({
       provider: "commandcode",
       id: "deepseek/deepseek-v4.1-flash",
     });
+  });
+
+  it("does not probe the capacity endpoint before the continuation (bd-257)", async () => {
+    // Recovery is a one-shot continuation after a failed turn: a probe bounded by
+    // the endpoint timeout would delay it, so it judges candidates against the
+    // capacity cache it already has (bd-257 review W1).
+    const capacity = createCapacityCache();
+    const probe = vi.spyOn(capacity, "refreshIfStale");
+    const { pi, emit } = setup({ capacity });
+
+    await emit("message_end", errorMessage(BILLING_ERROR), KNOWN_MODELS[0] as ModelRef);
+    await emit("agent_before_settle", BOUNDARY, KNOWN_MODELS[0] as ModelRef);
+
+    expect(probe).not.toHaveBeenCalled();
+    expect(pi.setModel).toHaveBeenCalledTimes(1);
   });
 
   it("stops switching at the per-session cap instead of walking the class forever", async () => {

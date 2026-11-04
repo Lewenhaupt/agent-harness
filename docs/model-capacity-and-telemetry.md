@@ -27,8 +27,10 @@ This document covers user-visible behaviour only. Internals:
 the capability wiring in `extensions/capabilities/model.ts` (routing state) and
 `extensions/capabilities/phase-run.ts` (per-run telemetry attach). Orchestrator
 sessions route themselves through `src/orchestrator-model.ts`,
-`extensions/capabilities/launch.ts` and
-`extensions/capabilities/model-recovery.ts` (bd-229).
+`extensions/capabilities/launch.ts`,
+`extensions/capabilities/model-availability.ts` and
+`extensions/capabilities/model-recovery.ts` (bd-229), plus the plain-session
+pre-flight in `extensions/capabilities/session-model-routing.ts` (bd-257).
 
 ## How to Verify
 
@@ -645,20 +647,20 @@ happen, in this order:
 1. **The shared cooldown rows are re-read** —
    `ModelCooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS)` followed by
    `prune()`. Since bd-256 this is the *same* SQLite store the provider wrapper
-   writes (`ModelCooldownStore` is a thin adapter over `ModelStateStore`), so
-   "re-read" means dropping the store's 1 s read cache, not parsing a second
-   file. It is deliberately *not* gated by the capacity TTL and happens
-   even when the capacity probe is an endpoint probe: without it the picker
-   dispatches onto a provider another fleet member (or the wrapped dispatch in
-   this same process) already spent, and only recovers after paying a failed
-   spawn in the fallback loop (bd-234). `refreshIfStale` never throws and is a
-   no-op without a store, so a degraded store leaves candidate selection
-   permissive. A missing refresh stamp and a *regressed* clock both count as
-   stale (a negative elapsed time cannot prove freshness), so a backwards clock
-   change re-reads instead of suppressing reads until wall time catches up.
-   Callers that need certainty (orchestrator launch preflight, in-session
-   recovery) still use the unbounded `refresh()`, which clears the cache
-   outright.
+   writes (`ModelCooldownStore` is a thin adapter over `ModelStateStore`), and
+   candidate selection queries it live (`cooldownScope` → `listCooldowns`, no
+   cache), so a provider another fleet member already spent is skipped on the
+   first attempt whoever wrote the row (bd-234) without any refresh step. What
+   the refresh still buys here is the wrapper's view: the store keeps a 1 s
+   cache for `cooldownFor`, which is what the in-process wrapped dispatch reads,
+   and `prune()` is GC of expired rows (already invisible to readers). Neither is
+   gated by the capacity TTL. `refreshIfStale` never throws and is a no-op
+   without a store, so a degraded store leaves candidate selection permissive. A
+   missing refresh stamp and a *regressed* clock both count as stale (a negative
+   elapsed time cannot prove freshness), so a backwards clock change re-reads
+   instead of suppressing reads until wall time catches up. Callers that also
+   want to clear that cache outright (orchestrator launch preflight, in-session
+   recovery) use the unbounded `refresh()`.
 
 2. **The cached capacity signal is refreshed** (TTL permitting), and then it:
 
@@ -687,8 +689,8 @@ happen, in this order:
 
 Reactive cooldown skips (`(cooldown)`, `(provider X exhausted)`) are unchanged
 and keep their original slot in the attempt trail; the capacity cache is what
-pre-empts the *first* attempt, and the store re-read above makes those skips
-correct on the first attempt instead of reactive discovery.
+pre-empts the *first* attempt, and the live store read at candidate selection
+makes those skips correct on the first attempt instead of reactive discovery.
 
 - **Cooldown/capacity skips do not consume `maxAttempts`.** The cap bounds
   *spawned* attempts: `maxAttempts: 1` with a cooling first candidate still
@@ -969,7 +971,64 @@ What the launch path does now, before the child is prompted:
    session, never repeating a model it already ran on) and it skips phase
    sub-agents, whose model accounting belongs to `spawn-with-fallback`.
 
-`BELAYD_MODEL_FALLBACK=0` disables all three. Phase sub-agents are unaffected:
+4. **Session pre-flight for plain pi-web sessions (bd-257).** Steps 1–3 above
+   only covered the `/belayd` launch path. A session the operator creates
+   directly in pi-web used the global default verbatim and spent one `402` on
+   its first turn before recovery could act. `session_start` now runs the same
+   decision (`extensions/capabilities/session-model-routing.ts`) through the
+   shared availability helpers (`extensions/capabilities/model-availability.ts`,
+   also used by the launch pre-flight and by in-session recovery):
+
+   - it switches only when the session's current provider or endpoint is
+     **known** unable to serve (cooldown entry or capacity window). A healthy
+     default is left untouched, silently — this must not fight the operator.
+   - the accepted model is applied with `pi.setModel`, which records it in the
+     **session transcript** (`appendModelChange`). It survives a restart and
+     does **not** rewrite `~/.pi/agent/settings.json`, so the operator's global
+     default is unchanged. Exactly one log line names the old model, the new one
+     and the reset window that forced the swap:
+
+     ```text
+     [belayd-harness] session model routed from llmgateway/deepseek-v4.1-flash to opencode-go/deepseek-v4.1-flash because llmgateway (resets 2026-11-04T19:28:00.000Z) cannot serve a turn.
+     ```
+
+   - when every candidate is blocked (or none has a credential) it does not
+     switch; it warns with the blocked provider names and their reset windows, so
+     the failure is not unexplained. The first turn still runs on the cooled
+     default and in-session recovery absorbs that one failed request. It never
+     throws: a routing error must not abort pi's remaining `session_start`
+     handlers.
+   - phase sub-agents are excluded (`isSubAgentSession`), because each spawn
+     resolves its own model from the workflow registry and its attempts and
+     telemetry are `spawn-with-fallback`'s accounting.
+
+   The `/belayd` launch path keeps its own pre-flight (steps 1–3), and a child it
+   creates also reaches this hook (`createOrchestratorSession` routes through
+   `POST /sessions/:id/model`). Both build the same deterministic plan, so nothing
+   is left on a wrong model. When the launch path's status read lands before the
+   child's own `pi.setModel`, the second observer acts on its pre-switch snapshot:
+   the same candidate is applied again and a second routing line can be logged.
+
+   Signal freshness: the routing signal is the shared `ModelStateStore`
+   (`$XDG_STATE_HOME/belayd/model-state.sqlite`, or `BELAYD_MODEL_STATE_FILE`),
+   not a JSON file. `~/.pi/agent/model-cooldowns.json` is imported once, when the
+   store is first used (a `<file>.imported` marker records it), and never read
+   again. Cooldown reads are live — `cooldownScope`/`entries`/`providerEntries`
+   run an uncached `listCooldowns` query per call — so a cooldown another process
+   wrote is visible with no refresh step. `refresh()` remains belt-and-braces: it
+   clears the store's per-key `cooldownFor` cache, which is the bd-187 wrapper's
+   dispatch view, and `prune()` is GC of expired rows. Deleting the recovery
+   path's `refresh()` call therefore does **not** change the recovery target
+   (mutation-verified), and the pre-flight behaves the same way: the cases
+   `sees a provider another process cooled after the store was created` in both
+   suites prove the structural visibility, not a re-read. What the pre-flights
+   really add is the capacity **probe**: it is TTL-gated and only the startup
+   paths opt in, so a stale cache is refreshed once before a model is committed
+   to. In-session recovery takes no probe, so its single continuation never waits
+   on an endpoint call (its candidate check still reads the capacity cache it
+   already has).
+
+`BELAYD_MODEL_FALLBACK=0` disables all four. Phase sub-agents are unaffected:
 their attempts, telemetry and `-fallback-N` naming still describe the model each
 spawn actually used.
 
@@ -980,12 +1039,21 @@ refusal wording, wire-id splitting);
 `leaves a healthy session model alone`,
 `routes even when the caller's model differs from the child's`,
 `refuses before any side effect when every provider is spent`,
-`skips routing entirely when fallback is disabled`; and
+`skips routing entirely when fallback is disabled`;
 `src/__tests__/extension-model-recovery.test.ts` →
 `switches to the next candidate and continues the run once on a 402`,
 `persists a provider-scoped cooldown so the next phase spawn skips it`,
 `does not repeat a candidate it already ran on`,
-`leaves a phase sub-agent alone`, `stops switching at the per-session cap`.
+`leaves a phase sub-agent alone`, `stops switching at the per-session cap`; and
+`src/__tests__/extension-session-model-routing.test.ts` →
+`routes a session off a cooled default before its first turn`,
+`leaves a healthy default untouched`,
+`reports the blocked providers instead of starting silently dead`,
+`skips the pre-flight entirely when fallback is disabled`,
+`leaves a phase sub-agent alone even when its model is cooled`,
+`falls through a candidate the session cannot switch to`,
+`sees a provider another process cooled after the store was created`,
+`routes on a capacity window without a cooldown entry`.
 
 ### Shared model-state store and provider wrapper (bd-187)
 
@@ -1547,15 +1615,13 @@ const capacity = createCapacityCache({
 });
 
 await capacity.refreshIfStale();               // never rejects
-// Candidate selection refreshes the store itself: `spawnAgentWithFallback`
-// calls cooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS) + prune()
-// before picking a candidate, on every spawn (TTL-independent, and independent
-// of the capacity probe). probeFromCooldownStore uses the same bounded window,
-// so one spawn reads the file at most once. Call the unbounded refresh()
-// yourself when a decision needs certainty and the store may predate the entry
-// (orchestrator launch preflight, in-session recovery).
+// Candidate selection reads the shared rows live (an uncached `listCooldowns`
+// query), so a peer's cooldown is skipped on the first attempt. The refresh
+// below only bounds the store's 1 s `cooldownFor` cache — the wrapped dispatch's
+// view — and `prune()` is GC of expired rows. `refreshIfStale` is TTL-gated for
+// that cache; the unbounded `refresh()` clears it outright.
 cooldownStore.refreshIfStale(COOLDOWN_REFRESH_MAX_AGE_MS); // shared with the probe
-cooldownStore.refresh(); // unconditional merge; no-op in-memory
+cooldownStore.refresh(); // cache invalidation, not a snapshot merge
 capacity.record({ provider: "opencode-go", resetAt: Date.now() + 3_600_000, reason: "429" });
 capacity.isModelExhausted("opencode-go/mimo-v2.6-flash"); // true
 orderCandidatesByCapacity(["opencode-go/a", "llmgateway/a"], (c) =>

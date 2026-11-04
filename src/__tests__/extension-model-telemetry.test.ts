@@ -129,6 +129,10 @@ function createMockPi(): MockPi {
   >();
   const messages: Array<{ customType: string }> = [];
   const eventHandlers = new Map<string, (...args: unknown[]) => void>();
+  // pi runs every `session_start` handler in registration order; keep the full
+  // list so a handler registered after the workflow commands (the bd-257 session
+  // model pre-flight) still runs in this mock.
+  const sessionStartHandlers: Array<(...args: unknown[]) => void> = [];
   let activeTools: string[] = [];
   const eventBus = createMockEventBus();
 
@@ -138,7 +142,14 @@ function createMockPi(): MockPi {
     },
     registerCommand: () => {},
     on: (event: string, handler: (...args: unknown[]) => void) => {
-      eventHandlers.set(event, handler);
+      if (event !== "session_start") {
+        eventHandlers.set(event, handler);
+        return;
+      }
+      sessionStartHandlers.push(handler);
+      eventHandlers.set(event, (...args: unknown[]) => {
+        for (const registered of sessionStartHandlers) registered(...args);
+      });
     },
     sendMessage: (msg: { customType: string }) => {
       messages.push(msg);
