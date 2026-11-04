@@ -9,7 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DEFAULT_AGENTS, getPhaseToolName } from "../../src/agent-registry.js";
-import { listRuns } from "../../src/run-manifest.js";
+import { listRuns, type RunManifest, runBelongsToTask } from "../../src/run-manifest.js";
 import { generateShortRunId } from "../../src/session-naming.js";
 import type { CoreSessionState } from "./context.js";
 import { emptyUsage, missingWorkingDirectoryError, textToolResult } from "./context.js";
@@ -108,6 +108,64 @@ export function registerAgentPhaseTools(deps: AgentPhaseToolsDeps): void {
   }
 }
 
+/**
+ * One line naming the manifests another bead left in `.belayd/runs` (bd-242).
+ *
+ * They are reported rather than silently dropped: an operator looking at run
+ * history should see why a run they remember is not there, and see that the
+ * worktree was provisioned from a checkout that had its own runs.
+ */
+function formatForeignRunsNotice(foreign: readonly RunManifest[]): string {
+  const taskIds = [...new Set(foreign.map((run) => run.taskId))].sort();
+  return (
+    `**Foreign runs ignored** — ${foreign.length} manifest(s) in \`.belayd/runs\` belong to ` +
+    `another task (${taskIds.join(", ")}); inherited state, not this session's history.`
+  );
+}
+
+/**
+ * The run-history sections for this session's bead, plus the notices for the
+ * manifests it cannot claim.
+ *
+ * A fresh worktree inherits `.belayd/runs` from the primary checkout
+ * (`wt step copy-ignored`), so the table must be this bead's runs only (bd-242).
+ * With no task id nothing can be attributed — and the pre-start window is exactly
+ * where an inherited directory would otherwise be presented as this session's
+ * history — so the manifests are named as unattributable instead of listed.
+ */
+function formatRunHistorySections(taskId: string, runs: readonly RunManifest[]): string[] {
+  if (taskId === "") return runs.length === 0 ? [] : [formatUnattributedRunsNotice(runs)];
+  const ownRuns = runs.filter((run) => runBelongsToTask(run, taskId));
+  const foreignRuns = runs.filter((run) => !runBelongsToTask(run, taskId));
+  const sections: string[] = [];
+  if (ownRuns.length > 0) {
+    const lines = ["**Run history**", ""];
+    lines.push("| runId | phase | status | startedAt | exitCode | model |");
+    lines.push("| --- | --- | --- | --- | --- | --- |");
+    for (const run of ownRuns) {
+      lines.push(
+        `| \`${run.runId}\` | ${run.phase} | ${run.status} | ${new Date(run.startedAt).toISOString()} | ${run.exitCode ?? ""} | ${run.model ?? ""} |`,
+      );
+    }
+    sections.push(lines.join("\n"));
+  }
+  if (foreignRuns.length > 0) sections.push(formatForeignRunsNotice(foreignRuns));
+  return sections;
+}
+
+/**
+ * Notice for a runs directory with no bead to attribute it to (bd-242).
+ *
+ * They are not dropped silently: the count tells an operator the directory holds
+ * manifests, and the reason says why none of them is shown as history.
+ */
+function formatUnattributedRunsNotice(runs: readonly RunManifest[]): string {
+  return (
+    `**Run history not shown** — no task id is recorded, so the ${runs.length} manifest(s) in ` +
+    "`.belayd/runs` cannot be attributed to this session."
+  );
+}
+
 /** Register `belayd_status` at its original composer position. */
 export function registerStatusTool(deps: StatusToolDeps): void {
   const { pi, getSessionState, core, readBeadOwnership } = deps;
@@ -140,19 +198,7 @@ export function registerStatusTool(deps: StatusToolDeps): void {
       }
 
       sections.push(formatActiveRunsSection(state.activeRuns));
-
-      const runs = listRuns({ cwd });
-      if (runs.length > 0) {
-        const lines = ["**Run history**", ""];
-        lines.push("| runId | phase | status | startedAt | exitCode | model |");
-        lines.push("| --- | --- | --- | --- | --- | --- |");
-        for (const run of runs) {
-          lines.push(
-            `| \`${run.runId}\` | ${run.phase} | ${run.status} | ${new Date(run.startedAt).toISOString()} | ${run.exitCode ?? ""} | ${run.model ?? ""} |`,
-          );
-        }
-        sections.push(lines.join("\n"));
-      }
+      sections.push(...formatRunHistorySections(state.currentTaskId, listRuns({ cwd })));
 
       return {
         content: [{ type: "text" as const, text: sections.join("\n\n") }],

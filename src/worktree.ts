@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { taskIdFromBranch } from "./handoff.js";
+import { type PruneForeignRunsResult, pruneForeignRunManifests } from "./run-manifest.js";
 import {
   DEFAULT_BASE_BRANCH,
   defaultGitExec,
@@ -35,6 +37,11 @@ export interface WorktreeDeps {
   captureStack?: (input: { cwd: string; branch: string; base: string }) => void;
   /** Worktrunk project identifier used to pin the worktree layout. */
   wtProjectIdentifier?: (cwd: string) => string | undefined;
+  /**
+   * Drop run manifests another bead left in the new worktree. Tests inject this
+   * because it touches the filesystem.
+   */
+  pruneForeignRuns?: (input: { worktreePath: string; taskId: string }) => PruneForeignRunsResult;
 }
 
 /**
@@ -230,6 +237,60 @@ function captureStackForNewBranch(
 }
 
 /**
+ * Delete the run manifests a new worktree inherited from the primary checkout.
+ *
+ * `wt step copy-ignored` copies `.belayd/` into every new worktree, so a tree
+ * created for one bead checks out the previous bead's `.belayd/runs` — the
+ * provenance of bd-242, where a fresh member reported bd-37's failed run.
+ * Best-effort: a worktree with no `.belayd` (or an unreadable one) is already
+ * correct, so a failure must not fail the setup.
+ */
+function pruneInheritedRuns(
+  worktreePath: string,
+  branch: string,
+  prune: (input: { worktreePath: string; taskId: string }) => PruneForeignRunsResult,
+): void {
+  const taskId = taskIdFromBranch(branch);
+  if (taskId === undefined) return;
+  let result: PruneForeignRunsResult;
+  try {
+    result = prune({ worktreePath, taskId });
+  } catch (error) {
+    console.warn(
+      `[belayd-harness] failed to prune inherited run manifests in ${worktreePath}: ${errorMessage(error)}`,
+    );
+    return;
+  }
+  if (result.removed.length > 0) {
+    console.warn(
+      `[belayd-harness] removed ${result.removed.length} run manifest(s) inherited from another task ` +
+        `in ${worktreePath}: ${result.removed.join(", ")}`,
+    );
+  }
+  if (result.failed.length > 0) {
+    console.warn(
+      `[belayd-harness] could not delete ${result.failed.length} inherited run manifest(s) in ` +
+        `${worktreePath}: ${result.failed.map((entry) => `${entry.runId} (${entry.error})`).join("; ")}`,
+    );
+  }
+  if (result.unattributable.length > 0) {
+    console.warn(
+      `[belayd-harness] left ${result.unattributable.length} unattributable run manifest(s) in ` +
+        `${worktreePath}/.belayd/runs: ${result.unattributable.join(", ")} — no run of this ` +
+        "worktree's bead wrote them, and they cannot be deleted safely; remove them by hand if they are junk",
+    );
+  }
+}
+
+/** Production prune: report the deletions the runs directory could not complete. */
+function pruneForeignRunsIn(input: {
+  worktreePath: string;
+  taskId: string;
+}): PruneForeignRunsResult {
+  return pruneForeignRunManifests({ cwd: input.worktreePath, taskId: input.taskId });
+}
+
+/**
  * Set up the worktree for a workflow run.
  *
  * Strategy (in order):
@@ -304,6 +365,13 @@ export function setupWorktree(
     { cwd: projectRoot, branch: options.branch, base, branchExists },
     captureStack,
   );
+
+  // A tree this call created is the one that just inherited `.belayd/` from the
+  // primary checkout, so this is where foreign run manifests are dropped. An
+  // already-registered worktree (step 1) is returned untouched: its manifests
+  // are its own, and readers filter by task id anyway.
+  const prune = deps.pruneForeignRuns;
+  pruneInheritedRuns(worktreePath, options.branch, prune ?? pruneForeignRunsIn);
 
   return worktreePath;
 }

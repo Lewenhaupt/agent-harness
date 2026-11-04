@@ -16,12 +16,13 @@ import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getPhaseToolName } from "../../src/agent-registry.js";
 import { orchestratorActor, withActorArgv } from "../../src/beads-actor.js";
-import { readHandoff } from "../../src/handoff.js";
+import { readHandoff, taskIdFromBranch } from "../../src/handoff.js";
 import {
   adoptableWorktreeTaskId,
   matchSessionOwnedWorktree,
   type OwnedWorktreeResult,
   type readWorktreeBranch,
+  type WorktreeBranch,
 } from "../../src/owned-worktree.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
 import { PLANNING_TOOL_SET, workflowGateToolSet } from "../../src/role-tools.js";
@@ -241,6 +242,25 @@ export interface ToolCallGateEvent {
  * terminates instead of spinning forever.
  */
 const MAX_EPOCH_ADVANCES = 1000;
+
+/**
+ * Bead whose run manifests a directory's handoff settle may touch, or undefined.
+ *
+ * Completion clears `.belayd/workflow.json`, so a restarted caller's only
+ * surviving record can be its branch (bd-242 review). Undefined means no owner is
+ * known, and a settle with no owner must write nothing: a copy-ignored tree holds
+ * the primary checkout's runs, so flipping an unattributed manifest would be a
+ * write to another bead's state.
+ */
+function directoryOwnerTaskId(input: {
+  persisted: WorkflowState | undefined;
+  sessionTaskId: string;
+  branch: WorktreeBranch;
+}): string | undefined {
+  if (input.persisted !== undefined) return input.persisted.taskId;
+  if (input.sessionTaskId !== "") return input.sessionTaskId;
+  return input.branch.ok ? taskIdFromBranch(input.branch.branch) : undefined;
+}
 
 export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
   const { pi, getSessionState, gate, readWorktreeBranch } = deps;
@@ -1065,9 +1085,19 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     );
   }
 
-  /** Resolve the pending user completions to reconcile: one run or all. */
-  function pendingCompletionsFor(cwd: string, runId: string | undefined): RunManifest[] {
-    if (runId === undefined) return listPendingUserCompletions({ cwd });
+  /**
+   * Resolve the pending user completions to reconcile: one run or all.
+   *
+   * `taskId` scopes the `runId === undefined` scan to this bead's manifests. The
+   * explicit-runId branch ignores it: `readRunManifest`/`markRunDelivered` already
+   * pin that id to its own file, and the caller checks ownership of the result.
+   */
+  function pendingCompletionsFor(
+    cwd: string,
+    runId: string | undefined,
+    taskId: string,
+  ): RunManifest[] {
+    if (runId === undefined) return listPendingUserCompletions({ cwd, taskId });
     const manifest = readRunManifest({ cwd, runId });
     if (manifest === undefined || manifest.completedBy !== "user") return [];
     if (manifest.deliveredAt !== undefined) return [];
@@ -1103,7 +1133,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       }
     };
 
-    for (const run of pendingCompletionsFor(cwd, options.runId)) {
+    for (const run of pendingCompletionsFor(cwd, options.runId, state.currentTaskId)) {
       if (run.taskId !== state.currentTaskId) continue;
       if (state.deliveredRunIds.has(run.runId)) continue;
       // A phase already completed here must not stall the scan: mark the
@@ -1171,11 +1201,23 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     const persistedHere = readWorkflowState({ cwd });
     if (persistedHere !== undefined && persistedHere.taskId === marker.taskId) return;
 
-    const interrupted = scanForInterruptedRuns({ cwd });
-    const { delivered, undeliverable } = markPendingCompletionsDelivered({
-      cwd,
-      skipTaskId: marker.taskId,
+    // Only the directory owner's own manifests are settled: a copy-ignored tree
+    // holds the primary checkout's runs, and flipping another bead's running
+    // manifest (or marking its completion delivered) would write foreign state and
+    // report it under this handoff (bd-242). With no owner there is nothing to
+    // attribute, so nothing is written at all — arming a workflow later settles
+    // its own runs.
+    const ownerTaskId = directoryOwnerTaskId({
+      persisted: persistedHere,
+      sessionTaskId: state.currentTaskId,
+      branch: readWorktreeBranch(cwd),
     });
+    const interrupted =
+      ownerTaskId === undefined ? [] : scanForInterruptedRuns({ cwd, taskId: ownerTaskId });
+    const { delivered, undeliverable } =
+      ownerTaskId === undefined
+        ? { delivered: [], undeliverable: [] }
+        : markPendingCompletionsDelivered({ cwd, taskId: ownerTaskId, skipTaskId: marker.taskId });
     const notice = formatHandoffPendingNotice({
       taskId: marker.taskId,
       interrupted,
@@ -1214,8 +1256,11 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       isAwaitingReviewResponse(persisted.completedPhaseNames, persisted.phaseOrder);
     applyToolGate(state);
 
-    // Surface any phase runs that died with the previous orchestrator.
-    const interrupted = scanForInterruptedRuns({ cwd });
+    // Surface any phase runs that died with the previous orchestrator. Only this
+    // bead's own manifests count: a fresh worktree inherits `.belayd/runs` from the
+    // primary checkout, and flipping (or reporting) another bead's manifest would
+    // attribute that bead's crashed run to this workflow (bd-242).
+    const interrupted = scanForInterruptedRuns({ cwd, taskId: persisted.taskId });
     if (interrupted.length > 0) {
       console.warn(
         `[belayd-harness] ${interrupted.length} interrupted phase run(s) detected for ${persisted.taskId}`,

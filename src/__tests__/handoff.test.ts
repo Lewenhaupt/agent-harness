@@ -731,4 +731,11 @@ describe("taskIdFromBranch", () => {
     expect(taskIdFromBranch("fix/bd-42.1")).toBe("bd-42.1");
     expect(taskIdFromBranch("main")).toBeUndefined();
   });
+
+  it("keeps every sub-bead segment of a deeply nested branch", () => {
+    // Worktree pruning keys on this id, so a 3-level sub-bead must not look
+    // branch-less and skip its runs (bd-242 review).
+    expect(taskIdFromBranch("feat/bd-42.1.2")).toBe("bd-42.1.2");
+    expect(taskIdFromBranch("feat/bd-42.1.2.3")).toBe("bd-42.1.2.3");
+  });
 });

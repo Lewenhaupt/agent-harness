@@ -1551,11 +1551,15 @@ export { classifyRunOutcome, spawnDetachedRun, watchRunCompletion } from "./run-
 export type { RunManifest, RunTelemetryTotals } from "./run-manifest.js";
 export {
   completeRunByUser,
+  isSafeRunId,
   listPendingUserCompletions,
   listRuns,
   markRunDelivered,
+  type PruneForeignRunsResult,
+  pruneForeignRunManifests,
   RunStatus,
   readRunManifest,
+  runBelongsToTask,
   runManifestFs,
   runManifestPath,
   runsDir,

@@ -1321,8 +1321,8 @@ describe("buildFleetStatus", () => {
     expect(subBead.members[0]).toHaveProperty("expectedTaskId", "bd-12.3");
     expect(subBead.warnings).toEqual([]);
 
-    // `taskIdFromBranch` does not accept a second dot segment either, so neither
-    // source claims an id and no mismatch is invented for the same worktree.
+    // Both sources accept any dot depth (bd-242 review), so a 3-level sub-bead
+    // is still recognized and no mismatch is invented for the same worktree.
     const deep = buildFleetStatus({
       fleetId: "fleet-1",
       intent: undefined,
@@ -1334,8 +1334,23 @@ describe("buildFleetStatus", () => {
         }),
       ],
     });
-    expect(deep.members[0]).toHaveProperty("expectedTaskId", undefined);
+    expect(deep.members[0]).toHaveProperty("expectedTaskId", "bd-12.3.4");
     expect(deep.warnings).toEqual([]);
+
+    // The directory-name fallback (no branch) agrees with the branch pattern.
+    const fromDirectoryName = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: undefined,
+      members: [
+        sampleMember({
+          worktreePath: "/repo.feat-bd-12.3.4",
+          branch: undefined,
+          workflow: okWorkflow({ taskId: "bd-12.3.4" }),
+        }),
+      ],
+    });
+    expect(fromDirectoryName.members[0]).toHaveProperty("expectedTaskId", "bd-12.3.4");
+    expect(fromDirectoryName.warnings).toEqual([]);
   });
 
   it("orders by code unit, not by host locale", () => {

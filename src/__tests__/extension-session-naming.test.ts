@@ -1729,6 +1729,104 @@ describe("non-blocking phase runs (bd-41)", () => {
     }
   });
 
+  it("belayd_status ignores a run manifest inherited from another bead (bd-242)", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-status-foreign-"));
+    try {
+      const { api, tools, messages } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `status-foreign-${Date.now()}`, cwd });
+
+      await tools
+        .get("belayd_start_task")
+        ?.execute(
+          "start",
+          { taskId: "bd-42", workflowType: "research" },
+          undefined,
+          undefined,
+          ctx,
+        );
+      await runPhaseToolAndWait(tools, "belayd_scout", messages, ctx);
+
+      // The shape a fresh worktree inherits: `wt step copy-ignored` copies
+      // `.belayd/` from the primary checkout, so another bead's failed run is
+      // sitting in this bead's run directory.
+      writeRunManifest({
+        cwd,
+        manifest: {
+          schemaVersion: 1,
+          runId: "mthosemh",
+          taskId: "bd-37",
+          phase: "implement",
+          sessionName: "belayd-bd-37-sub-implement-mthosemh",
+          status: RunStatus.Failed,
+          startedAt: 1_000,
+          completedAt: 2_000,
+          exitCode: 143,
+        },
+      });
+
+      const status = (await tools
+        .get("belayd_status")
+        ?.execute("status", {}, undefined, undefined, ctx)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const text = status.content[0]?.text ?? "";
+      const historyStart = text.indexOf("**Run history**");
+      const foreignStart = text.indexOf("**Foreign runs ignored**");
+      expect(historyStart).toBeGreaterThanOrEqual(0);
+      expect(foreignStart).toBeGreaterThan(historyStart);
+      const historyTable = text.slice(historyStart, foreignStart);
+
+      expect(historyTable).not.toContain("mthosemh");
+      expect(historyTable).toContain("scout");
+      // Reported, not silently dropped, so an operator can explain the file.
+      expect(text.slice(foreignStart)).toContain("bd-37");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("belayd_status shows no history for manifests it cannot attribute (bd-242 review)", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "belayd-status-prestart-"));
+    try {
+      // Before `belayd_start_task` there is no task id, and this directory holds
+      // an inherited manifest: presenting it as this session's history is exactly
+      // the misattribution bd-242 fixes, surviving in the pre-start window.
+      writeRunManifest({
+        cwd,
+        manifest: {
+          schemaVersion: 1,
+          runId: "mthosemh",
+          taskId: "bd-37",
+          phase: "implement",
+          sessionName: "belayd-bd-37-sub-implement-mthosemh",
+          status: RunStatus.Failed,
+          startedAt: 1_000,
+          completedAt: 2_000,
+          exitCode: 143,
+        },
+      });
+      const { api, tools } = createMockPi();
+      const factory = await loadExtension();
+      factory(api);
+      const ctx = createMockCtx({ sessionId: `status-prestart-${Date.now()}`, cwd });
+
+      const status = (await tools
+        .get("belayd_status")
+        ?.execute("status", {}, undefined, undefined, ctx)) as {
+        content: Array<{ type: string; text: string }>;
+      };
+      const text = status.content[0]?.text ?? "";
+
+      expect(text).toContain("Run history not shown");
+      expect(text).not.toContain("mthosemh");
+      expect(text).not.toContain("**Run history**");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("a signal-killed run (exitCode 128) is failed, not phase-completed, and delivered exactly once", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "belayd-signalkill-"));
     try {

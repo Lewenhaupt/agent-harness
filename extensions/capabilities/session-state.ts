@@ -296,15 +296,27 @@ export function formatActiveRunsSection(
   return lines.join("\n");
 }
 
-/** Mark every pending user completion delivered; returns per-run outcome labels. */
+/**
+ * Mark the directory owner's pending user completions delivered; returns per-run
+ * outcome labels.
+ *
+ * Only runs attributable to `taskId` are touched. A copy-ignored worktree holds
+ * the primary checkout's manifests, and marking another bead's completion
+ * delivered would be a write to foreign state that also swallows that bead's own
+ * recovery (bd-242 review). The child's runs are skipped: they belong to the
+ * orchestrator that owns them now.
+ */
 export function markPendingCompletionsDelivered(options: {
   cwd: string;
+  /** The directory owner's bead; nothing outside it may be settled. */
+  taskId: string;
   /** Runs for this task belong to the child orchestrator; leave them alone. */
   skipTaskId: string;
 }): { delivered: string[]; undeliverable: string[] } {
   const delivered: string[] = [];
   const undeliverable: string[] = [];
-  for (const run of listPendingUserCompletions({ cwd: options.cwd })) {
+  const pending = listPendingUserCompletions({ cwd: options.cwd, taskId: options.taskId });
+  for (const run of pending) {
     if (run.taskId === options.skipTaskId) continue;
     const result = markRunDelivered({ cwd: options.cwd, runId: run.runId });
     if (result.ok) {

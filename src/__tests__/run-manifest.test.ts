@@ -1,16 +1,21 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
   completeRunByUser,
+  isSafeRunId,
   listPendingUserCompletions,
   listRuns,
   markRunDelivered,
   parseRunManifest,
+  pruneForeignRunManifests,
   type RunManifest,
   type RunManifestFs,
   RunStatus,
   readRunManifest,
+  runBelongsToTask,
   runManifestPath,
+  runsDir,
   scanForInterruptedRuns,
   setRunModelSelection,
   setRunStatus,
@@ -297,6 +302,237 @@ describe("run manifest", () => {
     expect(readRunManifest({ cwd, runId: "running1", fs })).toHaveProperty("status", "interrupted");
     expect(readRunManifest({ cwd, runId: "running2", fs })).toHaveProperty("completedAt", 9_000);
     expect(readRunManifest({ cwd, runId: "done", fs })).toHaveProperty("status", "completed");
+  });
+
+  it("scanForInterruptedRuns leaves another task's running manifest alone (bd-242)", () => {
+    const fs = createFakeFs({
+      [runManifestPath(cwd, "own")]: JSON.stringify(
+        sampleManifest({ runId: "own", status: RunStatus.Running }),
+      ),
+      [runManifestPath(cwd, "foreign")]: JSON.stringify(
+        sampleManifest({ runId: "foreign", taskId: "bd-37", status: RunStatus.Running }),
+      ),
+    });
+
+    const interrupted = scanForInterruptedRuns({ cwd, fs, taskId: "bd-42", now: () => 9_000 });
+
+    expect(interrupted.map((run) => run.runId)).toEqual(["own"]);
+    // Flipping it would attribute bd-37's crashed run to bd-42 when the gate arms.
+    expect(readRunManifest({ cwd, runId: "foreign", fs })).toHaveProperty("status", "running");
+  });
+
+  it("runBelongsToTask keeps a sub-bead's manifest and rejects a foreign one", () => {
+    expect(runBelongsToTask(sampleManifest(), "bd-42")).toBe(true);
+    expect(runBelongsToTask(sampleManifest({ taskId: "bd-42.1" }), "bd-42")).toBe(true);
+    expect(runBelongsToTask(sampleManifest({ taskId: "bd-37" }), "bd-42")).toBe(false);
+    // An id that only shares a prefix is another bead, not a descendant.
+    expect(runBelongsToTask(sampleManifest({ taskId: "bd-42x" }), "bd-42")).toBe(false);
+    expect(runBelongsToTask(sampleManifest({ taskId: "bd-43" }), "bd-42")).toBe(false);
+  });
+
+  it("listRuns filters by task id when the caller names its bead", () => {
+    const fs = createFakeFs({
+      [runManifestPath(cwd, "own")]: JSON.stringify(
+        sampleManifest({ runId: "own", startedAt: 1_000 }),
+      ),
+      [runManifestPath(cwd, "child")]: JSON.stringify(
+        sampleManifest({ runId: "child", taskId: "bd-42.1", startedAt: 2_000 }),
+      ),
+      [runManifestPath(cwd, "foreign")]: JSON.stringify(
+        sampleManifest({ runId: "foreign", taskId: "bd-37", startedAt: 3_000 }),
+      ),
+    });
+
+    expect(listRuns({ cwd, fs }).map((run) => run.runId)).toEqual(["own", "child", "foreign"]);
+    expect(listRuns({ cwd, fs, taskId: "bd-42" }).map((run) => run.runId)).toEqual([
+      "own",
+      "child",
+    ]);
+  });
+
+  it("pruneForeignRunManifests deletes only another task's manifests (bd-242)", () => {
+    const fs = createFakeFs({
+      [runManifestPath(cwd, "own")]: JSON.stringify(sampleManifest({ runId: "own" })),
+      [runManifestPath(cwd, "child")]: JSON.stringify(
+        sampleManifest({ runId: "child", taskId: "bd-42.1" }),
+      ),
+      [runManifestPath(cwd, "deepChild")]: JSON.stringify(
+        sampleManifest({ runId: "deepChild", taskId: "bd-42.1.2" }),
+      ),
+      [runManifestPath(cwd, "foreign")]: JSON.stringify(
+        sampleManifest({ runId: "foreign", taskId: "bd-37", status: RunStatus.Failed }),
+      ),
+      [runManifestPath(cwd, "corrupt")]: "{not json",
+      [join(runsDir(cwd), "notes.md")]: "ignored",
+    });
+
+    expect(pruneForeignRunManifests({ cwd, fs, taskId: "bd-42" })).toEqual({
+      removed: ["foreign"],
+      failed: [],
+      // The corrupt file is invisible and undeletable, so the caller can warn.
+      unattributable: ["corrupt"],
+    });
+    expect(fs.files.has(runManifestPath(cwd, "own"))).toBe(true);
+    expect(fs.files.has(runManifestPath(cwd, "child"))).toBe(true);
+    expect(fs.files.has(runManifestPath(cwd, "deepChild"))).toBe(true);
+    expect(fs.files.has(runManifestPath(cwd, "foreign"))).toBe(false);
+    // A file with no attributable task id stays for `listRuns` to skip.
+    expect(fs.files.has(runManifestPath(cwd, "corrupt"))).toBe(true);
+    // Non-`.json` entries are not run manifests at all, so they are not reported.
+    expect(fs.files.has(join(runsDir(cwd), "notes.md"))).toBe(true);
+  });
+
+  it("pruneForeignRunManifests names a file called .json instead of an empty id (bd-242 review)", () => {
+    const emptyIdPath = join(runsDir(cwd), ".json");
+    const fs = createFakeFs({
+      [runManifestPath(cwd, "own")]: JSON.stringify(sampleManifest({ runId: "own" })),
+      [runManifestPath(cwd, "foreign")]: JSON.stringify(
+        sampleManifest({ runId: "foreign", taskId: "bd-37" }),
+      ),
+      // Strips to an empty run id, which would join the warning list as a blank token.
+      [emptyIdPath]: JSON.stringify(sampleManifest({ runId: "hidden", taskId: "bd-37" })),
+      [runManifestPath(cwd, "corrupt")]: "{not json",
+    });
+
+    const result = pruneForeignRunManifests({ cwd, fs, taskId: "bd-42" });
+
+    expect(result.removed).toEqual(["foreign"]);
+    // Real ids are still listed alongside the literal filename.
+    expect(result.unattributable).toEqual(["<unnamed>.json", "corrupt"]);
+    expect(result.unattributable).not.toContain("");
+    expect(fs.files.has(emptyIdPath)).toBe(true);
+    expect(listRuns({ cwd, fs }).map((run) => run.runId)).toEqual(["own"]);
+  });
+
+  it("pruneForeignRunManifests is a no-op without a runs directory", () => {
+    expect(pruneForeignRunManifests({ cwd, fs: createFakeFs(), taskId: "bd-42" })).toEqual({
+      removed: [],
+      failed: [],
+      unattributable: [],
+    });
+  });
+
+  it("a manifest whose body runId escapes the runs dir deletes nothing (bd-242 review)", () => {
+    const outsidePath = join(cwd, "keep.json");
+    const fs = createFakeFs({
+      [runManifestPath(cwd, "evil")]: JSON.stringify(
+        sampleManifest({ runId: "../../keep", taskId: "bd-37" }),
+      ),
+      [outsidePath]: "not a run manifest",
+    });
+
+    expect(pruneForeignRunManifests({ cwd, fs, taskId: "bd-42" })).toEqual({
+      removed: [],
+      failed: [],
+      unattributable: ["evil"],
+    });
+    // The traversal target survives, and so does the file it came from: a body
+    // the schema rejects carries no task id to attribute.
+    expect(fs.files.has(outsidePath)).toBe(true);
+    expect(fs.files.has(runManifestPath(cwd, "evil"))).toBe(true);
+  });
+
+  it("pruneForeignRunManifests deletes the entry it read, not the body's runId", () => {
+    const fs = createFakeFs({
+      // A mismatched body naming another entry's id must not redirect the unlink
+      // to that entry.
+      [runManifestPath(cwd, "aaa")]: JSON.stringify(
+        sampleManifest({ runId: "bbb", taskId: "bd-37" }),
+      ),
+      [runManifestPath(cwd, "bbb")]: JSON.stringify(
+        sampleManifest({ runId: "bbb", taskId: "bd-42" }),
+      ),
+    });
+
+    expect(pruneForeignRunManifests({ cwd, fs, taskId: "bd-42" })).toEqual({
+      removed: [],
+      failed: [],
+      unattributable: ["aaa"],
+    });
+    // The mismatch is skipped like a corrupt file, so bd-42's own run survives.
+    expect(fs.files.has(runManifestPath(cwd, "bbb"))).toBe(true);
+    expect(fs.files.has(runManifestPath(cwd, "aaa"))).toBe(true);
+    expect(listRuns({ cwd, fs }).map((run) => run.runId)).toEqual(["bbb"]);
+  });
+
+  it("pruneForeignRunManifests keeps going after a failed unlink and reports it", () => {
+    const base = createFakeFs({
+      [runManifestPath(cwd, "foreignA")]: JSON.stringify(
+        sampleManifest({ runId: "foreignA", taskId: "bd-37" }),
+      ),
+      [runManifestPath(cwd, "stuck")]: JSON.stringify(
+        sampleManifest({ runId: "stuck", taskId: "bd-38" }),
+      ),
+      [runManifestPath(cwd, "own")]: JSON.stringify(sampleManifest({ runId: "own" })),
+    });
+    const fs: RunManifestFs = {
+      ...base,
+      unlinkSync(path) {
+        if (path.endsWith("/stuck.json")) throw new Error("EBUSY: resource busy");
+        base.unlinkSync(path);
+      },
+    };
+
+    const result = pruneForeignRunManifests({ cwd, fs, taskId: "bd-42" });
+
+    expect(result.removed).toEqual(["foreignA"]);
+    expect(result.failed).toEqual([{ runId: "stuck", error: "EBUSY: resource busy" }]);
+    expect(result.unattributable).toEqual([]);
+    expect(base.files.has(runManifestPath(cwd, "stuck"))).toBe(true);
+    expect(base.files.has(runManifestPath(cwd, "own"))).toBe(true);
+  });
+
+  it("a mismatched body is invisible to readRunManifest and no RMW rewrites another file", () => {
+    // The craft: aaa.json claims bbb's id *and* bd-42's task, so a body-trusting
+    // read-modify-write would write bbb.json for a request against aaa.
+    const mismatched = JSON.stringify(sampleManifest({ runId: "bbb", taskId: "bd-42" }));
+    const fs = createFakeFs({ [runManifestPath(cwd, "aaa")]: mismatched });
+
+    expect(readRunManifest({ cwd, runId: "aaa", fs })).toBe(undefined);
+
+    const noRun = { ok: false, error: "No run manifest found for aaa" };
+    expect(setRunStatus({ cwd, runId: "aaa", status: RunStatus.Interrupted, fs })).toEqual(noRun);
+    expect(completeRunByUser({ cwd, runId: "aaa", report: "done", fs })).toEqual(noRun);
+    expect(markRunDelivered({ cwd, runId: "aaa", fs })).toEqual(noRun);
+    const telemetry = { attempts: 1, fallbacks: 0, quotaFailures: 0, noOps: 0, cost: 0 };
+    expect(setRunTelemetry({ cwd, runId: "aaa", telemetry, fs })).toEqual(noRun);
+    expect(setRunModelSelection({ cwd, runId: "aaa", requestedModel: "x/y", fs })).toEqual(noRun);
+
+    // Nothing was created or rewritten under the body's id.
+    expect(fs.files.has(runManifestPath(cwd, "bbb"))).toBe(false);
+    expect(fs.files.get(runManifestPath(cwd, "aaa"))).toBe(mismatched);
+  });
+
+  it("scanForInterruptedRuns never rewrites a file its body runId does not own (bd-242 review)", () => {
+    const fs = createFakeFs({
+      // `aaa.json` claims `bbb`'s id: following it would flip bbb.json, which is
+      // not the file that was read.
+      [runManifestPath(cwd, "aaa")]: JSON.stringify(
+        sampleManifest({ runId: "bbb", status: RunStatus.Running }),
+      ),
+      [runManifestPath(cwd, "bbb")]: JSON.stringify(
+        sampleManifest({ runId: "bbb", status: RunStatus.Completed, completedAt: 2_000 }),
+      ),
+    });
+
+    expect(scanForInterruptedRuns({ cwd, fs, now: () => 9_000 })).toEqual([]);
+    expect(readRunManifest({ cwd, runId: "bbb", fs })).toHaveProperty("status", "completed");
+  });
+
+  it("rejects and refuses to write an unsafe run id", () => {
+    expect(isSafeRunId("abc123")).toBe(true);
+    expect(isSafeRunId("pending-run")).toBe(true);
+    expect(isSafeRunId("../../EVIL")).toBe(false);
+    expect(isSafeRunId("..")).toBe(false);
+    expect(isSafeRunId("a/b")).toBe(false);
+    expect(parseRunManifest(sampleManifest({ runId: "../../EVIL" }))).toBe(undefined);
+
+    const fs = createFakeFs();
+    expect(writeRunManifest({ cwd, fs, manifest: sampleManifest({ runId: "../escape" }) })).toEqual(
+      { ok: false, error: 'unsafe run id "../escape"' },
+    );
+    expect(fs.files.size).toBe(0);
+    expect(readRunManifest({ cwd, fs, runId: "../escape" })).toBe(undefined);
   });
 
   it("parseRunManifest rejects malformed fields and wrong versions", () => {

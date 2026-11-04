@@ -720,6 +720,34 @@ therefore shows only its own phases. Filtering needs a resolvable task id: a
 worktree whose branch and directory name yield none, and that has no
 `workflow.json`, still lists the manifests as read.
 
+Worktree creation also drops the inherited manifests (bd-242): `wt step
+copy-ignored` copies `.belayd/` into a new tree, so `setupWorktree` deletes the
+run manifests whose `taskId` is neither the new branch's bead (any sub-bead
+depth) nor one of its sub-beads, and warns with the removed run ids. That keeps
+the directory honest for a reader that only counts files, while the
+list/latest-run readers keep filtering by task id for trees created before this
+and for the fleet's own members.
+
+Every reader takes the filename as the authority: a manifest whose body `runId`
+does not match the file it lives in, or whose id could name a path outside
+`.belayd/runs`, is skipped like a corrupt one. `readRunManifest` enforces that
+match, so the read-modify-write family (`setRunStatus`, `completeRunByUser`,
+`setRunTelemetry`, `setRunModelSelection`, `markRunDelivered`) always writes the
+manifest it just read — the file it writes is the one whose name it was asked
+for, never a body-supplied id. That boundary belongs to the readers, not to
+`writeRunManifest`: the write path derives its target from the caller's manifest
+body, and `isSafeRunId` only keeps that id inside `.belayd/runs`, so a caller
+that writes a body it never read can still name another run's file. The files
+that cannot be attributed are left in
+place by the creation-time prune, which reports them so they cannot silently
+accumulate. `belayd_status` applies the same filename rule to its run-history
+table — reporting the foreign manifests it skipped in one line, and showing no
+table at all when no task id is recorded, because nothing in a copy-ignored
+directory can be attributed then. Arming a workflow and the handoff settle only
+flip (or mark delivered) their own bead's manifests (the settle falls back to the
+branch's bead when no state file or session id survives), never an inherited
+one.
+
 A view with an intent, a deferral and a park — in a throwaway repository, so
 nothing here touches your checkout:
 

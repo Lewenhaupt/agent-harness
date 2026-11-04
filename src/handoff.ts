@@ -560,7 +560,7 @@ export function buildOrchestratorPrompt(input: OrchestratorPromptInput): string 
  * undefined when the branch is not workflow-shaped (e.g. `main`).
  */
 export function taskIdFromBranch(branch: string): string | undefined {
-  const match = /(?:^|\/)(bd-\d+(?:\.\d+)?)$/.exec(branch.trim());
+  const match = /(?:^|\/)(bd-\d+(?:\.\d+)*)$/.exec(branch.trim());
   return match?.[1];
 }
 

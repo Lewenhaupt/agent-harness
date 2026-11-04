@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { ModelTelemetryTotalsSchema } from "./model-telemetry.js";
+import { isSameOrDescendantTask } from "./owned-worktree.js";
 import type { SkippedModel } from "./spawn-with-fallback.js";
 import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
@@ -23,6 +24,18 @@ export enum RunStatus {
 }
 
 const SCHEMA_VERSION = 1;
+
+/**
+ * Run ids name a file inside `.belayd/runs`, so they must stay one path segment:
+ * no separators, no `.`/`..`.
+ *
+ * The write path is derived from the manifest's `runId`, so an unconstrained one
+ * would let a crafted inherited manifest point a write or an unlink outside the
+ * runs directory. `readRunManifest` additionally refuses a body that names a
+ * different file, so a read-modify-write reads and writes the same one (bd-242
+ * review).
+ */
+const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /**
  * Rolled-up model telemetry attached to a run. The per-(phase, model)
@@ -48,7 +61,7 @@ const SkippedModelSchema: z.ZodType<SkippedModel> = z.object({
 
 const RunManifestSchema = z.object({
   schemaVersion: z.literal(SCHEMA_VERSION),
-  runId: z.string(),
+  runId: z.string().regex(RUN_ID_PATTERN),
   taskId: z.string(),
   phase: z.string(),
   sessionName: z.string(),
@@ -107,6 +120,15 @@ export interface SetRunStatusOptions {
 
 export interface ListRunsOptions {
   cwd: string;
+  /**
+   * Only manifests belonging to this bead (or one of its sub-beads).
+   *
+   * `.belayd/` is gitignored and worktrunk's `copy-ignored` step copies it into
+   * every new worktree, so `.belayd/runs` can hold another bead's manifests
+   * (bd-242). A caller that names its bead gets its own runs instead of the
+   * directory's contents.
+   */
+  taskId?: string;
   fs?: RunManifestFs;
 }
 
@@ -127,13 +149,46 @@ export interface MarkRunDeliveredOptions {
 
 export interface ListPendingUserCompletionsOptions {
   cwd: string;
+  /** Restrict the scan to this bead's own manifests (see {@link ListRunsOptions}). */
+  taskId?: string;
   fs?: RunManifestFs;
 }
 
 export interface ScanForInterruptedRunsOptions {
   cwd: string;
+  /** Restrict the scan to this bead's own manifests (see {@link ListRunsOptions}). */
+  taskId?: string;
   fs?: RunManifestFs;
   now?: () => number;
+}
+
+export interface PruneForeignRunsOptions {
+  cwd: string;
+  /**
+   * The bead this worktree belongs to. Its own and its sub-beads' manifests
+   * survive; anything else is inherited state, not this worktree's history.
+   */
+  taskId: string;
+  fs?: RunManifestFs;
+}
+
+/** Outcome of a prune: what went away, what could not, and what it left alone. */
+export interface PruneForeignRunsResult {
+  /** Ids whose manifest file was deleted (sorted). */
+  removed: string[];
+  /**
+   * Foreign manifests that are still there, with the failure reason.
+   *
+   * Reported per file instead of aborting the prune: one undeletable manifest
+   * must not leave the rest of the inherited runs in place.
+   */
+  failed: { runId: string; error: string }[];
+  /**
+   * Files the prune could not attribute (see {@link RunFileListing}): unsafe ids,
+   * body/filename mismatches and unparseable JSON. Never deleted, so the caller
+   * can warn that they are accumulating.
+   */
+  unattributable: string[];
 }
 
 export interface SetRunTelemetryOptions {
@@ -181,6 +236,19 @@ export function runManifestPath(cwd: string, runId: string): string {
   return join(runsDir(cwd), `${runId}.json`);
 }
 
+/** Whether `runId` can name a file inside the runs directory (see {@link RUN_ID_PATTERN}). */
+export function isSafeRunId(runId: string): boolean {
+  return RUN_ID_PATTERN.test(runId);
+}
+
+/**
+ * Whether a manifest is evidence about `taskId`: the same bead, or a sub-bead of
+ * it (a sub-bead run can legitimately live in its parent's worktree).
+ */
+export function runBelongsToTask(run: RunManifest, taskId: string): boolean {
+  return isSameOrDescendantTask(run.taskId, taskId);
+}
+
 /** Parse and strictly narrow a run manifest; corrupt/wrong version → undefined. */
 export function parseRunManifest(raw: unknown): RunManifest | undefined {
   const result = RunManifestSchema.safeParse(raw);
@@ -191,6 +259,9 @@ export function writeRunManifest(
   options: WriteRunManifestOptions,
 ): { ok: true } | { ok: false; error: string } {
   const fs = options.fs ?? runManifestFs;
+  if (!isSafeRunId(options.manifest.runId)) {
+    return { ok: false, error: `unsafe run id "${options.manifest.runId}"` };
+  }
   return atomicWriteJson(
     runManifestPath(options.cwd, options.manifest.runId),
     options.manifest,
@@ -200,6 +271,9 @@ export function writeRunManifest(
 
 export function readRunManifest(options: ReadRunManifestOptions): RunManifest | undefined {
   const fs = options.fs ?? runManifestFs;
+  // A caller-supplied id is untrusted (a parsed session name, a daemon payload),
+  // so it is validated before it becomes a path.
+  if (!isSafeRunId(options.runId)) return undefined;
   const filePath = runManifestPath(options.cwd, options.runId);
   if (!fs.existsSync(filePath)) return undefined;
   let text: string;
@@ -208,11 +282,25 @@ export function readRunManifest(options: ReadRunManifestOptions): RunManifest | 
   } catch {
     return undefined;
   }
+  let manifest: RunManifest | undefined;
   try {
-    return parseRunManifest(JSON.parse(text));
+    manifest = parseRunManifest(JSON.parse(text));
   } catch {
     return undefined;
   }
+  // The filename is the authority: a body naming another id would make every
+  // read-modify-write write a different file than the one it read, so a mismatch
+  // is as unusable as a corrupt body (bd-242 review).
+  return manifest?.runId === options.runId ? manifest : undefined;
+}
+
+/** Forwarded `taskId` for the option sets that extend the runs listing. */
+function taskFilter(options: { taskId?: string }): { taskId?: string } {
+  return options.taskId === undefined ? {} : { taskId: options.taskId };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function terminalStatus(status: RunStatus): boolean {
@@ -251,25 +339,111 @@ export function setRunStatus(
   return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
 }
 
-/** List persisted runs sorted by start time; malformed files and non-.json entries are skipped. */
-export function listRuns(options: ListRunsOptions): RunManifest[] {
+/** One manifest file, paired with the id its filename proves. */
+interface ListedRun {
+  /** The id the directory entry names — the authority for any later path. */
+  runId: string;
+  manifest: RunManifest;
+}
+
+/** A runs directory listing, split by what the filenames can attribute. */
+interface RunFileListing {
+  /** Entries that parsed and whose body names the file they live in. */
+  listed: ListedRun[];
+  /**
+   * `.json` entries nothing could attribute: unsafe ids, body/filename
+   * mismatches and unparseable JSON. They are invisible to every reader and safe
+   * to leave alone, so the count is what stops the directory silently
+   * accumulating junk (bd-242 review).
+   */
+  unattributable: string[];
+}
+
+/**
+ * The label an unattributable run file is reported under.
+ *
+ * A file named exactly `.json` strips to an empty id, which renders as an
+ * invisible token (`…: `) in the worktree warning, so it gets a visible label.
+ */
+function unattributableName(runId: string): string {
+  return runId === "" ? "<unnamed>.json" : runId;
+}
+
+/**
+ * Manifest files in the runs dir, sorted by run id.
+ *
+ * `readRunManifest` already refuses a body that names another file, so a listed
+ * entry is always the file its id names; what it rejects is reported as
+ * unattributable instead of listed or silently merged.
+ */
+function listRunFiles(options: ListRunsOptions): RunFileListing {
   const fs = options.fs ?? runManifestFs;
-  const dir = runsDir(options.cwd);
   let entries: string[];
   try {
-    entries = fs.readdirSync(dir);
+    entries = fs.readdirSync(runsDir(options.cwd));
   } catch {
-    return []; // missing runs dir is the initial (empty) state
+    return { listed: [], unattributable: [] }; // missing runs dir is the initial (empty) state
   }
-  const runs: RunManifest[] = [];
+  const listing: RunFileListing = { listed: [], unattributable: [] };
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
     const runId = entry.slice(0, -".json".length);
     const manifest = readRunManifest({ cwd: options.cwd, runId, fs });
-    if (manifest !== undefined) runs.push(manifest);
+    if (manifest === undefined) {
+      listing.unattributable.push(unattributableName(runId));
+      continue;
+    }
+    listing.listed.push({ runId, manifest });
+  }
+  listing.listed.sort((a, b) => (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
+  listing.unattributable.sort();
+  return listing;
+}
+
+/** List persisted runs sorted by start time; malformed files and non-.json entries are skipped. */
+export function listRuns(options: ListRunsOptions): RunManifest[] {
+  const runs: RunManifest[] = [];
+  for (const { manifest } of listRunFiles(options).listed) {
+    if (options.taskId !== undefined && !runBelongsToTask(manifest, options.taskId)) continue;
+    runs.push(manifest);
   }
   runs.sort((a, b) => a.startedAt - b.startedAt);
   return runs;
+}
+
+/**
+ * Delete run manifests that belong to another bead.
+ *
+ * Readers filter by task id (`listRuns`), but the files themselves are what a
+ * caller that only counts `.belayd/runs` reads, so worktree creation drops the
+ * inherited ones at the source: worktrunk's `copy-ignored` step copies
+ * `.belayd/` from the primary checkout into every new worktree (bd-242).
+ *
+ * Only files this function could attribute are touched: an entry that does not
+ * parse, whose body disagrees with its filename, or whose id cannot name a file
+ * is left alone — `listRuns` already skips it, and deleting something this
+ * function cannot attribute would be worse than ignoring it. Those entries are
+ * reported as `unattributable` so the caller can warn instead of letting them
+ * accumulate unnoticed.
+ */
+export function pruneForeignRunManifests(options: PruneForeignRunsOptions): PruneForeignRunsResult {
+  const fs = options.fs ?? runManifestFs;
+  const { listed, unattributable } = listRunFiles({ cwd: options.cwd, fs });
+  const removed: string[] = [];
+  const failed: { runId: string; error: string }[] = [];
+  for (const { runId, manifest } of listed) {
+    if (runBelongsToTask(manifest, options.taskId)) continue;
+    // Delete the entry that was read, never a path derived from the body: the
+    // path's id is the filename's, so the unlink cannot leave the runs directory.
+    try {
+      fs.unlinkSync(runManifestPath(options.cwd, runId));
+    } catch (error) {
+      failed.push({ runId, error: errorMessage(error) });
+      continue;
+    }
+    removed.push(runId);
+  }
+  return { removed, failed, unattributable };
 }
 
 /**
@@ -382,7 +556,7 @@ export function scanForInterruptedRuns(options: ScanForInterruptedRunsOptions): 
   const fs = options.fs ?? runManifestFs;
   const now = options.now ?? Date.now;
   const interrupted: RunManifest[] = [];
-  for (const run of listRuns({ cwd: options.cwd, fs })) {
+  for (const run of listRuns({ cwd: options.cwd, fs, ...taskFilter(options) })) {
     if (run.status !== RunStatus.Running) continue;
     const completedAt = now();
     const result = setRunStatus({

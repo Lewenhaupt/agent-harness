@@ -70,6 +70,15 @@ function respondConfig(args: readonly string[]): string {
   return "";
 }
 
+/**
+ * `git branch …` answers: the ownership probes read `--show-current`, and it
+ * reports the same HEAD this mock exposes through `rev-parse --abbrev-ref`.
+ */
+function respondBranch(args: readonly string[]): string {
+  if (args[1] !== "--show-current") return "";
+  return gitState.head === undefined ? "" : `${gitState.head}\n`;
+}
+
 function respondGit(args: readonly string[]): string {
   switch (args[0]) {
     case "rev-parse": {
@@ -84,6 +93,8 @@ function respondGit(args: readonly string[]): string {
     }
     case "config":
       return respondConfig(args);
+    case "branch":
+      return respondBranch(args);
     case "merge-base": {
       const sha = gitState.stack.mergeBases[`${args[2] ?? ""} ${args[3] ?? ""}`];
       if (sha === undefined) throw new Error("no merge base");
@@ -832,6 +843,93 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
     expect(text).toContain("Pending items from the handoff");
     expect(text).toContain("interrupted phase run");
     expect(text).toContain("marked delivered without applying them");
+  });
+
+  it("settles only the caller's own runs, never an inherited foreign one (bd-242)", async () => {
+    const harness = await loadPi();
+    const sessionId = `foreign-settle-${nextSessionId++}`;
+    writeCallerHandoff({
+      cwd,
+      sessionKey: sessionId,
+      marker: { taskId: "bd-101", branch: "feat/bd-101", sessionId: "sess-child" },
+    });
+    // The caller's own run, plus the shape `wt step copy-ignored` inherits from
+    // the primary checkout: another bead's still-running manifest.
+    writeRunManifest({
+      cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: "own-run",
+        taskId: "bd-100",
+        phase: "implement",
+        sessionName: "belayd-bd-100-sub-implement-own-run",
+        status: RunStatus.Running,
+        startedAt: 2_000,
+      },
+    });
+    writeRunManifest({
+      cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: "mthosemh",
+        taskId: "bd-37",
+        phase: "implement",
+        sessionName: "belayd-bd-37-sub-implement-mthosemh",
+        status: RunStatus.Running,
+        startedAt: 1_000,
+      },
+    });
+    // One undelivered user completion each: the caller's own, and an inherited
+    // foreign one whose report this handoff must not swallow.
+    writeRunManifest({
+      cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: "own-completion",
+        taskId: "bd-100",
+        phase: "review",
+        sessionName: "belayd-bd-100-sub-review-own-completion",
+        status: RunStatus.Completed,
+        completedBy: "user",
+        completionReport: "own answer",
+        startedAt: 2_500,
+      },
+    });
+    writeRunManifest({
+      cwd,
+      manifest: {
+        schemaVersion: 1,
+        runId: "foreign-completion",
+        taskId: "bd-37",
+        phase: "review",
+        sessionName: "belayd-bd-37-sub-review-foreign-completion",
+        status: RunStatus.Completed,
+        completedBy: "user",
+        completionReport: "bd-37 answer",
+        startedAt: 1_500,
+      },
+    });
+
+    const ctx = createCtx(cwd, { sessionId });
+    await harness.handlers.get("session_start")?.[0]?.({}, ctx);
+
+    // The branch names bd-100, so the caller's own run is settled...
+    expect(readRunManifest({ cwd, runId: "own-run" })).toHaveProperty(
+      "status",
+      RunStatus.Interrupted,
+    );
+    expect(readRunManifest({ cwd, runId: "own-completion" })?.deliveredAt).toBeDefined();
+    // ...and bd-37's manifests are not this handoff's to write or report: the
+    // foreign run keeps running and its completion keeps its recovery marker.
+    expect(readRunManifest({ cwd, runId: "mthosemh" })).toHaveProperty("status", RunStatus.Running);
+    expect(readRunManifest({ cwd, runId: "foreign-completion" })?.deliveredAt).toBeUndefined();
+    const text = statusText(
+      await harness.tools.get("belayd_status")?.execute("status", {}, undefined, undefined, ctx),
+    );
+    expect(text).toContain("own-run (implement)");
+    expect(text).toContain("own-completion (review)");
+    expect(text).not.toContain("mthosemh (implement)");
+    expect(text).not.toContain("foreign-completion (review)");
   });
 
   it("records the handoff for a caller with no workflow.json", async () => {

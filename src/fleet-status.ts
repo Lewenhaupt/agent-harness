@@ -764,13 +764,12 @@ export interface BuildFleetStatusOptions {
 /**
  * Task id carried by a worktree directory name such as `<repo>.feat-bd-42`.
  *
- * Deliberately the same shape as `taskIdFromBranch` (`bd-<digits>` plus at most
- * one sub-bead segment): a multi-dot id is not a task id there either, and two
- * different patterns would silently skip the mismatch check for one source.
- * The only difference is the separator before `bd-`: a directory name joins the
- * branch with `.` or `-`, not `/`.
+ * Deliberately the same shape as `taskIdFromBranch` (`bd-<digits>` plus any
+ * number of sub-bead segments): two different patterns would silently skip the
+ * mismatch check for one source. The only difference is the separator before
+ * `bd-`: a directory name joins the branch with `.` or `-`, not `/`.
  */
-const TASK_ID_SUFFIX = /(?:^|[^A-Za-z0-9])(bd-\d+(?:\.\d+)?)$/;
+const TASK_ID_SUFFIX = /(?:^|[^A-Za-z0-9])(bd-\d+(?:\.\d+)*)$/;
 
 function expectedTaskIdFor(snapshot: FleetMemberSnapshot): string | undefined {
   if (snapshot.branch !== undefined) {
