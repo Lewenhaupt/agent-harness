@@ -61,7 +61,9 @@ import {
   updateFleetMergeQueue,
 } from "./fleet-state.js";
 import type { FleetIntent } from "./fleet-status.js";
-import { evaluatePublishGate } from "./publish-gate.js";
+import type { ProofArtifactPolicy } from "./proof-policy.js";
+import { DEFAULT_PROOF_ARTIFACT_POLICY, readRepoProofPolicy } from "./proof-policy.js";
+import { evaluatePublishGate, isProofArtifactPathInDiff } from "./publish-gate.js";
 import type { WorktreeListEntry } from "./worktree.js";
 import { gitContextFreeEnv, parseWorktreeListPorcelainZ } from "./worktree.js";
 
@@ -1437,10 +1439,39 @@ async function checkPublishPayload(
   }
 
   const changedPaths = diff.stdout.split("\0").filter((path) => path !== "");
-  const gate = evaluatePublishGate({ changedPaths });
-  if (gate.ok) return undefined;
-  // `paths` is the complete sorted list; `text` is bounded to one line.
-  return { reason: gate.reason, text: gate.text, paths: gate.paths };
+  const gate = evaluatePublishGate({
+    changedPaths,
+    proofPolicy: resolveProofPolicy(context, changedPaths),
+  });
+  if (!gate.ok) return { reason: gate.reason, text: gate.text, paths: gate.paths };
+  if (gate.proofArtifacts !== undefined) {
+    // Carrying proof past the gate is a repo policy decision, so it is reported on
+    // every landing it affects instead of happening silently (bd-276).
+    context.warnings.push(
+      `carried ${gate.proofArtifacts.length} proof artifact path(s) under the repo ` +
+        `policy proof.artifacts=in-tree: ${gate.proofArtifacts.join(", ")}`,
+    );
+  }
+  return undefined;
+}
+
+/**
+ * The proof policy this payload is judged by (bd-276).
+ *
+ * Only read when the payload actually carries a proof path: a repo with no proof
+ * in flight never pays a config read, and an existing test's fs seam never has to
+ * answer for a file the contract did not ask about. When it is read, the repo's
+ * live declaration is the truth (not a value frozen into the intent at launch), so
+ * a repo that declares the policy mid-run unblocks the work already in flight.
+ */
+function resolveProofPolicy(
+  context: MergeAttemptContext,
+  changedPaths: readonly string[],
+): ProofArtifactPolicy {
+  if (!changedPaths.some(isProofArtifactPathInDiff)) return DEFAULT_PROOF_ARTIFACT_POLICY;
+  const read = readRepoProofPolicy({ repoRoot: context.options.rootCwd, fs: context.fs });
+  context.warnings.push(...read.warnings);
+  return read.policy;
 }
 
 /** Stash a dirty root, recording the ref so it can be reported and restored. */

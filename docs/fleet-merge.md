@@ -88,7 +88,10 @@ runs the documented sequence:
    non-ASCII (lookalike) paths refuse with `paths-outside-scope`; an unreadable
    diff refuses with
    `publish-payload-unreadable`. **Deleting** proof artifacts is allowed — that is
-   the migration: upload the proof, keep the receipt, `git rm -r docs/proof`. The
+   the migration: upload the proof, keep the receipt, `git rm -r docs/proof`. A
+   repo whose own policy keeps *text* proof in git overrules the proof half of this
+   check by declaring `proof.artifacts: "in-tree"` (see [Repo proof
+   policy](#repo-proof-policy-bd-276)); every other predicate still applies. The
    one-line refusal text is bounded (10 paths,
    then a `(+N more)` pointer naming `paths`), and the drain result carries the
    complete sorted list as `paths`, which `belayd_fleet_merge` renders as
@@ -149,9 +152,48 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 | `lock-unavailable` | another supervisor holds a live lease, or an orphaned primitive is inside its grace window |
 | `root-not-own-checkout` / `root-not-on-base` | run the drain from the root on the base branch |
 | `member-worktree-dirty` | commit or discard the member's working-tree changes first |
-| `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof and keep the receipt at `.belayd/proof-receipt.json` instead. Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
+| `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof and keep the receipt at `.belayd/proof-receipt.json` instead. Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. A repo that keeps text proof in git declares `{"proof":{"artifacts":"in-tree"}}` in `.belayd/config.json` and this refusal stops applying to it (see [Repo proof policy](#repo-proof-policy-bd-276)). The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
 | `paths-outside-scope` | the payload contains harness-local (`.belayd`, `.belayd/`, `.belayd-task.json`, `proof-of-work`), absolute, traversal or backslash paths, a non-ASCII/lookalike path (refused rather than guessed; rename it to ASCII), or (when the publisher declares a payload) a path outside it |
 | `publish-payload-unreadable` | the payload diff could not be computed; the drain fails closed rather than guessing |
+
+### Repo proof policy (bd-276)
+
+Proof artifacts are refused in a published payload by default (bd-181): they
+upload to the reviewing platform and the workflow keeps a receipt at
+`.belayd/proof-receipt.json`. A repository whose own policy keeps *text* evidence
+in git — `docs/proof/<bead>/` READMEs, casts, transcripts, capture scripts — is
+the case that default cannot express, and bd-181 deliberately left those repos
+"not migrated, only stopped". Every member then refuses to land, and the refusal is
+indistinguishable from a member that committed junk.
+
+So the repository declares the policy and the drain defers to it:
+
+```json
+{ "proof": { "artifacts": "in-tree" } }
+```
+
+in `<repoRoot>/.belayd/config.json` (commit it: it is repo policy, not scratch
+state — a repo that ignores `.belayd/*` needs `!.belayd/config.json`).
+
+| Value | Effect on the drain |
+|---|---|
+| `forbid` (default, and what an absent or unusable declaration resolves to) | a payload carrying proof refuses with `proof-artifacts-in-diff` |
+| `in-tree` | proof paths are ordinary content: the proof refusal is skipped and a landing that carried any reports `carried N proof artifact path(s) under the repo policy proof.artifacts=in-tree: …` in its warnings |
+
+Under `in-tree`, every other predicate is unchanged: harness-local paths
+(`.belayd`, `.belayd-task.json`, `proof-of-work`), absolute, traversal, backslash
+and non-ASCII/lookalike paths still refuse, and a publisher that declares a payload
+still refuses proof outside it.
+
+It is read **live, per drain, from the repo root** — never frozen into the intent —
+because it describes what the repository is. Declaring it mid-run therefore applies
+to members already in flight, which is the point: it is the transition guard for a
+repo that has not migrated.
+
+A declaration that does not parse (wrong value, misspelled key, non-object) is a
+warning plus the strict default, never a launch abort. `pr`/`push` publishing must
+keep the strict refusal whatever the repo declares, because a published PR is not
+the repository.
 
 ### What it will not do
 

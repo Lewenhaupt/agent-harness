@@ -36,6 +36,13 @@
  * harness-local, absolute, traversal, non-ASCII and proof-artifact paths in that
  * mode.
  *
+ * **The repository can overrule the proof refusal.** `proofPolicy` (bd-276) is the
+ * repo's own declaration (`.belayd/config.json` `proof.artifacts`, see
+ * `src/proof-policy.ts`). Under `in-tree` — a repo that keeps text evidence in git
+ * on purpose — proof paths are ordinary content and only the scope predicates
+ * apply. The default is `forbid`, and a `pr`/`push` publish executor must pass it
+ * explicitly whatever the repo declares, because a published PR is not the repo.
+ *
  * **Proof is refused in one direction only.** This gate classifies the paths it
  * is given; it is the caller's job to pass a payload that means "carried in".
  * Proof artifacts that are *added or modified* are refused
@@ -48,6 +55,7 @@
  */
 
 import { isAbsolute } from "node:path";
+import { DEFAULT_PROOF_ARTIFACT_POLICY, type ProofArtifactPolicy } from "./proof-policy.js";
 import { PROOF_RECEIPT_RELATIVE_PATH } from "./proof-receipt.js";
 import { isProofArtifactPath } from "./proof-verification.js";
 
@@ -59,10 +67,20 @@ export interface PublishGateInput {
   changedPaths: readonly string[];
   /** The declared payload set, when the caller knows it. */
   intendedPaths?: readonly string[];
+  /** The repo's declared proof policy; absent means the strict default. */
+  proofPolicy?: ProofArtifactPolicy;
 }
 
 export type PublishGateResult =
-  | { ok: true; paths: readonly string[] }
+  | {
+      ok: true;
+      paths: readonly string[];
+      /**
+       * Proof paths carried under an `in-tree` policy, sorted. Absent when none
+       * were carried, so a caller that never sees this field has nothing to report.
+       */
+      proofArtifacts?: readonly string[];
+    }
   | {
       ok: false;
       reason: PublishGateRefusalReason;
@@ -174,7 +192,12 @@ export function isHarnessLocalPath(path: string): boolean {
   return normalized.ok ? isHarnessLocalNormalizedPath(normalized.path) : false;
 }
 
-/** True when the path may be part of a published payload. */
+/**
+ * True when the path may be part of a published payload under the strict default
+ * proof policy. Proof content is refused here regardless of what a repo declares:
+ * `evaluatePublishGate` applies an `in-tree` declaration to the paths the policy
+ * named, so this predicate keeps one meaning for every caller.
+ */
 export function isPublishablePath(path: string): boolean {
   const normalized = normalizePublishPath(path);
   if (!normalized.ok) return false;
@@ -204,6 +227,12 @@ function refusal(
   if (reason === "proof-artifacts-in-diff") {
     notes.push(
       `proof artifacts must not be published — upload them and keep the receipt at ${PROOF_RECEIPT_RELATIVE_PATH}`,
+    );
+    // This refusal can only happen under the strict default, so the escape hatch a
+    // repo with a deliberate in-git proof policy needs belongs in the message: the
+    // refusal is otherwise indistinguishable from a member that committed junk.
+    notes.push(
+      'a repo that keeps proof in git declares {"proof":{"artifacts":"in-tree"}} in .belayd/config.json',
     );
   } else {
     notes.push("only the intended publishable paths may be carried");
@@ -235,22 +264,31 @@ function refusal(
  * the proof reason.
  */
 export function evaluatePublishGate(input: PublishGateInput): PublishGateResult {
+  const policy = input.proofPolicy ?? DEFAULT_PROOF_ARTIFACT_POLICY;
   const changedPaths = dedupeSorted(
     input.changedPaths.filter((path) => path.trim() !== "").map((path) => publishDisplayPath(path)),
   );
 
   const proofPaths = changedPaths.filter(isProofArtifactPathInDiff);
-  if (proofPaths.length > 0) return refusal("proof-artifacts-in-diff", proofPaths);
+  if (policy === "forbid" && proofPaths.length > 0) {
+    return refusal("proof-artifacts-in-diff", proofPaths);
+  }
 
   const intended =
     input.intendedPaths === undefined
       ? undefined
       : new Set(input.intendedPaths.map((path) => publishDisplayPath(path)));
+  // Under `in-tree` a proof path is ordinary content: `isPublishablePath` keeps its
+  // strict meaning (so the pr/push executor cannot accidentally inherit a lenient
+  // predicate), and leniency is applied here, to the proof paths the policy named.
+  const carriedProof = new Set(proofPaths);
   const outsideScope = changedPaths.filter((path) => {
-    if (!isPublishablePath(path)) return true;
+    if (!carriedProof.has(path) && !isPublishablePath(path)) return true;
     return intended === undefined ? false : !intended.has(path);
   });
   if (outsideScope.length > 0) return refusal("paths-outside-scope", outsideScope);
 
-  return { ok: true, paths: changedPaths };
+  return proofPaths.length === 0
+    ? { ok: true, paths: changedPaths }
+    : { ok: true, paths: changedPaths, proofArtifacts: proofPaths };
 }

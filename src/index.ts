@@ -1382,6 +1382,12 @@ export {
   resolveProjectProofBase,
   resolveProofBase,
 } from "./proof-dir.js";
+export type { ProofArtifactPolicy, RepoProofArtifactPolicy } from "./proof-policy.js";
+export {
+  DEFAULT_PROOF_ARTIFACT_POLICY,
+  PROOF_ARTIFACT_POLICIES,
+  readRepoProofPolicy,
+} from "./proof-policy.js";
 export type {
   ProofReceipt,
   ProofReceiptFs,

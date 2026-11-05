@@ -1896,6 +1896,58 @@ describe("drainFleetMerge: publish payload guard (bd-181)", () => {
   });
 });
 
+describe("drainFleetMerge: repo proof policy (bd-276)", () => {
+  /** Put a proof-carrying branch in the member worktree and declare the policy on base. */
+  function fixtureWithProof(options: { policy: string }): FixtureRepo {
+    const fixture = createFixtureRepo();
+    mkdirSync(join(fixture.root, ".belayd"), { recursive: true });
+    writeFileSync(
+      join(fixture.root, ".belayd", "config.json"),
+      JSON.stringify({ proof: { artifacts: options.policy } }),
+    );
+    commit(fixture.root, "declare the repo proof policy");
+
+    mkdirSync(join(fixture.memberPath, "docs", "proof", "bd-12"), { recursive: true });
+    writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", "README.md"), "evidence\n");
+    writeFileSync(join(fixture.memberPath, "docs", "proof", "bd-12", "run.cast"), "cast\n");
+    commit(fixture.memberPath, "commit the bead's text evidence");
+    enqueue(fixture);
+    return fixture;
+  }
+
+  it("lands a proof-carrying branch when the repo declares proof.artifacts=in-tree", async () => {
+    const fixture = fixtureWithProof({ policy: "in-tree" });
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    // Carrying proof past the gate is a policy decision, so it is reported on the
+    // landing instead of happening silently.
+    expect(result.warnings).toContain(
+      "carried 2 proof artifact path(s) under the repo policy proof.artifacts=in-tree: " +
+        "docs/proof/bd-12/README.md, docs/proof/bd-12/run.cast",
+    );
+    expect(git(fixture.root, ["show", "--name-only", "--pretty=format:", "HEAD"])).toContain(
+      "docs/proof/bd-12/README.md",
+    );
+  });
+
+  it("still refuses when the declaration itself is unusable", async () => {
+    const fixture = fixtureWithProof({ policy: "in-git" });
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    expect(result.warnings.some((warning) => warning.includes("invalid proof policy"))).toBe(true);
+    expect(readQueue(fixture).entries.find((entry) => entry.taskId === "bd-12")?.state).toBe(
+      "queued",
+    );
+  });
+});
+
 describe("merge gate runner detection (S1)", () => {
   it("honors packageManager, then the lockfile, then falls back to npm", () => {
     expect(resolveFleetGateRunner({ packageManager: "pnpm@9.12.0", lockfiles: [] })).toBe("pnpm");

@@ -238,3 +238,72 @@ describe("evaluatePublishGate", () => {
     expect(result.text).not.toContain("artifact-12.png");
   });
 });
+
+describe("evaluatePublishGate: repo proof policy (bd-276)", () => {
+  const proofPaths = ["docs/proof/bd-276/README.md", "docs/proof/bd-276/run.cast"];
+
+  it("refuses proof content by default and names the declaration that allows it", () => {
+    const result = evaluatePublishGate({ changedPaths: proofPaths });
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("proof-artifacts-in-diff");
+    // The escape hatch has to be in the refusal: an operator otherwise cannot tell
+    // an unmigrated repo from a member that committed junk (bd-276).
+    expect(result.text).toContain('{"proof":{"artifacts":"in-tree"}}');
+    expect(result.text).toContain(".belayd/config.json");
+  });
+
+  it("carries proof content under an in-tree policy and reports what it carried", () => {
+    const result = evaluatePublishGate({
+      changedPaths: ["src/a.ts", ...proofPaths],
+      proofPolicy: "in-tree",
+    });
+    expect(result).toStrictEqual({
+      ok: true,
+      paths: ["docs/proof/bd-276/README.md", "docs/proof/bd-276/run.cast", "src/a.ts"],
+      proofArtifacts: ["docs/proof/bd-276/README.md", "docs/proof/bd-276/run.cast"],
+    });
+  });
+
+  it("omits the carried field when an in-tree payload has no proof", () => {
+    expect(
+      evaluatePublishGate({ changedPaths: ["src/a.ts"], proofPolicy: "in-tree" }),
+    ).toStrictEqual({ ok: true, paths: ["src/a.ts"] });
+  });
+
+  it("still refuses harness bookkeeping under an in-tree policy", () => {
+    const result = evaluatePublishGate({
+      changedPaths: ["docs/proof/bd-276/README.md", ".belayd/proof-receipt.json"],
+      proofPolicy: "in-tree",
+    });
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("paths-outside-scope");
+    expect(result.paths).toStrictEqual([".belayd/proof-receipt.json"]);
+  });
+
+  it("still refuses traversal, absolute, backslash and non-ASCII paths under an in-tree policy", () => {
+    for (const offending of ["../escape.ts", "/abs/x.ts", "src\\a.ts", "docs/café.md"]) {
+      const result = evaluatePublishGate({
+        changedPaths: ["docs/proof/bd-276/README.md", offending],
+        proofPolicy: "in-tree",
+      });
+      expect(result, offending).toHaveProperty("ok", false);
+      if (result.ok) return;
+      expect(result.reason, offending).toBe("paths-outside-scope");
+      expect(result.paths, offending).toStrictEqual([offending]);
+    }
+  });
+
+  it("honours the declared payload set for proof paths under an in-tree policy", () => {
+    const result = evaluatePublishGate({
+      changedPaths: proofPaths,
+      intendedPaths: ["docs/proof/bd-276/README.md"],
+      proofPolicy: "in-tree",
+    });
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("paths-outside-scope");
+    expect(result.paths).toStrictEqual(["docs/proof/bd-276/run.cast"]);
+  });
+});
