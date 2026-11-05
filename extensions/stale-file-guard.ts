@@ -25,6 +25,13 @@ import { checkEdit, clearHashes, recordRead } from "../src/stale-file-guard.js";
 // and project-locally (.pi/settings.json). When both load in one process the
 // event handlers would be registered twice. The process-wide marker dedupes:
 // the first copy wins, the second returns before registering handlers.
+//
+// Load order makes an out-of-date global copy worse than a duplicate: a copy
+// that still reads only `input.filePath` is a silent no-op, and because it
+// usually loads first it permanently disables the fixed local copy for the
+// process. Any change to the guard's input contract therefore requires
+// redeploying the global copy in lockstep — otherwise the fix has no effect on
+// machines still running the older one.
 const STALE_GUARD_LOAD_MARKER = "__belayd_stale_file_guard_loaded__";
 
 function staleGuardAlreadyLoaded(): boolean {
@@ -33,6 +40,24 @@ function staleGuardAlreadyLoaded(): boolean {
 
 function markStaleGuardLoaded(): void {
   (globalThis as Record<string, unknown>)[STALE_GUARD_LOAD_MARKER] = true;
+}
+
+/**
+ * Extracts the edit target path from a pi tool_call input.
+ *
+ * pi-coding-agent 1.0.x `EditToolInput` is `{ path, edits: [{ oldText, newText }] }`;
+ * the pre-1.0 `{ filePath, oldText }` shape no longer exists, so reading only
+ * `filePath` silently turned the stale-edit guard into a no-op. `filePath` is
+ * still accepted because other tool schemas (and older pi versions) expose it,
+ * matching `extensions/worktree-guard.ts`.
+ *
+ * Exported so the extraction is unit-testable without driving a handler.
+ */
+export function extractEditPath(input: unknown): string | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const candidate = input as { path?: unknown; filePath?: unknown };
+  const path = typeof candidate.path === "string" ? candidate.path : candidate.filePath;
+  return typeof path === "string" && path.length > 0 ? path : undefined;
 }
 
 export default function staleFileGuardExtension(pi: ExtensionAPI): void {
@@ -63,10 +88,10 @@ export default function staleFileGuardExtension(pi: ExtensionAPI): void {
   // Intercept tool_call events to block stale edits
   pi.on("tool_call", (event: ToolCallEvent): ToolCallEventResult => {
     if (event.toolName === "edit" || event.toolName === "Edit") {
-      const input = event.input as { filePath?: string; oldText?: string } | undefined;
+      const filePath = extractEditPath(event.input);
 
-      if (input?.filePath) {
-        const result = checkEdit(input.filePath);
+      if (filePath) {
+        const result = checkEdit(filePath);
         if (!result.allowed) {
           return { block: true, reason: result.reason ?? "File has changed since read" };
         }

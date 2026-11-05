@@ -19,7 +19,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { checkEdit, recordRead, reset } from "../stale-file-guard.js";
+import { extractEditPath } from "../../extensions/stale-file-guard.js";
+import { checkEdit, getTrackedFileCount, recordRead, reset } from "../stale-file-guard.js";
 
 // Mirrors the module-private marker constant in extensions/stale-file-guard.ts.
 // The extension sets a process-wide flag so a second copy of the same guard
@@ -67,6 +68,26 @@ function getFirstHandler(event: string): CapturedHandler {
 
 function clearLoadMarker(): void {
   delete (globalThis as Record<string, unknown>)[STALE_GUARD_LOAD_MARKER];
+}
+
+interface BlockResult {
+  block?: boolean;
+  reason?: string;
+}
+
+// Every tool_call handler runs in registration order; a block short-circuits in
+// pi, so the first blocking result is what the session would actually see.
+async function runToolCallHandlers(event: object): Promise<BlockResult | undefined> {
+  let blocked: BlockResult | undefined;
+  for (const handler of getHandlers("tool_call")) {
+    const result = (await handler(event, undefined)) as BlockResult | undefined;
+    if (result?.block) blocked = result;
+  }
+  return blocked;
+}
+
+async function runToolResultHandlers(event: object): Promise<unknown> {
+  return getFirstHandler("tool_result")(event, undefined);
 }
 
 let tmpDir: string;
@@ -159,6 +180,54 @@ describe("tool_result read recording", () => {
     };
     expect(await handler(event, undefined)).toEqual({});
   });
+
+  it("records a read for the capitalized Read tool name", async () => {
+    const filePath = join(tmpDir, "capitalized-read.txt");
+    writeFileSync(filePath, "original", "utf8");
+
+    expect(
+      await runToolResultHandlers({
+        type: "tool_result" as const,
+        toolCallId: "t12",
+        toolName: "Read",
+        input: { path: filePath },
+        content: [{ type: "text", text: "original" }],
+        isError: false,
+      }),
+    ).toEqual({});
+
+    writeFileSync(filePath, "modified", "utf8");
+    expect(checkEdit(filePath)).toHaveProperty("allowed", false);
+  });
+
+  it("tracks nothing for a read without a usable path or text content", async () => {
+    const events: object[] = [
+      // pi 1.0.x always sets input, but the handler narrows it, not asserts it.
+      { type: "tool_result", toolCallId: "t13", toolName: "read", content: [], isError: false },
+      {
+        type: "tool_result",
+        toolCallId: "t14",
+        toolName: "read",
+        input: { path: 42 },
+        content: [{ type: "text", text: "x" }],
+        isError: false,
+      },
+      {
+        type: "tool_result",
+        toolCallId: "t15",
+        toolName: "read",
+        input: { path: join(tmpDir, "empty.txt") },
+        content: [{ type: "image", data: "", mimeType: "image/png" }],
+        isError: false,
+      },
+    ];
+
+    for (const event of events) {
+      expect(await runToolResultHandlers(event)).toEqual({});
+    }
+    // No text and no usable path means no hash to compare against later.
+    expect(getTrackedFileCount()).toBe(0);
+  });
 });
 
 describe("tool_call guard handlers", () => {
@@ -194,10 +263,7 @@ describe("tool_call guard handlers", () => {
     }
   });
 
-  it("blocks a stale edit when the guard tracked a read for input.filePath", async () => {
-    // Documents current behavior: the handler guards on `input.filePath`.
-    // NOTE: pi 1.0.2's EditToolInput is { path, edits[] } — see the coverage
-    // gap reported with bd-90; this test pins the existing contract only.
+  it("blocks a stale edit for a faithful 1.0.2 EditToolInput ({ path, edits[] })", async () => {
     const filePath = join(tmpDir, "file.txt");
     writeFileSync(filePath, "original", "utf8");
     recordRead(filePath, "original");
@@ -207,7 +273,7 @@ describe("tool_call guard handlers", () => {
       type: "tool_call" as const,
       toolCallId: "t5",
       toolName: "edit",
-      input: { filePath, oldText: "original" },
+      input: { path: filePath, edits: [{ oldText: "original", newText: "changed" }] },
     };
     let blocked: { block?: boolean; reason?: string } | undefined;
     for (const handler of getHandlers("tool_call")) {
@@ -225,11 +291,126 @@ describe("tool_call guard handlers", () => {
       type: "tool_call" as const,
       toolCallId: "t6",
       toolName: "edit",
-      input: { filePath: join(tmpDir, "untracked.txt"), oldText: "x" },
+      input: { path: join(tmpDir, "untracked.txt"), edits: [{ oldText: "x", newText: "y" }] },
     };
     for (const handler of getHandlers("tool_call")) {
       expect(await handler(event, undefined)).toEqual({});
     }
+  });
+
+  it("does not block an edit for a file read and left unchanged", async () => {
+    const filePath = join(tmpDir, "unchanged.txt");
+    writeFileSync(filePath, "stable", "utf8");
+    recordRead(filePath, "stable");
+
+    const event = {
+      type: "tool_call" as const,
+      toolCallId: "t7",
+      toolName: "edit",
+      input: { path: filePath, edits: [{ oldText: "stable", newText: "edited" }] },
+    };
+    expect(await runToolCallHandlers(event)).toBeUndefined();
+  });
+
+  it("blocks a stale edit supplied through the legacy `filePath` field", async () => {
+    const filePath = join(tmpDir, "legacy.txt");
+    writeFileSync(filePath, "original", "utf8");
+    recordRead(filePath, "original");
+    writeFileSync(filePath, "modified", "utf8");
+
+    const blocked = await runToolCallHandlers({
+      type: "tool_call" as const,
+      toolCallId: "t8",
+      toolName: "edit",
+      input: { filePath, oldText: "original", newText: "changed" },
+    });
+    expect(blocked).toHaveProperty("block", true);
+    expect(blocked?.reason).toContain("has changed since it was read");
+  });
+
+  it("accepts the capitalized Edit tool name", async () => {
+    const filePath = join(tmpDir, "capitalized.txt");
+    writeFileSync(filePath, "original", "utf8");
+    recordRead(filePath, "original");
+    writeFileSync(filePath, "modified", "utf8");
+
+    const blocked = await runToolCallHandlers({
+      type: "tool_call" as const,
+      toolCallId: "t9",
+      toolName: "Edit",
+      input: { path: filePath, edits: [{ oldText: "original", newText: "changed" }] },
+    });
+    expect(blocked).toHaveProperty("block", true);
+  });
+
+  it("does not throw or block on null, non-object or non-string path input", async () => {
+    // LLM-generated input is untrusted: odd shapes must degrade to "no path",
+    // i.e. pass through, never throw and never block an unrelated edit.
+    const oddInputs: unknown[] = [
+      undefined,
+      null,
+      "just-a-string",
+      42,
+      {},
+      { path: null },
+      { path: 42 },
+      { path: "" },
+      { path: [join(tmpDir, "array.txt")] },
+      { filePath: 7 },
+    ];
+
+    for (const input of oddInputs) {
+      const blocked = await runToolCallHandlers({
+        type: "tool_call" as const,
+        toolCallId: "t10",
+        toolName: "edit",
+        input,
+      });
+      expect(blocked).toBeUndefined();
+    }
+  });
+
+  it("does not block a write tool_call (write is an intentional overwrite)", async () => {
+    const filePath = join(tmpDir, "written.txt");
+    writeFileSync(filePath, "original", "utf8");
+    recordRead(filePath, "original");
+    writeFileSync(filePath, "modified", "utf8");
+
+    expect(
+      await runToolCallHandlers({
+        type: "tool_call" as const,
+        toolCallId: "t11",
+        toolName: "write",
+        input: { path: filePath, content: "new" },
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("extractEditPath (pi 1.0.x edit input)", () => {
+  it("reads `path` from the documented EditToolInput shape", () => {
+    expect(extractEditPath({ path: "/tmp/a.txt", edits: [{ oldText: "a", newText: "b" }] })).toBe(
+      "/tmp/a.txt",
+    );
+  });
+
+  it("falls back to legacy `filePath` for older tool schemas", () => {
+    expect(extractEditPath({ filePath: "/tmp/a.txt", oldText: "a" })).toBe("/tmp/a.txt");
+  });
+
+  it("prefers `path` when both fields are present", () => {
+    expect(extractEditPath({ path: "/tmp/new.txt", filePath: "/tmp/old.txt" })).toBe(
+      "/tmp/new.txt",
+    );
+  });
+
+  it("returns undefined for missing, empty or non-string paths", () => {
+    expect(extractEditPath(undefined)).toBeUndefined();
+    expect(extractEditPath(null)).toBeUndefined();
+    expect(extractEditPath("file.txt")).toBeUndefined();
+    expect(extractEditPath({ path: "" })).toBeUndefined();
+    expect(extractEditPath({ path: 42 })).toBeUndefined();
+    expect(extractEditPath({ edits: [] })).toBeUndefined();
   });
 });
 
