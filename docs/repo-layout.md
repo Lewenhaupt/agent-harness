@@ -350,6 +350,7 @@ deliberately and say why.
 | `docs/proof-verifier.md`, `docs/userguide-phase.md` | advisory verifier, userguide deliverable |
 | `docs/playwright-proof-env.md`, `docs/agent-browser-tool.md` | proof + browser tooling |
 | `docs/archify-diagrams.md` | committed diagram workflow |
+| `docs/diagrams/README.md` | ad-hoc explanation diagrams (mermaid in chat) vs committed archify artifacts |
 | `docs/unslop-skill.md` | unslop UI-design skill: pinned router, `$UNSLOP_HOME`, wrappers, `belayd_unslop` |
 | `docs/bd-253-userguide.md` | operator walkthrough for the unslop skill (bd-253): when to reach for it, the two-pass flow, the degrade paths, the verification commands |
 | `docs/bd-257-userguide.md` | operator walkthrough for the session model pre-flight (bd-257): the routing line, confirming the model, the all-cooled warning, `BELAYD_MODEL_FALLBACK=0`, live and unit verification |

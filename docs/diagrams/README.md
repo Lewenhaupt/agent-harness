@@ -4,6 +4,82 @@ Committed [archify](https://github.com/tt-a1i/archify) diagrams live here.
 Each file is a single self-contained interactive HTML document compiled from a
 typed JSON IR; there are no external assets or network dependencies.
 
+There are two ways to draw a diagram, and they are complementary, not
+competing. **Ad-hoc explanation** (below) answers "what is going on right now"
+mid-conversation. **Committed archify** (the rest of this file) is a polished,
+reviewed artifact. Never use one where the other belongs: an ad-hoc sketch that
+gets committed goes stale, and an archify authoring pass is far too expensive
+for a question you can answer with a picture in ten seconds.
+
+## Ad-hoc explanation diagrams
+
+For explaining a process, a blockage or a flow to a human during a session.
+These are **not** committed and carry no review weight: they exist to make
+shared understanding cheap, and they are thrown away once the question is
+answered.
+
+Emit them as a `mermaid` code fence in the reply. pi-web ships the
+`@pi-web/mermaid-plugin` (bundled engine including the ELK and cose-bilkent
+layout engines), so a fence renders as a diagram directly in the chat with no
+file, no build step and no dependency to install. Verify the pipe rather than
+assuming it: a fence that comes back as raw text means the plugin is off in
+that instance, not that the syntax is wrong.
+
+Use ELK when the diagram has hierarchy or a fan-out, since it degrades far more
+gracefully than the default dagre engine:
+
+````text
+---
+config:
+  flowchart:
+    defaultRenderer: elk
+---
+flowchart LR
+  ...
+````
+
+Frontmatter ELK fails outright where the engine is missing, so a rendering
+surface without it needs the frontmatter dropped rather than the diagram
+redrawn.
+
+A syntax error is fatal to the whole picture, not to the one node: the reader
+gets an error box or raw text and nothing else, so a single bad label silently
+discards the explanation. The trap that has bitten here: a label may not begin
+with `{` inside square brackets (`a[{text}]` parses as a deliberate shape
+start, not as text — `Parsing failed ... got 'DIAMOND_START'`). Keep braces out
+of bracket labels, or quote the label. Parse before trusting: a fence that
+looks right in the source can still be unrenderable.
+
+Readability, not engine capability, is the limit. A reader loses the thread
+somewhere around 15 boxes, and ELK buys roughly twice that. Past it, add a
+view instead of growing the canvas. The rules that keep these honest:
+
+- **One question per diagram.** Caption it with the question it answers, and
+  state in one line what it deliberately omits. Otherwise the picture invites
+  arguments about everything it was never meant to model.
+- **Split views over a bigger canvas.** A top-level view plus one detail view
+  beats a single 40-node poster; the reader navigates instead of panning.
+- **Style the blocked path apart from the live one.** This is the whole point
+  when the subject is a stall: if waiting, failed and retried edges look like
+  working ones, the picture answers nothing.
+- **Label every waiting or terminal node with its unblocker** — the person, the
+  gate, or the event that would move it. A box that says `waiting` and stops
+  there reproduces the problem it was drawn to explain.
+- **Name nodes for their role, not their position.** `awaiting human answer`
+  beats `step 4`; a sequential numbering is what the layout is already telling
+  the reader.
+
+These sketches describe state; they do not compute it. When the picture has to
+be consistent with what the harness actually knows, it needs generating from a
+state model rather than narrated from memory — a sketch drawn from memory is
+most dangerous exactly when it looks authoritative.
+
+Why not archify for this: its `workflow` type is a declared-lane grid with
+`col` restricted to `0..5`, so it cannot lay out a process that is both wide and
+deep, and a showcase pass is an authoring task measured in minutes — too slow
+and too polished for a mid-conversation question. Reach for archify when the
+diagram is a deliverable.
+
 ## Why this directory is committed
 
 Generated HTML is part of the repository documentation, so reviewers can open
