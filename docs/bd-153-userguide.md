@@ -769,8 +769,8 @@ Member bd-iwd — active
 
 | Line | Meaning |
 | --- | --- |
-| `Needs you (<n>): <ids>` | Members whose bead carries bd's `human` label **or** has a parsed open `human` gate. The list is bounded to 10 beads (`…and N more` before the member blocks) and ordered like the member blocks (by task id). Omitted entirely when nothing needs a person |
-| `  - <id> (assignee <a>, awaiting human) — <comment>` | Who to chase, and what they said: assignee, `awaiting human` only for a bead with an open gate, then the newest comment excerpt (120 characters). `(unassigned)` when bd reported no assignee, `(unknown)` when the bead record itself could not be read, `(no comments yet)` / `(comments unknown)` when there is no usable newest comment |
+| `Needs you (<n>): <ids>` | Members whose bead carries bd's `human` label, has a parsed open `human` gate, **or** was stopped by a fleet run (the stop's reason/detail render on its entry, bd-279). The list is bounded to 10 beads (`…and N more` before the member blocks) and ordered like the member blocks (by task id). Omitted entirely when nothing needs a person |
+| `  - <id> (assignee <a>, awaiting human) — <comment>` | Who to chase, and what they said: assignee, `awaiting human` only for a bead with an open gate, then the newest comment excerpt (120 characters). A stopped member's entry reads `stopped <reason>` and its run detail instead (plus `(answered: <note>)` once the escalation gate was resolved, or `(answered, no note)` when the resolver left none — the same `answered` notion the run header's stop lines use, bd-279). `(unassigned)` when bd reported no assignee, `(unknown)` when the bead record itself could not be read, `(no comments yet)` / `(comments unknown)` when there is no usable newest comment |
 | `owner:` | `owner` from `bd show --json` (usually an email). `(unknown)` when bd reported none or renamed the field — a bad field degrades only that column |
 | `assignee:` | bd's assignee: a person, or `belayd:<task>:<phase>` while a phase agent holds the bead. `(unassigned)` only when bd reported none |
 | `human: yes\|no` | The bead carries the `human` label. Independent of the gate column |

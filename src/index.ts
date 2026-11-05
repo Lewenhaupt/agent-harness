@@ -138,8 +138,11 @@ export {
   stripBdShowComments,
 } from "./bead-comments.js";
 export type {
+  FleetEscalationGateDrift,
+  FleetEscalationGateMarker,
   GateCreateOptions,
   LookupOpenHumanGateOptions,
+  OpenFleetEscalationGate,
   OpenHumanGate,
   OpenHumanGateLookup,
 } from "./bead-gates.js";
@@ -147,18 +150,26 @@ export {
   buildGateCreateArgv,
   buildGateListArgv,
   buildGateResolveArgv,
+  FLEET_ESCALATION_GATE_PREFIX,
   FLEET_ORDERING_GATE_PREFIX,
+  fleetEscalationGateDrift,
+  fleetEscalationGateMarkerOf,
   fleetOrderingGateDriftWarning,
   fleetOrderingGateMarkerOf,
+  isFleetEscalationGateRecord,
   isFleetOrderingGateRecord,
   lookupOpenHumanGate,
   openHumanGateFromRecord,
   parseCreatedGateId,
+  parseFleetEscalationGateMarkerLine,
   parseFleetOrderingGateMarkerLine,
+  parseOpenFleetEscalationGates,
   parseOpenFleetOrderingGates,
   parseOpenHumanGate,
   parseOpenOrderingGateBlocker,
+  readOpenFleetEscalationGates,
   readOpenFleetOrderingGates,
+  renderFleetEscalationGateMarker,
   renderFleetOrderingGateMarker,
 } from "./bead-gates.js";
 export {
@@ -405,6 +416,35 @@ export type {
   FleetCapacitySupervisor,
 } from "./fleet-capacity.js";
 export { describeFleetCapacity, memberHoldsCapacity } from "./fleet-capacity.js";
+// Fleet escalation as bd gates: one described gate per human-relevant stop (bd-279)
+export type {
+  CheckFleetEscalationGatesOptions,
+  CheckFleetEscalationGatesResult,
+  EnsureFleetEscalationGatesOptions,
+  EnsureFleetEscalationGatesResult,
+  FleetEscalationCause,
+  FleetEscalationGate,
+  FleetEscalationGateListResult,
+  FleetEscalationPlan,
+  FleetEscalationReapScope,
+  ParkedFleetEscalation,
+  PlanFleetEscalationsInput,
+  ReapFleetEscalationGatesResult,
+} from "./fleet-escalation.js";
+export {
+  applyFleetEscalationGates,
+  buildFleetEscalationGateArgv,
+  checkFleetEscalationGates,
+  ensureFleetEscalationGates,
+  FLEET_ESCALATION_CAUSES,
+  FLEET_ESCALATION_REASON_PROSE_MAX,
+  fleetEscalationGateReason,
+  fleetEscalationGateTitle,
+  isFleetEscalationCause,
+  listFleetEscalationGatesForBead,
+  planFleetEscalations,
+  reapFleetEscalationGatesByPrefix,
+} from "./fleet-escalation.js";
 // Supervisor heartbeat for a run-mode fleet (P5)
 export type {
   SupervisorBeatVerdict,
@@ -664,6 +704,7 @@ export {
   FleetRunSchema,
   finishFleetRun,
   fleetMemberSignature,
+  fleetRunStopAnswer,
   fleetTickProgress,
   formatFleetRunLine,
   formatFleetRunStops,
@@ -678,6 +719,8 @@ export {
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
+  recordRunStopGate,
+  recordRunStopResolution,
   recordRunTick,
   releaseRunMembers,
   startFleetRun,

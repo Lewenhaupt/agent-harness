@@ -22,6 +22,16 @@ import { acceptLandedMember } from "../../src/fleet-accept.js";
 import { lookupFleetBeadEngagement } from "../../src/fleet-bead-engagement.js";
 import { lookupFleetBeads, lookupFleetDependencies } from "../../src/fleet-beads.js";
 import {
+  applyFleetEscalationGates,
+  checkFleetEscalationGates,
+  ensureFleetEscalationGates,
+  type FleetEscalationCause,
+  type FleetEscalationPlan,
+  type ParkedFleetEscalation,
+  planFleetEscalations,
+  reapFleetEscalationGatesByPrefix,
+} from "../../src/fleet-escalation.js";
+import {
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
   isFleetLoopProvablyDead,
   planSupervisorReadoption,
@@ -105,6 +115,7 @@ import {
   type FleetMemberObservation,
   type FleetMemberReleaseReason,
   type FleetRun,
+  type FleetRunStop,
   type FleetTickAction,
   type FleetWorkflowProgressSnapshot,
   finishFleetRun,
@@ -159,6 +170,7 @@ import {
 import {
   applyFleetBeadEngagement,
   applyFleetBeadLookup,
+  type BeadOwnershipInput,
   DEFAULT_FLEET_ID,
   type FleetBead,
   type FleetBeadLookup,
@@ -543,26 +555,86 @@ export function createFleet(deps: FleetDeps): FleetApi {
         runBd: (argv, options) => runBdCommand(argv, options),
       }),
     ]);
-    if (!beadLookup.ok) {
-      return formatBeadOwnership({ cwdTaskId: taskId, error: beadLookup.error });
+    return formatBeadOwnership(
+      ownershipInput({
+        taskId,
+        beadLookup,
+        engagementLookup,
+        stop: findRecordedStop({ taskId, cwd }),
+      }),
+    );
+  }
+
+  /**
+   * The already-read data `formatBeadOwnership` renders, one input per read outcome.
+   *
+   * A failed bead read is the one case that prints without bead columns, and a failed
+   * engagement read keeps the bead columns it did read: both shapes are decided here so
+   * `readBeadOwnership` stays a plain two-read function.
+   */
+  function ownershipInput(options: {
+    taskId: string;
+    beadLookup: FleetBeadLookup;
+    engagementLookup: FleetEngagementLookup;
+    stop: FleetRunStop | undefined;
+  }): BeadOwnershipInput {
+    const lowered = options.taskId.toLowerCase();
+    const withStop = options.stop === undefined ? {} : { stop: options.stop };
+    if (!options.beadLookup.ok) {
+      return {
+        cwdTaskId: options.taskId,
+        ...withStop,
+        error: options.beadLookup.error,
+      };
     }
-    const lowered = taskId.toLowerCase();
-    const bead = beadLookup.beads.find((candidate) => candidate.id.toLowerCase() === lowered);
-    if (!engagementLookup.ok) {
-      return formatBeadOwnership({
-        cwdTaskId: taskId,
-        ...(bead === undefined ? {} : { bead }),
-        error: engagementLookup.error,
-      });
+    const bead = options.beadLookup.beads.find(
+      (candidate) => candidate.id.toLowerCase() === lowered,
+    );
+    const withBead = bead === undefined ? {} : { bead };
+    if (!options.engagementLookup.ok) {
+      return {
+        cwdTaskId: options.taskId,
+        ...withBead,
+        ...withStop,
+        error: options.engagementLookup.error,
+      };
     }
-    const engagement = engagementLookup.entries.find(
+    const engagement = options.engagementLookup.entries.find(
       (entry) => entry.taskId.toLowerCase() === lowered,
     )?.engagement;
-    return formatBeadOwnership({
-      cwdTaskId: taskId,
-      ...(bead === undefined ? {} : { bead }),
+    return {
+      cwdTaskId: options.taskId,
+      ...withBead,
       ...(engagement === undefined ? {} : { engagement }),
-    });
+      ...withStop,
+    };
+  }
+
+  /**
+   * The run stop record for a bead, from the fleet intents of this repository.
+   *
+   * `belayd_status` is a single-bead surface, so it must show the same fact the
+   * supervisor's "Needs you" block does (bd-279): a member the run stopped carries
+   * its reason, detail, and the escalation gate a person answers on `run.stopped`.
+   * A bead id belongs to one fleet here, and the intents are a handful of small
+   * files, so this stays a cheap read with no bd call and no write.
+   */
+  function findRecordedStop(options: { taskId: string; cwd: string }): FleetRunStop | undefined {
+    const resolved = resolveGitCommonDir(options.cwd);
+    if (!resolved.ok) return undefined;
+    const lowered = options.taskId.toLowerCase();
+    for (const directoryId of listFleetIds({ gitCommonDir: resolved.commonDir })) {
+      const loaded = readFleetIntent({
+        gitCommonDir: resolved.commonDir,
+        fleetId: directoryId,
+      });
+      if (!loaded.ok || loaded.intent === undefined) continue;
+      const stop = loaded.intent.run?.stopped?.find(
+        (entry) => entry.taskId.toLowerCase() === lowered,
+      );
+      if (stop !== undefined) return stop;
+    }
+    return undefined;
   }
 
   function findBead(taskId: string, cwd: string): Promise<FleetBeadLookup> {
@@ -617,7 +689,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
       };
     }
     if (lookup.status === "unrecognized") {
-      return { readError: "bd returned gate records that did not parse" };
+      // bd answered: the records are simply not this wait's question (an escalation
+      // gate, a timer gate). Reported apart from `readError` so the digest does not
+      // claim a read failure that did not happen (bd-279 S2).
+      return { unrecognizedGateState: "bd listed open gates, none of them asks this wait" };
     }
     return lookup.orderingBlocker === undefined ? {} : { orderingBlocker: lookup.orderingBlocker };
   }
@@ -1351,8 +1426,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * Best-effort and silent on failure: one tick's bd read failing must not become
    * a warning every 15 s, and an unread gate is "unknown", never a wait (a member
    * wrongly read as waiting would hold the run under the 12 h human cap instead of
-   * the 1 h stall cap). An ordering gate is not this member's own wait either, so
-   * `lookupOpenHumanGate` reports it separately and it stays `false` here.
+   * the 1 h stall cap). An ordering gate or an open fleet escalation gate is not
+   * this member's own wait either (`lookupOpenHumanGate` reports them apart from
+   * the ask-human wait), so it stays `false` here.
    */
   async function readMemberHumanGate(options: {
     taskId: string;
@@ -1571,7 +1647,20 @@ export function createFleet(deps: FleetDeps): FleetApi {
     // longer a member, which is exactly the orphan case it reaps). Stopping here
     // would end the run `partial` on a transient bd failure and wedge a merged
     // member forever.
-    const gateLines = await resolveLandedOrderingGates({ ctx, mode, taskId, now });
+    // bd-279: the landing cleared the member's stop (and with it the record the
+    // tick's escalation check keys on), so its escalation gate is resolved here.
+    const landEscalations = await reapEscalationGates({
+      ctx,
+      mode,
+      beadIds: [taskId],
+      scope: "whole-bead",
+      label: "landed member",
+    });
+    const gateLines = [
+      ...(await resolveLandedOrderingGates({ ctx, mode, taskId, now })),
+      ...landEscalations.lines,
+      ...landEscalations.warnings,
+    ];
 
     if (!accepted.ok) {
       // The work landed, so the member is out of the member list; only the bead
@@ -1731,6 +1820,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
 
   /** Why a tick ended the run loop, so the caller can tell terminal from lost. */
   type FleetTickStopReason = "terminal" | "authority-lost" | "intent-lost";
+
+  /**
+   * What a by-prefix escalation reaper produced, split by kind.
+   *
+   * The split exists so notification level follows the *result*, not the wording: a
+   * resolved gate is information and a bd failure is a warning, and a bd error string
+   * is arbitrary text that may contain either phrase (bd-279 review S2).
+   */
+  interface EscalationReapReport {
+    lines: readonly string[];
+    warnings: readonly string[];
+  }
 
   /** What one executed action produced, plus whether the loop must stop. */
   interface FleetTickOutcome {
@@ -1954,9 +2055,23 @@ export function createFleet(deps: FleetDeps): FleetApi {
         ...(advanced.ok ? {} : { reason: advanced.text }),
       });
     }
+    // A launch clears any stop the member carried (`recordRunMemberLaunched`),
+    // which erases the handle the escalation check uses; resolve its gates now so
+    // a relaunched member is not left blocked by the old escalation (bd-279).
+    const launchEscalations = await reapEscalationGates({
+      ctx,
+      mode,
+      beadIds: outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.taskId),
+      scope: "whole-bead",
+      label: "relaunched member",
+    });
     return {
       run: extendRunWithLaunches({ run, outcomes, now }),
-      lines: outcomes.length === 0 ? [] : [`Fleet ${mode.fleetId}: ${advanced.text}`],
+      lines: [
+        ...(outcomes.length === 0 ? [] : [`Fleet ${mode.fleetId}: ${advanced.text}`]),
+        ...launchEscalations.lines,
+        ...launchEscalations.warnings,
+      ],
       stop: false,
       acted: true,
     };
@@ -2281,6 +2396,213 @@ export function createFleet(deps: FleetDeps): FleetApi {
       warnings: [...warnings, ...planned.fresh.map((notice) => notice.message)],
       gateNoticeIds: planned.noticeIds,
     };
+  }
+
+  /**
+   * Escalate every human-relevant stop, and keep bd and the run record in agreement
+   * about which escalations are still live (bd-279).
+   *
+   * Runs once per tick, after the action, instead of at each `recordRunMemberStopped`
+   * call site: the tick is the only place that sees the run record after *every*
+   * writer (the loop's stop action, a failed accept, a failed land) has run, so one
+   * call covers all of them and a new stop writer cannot forget to escalate. It is
+   * also where the parked-fleet case lands: a park halts the run, so the tick that
+   * writes (or re-reads) the park is the one that opens its gates.
+   *
+   * A bd failure is reported, never fatal: the stop is the durable fact and the gate
+   * is how a person reaches it. A create that failed leaves the stop without a
+   * `gateId`, so the next tick plans it again; a read that failed leaves the whole
+   * pass untouched.
+   */
+  async function escalateFleetRun(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    run: FleetRun;
+    now: number;
+    /** Gate ids the ordering reap already warned about: both passes share one ledger. */
+    existingNoticeIds: readonly string[];
+  }): Promise<{
+    run: FleetRun;
+    lines: readonly string[];
+    gateNoticeIds: readonly string[];
+  }> {
+    const { ctx, mode, run } = options;
+    const parked = parkedEscalationOf(options.intent);
+    const plan = planFleetEscalations({
+      fleetId: mode.fleetId,
+      run,
+      taskIds: options.intent.taskIds,
+      ...(parked === undefined ? {} : { parked }),
+    });
+    const opened = await openEscalationGates({
+      ctx,
+      mode,
+      plan,
+      run,
+      now: options.now,
+    });
+    const checked = await checkFleetEscalationGates({
+      cwd: ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+      fleetId: mode.fleetId,
+      run: opened.run,
+      now: options.now,
+      taskIds: options.intent.taskIds,
+      ...(parked === undefined ? {} : { parked }),
+    });
+    const planned = planGateNotices({
+      ...(options.existingNoticeIds.length === 0 ? {} : { existing: options.existingNoticeIds }),
+      notices: checked.notices,
+      releasedGateIds: checked.reaped,
+    });
+    return {
+      run: checked.run,
+      lines: [
+        ...opened.lines,
+        ...checked.warnings,
+        ...planned.fresh.map((notice) => notice.message),
+      ],
+      gateNoticeIds: planned.noticeIds,
+    };
+  }
+
+  /** The park record as the escalation planner needs it, when the fleet has one. */
+  function parkedEscalationOf(intent: FleetIntent): ParkedFleetEscalation | undefined {
+    if (intent.park === undefined) return undefined;
+    return { reason: intent.park.reason, recordedAt: intent.park.recordedAt };
+  }
+
+  /**
+   * Open (or adopt) the gates the plan calls for and record their ids on the stops.
+   *
+   * A failed create is reported as a line and nothing more: the stop is already
+   * recorded, the gate is how a person reaches it, and a stop without a gate id is
+   * re-planned on the next tick.
+   */
+  async function openEscalationGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    plan: readonly FleetEscalationPlan[];
+    run: FleetRun;
+    now: number;
+  }): Promise<{ run: FleetRun; lines: readonly string[] }> {
+    if (options.plan.length === 0) return { run: options.run, lines: [] };
+    const ensured = await ensureFleetEscalationGates({
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+      fleetId: options.mode.fleetId,
+      plan: options.plan,
+    });
+    const lines = ensured.warnings.map((warning) => `Fleet ${options.mode.fleetId}: ${warning}`);
+    if (!ensured.ok) {
+      lines.push(
+        `Fleet ${options.mode.fleetId}: could not open the escalation gate(s) for ` +
+          `${options.plan.map((entry) => `${entry.taskId} (${entry.cause})`).join(", ")}: ` +
+          `${ensured.error} — the stop record stands, and the next tick retries`,
+      );
+    }
+    if (ensured.created.length > 0) {
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "escalation-gates-opened",
+        taskIds: ensured.created.map((gate) => gate.taskId),
+        detail: ensured.created
+          .map((gate) => `${gate.taskId} ${gate.cause} (${gate.gateId})`)
+          .join(", "),
+      });
+    }
+    return {
+      run: applyFleetEscalationGates({ run: options.run, gates: ensured.gates, now: options.now }),
+      lines,
+    };
+  }
+
+  /**
+   * Resolve the parked-fleet escalations a cleared park left behind (bd-279).
+   *
+   * Scoped to the `fleet-parked` cause on purpose: the same member may also carry a
+   * *stop* escalation that is still in force, and an unpark must never answer that
+   * one. The park gate has no per-member record to find it from (a park strands the
+   * member without stopping it), so bd's own marker is the only handle. Best-effort:
+   * a failure is reported and the gate stays for the next park/stop pass to reap.
+   */
+  async function reapParkedEscalationGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    beadIds: readonly string[];
+  }): Promise<void> {
+    if (options.beadIds.length === 0) return;
+    const reaped = await reapEscalationGates({
+      ctx: options.ctx,
+      mode: options.mode,
+      beadIds: options.beadIds,
+      scope: "causes",
+      causes: ["fleet-parked"],
+      label: "parked-fleet",
+    });
+    notifyEscalationReap(options.ctx, reaped);
+  }
+
+  /**
+   * Resolve escalation gates whose reason to exist just ended, whatever it was.
+   *
+   * The stop record is the handle the tick uses to find its escalation, and landing,
+   * retrying, or pruning a member erases that handle (`recordRunMemberLanded` and
+   * `retryRunMembers` clear the stop). The bead's own gates are therefore the only
+   * remaining evidence, which is what the by-prefix sweep reads. `scope` keeps the
+   * sweep honest: a cleared park answers only park escalations, while a member that
+   * left the fleet answers every escalation on its bead.
+   */
+  async function reapEscalationGates(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    beadIds: readonly string[];
+    label: string;
+    scope: "causes" | "whole-bead";
+    causes?: readonly FleetEscalationCause[];
+  }): Promise<EscalationReapReport> {
+    if (options.beadIds.length === 0) return { lines: [], warnings: [] };
+    const reaped = await reapFleetEscalationGatesByPrefix({
+      fleetId: options.mode.fleetId,
+      beadIds: options.beadIds,
+      cwd: options.ctx.cwd,
+      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+      ...(options.scope === "causes"
+        ? { scope: "causes" as const, causes: options.causes ?? [] }
+        : { scope: "whole-bead" as const }),
+    });
+    const lines: string[] = [];
+    if (reaped.resolved.length > 0) {
+      const detail = reaped.resolved
+        .map((gate) => `${gate.taskId} ${gate.cause} (${gate.gateId})`)
+        .join(", ");
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "escalation-gates-resolved",
+        taskIds: reaped.resolved.map((gate) => gate.taskId),
+        detail: `${options.label}: ${detail}`,
+      });
+      lines.push(
+        `Fleet ${options.mode.fleetId}: resolved ${reaped.resolved.length} escalation gate(s) ` +
+          `no longer needed (${options.label}): ${detail}`,
+      );
+    }
+    // The result shape decides the notification level, never the text: a bd error
+    // string is arbitrary and need not say "could not" (bd-279 review S2).
+    const warnings = reaped.warnings.map((warning) => `Fleet ${options.mode.fleetId}: ${warning}`);
+    if (!reaped.ok) warnings.push(`Fleet ${options.mode.fleetId}: ${reaped.error}`);
+    return { lines, warnings };
+  }
+
+  /** Show a reaper report at the level its own shape asked for. */
+  function notifyEscalationReap(ctx: ExtensionContext, report: EscalationReapReport): void {
+    for (const line of report.lines) ctx.ui.notify(line, "info");
+    for (const warning of report.warnings) ctx.ui.notify(warning, "warning");
   }
 
   /**
@@ -3050,16 +3372,27 @@ export function createFleet(deps: FleetDeps): FleetApi {
       stopped: result.stop,
       progress,
     });
+    // Escalate after the action, because a stop recorded by this very tick is the
+    // case the primitive exists for: the gate opens in the same pass as the stop, so
+    // a supervisor (or a human) never has to read `fleet.json` to learn what happened.
+    const escalated = await escalateFleetRun({
+      ctx,
+      mode: current,
+      intent: tickIntent,
+      run: ticked,
+      now,
+      existingNoticeIds: reaped.gateNoticeIds,
+    });
     // The gate-notice ledger rides on the run this tick persists, so the next
     // rotation does not re-notify the same drifted or unrecordable gate.
     persistFleetRun({
       ctx,
       mode: current,
-      run: recordFleetGateNotices(ticked, reaped.gateNoticeIds),
+      run: recordFleetGateNotices(escalated.run, escalated.gateNoticeIds),
       now,
     });
     return {
-      lines: [...swept.lines, ...reaped.warnings, ...result.lines],
+      lines: [...swept.lines, ...reaped.warnings, ...escalated.lines, ...result.lines],
       stop: result.stop,
       acted: result.acted,
       ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
@@ -6047,6 +6380,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       resumeFleetRunLoop(extensionCtx, getSessionState(extensionCtx));
       ensureFleetRunTimer({ ctx: extensionCtx, state: getSessionState(extensionCtx) });
 
+      // bd-279: the park's escalation gates were asking about a state this resume just
+      // cleared, so they are resolved with it — scoped to the park cause, because a
+      // member may still carry its own stop escalation.
+      await reapParkedEscalationGates({
+        ctx: extensionCtx,
+        mode,
+        beadIds: mode.intent.taskIds,
+      });
+
       const notified = announceToMembers({
         ctx: extensionCtx,
         mode,
@@ -6142,6 +6484,31 @@ export function createFleet(deps: FleetDeps): FleetApi {
       extraBeads: pruned,
     });
     for (const warning of reaped.warnings) options.ctx.ui.notify(warning, "warning");
+    // bd-279: a pruned member's escalation gates have nobody left to answer them, and
+    // a retried one's stop (and with it the record the tick keys on) was just cleared.
+    // Both leave the bead's own gates as the only evidence, so they are swept by
+    // marker — one read per bead, and only for the members this repair touched.
+    const retried = options.repairs
+      .filter((repair) => repair.startsWith("member-retry:"))
+      .map((repair) => repair.slice("member-retry:".length))
+      .filter((taskId) => taskId !== "");
+    const orphaned = await reapEscalationGates({
+      ctx: options.ctx,
+      mode: options.mode,
+      beadIds: [...pruned, ...retried],
+      scope: "whole-bead",
+      label: pruned.length > 0 ? "pruned member" : "retried member",
+    });
+    notifyEscalationReap(options.ctx, orphaned);
+    // A park this repair cleared had escalation gates asking about it; resolve them,
+    // scoped to the park cause so a member's own stop escalation survives.
+    if (options.repairs.some((repair) => repair.startsWith("park:unparked:"))) {
+      await reapParkedEscalationGates({
+        ctx: options.ctx,
+        mode: options.mode,
+        beadIds: reconciled.intent.taskIds,
+      });
+    }
   }
 
   /** Record the recovery claim only for a pass that actually repaired something (S1). */

@@ -308,9 +308,9 @@ function viewComment(comment: BeadComment): FleetBeadComment {
  *
  * Fail closed: only a parsed open human gate is `true`, only bd's explicit
  * "no gates" is `false`. `unrecognized` (records exist but none is an open
- * human gate — a renamed field or malformed record) and a failed read are
- * `undefined`, so the view says `unknown` instead of claiming a human is not
- * needed.
+ * human gate — a renamed field, a malformed record, or an escalation gate that is
+ * a human wait for a *different* question) and a failed read are `undefined`, so
+ * the view says `unknown` instead of claiming a human is not needed.
  */
 function awaitingHumanFrom(gate: OpenHumanGateLookup): boolean | undefined {
   if (!gate.ok) return undefined;

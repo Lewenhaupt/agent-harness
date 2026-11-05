@@ -336,6 +336,19 @@ describe("workflow digest sections (bd-189)", () => {
     expect(text).toContain("- waiting on: unknown (gate read failed: bd gate list timed out)");
   });
 
+  it("does not report a successful read as a gate read failure (bd-279 S2)", () => {
+    // bd answered and the records are real, just not this wait's question (an
+    // escalation gate, a timer gate). "gate read failed" invented a bd failure the
+    // operator would go looking for; the genuine failure above must stay distinct.
+    const text = digestText({
+      gates: { unrecognizedGateState: "bd listed open gates, none of them asks this wait" },
+    });
+    expect(text).toContain(
+      "- waiting on: unknown (gate state unrecognized: bd listed open gates, none of them asks this wait)",
+    );
+    expect(text).not.toContain("gate read failed");
+  });
+
   it("renders no human wait for a post-review member with no open gate (bd-219)", () => {
     // `awaitingReviewResponse` persists on every review completion, so reading it
     // as a wait contradicted the digest's own `- state: active` while the member

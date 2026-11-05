@@ -142,7 +142,10 @@ export function fleetOrderingGateMarkerOf(
   if (typeof title !== "string") return undefined;
   const fromTitle = parseFleetOrderingGateMarkerLine(title);
   if (fromTitle === undefined) return undefined;
-  const fromDescription = markerFromDescription(record.description);
+  const fromDescription = markerFromDescription(
+    record.description,
+    parseFleetOrderingGateMarkerLine,
+  );
   if (fromDescription === undefined) return fromTitle;
   return sameMarker(fromTitle, fromDescription) ? fromTitle : undefined;
 }
@@ -170,17 +173,41 @@ export interface FleetOrderingGateDrift {
 export function fleetOrderingGateDrift(
   record: Record<string, unknown>,
 ): FleetOrderingGateDrift | undefined {
-  if (fleetOrderingGateMarkerOf(record) === undefined) return undefined;
-  const description = record.description;
+  return markedGateDrift({
+    record,
+    markerOf: fleetOrderingGateMarkerOf,
+    prefix: FLEET_ORDERING_GATE_PREFIX,
+    parse: parseFleetOrderingGateMarkerLine,
+    label: "fleet ordering",
+  });
+}
+
+/**
+ * The reason-drift finding for a marked gate, or undefined when there is none.
+ *
+ * Shared by every gate family whose marker lives in the title and is copied into
+ * the reason: the failure (`bd` truncated or re-folded `--reason`) and the verdict
+ * (the title still classifies) are identical, only the label a human reads differs.
+ */
+function markedGateDrift<T>(input: {
+  record: Record<string, unknown>;
+  markerOf: (record: Record<string, unknown>) => T | undefined;
+  prefix: string;
+  parse: (line: string) => T | undefined;
+  label: string;
+}): { gateId: string; message: string } | undefined {
+  if (input.markerOf(input.record) === undefined) return undefined;
+  const description = input.record.description;
   if (typeof description !== "string") return undefined;
-  if (!description.includes(FLEET_ORDERING_GATE_PREFIX)) return undefined;
-  if (markerFromDescription(description) !== undefined) return undefined;
-  const gateId = record.id;
+  if (!description.includes(input.prefix)) return undefined;
+  if (markerFromDescription(description, input.parse) !== undefined) return undefined;
+  const id = input.record.id;
+  const gateId = typeof id === "string" && id !== "" ? id : "(no id)";
   return {
-    gateId: typeof gateId === "string" && gateId !== "" ? gateId : "(no id)",
+    gateId,
     message:
-      `gate ${typeof gateId === "string" ? gateId : "(no id)"} carries the fleet ordering marker in ` +
-      "its title but not in its reason (bd truncated or re-folded the reason); classified from the title",
+      `gate ${gateId} carries the ${input.label} marker in its title but not in its reason ` +
+      "(bd truncated or re-folded the reason); classified from the title",
   };
 }
 
@@ -190,10 +217,13 @@ export function fleetOrderingGateDriftWarning(record: Record<string, unknown>): 
 }
 
 /** bd folds `--reason` into the description as "…\n\nReason: <reason>". */
-function markerFromDescription(description: unknown): FleetOrderingGateMarker | undefined {
+function markerFromDescription<T>(
+  description: unknown,
+  parse: (line: string) => T | undefined,
+): T | undefined {
   if (typeof description !== "string") return undefined;
   for (const line of description.split("\n")) {
-    const marker = parseFleetOrderingGateMarkerLine(line.replace(/^Reason:\s*/u, ""));
+    const marker = parse(line.replace(/^Reason:\s*/u, ""));
     if (marker !== undefined) return marker;
   }
   return undefined;
@@ -205,6 +235,193 @@ function sameMarker(left: FleetOrderingGateMarker, right: FleetOrderingGateMarke
     left.blocker === right.blocker &&
     left.blocked === right.blocked
   );
+}
+
+/**
+ * Stable marker carried by the gates that escalate a fleet member to a human
+ * (bd-279).
+ *
+ * One escalation primitive, not one channel per condition: a member the run
+ * stopped and a parked fleet both leave a person a decision to make, and each of
+ * those is expressed as *one* described gate whose title says what happened and
+ * whose reason says what an answer may be. The gate is the only channel — no
+ * marker file, no parallel JSON record — so the answer
+ * (`bd gate resolve <id> --reason "..."`) is also the decision input a supervisor
+ * reads afterwards. Withheld sensitive findings are not a cause here: they already
+ * own the review gate's ask-human gate (see `fleet-escalation.ts`).
+ *
+ * The marker lives here rather than in `fleet-escalation.ts` because
+ * classification must be able to *refuse* it: {@link openHumanGateFromRecord} and
+ * {@link resolvedHumanGateFromRecord} are the phase-tool answer channel, and a
+ * comment must never "answer" an escalation that is still in force. Keeping the
+ * marker next to those readers is what makes that refusal impossible to forget.
+ *
+ * The shape is structured for the same reason the ordering marker is:
+ * `<prefix> fleet:<fleetId> <taskId> <cause> r<round>`. A bare prefix would be
+ * fail-open — any human gate whose title merely started with it would be read as
+ * an escalation and silently unblocked.
+ */
+export const FLEET_ESCALATION_GATE_PREFIX = "belayd-fleet-escalation:";
+
+/** The escalation facts a gate carries, in the only place bd keeps them: its text. */
+export interface FleetEscalationGateMarker {
+  fleetId: string;
+  taskId: string;
+  /** `FLEET_ESCALATION_CAUSES` entry; a free token here so this module owns no policy. */
+  cause: string;
+  /** The record this escalation is about (`stop.at` or `park.recordedAt`). */
+  round: number;
+}
+
+/** Open fleet escalation gate as `bd gate list <bead> --json` reports it. */
+export interface OpenFleetEscalationGate {
+  gateId: string;
+  fleetId: string;
+  taskId: string;
+  cause: string;
+  round: number;
+}
+
+/** Built from the prefix constant so the marker and its parser cannot drift apart. */
+const ESCALATION_MARKER_LINE = new RegExp(
+  `^${escapeRegExp(FLEET_ESCALATION_GATE_PREFIX)}\\s+fleet:(${ORDERING_TOKEN})\\s+` +
+    `(${ORDERING_TOKEN})\\s+(${ORDERING_TOKEN})\\s+r(\\d+)(?::|\\s*$)`,
+  "u",
+);
+
+/** Render the canonical marker both the gate title and its reason start with. */
+export function renderFleetEscalationGateMarker(input: FleetEscalationGateMarker): string {
+  return (
+    `${FLEET_ESCALATION_GATE_PREFIX} fleet:${input.fleetId} ${input.taskId} ` +
+    `${input.cause} r${Math.trunc(input.round)}`
+  );
+}
+
+/**
+ * Parse one escalation marker line, or undefined when it is not the exact shape.
+ *
+ * Prose after the round is allowed (the reason says what an answer may be after the
+ * marker), but nothing before it: the fleet id, the task id and the cause must be
+ * real tokens and the round a number, so a truncated or re-folded description is
+ * never read as a different escalation.
+ */
+export function parseFleetEscalationGateMarkerLine(
+  line: string,
+): FleetEscalationGateMarker | undefined {
+  const match = ESCALATION_MARKER_LINE.exec(line.trim());
+  if (match === null) return undefined;
+  const fleetId = match[1];
+  const taskId = match[2];
+  const cause = match[3];
+  const round = match[4];
+  if (fleetId === undefined || taskId === undefined || cause === undefined) return undefined;
+  if (round === undefined) return undefined;
+  const parsedRound = Number.parseInt(round, 10);
+  if (!Number.isFinite(parsedRound)) return undefined;
+  return { fleetId, taskId, cause, round: parsedRound };
+}
+
+/**
+ * The marker a gate record carries, or undefined when it is not an escalation gate.
+ *
+ * The same three-state join the ordering classifier uses, for the same failures:
+ * the title decides when the description cannot parse (bd owns `--reason` and may
+ * cut it), and two *disagreeing* sources are not an escalation (that fail-closed
+ * branch is what stops a forged second marker from redirecting a gate).
+ */
+export function fleetEscalationGateMarkerOf(
+  record: Record<string, unknown>,
+): FleetEscalationGateMarker | undefined {
+  const title = record.title;
+  if (typeof title !== "string") return undefined;
+  const fromTitle = parseFleetEscalationGateMarkerLine(title);
+  if (fromTitle === undefined) return undefined;
+  const fromDescription = markerFromDescription(
+    record.description,
+    parseFleetEscalationGateMarkerLine,
+  );
+  if (fromDescription === undefined) return fromTitle;
+  return sameEscalationMarker(fromTitle, fromDescription) ? fromTitle : undefined;
+}
+
+/** A drift finding for a marked gate, keyed by gate id so it can be reported once. */
+export interface FleetEscalationGateDrift {
+  gateId: string;
+  message: string;
+}
+
+/**
+ * The reason-drift finding for a marked escalation gate, or undefined when none.
+ *
+ * The gate is still an escalation (the title decides); the loss is surfaced once
+ * because a reader that depended on the reason — a human looking for the options
+ * in `bd gate list` — would otherwise fail silently. That is the ordering
+ * precedent, applied to the family whose reason *is* the escalation description.
+ */
+export function fleetEscalationGateDrift(
+  record: Record<string, unknown>,
+): FleetEscalationGateDrift | undefined {
+  return markedGateDrift({
+    record,
+    markerOf: fleetEscalationGateMarkerOf,
+    prefix: FLEET_ESCALATION_GATE_PREFIX,
+    parse: parseFleetEscalationGateMarkerLine,
+    label: "fleet escalation",
+  });
+}
+
+function sameEscalationMarker(
+  left: FleetEscalationGateMarker,
+  right: FleetEscalationGateMarker,
+): boolean {
+  return (
+    left.fleetId === right.fleetId &&
+    left.taskId === right.taskId &&
+    left.cause === right.cause &&
+    left.round === right.round
+  );
+}
+
+/** Does this gate record carry the fleet's structured escalation marker? */
+export function isFleetEscalationGateRecord(record: Record<string, unknown>): boolean {
+  return fleetEscalationGateMarkerOf(record) !== undefined;
+}
+
+/**
+ * Every open fleet escalation gate in one `bd gate list <bead> --json` answer.
+ *
+ * bd's truth rather than the run's records: a relaunch that lost a stop record
+ * still finds the gate a human must answer, and a gate whose id the fleet never
+ * recorded is discoverable (and adopted) before a second one is created.
+ */
+export function parseOpenFleetEscalationGates(raw: unknown): readonly OpenFleetEscalationGate[] {
+  return readOpenFleetEscalationGates(raw).gates;
+}
+
+/** The open escalation gates in a gate-list answer, plus any drift it revealed. */
+export function readOpenFleetEscalationGates(raw: unknown): {
+  gates: readonly OpenFleetEscalationGate[];
+  drifts: readonly FleetEscalationGateDrift[];
+} {
+  const gates: OpenFleetEscalationGate[] = [];
+  const drifts: FleetEscalationGateDrift[] = [];
+  for (const record of gateRecordList(raw)) {
+    if (record.status !== "open") continue;
+    const gateId = record.id;
+    if (typeof gateId !== "string" || gateId === "" || gateId.startsWith("-")) continue;
+    const marker = fleetEscalationGateMarkerOf(record);
+    if (marker === undefined) continue;
+    const drift = fleetEscalationGateDrift(record);
+    if (drift !== undefined) drifts.push(drift);
+    gates.push({
+      gateId,
+      fleetId: marker.fleetId,
+      taskId: marker.taskId,
+      cause: marker.cause,
+      round: marker.round,
+    });
+  }
+  return { gates, drifts };
 }
 
 /** Open human gate as the answer channel needs it. */
@@ -369,6 +586,10 @@ function resolvedHumanGateFromRecord(
   gateId: string | undefined,
 ): ResolvedHumanGate | undefined {
   if (isFleetOrderingGateRecord(record)) return undefined;
+  // An escalation gate is answered by the fleet's own decision input, not by the
+  // phase-tool comment channel: reading its closure here would report a stopped
+  // member as unblocked while its work is still stopped (bd-279).
+  if (isFleetEscalationGateRecord(record)) return undefined;
   const id = record.id;
   if (typeof id !== "string" || id === "" || id === beadId) return undefined;
   if (gateId !== undefined && id !== gateId) return undefined;
@@ -414,6 +635,10 @@ export function openHumanGateFromRecord(
 ): OpenHumanGate | undefined {
   // An ordering gate is a wait on another *member*, never on a person.
   if (isFleetOrderingGateRecord(record)) return undefined;
+  // An escalation gate does wait on a person, but it is answered by resolving the
+  // gate itself, not by a bead comment. Letting it through here would make a
+  // comment "answer" a stop that still needs a decision (bd-279).
+  if (isFleetEscalationGateRecord(record)) return undefined;
   const gateId = record.id;
   if (typeof gateId !== "string" || gateId === "" || gateId === beadId) return undefined;
   if (record.status !== "open") return undefined;
@@ -555,9 +780,14 @@ export interface LookupOpenHumanGateOptions {
  * - `open` — a parsed open human gate; the wait is real and comments are read.
  * - `none` — the command succeeded and reported zero open gates; the gate was
  *   genuinely resolved (by a human in bd/Scotty), so the workflow may proceed.
+ *   A fleet ordering gate is included here: it is a wait on another member, not
+ *   on a person, so it is not this comment channel's question either way.
  * - `unrecognized` — records exist but none is an open human gate (a renamed
- *   `status`/`await_type`, a timer gate, a malformed record). Never treated as
- *   resolved: a parse failure must not unblock a workflow that is still waiting.
+ *   `status`/`await_type`, a timer gate, a malformed record), or a record carries
+ *   a fleet escalation marker and is not resolved. Never treated as resolved: a parse
+ *   failure must not unblock a workflow that is still waiting, and an escalation
+ *   is a human wait for a *different* question — reporting `none` for it would
+ *   let this wait be settled by an answer nobody gave (bd-279).
  */
 export async function lookupOpenHumanGate(
   options: LookupOpenHumanGateOptions,
@@ -581,13 +811,24 @@ export async function lookupOpenHumanGate(
     const parsed = JSON.parse(stdout) as unknown;
     const gate = parseOpenHumanGate(parsed, options.beadId);
     if (gate !== undefined) return { ok: true, status: "open", gate };
-    // `null`/`[]` is bd's "no open gates". A fleet ordering gate is not a human
-    // gate at all, so it must not degrade the answer to `unrecognized`; any other
-    // record that did not parse is a contract change, not a resolution.
+    // `null`/`[]` is bd's "no open gates". A fleet ordering gate is a member wait,
+    // so it stays `none`; any other record that did not parse is a contract
+    // change, not a resolution.
     const humanRecords = gateRecordList(parsed).filter(
-      (record) => !isFleetOrderingGateRecord(record),
+      (record) => !isFleetOrderingGateRecord(record) && !isFleetEscalationGateRecord(record),
     );
     if (humanRecords.length > 0) return { ok: true, status: "unrecognized" };
+    // Escalation before ordering: an escalation gate is a human wait that is not
+    // this one, so the wait stays armed instead of reading as resolved. The marker
+    // decides, not the open-gate parser: a record with a malformed id or a missing
+    // `status` is still an escalation, and letting it fall through to `none` would
+    // reopen the fail-open this branch exists to close. A gate bd reports as
+    // `closed` is the human's answer, so it stays `none` — the only way an
+    // escalation-blocked wait recovers once the gate is resolved.
+    const unreadableEscalation = gateRecordList(parsed).some(
+      (record) => fleetEscalationGateMarkerOf(record) !== undefined && record.status !== "closed",
+    );
+    if (unreadableEscalation) return { ok: true, status: "unrecognized" };
     const orderingBlocker = parseOpenOrderingGateBlocker(parsed, options.beadId);
     return orderingBlocker === undefined
       ? { ok: true, status: "none" }

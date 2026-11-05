@@ -149,6 +149,7 @@ otherwise put two repositories' same-named branches in one shared directory.
 |---|---|
 | `src/fleet-accept.ts` | Accepting a landed member: close the bead, remove the worktree (bd-126 P5) |
 | `src/fleet-beads.ts` | Batched, read-only bead lookup for the fleet observer (bd-126 P0) |
+| `src/fleet-escalation.ts` | One described bd escalation gate per human-relevant stop (the seven stop reasons, a parked fleet), idempotent per bead/cause/round; withheld sensitive findings stay on the review gate's ask-human gate (bd-279) |
 | `src/fleet-heartbeat.ts` | Supervisor heartbeat for a run-mode fleet (bd-126 P5) |
 | `src/fleet-launch.ts` | Fleet launch: the decision half of `belayd_fleet_launch` / `/fleet` (bd-126 P1) |
 | `src/fleet-mailbox.ts` | Fleet mailbox rendering (bd-126 P1) |

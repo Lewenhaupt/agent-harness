@@ -245,7 +245,7 @@ export function clearHumanAnswerWait(state: CoreSessionState): void {
   // one diagnosis (a failed read) cannot mute another (a malformed gate), and
   // the identity warning has its own flag again.
   state.humanAnswerWarned = false;
-  state.humanUnrecognizedGateWarned = false;
+  state.humanUnrecognizedGateWarnedBeads = undefined;
   state.humanAnswerDroppedWarned = false;
   state.harnessIdentityWarned = false;
 }
@@ -502,13 +502,39 @@ async function resolvedObservation(
   return { kind: "resolved", note: closed.gate.note };
 }
 
-/** Say once per wait that bd's gate JSON no longer parses; never spam the poll. */
-function warnUnrecognizedHumanGate(state: CoreSessionState, beadId: string): void {
-  if (state.humanUnrecognizedGateWarned === true) return;
-  state.humanUnrecognizedGateWarned = true;
+/**
+ * How many beads the unrecognized-gate warnings remember.
+ *
+ * The memory is per bead so a second bead blocked later in the session still
+ * warns; the cap keeps a long session that sees many beads from growing the set
+ * without limit, evicting oldest-first (a re-warn for an evicted bead is cheap,
+ * an unbounded set in a daemon session is not).
+ */
+const HUMAN_UNRECOGNIZED_GATE_WARNED_MAX_BEADS = 32;
+
+/**
+ * Say once per bead that bd's gate read is not this wait's answer.
+ *
+ * Fires both for a record the gate parser cannot read and for a cleanly parsed
+ * escalation gate: either way the wait stays armed and the reason is not this
+ * one's question, so one line per bead is enough and the 30s poll cannot spam.
+ *
+ * Keyed per bead rather than per session, so a second bead blocked later in the
+ * same session is a new diagnosis instead of silence.
+ */
+export function warnUnrecognizedHumanGate(state: CoreSessionState, beadId: string): void {
+  const warned = state.humanUnrecognizedGateWarnedBeads ?? new Set<string>();
+  state.humanUnrecognizedGateWarnedBeads = warned;
+  if (warned.has(beadId)) return;
+  warned.add(beadId);
+  while (warned.size > HUMAN_UNRECOGNIZED_GATE_WARNED_MAX_BEADS) {
+    const oldest = warned.values().next().value;
+    if (oldest === undefined) break;
+    warned.delete(oldest);
+  }
   console.warn(
-    `[belayd-harness] bd reported gates for ${beadId} that are not open human gates; ` +
-      "the human wait stays armed (bd gate JSON may have changed).",
+    `[belayd-harness] bd reported no ask-human gate for ${beadId}, only gates this wait ` +
+      "cannot read (an escalation gate or an unrecognized record); the human wait stays armed.",
   );
 }
 

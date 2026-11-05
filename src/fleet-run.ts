@@ -26,6 +26,7 @@
  */
 
 import { z } from "zod";
+import { excerptComment } from "./bead-comments.js";
 import type { FleetIntent } from "./fleet-status.js";
 import type { RunManifest } from "./run-manifest.js";
 import { RunStatus } from "./run-manifest.js";
@@ -170,6 +171,28 @@ const FleetRunStopSchema = z.object({
   reason: z.enum(FLEET_RUN_STOP_REASONS),
   detail: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH),
   at: z.number().finite(),
+  /**
+   * The escalation gate this stop opened for a human (bd-279).
+   *
+   * Optional so every record written before the escalation primitive still parses.
+   * Its presence means the gate was opened and its id recorded; its *absence* on a
+   * stop is not evidence that no gate exists — a failed create leaves the record
+   * without one on purpose, and the drift read adopts the gate on a later tick.
+   */
+  gateId: z.string().min(1).max(128).optional(),
+  /**
+   * The person's answer, once the escalation gate was resolved (bd-279).
+   *
+   * The note is the decision input, not a copy of some other conversation: a
+   * supervisor acts on `note` (retry, abandon, release). A stop carrying a
+   * resolution is answered and is never escalated again.
+   */
+  resolution: z
+    .object({
+      note: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH).optional(),
+      at: z.number().finite(),
+    })
+    .optional(),
 });
 
 /**
@@ -249,6 +272,29 @@ export type FleetRun = z.infer<typeof FleetRunSchema>;
 
 export type FleetRunMember = z.infer<typeof FleetRunMemberSchema>;
 export type FleetRunStop = z.infer<typeof FleetRunStopSchema>;
+
+/**
+ * Whether a stop record carries a person's answer, and what that answer said.
+ *
+ * Every renderer of a stop record reads this one shape (bd-279): "answered, no
+ * note" and "still waiting" are opposite next actions, so a second, subtly
+ * different notion of "answered" in a single renderer sends a supervisor to
+ * settle a question a person already settled.
+ */
+export type FleetRunStopAnswer = { answered: false } | { answered: true; note?: string };
+
+/** Classify a stop record's answer for every renderer of that record (pure). */
+export function fleetRunStopAnswer(stop: FleetRunStop): FleetRunStopAnswer {
+  const resolution = stop.resolution;
+  if (resolution === undefined) return { answered: false };
+  // `humanGateResolveNote` trims before storing, so a blank note can only come from a
+  // hand-edited record — and `fleet.json` is untrusted input. An empty answer must read
+  // as "answered without a note", never as a note, or every renderer prints an empty
+  // answer in the one surface whose job is to say what the person chose.
+  const note = resolution.note?.trim();
+  if (note === undefined || note === "") return { answered: true };
+  return { answered: true, note };
+}
 
 /** One gate warning, keyed so the run can show it exactly once. */
 export interface FleetGateNotice {
@@ -1301,6 +1347,73 @@ export function recordRunMemberStopped(options: {
   };
 }
 
+/**
+ * Attach the escalation gate a stop opened, so the record and bd agree (bd-279).
+ *
+ * A no-op when the stop is gone (the member was retried or landed between the gate
+ * create and this write): the gate id then belongs to a gate the drift check reaps,
+ * and attaching it to nothing would be the drift the check exists to prevent.
+ */
+export function recordRunStopGate(options: {
+  run: FleetRun;
+  taskId: string;
+  gateId: string;
+  now: number;
+}): FleetRun {
+  const stopped = options.run.stopped ?? [];
+  if (!stopped.some((entry) => entry.taskId === options.taskId)) return options.run;
+  return {
+    ...options.run,
+    updatedAt: options.now,
+    stopped: stopped.map((entry) =>
+      entry.taskId === options.taskId ? { ...entry, gateId: options.gateId } : entry,
+    ),
+  };
+}
+
+/**
+ * Record the person's answer on the stop it settles (bd-279).
+ *
+ * The answer lives on the stop record rather than in the gate's own history because
+ * the stop is what a supervisor and every status surface read; the gate is only how
+ * the question reached the person. A stop with a resolution is answered, so no
+ * later tick escalates it again.
+ */
+export function recordRunStopResolution(options: {
+  run: FleetRun;
+  taskId: string;
+  note?: string;
+  now: number;
+}): FleetRun {
+  const stopped = options.run.stopped ?? [];
+  if (!stopped.some((entry) => entry.taskId === options.taskId)) return options.run;
+  // The note is a decision, not a transcript: collapse it to one line so a resolved
+  // stop still renders as one line (`formatFleetRunStops`), then bound it like the
+  // record field it is stored in.
+  const note =
+    options.note === undefined
+      ? undefined
+      : options.note.replace(/\s+/gu, " ").trim().slice(0, FLEET_RUN_DETAIL_MAX_LENGTH);
+  return {
+    ...options.run,
+    updatedAt: options.now,
+    stopped: stopped.map((entry) =>
+      entry.taskId === options.taskId
+        ? {
+            ...entry,
+            resolution: {
+              // A recorded answer is never erased by a later note-less write: the note
+              // is the decision a supervisor acts on, so it is merged, not replaced.
+              ...entry.resolution,
+              ...(note === undefined ? {} : { note }),
+              at: options.now,
+            },
+          }
+        : entry,
+    ),
+  };
+}
+
 /** Advance the tick counter and the idle counter (progress resets the latter). */
 export function recordRunTick(options: {
   run: FleetRun;
@@ -1648,10 +1761,46 @@ export function formatFleetRunLine(run: FleetRun | undefined): string | undefine
   return `run: ${run.mode} — ${run.ticks} tick(s), last tick ${isoTime(run.updatedAt)}`;
 }
 
-/** Detail lines for the members a run stopped, one per member. */
+/** Prefix an answered stop's note carries on the header line (bd-279). */
+const FLEET_RUN_STOP_ANSWER_PREFIX = " — answered: ";
+/**
+ * Note budget on the header line: half the record field, so the stop's own detail
+ * keeps at least half of the same bound (`FLEET_RUN_DETAIL_MAX_LENGTH`).
+ */
+const FLEET_RUN_STOP_ANSWER_NOTE_MAX =
+  Math.floor(FLEET_RUN_DETAIL_MAX_LENGTH / 2) - FLEET_RUN_STOP_ANSWER_PREFIX.length;
+/** A resolution the resolver left note-less says so rather than looking unanswered. */
+const FLEET_RUN_STOP_ANSWER_NO_NOTE = " — answered, no note";
+
+/**
+ * Detail lines for the members a run stopped, one per member.
+ *
+ * The answer is appended, never substituted: the stop is still what happened, and a
+ * reader who only wants the log line keeps the shape it always had. It is classified
+ * by {@link fleetRunStopAnswer}, the same notion "Needs you" uses, so the two
+ * renderers of one record cannot disagree about whether a person already answered —
+ * a note-less answer that read like an open stop would send a supervisor to settle a
+ * question that is already settled.
+ */
 export function formatFleetRunStops(run: FleetRun | undefined): readonly string[] {
   if (run === undefined) return [];
-  return (run.stopped ?? []).map(
-    (entry) => `stopped ${entry.taskId} (${entry.reason}): ${entry.detail}`,
-  );
+  return (run.stopped ?? []).map((entry) => {
+    const head = `stopped ${entry.taskId} (${entry.reason}): `;
+    const answer = fleetRunStopAnswer(entry);
+    if (!answer.answered) return `${head}${entry.detail}`;
+    const suffix =
+      answer.note === undefined
+        ? FLEET_RUN_STOP_ANSWER_NO_NOTE
+        : `${FLEET_RUN_STOP_ANSWER_PREFIX}${excerptComment(answer.note, FLEET_RUN_STOP_ANSWER_NOTE_MAX)}`;
+    // Detail and answer share the record field's bound, so appending an answer can
+    // never make the line longer than the stop description it describes.
+    const detail = boundedStopDetail(entry.detail, FLEET_RUN_DETAIL_MAX_LENGTH - suffix.length);
+    return `${head}${detail}${suffix}`;
+  });
+}
+
+/** The detail untouched when it fits, else excerpted to the shared bound. */
+function boundedStopDetail(detail: string, maxChars: number): string {
+  const budget = Math.max(1, maxChars);
+  return Array.from(detail).length <= budget ? detail : excerptComment(detail, budget);
 }

@@ -26,7 +26,9 @@ import {
   FLEET_RUN_STALE_TICK_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FleetRunSchema,
+  type FleetRunStop,
   fleetMemberBranch,
+  fleetRunStopAnswer,
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
@@ -678,6 +680,16 @@ export interface FleetMemberView {
   bead?: FleetBead;
   /** Ownership/human columns read on top of the bead record; absent when unread. */
   engagement?: FleetBeadEngagement;
+  /**
+   * The run's stop record for this member, when the run stopped it (bd-279).
+   *
+   * This is the reader the `taskIds` doc comment always promised: a stopped member
+   * stays in the fleet precisely because `run.stopped` says why it needs a human, and
+   * the stop carries a detail (bounded by `FLEET_RUN_DETAIL_MAX_LENGTH`) plus the
+   * escalation gate a person answers. Absent means the run did not stop it — not that
+   * no human is needed.
+   */
+  stop?: FleetRunStop;
   state: FleetMemberState;
 }
 
@@ -955,6 +967,20 @@ export function deriveFleetMemberState(input: DeriveFleetMemberStateInput): Flee
   return "active";
 }
 
+/**
+ * The run's stop record for one member, if it has one.
+ *
+ * Keyed on the member's task id: `run.stopped` is the run's record of a stop, so a
+ * member without an id (unenrolled worktree, unreadable state) has no stop to show.
+ */
+function stopForMember(
+  intent: FleetIntent | undefined,
+  taskId: string | undefined,
+): FleetRunStop | undefined {
+  if (intent === undefined || taskId === undefined) return undefined;
+  return intent.run?.stopped?.find((entry) => entry.taskId === taskId);
+}
+
 function memberView(
   snapshot: FleetMemberSnapshot,
   intent: FleetIntent | undefined,
@@ -995,6 +1021,7 @@ function memberView(
   const pendingPhases = state.phaseOrder.filter((phase) => !completed.has(phase));
   // Absent flag means "not awaiting" (pre-bd-81 state files predate the field).
   const awaitingReviewResponse = state.awaitingReviewResponse === true;
+  const stop = stopForMember(intent, state.taskId);
 
   return {
     taskId: state.taskId,
@@ -1012,6 +1039,7 @@ function memberView(
     updatedAt:
       runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
     lease: fleetLeaseView(snapshot.lease),
+    ...(stop === undefined ? {} : { stop }),
     state: deriveFleetMemberState({
       workflow: snapshot.workflow,
       runs,
@@ -1829,13 +1857,26 @@ function formatOwnershipLines(member: FleetMemberView): string[] {
  * A supervisor's whole value here is aggregation: "bd-19 and bd-22 are both
  * waiting on you" is actionable, one member block at a time is not. Undefined
  * when nothing needs a human, so the fleet view omits the block entirely.
+ *
+ * Three signals admit a member, and they are the three ways a person ends up owning
+ * a decision (bd-279): the bead carries the `human` label, an open bd gate waits on
+ * a human, or **the run stopped the member** — which used to be rendered only as a
+ * header log line, so a stopped member never appeared in the one block that answers
+ * "what must I do". The stop's reason and detail are the only description of that
+ * state, so they are rendered here, together with the answer a person chose.
  */
 export function formatNeedsYou(status: FleetStatus): string | undefined {
   const needy: Array<{ taskId: string; member: FleetMemberView }> = [];
   for (const member of status.members) {
     const taskId = member.taskId;
     if (taskId === undefined) continue;
-    if (!beadNeedsHuman(member.bead) && member.engagement?.awaitingHuman !== true) continue;
+    if (
+      !beadNeedsHuman(member.bead) &&
+      member.engagement?.awaitingHuman !== true &&
+      member.stop === undefined
+    ) {
+      continue;
+    }
     needy.push({ taskId, member });
   }
   if (needy.length === 0) return undefined;
@@ -1856,7 +1897,33 @@ function formatNeedsYouEntry(entry: { taskId: string; member: FleetMemberView })
     member.bead === undefined ? "(unknown)" : (member.bead.assignee ?? "(unassigned)");
   const parts = [`assignee ${assignee}`];
   if (member.engagement?.awaitingHuman === true) parts.push("awaiting human");
-  return `  - ${entry.taskId} (${parts.join(", ")}) — ${needsYouCommentText(member.engagement)}`;
+  const stop = member.stop;
+  if (stop !== undefined) parts.push(`stopped ${stop.reason}`);
+  const text = stop === undefined ? needsYouCommentText(member.engagement) : needsYouStopText(stop);
+  return `  - ${entry.taskId} (${parts.join(", ")}) — ${text}`;
+}
+
+/**
+ * What the run stopped the member for, and what a person answered (bd-279).
+ *
+ * The detail is the escalation's own description, so it is excerpted with the same
+ * bound as a comment: this block is a supervisor's scan list, not a transcript. An
+ * answered stop says so explicitly — including when the resolver left no note —
+ * because "answered, no note" and "still waiting" are opposite next actions, and a
+ * note-less answer that read like an open stop would send a supervisor to answer a
+ * question that is already settled.
+ */
+function needsYouStopText(stop: FleetRunStop): string {
+  const answer = fleetRunStopAnswer(stop);
+  if (!answer.answered) return excerptComment(stop.detail, NEEDS_YOU_EXCERPT_MAX_CHARS);
+  const rendered =
+    answer.note === undefined
+      ? " (answered, no note)"
+      : ` (answered: ${excerptComment(answer.note, Math.floor(NEEDS_YOU_EXCERPT_MAX_CHARS / 2))})`;
+  // The whole entry stays inside the shared bound: the answer is half the budget, so
+  // a long note can never push the stop's own detail out of the line.
+  const detailBudget = Math.max(1, NEEDS_YOU_EXCERPT_MAX_CHARS - rendered.length);
+  return `${excerptComment(stop.detail, detailBudget)}${rendered}`;
 }
 
 function needsYouCommentText(engagement: FleetBeadEngagement | undefined): string {
@@ -1873,8 +1940,34 @@ export interface BeadOwnershipInput {
   cwdTaskId: string;
   bead?: FleetBead;
   engagement?: FleetBeadEngagement;
+  /**
+   * The run's stop record for this bead, when a fleet in this repository stopped it.
+   *
+   * The single-bead version of the fleet view's join: a session reading its own
+   * status must see the same "Needs you" fact the supervisor's scan does.
+   */
+  stop?: FleetRunStop;
   /** Bounded read failure, rendered instead of the ownership columns. */
   error?: string;
+}
+
+/**
+ * The stop line for the single-bead section, with the answer a person chose.
+ *
+ * The detail is excerpted with the fleet view's bound: this is a status section, not
+ * the run record, and the full text is one `belayd_fleet_status` away.
+ */
+function ownershipStopLine(stop: FleetRunStop): string {
+  const detail = excerptComment(stop.detail, NEEDS_YOU_EXCERPT_MAX_CHARS);
+  const answer = fleetRunStopAnswer(stop);
+  // Same notion of "answered" as the fleet view and the run header: a note-less
+  // answer must not read as a stop that is still open.
+  if (!answer.answered) return `- stop: ${stop.reason} — ${detail}`;
+  const rendered =
+    answer.note === undefined
+      ? "answered, no note"
+      : `answered: ${excerptComment(answer.note, NEEDS_YOU_EXCERPT_MAX_CHARS)}`;
+  return `- stop: ${stop.reason} — ${detail} (${rendered})`;
 }
 
 /**
@@ -1889,7 +1982,8 @@ export interface BeadOwnershipInput {
  */
 export function formatBeadOwnership(input: BeadOwnershipInput): string | undefined {
   if (input.cwdTaskId === "") return undefined;
-  const hasData = input.bead !== undefined || input.engagement !== undefined;
+  const hasData =
+    input.bead !== undefined || input.engagement !== undefined || input.stop !== undefined;
   if (!hasData) {
     return input.error === undefined
       ? undefined
@@ -1912,9 +2006,12 @@ export function formatBeadOwnership(input: BeadOwnershipInput): string | undefin
   if (input.error !== undefined) {
     lines.push(`bead engagement unavailable (bd read failed): ${boundLookupError(input.error)}`);
   }
-  if (beadNeedsHuman(input.bead) || input.engagement?.awaitingHuman === true) {
-    lines.push(`**Needs you** — ${input.cwdTaskId} is waiting on a human.`);
-  }
+  if (input.stop !== undefined) lines.push(ownershipStopLine(input.stop));
+  const needsHuman =
+    beadNeedsHuman(input.bead) ||
+    input.engagement?.awaitingHuman === true ||
+    input.stop !== undefined;
+  if (needsHuman) lines.push(`**Needs you** — ${input.cwdTaskId} is waiting on a human.`);
   return lines.join("\n");
 }
 

@@ -24,6 +24,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FleetForceStopSeams } from "../../extensions/index.js";
+import { renderFleetEscalationGateMarker } from "../bead-gates.js";
 import { writeFleetLaunchMarker } from "../fleet-state.js";
 import { readFleetLaunchMarker } from "../fleet-status.js";
 import type { HandoffPacket } from "../handoff.js";
@@ -2272,6 +2273,143 @@ describe("fleet supervisor mode", () => {
       expect(after.intent?.run?.stopped ?? []).toEqual([]);
     });
 
+    it("warns with bd's own error text when an escalation gate cannot be resolved (bd-279 S2)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      const seeded = updateFleetIntent({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        update: (current) =>
+          current === undefined
+            ? { refuse: "no intent" }
+            : {
+                ...current,
+                run: {
+                  ...startFleetRun({ now: 1, accept: false, members: [{ taskId: "bd-12" }] }),
+                  stopped: [
+                    {
+                      taskId: "bd-12",
+                      reason: "orchestrator-missing" as const,
+                      detail: "no live orchestrator lease holds the worktree",
+                      at: 1,
+                    },
+                  ],
+                },
+              },
+      });
+      expect(seeded).toHaveProperty("ok", true);
+
+      // A real escalation gate blocks the bead, and resolving it fails with text that
+      // does not contain "could not": the notification level must follow the result
+      // shape, never the wording of a bd error.
+      const marker = "belayd-fleet-escalation: fleet:default bd-12 orchestrator-missing r1";
+      childProcess.bdStdout = (args) =>
+        args[0] === "gate" && args[1] === "list"
+          ? JSON.stringify([
+              {
+                id: "bd-940",
+                status: "open",
+                await_type: "human",
+                title: marker,
+                description: `Reason: ${marker}: needs a human`,
+              },
+            ])
+          : undefined;
+      childProcess.bdFailure = (args) =>
+        args[0] === "gate" && args[1] === "resolve" ? "bd: lock timeout" : undefined;
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-s2",
+        { fleetId: "default", retryMembers: ["bd-12"] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+
+      const warnings = ctxNotifications
+        .filter((entry) => entry.level === "warning")
+        .map((entry) => entry.message)
+        .join("\n");
+      expect(warnings).toContain("bd: lock timeout");
+    });
+
+    it("resolves the escalation gate a retry orphaned, and audits it (bd-279)", async () => {
+      // A retried member's stop (and with it the record the tick keys on) is cleared,
+      // so the bead's own gate is the only evidence left. The sweep is by marker, and
+      // the resolution is audited as the fleet's action rather than mined from text.
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      const seeded = updateFleetIntent({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        update: (current) =>
+          current === undefined
+            ? { refuse: "no intent" }
+            : {
+                ...current,
+                run: {
+                  ...startFleetRun({ now: 1, accept: false, members: [{ taskId: "bd-12" }] }),
+                  stopped: [
+                    {
+                      taskId: "bd-12",
+                      reason: "orchestrator-missing" as const,
+                      detail: "no live orchestrator lease holds the worktree",
+                      at: 1,
+                      gateId: "bd-940",
+                    },
+                  ],
+                },
+              },
+      });
+      expect(seeded).toHaveProperty("ok", true);
+
+      const marker = "belayd-fleet-escalation: fleet:default bd-12 orchestrator-missing r1";
+      childProcess.bdStdout = (args) =>
+        args[0] === "gate" && args[1] === "list"
+          ? JSON.stringify([
+              {
+                id: "bd-940",
+                status: "open",
+                await_type: "human",
+                title: marker,
+                description: `Reason: ${marker}: needs a human`,
+              },
+            ])
+          : undefined;
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-orphan",
+        { fleetId: "default", retryMembers: ["bd-12"] },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+
+      expect(
+        childProcess.execFileCalls
+          .filter((call) => call.file === "bd" && call.args[0] === "gate")
+          .map((call) => [...call.args]),
+      ).toContainEqual(["gate", "resolve", "bd-940"]);
+      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
+      const audited = readFileSync(auditPath, "utf8")
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
+        .filter((entry) => entry.action === "escalation-gates-resolved");
+      expect(audited).toHaveLength(1);
+      expect(audited[0]?.taskIds).toEqual(["bd-12"]);
+      expect(audited[0]?.detail).toContain("retried member");
+      expect(audited[0]?.detail).toContain("bd-940");
+    });
+
     it("AC1: recovers a named fleet whose supervisor is provably dead from a session that supervises none", async () => {
       // bd-233: this used to be refused ("supervises no fleet in this repository"),
       // which is exactly the deadlock — repair was supervisor-only while the only
@@ -3476,6 +3614,105 @@ describe("fleet run mode", () => {
       expect.objectContaining({ taskId: "bd-12", reason: "orchestrator-missing" }),
     ]);
   }
+
+  it("opens one described escalation gate for the stop it just recorded, and none on the next tick", async () => {
+    // The wiring case: the tick is the only place that sees the run record after
+    // every stop writer, so a stop recorded by this very tick must be escalated in the
+    // same pass and its gate id persisted with the record (bd-279).
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+
+    const creates: string[][] = [];
+    let openGates: unknown = null;
+    childProcess.bdStdout = (args) => {
+      if (args[0] !== "gate") return undefined;
+      if (args[1] === "list") return JSON.stringify(openGates);
+      if (args[1] === "create") {
+        creates.push([...args]);
+        return JSON.stringify({ id: "bd-901" });
+      }
+      return undefined;
+    };
+
+    await command.handler("bd-12", ctx);
+    await vi.advanceTimersByTimeAsync(121_000);
+
+    const escalationCreates = (): string[][] =>
+      creates.filter((argv) => argv.join(" ").includes("belayd-fleet-escalation:"));
+    expect(escalationCreates()).toHaveLength(1);
+    const create = escalationCreates()[0] ?? [];
+    expect(create).toContain("--blocks");
+    expect(create).toContain("bd-12");
+    expect(create).toContain("--type=human");
+    // The gate is described, not a bare "blocked": the reason says what happened and
+    // what an answer may be.
+    const reason = create[create.indexOf("--reason") + 1] ?? "";
+    expect(reason).toContain("orchestrator-missing");
+    expect(reason).toContain("retry, abandon, or release");
+    const title = create[create.indexOf("--title") + 1] ?? "";
+    expect(title).toContain("belayd-fleet-escalation: fleet:default bd-12 orchestrator-missing");
+
+    const opened = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(opened).toHaveProperty("ok", true);
+    if (!opened.ok) return;
+    expect(opened.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", gateId: "bd-901" }),
+    ]);
+    expect(auditEntries("escalation-gates-opened").map((entry) => entry.taskIds)).toEqual([
+      ["bd-12"],
+    ]);
+
+    // The next tick reads the gate it created, so the record and bd agree: nothing is
+    // created twice and the recorded id is left alone.
+    openGates = [
+      { id: "bd-901", status: "open", await_type: "human", title, description: `Reason: ${title}` },
+    ];
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+    expect(escalationCreates()).toHaveLength(1);
+
+    const retick = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(retick).toHaveProperty("ok", true);
+    if (!retick.ok) return;
+    expect(retick.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", gateId: "bd-901" }),
+    ]);
+  });
+
+  it("keeps the stop record when bd's gate list fails, creating nothing blind", async () => {
+    // A bd outage must not lose the stop or invent a gate: the stop is the durable
+    // fact, and a create without the read is exactly the blind write the read-then-write
+    // order exists to prevent.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    childProcess.bdFailure = (args) =>
+      args[0] === "gate" && args[1] === "list" ? "bd: database locked" : undefined;
+
+    await command.handler("bd-12", ctx);
+    await vi.advanceTimersByTimeAsync(121_000);
+
+    const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(loaded).toHaveProperty("ok", true);
+    if (!loaded.ok) return;
+    expect(loaded.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "orchestrator-missing" }),
+    ]);
+    expect(loaded.intent?.run?.stopped?.[0]).not.toHaveProperty("gateId");
+    expect(
+      childProcess.execFileCalls.filter(
+        (call) => call.file === "bd" && call.args[0] === "gate" && call.args[1] === "create",
+      ),
+    ).toEqual([]);
+    // The failure is reported as a tick line, so an operator sees why no gate exists.
+    const reported = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(reported).toContain(
+      "could not open the escalation gate(s) for bd-12 (orchestrator-missing)",
+    );
+    expect(reported).toContain("the stop record stands");
+  });
 
   it("ends a stopped-everything run as partial on the next tick, not after 240", async () => {
     // The bd-157 report: nothing working, the deferred wave unplannable, and the loop
@@ -6372,5 +6609,460 @@ describe("worktree orchestrator lease", () => {
     expect(daemon.calls.some((call) => call.path === "/sessions")).toBe(false);
     const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
     expect(intent.ok ? intent.intent?.taskIds : undefined).toEqual([]);
+  });
+});
+
+/**
+ * Fleet escalation gates follow only human-relevant stops (bd-279).
+ *
+ * Two halves, both at the wiring level (the pure planning and drift rules live in
+ * `fleet-escalation.test.ts`):
+ *
+ * - a condition a machine resolves must open **no** `belayd-fleet-escalation:` gate
+ *   (the bead's explicit "must not"), asserted on a real tick's `gate create` argv
+ *   rather than on the planner's absent input;
+ * - the gates a stop *did* open are resolved when the reason for them ends — a
+ *   landing, a relaunch, an unpark (the latter scoped so it can never answer a
+ *   member's own stop escalation).
+ */
+describe("fleet escalation reap paths (bd-279)", () => {
+  let cwd: string;
+  let commonDir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-escalation-reap-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", "default"), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.byBranch = undefined;
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    childProcess.bdStdout = undefined;
+    childProcess.bdFailure = undefined;
+    ctxNotifications = [];
+    afterLaunchHook = undefined;
+  });
+
+  afterEach(() => {
+    liveness.memberTaskIds = [];
+    vi.useRealTimers();
+    childProcess.bdStdout = undefined;
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+  });
+
+  interface BdStubOptions {
+    /** Open gates per bead, as `bd gate list <bead> --json` answers before resolves. */
+    openGates?: (beadId: string) => readonly Record<string, unknown>[];
+    /** `bd show --brief-deps` graph; absent means "no edges". */
+    edges?: readonly unknown[];
+    /** Ids `bd gate create` mints, in create order. */
+    mintIds?: readonly string[];
+  }
+
+  interface BdStub {
+    /** Gate ids this stub was asked to resolve, in order. */
+    resolved: string[];
+  }
+
+  /**
+   * A bd stub covering what these cases read: the dependency graph, bead statuses,
+   * and gate list/create/resolve.
+   *
+   * A resolved gate drops out of the stub's own `gate list` answer, so "the gate is
+   * no longer open" is a real assertion rather than a restatement of the call.
+   */
+  function stubBd(options: BdStubOptions = {}): BdStub {
+    const resolved: string[] = [];
+    const minted = { count: 0 };
+    const show = (args: readonly string[]): string => {
+      if (args.includes("--brief-deps")) return JSON.stringify(options.edges ?? []);
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
+    };
+    const gate = (args: readonly string[]): string | undefined => {
+      switch (args[1]) {
+        case "list":
+          return JSON.stringify(
+            (options.openGates?.(args[2] ?? "") ?? []).filter(
+              (record) => !resolved.includes(String(record.id)),
+            ),
+          );
+        case "create": {
+          const id = options.mintIds?.[minted.count] ?? "bd-960";
+          minted.count += 1;
+          return JSON.stringify({ id, status: "open" });
+        }
+        case "resolve":
+          resolved.push(args[2] ?? "");
+          return "";
+        default:
+          return undefined;
+      }
+    };
+    childProcess.bdStdout = (args) =>
+      args[0] === "show" ? show(args) : args[0] === "gate" ? gate(args) : undefined;
+    return { resolved };
+  }
+
+  function intent(): ReturnType<typeof readFleetIntent> {
+    return readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+  }
+
+  function auditEntries(action: string): Array<{ taskIds: readonly string[]; detail: string }> {
+    const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
+    if (!existsSync(path)) return [];
+    return readFileSync(path, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
+      .filter((entry) => entry.action === action)
+      .map((entry) => ({ taskIds: entry.taskIds ?? [], detail: entry.detail ?? "" }));
+  }
+
+  function bdCalls(predicate: (args: readonly string[]) => boolean): string[][] {
+    return childProcess.execFileCalls
+      .filter((call) => call.file === "bd" && predicate(call.args))
+      .map((call) => [...call.args]);
+  }
+
+  function gateCreates(): string[][] {
+    return bdCalls((args) => args[0] === "gate" && args[1] === "create");
+  }
+
+  /** Escalation creates only: the marker is the one channel this change owns. */
+  function escalationCreates(): string[][] {
+    return gateCreates().filter((argv) => argv.join(" ").includes("belayd-fleet-escalation:"));
+  }
+
+  function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
+    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify(mutate(current)));
+  }
+
+  function escalationMarker(taskId: string, cause: string, round: number): string {
+    return renderFleetEscalationGateMarker({ fleetId: "default", taskId, cause, round });
+  }
+
+  function openEscalationGate(input: {
+    gateId: string;
+    taskId: string;
+    cause: string;
+    round: number;
+  }): Record<string, unknown> {
+    const title = escalationMarker(input.taskId, input.cause, input.round);
+    return {
+      id: input.gateId,
+      status: "open",
+      await_type: "human",
+      title,
+      description: `Reason: ${title}: needs a human`,
+    };
+  }
+
+  /** Stand a landed member in the run record, as a previous landing would have. */
+  function standLandedRun(current: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...(current.run as Record<string, unknown>),
+      members: [{ taskId: "bd-12", launchedAt: 1, landedAt: 2 }],
+    };
+  }
+
+  /** Mark bd-12 complete and its merge done, so the tick's next action is a landing. */
+  function arrangeLandedMember(): void {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    mkdirSync(memberDir, { recursive: true });
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    const queue = createFleetMergeQueue(1);
+    writeFleetMergeQueue({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      queue: {
+        ...queue,
+        entries: [
+          {
+            taskId: "bd-12",
+            branch: "feat/bd-12",
+            requestedAt: 1,
+            state: "merged",
+            attempts: 1,
+            updatedAt: 2,
+          },
+        ],
+      },
+    });
+  }
+
+  it("writes a capacity deferral without opening an escalation gate", async () => {
+    // The bead's "must not": a capacity wait is a condition the loop resolves (a
+    // slot frees itself), so no person is asked. The fixture is the real shape — the
+    // run's only member has landed, the next wave waits for another fleet's slot.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // Another fleet holds the repository's only slot, and default's landed member
+    // leaves a deferred wave that cannot start.
+    mkdirSync(join(commonDir, "belayd", "fleet", "other"), { recursive: true });
+    writeFileSync(
+      join(commonDir, "belayd", "fleet", "other", "fleet.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        fleetId: "other",
+        taskIds: ["bd-15"],
+        createdAt: 1,
+        updatedAt: 1,
+      }),
+    );
+    liveness.memberTaskIds = ["bd-15"];
+    stubBd();
+    editIntent((current) => ({
+      ...current,
+      taskIds: [],
+      maxConcurrent: 1,
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+      run: standLandedRun(current),
+    }));
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // The tick really did hit the capacity path, so the assertion is not vacuous.
+    expect(auditEntries("capacity-blocked").map((entry) => entry.taskIds)).toContainEqual([
+      "bd-19",
+    ]);
+    // No gate of any family: nothing was launched, so not even an ordering gate.
+    expect(gateCreates()).toEqual([]);
+    expect(escalationCreates()).toEqual([]);
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+  });
+
+  it("creates only the ordering gate for a dependency wait, never an escalation", async () => {
+    // bd-158's gate is the machine's own answer: the dependent starts when the
+    // blocker lands. It must stay the only gate the tick creates (bd-279).
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    stubBd({
+      edges: [
+        { id: "bd-13", dependencies: [{ id: "bd-12", dependency_type: "blocks", status: "open" }] },
+      ],
+      mintIds: ["bd-901"],
+    });
+
+    await command.handler("bd-12 bd-13", ctx);
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    const creates = gateCreates();
+    expect(creates).toHaveLength(1);
+    expect(creates[0]?.join(" ")).toContain("belayd-fleet-ordering:");
+    // Created, not touched: no gate was resolved on this wait either.
+    expect(bdCalls((args) => args[0] === "gate" && args[1] === "resolve")).toEqual([]);
+    expect(escalationCreates()).toEqual([]);
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+  });
+
+  it("opens no escalation for a machine-resolvable gate failure the loop retries", async () => {
+    // The nearest reachable equivalent of the "quality gate the loop retries" case:
+    // on the run path a *publish/diff* refusal records `land-failed` by design
+    // (bd-277 measured exactly that), so the machine-resolvable failure a tick
+    // retries without a stop is the ordering-gate resolve. It must not escalate:
+    // the retry, not a person, is what fixes it.
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    stubBd({ mintIds: ["bd-901"] });
+    await command.handler("bd-12", ctx);
+
+    // The merge already happened; bd refuses the gate resolve, so the loop retries it
+    // from the record instead of ending the member.
+    updateFleetIntent({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      update: (current) =>
+        current === undefined
+          ? { refuse: "no intent" }
+          : {
+              ...current,
+              orderingGates: [{ blocker: "bd-12", blocked: "bd-13", gateId: "bd-900" }],
+            },
+    });
+    childProcess.bdFailure = (args) =>
+      args[0] === "gate" && args[1] === "resolve" ? "bd: database is locked" : undefined;
+    arrangeLandedMember();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    expect(after.intent?.orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-900" },
+    ]);
+    // The retried failure opened no gate of any kind, and the ordering gate it could
+    // not resolve is still the only one recorded.
+    expect(gateCreates()).toEqual([]);
+    expect(escalationCreates()).toEqual([]);
+  });
+
+  it("resolves a landed member's escalation gate and audits the landing", async () => {
+    // A landing clears the stop (and the record the tick keys on), so the bead's own
+    // gate is the only handle left: reap it, or the merged member stays blocked by a
+    // question nobody can answer any more.
+    const bd = stubBd({
+      openGates: (beadId) =>
+        beadId === "bd-12"
+          ? [
+              openEscalationGate({
+                gateId: "bd-941",
+                taskId: "bd-12",
+                cause: "land-failed",
+                round: 2,
+              }),
+            ]
+          : [],
+    });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    arrangeLandedMember();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(bd.resolved).toEqual(["bd-941"]);
+    // The stub drops resolved gates from its `list` answer, so this proves the gate is
+    // no longer open: the next tick reads none and resolves nothing a second time.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+    expect(bd.resolved).toEqual(["bd-941"]);
+    const audited = auditEntries("escalation-gates-resolved");
+    expect(audited).toHaveLength(1);
+    expect(audited[0]?.detail).toContain("landed member");
+    expect(audited[0]?.detail).toContain("bd-941");
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(
+      after.intent?.run?.members?.find((member) => member.taskId === "bd-12")?.landedAt,
+    ).toEqual(expect.any(Number));
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+  });
+
+  it("resolves a relaunched member's old escalation gate on the advance tick", async () => {
+    // A relaunch clears any stop the member carried, so its old escalation has no
+    // record left to be reaped from: the advance sweep by marker is what answers it.
+    const bd = stubBd({
+      openGates: (beadId) =>
+        beadId === "bd-19"
+          ? [
+              openEscalationGate({
+                gateId: "bd-942",
+                taskId: "bd-19",
+                cause: "phase-failed",
+                round: 1,
+              }),
+            ]
+          : [],
+    });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // The run's only member landed; the deferred wave is free to start now.
+    editIntent((current) => ({
+      ...current,
+      taskIds: [],
+      deferred: [
+        { taskId: "bd-19", reason: "dependency", blockers: [], detail: "the blocker landed" },
+      ],
+      run: standLandedRun(current),
+    }));
+
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.taskIds).toEqual(["bd-19"]);
+    expect(bd.resolved).toEqual(["bd-942"]);
+    const audited = auditEntries("escalation-gates-resolved");
+    expect(audited).toHaveLength(1);
+    expect(audited[0]?.detail).toContain("relaunched member");
+    expect(audited[0]?.detail).toContain("bd-942");
+  });
+
+  it("unparks only the parked-fleet escalation, never a member's stop escalation", async () => {
+    // The documented scope guarantee: an unpark answers the park, not a stop. Both
+    // gates block the same bead, which is exactly when a whole-bead sweep would be
+    // wrong — it would report a stopped member as unblocked.
+    const bd = stubBd({
+      openGates: (beadId) =>
+        beadId === "bd-12"
+          ? [
+              openEscalationGate({
+                gateId: "bd-970",
+                taskId: "bd-12",
+                cause: "fleet-parked",
+                round: 7_000,
+              }),
+              openEscalationGate({
+                gateId: "bd-971",
+                taskId: "bd-12",
+                cause: "land-failed",
+                round: 2,
+              }),
+            ]
+          : [],
+    });
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    // `--manual` keeps the explicit surface: no tick competes with this assertion.
+    await command.handler("bd-12 --manual", ctx);
+
+    editIntent((current) => ({
+      ...current,
+      park: { reason: "root stash could not be restored", recordedAt: 7_000 },
+    }));
+
+    const resume = mock.tools.get("belayd_fleet_resume");
+    if (resume === undefined) throw new Error("belayd_fleet_resume was not registered");
+    const resumed = await resume.execute("resume-1", {}, undefined, undefined, ctx);
+    expect(resumed.details).toHaveProperty("exitCode", 0);
+
+    // Only the park cause was selected; the stop escalation is still open.
+    expect(bd.resolved).toEqual(["bd-970"]);
+    const audited = auditEntries("escalation-gates-resolved");
+    expect(audited).toHaveLength(1);
+    expect(audited[0]?.detail).toContain("parked-fleet");
+    expect(audited[0]?.detail).toContain("bd-970");
+    expect(audited[0]?.detail).not.toContain("bd-971");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "resolved 1 escalation gate(s)",
+    );
   });
 });

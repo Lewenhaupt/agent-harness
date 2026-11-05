@@ -431,8 +431,16 @@ export interface CoreSessionState {
   humanAnswerClaimed?: boolean;
   /** The unrecognized-gate warning was already logged for the current wait. */
   humanAnswerWarned?: boolean;
-  /** Separately one-shot: an unrecognized gate must not mute a failed channel read. */
-  humanUnrecognizedGateWarned?: boolean;
+  /**
+   * The beads whose unrecognized-gate warning was already emitted.
+   *
+   * Separate from {@link humanAnswerWarned} so an unreadable gate cannot mute, or
+   * be muted by, a failed channel read. Per bead rather than per session: the line
+   * names the blocked bead, and a second bead blocked later in the same session is
+   * a new diagnosis that must still be visible. The set is capped by the warning
+   * helper so a long session that touches many beads keeps a bounded memory.
+   */
+  humanUnrecognizedGateWarnedBeads?: Set<string>;
   /** Separately one-shot: a dropped-comment warning is its own diagnosis. */
   humanAnswerDroppedWarned?: boolean;
   /**

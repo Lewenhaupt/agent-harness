@@ -7,11 +7,12 @@
  * `node:child_process` is mocked so gate activation's `bd` calls are inert.
  */
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { buildFleetStatus } from "../fleet-status.js";
 import type { WorkflowState } from "../workflow-state.js";
 
@@ -23,6 +24,14 @@ const fleet = vi.hoisted(() => ({
   /** When set, the fleet reader returns this pre-built view instead of an empty one. */
   status: undefined as unknown,
 }));
+
+/**
+ * The git common dir `belayd_status`'s run-stop scan reads fleet intents from.
+ *
+ * Defaults to "not a repository", which is what every other case in this file
+ * expects; the stop cases point it at the temp directory they write into.
+ */
+const git = vi.hoisted(() => ({ commonDir: "" }));
 
 // Records the `bd` lookup the tool issues; `bd show` output is injected per case.
 const bd = vi.hoisted(() => ({
@@ -39,6 +48,13 @@ vi.mock("../../src/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/index.js")>();
   return {
     ...actual,
+    // The real probe shells out to git; the stop scan only needs a directory to
+    // resolve fleet intents from, and an empty value reproduces today's default
+    // ("not a repository") for every case that does not opt in.
+    resolveGitCommonDir: (cwd: string) =>
+      git.commonDir === ""
+        ? { ok: false as const, error: `not a git repository: ${cwd}` }
+        : { ok: true as const, commonDir: git.commonDir },
     readFleetStatus: (options: { cwd: string; fleetId: string }) => {
       fleet.calls.push({ cwd: options.cwd, fleetId: options.fleetId });
       if (fleet.failWith !== undefined) return { ok: false as const, error: fleet.failWith };
@@ -221,6 +237,7 @@ describe("belayd_fleet_status tool", () => {
     bd.respond = undefined;
     bd.failWith = undefined;
     bd.failWhen = undefined;
+    git.commonDir = "";
   });
 
   afterEach(() => {
@@ -790,5 +807,100 @@ describe("belayd_fleet_status tool", () => {
     expect(result.details.exitCode).toBe(0);
     expect(textOf(result)).not.toContain("**Bead ");
     expect(bd.calls).toEqual([]);
+  });
+
+  describe("the run stop join (bd-279)", () => {
+    /** Write one fleet intent whose run stopped `taskId` with `detail`. */
+    function writeStoppedFleet(options: { fleetId: string; taskId: string; detail: string }): void {
+      const dir = join(cwd, "belayd", "fleet", options.fleetId);
+      mkdirSync(dir, { recursive: true });
+      const run = recordRunMemberStopped({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: options.taskId }] }),
+        taskId: options.taskId,
+        reason: "land-failed",
+        detail: options.detail,
+        now: 2_000,
+      });
+      writeFileSync(
+        join(dir, "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: options.fleetId,
+          taskIds: [options.taskId],
+          createdAt: 1,
+          updatedAt: 1,
+          run,
+        }),
+      );
+    }
+
+    /** Start a session on one bead and read its status with bd unavailable. */
+    async function statusFor(taskId: string, sessionId: string): Promise<string> {
+      const mock = await loadFleetExtension();
+      const startTask = mock.tools.get("belayd_start_task");
+      const status = mock.tools.get("belayd_status");
+      if (startTask === undefined || status === undefined) {
+        throw new Error("belayd_start_task / belayd_status were not registered");
+      }
+      await startTask.execute("stop-1", { taskId }, undefined, undefined, makeCtx(cwd, sessionId));
+      // bd unavailable: this case is about the fleet record, not the bead columns.
+      bd.failWith = "spawn bd ENOENT";
+      const result = await status.execute(
+        "stop-2",
+        {},
+        undefined,
+        undefined,
+        makeCtx(cwd, sessionId),
+      );
+      return textOf(result);
+    }
+
+    it("reads the stop for the viewed bead out of fleet.json", async () => {
+      git.commonDir = cwd;
+      writeStoppedFleet({
+        fleetId: "default",
+        taskId: "bd-126",
+        detail: "publish gate refused: proof-artifacts-in-diff",
+      });
+
+      const text = await statusFor("bd-126", "status-stop-session");
+
+      expect(text).toContain("- stop: land-failed — publish gate refused: proof-artifacts-in-diff");
+      expect(text).toContain("**Needs you** — bd-126 is waiting on a human.");
+    });
+
+    it("adds nothing when no fleet has a stop for the bead", async () => {
+      // No intent on disk at all: `findRecordedStop` is undefined, so the section is
+      // exactly what it was before bd-279 (only the bd read failure prints).
+      git.commonDir = cwd;
+      const text = await statusFor("bd-126", "status-no-stop-session");
+
+      expect(text).not.toContain("- stop: ");
+      expect(text).not.toContain("Needs you");
+    });
+
+    it("matches a mixed-case recorded id, the way the record was written", async () => {
+      // The scan lowercases both sides (the same rule the bead and engagement
+      // lookups use), so a hand-edited `BD-126` still reaches its own status.
+      git.commonDir = cwd;
+      writeStoppedFleet({ fleetId: "default", taskId: "BD-126", detail: "stopped upper" });
+
+      const text = await statusFor("bd-126", "status-stop-case-session");
+
+      expect(text).toContain("- stop: land-failed — stopped upper");
+    });
+
+    it("finds the record in the fleet that owns the bead, not just the first one", async () => {
+      // Several fleets can share a repository. Only one of them recorded this stop;
+      // the scan must keep looking instead of answering from the first intent.
+      git.commonDir = cwd;
+      writeStoppedFleet({ fleetId: "alpha", taskId: "bd-999", detail: "another fleet's stop" });
+      writeStoppedFleet({ fleetId: "beta", taskId: "bd-126", detail: "the owning fleet's stop" });
+
+      const text = await statusFor("bd-126", "status-stop-multi-session");
+
+      expect(text).toContain("- stop: land-failed — the owning fleet's stop");
+      expect(text).not.toContain("another fleet's stop");
+    });
   });
 });

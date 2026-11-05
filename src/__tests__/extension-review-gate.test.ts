@@ -1078,6 +1078,12 @@ describe("sensitive review findings (bd-183)", () => {
       expect(gateCall?.argv.join(" ")).toContain("publication decision");
       // The shared wait reason is still the prefix, so the fleet detail survives.
       expect(gateCall?.argv.some((arg) => arg.startsWith(REVIEW_HUMAN_GATE_REASON))).toBe(true);
+      // bd-279: withheld sensitive findings escalate through THIS gate (one per round),
+      // deliberately not through a second `belayd_ask_human`-shaped fleet escalation.
+      // Pin both halves: exactly one gate is created, and it is the review gate.
+      const creates = bd.calls.filter((call) => bd.keyOf(call.argv).startsWith("gate create"));
+      expect(creates).toHaveLength(1);
+      expect(creates[0]?.argv.join(" ")).not.toContain("belayd-fleet-escalation:");
 
       // The comment names the three options; the record blocks publishing.
       const comment = bd.calls.find((call) => bd.keyOf(call.argv) === COMMENT_KEY);

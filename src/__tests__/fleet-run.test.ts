@@ -20,16 +20,19 @@ import {
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_HUMAN_GATE_DETAIL,
+  FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
+  FleetRunSchema,
   finishFleetRun,
   fleetMemberBranch,
   fleetMemberSignature,
   fleetMemberSignatures,
   fleetProgressChanged,
+  fleetRunStopAnswer,
   fleetTickProgress,
   formatFleetRunLine,
   formatFleetRunStops,
@@ -45,6 +48,8 @@ import {
   recordRunMemberLanded,
   recordRunMemberLaunched,
   recordRunMemberStopped,
+  recordRunStopGate,
+  recordRunStopResolution,
   recordRunTick,
   releaseRunMembers,
   retryRunMembers,
@@ -2176,5 +2181,191 @@ describe("retryRunMembers (bd-233)", () => {
 
     expect(retried.retried).toEqual([]);
     expect(retried.run).toBe(run);
+  });
+});
+
+describe("escalation on a stop record (bd-279)", () => {
+  function stoppedRun(): FleetRun {
+    return recordRunMemberStopped({
+      run: recordRunMemberStopped({
+        run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+        taskId: "bd-12",
+        reason: "land-failed",
+        detail: "publish gate refused",
+        now: 2_000,
+      }),
+      taskId: "bd-15",
+      reason: "orchestrator-missing",
+      detail: "no lease",
+      now: 2_100,
+    });
+  }
+
+  it("round-trips gateId and resolution through the schema", () => {
+    const run = stoppedRun();
+    const gated = recordRunStopGate({ run, taskId: "bd-12", gateId: "bd-900", now: 3_000 });
+    const answered = recordRunStopResolution({
+      run: gated,
+      taskId: "bd-12",
+      note: "retry after fixing the proof",
+      now: 4_000,
+    });
+    const parsed = FleetRunSchema.safeParse(answered);
+    expect(parsed).toHaveProperty("success", true);
+    if (!parsed.success) return;
+    expect(parsed.data.stopped?.find((entry) => entry.taskId === "bd-12")).toMatchObject({
+      gateId: "bd-900",
+      resolution: { note: "retry after fixing the proof", at: 4_000 },
+    });
+  });
+
+  it("still validates a stop written before the escalation primitive", () => {
+    const legacy = stoppedRun();
+    expect(FleetRunSchema.safeParse(legacy)).toHaveProperty("success", true);
+    expect(legacy.stopped?.[0]).not.toHaveProperty("gateId");
+  });
+
+  it("attaches the gate to the right entry and leaves the others alone", () => {
+    const gated = recordRunStopGate({
+      run: stoppedRun(),
+      taskId: "bd-15",
+      gateId: "bd-901",
+      now: 3_000,
+    });
+    expect(gated.stopped?.find((entry) => entry.taskId === "bd-15")?.gateId).toBe("bd-901");
+    expect(gated.stopped?.find((entry) => entry.taskId === "bd-12")).not.toHaveProperty("gateId");
+    expect(gated.updatedAt).toBe(3_000);
+  });
+
+  it("records the answer on the right entry and bounds its note", () => {
+    const run = recordRunStopResolution({
+      run: recordRunStopGate({
+        run: stoppedRun(),
+        taskId: "bd-12",
+        gateId: "bd-900",
+        now: 3_000,
+      }),
+      taskId: "bd-12",
+      note: "retry",
+      now: 4_000,
+    });
+    const entry = run.stopped?.find((candidate) => candidate.taskId === "bd-12");
+    expect(entry?.resolution).toEqual({ note: "retry", at: 4_000 });
+    // The gate id survives the resolution: it is the record of what was answered.
+    expect(entry?.gateId).toBe("bd-900");
+
+    const long = recordRunStopResolution({
+      run: stoppedRun(),
+      taskId: "bd-12",
+      note: "x".repeat(10_000),
+      now: 4_000,
+    });
+    const note = long.stopped?.find((candidate) => candidate.taskId === "bd-12")?.resolution?.note;
+    expect(note).toHaveLength(FLEET_RUN_DETAIL_MAX_LENGTH);
+  });
+
+  it("is a no-op for an entry the run no longer holds", () => {
+    const run = stoppedRun();
+    expect(recordRunStopGate({ run, taskId: "bd-99", gateId: "bd-902", now: 3_000 })).toBe(run);
+    expect(recordRunStopResolution({ run, taskId: "bd-99", now: 3_000 })).toBe(run);
+  });
+
+  it("renders the answer after the stop line without changing a plain stop", () => {
+    const run = stoppedRun();
+    expect(formatFleetRunStops(run)).toEqual([
+      "stopped bd-12 (land-failed): publish gate refused",
+      "stopped bd-15 (orchestrator-missing): no lease",
+    ]);
+    const answered = recordRunStopResolution({
+      run,
+      taskId: "bd-12",
+      note: "abandon it",
+      now: 5_000,
+    });
+    expect(formatFleetRunStops(answered)[0]).toBe(
+      "stopped bd-12 (land-failed): publish gate refused — answered: abandon it",
+    );
+  });
+
+  it("says a stop was answered even when the resolver left no note", () => {
+    // "answered, no note" and "still waiting" are opposite next actions: the header
+    // line must not read like an open stop once a person has settled it (bd-279).
+    const answered = recordRunStopResolution({ run: stoppedRun(), taskId: "bd-12", now: 5_000 });
+    expect(formatFleetRunStops(answered)[0]).toBe(
+      "stopped bd-12 (land-failed): publish gate refused — answered, no note",
+    );
+  });
+
+  it("classifies a stop's answer once, for every renderer", () => {
+    const run = stoppedRun();
+    const unanswered = run.stopped?.[0];
+    expect(unanswered === undefined ? null : fleetRunStopAnswer(unanswered)).toEqual({
+      answered: false,
+    });
+
+    const noteLess = recordRunStopResolution({ run, taskId: "bd-12", now: 5_000 });
+    const noteLessEntry = noteLess.stopped?.find((entry) => entry.taskId === "bd-12");
+    expect(noteLessEntry === undefined ? null : fleetRunStopAnswer(noteLessEntry)).toEqual({
+      answered: true,
+    });
+
+    const noted = recordRunStopResolution({ run, taskId: "bd-12", note: "retry", now: 5_000 });
+    const notedEntry = noted.stopped?.find((entry) => entry.taskId === "bd-12");
+    expect(notedEntry === undefined ? null : fleetRunStopAnswer(notedEntry)).toEqual({
+      answered: true,
+      note: "retry",
+    });
+  });
+
+  it("treats a blank note as answered without a note", () => {
+    // Only a hand-edited record can carry a whitespace note (the resolve path trims),
+    // and an empty answer must never render as a note in the surface that says what
+    // the person chose (bd-279).
+    const handEdited = (note: string): FleetRun => {
+      const run = stoppedRun();
+      return {
+        ...run,
+        stopped: (run.stopped ?? []).map((entry) =>
+          entry.taskId === "bd-12" ? { ...entry, resolution: { note, at: 5_000 } } : entry,
+        ),
+      };
+    };
+
+    for (const note of ["", "   "]) {
+      const stop = handEdited(note).stopped?.find((entry) => entry.taskId === "bd-12");
+      expect(stop === undefined ? null : fleetRunStopAnswer(stop)).toEqual({ answered: true });
+      expect(formatFleetRunStops(handEdited(note))[0]).toBe(
+        "stopped bd-12 (land-failed): publish gate refused — answered, no note",
+      );
+    }
+
+    expect(formatFleetRunStops(handEdited("abandon it"))[0]).toBe(
+      "stopped bd-12 (land-failed): publish gate refused — answered: abandon it",
+    );
+  });
+
+  it("keeps an answered line inside the record bound", () => {
+    // Both fields bd allows to be 400 chars at once: the detail and the answer share
+    // one bound, so the header line stays a status line rather than a transcript.
+    const answered = recordRunStopResolution({
+      run: recordRunMemberStopped({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+        taskId: "bd-12",
+        reason: "state-corrupt",
+        detail: "漢".repeat(FLEET_RUN_DETAIL_MAX_LENGTH),
+        now: 2_000,
+      }),
+      taskId: "bd-12",
+      note: "x".repeat(FLEET_RUN_DETAIL_MAX_LENGTH),
+      now: 3_000,
+    });
+    const line = formatFleetRunStops(answered)[0] ?? "";
+    const head = "stopped bd-12 (state-corrupt): ";
+    expect(line.startsWith(head)).toBe(true);
+    expect(line.length).toBeLessThanOrEqual(head.length + FLEET_RUN_DETAIL_MAX_LENGTH);
+    // The detail kept its half, the answer fits, and both are marked as excerpted.
+    expect(line).toContain(`漢${"…"}`);
+    expect(line).toContain("— answered: x");
+    expect(line).toContain("…");
   });
 });

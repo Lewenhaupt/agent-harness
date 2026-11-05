@@ -26,6 +26,7 @@ import {
   TRANSCRIPT_FENCE_OPEN,
   TRANSCRIPT_FENCE_TOKEN,
 } from "../agent-registry.js";
+import { renderFleetEscalationGateMarker } from "../bead-gates.js";
 import {
   ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
   ORCHESTRATOR_CLAIM_STALE_MS,
@@ -576,6 +577,38 @@ describe("belayd_workflow_digest (bd-189)", () => {
     expect(result.details.exitCode).toBe(0);
     expect(text).toContain("- waiting on: unknown (gate read failed:");
     expect(text).toContain("- **stuck verdict:**");
+  });
+
+  it("renders a cleanly parsed escalation gate as unrecognized, never as a failed read (bd-279 S2)", async () => {
+    seedLiveMember(cwd);
+    const marker = renderFleetEscalationGateMarker({
+      fleetId: "default",
+      taskId: TASK_ID,
+      cause: "phase-failed",
+      round: 1,
+    });
+    shell.bdRespond = (args) => {
+      if (args[0] === "show") return JSON.stringify([{ id: TASK_ID }]);
+      return JSON.stringify([
+        {
+          id: "bd-950",
+          status: "open",
+          await_type: "human",
+          title: marker,
+          description: `Reason: ${marker}: the member stopped`,
+        },
+      ]);
+    };
+    const mock = await loadSupervisionExtension();
+    const tool = mock.tools.get("belayd_workflow_digest");
+    if (tool === undefined) throw new Error("belayd_workflow_digest was not registered");
+
+    const text = textOf(
+      await tool.execute("digest-13", { taskId: TASK_ID }, undefined, undefined, makeCtx(cwd)),
+    );
+
+    expect(text).toContain("- waiting on: unknown (gate state unrecognized:");
+    expect(text).not.toContain("gate read failed");
   });
 
   it("issues only read-only bd and git calls, and writes nothing", async () => {

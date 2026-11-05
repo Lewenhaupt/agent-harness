@@ -15,12 +15,19 @@ import {
   buildGateListAllArgv,
   buildGateListArgv,
   buildGateResolveArgv,
+  FLEET_ESCALATION_GATE_PREFIX,
+  FLEET_ORDERING_GATE_PREFIX,
+  fleetEscalationGateDrift,
   humanGateResolveNote,
+  isFleetEscalationGateRecord,
   lookupOpenHumanGate,
   lookupResolvedHumanGate,
   parseCreatedGateId,
+  parseFleetEscalationGateMarkerLine,
+  parseOpenFleetEscalationGates,
   parseOpenHumanGate,
   parseResolvedHumanGate,
+  renderFleetEscalationGateMarker,
 } from "../bead-gates.js";
 import type { FleetBeadRunner } from "../fleet-beads.js";
 
@@ -433,5 +440,252 @@ describe("lookupResolvedHumanGate", () => {
     expect(failed).toHaveProperty("ok", false);
     if (failed.ok) return;
     expect(failed.error).toContain("ENOENT");
+  });
+});
+
+describe("fleet escalation gates (bd-279)", () => {
+  const marker = renderFleetEscalationGateMarker({
+    fleetId: "default",
+    taskId: "bd-12",
+    cause: "phase-failed",
+    round: 2_000,
+  });
+
+  function escalationRecord(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "bd-901",
+      status: "open",
+      await_type: "human",
+      title: marker,
+      description: `Reason: ${marker}: bd-12 stopped the run`,
+      ...overrides,
+    };
+  }
+
+  it("renders and parses the structured marker, and refuses anything else", () => {
+    expect(marker).toBe(`${FLEET_ESCALATION_GATE_PREFIX} fleet:default bd-12 phase-failed r2000`);
+    expect(parseFleetEscalationGateMarkerLine(marker)).toEqual({
+      fleetId: "default",
+      taskId: "bd-12",
+      cause: "phase-failed",
+      round: 2_000,
+    });
+    // Prose after the marker is allowed; a truncated or bare prefix is not.
+    expect(parseFleetEscalationGateMarkerLine(`${marker}: why`)).toHaveProperty("round", 2_000);
+    expect(parseFleetEscalationGateMarkerLine(FLEET_ESCALATION_GATE_PREFIX)).toBeUndefined();
+    expect(
+      parseFleetEscalationGateMarkerLine(`${FLEET_ESCALATION_GATE_PREFIX} fleet:default bd-`),
+    ).toBeUndefined();
+    expect(parseFleetEscalationGateMarkerLine(`${marker} r9`)).toBeUndefined();
+  });
+
+  it("classifies from the title and treats a disagreeing reason as not an escalation", () => {
+    expect(isFleetEscalationGateRecord(escalationRecord())).toBe(true);
+    expect(
+      isFleetEscalationGateRecord(
+        escalationRecord({ description: "Reason: something else entirely" }),
+      ),
+    ).toBe(true);
+    expect(
+      isFleetEscalationGateRecord(
+        escalationRecord({
+          description: `Reason: ${renderFleetEscalationGateMarker({
+            fleetId: "default",
+            taskId: "bd-12",
+            cause: "phase-failed",
+            round: 9_999,
+          })}`,
+        }),
+      ),
+    ).toBe(false);
+    expect(isFleetEscalationGateRecord({ title: "Gate: human", status: "open" })).toBe(false);
+  });
+
+  it("warns when the reason lost the marker and not otherwise", () => {
+    const drifted = escalationRecord({
+      description: `Reason: ${FLEET_ESCALATION_GATE_PREFIX} fleet:default bd-`,
+    });
+    expect(fleetEscalationGateDrift(drifted)?.gateId).toBe("bd-901");
+    expect(fleetEscalationGateDrift(drifted)?.message).toContain("classified from the title");
+    expect(fleetEscalationGateDrift(escalationRecord())).toBeUndefined();
+    expect(
+      fleetEscalationGateDrift(escalationRecord({ description: "Reason: ship it?" })),
+    ).toBeUndefined();
+  });
+
+  it("is neither an open nor a resolved human gate", () => {
+    // The comment-answer channel must not settle an escalation: a human gate read
+    // here would report a stopped member as unblocked (bd-279).
+    expect(parseOpenHumanGate([escalationRecord()], "bd-12")).toBeUndefined();
+    expect(
+      parseResolvedHumanGate(
+        [
+          escalationRecord({
+            status: "closed",
+            close_reason: "Approved by hugo via Scotty at 2026-11-01T09:52:05.582Z\n\nretry",
+          }),
+        ],
+        "bd-12",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("reports an open escalation gate as unrecognized, never as a resolved wait", async () => {
+    // The regression this pins: an escalation is a human wait, just not *this*
+    // one. Reading it as `none` let a poll settle an ask-human wait whose gate
+    // was deleted, on an answer nobody gave (bd-279 fail-open).
+    const result = await lookupOpenHumanGate({
+      beadId: "bd-12",
+      cwd: "/repo",
+      runBd: async () => ({ stdout: JSON.stringify([escalationRecord()]) }),
+    });
+    expect(result).toEqual({ ok: true, status: "unrecognized" });
+  });
+
+  it("fails closed on a marked escalation record the open-gate parser cannot read", async () => {
+    // `isFleetEscalationGateRecord` is status-blind while the open-gate parser also
+    // filters on id and status, so a marked record with a malformed id or no status
+    // used to be claimed by neither branch and fell through to `none` — the exact
+    // fail-open the escalation rule exists to close (bd-279 S1).
+    for (const record of [
+      escalationRecord({ id: "" }),
+      escalationRecord({ id: "-bd-1" }),
+      escalationRecord({ status: undefined }),
+      escalationRecord({ status: "pending" }),
+    ]) {
+      const result = await lookupOpenHumanGate({
+        beadId: "bd-12",
+        cwd: "/repo",
+        runBd: async () => ({ stdout: JSON.stringify([record]) }),
+      });
+      expect(result).toEqual({ ok: true, status: "unrecognized" });
+    }
+
+    // The three-way distinction stays pinned next to it: a machine wait and an empty
+    // list are still `none`, so failing closed here cannot swallow either answer.
+    const orderingOnly = JSON.stringify([
+      {
+        id: "bd-900",
+        status: "open",
+        await_type: "bead",
+        await_id: "bd-11",
+        title: `${FLEET_ORDERING_GATE_PREFIX} fleet:default bd-11 -> bd-12`,
+      },
+    ]);
+    expect(
+      await lookupOpenHumanGate({
+        beadId: "bd-12",
+        cwd: "/repo",
+        runBd: async () => ({ stdout: orderingOnly }),
+      }),
+    ).toEqual({ ok: true, status: "none", orderingBlocker: "bd-11" });
+    expect(
+      await lookupOpenHumanGate({
+        beadId: "bd-12",
+        cwd: "/repo",
+        runBd: async () => ({ stdout: "[]" }),
+      }),
+    ).toEqual({ ok: true, status: "none" });
+  });
+
+  it("keeps a closed escalation gate out of the way: no open gates is still none", async () => {
+    const result = await lookupOpenHumanGate({
+      beadId: "bd-12",
+      cwd: "/repo",
+      runBd: async () => ({ stdout: JSON.stringify([escalationRecord({ status: "closed" })]) }),
+    });
+    expect(result).toEqual({ ok: true, status: "none" });
+  });
+
+  it("keeps an ordering gate a machine wait: still none, with its blocker", async () => {
+    // Ordering records are a wait on another member, not on a person, so they must
+    // not inherit the escalation rule above.
+    const result = await lookupOpenHumanGate({
+      beadId: "bd-12",
+      cwd: "/repo",
+      runBd: async () => ({
+        stdout: JSON.stringify([
+          {
+            id: "bd-900",
+            status: "open",
+            await_type: "bead",
+            await_id: "bd-11",
+            title: `${FLEET_ORDERING_GATE_PREFIX} fleet:default bd-11 -> bd-12`,
+          },
+        ]),
+      }),
+    });
+    expect(result).toEqual({ ok: true, status: "none", orderingBlocker: "bd-11" });
+  });
+
+  it("keeps an empty gate list the legacy resolution", async () => {
+    for (const stdout of ["null", "[]"]) {
+      const result = await lookupOpenHumanGate({
+        beadId: "bd-12",
+        cwd: "/repo",
+        runBd: async () => ({ stdout }),
+      });
+      expect(result).toEqual({ ok: true, status: "none" });
+    }
+  });
+
+  it("does not let an open escalation gate shadow the ask-human gate on the same bead", async () => {
+    // bd lists newest first; whichever order they arrive in, the comment channel must
+    // still find the ask-human gate it is waiting for and never the escalation.
+    const askHuman = {
+      id: "bd-950",
+      status: "open",
+      await_type: "human",
+      title: "Gate: human",
+      description: "Reason: may I publish these findings?",
+      created_at: "2026-11-01T10:00:00Z",
+    };
+    for (const raw of [
+      [escalationRecord(), askHuman],
+      [askHuman, escalationRecord()],
+    ]) {
+      const result = await lookupOpenHumanGate({
+        beadId: "bd-12",
+        cwd: "/repo",
+        runBd: async () => ({ stdout: JSON.stringify(raw) }),
+      });
+      expect(result).toMatchObject({ ok: true, status: "open", gate: { gateId: "bd-950" } });
+    }
+  });
+
+  it("never reports a closed escalation gate as the answer to a comment wait", async () => {
+    // A bead comment must not answer an escalation, and the escalation's own note
+    // must not be read as the comment channel's answer either: both directions of
+    // the refusal, on the async `--all` read the poll uses after `none`.
+    const result = await lookupResolvedHumanGate({
+      beadId: "bd-12",
+      cwd: "/repo",
+      runBd: async () => ({
+        stdout: JSON.stringify([
+          escalationRecord({
+            status: "closed",
+            close_reason: "Approved by hugo via Scotty at 2026-11-01T09:52:05.582Z\n\nretry",
+          }),
+        ]),
+      }),
+    });
+    expect(result).toEqual({ ok: true, status: "none" });
+  });
+
+  it("lists open escalation gates and their drift", () => {
+    const parsed = parseOpenFleetEscalationGates([
+      escalationRecord(),
+      escalationRecord({ status: "closed" }),
+      { id: "bd-902", status: "open", await_type: "human", title: "Gate: human" },
+    ]);
+    expect(parsed).toEqual([
+      {
+        gateId: "bd-901",
+        fleetId: "default",
+        taskId: "bd-12",
+        cause: "phase-failed",
+        round: 2_000,
+      },
+    ]);
   });
 });

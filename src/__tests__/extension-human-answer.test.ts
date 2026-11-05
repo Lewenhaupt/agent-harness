@@ -24,10 +24,12 @@ import type { Mock } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearHumanAnswerWait,
   deliverReviewFindings,
   type HumanGateDeps,
   humanAnswerMessage,
   stopHumanAnswerPoll,
+  warnUnrecognizedHumanGate,
 } from "../../extensions/capabilities/human-gate.js";
 import { createInitialSessionState } from "../../extensions/capabilities/session-state.js";
 import type { GithubAnswerTarget } from "../github-answer-target.js";
@@ -1983,5 +1985,67 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     bd.reply(commentsSinceKey(), { stdout: humanIssueComment("issue answer") });
     expect(humanAnswer(await startTurn(mock, ctx))?.content).toBe("hugo answered: issue answer");
     await shutdownSession(mock, ctx);
+  });
+});
+
+describe("unrecognized-gate warning budget (bd-279 S3)", () => {
+  /** The lines one run of the warning helper emitted, with console.warn restored. */
+  function warningsFor(run: (state: ReturnType<typeof createInitialSessionState>) => void): {
+    lines: string[];
+    state: ReturnType<typeof createInitialSessionState>;
+  } {
+    const state = createInitialSessionState();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      run(state);
+      return { lines: warn.mock.calls.map((call) => String(call[0])), state };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("warns once per bead, so a second blocked bead later in the session still warns", () => {
+    const { lines } = warningsFor((state) => {
+      warnUnrecognizedHumanGate(state, "bd-12");
+      warnUnrecognizedHumanGate(state, "bd-12");
+      warnUnrecognizedHumanGate(state, "bd-13");
+    });
+
+    // Twice for the same bead is one line (the 30s poll must not spam); a different
+    // bead is a new diagnosis, which a session-wide boolean muted forever. The
+    // message also covers a cleanly parsed escalation gate, not only a failed parse.
+    expect(lines).toEqual([
+      expect.stringContaining("for bd-12"),
+      expect.stringContaining("for bd-13"),
+    ]);
+    expect(lines[0]).toContain("cannot read");
+  });
+
+  it("forgets a cleared wait, so a new question on the same bead warns again", () => {
+    const { lines } = warningsFor((state) => {
+      warnUnrecognizedHumanGate(state, "bd-12");
+      clearHumanAnswerWait(state);
+      warnUnrecognizedHumanGate(state, "bd-12");
+    });
+
+    // A new question deserves its own warning budget, exactly like the other
+    // human-answer diagnostics that `clearHumanAnswerWait` resets.
+    expect(lines).toHaveLength(2);
+  });
+
+  it("keeps the per-bead memory bounded in a long session", () => {
+    const { lines, state } = warningsFor((initial) => {
+      for (let index = 0; index < 500; index += 1) {
+        warnUnrecognizedHumanGate(initial, `bd-${1_000 + index}`);
+      }
+    });
+
+    // One line per bead, but the memory evicts oldest-first: the newest beads are
+    // remembered and the first ones are not, so the set cannot grow with the fleet
+    // in a daemon session that sees bead after bead.
+    expect(lines).toHaveLength(500);
+    expect(state.humanUnrecognizedGateWarnedBeads?.size).toBe(32);
+    expect(state.humanUnrecognizedGateWarnedBeads?.has("bd-1499")).toBe(true);
+    expect(state.humanUnrecognizedGateWarnedBeads?.has("bd-1000")).toBe(false);
   });
 });

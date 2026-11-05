@@ -50,6 +50,13 @@ export interface SupervisionGateFacts {
   humanGateCreatedAtMs?: number;
   /** The member this bead is ordered behind (bd-158 fleet ordering gate). */
   orderingBlocker?: string;
+  /**
+   * bd answered, but returned records that are not this wait's answer (an
+   * escalation gate, a timer gate, a renamed status). Kept apart from
+   * {@link readError} so the digest does not report a read failure that did not
+   * happen (bd-279 S2).
+   */
+  unrecognizedGateState?: string;
   /** The gate read itself failed; the digest says so instead of guessing "none". */
   readError?: string;
 }
@@ -375,6 +382,9 @@ function formatWaitingOn(member: SupervisionMemberFacts, now: number): string {
   }
   if (gates.orderingBlocker !== undefined) {
     return `- waiting on: ${gates.orderingBlocker} (fleet ordering gate)`;
+  }
+  if (gates.unrecognizedGateState !== undefined) {
+    return `- waiting on: unknown (gate state unrecognized: ${gates.unrecognizedGateState})`;
   }
   if (gates.readError !== undefined) {
     return `- waiting on: unknown (gate read failed: ${gates.readError})`;

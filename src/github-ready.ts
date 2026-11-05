@@ -19,7 +19,11 @@
  * computes readiness from the local blocked-by edges alone.
  */
 
-import { gateRecordList, openHumanGateFromRecord } from "./bead-gates.js";
+import {
+  gateRecordList,
+  isFleetEscalationGateRecord,
+  openHumanGateFromRecord,
+} from "./bead-gates.js";
 import type { GithubAuthority } from "./github-authority.js";
 
 /** A gate the projection understands, with its external condition made explicit. */
@@ -122,6 +126,12 @@ function parseGhRunGate(
  * Only `open` records count, and the blocked bead's own id is rejected as a gate
  * id (same rule as the human-answer channel). `timer` and `bead` gates are not
  * GitHub conditions and are ignored here; ordering is handled by the fleet.
+ *
+ * A fleet escalation gate (bd-279) is a person's decision, so it must block exactly
+ * like an `ask_human` gate does. It cannot come through `openHumanGateFromRecord`,
+ * which refuses it on purpose so a bead comment cannot "answer" a stopped member,
+ * so the refusal is undone here for the readiness projection only: reporting the
+ * bead ready while an escalation is open would be a false "you may proceed".
  */
 export function parseGithubGate(
   record: Record<string, unknown>,
@@ -129,6 +139,7 @@ export function parseGithubGate(
 ): GithubGate | undefined {
   const human = openHumanGateFromRecord(record, beadId);
   if (human !== undefined) return { kind: "human", gateId: human.gateId, beadId };
+  if (isFleetEscalationGateRecord(record)) return escalationGateAsHumanWait(record, beadId);
 
   const gateId = record.id;
   if (typeof gateId !== "string" || gateId === "" || gateId === beadId) return undefined;
@@ -139,6 +150,23 @@ export function parseGithubGate(
   if (record.await_type === "gh:pr") return parseGhPrGate(gateId, beadId, awaitId, createdAt);
   if (record.await_type === "gh:run") return parseGhRunGate(gateId, beadId, awaitId, createdAt);
   return undefined;
+}
+
+/**
+ * An open escalation gate as a blocking human wait, with the same shape rules.
+ *
+ * Deliberately does not re-check `await_type`: the marker decides, and a marked
+ * record whose type was renamed is a corrupted wait, not an expired one — failing
+ * closed keeps the bead unready until someone resolves or repairs the gate.
+ */
+function escalationGateAsHumanWait(
+  record: Record<string, unknown>,
+  beadId: string,
+): GithubGate | undefined {
+  const gateId = record.id;
+  if (typeof gateId !== "string" || gateId === "" || gateId === beadId) return undefined;
+  if (record.status !== "open") return undefined;
+  return { kind: "human", gateId, beadId };
 }
 
 /**

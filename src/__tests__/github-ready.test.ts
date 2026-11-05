@@ -6,7 +6,7 @@
  * answer keeps the wait. Local mode must stay entirely free of the gh path.
  */
 import { describe, expect, it } from "vitest";
-
+import { renderFleetEscalationGateMarker, renderFleetOrderingGateMarker } from "../bead-gates.js";
 import type { GithubGate, GithubGateEvidence, GithubRunEvidence } from "../github-ready.js";
 import {
   classifyGates,
@@ -773,5 +773,70 @@ describe("computeReady", () => {
     expect(result.gate).toEqual(waiting);
     expect(result.verdict).toBe("open");
     expect(result.clearedGates).toEqual([cleared]);
+  });
+});
+
+describe("fleet escalation gates block GitHub-primary readiness (bd-279 review W3)", () => {
+  const escalationMarker = renderFleetEscalationGateMarker({
+    fleetId: "default",
+    taskId: "bd-12",
+    cause: "land-failed",
+    round: 2_000,
+  });
+
+  function escalationRecord(overrides: Record<string, unknown> = {}) {
+    return gateRecord({
+      id: "bd-901",
+      await_type: "human",
+      title: escalationMarker,
+      description: `Reason: ${escalationMarker}: bd-12 stopped the run`,
+      ...overrides,
+    });
+  }
+
+  it("classifies an open escalation gate as a human wait, like an ask_human gate", () => {
+    // The human-answer channel refuses escalation records on purpose, so the
+    // readiness projection has to classify the refusal again as blocking: a bead a
+    // fleet escalation blocks must never be reported ready.
+    expect(parseGithubGate(escalationRecord(), "bd-12")).toEqual({
+      kind: "human",
+      gateId: "bd-901",
+      beadId: "bd-12",
+    });
+
+    const ready = computeReady({
+      authority: "github",
+      beadId: "bd-12",
+      blockedBy: [],
+      gates: parseGithubGates([escalationRecord()], "bd-12"),
+      evidence: {},
+    });
+    expect(ready).toHaveProperty("ready", false);
+    if (ready.ready) return;
+    expect(ready.reason).toBe("waiting-on-gate");
+  });
+
+  it("still ignores closed escalation gates and an ordering gate", () => {
+    expect(parseGithubGate(escalationRecord({ status: "closed" }), "bd-12")).toBeUndefined();
+
+    // An ordering gate is a wait on another member, never a person: it must not turn
+    // into a human wait in this projection either (bd-158/bd-176).
+    const ordering = renderFleetOrderingGateMarker({
+      fleetId: "default",
+      blocker: "bd-12",
+      blocked: "bd-13",
+    });
+    expect(
+      parseGithubGate(
+        gateRecord({
+          id: "bd-950",
+          await_type: "bead",
+          await_id: "bd-12",
+          title: ordering,
+          description: `Reason: ${ordering}`,
+        }),
+        "bd-13",
+      ),
+    ).toBeUndefined();
   });
 });

@@ -16,7 +16,13 @@ import { FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "../fleet-capacity.js";
 import { countActiveFleetOrchestrators } from "../fleet-launch.js";
 import { DEFAULT_FLEET_PUBLISH } from "../fleet-publish.js";
 import { reportMemberLiveness } from "../fleet-reconcile.js";
-import { FLEET_RUN_STALE_TICK_MS, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
+import {
+  FLEET_RUN_STALE_TICK_MS,
+  FLEET_RUN_STOP_REASONS,
+  recordRunMemberStopped,
+  recordRunStopResolution,
+  startFleetRun,
+} from "../fleet-run.js";
 import { classifyMemberLease, classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
 import {
   applyFleetBeadEngagement,
@@ -3486,6 +3492,187 @@ describe("bead ownership and human surfaces (bd-153)", () => {
     expect(formatNeedsYou(status)).toContain("(comments unknown)");
   });
 
+  it("admits a member the run stopped, with its reason and detail, for every stop reason", () => {
+    // bd-279: `run.stopped` used to render only outside "Needs you", so a stopped
+    // member never entered the one block that answers "what must I do".
+    for (const reason of FLEET_RUN_STOP_REASONS) {
+      const status = buildFleetStatus({
+        fleetId: "fleet-1",
+        intent: sampleIntent({
+          taskIds: ["bd-12"],
+          run: recordRunMemberStopped({
+            run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+            taskId: "bd-12",
+            reason,
+            detail: `why ${reason}`,
+            now: 2_000,
+          }),
+        }),
+        members: [member("bd-12")],
+      });
+
+      const block = formatNeedsYou(status) ?? "";
+      expect(block).toContain("Needs you (1): bd-12");
+      expect(block).toContain(`stopped ${reason}`);
+      expect(block).toContain(`why ${reason}`);
+    }
+
+    // A run that stopped nobody admits nobody either.
+    const clean = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
+      members: [member("bd-12")],
+    });
+    expect(clean.members[0]).not.toHaveProperty("stop");
+    expect(formatNeedsYou(clean)).toBe(undefined);
+  });
+
+  it("bounds the stop detail and appends the answer a person chose", () => {
+    const run = recordRunStopResolution({
+      run: recordRunMemberStopped({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+        taskId: "bd-12",
+        reason: "land-failed",
+        detail: "publish gate refused: proof-artifacts-in-diff",
+        now: 2_000,
+      }),
+      taskId: "bd-12",
+      note: "retry after trimming the diff",
+      now: 3_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run }),
+      members: [member("bd-12")],
+    });
+
+    const block = formatNeedsYou(status) ?? "";
+    expect(block).toContain("stopped land-failed");
+    expect(block).toContain("publish gate refused: proof-artifacts-in-diff");
+    expect(block).toContain("(answered: retry after trimming the diff)");
+
+    // The excerpt bound still applies to a detail bd allowed to be 400 chars.
+    const long = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({
+        taskIds: ["bd-12"],
+        run: recordRunMemberStopped({
+          run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+          taskId: "bd-12",
+          reason: "state-corrupt",
+          detail: "漢".repeat(400),
+          now: 2_000,
+        }),
+      }),
+      members: [member("bd-12")],
+    });
+    const line = (formatNeedsYou(long) ?? "")
+      .split("\n")
+      .find((entry) => entry.includes("stopped"));
+    expect(line).toContain(`${"漢".repeat(NEEDS_YOU_EXCERPT_MAX_CHARS - 1)}…`);
+    expect(line).not.toContain("漢".repeat(NEEDS_YOU_EXCERPT_MAX_CHARS + 1));
+  });
+
+  it("says a stop was answered even when the resolver left no note", () => {
+    // "answered, no note" and "still waiting" are opposite next actions; a note-less
+    // answer must not read like an open stop (bd-279 review S1).
+    const run = recordRunStopResolution({
+      run: recordRunMemberStopped({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+        taskId: "bd-12",
+        reason: "state-corrupt",
+        detail: "漢".repeat(400),
+        now: 2_000,
+      }),
+      taskId: "bd-12",
+      now: 3_000,
+    });
+    const line = (
+      formatNeedsYou(
+        buildFleetStatus({
+          fleetId: "fleet-1",
+          intent: sampleIntent({ taskIds: ["bd-12"], run }),
+          members: [member("bd-12")],
+        }),
+      ) ?? ""
+    )
+      .split("\n")
+      .find((entry) => entry.includes("stopped"));
+
+    expect(line).toContain("(answered, no note)");
+    const text = (line ?? "").slice((line ?? "").lastIndexOf(" — ") + 3);
+    expect(text.length).toBeLessThanOrEqual(NEEDS_YOU_EXCERPT_MAX_CHARS);
+  });
+
+  it("reads a hand-edited blank note as answered on both status surfaces", () => {
+    // Only a hand-edited `fleet.json` can carry `note: ""`/`"   "` (the resolve path
+    // trims), and the schema admits it: an empty answer must not render as the empty
+    // string in the two surfaces whose job is to say what the person chose.
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail: "publish gate refused",
+      now: 2_000,
+    });
+    const handEditedStop = {
+      ...(stopped.stopped?.[0] ?? { taskId: "bd-12", reason: "land-failed", detail: "", at: 0 }),
+      resolution: { note: "   ", at: 3_000 },
+    };
+    const run = { ...stopped, stopped: [handEditedStop] };
+
+    const line = (
+      formatNeedsYou(
+        buildFleetStatus({
+          fleetId: "fleet-1",
+          intent: sampleIntent({ taskIds: ["bd-12"], run }),
+          members: [member("bd-12")],
+        }),
+      ) ?? ""
+    )
+      .split("\n")
+      .find((entry) => entry.includes("stopped"));
+    expect(line).toContain("(answered, no note)");
+    expect(line).not.toContain("answered: )");
+
+    const section = formatBeadOwnership({ cwdTaskId: "bd-12", stop: handEditedStop }) ?? "";
+    expect(section).toContain("- stop: land-failed — publish gate refused (answered, no note)");
+  });
+
+  it("lists a stopped member once when its bead also needs a human", () => {
+    const run = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "phase-failed",
+      detail: "gate failed",
+      now: 2_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run }),
+      members: [member("bd-12")],
+    });
+    const withBead = applyFleetBeadLookup(status, {
+      ok: true,
+      beads: [
+        {
+          id: "bd-12",
+          title: "Title bd-12",
+          status: "open",
+          priority: 2,
+          labels: ["human"],
+        },
+      ],
+    });
+
+    const block = formatNeedsYou(withBead) ?? "";
+    expect(block.split("\n").filter((line) => line.startsWith("  - "))).toHaveLength(1);
+    expect(block).toContain("stopped phase-failed");
+  });
+
   it("says (unknown) for the assignee when the bead record failed to read", () => {
     const status = enriched(
       [member("bd-12")],
@@ -3516,6 +3703,38 @@ describe("bead ownership and human surfaces (bd-153)", () => {
         .join(", ")}`,
     );
     expect(lines.at(-1)).toBe("  …and 3 more");
+    expect(lines).toHaveLength(1 + NEEDS_YOU_LIST_MAX + 1);
+  });
+
+  it("caps a wave of stopped members the same way and names the remainder", () => {
+    // The stop signal is the third way into this block (bd-279): a wave of stops
+    // must be truncated like every other signal, or a big fleet prints every member.
+    const total = NEEDS_YOU_LIST_MAX + 2;
+    const taskIds = Array.from({ length: total }, (_, index) => `bd-${200 + index}`);
+    const stops = taskIds.reduce(
+      (run, taskId) =>
+        recordRunMemberStopped({
+          run,
+          taskId,
+          reason: "land-failed",
+          detail: `why ${taskId}`,
+          now: 2_000,
+        }),
+      startFleetRun({
+        now: 1_000,
+        accept: false,
+        members: taskIds.map((taskId) => ({ taskId })),
+      }),
+    );
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds, run: stops }),
+      members: taskIds.map((taskId) => member(taskId)),
+    });
+
+    const lines = (formatNeedsYou(status) ?? "").split("\n");
+    expect(lines[0]).toContain(`Needs you (${total}): `);
+    expect(lines.at(-1)).toBe("  …and 2 more");
     expect(lines).toHaveLength(1 + NEEDS_YOU_LIST_MAX + 1);
   });
 
@@ -3620,6 +3839,45 @@ describe("formatBeadOwnership (belayd_status section)", () => {
     expect(section).toContain("- owner: hugo");
     expect(section).toContain("- assignee: belayd:bd-19:orchestrator");
     expect(section).toContain("bead engagement unavailable (bd read failed): gate list failed");
+  });
+
+  it("renders the stop a fleet recorded, and flags needs-you from it alone", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        stop: {
+          taskId: "bd-19",
+          reason: "land-failed",
+          detail: "publish gate refused: proof-artifacts-in-diff",
+          at: 2_000,
+          gateId: "bd-900",
+          resolution: { note: "retry", at: 3_000 },
+        },
+      }) ?? "";
+
+    // bd-279: the single-bead surface must answer the same question the fleet's
+    // "Needs you" block does, even when bd supplied neither bead nor engagement.
+    expect(section).toContain("- stop: land-failed — publish gate refused");
+    expect(section).toContain("(answered: retry)");
+    expect(section).toContain("**Needs you** — bd-19 is waiting on a human.");
+  });
+
+  it("says a stop was answered even when the resolver left no note", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-19",
+        stop: {
+          taskId: "bd-19",
+          reason: "land-failed",
+          detail: "publish gate refused",
+          at: 2_000,
+          resolution: { at: 3_000 },
+        },
+      }) ?? "";
+
+    // The third renderer of one record: same notion of "answered" as the fleet view
+    // and the run header, so a settled stop never reads as still open.
+    expect(section).toContain("- stop: land-failed — publish gate refused (answered, no note)");
   });
 
   it("degrades a read failure to one bounded line", () => {
