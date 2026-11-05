@@ -63,6 +63,19 @@
           shellHook = ''
             # Make libstdc++ available to native node modules (file watchers, etc.)
             export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+            # Turborepo's local cache lives at <repo-root>/.turbo/cache, so every
+            # git worktree — and every agent working in one — starts cold even
+            # though the inputs are identical. One content-addressed directory
+            # outside the tree makes them share artifacts instead.
+            #
+            # This is deliberately not Vercel Remote Cache: a hash is derived from
+            # the inputs, so a shared directory is safe to write concurrently, and
+            # it needs no token, no network and no secret on disk. `turbo login`
+            # cannot even complete on a headless host — it waits for an OAuth
+            # redirect on a local callback server. Set TURBO_CACHE_DIR yourself to
+            # override the location; CI has no worktrees and keeps its own cache.
+            export TURBO_CACHE_DIR="''${TURBO_CACHE_DIR:-''${XDG_CACHE_HOME:-$HOME/.cache}/turbo/__PROJECT_NAME__}"
           '';
         };
       }

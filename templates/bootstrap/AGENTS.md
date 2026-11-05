@@ -12,7 +12,7 @@ __PROJECT_ONELINER__
 | tsc | TypeScript compilation (`dist/` output) | all packages |
 | Vitest | Test framework (unit, integration) | all packages |
 | Biome | Formatting and linting | root |
-| Turbo | Monorepo task orchestration | root |
+| Turbo | Monorepo task orchestration; one content-addressed local cache shared by every worktree via `TURBO_CACHE_DIR` (devShell `shellHook`) — no remote cache, so no token or login | root |
 | pnpm | Package manager | root |
 | Nix | Reproducible devShell | root |
 

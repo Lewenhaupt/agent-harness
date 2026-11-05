@@ -25,7 +25,7 @@ Everything under `templates/bootstrap/` in the harness repo:
 
 | Path | Contents |
 |------|----------|
-| `flake.nix` | Core-only devShell: nodejs, pnpm, typescript, biome, beads + dolt + procps, worktrunk, the configured `agent-harness.packages.<sys>.pi`, gcc lib |
+| `flake.nix` | Core-only devShell: nodejs, pnpm, typescript, biome, beads + dolt + procps, worktrunk, the configured `agent-harness.packages.<sys>.pi`, gcc lib; exports `TURBO_CACHE_DIR` (see below) |
 | `.envrc` | `use flake` |
 | `package.json` | Private root, `packageManager: pnpm@10.28.0`, turbo scripts, pinned devDeps, `preinstall: npx only-allow pnpm` |
 | `pnpm-workspace.yaml` | `packages/*` |
@@ -43,6 +43,35 @@ Everything under `templates/bootstrap/` in the harness repo:
 Placeholders are uppercased and double-underscore delimited:
 `__PROJECT_NAME__`, `__PACKAGE_SCOPE__`, `__PROJECT_DESCRIPTION__`,
 `__PROJECT_ONELINER__`.
+
+### The shared Turborepo cache
+
+Turbo's local cache is per repository root (`<repo-root>/.turbo/cache`), so every
+git worktree — and every belayd agent working in one — starts cold on identical
+inputs. The scaffold's `shellHook` therefore exports:
+
+```sh
+TURBO_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/turbo/<project-name>
+```
+
+so `nix develop` and direnv alike point all worktrees at one directory outside
+the tree, and `TURBO_CACHE_DIR=… pnpm build` still overrides it. Entries are
+content-addressed (`<hash>.tar.zst` + `<hash>-meta.json`), so concurrent writers
+in different worktrees cannot collide. CI is unaffected: it runs neither the
+shellHook nor worktrees, so it keeps its own ephemeral cache.
+
+This is deliberately not Vercel Remote Cache. `turbo login` cannot complete on a
+headless host — it is an OAuth flow that waits for the redirect on a local
+callback server (port 9789) — and `turbo login --manual` needs a TTY, validates
+the token against the API, and writes `remoteCache.apiUrl`/`teamSlug` into the
+committed `turbo.json`. The headless-safe form is the credential file
+`~/.config/turborepo/config.json` holding `{"token": "…"}`, or
+`TURBO_TOKEN`/`TURBO_TEAM` in the environment: both need a long-lived Vercel
+token on the machine. Adopt one only if artifacts must cross machines or reach
+CI; two things want fixing first — `turbo.json` has no `globalDependencies`, so
+a `flake.lock` toolchain bump would not invalidate the cache, and a CI job that
+uses `setup-node` instead of the devShell would span two toolchains under one
+hash.
 
 ## Scripted vs. agent-owned
 
