@@ -378,20 +378,18 @@ describe("planFleetEscalations (bd-279)", () => {
       planFleetEscalations({ fleetId: FLEET, run, taskIds: ["bd-12"], parked: undefined }),
     ).toEqual([]);
     expect(isFleetEscalationCause("fleet-parked")).toBe(true);
-    // Withheld sensitive findings are the review gate's ask-human gate, not this
-    // planner's: the cause is not in the vocabulary at all (see the next case).
+    // A sensitivity cause is not in the vocabulary either: bd-286 deleted the
+    // classifier that produced it (see the next case).
     expect(isFleetEscalationCause("sensitive-findings-withheld")).toBe(false);
     expect(isFleetEscalationCause("capacity")).toBe(false);
     expect(isFleetEscalationCause("ordering")).toBe(false);
   });
 
-  it("opens no second gate for withheld sensitive findings", () => {
-    // bd-279 relation clause: the sensitivity half keeps `evaluateDeferredFindingsGate`
-    // as the classifier and only changes how the escalation is *presented*. The review
-    // gate's own `belayd_ask_human` gate (one per round, "sensitive findings (round N)")
-    // is that channel, so this planner must never mint a fleet escalation for it. The
-    // pin: the cause is not a cause, and a run whose only signal is withheld findings
-    // plans nothing — there is no code path that could add a gate here.
+  it("opens no gate for a sensitivity cause that no longer exists", () => {
+    // bd-286 deleted the per-finding sensitivity classifier and its review gate, so
+    // there is no code path left that could mint an escalation for one. The pin:
+    // the cause is not a cause, and a run whose only signal is a sensitivity cause
+    // plans nothing.
     expect(FLEET_ESCALATION_CAUSES).not.toContain("sensitive-findings-withheld");
     const run = startFleetRun({
       now: 1_000,

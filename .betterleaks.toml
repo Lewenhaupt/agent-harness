@@ -1,0 +1,61 @@
+# betterleaks config for this tree (bd-286).
+#
+# `pnpm scan:secrets` (repo gate + pre-push hook) runs
+#   betterleaks dir . -c .betterleaks.toml --redact --no-banner --exit-code 1
+# and `src/secret-scan.ts` pipes outbound comment/note bodies through
+# `betterleaks stdin`. Secrets are a scanner's job — never a hand-written
+# detection table (see AGENTS.md "Never hand-roll detection heuristics").
+
+# Keep the upstream rule set: this file adds ignore paths, it never weakens or
+# replaces a rule. A real hit is fixed at the source, not allowlisted here.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated, vendored and VCS-internal trees are not ours to scan"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)\.direnv/''',
+  '''(^|/)\.git/''',
+]
+
+[[allowlists]]
+description = '''
+  Per-worktree harness runtime state: <worktree>/.belayd/ holds the workflow state,
+  handoffs, run manifests, telemetry and the review-findings record `.md`/`.json`. It
+  is gitignored (never part of the branch) and it duplicates text the gate already
+  sees elsewhere: the review record persists the reviewer's raw finding text, and a
+  finding that quotes a credential is refused from the bd comment by the outbound
+  scan (src/secret-scan.ts) — but it must still be *recorded*, or the fix loop loses
+  the finding. Scanning this file would fail on content that cannot be "fixed at the
+  source" and is not published anywhere. Do not add tracked paths here.
+'''
+paths = ['''(^|/)\.belayd/''']
+
+[[allowlists]]
+description = '''
+  pi runtime state inside the worktree: `.pi/sessions/` (session transcripts) and
+  `.pi/npm/` (pi's own package cache) are gitignored and machine-local. Only these
+  two subdirectories are ignored, deliberately not `.pi/` as a whole: the project
+  `.pi/settings.json` IS tracked and stays scanned. The rest of pi's state
+  (`~/.pi/agent/`) lives outside the repository, so `dir .` never sees it.
+'''
+paths = [
+  '''(^|/)\.pi/sessions/''',
+  '''(^|/)\.pi/npm/''',
+]
+
+[[allowlists]]
+description = '''
+  docs/proof/bd-169/loud-stop.log: pre-existing false positive. The
+  generic-api-key rule matches a fleet armToken UUID recorded in a historical
+  proof log (line 35); the value is an opaque per-run identifier, not a
+  credential, and the log is immutable evidence for bd-169. Ignoring this one
+  path is preferred over weakening the rule for the whole tree.
+'''
+paths = ['''docs/proof/bd-169/loud-stop\.log''']
+
+# An intentional fixture inside a scanned file uses the inline escape hatch
+# instead of a broader path ignore:
+#   token = "ghp_example..."  # betterleaks:allow

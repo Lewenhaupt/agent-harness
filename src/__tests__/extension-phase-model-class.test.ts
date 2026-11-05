@@ -76,7 +76,11 @@ const mockExec = vi.hoisted(() =>
         cb(null, { stdout: "ok", stderr: "" });
         return;
       }
-      if (cmd.startsWith("pnpm typecheck") || cmd.startsWith("pnpm lint")) {
+      if (
+        cmd.startsWith("pnpm typecheck") ||
+        cmd.startsWith("pnpm lint") ||
+        cmd.startsWith("pnpm scan:secrets")
+      ) {
         cb(null, { stdout: "ok", stderr: "" });
         return;
       }

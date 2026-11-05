@@ -211,6 +211,7 @@ import {
   withSessionPin,
 } from "../../src/pi-web-navigation.js";
 import { listRuns } from "../../src/run-manifest.js";
+import { scanOutboundText, secretRefusalText, warnScanUnavailable } from "../../src/secret-scan.js";
 import { isValidTaskId } from "../../src/session-naming.js";
 import { currentBranch, DEFAULT_BASE_BRANCH } from "../../src/stack-rebase.js";
 import type {
@@ -6349,6 +6350,17 @@ export function createFleet(deps: FleetDeps): FleetApi {
         channel: params.channel,
       });
       if (!resolved.ok) return textToolResult(resolved.error, 1);
+
+      // A note reaches member inboxes and is mirrored onto their beads, so it is
+      // outbound text like any comment (bd-286): refuse on a scanner hit, name
+      // the rule ids only, and let the author describe the location in prose.
+      const scan = await scanOutboundText({ text: params.body, cwd: extensionCtx.cwd });
+      if (!scan.ok && "rules" in scan) {
+        return textToolResult(`belayd_fleet_note: ${secretRefusalText(scan.rules)}`, 1);
+      }
+      if (!scan.ok) {
+        warnScanUnavailable({ budget: getSessionState(extensionCtx), reason: scan.unavailable });
+      }
 
       const written = await writeFleetNote({
         ctx: extensionCtx,

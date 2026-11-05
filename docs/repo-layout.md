@@ -21,6 +21,20 @@ belayd-agent-harness/
 └── templates/, models.json  # Bootstrap template, LLM Gateway model catalog
 ```
 
+## Secrets and detection
+
+Secrets are a scanner's job. `betterleaks` runs over the tree (`.betterleaks.toml`
+holds the config and the ignore paths; `pnpm scan:secrets` is the script, run by
+`gateSecrets` in `src/quality-gates.ts`, the pre-push hook, and `src/secret-scan.ts`
+for outbound comment/note bodies). A hit is fixed at the source or — for an
+intentional fixture — escaped inline with `betterleaks:allow`; a rule is never
+weakened and a real credential is never allowlisted.
+
+Never hand-roll detection heuristics in this repo: the permanent rule lives in
+`AGENTS.md` ("Never hand-roll detection heuristics") and in the
+`DETECTION_GUIDANCE` block of `src/agent-registry.ts`. Anything that needs
+judgement goes to a person or a sub-agent, never to a rule table.
+
 ## Module map
 
 The table is generated from each file's leading docblock, so it describes what the
@@ -40,7 +54,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/role-tools.ts` | Per-role tool surfaces |
 | `src/tool-audit.ts` | Tool-surface auditing for the harness |
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
-| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` with its `reviewFindings` round marker (bd-183) and `publicationOnly` PR-body-only marker (bd-252) |
+| `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` (the in-memory mirror of an open `belayd_ask_human` gate) |
 | `src/workflow-registry.ts` | Workflow sub-type registry — defines 7 workflow types with phase sequences, |
 | `src/workflow-state.ts` | Belayd workflow state persistence |
 | `src/handoff.ts` | Handoff packets carried from a parent session into a spawned orchestrator |
@@ -51,9 +65,8 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
-| `src/review-findings.ts` | Durable review findings: severity/disposition record, gate reason, and the human-gate comment body (bd-175); per-finding sensitivity and the human publication decision (bd-183) |
-| `src/finding-sensitivity.ts` | Deterministic finding-sensitivity classifier (bd-183) — security topics, credential shapes, deny paths; answer parsing and the redacted one-liner |
-| `src/finding-publication.ts` | Publication safety surface (bd-183) — the only supported source of deferred-finding text for a PR body (bd-184) |
+| `src/review-findings.ts` | Durable review findings: severity/disposition record and the comment body a human reads (bd-175, bd-219) |
+| `src/secret-scan.ts` | Outbound text scan (bd-286): refuses to post a comment, gate question or fleet note that `betterleaks` flags, naming rule ids only |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
 | `src/workflow-digest.ts` | Deterministic workflow digest for one fleet member (bd-189, tier 2) — sections, the ranked stuck verdict, and no model or transcript seam |
 | `src/run-detached.ts` | Detached background run orchestration |
@@ -149,7 +162,7 @@ otherwise put two repositories' same-named branches in one shared directory.
 |---|---|
 | `src/fleet-accept.ts` | Accepting a landed member: close the bead, remove the worktree (bd-126 P5) |
 | `src/fleet-beads.ts` | Batched, read-only bead lookup for the fleet observer (bd-126 P0) |
-| `src/fleet-escalation.ts` | One described bd escalation gate per human-relevant stop (the seven stop reasons, a parked fleet), idempotent per bead/cause/round; withheld sensitive findings stay on the review gate's ask-human gate (bd-279) |
+| `src/fleet-escalation.ts` | One described bd escalation gate per human-relevant stop (the seven stop reasons, a parked fleet), idempotent per bead/cause/round (bd-279) |
 | `src/fleet-heartbeat.ts` | Supervisor heartbeat for a run-mode fleet (bd-126 P5) |
 | `src/fleet-launch.ts` | Fleet launch: the decision half of `belayd_fleet_launch` / `/fleet` (bd-126 P1) |
 | `src/fleet-mailbox.ts` | Fleet mailbox rendering (bd-126 P1) |
@@ -250,7 +263,7 @@ order so pi hook/tool order is unchanged.
 | `bd.ts` | `bd` CLI proxy tool |
 | `commit.ts` | `belayd_commit` + `belayd_stack_rebase`, commit preflight/runners, commit-body helpers |
 | `doctor.ts` | `belayd_doctor` packaging/tool-surface report |
-| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review-findings delivery (`deliverReviewFindings`: record + comment always, the bd-183 publication gate only for a security-class finding) and the single choke point that records a publication choice |
+| `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review-findings delivery (`deliverReviewFindings`: record + comment, no gate) and `postChannelBody`, the choke point every outbound question and findings comment passes through |
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
 | `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
@@ -335,7 +348,7 @@ deliberately and say why.
 
 | Doc | Owns |
 |---|---|
-| `docs/packaging.md` | which extensions load, binary resolution, `belayd_doctor`, per-role tool surfaces |
+| `docs/packaging.md` | which extensions load, binary resolution (including the devShell binaries such as `betterleaks`), `belayd_doctor`, per-role tool surfaces |
 | `docs/subagent-sessions.md` | session naming, retry/resume epochs, `pi --resume` |
 | `docs/planning-implement-workflows.md` | `/plan` vs `/belayd`, gate behaviour, tool sets per mode |
 | `docs/owned-worktree.md` | bead ↔ branch ↔ worktree ownership preflight |

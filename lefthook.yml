@@ -36,6 +36,11 @@ pre-push:
     # fail on private-name leaks; the emit is an explicit acceptance criterion.
     - name: build
       run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm build
+    # Secrets are a scanner's job (bd-286): the tree is scanned whole, not as a
+    # commit range, so a hit already in the branch cannot slip through. Config
+    # and ignore paths live in .betterleaks.toml.
+    - name: secret scan
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE -u GIT_PREFIX pnpm scan:secrets
     # belayd-harness.pnpmDeps.hash is a fixed-output hash over the full
     # pnpm-lock.yaml store, so any lockfile change (devDependencies included)
     # invalidates it. Nothing else in the hook can see that. Gated on the files

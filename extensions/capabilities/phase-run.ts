@@ -147,7 +147,6 @@ export type ReviewFindingsSeam = (options: {
 /** What one review-findings delivery did, for the caller's warning path. */
 export interface ReviewFindingsDelivery {
   recorded: boolean;
-  gateOpened: boolean;
   reason: string;
 }
 
@@ -159,13 +158,8 @@ export interface ReviewFindingsDelivery {
  * of a lost write is a missing file. The fix-loop directive is never conditioned on
  * this result.
  *
- * Expected outcomes stay silent: a clean review, a host with no seam, an ordinary
- * findings delivery (record + comment, no gate), and a sensitive round whose
- * publication question could not be armed because a human wait is already open
- * (that one is announced by the seam and in the posted comment).
- *
- * A refused bd-183 gate is also logged by the seam, which owns the specific
- * wording, so this caller does not repeat it: exactly one line per failed gate.
+ * Expected outcomes stay silent: a clean review, a host with no seam, and an
+ * ordinary findings delivery (record + comment).
  */
 export function warnOnSkippedReviewFindings(delivery: ReviewFindingsDelivery): void {
   if (isExpectedSilentDelivery(delivery.reason)) return;
@@ -200,7 +194,6 @@ export async function tryDeliverReviewFindings(options: {
     console.warn("[belayd-harness] could not record the review findings", error);
     return {
       recorded: false,
-      gateOpened: false,
       reason: error instanceof Error ? error.message : String(error),
     };
   }
@@ -229,24 +222,17 @@ function reviewLoopHintFor(delivery: RunDelivery, state: CoreSessionState): stri
 /**
  * The loop hint a run-complete delivery carries.
  *
- * Withheld only while a blocking human wait is live: a member blocked by
+ * Withheld only while a human wait is live: a member blocked by
  * `belayd_ask_human` cannot call the next phase tool the hint names, so offering
- * it would only invite a refused call. A publication-only wait (bd-252) refuses
- * nothing — it decides the PR body, not whether the fix loop may run — so it
- * keeps the directive. A plain findings review delivers no wait at all (bd-219),
- * so it always carries the directive; a clean review and a host with no seam
- * reach here the same way.
+ * it would only invite a refused call. A findings review delivers no wait at all
+ * (bd-219, bd-286), so it always carries the directive; a clean review and a host
+ * with no seam reach here the same way.
  */
 export function runCompleteLoopHint(options: {
   delivered: RunDelivery;
   state: CoreSessionState;
 }): string {
-  if (
-    options.state.awaitingHuman !== undefined &&
-    options.state.awaitingHuman.publicationOnly !== true
-  ) {
-    return "";
-  }
+  if (options.state.awaitingHuman !== undefined) return "";
   return reviewLoopHintFor(options.delivered, options.state);
 }
 
@@ -498,11 +484,11 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
   }): Promise<ReviewFindingsDelivery> {
     const deliver = deps.reviewFindings;
     if (deliver === undefined) {
-      return { recorded: false, gateOpened: false, reason: REVIEW_NO_SEAM_REASON };
+      return { recorded: false, reason: REVIEW_NO_SEAM_REASON };
     }
     const reviewText = options.delivered.result.content?.[0]?.text ?? "";
     if (!hasReviewFindings(reviewText)) {
-      return { recorded: false, gateOpened: false, reason: REVIEW_NO_FINDINGS_REASON };
+      return { recorded: false, reason: REVIEW_NO_FINDINGS_REASON };
     }
     return tryDeliverReviewFindings({
       deliver,

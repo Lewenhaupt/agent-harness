@@ -1,10 +1,16 @@
 # A findings review is a trace, not a gate — and the fleet waits only on a real bd human gate (bd-219)
 
+> **bd-286 note.** The bd-183 sensitive-findings classifier and its publication
+> gate were deleted. No review opens a gate any more; the only human gate is
+> `belayd_ask_human`, and secrets are `betterleaks`' job (`.betterleaks.toml`,
+> `pnpm scan:secrets`). Read every "security-class" line below as history.
+
 Before bd-219 every review that reported findings opened a bd `human` gate. The
 orchestrator was blocked on a question — "should these findings be addressed?" —
 whose answer was always "yes, fix them", once per review round. bd-219 removes
 that wait and keeps only the one review decision a person must actually take:
-whether anything about a **security-class** finding may be published (bd-183).
+whether anything about a **security-class** finding may be published — a split
+> bd-286 later removed (see the note above).
 
 | What happens on a review that reports findings | Before (bd-175) | Now (bd-219) |
 |---|---|---|
@@ -17,8 +23,8 @@ whether anything about a **security-class** finding may be published (bd-183).
 
 | Piece | Where |
 |---|---|
-| Record, comment body, gate title/reason, `REVIEW_FIX_LOOP_REASON` | `src/review-findings.ts` |
-| The delivery: record + comment always, the bd-183 gate only when classified sensitive | `extensions/capabilities/human-gate.ts` → `deliverReviewFindings`, `createSensitiveReviewGate`, `reviewDeliveryReason` |
+| Record, comment body, `REVIEW_FIX_LOOP_REASON` | `src/review-findings.ts` |
+| The delivery: record + comment, no gate (bd-286) | `extensions/capabilities/human-gate.ts` → `deliverReviewFindings`, `reviewDeliveryReason` |
 | Wiring into the review completion | `extensions/capabilities/phase-run.ts` → `deliverReviewFindingsIfFound`, `runCompleteLoopHint`, `warnOnSkippedReviewFindings` |
 | The escalation policy both guidance sites emit verbatim | `extensions/capabilities/review.ts` → `HUMAN_ESCALATION_LINES` |
 | Per-member gate read in the run loop, bounded concurrency 4 | `extensions/capabilities/fleet.ts` → `observeFleetMember`, `readMemberHumanGate`, `readMemberObservationsBounded` |
@@ -52,15 +58,12 @@ What each test pins, by acceptance criterion:
 
 | Test (`src/__tests__/…`) | Pins |
 | --- | --- |
-| `extension-review-gate` › `records ordinary findings and leaves the member working (bd-219)` | `{recorded: true, gateOpened: false, reason: "awaiting the fix loop in this workflow"}`, `awaitingHuman` and the poll timer unset, no `gate create`, and the posted body (`## Review findings (round 1)`, `### Next step`, no `### Question`) |
+| `extension-review-gate` › `records ordinary findings and leaves the member working (bd-219)` | `{recorded: true, reason: "awaiting the fix loop in this workflow"}`, `awaitingHuman` and the poll timer unset, no `gate create`, and the posted body (`## Review findings (round 1)`, `### Next step`, no `### Question`) |
 | `extension-review-gate` › `leaves a Suggestions-only review ungated too` | a Suggestions-only review is the orchestrator's triage, not a human decision |
 | `extension-review-gate` › `leaves bd gate list empty after an ordinary findings review (acceptance)` | `lookupOpenHumanGate` returns `{ok: true, status: "none"}` after the delivery — the literal "no gate" acceptance check |
-| `extension-review-gate` › `opens one gate with the disclosure wording and blocks publishing` | bd-183 preserved: gate argv (`--blocks`, `--type=human`, `--title "belayd-review: … sensitive findings …"`), `awaitingHuman`, poll armed, publication withheld |
-| `extension-review-gate` › `names the lost publication question when a human wait is already open (bd-219)` | the sensitive re-ask case: no second gate, the comment carries the re-ask notice |
-| `extension-review-gate` › `withholds by default when the gate is resolved without an answer` | resolving the sensitive gate with no reply publishes nothing |
 | `extension-review-gate` › `stays on the fast path for a clean review and writes nothing to bd` / `does not open a gate for a narration-only review` | clean and narration-only reviews stay silent |
 | `extension-review-gate` › `human escalation policy (bd-219)` › `names only the two escalation conditions and the do-not-ask list, in both blocks` | both guidance sites emit `HUMAN_ESCALATION_LINES` verbatim, exactly two bullets, no "always ask"/"ask whenever" |
-| `extension-review-gate` › `runCompleteLoopHint` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive while a blocking human wait is live` / `keeps the directive for a publication-only wait (bd-252)` | the delivery names the next phase tool for a findings review; only a blocking human wait suppresses it, while a publication-only wait keeps it |
+| `extension-review-gate` › `runCompleteLoopHint` › `always emits the resumable-fix directive when no human wait is live` / `withholds the directive while a blocking human wait is live` | the delivery names the next phase tool for a findings review; only a blocking human wait suppresses it |
 | `review-flag-not-a-wait` (whole file) | `awaitingReviewResponse` changes nothing: fleet progress, fleet state, digest text, the run-complete directive and the human-wait guidance |
 | `fleet-run` › `keeps a post-review member running, not awaiting a human (bd-219)` / `is awaiting-human for an open human gate on the bead (bd-219)` | progress derives from `humanGateOpen`, not the phase flag |
 | `fleet-status` › `reads a post-review member as active, not awaiting-human (bd-219)` / `reads an open bd human gate as awaiting-human (bd-219)` | the status view's `state` |
@@ -113,8 +116,7 @@ node_modules/.bin/jiti /tmp/bd219-record.ts
         "kind": "deferred",
         "reason": "awaiting the fix loop in this workflow"
       },
-      "dispositionSource": "default",
-      "sensitivity": { "sensitive": false, "reasons": [] }
+      "dispositionSource": "default"
     }
   ]
 }
@@ -170,77 +172,7 @@ The run-complete message in the orchestrator session ends with a line that start
 `` **When review findings remain:** `` and names the next phase tool
 (`belayd_implement`, then `belayd_review`, then the phase after review).
 
-### 3. A security-class finding still opens the bd-183 gate
-
-```bash
-repo=$PWD
-sed "s|<repo>|$repo|g" > /tmp/bd219-sensitive.ts <<'TS'
-import {
-  buildReviewFindingsRecord,
-  formatReviewFindingsComment,
-  reviewFindingsGateReason,
-  reviewFindingsGateTitle,
-} from "<repo>/src/review-findings.ts";
-
-const text = [
-  "## Critical (must fix)",
-  "- `src/auth/session.ts:42` — the session token is logged in plaintext",
-].join("\n");
-const record = buildReviewFindingsRecord({ taskId: "bd-42", text, round: 2 });
-if (record === undefined) throw new Error("no record for a findings review");
-console.log("title:", reviewFindingsGateTitle({ taskId: "bd-42", round: 2, sensitive: true }));
-console.log("reason:", reviewFindingsGateReason(record));
-console.log("---- comment ----");
-console.log(formatReviewFindingsComment(record));
-TS
-node_modules/.bin/jiti /tmp/bd219-sensitive.ts
-```
-
-```text
-title: belayd-review: bd-42 sensitive findings (round 2)
-reason: workflow is waiting for a review response — sensitive findings need a publication decision: publish as-is, publish a redacted one-liner, or withhold (default)
----- comment ----
-Review findings (round 2)
-…
-Critical (must fix)
-- src/auth/session.ts:42 — the session token is logged in plaintext — deferred — workflow is waiting for a review response — **sensitive** (publication decision required)
-
-Sensitive findings — publication decision required
-1 finding is security-class. Nothing about it is published — not in a PR body, and not on a re-publish — unless a human says so:
-
-- **publish as-is** — the finding may appear in the PR body verbatim
-- **publish a redacted one-liner** — only a redacted summary appears
-- **withhold** (default) — nothing about it is published
-
-Any other reply keeps them withheld.
-
-The sensitive findings above need an answer before anything about them is published; every other finding stays in the fix loop below.
-
-Next step
-…
-```
-
-Note the two reason levels, both real: the **record-level** `reason` is always
-`awaiting the fix loop in this workflow` (it describes the delivery), while the
-sensitive *finding's* disposition says `workflow is waiting for a review
-response` and the gate's `--reason` carries the publication question. Heading
-markers are stripped from the comment excerpt here, as in step 2; the three
-answers the disclosure section names are quoted verbatim under
-[Answering a sensitive-findings publication gate](#answering-a-sensitive-findings-publication-gate).
-
-Live, on the bead:
-
-```bash
-bd gate list bd-42            # one open human gate
-bd gate list bd-42 --json | jq '.[0]'
-bd show <gate-id>             # title "belayd-review: bd-42 sensitive findings (round 2)" + the reason
-```
-
-The member is `awaiting-human`, its 30 s answer poll is armed, and nothing about
-that finding reaches a PR body until the answer is recorded as `publish` or
-`redact` (default: withhold).
-
-### 4. The fleet reads the gate, not the review flag
+### 3. The fleet reads the gate, not the review flag
 
 Deterministic, no live fleet:
 
@@ -283,10 +215,10 @@ A run loop ticking over such a member applies the 1 h `stalled` cap
 detail from `FLEET_HUMAN_GATE_DETAIL`
 (`waiting on an open human gate on the bead`).
 
-### 5. Clean up
+### 4. Clean up
 
 ```bash
-rm -f /tmp/bd219-record.ts /tmp/bd219-sensitive.ts /tmp/bd219-sample.ts
+rm -f /tmp/bd219-record.ts /tmp/bd219-sample.ts
 ```
 
 ## How to Use
@@ -337,7 +269,7 @@ round predates bd-219.
   the `` **When review findings remain:** `` directive with the next phase tool,
   and the gate context repeats the fix-loop directive each turn. It is withheld
   only while a blocking human wait is live, because a blocked member could not act
-  on it; a publication-only wait keeps the directive (bd-252).
+  on it.
 - **`awaiting review response: yes` in `belayd_fleet_status` is not a wait.** It
   is the persisted review phase flag, and the one thing it still drives is the
   gate context's per-turn next-step line (`Review findings need addressing. …`
@@ -362,52 +294,6 @@ title, and a member that reads `awaiting-human`. Answer by commenting on the bea
 (or on the mapped issue) or by `bd gate resolve <gate-id>`; the answer arrives in
 the orchestrator session and the workflow resumes.
 
-### Answering a sensitive-findings publication gate
-
-A gate titled `belayd-review: <bead> sensitive findings (round N)` is a real
-blocking question, and only a wait carrying the `reviewFindings = { round }`
-marker can record a publication decision — only `deliverReviewFindings` sets it.
-Reply with one of the three spellings the comment names:
-
-```text
-publish as-is
-publish a redacted one-liner
-withhold
-```
-
-Anything else — including `bd gate resolve` with no text — leaves the finding
-withheld. A decision answers exactly one round: a re-review resets it and the
-comment says so (`previous publication decisions were reset by this re-review`).
-
-If a sensitive round arrives while another human wait is already open, no second
-gate is created and the comment carries:
-
-```text
-**Publication question not armed for this round.** A human wait is already open on this bead, so these sensitive findings could not open a gate and an answer to the older wait cannot decide them. Re-ask them with `belayd_ask_human` once that answer arrives; nothing about them may be published until a decision is recorded.
-```
-
-### `awaiting-human` vs `stalled` in the fleet
-
-| Fleet says | Meaning | What you do |
-|---|---|---|
-| `awaiting-human` | the member's bead has an **open bd `human` gate** (read per member per tick from `bd gate list <bead> --json`) | answer the gate; the run waits up to 12 h, then halts `awaiting-human` with `bd-143 awaited a human response for 2880 ticks (cap 2880); re-arm the fleet after answering` |
-| `stalled` | no gate and no progress for 1 h (240 ticks) | the member is hung; fix that worktree, then re-arm |
-| `active` after a review | ordinary findings: the member is running its own fix loop | nothing — this is the healthy state bd-219 introduced |
-
-An unreadable gate read is "unknown", never a wait, so a bd outage errs toward
-`stalled` rather than silently granting the 12 h human cap.
-
-### When the trace itself is incomplete
-
-The delivery is best-effort; the workflow is never blocked on it. One log line,
-`[belayd-harness] review findings were not fully delivered: <reason>`, tells you
-the record was skipped (read-only worktree, failed rename, invalid task id). The
-seam logs its own lines for a refused gate
-(`could not open the sensitive-findings human gate`) and for an un-armable
-publication question (`could not arm the sensitive-findings publication
-question`). A clean review, a host with no seam, and an ordinary delivery stay
-silent on purpose.
-
 ## Known limits
 
 - **The informational line still prints the flag.** `belayd_fleet_status` keeps
@@ -418,27 +304,18 @@ silent on purpose.
   before this change reads back as-is (`reason: "workflow is waiting for a review
   response"`, no `dispositionSource`), because the schema version was deliberately
   not bumped; the next review round overwrites it with the shape shown above.
-- **A sensitive round that lands on an open human wait loses its question for that
-  round.** No second gate is opened, so the round advances and the older wait's
-  answer would be refused as `round-mismatch`. The re-ask notice in the comment is
-  the only signal; the decision needs a fresh round (and its gate) or an explicit
-  `belayd_ask_human`.
-- **The gate is keyed on the classified finding text.** Which bullets count as
-  findings is lexical (`parseReviewFindings` with `{ strict: true }`): a bullet
-  that opens with a past-tense check verb is narration and is not recorded, even
-  when a clause after it restates a defect. Re-wording a finding can change its
-  sensitivity class; `carryForwardSensitivity` keeps a verdict from an earlier
-  round in the same worktree, but it cannot recover a record deleted or replaced
-  elsewhere.
+- **The finding trigger is lexical.** Which bullets count as findings is decided
+  by `parseReviewFindings` with `{ strict: true }`: a bullet that opens with a
+  past-tense check verb is narration and is not recorded, even when a clause after
+  it restates a defect.
 - **The record is per worktree and per round.** `.belayd/review-findings.json` is
   overwritten on every review, so it describes the latest round only; the bead
   comment thread is the history.
-- **A restart-discovered sensitive wait records no publication decision.** Only a
-  wait created by `deliverReviewFindings` carries `reviewFindings = { round }`; a
-  wait re-armed from an open gate after a session restart delivers the answer but
-  records nothing, so the finding stays withheld (fail-closed). See
-  `docs/bd-183-userguide.md`.
-- **bd-175's docs keep their historical transcripts.** `docs/bd-175-userguide.md`
-  and `docs/fleet-run.md` describe the gate mechanics that still apply to the
-  bd-183 path and `belayd_ask_human`; the wait those pages show for *ordinary*
-  findings no longer happens.
+- **The sensitive-findings machinery is gone (bd-286).** The classifier, the
+  publication gate and the decision record were deleted; no review opens a gate,
+  so a post-review member is always `active`.
+- **bd-175's guide now describes the no-gate trace.**
+  `docs/bd-175-userguide.md` was rewritten for bd-286: it documents the record,
+  the comment and the fleet's human-wait caps, with no review gate. Only its proof
+  dir (`docs/proof/bd-175/`) keeps the historical gate recordings, banner-marked
+  as pre-bd-219 evidence.

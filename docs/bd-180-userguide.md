@@ -752,7 +752,7 @@ modes.
 | --- | --- |
 | Close-on-merge and `mergedAt` acceptance | bd-174.4 / bd-174.10 / bd-174.12 |
 | Reading a person's answer from issue comments | bd-182 |
-| PR body and deferred findings | bd-183 / bd-184 |
+| PR body | bd-184 (unbuilt) |
 | Token and credential boundary for GitHub access | bd-7 |
 
 Related: [`docs/github-primary.md`](github-primary.md) (design record: the

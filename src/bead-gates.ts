@@ -247,8 +247,9 @@ function sameMarker(left: FleetOrderingGateMarker, right: FleetOrderingGateMarke
  * whose reason says what an answer may be. The gate is the only channel — no
  * marker file, no parallel JSON record — so the answer
  * (`bd gate resolve <id> --reason "..."`) is also the decision input a supervisor
- * reads afterwards. Withheld sensitive findings are not a cause here: they already
- * own the review gate's ask-human gate (see `fleet-escalation.ts`).
+ * reads afterwards. Sensitive findings are not a cause here: bd-286 deleted that
+ * classifier, and a flagged outbound post is refused rather than escalated (see
+ * `fleet-escalation.ts`).
  *
  * The marker lives here rather than in `fleet-escalation.ts` because
  * classification must be able to *refuse* it: {@link openHumanGateFromRecord} and
@@ -430,12 +431,11 @@ export interface OpenHumanGate {
   /** bd's ISO creation timestamp; the answer baseline when present. */
   createdAt?: string;
   /**
-   * The gate's own title, when bd stored one (bd-252).
+   * The gate's own title, when bd stored one.
    *
-   * why: a restart finds the wait by listing gates, and only the title says
-   * whether a rediscovered gate is the review publication question (which must
-   * not block phase tools) or a plain ask (which must). The fleet-ordering
-   * classifier reads `record.title` the same way.
+   * why: a human gate is listed, not read in context, and only the title says
+   * which wait is open. The fleet-ordering classifier reads `record.title` the
+   * same way.
    */
   title?: string;
 }

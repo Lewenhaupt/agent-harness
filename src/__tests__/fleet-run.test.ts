@@ -866,7 +866,7 @@ describe("planFleetTick", () => {
   });
 
   it("holds the run for any awaiting-human stop with a live lease, regardless of detail (bd-175)", () => {
-    // A review gate leaves the member stopped as `awaiting-human`, but its own
+    // A human gate leaves the member stopped as `awaiting-human`, but its own
     // session keeps polling the bd gate under a live lease. The run must wait for
     // that answer: concluding now would leave the resumed, committed work unlanded.
     // The predicate is the progress kind plus the lease, never the detail text.
@@ -941,7 +941,7 @@ describe("planFleetTick", () => {
   });
 
   it("prefers the idle-cap stalled halt over a live human wait when a sibling is hung (bd-175)", () => {
-    // Both members are stopped: bd-12 waits on a review gate under a live lease,
+    // Both members are stopped: bd-12 waits on a human gate under a live lease,
     // bd-15 retries under a live lease and makes no progress. The hung non-human
     // member is a fault, so its 1h idle cap outranks the human's 12h window; the
     // stalled detail still names the human wait so the halt does not hide it.

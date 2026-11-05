@@ -25,19 +25,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   clearHumanAnswerWait,
-  deliverReviewFindings,
   type HumanGateDeps,
   humanAnswerMessage,
-  stopHumanAnswerPoll,
   warnUnrecognizedHumanGate,
 } from "../../extensions/capabilities/human-gate.js";
 import { createInitialSessionState } from "../../extensions/capabilities/session-state.js";
 import type { GithubAnswerTarget } from "../github-answer-target.js";
-import {
-  buildReviewFindingsRecord,
-  reviewFindingsGateReason,
-  reviewFindingsGateTitle,
-} from "../review-findings.js";
 
 import { writeWorkflowState } from "../workflow-state.js";
 
@@ -55,6 +48,8 @@ interface BdCallRecord {
 interface BdReply {
   stdout?: string;
   error?: string;
+  /** The exit code on the exec error; 1 is betterleaks' "leaks found". */
+  code?: number;
 }
 
 const bd = vi.hoisted(() => {
@@ -101,7 +96,8 @@ const bd = vi.hoisted(() => {
           const reply = replies.get(keyOf(args)) ?? {};
           const finish = (): void => {
             if (reply.error !== undefined) {
-              callback(new Error(reply.error), "", "");
+              const failure = Object.assign(new Error(reply.error), { code: reply.code });
+              callback(failure, reply.stdout ?? "", "");
               return;
             }
             callback(null, reply.stdout ?? "", "");
@@ -466,6 +462,37 @@ describe("belayd_ask_human", () => {
     expect(await blockReason(mock, "belayd_ask_human", ctx)).toBeUndefined();
     expect(await blockReason(mock, "belayd_status", ctx)).toBeUndefined();
     expect(await blockReason(mock, "read", ctx)).toBeUndefined();
+  });
+
+  it("refuses a question that matches a secret rule before creating any gate (bd-286)", async () => {
+    // The scan runs before the gate, so a refused question leaves no bd write and
+    // needs no compensation. Rule ids only: the refusal must not echo the value.
+    const mock = await loadExtension();
+    const ctx = makeCtx(cwd);
+    seedWorkflow(cwd);
+    await startSession(mock, ctx);
+    bd.reply("stdin --redact --no-banner --exit-code 1 -f json -r -", {
+      stdout: JSON.stringify([{ RuleID: "github-pat", Match: "REDACTED" }]),
+      error: "Command failed: betterleaks stdin",
+      code: 1,
+    });
+
+    const ask = mock.tools.get("belayd_ask_human");
+    if (ask === undefined) throw new Error("belayd_ask_human was not registered");
+    const result = await ask.execute(
+      "call-1",
+      { question: "Which token is this?" },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(result.details.exitCode).toBe(1);
+    expect(textOf(result)).toContain("refused to post");
+    expect(textOf(result)).toContain("github-pat");
+    expect(findCall("gate create")).toBeUndefined();
+    expect(findCall(ASK_COMMENT_KEY)).toBeUndefined();
+    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
   });
 
   it("does not block anything when the gate could not be created", async () => {
@@ -1175,63 +1202,6 @@ describe("human wait discovery after a restart", () => {
       "hugo answered: option b, ship it",
     );
   });
-
-  it("re-arms a rediscovered review gate as publication-only (bd-252)", async () => {
-    // The title marker is all a restart has: without it the rebuilt wait would
-    // block the fix loop again. `reviewFindings` must stay unset, so an answer to
-    // a wait this process did not arm cannot release withheld findings (bd-183).
-    bd.reply(GATE_LIST_KEY, {
-      stdout: JSON.stringify([
-        {
-          id: "bd-159",
-          title: "belayd-review: bd-152 sensitive findings (round 1)",
-          status: "open",
-          issue_type: "gate",
-          await_type: "human",
-          created_at: "2026-10-26T20:00:00Z",
-        },
-      ]),
-    });
-    const mock = await loadExtension();
-    const ctx = makeCtx(cwd);
-    seedWorkflow(cwd);
-    await startSession(mock, ctx);
-
-    const { getSessionState } = await import("../../extensions/index.js");
-    const state = getSessionState(ctx);
-    expect(state.awaitingHuman).toMatchObject({ beadId: "bd-152", publicationOnly: true });
-    expect(state.awaitingHuman?.reviewFindings).toBeUndefined();
-    expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
-    stopHumanAnswerPoll(state);
-  });
-
-  it("keeps a drifted or wrong-bead review title blocking (bd-252)", async () => {
-    // The full shape and the blocked bead id are both required; a bare-ish title
-    // must fail closed and keep refusing phase tools.
-    bd.reply(GATE_LIST_KEY, {
-      stdout: JSON.stringify([
-        {
-          id: "bd-159",
-          title: "belayd-review: bd-999 sensitive findings (round 1)",
-          status: "open",
-          issue_type: "gate",
-          await_type: "human",
-          created_at: "2026-10-26T20:00:00Z",
-        },
-      ]),
-    });
-    const mock = await loadExtension();
-    const ctx = makeCtx(cwd);
-    seedWorkflow(cwd);
-    await startSession(mock, ctx);
-
-    const { getSessionState } = await import("../../extensions/index.js");
-    const state = getSessionState(ctx);
-    expect(state.awaitingHuman).toMatchObject({ beadId: "bd-152" });
-    expect(state.awaitingHuman?.publicationOnly).toBeUndefined();
-    expect(await blockReason(mock, "belayd_implement", ctx)).toBeDefined();
-    stopHumanAnswerPoll(state);
-  });
 });
 
 /**
@@ -1642,31 +1612,15 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     expect(await blockReason(mock, "belayd_implement", ctx)).toBeUndefined();
   });
 
-  // A security-class review: it is the one review shape that still opens the
-  // bd-183 publication gate after bd-219, so the channel/answer plumbing here
-  // keeps exercising a real wait.
-  const REVIEW_FINDINGS = [
-    "## Critical (must fix)",
-    "- `src/auth/session.ts:42` — the session token is logged in plaintext",
-  ].join("\n");
-
-  const REVIEW_GATE_KEY = (() => {
-    const record = buildReviewFindingsRecord({ taskId: "bd-152", text: REVIEW_FINDINGS });
-    if (record === undefined) throw new Error("expected a record");
-    const title = reviewFindingsGateTitle({ taskId: "bd-152", round: 1, sensitive: true });
-    const reason = reviewFindingsGateReason(record);
-    return `gate create --blocks bd-152 --type=human --title ${title} --reason ${reason} --json`;
-  })();
-
-  function reviewState() {
+  function waitState() {
     const state = createInitialSessionState();
     state.gateActive = true;
     state.currentTaskId = "bd-152";
     return state;
   }
 
-  function reviewDeps(
-    state: ReturnType<typeof reviewState>,
+  function waitDeps(
+    state: ReturnType<typeof waitState>,
     target: GithubAnswerTarget,
   ): { deps: HumanGateDeps; resolve: Mock<() => GithubAnswerTarget> } {
     const resolve = vi.fn<() => GithubAnswerTarget>(() => target);
@@ -1681,106 +1635,10 @@ describe("GitHub-primary answer channel (bd-182)", () => {
     };
   }
 
-  it("posts review findings to a mapped issue and delivers its answer once", async () => {
-    seedGithubRepo();
-    const state = reviewState();
-    const { deps } = reviewDeps(state, {
-      kind: "github",
-      owner: GH_OWNER,
-      repo: GH_REPO,
-      issue: ISSUE,
-    });
-    const ctx = makeCtx(cwd);
-    bd.reply(REVIEW_GATE_KEY, { stdout: JSON.stringify({ id: "bd-159", status: "open" }) });
-    bd.reply(GH_CREATE_KEY, { stdout: JSON.stringify({ id: 700 }) });
-    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
-    // The harness's own findings comment, answer-shaped and reused by id: the
-    // exclusion must be exercised through the real POST flow.
-    bd.reply(commentsSinceKey(), {
-      stdout: JSON.stringify([
-        {
-          id: 700,
-          body: "Which option?",
-          created_at: "2026-10-26T20:00:05Z",
-          user: { login: "hugo", type: "User" },
-        },
-        {
-          id: 701,
-          body: "option b, ship it",
-          created_at: "2026-10-26T20:05:00Z",
-          user: { login: "hugo", type: "User" },
-        },
-      ]),
-    });
-
-    const opened = await deliverReviewFindings({
-      state,
-      ctx,
-      deps,
-      taskId: "bd-152",
-      reviewText: REVIEW_FINDINGS,
-    });
-    expect(opened.gateOpened).toBe(true);
-    expect(state.awaitingHuman?.channel).toEqual({
-      kind: "github",
-      owner: GH_OWNER,
-      repo: GH_REPO,
-      issue: ISSUE,
-    });
-    // Findings went to the issue, not a bd comment, and the posted record is
-    // excluded from the answer read.
-    expect(findGhCall("api --method POST")?.argv.join(" ")).toContain(
-      `/issues/${ISSUE.toString()}/comments`,
-    );
-    expect(findCall(ASK_COMMENT_KEY)).toBeUndefined();
-    expect(state.awaitingHuman?.answerCommentId).toBe("700");
-
-    const delivered = await humanAnswerMessage(ctx, deps);
-    // A sensitive review wait also reports the recorded publication choice.
-    expect(delivered?.message.content).toContain("hugo answered: option b, ship it");
-    expect(await humanAnswerMessage(ctx, deps)).toBeUndefined();
-    expect(bd.calls.filter((call) => callKey(call).startsWith("gate resolve"))).toHaveLength(1);
-    stopHumanAnswerPoll(state);
-  });
-
-  it("falls back to the bd comment for an unmapped review and reads that channel", async () => {
-    seedGithubRepo({});
-    const state = reviewState();
-    const { deps, resolve } = reviewDeps(state, {
-      kind: "unmapped",
-      reason: "bd-152 has no issue in .belayd/github-map.json",
-    });
-    const ctx = makeCtx(cwd);
-    bd.reply(REVIEW_GATE_KEY, { stdout: JSON.stringify({ id: "bd-159", status: "open" }) });
-    bd.reply(ASK_COMMENT_KEY, { stdout: "" });
-    bd.reply(GATE_LIST_KEY, { stdout: OPEN_GATE });
-    bd.reply(COMMENTS_KEY, { stdout: humanComment() });
-
-    const opened = await deliverReviewFindings({
-      state,
-      ctx,
-      deps,
-      taskId: "bd-152",
-      reviewText: REVIEW_FINDINGS,
-    });
-    expect(opened.gateOpened).toBe(true);
-    // The findings were posted where the wait says they were posted.
-    expect(findCall(ASK_COMMENT_KEY)).toBeDefined();
-    expect(state.awaitingHuman?.channel).toEqual({ kind: "bd" });
-
-    // Keyed off the recorded channel: no fresh authority/map resolution, and
-    // the bd thread the guidance points at is the one that is read.
-    resolve.mockClear();
-    const delivered = await humanAnswerMessage(ctx, deps);
-    expect(delivered?.message.content).toContain("hugo answered: option b, ship it");
-    expect(resolve).not.toHaveBeenCalled();
-    stopHumanAnswerPoll(state);
-  });
-
   it("keeps a channel-less wait armed when the map is unreadable, then resolves once usable", async () => {
-    const state = reviewState();
+    const state = waitState();
     state.awaitingHuman = { beadId: "bd-152", askedAt: Date.now() };
-    const { deps, resolve } = reviewDeps(state, {
+    const { deps, resolve } = waitDeps(state, {
       kind: "unknown",
       reason: ".belayd/github-map.json: invalid JSON",
     });

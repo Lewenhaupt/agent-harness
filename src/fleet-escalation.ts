@@ -24,12 +24,11 @@
  *   consequence is that its members cannot proceed (the root checkout holds work the
  *   merge could not restore). The park timestamp is the round, so re-ticking the
  *   same park adopts the same gate while a genuine re-park opens a new one.
- * - **Withheld sensitive findings: deliberately not here.** They already escalate
- *   through the review gate's `belayd_ask_human` gate (`evaluateDeferredFindingsGate`,
- *   one gate per round, titled "sensitive findings (round N)"), so this planner opens
- *   no second gate for them: two gates for one condition would be two human channels.
- *   That is why the cause is absent from `FLEET_ESCALATION_CAUSES` below — the review
- *   gate stays the classifier and this module only presents stop and park causes.
+ * - **Sensitive findings: deliberately not here, and no longer anywhere.** bd-286
+ *   deleted the per-finding sensitivity classifier and its review gate; secrets are
+ *   `betterleaks`' job (`gateSecrets`, and `src/secret-scan.ts` refuses a flagged
+ *   outbound post instead of asking a person). So this module presents stop and park
+ *   causes only, and `FLEET_ESCALATION_CAUSES` has no sensitivity entry.
  *
  * What deliberately does **not** escalate: an ordering wait (the fleet resolves it
  * on landing), a capacity deferral (another fleet's slot frees itself), and a
@@ -74,9 +73,9 @@ import {
  * Every condition that opens an escalation gate.
  *
  * One vocabulary for everything this planner can emit: the seven stop reasons and a
- * parked fleet. Withheld sensitive findings are *not* here — the review gate's
- * ask-human gate is their one channel (see the module header) — and neither are
- * ordering, capacity, or quality-gate conditions, which a machine resolves.
+ * parked fleet. Sensitive findings are not here (bd-286 removed the classifier that
+ * escalated them, see the module header), and neither are ordering, capacity, or
+ * quality-gate conditions, which a machine resolves.
  */
 export const FLEET_ESCALATION_CAUSES = [...FLEET_RUN_STOP_REASONS, "fleet-parked"] as const;
 

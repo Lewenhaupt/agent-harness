@@ -43,6 +43,7 @@
     "lint": "biome check .",
     "lint:fix": "biome check --fix .",
     "dev:pi-web": "bash -c 'trap \"kill 0\" EXIT; pi-web-sessiond & pi-web-server & wait'",
+    "scan:secrets": "betterleaks dir . -c .betterleaks.toml --redact --no-banner --exit-code 1",
     "scotty": "scotty -p 7687"
   },
   "peerDependencies": {

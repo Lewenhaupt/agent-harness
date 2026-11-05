@@ -15,6 +15,7 @@ import {
 } from "../../src/owned-worktree.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
 import { RunStatus, setRunStatus, writeRunManifest } from "../../src/run-manifest.js";
+import { scanOutboundText, secretRefusalText, warnScanUnavailable } from "../../src/secret-scan.js";
 import {
   computeSubagentSessionName,
   generateShortRunId,
@@ -385,19 +386,34 @@ async function flagForHumanReview(taskId: string, cwd: string, deps: CommitDeps)
  * Deliverables go to the comment thread (authored + timestamped + ordered)
  * rather than the notes blob, which is reserved for the plan that later phase
  * prompts read back.
+ *
+ * The body is scanned first (bd-286): a comment that carries a credential is
+ * dropped with a warning naming the rule, never with the match. Best-effort like
+ * the append itself — the commit must not fail over a scan. The session is the
+ * warn-once budget for a scanner that cannot run.
  */
 async function appendTaskComment(options: {
   taskId: string;
   phase: PhaseCommentAuthor;
   content: string;
   cwd: string;
+  state: CoreSessionState;
 }): Promise<void> {
+  const body = phaseCommentBody(options.phase, options.content);
+  const scan = await scanOutboundText({ text: body, cwd: options.cwd });
+  if (!scan.ok && "rules" in scan) {
+    console.warn(
+      `[belayd-harness] dropped the ${options.phase} comment: ${secretRefusalText(scan.rules)}`,
+    );
+    return;
+  }
+  if (!scan.ok) warnScanUnavailable({ budget: options.state, reason: scan.unavailable });
   try {
     // Piping via `--stdin` keeps the body out of argv and avoids a temp file
     // that could leak if the process dies mid-append.
     await runBdCommand(["comment", "--stdin", "--", options.taskId], {
       cwd: options.cwd,
-      stdin: phaseCommentBody(options.phase, options.content),
+      stdin: body,
       timeoutInMs: 15_000,
       maxBufferInBytes: 1024 * 1024,
     });
@@ -527,6 +543,7 @@ async function appendPhaseDeliverables(
         report: state.userGuideContent,
       }),
       cwd,
+      state,
     });
   }
   if (state.proofVerifierVerdict) {
@@ -535,6 +552,7 @@ async function appendPhaseDeliverables(
       phase: "proof-verifier",
       content: state.proofVerifierVerdict,
       cwd,
+      state,
     });
   }
 }

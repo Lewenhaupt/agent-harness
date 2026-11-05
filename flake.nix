@@ -672,6 +672,11 @@
           # scripts/story.mjs hard-fails without ffmpeg (it renders the unslop
           # story video); nothing in the harness shells out to it otherwise.
           pkgs.ffmpeg
+          # Secret scanner (bd-286): the repo gate (`pnpm scan:secrets`) and the
+          # outbound-text scan in src/secret-scan.ts shell out to this binary.
+          # Agent shells reach it through pi-web-runtime-env, so adding it here
+          # covers the devShell and the service in one place.
+          pkgs.betterleaks
           # belayd_outline extraction backends: universal-ctags is the
           # multi-language symbol extractor (`ctags --output-format=json`, one
           # process per file set) and ast-grep supplies the structured

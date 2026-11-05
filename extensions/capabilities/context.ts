@@ -411,11 +411,9 @@ export interface CoreSessionState {
     answerCommentId?: string;
   };
   /**
-   * Set synchronously while a review gate is being opened, before its bd writes
-   * complete (bd-175). It reserves the wait so a second concurrent delivery
-   * cannot open a duplicate gate, but — unlike `awaitingHuman` — it must not be
-   * visible to the answer poll, because the gate does not exist yet and an empty
-   * gate list would read as "the human resolved it".
+   * Set synchronously while a review delivery is in flight, before its bd writes
+   * complete (bd-175). It reserves the round so two concurrent deliveries cannot
+   * both advance it; it never becomes `awaitingHuman`, because nothing waits.
    */
   reviewGatePending?: boolean;
   /**
@@ -451,6 +449,14 @@ export interface CoreSessionState {
    * cannot mute, or be muted by, a failed channel read.
    */
   harnessIdentityWarned?: boolean;
+  /**
+   * One-shot per session: the outbound secret scan is unavailable (bd-286).
+   *
+   * The budget lives in the session rather than in `src/secret-scan.ts` so the
+   * module stays stateless (AGENTS.md freezes the module-level-state list) and a
+   * later session can legitimately warn again after a rebuild.
+   */
+  secretScanWarned?: boolean;
   /**
    * Completion follow-ups held because an unanswered `ask_user` question set is
    * open (bd-177).

@@ -98,6 +98,31 @@ registered later. `/reload` and a web/API restart do not rebuild it. Tools-only
 extensions (exa, ast-grep, vision, plannotator, agent-browser) are picked up by
 the next session with no restart.
 
+## Binaries the harness shells out to (devShell)
+
+Some tools are not npm packages: the harness spawns them from PATH. They live in
+`devShellTools` in `flake.nix`, which feeds **both** `devShells.default` and
+`pi-web-runtime-env`, so one edit covers a terminal and a pi-web session.
+
+| Binary | Used by |
+|---|---|
+| `ctags`, `ast-grep` | `belayd_outline` symbol maps |
+| `git`, `bd`, `gh`, `wt` | worktrees, beads, GitHub answers, fleet merges |
+| `asciinema`, `ffmpeg`, `duckdb` | proof recordings, unslop story video, metrics queries |
+| `betterleaks` | `pnpm scan:secrets` (repo gate + pre-push hook) and the outbound text scan in `src/secret-scan.ts` |
+
+A new entry needs a **shell restart**, not a `/reload`: the tool must exist in
+the environment the extension's `execFile` inherits. For a pi-web session that
+means rebuilding the runtime env and restarting the session daemon:
+
+```bash
+nix build .#pi-web-runtime-env   # or: direnv reload / re-enter the devShell
+```
+
+`src/secret-scan.ts` degrades rather than wedging: if `betterleaks` is missing it
+warns once (`outbound secret scan is unavailable`) and posts anyway. The hard
+enforcement is the repo gate and the pre-push hook, not the outbound scan.
+
 ## Which pi binary a sub-agent gets
 
 `src/pi-binary.ts` resolves in this order and reports provenance:

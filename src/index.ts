@@ -1566,6 +1566,7 @@ export {
 export {
   gateFullValidation,
   gateLint,
+  gateSecrets,
   gateTests,
   gateTypecheck,
   gateUserGuide,

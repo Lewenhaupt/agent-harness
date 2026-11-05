@@ -404,6 +404,27 @@ export async function gateTests(
   });
 }
 
+/**
+ * Run the repo secret scan and return pass/fail (bd-286).
+ *
+ * Secrets are a scanner's job, so this is the same `betterleaks` invocation the
+ * pre-push hook runs (`.betterleaks.toml` holds the config and the ignore paths).
+ * A hit fails the gate with the scanner's own redacted report: it names the file,
+ * line and rule, never the secret.
+ */
+export async function gateSecrets(
+  _output: string,
+  _details: SpawnDetails,
+  options?: GateOptions,
+): Promise<GateResult> {
+  return runGateCommand({
+    label: "Secret scan",
+    command: "pnpm scan:secrets",
+    cwd: options?.cwd ?? process.cwd(),
+    timeoutInMs: options?.timeoutInMs ?? DEFAULT_TIMEOUT_MS,
+  });
+}
+
 /** Minimum content length for a user guide to be considered valid. */
 const MIN_USER_GUIDE_LENGTH = 200;
 
@@ -951,7 +972,7 @@ export async function gateStaticValidation(
   });
 }
 
-/** Combined quality gate: typecheck + lint + test. */
+/** Combined quality gate: typecheck + lint + test + secret scan. */
 export async function gateFullValidation(
   output: string,
   details: SpawnDetails,
@@ -965,6 +986,7 @@ export async function gateFullValidation(
       { name: "typecheck", gate: gateTypecheck },
       { name: "lint", gate: gateLint },
       { name: "tests", gate: gateTests },
+      { name: "secrets", gate: gateSecrets },
     ],
   });
 }

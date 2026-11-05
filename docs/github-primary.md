@@ -250,7 +250,7 @@ must not be duplicated here:
 | Concern | Owner |
 |---|---|
 | Close-on-merge and `mergedAt` acceptance (the human label's replacement in PR mode) | bd-174.4 / bd-174.10 / bd-174.12 |
-| PR body and deferred findings | bd-183 / bd-184 |
+| PR body | bd-184 (unbuilt) |
 | Token and credential boundary for GitHub access | bd-7 |
 
 The projection does not close beads itself. In PR mode the merge event is the

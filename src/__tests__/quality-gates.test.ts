@@ -26,8 +26,10 @@ import {
 } from "../proof-receipt.js";
 import {
   extractFailingLocations,
+  gateFullValidation,
   gateLint,
   gateProofContent,
+  gateSecrets,
   gateTests,
   gateTypecheck,
   gateUserGuide,
@@ -1676,6 +1678,76 @@ describe("quality gate command feedback", () => {
     expect(result.feedback).toContain("--- stdout ---");
     expect(result.feedback).toContain("Failing files:");
     expect(result.feedback).toContain("src/index.ts:174");
+  });
+
+  it("runs the repo secret scan over the tree (bd-286)", async () => {
+    const result = await gateSecrets("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toEqual({ passed: true });
+    expect(gateExec.state.calls).toHaveLength(1);
+    expect(gateExec.state.calls[0]?.command).toBe("pnpm scan:secrets");
+    expect(gateExec.state.calls[0]?.options).toHaveProperty("cwd", "/tmp/gate-cwd");
+  });
+
+  it("fails the secret gate with the scanner's redacted report on a hit (bd-286)", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm scan:secrets",
+      stdout: [
+        "Finding:     token = github_pat_11ABC****************",
+        "RuleID:      github-pat",
+        "File:        src/leaked.ts",
+        "Line:        12",
+      ].join("\n"),
+      code: 1,
+    });
+
+    const result = await gateSecrets("", MOCK_DETAILS, GATE_OPTIONS);
+
+    // The gate must fail on a hit, and the feedback must name the rule and the
+    // location without ever carrying the secret itself.
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("Secret scan failed (pnpm scan:secrets, exit 1):");
+    expect(result.feedback).toContain("github-pat");
+    expect(result.feedback).toContain("File:        src/leaked.ts");
+    expect(result.feedback).toContain("Line:        12");
+    // The gate passes the scanner's own report through; `--redact` (in the
+    // script it runs) is what keeps the secret out of it.
+    expect(result.feedback).toContain("RuleID:      github-pat");
+  });
+
+  it("composes the secret scan into gateFullValidation, in order (bd-286)", async () => {
+    // The gate sequence is the acceptance path: adding `gateSecrets` here is what
+    // makes a leaked credential fail the implement/fix loop, not just pre-push.
+    const result = await gateFullValidation("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toEqual({ passed: true });
+    expect(gateExec.state.calls.map((call) => call.command)).toEqual([
+      "pnpm typecheck",
+      "pnpm lint",
+      "pnpm test",
+      "pnpm scan:secrets",
+    ]);
+    for (const call of gateExec.state.calls) {
+      expect(call.options).toHaveProperty("cwd", "/tmp/gate-cwd");
+    }
+  });
+
+  it("fails gateFullValidation on a secret hit and names the secrets section (bd-286)", async () => {
+    gateExec.state.failure = gateFailure({
+      message: "Command failed: pnpm scan:secrets",
+      stdout: "RuleID:      github-pat\nFile:        src/leaked.ts\n",
+      code: 1,
+    });
+
+    const result = await gateFullValidation("", MOCK_DETAILS, GATE_OPTIONS);
+
+    expect(result).toHaveProperty("passed", false);
+    expect(result.feedback).toContain("### secrets");
+    expect(result.feedback).toContain("Secret scan failed (pnpm scan:secrets, exit 1):");
+    expect(result.feedback).toContain("github-pat");
+    // All four checks still run: a secret hit must not short-circuit the rest, so
+    // the retry sees every failure at once.
+    expect(gateExec.state.calls).toHaveLength(4);
   });
 
   it("returns stderr diagnostics for a stderr-only typecheck failure", async () => {

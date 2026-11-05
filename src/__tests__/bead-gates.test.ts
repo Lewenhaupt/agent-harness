@@ -197,15 +197,13 @@ describe("parseOpenHumanGate", () => {
     expect(parseOpenHumanGate([openHumanGate], "bd-159")).toBeUndefined();
   });
 
-  it("carries the title so a restart can classify the wait (bd-252)", () => {
-    // The publication gate is the only wait whose answer does not block phase
-    // tools, and its title marker is the only durable discriminator a restart has.
+  it("carries the gate title so a human can tell which wait is open", () => {
     expect(
       parseOpenHumanGate(
-        [{ ...openHumanGate, title: "belayd-review: bd-152 sensitive findings (round 1)" }],
+        [{ ...openHumanGate, title: "belayd: bd-152 needs a decision" }],
         "bd-152",
       ),
-    ).toMatchObject({ title: "belayd-review: bd-152 sensitive findings (round 1)" });
+    ).toMatchObject({ title: "belayd: bd-152 needs a decision" });
     expect(parseOpenHumanGate([{ ...openHumanGate, title: undefined }], "bd-152")).toEqual({
       gateId: "bd-159",
       createdAt: "2026-10-26T20:14:26Z",

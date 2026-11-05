@@ -267,22 +267,22 @@ The tick reads each member's bead for an open bd `human` gate
 **not** a wait: it writes `.belayd/review-findings.json` and posts the
 `[belayd:review]` comment as the workflow actor, then the member runs its own
 fix loop — so a post-review member reads `active`, exactly as the orchestrator
-is expected to proceed. The one review that still opens a gate is a
-security-class finding (bd-183), whose publication decision the orchestrator may
-not take. An unreadable gate read is "unknown", never a wait. `bd show`,
+is expected to proceed. No review opens a gate: the only human gate a workflow
+can open is `belayd_ask_human` (bd-286), and secrets are a scanner's job
+(`pnpm scan:secrets`). An unreadable gate read is "unknown", never a wait. `bd show`,
 `needs-you` views, and `bd ready` therefore agree with the fleet's own view; a
 clean review writes nothing and stays on the fast path.
 
-**Known gate limitation: a verb-lead bullet with a defect clause.** The finding
+**Known trigger limitation: a verb-lead bullet with a defect clause.** The finding
 trigger is lexical: a bullet that opens with a past-tense check verb
 (`checked`/`verified`/`tested`/`reviewed`) is narration and is not recorded, even
 when a `:`/`—` clause after it restates a present-tense defect (`- Checked: race
 in src/a.ts:5`). Separating that clause from an affirmation (`- Checked: all
-fine`) needs a defect lexicon, and a wrong guess *records a finding (and can gate
-on a security-class one) for nothing* — the failure the narration rule exists to
-prevent. The tradeoff is deliberate and pinned by tests (`parseReviewFindings`
-strict cases, `hasReviewFindings`); a defect should be written without the
-check-verb prefix. A narration bullet that cites a location still does not count,
+fine`) needs a defect lexicon, and a wrong guess *records and posts a finding for
+nothing* — the failure the narration rule exists to prevent. The tradeoff is
+deliberate and pinned by tests (`parseReviewFindings` strict cases,
+`hasReviewFindings`); a defect should be written without the check-verb prefix. A
+narration bullet that cites a location still does not count,
 whether its marker is bare, backticked, or markdown-emphasized (`**Verified**`,
 `__Checked__`).
 
