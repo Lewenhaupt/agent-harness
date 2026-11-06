@@ -80,6 +80,8 @@ export const FLEET_MEMBER_RELEASE_REASONS = [
   "run-complete",
   "run-halted",
   "operator-release",
+  // The member landed: the merge itself proves the slot is free (bd-168).
+  "merged",
 ] as const;
 
 export type FleetMemberReleaseReason = (typeof FLEET_MEMBER_RELEASE_REASONS)[number];
@@ -106,8 +108,29 @@ export const FLEET_RUN_GATE_NOTICE_IDS_MAX = 256;
  */
 export const FLEET_RUN_START_GRACE_MS = 120_000;
 
+/**
+ * Final phase assumed when a worktree has no state file to supply its order.
+ *
+ * One constant for the no-state completion rule: status and the run loop must not
+ * each decide what "the final phase" means when completion cleared the state
+ * (bd-168 W2/S2).
+ */
+export const FLEET_DEFAULT_FINAL_PHASE = "commit";
+
 /** Consecutive no-progress ticks before the loop stops with `stalled`. */
 export const FLEET_RUN_MAX_IDLE_TICKS = 240;
+
+/**
+ * Consecutive no-progress ticks a run may wait while every in-flight member is
+ * still renewing its orchestrator lease.
+ *
+ * A detached member can work inside one phase for longer than the ordinary cap,
+ * and its lease renewal is the only liveness evidence the loop has (bd-168 #4).
+ * This cap is deliberately far larger so a genuinely healthy member is not halted
+ * at the tick count that means "nothing changed", but not unbounded: a lease could
+ * be renewed by a stuck loop, so the run must still end eventually.
+ */
+export const FLEET_RUN_MAX_LIVE_IDLE_TICKS = FLEET_RUN_MAX_IDLE_TICKS * 8;
 
 /**
  * Consecutive no-progress ticks a live human wait may hold the run before it
@@ -421,6 +444,41 @@ function newestRun(runs: readonly RunManifest[]): RunManifest | undefined {
   })[0];
 }
 
+/** The final phase name for a member with no state file. */
+export function fleetFinalPhase(phaseOrder: readonly string[] | undefined): string {
+  if (phaseOrder === undefined || phaseOrder.length === 0) return FLEET_DEFAULT_FINAL_PHASE;
+  return phaseOrder[phaseOrder.length - 1] ?? FLEET_DEFAULT_FINAL_PHASE;
+}
+
+/**
+ * What a state-less worktree's run manifests say about its completion.
+ *
+ * ONE rule for status and the tick (bd-168 W2). The **newest** run decides: a
+ * completed final-phase run is finished work, but a later failed re-run is not —
+ * the earlier completion is not a licence to land work the run itself refuses.
+ */
+export type MissingStateRunVerdict =
+  | { kind: "none" }
+  | { kind: "complete" }
+  | { kind: "failed"; run: RunManifest }
+  | { kind: "running"; run: RunManifest };
+
+export function missingStateRunVerdict(options: {
+  runs: readonly RunManifest[];
+  phaseOrder?: readonly string[];
+}): MissingStateRunVerdict {
+  const newest = newestRun(options.runs);
+  if (newest === undefined) return { kind: "none" };
+  if (
+    newest.phase === fleetFinalPhase(options.phaseOrder) &&
+    newest.status === RunStatus.Completed
+  ) {
+    return { kind: "complete" };
+  }
+  if (newest.status === RunStatus.Failed) return { kind: "failed", run: newest };
+  return { kind: "running", run: newest };
+}
+
 /** Latest run per phase, used to decide whether a pending phase already failed. */
 function latestPerPhase(runs: readonly RunManifest[]): RunManifest[] {
   const byPhase = new Map<string, RunManifest>();
@@ -541,10 +599,11 @@ export function fleetMemberBranch(taskId: string): string {
  * Whether a member's worktree provably existed (bd-233).
  *
  * The capacity leak this closes: a member whose worktree was deleted used to be
- * classified `unknown` forever, and `unknown` holds a slot. Two facts prove the
+ * classified `unknown` forever, and `unknown` holds a slot. Three facts prove the
  * tree existed even when no path resolves now — a local branch of this member
- * still exists (removing a worktree does not delete its branch), or git still
- * lists a worktree for it.
+ * still exists (removing a worktree does not delete its branch), git still lists a
+ * worktree for it, or the run recorded landing it (bd-168: a clean landing removes
+ * both the tree and the branch, so the landing record is the only proof left).
  *
  * Injected booleans, never a probe: the caller reads them through the git seam it
  * already has (launch, status, reconcile) and this module stays free of git.
@@ -566,9 +625,20 @@ export function memberWorktreeExisted(options: {
   worktreeListed: boolean;
   /** A spawn marker for this member is still inside its grace window. */
   spawnInFlight: boolean;
+  /**
+   * When the fleet's run recorded merging this member (bd-168).
+   *
+   * A landing is positive evidence that a worktree existed even after the merge
+   * removed both the tree and the branch — the one proof a clean landing leaves
+   * behind, and what makes a landed-but-worktreeless member `absent` (prunable)
+   * instead of `unknown` (counted forever).
+   */
+  landedAt?: number;
 }): boolean {
   if (options.taskId === "") return false;
-  if (!options.branchExists && !options.worktreeListed) return false;
+  if (!options.branchExists && !options.worktreeListed && options.landedAt === undefined) {
+    return false;
+  }
   return !options.spawnInFlight;
 }
 
@@ -712,28 +782,34 @@ function progressFromWorkflow(
  * final-phase run is finished work; no runs at all is a member that never started.
  */
 function progressFromMissingState(options: DeriveFleetMemberProgressOptions): FleetMemberProgress {
-  const order = options.phaseOrder ?? [];
-  const finalPhase = order.length > 0 ? order[order.length - 1] : "commit";
-  const newest = newestRun(options.runs);
-  if (newest === undefined) {
-    const grace = options.startGraceInMs ?? FLEET_RUN_START_GRACE_MS;
-    const withinGrace =
-      options.launchedAt !== undefined && options.now - options.launchedAt < grace;
-    return withinGrace
-      ? { kind: "starting", detail: "launched, no phase has started yet" }
-      : { kind: "missing", detail: "no workflow state and no phase runs" };
+  const verdict = missingStateRunVerdict({
+    runs: options.runs,
+    ...(options.phaseOrder === undefined ? {} : { phaseOrder: options.phaseOrder }),
+  });
+  switch (verdict.kind) {
+    case "none": {
+      const grace = options.startGraceInMs ?? FLEET_RUN_START_GRACE_MS;
+      const withinGrace =
+        options.launchedAt !== undefined && options.now - options.launchedAt < grace;
+      return withinGrace
+        ? { kind: "starting", detail: "launched, no phase has started yet" }
+        : { kind: "missing", detail: "no workflow state and no phase runs" };
+    }
+    case "complete":
+      return { kind: "complete" };
+    case "failed":
+      return {
+        kind: "phase-failed",
+        detail: describeFailure(verdict.run),
+        key: `failed:${verdict.run.phase}`,
+      };
+    case "running":
+      return {
+        kind: "running",
+        detail: `no workflow state; newest run is ${verdict.run.phase} (${verdict.run.status})`,
+        key: `newest:${verdict.run.phase}:${verdict.run.status}`,
+      };
   }
-  if (newest.phase === finalPhase && newest.status === RunStatus.Completed) {
-    return { kind: "complete" };
-  }
-  if (newest.status === RunStatus.Failed) {
-    return { kind: "phase-failed", detail: describeFailure(newest), key: `failed:${newest.phase}` };
-  }
-  return {
-    kind: "running",
-    detail: `no workflow state; newest run is ${newest.phase} (${newest.status})`,
-    key: `newest:${newest.phase}:${newest.status}`,
-  };
 }
 
 // ── Orchestrator liveness as the loop sees it ─────────────────────────
@@ -750,6 +826,15 @@ export interface FleetMemberObservation {
   taskId: string;
   progress: FleetMemberProgress;
   claim: FleetMemberClaim;
+  /**
+   * When the live orchestrator lease was last renewed (bd-168).
+   *
+   * Only set when the lease probe classified the lease `live`; it is liveness
+   * evidence, not progress, so it never enters a member's progress signature. The
+   * stall decision reads it separately to tell "nobody is progressing" from
+   * "the supervisor is not ticking".
+   */
+  leaseHeartbeatAt?: number;
   /**
    * Whether this member's bead had an open bd `human` gate when the tick read it
    * (bd-219). The observation is the only place the gate read lands, so the plan
@@ -1090,22 +1175,23 @@ function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): 
   const otherMembers = members.filter((taskId) => !humanWaitIds.has(taskId));
 
   const maxIdle = options.maxIdleTicks ?? FLEET_RUN_MAX_IDLE_TICKS;
+  const maxLiveIdle = FLEET_RUN_MAX_LIVE_IDLE_TICKS;
   const maxHumanIdle = options.maxHumanIdleTicks ?? FLEET_RUN_MAX_HUMAN_WAIT_TICKS;
   const idleTicks = options.idleTicks ?? 0;
+  const byTask = new Map(options.observations.map((entry) => [entry.taskId, entry]));
 
   // A hung running member must still stall even while a sibling waits on a human:
   // exempting the whole run would hide a stuck phase behind an unrelated decision.
   if (otherMembers.length > 0 && idleTicks >= maxIdle) {
-    const humanClause =
-      humanWait.length === 0 ? "" : `; ${formatTaskIdList(humanWait)} awaiting a human response`;
-    return {
-      kind: "halt",
-      reason: "stalled",
-      detail: boundRunDetail(
-        `no member progressed for ${idleTicks} ticks (cap ${maxIdle}); ` +
-          `${formatTaskIdList(otherMembers)} still in flight${humanClause}`,
-      ),
-    };
+    return stallOrLiveWait({
+      members: otherMembers,
+      humanWait,
+      byTask,
+      idleTicks,
+      maxIdle,
+      maxLiveIdle,
+      now: options.now,
+    });
   }
 
   if (humanWait.length > 0) {
@@ -1130,18 +1216,95 @@ function idleOrWait(options: PlanFleetTickOptions, members: readonly string[]): 
   }
 
   if (idleTicks >= maxIdle) {
-    // Both counters and the stuck members, because the durable line is all a human
-    // sees later: it must say how long nothing moved, and on whom.
+    return stallOrLiveWait({
+      members,
+      humanWait: [],
+      byTask,
+      idleTicks,
+      maxIdle,
+      maxLiveIdle,
+      now: options.now,
+    });
+  }
+  return { kind: "wait", detail: `${members.length} member(s) in flight: ${members.join(", ")}` };
+}
+
+/**
+ * The cap decision for one set of in-flight members that made no progress.
+ *
+ * A fresh lease is the member's own session saying it is still alive, so the
+ * ordinary cap must not halt while every member in this set has one; the larger
+ * live cap still ends a lease-renewing loop. The halt line always states each
+ * member's lease evidence, so it never claims a member is stuck while its lease is
+ * fresh (bd-168 #4).
+ */
+function stallOrLiveWait(options: {
+  members: readonly string[];
+  humanWait: readonly string[];
+  byTask: ReadonlyMap<string, FleetMemberObservation>;
+  idleTicks: number;
+  maxIdle: number;
+  maxLiveIdle: number;
+  now: number;
+}): FleetTickAction {
+  const leaseEvidence = formatLeaseEvidence({
+    members: options.members,
+    byTask: options.byTask,
+    now: options.now,
+  });
+  const everyLive = options.members.every((taskId) => hasFreshLease(options.byTask.get(taskId)));
+  const humanClause =
+    options.humanWait.length === 0
+      ? ""
+      : `; ${formatTaskIdList(options.humanWait)} awaiting a human response`;
+  if (everyLive && options.idleTicks < options.maxLiveIdle) {
     return {
-      kind: "halt",
-      reason: "stalled",
+      kind: "wait",
       detail: boundRunDetail(
-        `no member progressed for ${idleTicks} ticks (cap ${maxIdle}); ` +
-          `${formatTaskIdList(members)} still in flight`,
+        `the supervisor is ticking; no member progressed for ${options.idleTicks} ticks ` +
+          `(stall cap ${options.maxIdle}, live cap ${options.maxLiveIdle}); ` +
+          `${formatTaskIdList(options.members)} still in flight and renewing a lease ` +
+          `(${leaseEvidence})${humanClause}`,
       ),
     };
   }
-  return { kind: "wait", detail: `${members.length} member(s) in flight: ${members.join(", ")}` };
+  return {
+    kind: "halt",
+    reason: "stalled",
+    detail: boundRunDetail(
+      `no member progressed for ${options.idleTicks} ticks (cap ${
+        everyLive ? options.maxLiveIdle : options.maxIdle
+      }); ${formatTaskIdList(options.members)} still in flight (${leaseEvidence})${humanClause}`,
+    ),
+  };
+}
+
+/** Whether an observation carries a live lease heartbeat (never merely a claim). */
+function hasFreshLease(observation: FleetMemberObservation | undefined): boolean {
+  return observation?.leaseHeartbeatAt !== undefined;
+}
+
+/**
+ * Lease evidence for a stall line: `bd-1 fresh 12s, bd-2 no live lease`.
+ *
+ * The stall line must not claim members are stuck while their leases are fresh,
+ * so every halt states which members had one and how old it was. An absent
+ * heartbeat can be either "no live lease" or "not observed"; both are the same
+ * actionable fact here (there is no liveness proof), so one wording is honest.
+ */
+function formatLeaseEvidence(options: {
+  members: readonly string[];
+  byTask: ReadonlyMap<string, FleetMemberObservation>;
+  now: number;
+}): string {
+  return options.members
+    .map((taskId) => {
+      const heartbeatAt = options.byTask.get(taskId)?.leaseHeartbeatAt;
+      if (heartbeatAt === undefined) return `${taskId} no live lease`;
+      const ageSeconds = Math.max(0, Math.floor((options.now - heartbeatAt) / 1000));
+      return `${taskId} lease fresh ${ageSeconds}s`;
+    })
+    .join(", ");
 }
 
 /**

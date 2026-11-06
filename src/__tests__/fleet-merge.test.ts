@@ -965,6 +965,7 @@ async function drain(
 describe("drainFleetMerge: the documented merge sequence", () => {
   it("rebases, gates, fast-forwards the root, broadcasts, and releases the lock", async () => {
     const fixture = createFixtureRepo();
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
     enqueue(fixture);
     const gate = gateSpy();
     const commands: string[][] = [];
@@ -979,8 +980,12 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     if (!result.ok) return;
     expect(result.taskId).toBe("bd-12");
     expect(result.mergeCommit).toBe(git(fixture.root, ["rev-parse", "HEAD"]));
-    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(
-      git(fixture.memberPath, ["rev-parse", "feat/bd-12"]),
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+    // A successful drain now honours the documented removal (bd-168 #3).
+    expect(existsSync(fixture.memberPath)).toBe(false);
+    expect(git(fixture.root, ["branch", "--list", "feat/bd-12"])).toBe("");
+    expect(result.text).toContain(
+      `removed worktree ${fixture.memberPath} and merged branch feat/bd-12`,
     );
 
     // Gates ran against the rebased member worktree, in the project's order.
@@ -1024,6 +1029,51 @@ describe("drainFleetMerge: the documented merge sequence", () => {
 
     // The report states the bead is not closed.
     expect(result.text).toContain("merging is not closing");
+  });
+
+  it("records a merged member's landing release (bd-168)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", true);
+    const loaded = readFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) throw new Error("intent unreadable");
+    expect(loaded.intent.released).toContainEqual({
+      taskId: "bd-12",
+      reason: "merged",
+      at: expect.any(Number),
+    });
+    expect(auditActions(fixture)).toContain("member-merged-released");
+  });
+
+  it("reports a refused worktree removal without failing the drain (bd-168)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const refusing: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "worktree" && argv[1] === "remove") {
+        return {
+          ok: false,
+          error: "fatal: working tree is dirty",
+          stdout: "",
+          stderr: "fatal: working tree is dirty",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: refusing });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(existsSync(fixture.memberPath)).toBe(true);
+    expect(result.text).toContain(`kept worktree ${fixture.memberPath}`);
+    expect(result.text).toContain(`git worktree remove ${fixture.memberPath}`);
+    expect(result.warnings.join("\n")).toContain("could not remove");
   });
 
   it("does not mutate this repository: a full merge run changes only the fixture", async () => {
@@ -1375,6 +1425,9 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
   }
 
   function assertNoRebaseLeft(fixture: FixtureRepo): void {
+    // A successful drain removes the worktree, so there is no rebase state left to
+    // inspect (bd-168); the removal itself is asserted by the sequence test.
+    if (!existsSync(fixture.memberPath)) return;
     expect(existsSync(rebaseStatePath(fixture.memberPath))).toBe(false);
     expect(git(fixture.memberPath, ["status", "--porcelain"])).toBe("");
   }
@@ -1479,10 +1532,9 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(regenerations).toEqual([{ paths: ["pnpm-lock.yaml"], installRequired: true }]);
     // The rebased member branch carries the base's lockfile; the member's lockfile
     // commit became empty and git dropped it during the continue, which is the
-    // honest outcome of regenerating that change wholesale.
-    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(
-      git(fixture.memberPath, ["rev-parse", "feat/bd-12"]),
-    );
+    // honest outcome of regenerating that change wholesale. The successful drain
+    // then removed the member branch, so the base HEAD is the landing itself.
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(result.mergeCommit);
     expect(git(fixture.root, ["rev-parse", "HEAD"])).not.toBe(memberSha);
     expect(git(fixture.root, ["log", "-1", "--format=%s"])).toBe("member bd-12");
     expect(git(fixture.root, ["show", "HEAD:pnpm-lock.yaml"])).toBe("lockfileVersion: 3");
@@ -1827,6 +1879,218 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(noteRecipients(fixture, "rebase-hint")).toEqual(["bd-15"]);
     expect(auditDetails(fixture, "rebase-hint")[0]).toContain("the merge commit was unreadable");
     expect(result.warnings.join("\n")).toContain("every remaining member was sent a rebase-hint");
+
+    // The base moved, so the landed-then-threw arm must still free the slot and
+    // clean up the tree (bd-168 W1), exactly like the clean success arm.
+    const loaded = readFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) throw new Error("intent unreadable");
+    expect(loaded.intent.released).toContainEqual({
+      taskId: "bd-12",
+      reason: "merged",
+      at: expect.any(Number),
+    });
+    expect(auditActions(fixture)).toContain("member-merged-released");
+    expect(existsSync(fixture.memberPath)).toBe(false);
+    expect(git(fixture.root, ["branch", "--list", "feat/bd-12"])).toBe("");
+
+    // Re-entering the drain after the landed arm is a no-op, not a second release
+    // or audit entry.
+    const again = await drain(fixture, { runGate: gateSpy().runGate });
+    expect(again).toHaveProperty("ok", false);
+    expect(
+      auditActions(fixture).filter((action) => action === "member-merged-released"),
+    ).toHaveLength(1);
+    const after = readFleetIntent({ gitCommonDir: fixture.commonDir, fleetId: fixture.fleetId });
+    if (!after.ok || after.intent === undefined) throw new Error("intent unreadable");
+    expect((after.intent.released ?? []).filter((entry) => entry.taskId === "bd-12")).toHaveLength(
+      1,
+    );
+  });
+
+  it("reports cleanup honestly when branch deletion throws after removal (bd-168 W4)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        throw new Error("branch seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(existsSync(fixture.memberPath)).toBe(false);
+    expect(result.text).toContain("cleanup did not finish (branch seam exploded)");
+    expect(result.text).toContain(`worktree ${fixture.memberPath} is gone`);
+    expect(result.text).toContain("branch feat/bd-12 still exists");
+    expect(result.text).not.toContain("kept worktree");
+    expect(result.warnings.join("\n")).toContain("cleanup did not finish");
+  });
+
+  it("reports an unverifiable branch probe as unknown, never as gone (bd-168 W1)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "for-each-ref") {
+        return {
+          ok: false,
+          error: "fatal: not a git repository",
+          stdout: "",
+          stderr: "fatal: not a git repository",
+        };
+      }
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        throw new Error("branch seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.text).toContain("branch feat/bd-12 state is unknown");
+    expect(result.text).not.toContain("branch feat/bd-12 is gone");
+  });
+
+  it("reports a branch that disappeared as already gone, not kept (bd-168 S1)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    let probes = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "for-each-ref") {
+        probes += 1;
+        // The first probe cannot answer, so the drain tries the delete; the re-probe
+        // after the refusal is a successful query that finds no ref: absence (bd-168 R3).
+        return probes === 1
+          ? { ok: false, error: "probe failed", stdout: "", stderr: "probe failed" }
+          : { ok: true, stdout: "", stderr: "" };
+      }
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        return {
+          ok: false,
+          error: "error: branch 'feat/bd-12' not found",
+          stdout: "",
+          stderr: "error: branch 'feat/bd-12' not found.",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.text).toContain("branch feat/bd-12 was already gone");
+    expect(result.text).not.toContain("kept branch");
+  });
+
+  it("classifies a refusal by the re-probe, not by a 'not found' branch name (bd-168 R3 W1)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      // The real probe keeps answering "present": the branch is still there, whatever
+      // git's refusal message happens to say about it.
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        return {
+          ok: false,
+          error: "error: Cannot delete branch",
+          stdout: "",
+          stderr: "error: Cannot delete branch 'feat/not found hack' checked out at somewhere",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.text).toContain("kept branch feat/bd-12");
+    expect(result.text).not.toContain("was already gone");
+    expect(git(fixture.root, ["branch", "--list", "feat/bd-12"])).not.toBe("");
+  });
+
+  it("reports an unanswered re-probe after a refusal as unverified (bd-168 R3 W1)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    let probes = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "for-each-ref") {
+        probes += 1;
+        return probes === 1
+          ? { ok: true, stdout: "refs/heads/feat/bd-12\n", stderr: "" }
+          : {
+              ok: false,
+              error: "fatal: not a git repository",
+              stdout: "",
+              stderr: "fatal: not a git repository",
+            };
+      }
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        return {
+          ok: false,
+          error: "error: Cannot delete branch",
+          stdout: "",
+          stderr: "error: Cannot delete branch 'feat/bd-12' checked out at somewhere",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.text).toContain("branch feat/bd-12 may still exist");
+    expect(result.text).not.toContain("was already gone");
+    expect(result.text).not.toContain("kept branch");
+  });
+
+  it("reports a real branch-delete refusal as kept (bd-168 S1)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "branch" && argv[1] === "-d") {
+        return {
+          ok: false,
+          error: "error: Cannot delete branch checked out",
+          stdout: "",
+          stderr: "error: Cannot delete branch 'feat/bd-12' checked out at somewhere",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(result.text).toContain("kept branch feat/bd-12");
+    expect(result.text).not.toContain("was already gone");
+  });
+
+  it("does not leave a phantom release for an already-pruned member (bd-168 S3)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture, "bd-12");
+    // Another operator pruned bd-12 from the fleet before this manual drain.
+    writeFleetIntent(fixture.commonDir, fixture.fleetId, ["bd-15"]);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", true);
+    const loaded = readFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) throw new Error("intent unreadable");
+    expect(loaded.intent.released).toBeUndefined();
+    expect(auditActions(fixture)).not.toContain("member-merged-released");
   });
 
   it("reports a finisher throw after the merge as landed, never as failed (bd-280 WF)", async () => {
@@ -2389,6 +2653,7 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     const fixture = createFixtureRepo();
     const decoy = createFixtureRepo();
     const decoyHead = git(decoy.root, ["rev-parse", "HEAD"]);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
     enqueue(fixture);
 
     const saved = process.env.GIT_DIR;
@@ -2402,9 +2667,7 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     }
 
     expect(result).toHaveProperty("ok", true);
-    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(
-      git(fixture.memberPath, ["rev-parse", "feat/bd-12"]),
-    );
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
     // The decoy repository the poisoned env pointed at was never touched.
     expect(git(decoy.root, ["rev-parse", "HEAD"])).toBe(decoyHead);
   });
@@ -2615,16 +2878,10 @@ describe("drainFleetMerge: publish payload guard (bd-181)", () => {
     const result = await drain(fixture, { runGate: gateSpy().runGate });
 
     expect(result).toHaveProperty("ok", true);
-    // The receipt itself was never carried: the merged root has no receipt file
-    // and the member's own receipt survived untouched next to the worktree.
+    // The receipt itself was never carried: the merged root has no receipt file,
+    // and the successful drain removed the member worktree (bd-168 #3).
     expect(existsSync(join(fixture.root, ".belayd", "proof-receipt.json"))).toBe(false);
-    expect(
-      JSON.parse(readFileSync(join(fixture.memberPath, ".belayd", "proof-receipt.json"), "utf8")),
-    ).toStrictEqual({
-      version: 1,
-      taskId: "bd-12",
-      url: "https://proof.example.com/uploads/bd-12",
-    });
+    expect(existsSync(fixture.memberPath)).toBe(false);
   });
 
   it("refuses a payload that commits the receipt file itself", async () => {

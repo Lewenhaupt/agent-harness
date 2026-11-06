@@ -1095,6 +1095,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
    */
   interface FleetRunEvidence {
     launches: ReadonlyMap<string, number>;
+    /**
+     * Members the run recorded landing (bd-168).
+     *
+     * A clean landing removes both the worktree and the branch, which used to
+     * destroy every proof the member ever existed; the run's own landing record is
+     * the positive evidence that makes it `absent` (prunable) instead of `unknown`
+     * (counted forever).
+     */
+    landings: ReadonlyMap<string, number>;
   }
 
   function recordedRunEvidence(options: {
@@ -1102,16 +1111,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
     fleetId: string;
   }): FleetRunEvidence {
     const launches = new Map<string, number>();
-    if (options.gitCommonDir === undefined) return { launches };
+    const landings = new Map<string, number>();
+    if (options.gitCommonDir === undefined) return { launches, landings };
     const loaded = readFleetIntent({
       gitCommonDir: options.gitCommonDir,
       fleetId: options.fleetId,
     });
-    if (!loaded.ok || loaded.intent === undefined) return { launches };
+    if (!loaded.ok || loaded.intent === undefined) return { launches, landings };
     for (const member of loaded.intent.run?.members ?? []) {
       launches.set(member.taskId, member.launchedAt);
+      if (member.landedAt !== undefined) landings.set(member.taskId, member.landedAt);
     }
-    return { launches };
+    return { launches, landings };
   }
 
   /** The per-member evidence a liveness verdict is built from, derived once (bd-166/bd-233). */
@@ -1194,12 +1205,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       },
       worktreeExistedFor: (fleetId: string, taskId: string): boolean => {
         // A *listed* worktree is the proof even when its directory was deleted; the
-        // branch is what a completed removal leaves behind (bd-233 W1).
+        // branch is what a completed removal leaves behind (bd-233 W1), and a run's
+        // recorded landing is the proof a clean removal leaves behind (bd-168).
         const listed = resolveFor(taskId).path !== undefined;
+        const landedAt = evidenceFor(fleetId).landings.get(taskId);
         return memberWorktreeExisted({
           taskId,
           branchExists: listed || branchExists(options.ctx.cwd, fleetMemberBranch(taskId)),
           worktreeListed: listed,
+          ...(landedAt === undefined ? {} : { landedAt }),
           // The window is this member's own spawn marker, never a fleet-record stamp:
           // `intent.updatedAt` is rewritten by every tick, so it would hold every
           // member of a running fleet `unknown` forever (bd-233 review round 2).
@@ -1372,6 +1386,29 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
   }
 
+  /** The workflow progress snapshot for a (possibly missing) persisted state. */
+  function workflowProgressSnapshot(
+    state: ReturnType<typeof readWorkflowState>,
+  ): FleetWorkflowProgressSnapshot {
+    if (state === undefined) return { kind: "missing" };
+    return {
+      kind: "ok",
+      completedPhaseNames: state.completedPhaseNames,
+      phaseOrder: state.phaseOrder,
+    };
+  }
+
+  function memberClaimOf(probe: ReturnType<typeof leaseProbeFor>): FleetMemberClaim {
+    switch (probe.state) {
+      case "live":
+        return "live";
+      case "corrupt":
+        return "corrupt";
+      default:
+        return probe.state;
+    }
+  }
+
   /** Read one member's workflow progress and orchestrator lease from its worktree. */
   async function observeFleetMember(options: {
     cwd: string;
@@ -1402,14 +1439,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       state === undefined
         ? false
         : await readMemberHumanGate({ taskId: options.taskId, worktreePath });
-    const workflow: FleetWorkflowProgressSnapshot =
-      state === undefined
-        ? { kind: "missing" }
-        : {
-            kind: "ok",
-            completedPhaseNames: state.completedPhaseNames,
-            phaseOrder: state.phaseOrder,
-          };
+    const workflow = workflowProgressSnapshot(state);
     const progress = deriveFleetMemberProgress({
       taskId: options.taskId,
       workflow,
@@ -1420,9 +1450,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
       humanGateOpen,
     });
     const probe = leaseProbeFor(worktreePath, options.now);
-    const claim: FleetMemberClaim =
-      probe.state === "live" ? "live" : probe.state === "corrupt" ? "corrupt" : probe.state;
-    return { taskId: options.taskId, progress, claim, humanGateOpen, ...launched };
+    const claim = memberClaimOf(probe);
+    return {
+      taskId: options.taskId,
+      progress,
+      claim,
+      humanGateOpen,
+      ...(probe.state === "live" ? { leaseHeartbeatAt: probe.heartbeatAt } : {}),
+      ...launched,
+    };
   }
 
   /**
@@ -5260,49 +5296,120 @@ export function createFleet(deps: FleetDeps): FleetApi {
     );
   }
 
-  /** A release request's decision, or the refusal text (bd-166). */
-  function planFleetRelease(options: { ctx: ExtensionContext; taskId: string }):
+  type ReleaseTarget =
+    | { ok: true; mode: FleetMode; recovery?: SupervisorRecovery }
+    | { ok: false; text: string };
+
+  /**
+   * Which fleet a release targets, and whether it needs recovery authority.
+   *
+   * The session's own fleet needs no more than its live supervisor. A named foreign
+   * fleet needs that fleet's supervisor to be provably dead; a live one keeps the
+   * refusal because it owns that capacity decision.
+   */
+  function resolveReleaseTarget(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    fleetId: string | undefined;
+  }): ReleaseTarget {
+    const requested =
+      options.fleetId === undefined || options.fleetId.trim() === ""
+        ? undefined
+        : sanitizeFleetId(options.fleetId.trim());
+    const own = fleetModeFor(options.ctx);
+    if (requested === undefined || requested === own?.fleetId) {
+      return own === undefined
+        ? { ok: false, text: fleetSupervisorOnly("belayd_fleet_release") }
+        : { ok: true, mode: own };
+    }
+    const common = gitCommonDirFor(options.ctx.cwd);
+    if (!common.ok) {
+      return { ok: false, text: `Fleet release needs a git repository: ${common.error}` };
+    }
+    const target = fleetModeForId({ gitCommonDir: common.gitCommonDir, fleetId: requested });
+    if (target === undefined) {
+      return { ok: false, text: `No fleet intent for \`${requested}\`; nothing to release.` };
+    }
+    const recovery = supervisorRecoveryFor({
+      gitCommonDir: common.gitCommonDir,
+      fleetId: requested,
+      now: Date.now(),
+    });
+    if (recovery === undefined) {
+      return {
+        ok: false,
+        text:
+          `Fleet release refused: ${options.taskId} is a member of fleet \`${requested}\`, ` +
+          "whose supervisor is not provably dead. Only that fleet's live supervisor (or the " +
+          `operator once its supervisor is provably dead) may give its capacity back.`,
+      };
+    }
+    return { ok: true, mode: target, recovery };
+  }
+
+  type ReleasePlan =
     | {
         ok: true;
         mode: FleetMode;
         taskId: string;
         already: boolean;
         liveness: FleetMemberLiveness;
+        recovery?: SupervisorRecovery;
       }
-    | { ok: false; text: string } {
-    const mode = fleetModeFor(options.ctx);
-    if (mode === undefined) {
-      return { ok: false, text: fleetSupervisorOnly("belayd_fleet_release") };
-    }
-    const taskId = options.taskId.trim();
+    | { ok: false; text: string };
+
+  type ReleaseMembership = { ok: true; already: boolean } | { ok: false; text: string };
+
+  /** Read the target intent and confirm the id is a member, and whether it is released. */
+  function releaseMembership(options: { mode: FleetMode; taskId: string }): ReleaseMembership {
     const loaded = readFleetIntent({
-      gitCommonDir: mode.gitCommonDir,
-      fleetId: mode.fleetId,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
     });
     if (!loaded.ok) {
       return { ok: false, text: `Could not read the fleet intent: ${loaded.error}` };
     }
     if (loaded.intent === undefined) {
-      return { ok: false, text: `No fleet intent for \`${mode.fleetId}\`; nothing to release.` };
+      return {
+        ok: false,
+        text: `No fleet intent for \`${options.mode.fleetId}\`; nothing to release.`,
+      };
     }
-    if (!loaded.intent.taskIds.includes(taskId)) {
+    if (!loaded.intent.taskIds.includes(options.taskId)) {
       return {
         ok: false,
         text:
-          `${taskId} is not a member of fleet \`${mode.fleetId}\`; its members are ` +
+          `${options.taskId} is not a member of fleet \`${options.mode.fleetId}\`; its members are ` +
           `${loaded.intent.taskIds.join(", ") || "(none)"}`,
       };
     }
-    if ((loaded.intent.released ?? []).some((entry) => entry.taskId === taskId)) {
+    return {
+      ok: true,
+      already: (loaded.intent.released ?? []).some((entry) => entry.taskId === options.taskId),
+    };
+  }
+
+  /** Validate one member of a resolved target fleet and classify its liveness. */
+  function releaseMemberPlan(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    recovery: SupervisorRecovery | undefined;
+  }): ReleasePlan {
+    const { ctx, mode, taskId, recovery } = options;
+    const membership = releaseMembership({ mode, taskId });
+    if (!membership.ok) return membership;
+    if (membership.already) {
       return {
         ok: true,
         mode,
         taskId,
         already: true,
         liveness: { kind: "unknown", reason: "already released" },
+        ...(recovery === undefined ? {} : { recovery }),
       };
     }
-    const liveness = memberLivenessProbe(options.ctx, mode.gitCommonDir)(mode.fleetId, taskId);
+    const liveness = memberLivenessProbe(ctx, mode.gitCommonDir)(mode.fleetId, taskId);
     // The same evidence reconcile trusts: a live lease (or a member argv token)
     // means something is really running, and releasing it out from under itself
     // would let the next fleet start a fourth orchestrator.
@@ -5315,7 +5422,38 @@ export function createFleet(deps: FleetDeps): FleetApi {
           "released out from under itself.",
       };
     }
-    return { ok: true, mode, taskId, already: false, liveness };
+    return {
+      ok: true,
+      mode,
+      taskId,
+      already: false,
+      liveness,
+      ...(recovery === undefined ? {} : { recovery }),
+    };
+  }
+
+  /**
+   * A release request's decision, or the refusal text (bd-166, bd-168).
+   *
+   * A member of another fleet may be released when that fleet's supervisor is
+   * provably dead. Without that escape the only way to clear a dead fleet's slot
+   * was a hand edit of `fleet.json`; a live foreign supervisor keeps today's
+   * refusal, because it owns that capacity decision.
+   */
+  function planFleetRelease(options: {
+    ctx: ExtensionContext;
+    taskId: string;
+    fleetId?: string;
+  }): ReleasePlan {
+    const taskId = options.taskId.trim();
+    const target = resolveReleaseTarget({ ctx: options.ctx, taskId, fleetId: options.fleetId });
+    if (!target.ok) return target;
+    return releaseMemberPlan({
+      ctx: options.ctx,
+      mode: target.mode,
+      taskId,
+      recovery: target.recovery,
+    });
   }
 
   /**
@@ -5354,6 +5492,27 @@ export function createFleet(deps: FleetDeps): FleetApi {
       },
     });
     return written.ok ? { ok: true, released } : { ok: false, error: written.error };
+  }
+
+  /** Audit a written release, naming the recovery authority when it was used. */
+  function auditFleetRelease(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    recovery: SupervisorRecovery | undefined;
+  }): void {
+    auditFleetAction({
+      ctx: options.ctx,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      action: options.recovery === undefined ? "member-released" : "member-released-recovery",
+      taskIds: [options.taskId],
+      detail:
+        options.recovery === undefined
+          ? "operator-release: the capacity slot is free; the bead, worktree, and transcript stay"
+          : `operator-release: the capacity slot is free (recovery: that fleet's supervisor ` +
+            `is provably dead, ${options.recovery.reason}); the bead, worktree, and transcript stay`,
+    });
   }
 
   /** Narrow a note kind parameter; undefined means "not a known kind". */
@@ -6876,15 +7035,28 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "Refused while the member's orchestrator is live (stop or land it instead), and " +
       "refused for an id that is not a member of this fleet. Unknown liveness may be " +
       "released, because that is exactly the operator saying the work is not running. " +
-      "Idempotent. Supervisor sessions only.",
+      "A member of another fleet needs that fleet's `fleetId` and is accepted only when " +
+      "its supervisor is provably dead (audited member-released-recovery). Idempotent. " +
+      "Supervisor sessions only, or any session for a provably dead foreign fleet.",
     parameters: Type.Object({
       taskId: Type.String({
         description: "Fleet member whose slot to give back (e.g. bd-37)",
       }),
+      fleetId: Type.Optional(
+        Type.String({
+          description:
+            "Fleet that records the member; only needed when it is not this session's own " +
+            "fleet, and then only when that fleet's supervisor is provably dead",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const extensionCtx = ctx as ExtensionContext;
-      const plan = planFleetRelease({ ctx: extensionCtx, taskId: params.taskId });
+      const plan = planFleetRelease({
+        ctx: extensionCtx,
+        taskId: params.taskId,
+        ...(params.fleetId === undefined ? {} : { fleetId: params.fleetId }),
+      });
       if (!plan.ok) return textToolResult(plan.text, 1);
       const { mode, taskId } = plan;
       if (plan.already) {
@@ -6897,14 +7069,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
       const written = applyFleetRelease({ mode, taskId, now: Date.now() });
       if (!written.ok) return textToolResult(`Fleet release refused: ${written.error}`, 1);
       if (written.released) {
-        auditFleetAction({
+        auditFleetRelease({
           ctx: extensionCtx,
-          gitCommonDir: mode.gitCommonDir,
-          fleetId: mode.fleetId,
-          action: "member-released",
-          taskIds: [taskId],
-          detail:
-            "operator-release: the capacity slot is free; the bead, worktree, and transcript stay",
+          mode,
+          taskId,
+          recovery: plan.recovery,
         });
       }
       return textToolResult(

@@ -1209,6 +1209,8 @@ interface MergeAttemptContext {
   stashRef?: string;
   mergeCommit?: string;
   gateNames?: readonly string[];
+  /** The member worktree the preconditions resolved; removed after a successful landing. */
+  memberWorktree?: string;
   broadcast: FleetMergeBroadcast;
   /**
    * Whether `merge-completed` has been written for this drain attempt (bd-280).
@@ -3371,24 +3373,334 @@ async function finishSuccessfulDrain(context: MergeAttemptContext): Promise<Drai
   const gateCommands = readFleetGateCommands({ rootCwd: context.options.rootCwd, fs: context.fs });
   const gateNames =
     context.gateNames ?? (gateCommands.ok ? gateCommands.commands.map((gate) => gate.name) : []);
+  const worktree = await applyLandingCleanup(context);
+  context.warnings.push(...worktree.warnings);
+  const report = formatFleetMergeDrainReport({
+    fleetId: context.options.fleetId,
+    taskId: entry.taskId,
+    branch: entry.branch,
+    baseBranch: context.baseBranch,
+    mergeCommit,
+    gateNames,
+    ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
+    broadcast: context.broadcast,
+  });
   return {
     ok: true,
     taskId: entry.taskId,
-    text: formatFleetMergeDrainReport({
-      fleetId: context.options.fleetId,
-      taskId: entry.taskId,
-      branch: entry.branch,
-      baseBranch: context.baseBranch,
-      mergeCommit,
-      gateNames,
-      ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
-      broadcast: context.broadcast,
-    }),
+    text: worktree.lines.length === 0 ? report : `${report}\n${worktree.lines.join("\n")}`,
     mergeCommit,
     ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
     broadcast: context.broadcast,
     warnings: context.warnings,
   };
+}
+
+/**
+ * Record the landing and remove the merged worktree/branch, never failing the drain.
+ *
+ * Cleanup runs after the merge landed, so any refusal is a warning plus a report line
+ * naming what remains; a throwing seam is treated the same way.
+ */
+async function applyLandingCleanup(
+  context: MergeAttemptContext,
+): Promise<{ lines: readonly string[]; warnings: readonly string[] }> {
+  // The run landed the member, so its slot is free even when the queue entry keeps
+  // the id. Recorded here rather than left to a later status read, because a clean
+  // worktree removal destroys the evidence the capacity probe would otherwise need
+  // (bd-168). This runs on every landed arm (clean finish and landed-then-threw),
+  // and is idempotent so a second call changes nothing.
+  try {
+    recordMergedRelease(context);
+  } catch (error) {
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: merged ${context.entry.taskId} but recording its ` +
+        `landing release threw (${describeThrown(error)})`,
+    );
+  }
+  try {
+    return await removeLandedWorktree(context);
+  } catch (error) {
+    return cleanupAfterThrow(context, error);
+  }
+}
+
+/**
+ * Honest cleanup report for a seam that threw after the merge landed (bd-168 W4).
+ *
+ * It never claims the tree was "kept": it inspects what exists now, so a throw
+ * after `git worktree remove` succeeded cannot report a removed tree as present.
+ * The branch probe is best-effort; an unanswerable probe is reported as unknown.
+ */
+async function cleanupAfterThrow(
+  context: MergeAttemptContext,
+  error: unknown,
+): Promise<{ lines: readonly string[]; warnings: readonly string[] }> {
+  const reason = describeThrown(error);
+  const path = context.memberWorktree;
+  const worktreePresent = path !== undefined && context.fs.existsSync(path);
+  const branchPresence = await branchPresenceOf(context);
+  const facts = [
+    path === undefined
+      ? undefined
+      : worktreePresent
+        ? `worktree ${path} is still present`
+        : `worktree ${path} is gone`,
+    branchPresence === "unknown"
+      ? `branch ${context.entry.branch} state is unknown`
+      : branchPresence === "present"
+        ? `branch ${context.entry.branch} still exists`
+        : `branch ${context.entry.branch} is gone`,
+  ].filter((fact): fact is string => fact !== undefined);
+  const commands = [
+    worktreePresent && path !== undefined ? `git worktree remove ${path}` : undefined,
+    branchPresence !== "absent" ? `git branch -d ${context.entry.branch}` : undefined,
+  ].filter((command): command is string => command !== undefined);
+  const finish =
+    commands.length === 0 ? "nothing remains to clean up" : `finish with ${commands.join("; ")}`;
+  const detail = `${facts.join("; ")}; ${finish}`;
+  return {
+    lines: [`- cleanup did not finish (${reason}): ${detail}`],
+    warnings: [
+      `fleet ${context.options.fleetId}: merged ${context.entry.taskId} but cleanup did not ` +
+        `finish (${reason}); ${detail}`,
+    ],
+  };
+}
+
+/**
+ * Whether a branch is present, absent, or unverifiable.
+ *
+ * ONE tri-state for every cleanup report (bd-168 W1). `for-each-ref` is used
+ * deliberately: an absent ref is a *successful* query with no matching line, while
+ * a corrupt repository or permission failure is a non-zero exit. That makes absence
+ * a positive signal instead of "rev-parse did not answer", which could equally be a
+ * broken repository. It is also the only classifier of a refused `git branch -d`
+ * (bd-168 R3): that answer must come from the ref database, because the branch name
+ * in git's message is arbitrary operator text.
+ */
+type BranchPresence = "present" | "absent" | "unknown";
+
+async function branchPresenceOf(context: MergeAttemptContext): Promise<BranchPresence> {
+  const ref = `refs/heads/${context.entry.branch}`;
+  try {
+    const probe = await context.git(["for-each-ref", "--format=%(refname)", ref], {
+      cwd: context.options.rootCwd,
+    });
+    if (!probe.ok) return "unknown";
+    return probe.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .includes(ref)
+      ? "present"
+      : "absent";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Record a successful landing as a release on the fleet intent (bd-168).
+ *
+ * `released[]` is the audited, idempotent statement "this member holds no slot".
+ * It is separate from `run.members[].landedAt` so a status read (and the capacity
+ * arithmetic) frees the slot without needing the run's own member record.
+ */
+function recordMergedRelease(context: MergeAttemptContext): void {
+  const taskId = context.entry.taskId;
+  const now = context.clock();
+  let appended = false;
+  const written = updateFleetIntent({
+    gitCommonDir: context.options.gitCommonDir,
+    fleetId: context.options.fleetId,
+    fs: context.fs,
+    update: (current) => {
+      if (current === undefined) {
+        return {
+          refuse:
+            `merged ${taskId} but fleet \`${context.options.fleetId}\` has no intent; ` +
+            "cannot record the landing release",
+        };
+      }
+      // Re-check membership inside the CAS (bd-168 S3). A manual drain of an id
+      // another operator already pruned must not leave a phantom released entry.
+      if (!current.taskIds.includes(taskId)) return current;
+      const existing = current.released ?? [];
+      if (existing.some((entry) => entry.taskId === taskId)) return current;
+      appended = true;
+      return {
+        ...current,
+        released: [...existing, { taskId, reason: "merged", at: now }],
+        updatedAt: now,
+      };
+    },
+  });
+  if (!written.ok) {
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: merged ${taskId} but could not record its landing ` +
+        `release (${written.error}); the slot stays counted until a release or prune`,
+    );
+    return;
+  }
+  if (appended) {
+    auditAttempt(
+      context,
+      "member-merged-released",
+      [taskId],
+      "landed: the capacity slot is free; the member record stays until the run prunes it",
+    );
+  }
+}
+
+/**
+ * Remove a successfully merged member's worktree and branch (bd-168 #3).
+ *
+ * `git worktree remove` runs without `--force` and `git branch -d` without `-D`, so
+ * a dirty tree or an unmerged branch refuses instead of losing work. A refusal is a
+ * warning, never a failed drain: the merge already landed. The report states
+ * exactly what happened, so it can no longer claim a removal that did not occur.
+ */
+async function removeLandedWorktree(
+  context: MergeAttemptContext,
+): Promise<{ lines: readonly string[]; warnings: readonly string[] }> {
+  const worktreePath = context.memberWorktree;
+  // The root checkout is the operator's own tree and is never removed.
+  if (worktreePath === undefined || worktreePath === context.options.rootCwd) {
+    return { lines: [], warnings: [] };
+  }
+  // Inspect before acting so a second landing (idempotent cleanup) reports a true
+  // no-op instead of asking git to remove a tree that is already gone (bd-168 W1/W4).
+  const worktreePresent = context.fs.existsSync(worktreePath);
+  const branchPresence = await branchPresenceOf(context);
+  const worktree = await removeWorktreeOnly(context, worktreePath, worktreePresent);
+  if (!worktree.ok) return worktree;
+  const branch = await deleteMergedBranchOnly(context, {
+    branchPresence,
+    removedWorktree: worktree.removed,
+  });
+  if (!branch.ok) return branch;
+  return removalReport({
+    worktreePath,
+    branch: context.entry.branch,
+    removedWorktree: worktree.removed,
+    removedBranch: branch.removed,
+    branchAlreadyGone: branch.alreadyGone === true,
+  });
+}
+
+type CleanupStep =
+  | { ok: true; removed: boolean; alreadyGone?: boolean }
+  | { ok: false; lines: readonly string[]; warnings: readonly string[] };
+
+/** Remove just the worktree; an absent tree is a successful no-op. */
+async function removeWorktreeOnly(
+  context: MergeAttemptContext,
+  worktreePath: string,
+  present: boolean,
+): Promise<CleanupStep> {
+  if (!present) return { ok: true, removed: false };
+  const removal = await context.git(["worktree", "remove", worktreePath], {
+    cwd: context.options.rootCwd,
+  });
+  if (removal.ok) return { ok: true, removed: true };
+  const reason = commandError(removal);
+  return {
+    ok: false,
+    lines: [
+      `- kept worktree ${worktreePath}: \`git worktree remove\` refused (${reason}); remove it ` +
+        `with \`git worktree remove ${worktreePath}\``,
+    ],
+    warnings: [
+      `fleet ${context.options.fleetId}: merged ${context.entry.taskId} but could not remove ` +
+        `${worktreePath} (${reason})`,
+    ],
+  };
+}
+
+/** Delete just the merged branch; an absent branch is a successful no-op. */
+async function deleteMergedBranchOnly(
+  context: MergeAttemptContext,
+  options: { branchPresence: BranchPresence; removedWorktree: boolean },
+): Promise<CleanupStep> {
+  if (options.branchPresence === "absent") return { ok: true, removed: false };
+  const branch = context.entry.branch;
+  const deleted = await context.git(["branch", "-d", branch], {
+    cwd: context.options.rootCwd,
+  });
+  if (deleted.ok) return { ok: true, removed: true };
+  // Classify the refusal from git's ref database, never from its message text: a
+  // branch name is arbitrary, so a real refusal whose name contains "not found"
+  // would be inverted into "already gone" and its branch left behind unreported
+  // (bd-168 R3 W1). The refusal message stays human-readable detail only.
+  const presenceAfterRefusal = await branchPresenceOf(context);
+  if (presenceAfterRefusal === "absent") {
+    return { ok: true, removed: false, alreadyGone: true };
+  }
+  const reason = commandError(deleted);
+  if (presenceAfterRefusal === "unknown") {
+    // The probe could not answer, so neither "kept" nor "gone" can be claimed.
+    return {
+      ok: false,
+      lines: [
+        `- branch ${branch} may still exist: \`git branch -d\` refused (${reason}) and the ` +
+          `branch probe could not confirm it; check with \`git branch --list ${branch}\``,
+      ],
+      warnings: [
+        `fleet ${context.options.fleetId}: merged ${context.entry.taskId} but could not confirm ` +
+          `whether branch ${branch} was deleted (${reason})`,
+      ],
+    };
+  }
+  return {
+    ok: false,
+    lines: [
+      options.removedWorktree
+        ? `- removed the worktree but kept branch ${branch}: \`git branch -d\` refused ` +
+          `(${reason}); remove it with \`git branch -d ${branch}\``
+        : `- kept branch ${branch}: \`git branch -d\` refused (${reason}); remove it with ` +
+          `\`git branch -d ${branch}\``,
+    ],
+    warnings: [
+      `fleet ${context.options.fleetId}: merged ${context.entry.taskId} but could not delete ` +
+        `branch ${branch} (${reason})`,
+    ],
+  };
+}
+
+/** The honest report line for whatever the two cleanup steps actually removed. */
+function removalReport(options: {
+  worktreePath: string;
+  branch: string;
+  removedWorktree: boolean;
+  removedBranch: boolean;
+  branchAlreadyGone: boolean;
+}): { lines: readonly string[]; warnings: readonly string[] } {
+  if (options.removedWorktree && options.removedBranch) {
+    return {
+      lines: [`- removed worktree ${options.worktreePath} and merged branch ${options.branch}`],
+      warnings: [],
+    };
+  }
+  if (options.removedWorktree) {
+    return {
+      lines: [
+        options.branchAlreadyGone
+          ? `- removed worktree ${options.worktreePath}; branch ${options.branch} was already gone`
+          : `- removed worktree ${options.worktreePath} (its merged branch was already gone)`,
+      ],
+      warnings: [],
+    };
+  }
+  if (options.removedBranch) {
+    return {
+      lines: [`- removed merged branch ${options.branch} (its worktree was already gone)`],
+      warnings: [],
+    };
+  }
+  if (options.branchAlreadyGone) {
+    return { lines: [`- branch ${options.branch} was already gone`], warnings: [] };
+  }
+  return { lines: [], warnings: [] };
 }
 
 /**
@@ -3434,6 +3746,7 @@ export async function drainFleetMerge(
 
   const preconditions = await checkMergePreconditions(context);
   if ("reason" in preconditions) return drainRefusal(context, preconditions);
+  context.memberWorktree = preconditions.memberWorktree;
 
   const payload = await checkPublishPayload(context);
   if (payload !== undefined) return drainRefusal(context, payload);
@@ -3572,14 +3885,21 @@ async function mergedAfterThrowResult(
     `fleet ${context.options.fleetId}: a step after merging ${entry.taskId} failed (${detail}); ` +
       "the merge is landed and is not retried",
   );
+  // The base moved, so the member stops holding a slot and its tree is cleaned up
+  // on THIS arm too (bd-168 W1). The helper is idempotent: if a later throw happened
+  // after a cleanup already ran, the second call is a no-op.
+  const cleanup = await applyLandingCleanup(context);
+  context.warnings.push(...cleanup.warnings);
   const mergeCommit = context.mergeCommit ?? "";
   const sha = mergeCommit === "" ? "an unreadable sha" : mergeCommit.slice(0, 12);
+  const cleanupText = cleanup.lines.length === 0 ? "" : `\n${cleanup.lines.join("\n")}`;
   return drainFailure({
     reason: "step-failed",
     text:
       `merged ${entry.taskId} into ${context.baseBranch} at ${sha}, but ${detail}; ` +
       "the merge landed and is not retried — the remaining members were told about the new " +
-      "base best-effort, so finish any other pending cleanup (the root restore) by hand",
+      `base best-effort, so finish any other pending cleanup (the root restore) by hand` +
+      cleanupText,
     taskId: entry.taskId,
     ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
     warnings: context.warnings,

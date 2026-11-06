@@ -47,10 +47,12 @@ record into `fleet.json` and starts the ticker.
 ### What "complete" means
 
 A run is complete when every member is **landed** (its branch is on the base
-branch) and out of the fleet's member list. A landing removes the member's
-worktree and merged branch **either way**: the branch is already on the base
-branch, so the worktree has no remaining purpose and keeping it would only grow the
-disk. With `accept: false` (the default) the **bead** stays `in_progress` + `human`
+branch) and out of the fleet's member list. A successful drain removes the
+member's worktree and merged branch **either way**: the branch is already on the
+base branch, so the worktree has no remaining purpose and keeping it would only
+let a stray commit resurrect a merged branch (bd-168). A refused removal (dirty
+tree, unmerged branch) is a warning and the report names the cleanup command; the
+merge never fails over cleanup. With `accept: false` (the default) the **bead** stays `in_progress` + `human`
 — the run still finishes, because a member the fleet landed satisfies its
 dependents' dependency edges and its bd ordering gates are resolved (see below).
 With `accept: true` the landing also closes the bead (`bd close`): acceptance is
@@ -101,8 +103,9 @@ run is halted and recorded (`haltedReason`), because each needs a human:
 - `parked` — the root checkout could not be restored after a merge (reconcile,
   then re-arm).
 - `stalled` — `FLEET_RUN_MAX_IDLE_TICKS` ticks with no **member progress** (240 at
-  the 15 s interval, i.e. ~60 min). Progress is what the tick *observes*, not only
-  what it does: each member has a progress signature — its workflow state kind plus a
+  the 15 s interval, i.e. ~60 min) **and** at least one in-flight member without a
+  live orchestrator lease. Progress is what the tick *observes*, not only what it
+  does: each member has a progress signature — its workflow state kind plus a
   **stable** identity for that kind (the phase run in flight, the completed-phase
   count, the failed phase, or just the kind when it is the whole identity) — and any
   signature that differs from the previous tick's snapshot resets the counter, even
@@ -110,18 +113,18 @@ run is halted and recorded (`haltedReason`), because each needs a human:
   reason is model text) is **never** part of that comparison: a crash-looping member
   re-reports the same failed phase with new text on every attempt, and treating that
   as progress would disable the cap. So a member that starts and finishes phases
-  keeps the run alive wave after wave — **as long as no single phase run outlasts
-  the cap**. The in-flight signature is the phase run itself, and the member's
-  worktree has nothing that changes meaningfully *during* one (the run manifest is
-  written when the phase starts, the workflow state when it ends), so a phase that
-  takes longer than 240 ticks (~60 min) halts the run as `stalled` for a human
-  instead of being waited on forever. A member whose workflow says the same thing
-  for the whole window hits the cap the same way — that is the case the cap exists
-  for. The run stops instead of spinning; the record keeps the counter
-  at the cap (the giving-up tick does not add a 241st idle tick) and names the
-  members still in flight with the counters that justified the halt (`no member
-  progressed for 240 ticks (cap 240); bd-143 still in flight`) — or, when the wave is
-  capacity-blocked, the members waiting for a slot. An advance that launches nothing
+  keeps the run alive wave after wave. Lease renewal is liveness, not progress: it
+  never resets the counter, but a member renewing its lease inside one long phase is
+  not called stuck at the ordinary cap (bd-168). That wait is bounded by the
+  separate, much larger `FLEET_RUN_MAX_LIVE_IDLE_TICKS` (8× the ordinary cap, so
+  ≈ 8 h at the 15 s interval); a lease-renewing loop still ends. The run stops
+  instead of spinning; the record keeps the counter at the cap (the giving-up tick
+  does not add a 241st idle tick) and names the members still in flight with the
+  counters that justified the halt (`no member progressed for 240 ticks (cap 240);
+  bd-143 still in flight (bd-143 no live lease)`) — or, when the wave is
+  capacity-blocked, the members waiting for a slot. Every stalled line states each
+  member's lease evidence (`lease fresh Ns` or `no live lease`), so it never claims
+  a member is stuck while its lease is fresh. An advance that launches nothing
   because of a `dependency` or `external-blocker` — and no `capacity` entry — does
   not wait for this cap at all: it ends the run as `partial` on that tick.
 - `awaiting-human` — `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` ticks (2880 at the 15 s
@@ -247,7 +250,7 @@ One action per tick, in this order (`src/fleet-run.ts`):
 | 0 | `halt` | the fleet is paused (`resume` restarts) or parked (needs a human) |
 | 1 | `land` | the first landable member whose workflow is complete (all phases done, or a completed final-phase run with no state file), including one the run stopped earlier and whose retry finished |
 | 2 | `stop` | the first member that needs a human: `awaiting-human`, `phase-failed`, `phase-interrupted`, `state-corrupt`, or `orchestrator-missing` |
-| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached (no member's progress signature changed for `FLEET_RUN_MAX_IDLE_TICKS` ticks), then `halt`/`stalled`; when the only in-flight work is a live human wait the larger `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` cap applies instead and the halt reason is `awaiting-human` |
+| 3 | `wait` | something is still working — a healthy member, or a stopped member's retry that is observably alive — unless the idle cap is reached (no member's progress signature changed for `FLEET_RUN_MAX_IDLE_TICKS` ticks) **and** a member has no live lease, then `halt`/`stalled`; when every in-flight member is renewing its lease the separate `FLEET_RUN_MAX_LIVE_IDLE_TICKS` cap applies; when the only in-flight work is a live human wait the larger `FLEET_RUN_MAX_HUMAN_WAIT_TICKS` cap applies instead and the halt reason is `awaiting-human` |
 | 4 | `advance` | nothing is working and the deferred list is non-empty; an advance that launches nothing degrades to `complete`/`partial` — or to `wait` when **any** deferral names `capacity` (a mixed `capacity` + `dependency` list included), bounded by the same idle cap (then `halt`/`stalled`) |
 | 5 | `complete` | nothing is working and no deferred work remains (`partial` when something stopped) |
 
@@ -323,10 +326,11 @@ observation rule, only a landing, stop, or launch reset the counter, and any
 single-member wave whose *phases together* outlasted the cap halted as `stalled`
 by construction while its member was healthy — the observed bug was a 47-minute
 implement followed by an 18-minute review: 65 minutes of healthy work, no single
-phase over the cap. The bound is one phase run: the signature cannot see inside a
-run, so a single phase longer than ~60 minutes is reported as stalled on purpose,
-and `belayd_fleet_status` names the member so a human can decide. An action that
-did something still counts as progress; a `halt` or `pause` never does.
+phase over the cap. The signature cannot see inside a run, so a single long phase
+is protected by the member's lease: while it is renewed the ordinary cap is
+extended to `FLEET_RUN_MAX_LIVE_IDLE_TICKS`, and a stall at either cap states the
+lease evidence so a human can decide. An action that did something still counts
+as progress; a `halt` or `pause` never does.
 
 **A pause drops the baseline.** Only a paused run is ticked again, and the resume can
 come an arbitrary wall-clock time later. So the tick that ends the loop deletes
@@ -463,24 +467,37 @@ tick and never counts as a landing.
 
 `land` runs the unchanged merge queue (`belayd_fleet_merge`'s engine): enqueue the
 member's branch, acquire `merge.lock.d`, stash a dirty root, rebase, run the
-project gates, `git merge --ff-only`, restore the root, notify members.
+project gates, `git merge --ff-only`, restore the root, notify members. A drain
+that moved the base then does this even when a later post-merge step threw
+(`step-failed`):
+
+1. Records the landing as `released[] { taskId, reason: "merged", at }` (audited
+   `member-merged-released`), so the merged member stops holding a capacity slot
+   even if a queue entry or worktree survives (bd-168).
+2. `git worktree remove <path>` — **without `--force`**, so a dirty worktree is
+   left alone and reported; this step never deletes uncommitted work. It runs on
+   **every** landed merge, with or without acceptance: the branch is already on
+   the base branch, so a merged worktree has no remaining purpose. The report
+   says `removed worktree <path> and merged branch <branch>`, or `kept worktree
+   <path>: <reason>; remove it with git worktree remove <path>`. A cleanup seam
+   that throws is reported from the inspected state (tree gone/present, branch
+   gone/present), never as a fabricated "kept worktree".
+3. `git branch -d <branch>` — `-d`, not `-D`, so an unmerged branch is never
+   deleted. A refusal is classified by re-probing the ref (`for-each-ref`), not by
+   reading git's message: `absent` reports `branch <branch> was already gone`,
+   `present` reports the kept branch with git's message as detail, and an
+   unanswerable probe reports the branch as possibly still present (bd-168 R3).
 
 Then the accept step (`src/fleet-accept.ts`) finishes the landing:
 
 1. When acceptance was asked for (`accept: true` / `--accept`), `bd close <id>
    --reason "merged into <base> via belayd_fleet_merge"`. A bead that is already
    closed is accepted with a warning, not an error.
-2. `git worktree remove <path>` — **without `--force`**, so a dirty worktree is left
-   alone and reported; this step never deletes uncommitted work. It runs on
-   **every** landing, with or without acceptance: the branch is already on the base
-   branch, so a merged worktree has no remaining purpose.
-3. `git branch -d <branch>` — `-d`, not `-D`, so an unmerged branch is never
-   deleted.
 
 A failure to close the bead stops the member with `accept-failed` but keeps the
 landing: the branch is on the base branch, the member is out of the member list,
-and the close failure returns before the removal half runs — so the bead **and** its
-worktree are left for you to finish by hand.
+and no worktree currently holds its branch — so only the bead is left for you to
+finish by hand.
 
 **Bead status after a run.** `belayd_fleet_merge` never touches a bead, and neither
 does the merge half of a landing: the landing resolves the bd ordering gates the

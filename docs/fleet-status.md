@@ -134,7 +134,7 @@ Fleet night-shift
   intent: bd-42, bd-43, max 2 concurrent
   deferred: bd-44 (capacity), bd-45 (dependency)
   members: 2
-  states: active=2 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0
+  states: active=2 blocked=0 awaiting-human=0 interrupted=0 idle=0 complete-unlanded=0 missing-state=0
 ```
 
 (`paused` and `no task ids` can also appear in that `intent:` line; P0 only
@@ -151,16 +151,15 @@ Real output, captured in this repository while bd-126 was in its `userguide`
 phase (before bead enrichment landed: on a beads-backed repo every member block
 now also carries a `bead: <title> (<status>)` line under its `worktree:` line).
 It is kept as a capture, not a reproduction: on `feat/bd-126` as it stands both
-worktrees have finished their workflow, so the live view today is the
-all-`missing-state` one in [How to Verify](#how-to-verify). It is worth reading
-because it is the only shape here that shows a member with readable workflow
-state:
+worktrees have finished their workflow, so the live view today renders them as
+`complete-unlanded` (bd-168). It is worth reading because it is the only shape
+here that shows a member with readable workflow state:
 
 ```text
 Fleet default
   intent: none recorded
   members: 2
-  states: active=1 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=1
+  states: active=1 blocked=0 awaiting-human=0 interrupted=0 idle=0 complete-unlanded=1 missing-state=0
 
 Member bd-126 — active
   worktree: /home/hugo/git/belayd-agent-harness.feat-bd-126 (branch feat/bd-126)
@@ -171,22 +170,25 @@ Member bd-126 — active
   last updated: 2026-10-22T19:53:42.174Z
   latest runs: implement=completed, review=completed, test=completed, userguide=running
 
-Member (no task id) — missing-state
+Member bd-125 — complete-unlanded
   worktree: /home/hugo/git/belayd-agent-harness.feat-bd-125 (branch feat/bd-125)
+  task id: bd-125 (inferred from branch or worktree path)
   workflow: missing
   interrupted runs: 0
   last updated: 2026-10-21T22:55:47.738Z
   latest runs: commit=completed, implement=completed, proof=completed, review=completed, test=completed, userguide=completed
+  land it: belayd_fleet_merge action=enqueue task=bd-125 then action=drain
 
 Warnings (1):
-  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-125; that worktree drives no workflow
+  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-125 (completion clears it); bd-125 still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=bd-125 then action=drain
 ```
 
 That run is worth reading closely:
 
 - The `bd-125` worktree still holds completed run manifests but no workflow
-  state, so it is `missing-state` and sorts **last** (members without a task id
-  come after those with one).
+  state. Completion cleared the state file, so it is `complete-unlanded`, keeps
+  its id from the branch, and sorts **last** (members without a task id come
+  after those with one).
 - `last updated` for that member still resolves, because it falls back to the
   newest run timestamp when `workflow.json` is absent.
 - The repository's own checkout (`/home/hugo/git/belayd-agent-harness`, branch
@@ -214,14 +216,15 @@ Header lines:
 | `Fleet <id>` | Sanitized fleet id whose directory was read; `(requested "<raw>")` is appended only when sanitizing changed the input |
 | `intent:` | Contents of `fleet.json`, or `none recorded` |
 | `deferred:` | Members a launch deferred, with the reason each waits (`capacity`, `dependency`, `external-blocker`), bounded to 8 entries plus `...and N more`. Omitted when nothing is deferred |
-| `released:` | Members whose capacity slot was given back while they stay in the fleet (bd-166), with the reason (`run-complete`, `run-halted`, `operator-release`). Bounded like `deferred:`; omitted when nothing is released |
-| `capacity: ceiling 3, N free, M counted` | The repository-wide orchestrator arithmetic (bd-166): the ceiling, the free slots, and one indented line per fleet that records members — `<fleet>: N member(s), M counted (live, unknown, absent), stopped, released; supervisor live\|dead\|none`. "Counted" is live + unknown members not released: the number a launch subtracts. A member is `absent` (no slot) only when its own execution is accounted for: workflow state, or a run manifest that postdates the worktree's creation and the run's recorded `launchedAt`. A run manifest that merely names the task — an inherited one, or one with no cutoff available — leaves the member `unknown`, so the slot stays counted |
+| `released:` | Members whose capacity slot was given back while they stay in the fleet (bd-166), with the reason (`run-complete`, `run-halted`, `operator-release`, `merged`). Bounded like `deferred:`; omitted when nothing is released |
+| `capacity: ceiling 3, N free, M counted` | The repository-wide orchestrator arithmetic (bd-166): the ceiling, the free slots, and one indented line per fleet that records members — `<fleet>: N member(s), M counted (live, unknown, absent), stopped, released, landed; supervisor live\|dead\|none`. `released` and `landed` are separate populations: an operator/run release versus a recorded landing (`run.members[].landedAt`). A member with both is shown as landed only, so one member is never counted twice. "Counted" is live + unknown members not released: the number a launch subtracts. A member is `absent` (no slot) only when its own execution is accounted for: workflow state, or a run manifest that postdates the worktree's creation and the run's recorded `launchedAt`. A run manifest that merely names the task — an inherited one, or one with no cutoff available — leaves the member `unknown`, so the slot stays counted. A recorded landing (`run.members[].landedAt`) is positive evidence the tree existed, and a member in `released[]` or `landedAt` holds no slot at all (bd-168), so a fleet reporting `members: 0` contributes 0 counted slots |
 | `parked:` | Present only for a paused/parked fleet: `parked: <reason> (stash <sha>) — belayd_fleet_reconcile then belayd_fleet_resume`. This is the read-only pointer to the operator's stashed root work |
 | `run: <mode> — …` | The run loop's record (bd-126 P5): `n tick(s), last tick <ISO>` while live, `complete|partial at <ISO> (n tick(s))` when finished, `halted: <reason>` when parked or stalled. Absolute timestamps only, so two reads of unchanged files are identical. Absent for a `--manual` fleet |
 | `ordering gates open: <blocker> -> <blocked> (gate <id>), …` | bd-158 ordering gates this fleet still has open, from `fleet.json` `orderingGates` (a record is dropped the moment bd confirms the resolve, so a listed gate is open). Each entry blocks the second bead until the first lands. A landing whose resolve hit a transient bd failure stays listed until the next tick retries it; nothing is hidden. Bounded to 8 entries plus `...and N more`; the line is omitted when no gate is recorded |
 | `- stopped <taskId> (<reason>): <detail>` | One per member the run gave up on (needs a human); renders from `fleet.json` `run.stopped` |
-| `members:` | Number of worktrees in the view (the main checkout counts only when it holds workflow state). Deferred members are *not* counted here: they have no worktree yet |
-| `states:` | Count per derived state, printed in the fixed order `active blocked awaiting-human interrupted idle missing-state` |
+| `members:` | Number of worktrees attributable to the requested fleet (the main checkout counts only when it holds workflow state). When the fleet's intent records ids, worktrees outside them are listed separately under `Other worktrees` (bd-168) instead of being mixed into this count. Deferred members are *not* counted here: they have no worktree yet |
+| `states:` | Count per derived state, printed in the fixed order `active blocked awaiting-human interrupted idle complete-unlanded missing-state` |
+| `Other worktrees (<n>) — not members of fleet <id>:` | Present only when the requested fleet records ids and other worktrees exist in the repository. One indented `path (branch <branch>, <taskId>)` line each, with a matching `not-a-member` warning that names the owning fleet. Nothing is hidden and nothing is attributed to the wrong fleet |
 | `Needs you (<n>): <ids>` | Present only when at least one member carries the bd `human` label or has an **open** human gate. Names every waiting task id together (up to 10, then `…and N more`), one line per bead with its assignee and newest comment. This is the block to read first when a fleet looks stuck |
 
 Per member (blocks are separated by a blank line and sorted by task id, code
@@ -229,7 +232,8 @@ unit order):
 
 | Line | Meaning |
 |------|---------|
-| `Member <taskId> — <state>` | Task id recorded in `workflow.json`, or `(no task id)` when there is no readable state |
+| `Member <taskId> — <state>` | Task id attributed to the worktree: the `workflow.json` id, else the branch/directory suffix, else a run manifest id (bd-168). `(no task id)` only when none of those exist |
+| `task id: <id> (inferred from …)` | Present only when the id came from the branch/worktree path or the member's own run manifests, so an inferred id is never mistaken for a recorded one |
 | `worktree: <path> (branch <branch>)` | Path from `git worktree list`, and the checked-out branch (`detached HEAD` when there is none) |
 | `bead: <title> (<status>)` | Bead title and status from one batched read-only `bd show <ids> --json`. Omitted when bd is unavailable or has no record for that task id; `(no title)` / `(status unknown)` when bd returns the record without those fields |
 | `owner: <owner>` | `owner` from `bd show --json`; `(unknown)` when bd reports none or the field was renamed/absent. A renamed field degrades this column only |
@@ -248,12 +252,14 @@ unit order):
 | `last updated: <ISO-8601>\|unknown` | `workflow.json` `updatedAt`, raised to the newest run timestamp when that is later |
 | `latest runs: <phase>=<status>, …` | Newest manifest per phase, in workflow phase order (`none` when no manifests exist) |
 | `workflow: missing` / `workflow: corrupt` | Replaces the `<type> n/m phases complete` line when `workflow.json` is absent or does not parse; the `pending:` and `awaiting review response:` lines are then omitted (the remaining lines are unchanged) |
+| `land it: belayd_fleet_merge action=enqueue task=<id> then action=drain` | Present only for `complete-unlanded`: the work is finished, and these are the exact commands that land it without a human supplying the task id |
 
 Derived `state` (first match wins, in this order):
 
 | State | Meaning | Operator reading |
 |-------|---------|------------------|
-| `missing-state` | No readable `.belayd/workflow.json` in that worktree | Nothing is driving that tree; see [Common situations](#common-situations) |
+| `complete-unlanded` | No readable `.belayd/workflow.json`, but the member's own final-phase run completed — completion clears the state file while the work is finished and not yet landed (bd-168) | Land it: `belayd_fleet_merge action=enqueue task=<id>` then `action=drain` |
+| `missing-state` | No readable `.belayd/workflow.json` and no completed final-phase run in that worktree | Nothing is driving that tree; see [Common situations](#common-situations) |
 | `interrupted` | At least one run manifest is `interrupted` | A phase crashed or was killed; that workflow needs a re-run in its own worktree |
 | `awaiting-human` | The bead has an open bd `human` gate, or a `completedBy: "user"` run's report was never delivered | Someone must respond before it moves |
 | `blocked` | The newest run of a not-yet-completed phase `failed` | The phase failed; fix and re-run it in that worktree |
@@ -264,7 +270,8 @@ Warnings (absent when there are none):
 
 | Warning text | Trigger | What to do |
 |--------------|---------|------------|
-| `no .belayd/workflow.json in <path>; that worktree drives no workflow` | A linked worktree has no state file | If the workflow really finished, remove the stale worktree (`git worktree remove <path>`); if it did not, restart the task there. The member cannot be scheduled until it holds state. |
+| `no .belayd/workflow.json in <path>; that worktree drives no workflow` | A linked worktree has no state file and nothing proves its workflow finished | If it really finished but holds a different bead's runs, remove the stale worktree (`git worktree remove <path>`); if it did not, restart the task there. The member cannot be scheduled until it holds state. |
+| `no .belayd/workflow.json in <path> (completion clears it); <taskId> still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=<id> then action=drain` | A finished member whose state was archived at completion (bd-168) | Nothing is wrong: land it with the named commands. The id is preserved from the branch or the member's own runs, so the fleet can land it autonomously |
 | `unreadable .belayd/workflow.json in <path>` | The file exists but does not parse as workflow state | Inspect/replace the file. Nothing can be derived from that worktree until it parses; never edit it from a different worktree. |
 | `<path> records <a>, but its branch or directory names <b>` | `workflow.json` `taskId` disagrees with the branch (or the worktree directory name) | The worktree holds another bead's state, or was re-branched. bd-119 phase/commit/proof tools refuse in that state, so sort out the identity before running a phase. |
 | `<taskId> is claimed by <n> worktrees: <paths>` | Two worktrees record the same `taskId` | Exactly one is real. Do not run phases in either until you know which; `bd show <taskId>` plus the branches tell you which tree owns the bead. |
@@ -272,7 +279,8 @@ Warnings (absent when there are none):
 | `bead metadata unavailable (bd read failed): …` | The single batched `bd show <ids> --json` could not be read: no beads database, `bd` not on `PATH`, a timeout, or non-JSON output | Nothing about the workflow view is affected — states, phases, and runs are still derived correctly. Fix beads access only if you need titles/statuses. The warning appears **once per fleet**, never once per member, and never appears when no member has a task id (bd is not called at all then). |
 | `fleet <id> still records <taskId>, but no worktree holds feat/<taskId>; release it with belayd_fleet_release <taskId> …` (`stale-member`) | A recorded member has no worktree in this repository, and is not released. Usually a worktree removed after a merge that never reached `fleet.json` | Its liveness is `unknown` (no worktree is not proof that nothing is spawning), so it still counts a slot until released or pruned. `belayd_fleet_release <taskId>` frees the slot and keeps the bead; `belayd_fleet_reconcile` `pruneDeadMembers` (on this fleet's own supervisor) removes a provably dead member |
 | `fleet <id> still records <taskId>, but bd reports it closed; …` (`stale-member`) | The member's bead is `closed`/`done` while the intent still records it — the `wt merge` + `bd close` path. Bead status alone is not proof of merging, so the tick also requires the git ancestor check before landing it | Same: release it, or let the next tick land it if its branch is on the base branch |
-| `fleet <id> counts N member(s) against the ceiling of 3 but has no live supervisor …` (`capacity-held`) | A fleet with no live supervisor still holds slots: its members are live or their liveness is unknown | Re-arm that fleet (`/fleet <ids> --fleet <id>`), `belayd_fleet_release` members you know are done, or `belayd_fleet_reconcile` it by name from a session that supervises any fleet here |
+| `worktree <path> is not a member of fleet <id> …` (`not-a-member`) | The requested fleet records task ids, and this worktree's id is not one of them (it names the owning fleet when one records it) | Not an error: read the header and `members:` as the fleet you named. Operate on the other fleet by its own id |
+| `fleet <id> counts N member(s) against the ceiling of 3 but has no live supervisor …` (`capacity-held`) | A fleet with no live supervisor still holds slots: its members are live or their liveness is unknown | Re-arm that fleet (`/fleet <ids> --fleet <id>`), `belayd_fleet_release` members you know are done (naming `fleetId` if its supervisor is provably dead), or `belayd_fleet_reconcile` it by name from a session that supervises any fleet here |
 | `fleet <id> has an active run whose last tick was at <ISO> (… bound 10) …` (`run-not-ticking`) | The run record is still active but nothing has ticked for more than `FLEET_RUN_TICK_INTERVAL_MS × 10` (2.5 min). The ticker is a timer inside the supervisor session, so a busy or gone supervisor stops landing | Re-arm the fleet to resume the loop, or land/release the members; the run cannot finish on its own |
 | `bead engagement unavailable (bd read failed): …` | **Every** member's `bd comments` **and** `bd gate list` reads failed (bd missing, wrong database, total outage) | The derived view is intact, only the owner/assignee/human/comment columns are missing. Appears **once per fleet**, bounded to a single line. A mixed result (some beads readable) is not a warning: the unreadable beads simply render `unknown` |
 
@@ -324,11 +332,15 @@ read the view, then act through the bead's own orchestrator/worktree, `bd`,
 
 ### Common situations
 
-**A worktree shows `missing-state`.** Either its workflow finished and the
-worktree was left behind (`git worktree remove <path>`), or its `.belayd/` was
-deleted/moved. Note that run manifests can outlive `workflow.json` — that is why
-the bd-125 example still prints `last updated` and six `latest runs` while
-reporting `missing-state`.
+**A worktree shows `complete-unlanded`.** Its workflow finished: completion
+cleared `.belayd/workflow.json` and the final-phase run remains. The member keeps
+its id from the branch (or its own runs) and the block names the two landing
+commands. Land it; do not treat it as an anonymous stale worktree.
+
+**A worktree shows `missing-state`.** Either its `.belayd/` was deleted/moved, or
+it holds another bead's runs with no state file. Run manifests can outlive
+`workflow.json` — that is why a state-less member still prints `last updated` and
+its `latest runs`.
 
 **A `duplicate-task-id` warning.** Two worktrees both claim one bead — typically
 a worktree copied by hand, or a `.belayd/workflow.json` moved between trees.
@@ -451,10 +463,10 @@ nix develop -c bash -lc "$J $T '{}'" 2>/dev/null
 ```
 
 Expected: a `Fleet default` header, then one `Member <taskId> — <state>` block
-per worktree that holds workflow state. Assert structure, not counts: on this
+per attributable worktree. Assert structure, not counts: on this
 branch `git worktree list` reports three worktrees but only two are members,
 because the main checkout holds no state. Every state must be one of
-`active blocked awaiting-human interrupted idle missing-state`:
+`active blocked awaiting-human interrupted idle complete-unlanded missing-state`:
 
 ```bash
 nix develop -c bash -lc "$J $T '{}'" 2>/dev/null \
@@ -465,17 +477,17 @@ Produced on `feat/bd-126`:
 
 ```text
 Fleet default
-  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=2
-Member (no task id) — missing-state
-Member (no task id) — missing-state
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 complete-unlanded=2 missing-state=0
+Member bd-125 — complete-unlanded
+Member bd-126 — complete-unlanded
 ```
 
-Both members are `missing-state` because both worktrees have **finished** their
-workflow: completion clears `.belayd/workflow.json` and keeps the run manifests
-(`extensions/capabilities/hooks.ts`, the workflow-complete path), so there is
-no task id to report. That is also why no `bd show` call happens at all here and
-every member prints `(no task id)`. A fleet with live workflows looks like the worked example
-above and like the scratch view in `docs/fleet.md`.
+Both members are `complete-unlanded` because both worktrees have **finished**
+their workflow: completion clears `.belayd/workflow.json` and keeps the run
+manifests (`extensions/capabilities/hooks.ts`, the workflow-complete path). The
+branch suffix keeps each task id attributable (bd-168), so the fleet can land
+them without a human re-supplying the id. A fleet with live workflows looks like
+the worked example above and like the scratch view in `docs/fleet.md`.
 
 The fleet id is the driver's first argument (a JSON params object); a
 sanitized id is visible in the header:

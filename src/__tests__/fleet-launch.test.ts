@@ -1639,6 +1639,22 @@ describe("countActiveFleetOrchestrators", () => {
     ).toBe(1);
   });
 
+  it("skips a landed member even when its liveness is unknown (bd-168)", () => {
+    expect(
+      countActiveFleetOrchestrators({
+        fleets: [
+          {
+            fleetId: "default",
+            members: ["bd-12", "bd-15"],
+            supervisor: { kind: "none" },
+            landed: ["bd-12"],
+          },
+        ],
+        launchingTaskIds: [],
+      }),
+    ).toBe(1);
+  });
+
   it("applies a release only to the fleet that records it (bd-166)", () => {
     // Members are disjoint across fleets by convention, not validation: the same id
     // released in one fleet must still hold the other fleet's slot.

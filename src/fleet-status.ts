@@ -35,6 +35,7 @@ import {
   memberEvidenceCutoff,
   memberRanEvidence,
   memberWorktreeExisted,
+  missingStateRunVerdict,
   runsBelongingToMember,
   worktreeCreatedAtFromStat,
 } from "./fleet-run.js";
@@ -632,6 +633,7 @@ export const FLEET_MEMBER_STATES = [
   "awaiting-human",
   "interrupted",
   "idle",
+  "complete-unlanded",
   "missing-state",
 ] as const;
 
@@ -649,8 +651,17 @@ export interface FleetPhaseRunView {
 }
 
 export interface FleetMemberView {
-  /** Task id recorded in workflow.json; undefined without readable state. */
+  /** Task id attributed to this worktree; see {@link taskIdSource} for provenance. */
   taskId: string | undefined;
+  /**
+   * Where {@link taskId} came from (bd-168).
+   *
+   * Completion clears `.belayd/workflow.json`, so a finished-but-unlanded member
+   * has no recorded id; the branch (or its own run manifests) keeps it
+   * attributable. Recording the provenance stops an inferred id being mistaken
+   * for one the workflow itself wrote.
+   */
+  taskIdSource?: "workflow" | "worktree" | "runs";
   /**
    * Task id implied by the checked-out branch (or the worktree directory name
    * when the branch is unavailable). Used to flag a stale `workflow.json`.
@@ -697,6 +708,7 @@ export const FLEET_WARNING_KINDS = [
   "missing-workflow-state",
   "corrupt-workflow-state",
   "unparsed-worktree-path",
+  "not-a-member",
   "duplicate-task-id",
   "task-id-mismatch",
   "bead-metadata-unavailable",
@@ -717,6 +729,13 @@ export interface FleetWarning {
   message: string;
 }
 
+export interface FleetOtherWorktree {
+  worktreePath: string;
+  branch: string | undefined;
+  /** The id this worktree would carry, when it names one. */
+  taskId: string | undefined;
+}
+
 export interface FleetStatus {
   schemaVersion: number;
   /** Sanitized id whose directory actually located the fleet files. */
@@ -724,7 +743,14 @@ export interface FleetStatus {
   /** Raw operator input, set only when sanitizing changed it. */
   requestedFleetId?: string;
   intent: FleetIntent | undefined;
+  /** Worktrees attributable to the requested fleet (bd-168). */
   members: FleetMemberView[];
+  /**
+   * Worktrees visible in this repository that are not members of the requested
+   * fleet. Never dropped silently: naming a fleet used to list every worktree,
+   * which made the header and the body describe different fleets (bd-168).
+   */
+  otherWorktrees: FleetOtherWorktree[];
   counts: FleetStateCounts;
   /**
    * The repository-wide capacity arithmetic (bd-166), when the caller supplied the
@@ -741,6 +767,8 @@ export interface FleetCapacityMemberInput {
   liveness: FleetMemberLiveness;
   stopped?: boolean;
   released?: boolean;
+  /** The run recorded this member landing; it holds no slot (bd-168). */
+  landed?: boolean;
   /** Whether any worktree in this repository holds the member's branch. */
   worktreePresent?: boolean;
 }
@@ -809,6 +837,131 @@ function runLoopTaskId(input: {
     return input.expectedTaskId;
   }
   return input.workflowTaskId ?? input.expectedTaskId;
+}
+
+/** Distinct task ids named by a worktree's own run manifests, code-unit sorted. */
+function ownRunTaskIds(runs: readonly RunManifest[]): readonly string[] {
+  return [...new Set(runs.map((run) => run.taskId))].sort(compareCodeUnits);
+}
+
+interface MemberAttribution {
+  taskId?: string;
+  source?: "workflow" | "worktree" | "runs";
+  /**
+   * Whether the attributed id is one the requested fleet's intent records.
+   *
+   * Only consulted when the intent records ids; a fleet with no intent keeps the
+   * all-worktrees view.
+   */
+  belongsToIntent: boolean;
+}
+
+/**
+ * Attribute a worktree to a task id (bd-168).
+ *
+ * Completion clears `.belayd/workflow.json`, which used to erase the member's
+ * identity and make a finished workflow unlandable. The branch (and the directory
+ * name) is the durable identity the fleet itself assigned, and a worktree's own run
+ * manifests are the fallback when the branch is unavailable. A worktree whose only
+ * candidate id is not in the requested fleet and which has no own run evidence is
+ * deliberately left unattributed: it belongs to some other fleet, not this one.
+ */
+interface MemberAttributionFacts {
+  hasWorkflowState: boolean;
+  expectedTaskId: string | undefined;
+  workflowTaskId: string | undefined;
+  runTaskIds: readonly string[];
+}
+
+function attributionFacts(snapshot: FleetMemberSnapshot): MemberAttributionFacts {
+  return {
+    hasWorkflowState: snapshot.workflow.kind === "ok",
+    expectedTaskId: expectedTaskIdFor(snapshot),
+    workflowTaskId: snapshot.workflow.kind === "ok" ? snapshot.workflow.state.taskId : undefined,
+    runTaskIds: ownRunTaskIds(snapshot.runs),
+  };
+}
+
+function attributionCandidates(
+  facts: MemberAttributionFacts,
+): readonly { taskId: string; source: "workflow" | "worktree" | "runs" }[] {
+  return [
+    ...(facts.workflowTaskId === undefined
+      ? []
+      : [{ taskId: facts.workflowTaskId, source: "workflow" as const }]),
+    ...(facts.expectedTaskId === undefined
+      ? []
+      : [{ taskId: facts.expectedTaskId, source: "worktree" as const }]),
+    ...facts.runTaskIds.map((taskId) => ({ taskId, source: "runs" as const })),
+  ];
+}
+
+/** An id the worktree itself names, for a worktree outside the requested fleet. */
+function outsideIntentAttribution(facts: MemberAttributionFacts): MemberAttribution {
+  if (facts.workflowTaskId !== undefined) {
+    return { taskId: facts.workflowTaskId, source: "workflow", belongsToIntent: false };
+  }
+  if (facts.hasWorkflowState) return { belongsToIntent: false };
+  // Keep an id only when the worktree itself names one; a state-less worktree with
+  // neither a fleet id nor its own runs stays anonymous.
+  const runTaskId = facts.runTaskIds[0];
+  if (runTaskId !== undefined) return { taskId: runTaskId, source: "runs", belongsToIntent: false };
+  if (facts.expectedTaskId !== undefined) {
+    return { taskId: facts.expectedTaskId, source: "worktree", belongsToIntent: false };
+  }
+  return { belongsToIntent: false };
+}
+
+/** Attribution without a recorded fleet membership: today's all-worktrees view. */
+function unattributedMember(
+  facts: MemberAttributionFacts,
+  intent: FleetIntent | undefined,
+): MemberAttribution {
+  if (facts.hasWorkflowState) {
+    const taskId = runLoopTaskId({
+      expectedTaskId: facts.expectedTaskId,
+      workflowTaskId: facts.workflowTaskId,
+      intent,
+    });
+    if (taskId === undefined) return { belongsToIntent: false };
+    return {
+      taskId,
+      source: taskId === facts.workflowTaskId ? "workflow" : "worktree",
+      belongsToIntent: false,
+    };
+  }
+  if (facts.expectedTaskId !== undefined) {
+    return { taskId: facts.expectedTaskId, source: "worktree", belongsToIntent: false };
+  }
+  const runTaskId = facts.runTaskIds.length === 1 ? facts.runTaskIds[0] : undefined;
+  return runTaskId === undefined
+    ? { belongsToIntent: false }
+    : { taskId: runTaskId, source: "runs", belongsToIntent: false };
+}
+
+/**
+ * Attribute a worktree to a task id (bd-168).
+ *
+ * Completion clears `.belayd/workflow.json`, which used to erase the member's
+ * identity and make a finished workflow unlandable. The branch (and the directory
+ * name) is the durable identity the fleet itself assigned, and a worktree's own run
+ * manifests are the fallback when the branch is unavailable. A worktree whose only
+ * candidate id is not in the requested fleet and which has no own run evidence is
+ * deliberately left unattributed: it belongs to some other fleet, not this one.
+ */
+function attributeMember(
+  snapshot: FleetMemberSnapshot,
+  intent: FleetIntent | undefined,
+): MemberAttribution {
+  const facts = attributionFacts(snapshot);
+  const intentTaskIds = intent?.taskIds ?? [];
+  if (intentTaskIds.length === 0) return unattributedMember(facts, intent);
+  const member = attributionCandidates(facts).find((candidate) =>
+    intentTaskIds.includes(candidate.taskId),
+  );
+  return member === undefined
+    ? outsideIntentAttribution(facts)
+    : { taskId: member.taskId, source: member.source, belongsToIntent: true };
 }
 
 /** When the run record launched this member; absent for a member it did not launch. */
@@ -944,6 +1097,8 @@ export interface DeriveFleetMemberStateInput {
   runs: readonly RunManifest[];
   completedPhases: readonly string[];
   pendingPhases: readonly string[];
+  /** Phase order for the completed-without-state fallback; absent means `commit`. */
+  phaseOrder?: readonly string[];
   /**
    * The bead's open bd `human` gate, read by the caller (bd-219). Absent means the
    * caller did not read the gates, and not-read is never a wait.
@@ -952,12 +1107,40 @@ export interface DeriveFleetMemberStateInput {
 }
 
 /**
- * Pure state derivation. Precedence: no state → interrupted → awaiting human →
- * blocked (newest run of a pending phase failed) → idle (every phase done) →
- * active (workflow in progress, whether or not a run is in flight).
+ * State for a worktree with no state file.
+ *
+ * Mirrors the tick's own no-state progress derivation, using the shared
+ * `missingStateRunVerdict` completion rule (bd-168 W2): a later failed re-run must
+ * read `blocked` here when the tick reads `phase-failed` there. Running/interrupted
+ * runs keep the same precedence the tick uses.
+ */
+function deriveMissingStateMemberState(input: DeriveFleetMemberStateInput): FleetMemberState {
+  if (input.runs.some((run) => run.status === RunStatus.Running)) return "active";
+  if (countInterrupted(input.runs) > 0) return "interrupted";
+  const verdict = missingStateRunVerdict({
+    runs: input.runs,
+    ...(input.phaseOrder === undefined ? {} : { phaseOrder: input.phaseOrder }),
+  });
+  switch (verdict.kind) {
+    case "complete":
+      return "complete-unlanded";
+    case "failed":
+      return "blocked";
+    case "running":
+      return "active";
+    case "none":
+      return "missing-state";
+  }
+}
+
+/**
+ * Pure state derivation. Precedence: complete-but-unlanded (state archived) →
+ * no state → interrupted → awaiting human → blocked (newest run of a pending phase
+ * failed) → idle (every phase done) → active (workflow in progress, whether or not
+ * a run is in flight).
  */
 export function deriveFleetMemberState(input: DeriveFleetMemberStateInput): FleetMemberState {
-  if (input.workflow.kind !== "ok") return "missing-state";
+  if (input.workflow.kind !== "ok") return deriveMissingStateMemberState(input);
   if (countInterrupted(input.runs) > 0) return "interrupted";
   if (input.humanGateOpen === true || hasUndeliveredUserCompletion(input.runs)) {
     return "awaiting-human";
@@ -981,37 +1164,50 @@ function stopForMember(
   return intent.run?.stopped?.find((entry) => entry.taskId === taskId);
 }
 
-function memberView(
+interface AttributedMemberView {
+  view: FleetMemberView;
+  belongsToIntent: boolean;
+}
+
+/** Build a member view and keep the attribution that produced it (bd-168 S1). */
+function attributedMemberView(
   snapshot: FleetMemberSnapshot,
   intent: FleetIntent | undefined,
-): FleetMemberView {
+): AttributedMemberView {
   const expectedTaskId = expectedTaskIdFor(snapshot);
-  const taskId = runLoopTaskId({
-    expectedTaskId,
-    workflowTaskId: snapshot.workflow.kind === "ok" ? snapshot.workflow.state.taskId : undefined,
-    intent,
-  });
+  const attribution = attributeMember(snapshot, intent);
+  const taskId = attribution.taskId;
   const runs = memberRuns(snapshot, taskId, intent);
   const interruptedRunCount = countInterrupted(runs);
   const runTimestamp = lastRunTimestamp(runs);
+  const taskIdSource = attribution.source === undefined ? {} : { taskIdSource: attribution.source };
 
   if (snapshot.workflow.kind !== "ok") {
     return {
-      taskId: undefined,
-      expectedTaskId,
-      worktreePath: snapshot.worktreePath,
-      branch: snapshot.branch,
-      workflowFile: snapshot.workflow.kind,
-      workflowType: undefined,
-      phaseOrder: [],
-      completedPhases: [],
-      pendingPhases: [],
-      awaitingReviewResponse: false,
-      latestRuns: latestRunPerPhase(runs, []),
-      interruptedRunCount,
-      updatedAt: runTimestamp,
-      lease: fleetLeaseView(snapshot.lease),
-      state: "missing-state",
+      belongsToIntent: attribution.belongsToIntent,
+      view: {
+        taskId,
+        ...taskIdSource,
+        expectedTaskId,
+        worktreePath: snapshot.worktreePath,
+        branch: snapshot.branch,
+        workflowFile: snapshot.workflow.kind,
+        workflowType: undefined,
+        phaseOrder: [],
+        completedPhases: [],
+        pendingPhases: [],
+        awaitingReviewResponse: false,
+        latestRuns: latestRunPerPhase(runs, []),
+        interruptedRunCount,
+        updatedAt: runTimestamp,
+        lease: fleetLeaseView(snapshot.lease),
+        state: deriveFleetMemberState({
+          workflow: snapshot.workflow,
+          runs,
+          completedPhases: [],
+          pendingPhases: [],
+        }),
+      },
     };
   }
 
@@ -1024,29 +1220,33 @@ function memberView(
   const stop = stopForMember(intent, state.taskId);
 
   return {
-    taskId: state.taskId,
-    expectedTaskId,
-    worktreePath: snapshot.worktreePath,
-    branch: snapshot.branch,
-    workflowFile: "ok",
-    workflowType: state.workflowType,
-    phaseOrder: [...state.phaseOrder],
-    completedPhases,
-    pendingPhases,
-    awaitingReviewResponse,
-    latestRuns: latestRunPerPhase(runs, state.phaseOrder),
-    interruptedRunCount,
-    updatedAt:
-      runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
-    lease: fleetLeaseView(snapshot.lease),
-    ...(stop === undefined ? {} : { stop }),
-    state: deriveFleetMemberState({
-      workflow: snapshot.workflow,
-      runs,
+    belongsToIntent: attribution.belongsToIntent,
+    view: {
+      taskId: state.taskId,
+      taskIdSource: "workflow",
+      expectedTaskId,
+      worktreePath: snapshot.worktreePath,
+      branch: snapshot.branch,
+      workflowFile: "ok",
+      workflowType: state.workflowType,
+      phaseOrder: [...state.phaseOrder],
       completedPhases,
       pendingPhases,
-      ...(snapshot.humanGateOpen === undefined ? {} : { humanGateOpen: snapshot.humanGateOpen }),
-    }),
+      awaitingReviewResponse,
+      latestRuns: latestRunPerPhase(runs, state.phaseOrder),
+      interruptedRunCount,
+      updatedAt:
+        runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
+      lease: fleetLeaseView(snapshot.lease),
+      ...(stop === undefined ? {} : { stop }),
+      state: deriveFleetMemberState({
+        workflow: snapshot.workflow,
+        runs,
+        completedPhases,
+        pendingPhases,
+        ...(snapshot.humanGateOpen === undefined ? {} : { humanGateOpen: snapshot.humanGateOpen }),
+      }),
+    },
   };
 }
 
@@ -1069,10 +1269,38 @@ function countMemberStates(members: readonly FleetMemberView[]): FleetStateCount
     "awaiting-human": 0,
     interrupted: 0,
     idle: 0,
+    "complete-unlanded": 0,
     "missing-state": 0,
   };
   for (const member of members) counts[member.state] += 1;
   return counts;
+}
+
+/**
+ * The warning for a worktree with no state file.
+ *
+ * A finished but unlanded member gets truthful wording (bd-168): the state file is
+ * gone because completion cleared it, not because the worktree is anonymous, and
+ * the exact landing commands are named so the fleet can finish the work without a
+ * human supplying the task id.
+ */
+function missingWorkflowWarning(member: FleetMemberView): FleetWarning {
+  if (member.state === "complete-unlanded" && member.taskId !== undefined) {
+    return {
+      kind: "missing-workflow-state",
+      taskId: member.taskId,
+      worktreePath: member.worktreePath,
+      message:
+        `no .belayd/workflow.json in ${member.worktreePath} (completion clears it); ` +
+        `${member.taskId} still belongs to this fleet and its work is finished — land it ` +
+        `with belayd_fleet_merge action=enqueue task=${member.taskId} then action=drain`,
+    };
+  }
+  return {
+    kind: "missing-workflow-state",
+    worktreePath: member.worktreePath,
+    message: `no .belayd/workflow.json in ${member.worktreePath}; that worktree drives no workflow`,
+  };
 }
 
 function collectWarnings(members: readonly FleetMemberView[]): FleetWarning[] {
@@ -1081,11 +1309,7 @@ function collectWarnings(members: readonly FleetMemberView[]): FleetWarning[] {
   for (const member of members) {
     switch (member.workflowFile) {
       case "missing":
-        warnings.push({
-          kind: "missing-workflow-state",
-          worktreePath: member.worktreePath,
-          message: `no .belayd/workflow.json in ${member.worktreePath}; that worktree drives no workflow`,
-        });
+        warnings.push(missingWorkflowWarning(member));
         break;
       case "corrupt":
         warnings.push({
@@ -1149,7 +1373,8 @@ function staleMemberWarnings(fleets: readonly FleetCapacityFleetInput[]): FleetW
   const warnings: FleetWarning[] = [];
   for (const fleet of fleets) {
     for (const member of fleet.members) {
-      if (member.released === true || member.worktreePresent !== false) continue;
+      if (member.released === true || member.landed === true || member.worktreePresent !== false)
+        continue;
       warnings.push({
         kind: "stale-member",
         taskId: member.taskId,
@@ -1233,16 +1458,39 @@ function collectCapacityWarnings(options: {
  * Pure rollup: no fs, no git. Every input is already-read data, so tests need
  * no mocks and the same snapshot always yields the same view.
  */
-export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus {
+/** Split worktrees into the requested fleet's members and everything else. */
+function partitionByFleet(options: BuildFleetStatusOptions): {
+  restrictedToIntent: boolean;
+  members: FleetMemberView[];
+  otherWorktrees: FleetOtherWorktree[];
+} {
+  const restrictedToIntent = (options.intent?.taskIds.length ?? 0) > 0;
   const members: FleetMemberView[] = [];
+  const otherWorktrees: FleetOtherWorktree[] = [];
   for (const snapshot of options.members) {
     // The main checkout is the supervisor's merge target, not a fleet member,
     // unless an in-place workflow gave it workflow state.
     if (snapshot.isMainWorktree && snapshot.workflow.kind === "missing") continue;
-    members.push(memberView(snapshot, options.intent));
+    const { view, belongsToIntent } = attributedMemberView(snapshot, options.intent);
+    // A named fleet's body must describe that fleet (bd-168): a worktree whose
+    // attribution is not in its intent stays visible, but outside `members`.
+    if (!restrictedToIntent || belongsToIntent) {
+      members.push(view);
+    } else {
+      otherWorktrees.push({
+        worktreePath: view.worktreePath,
+        branch: view.branch,
+        taskId: view.taskId,
+      });
+    }
   }
   members.sort(compareMembers);
+  otherWorktrees.sort((left, right) => compareCodeUnits(left.worktreePath, right.worktreePath));
+  return { restrictedToIntent, members, otherWorktrees };
+}
 
+export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus {
+  const { restrictedToIntent, members, otherWorktrees } = partitionByFleet(options);
   const capacity = capacityArithmeticOf(options.capacity);
   return {
     schemaVersion: FLEET_SCHEMA_VERSION,
@@ -1253,11 +1501,19 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
         : options.requestedFleetId,
     intent: options.intent,
     members,
+    otherWorktrees,
     counts: countMemberStates(members),
     ...(capacity === undefined ? {} : { capacity }),
     warnings: [
       ...(options.worktreeWarnings ?? []),
       ...collectWarnings(members),
+      ...(restrictedToIntent
+        ? otherWorktreeWarnings({
+            fleetId: options.fleetId,
+            otherWorktrees,
+            capacity: options.capacity,
+          })
+        : []),
       ...(options.capacity === undefined || capacity === undefined
         ? []
         : collectCapacityWarnings({
@@ -1267,6 +1523,40 @@ export function buildFleetStatus(options: BuildFleetStatusOptions): FleetStatus 
           })),
     ],
   };
+}
+
+/**
+ * Warnings for worktrees outside a named fleet's membership.
+ *
+ * They are warnings rather than silence because the old view listed every
+ * worktree under whatever fleet id was requested; a reader needs to know which
+ * fleet the excluded work actually belongs to.
+ */
+function otherWorktreeWarnings(options: {
+  fleetId: string;
+  otherWorktrees: readonly FleetOtherWorktree[];
+  capacity: FleetCapacityInput | undefined;
+}): FleetWarning[] {
+  return options.otherWorktrees.map((worktree) => {
+    const owner =
+      worktree.taskId === undefined
+        ? undefined
+        : options.capacity?.fleets.find((fleet) =>
+            fleet.members.some((member) => member.taskId === worktree.taskId),
+          )?.fleetId;
+    const ownerText =
+      owner === undefined ? "no fleet here records it" : `it belongs to fleet \`${owner}\``;
+    return {
+      kind: "not-a-member",
+      ...(worktree.taskId === undefined ? {} : { taskId: worktree.taskId }),
+      worktreePath: worktree.worktreePath,
+      message:
+        `worktree ${worktree.worktreePath} is not a member of fleet \`${options.fleetId}\`` +
+        (worktree.taskId === undefined
+          ? " and holds no recorded task id"
+          : ` (${worktree.taskId}: ${ownerText})`),
+    };
+  });
 }
 
 /** Project the reader's per-member observation onto the shared arithmetic. */
@@ -1286,6 +1576,7 @@ function capacityArithmeticOf(
           liveness: member.liveness,
           ...(member.stopped === true ? { stopped: true } : {}),
           ...(member.released === true ? { released: true } : {}),
+          ...(member.landed === true ? { landed: true } : {}),
         })),
       })),
   });
@@ -1646,9 +1937,16 @@ export function applyFleetBeadEngagement(
       if (engagement === undefined) return member;
       // A bead with an open `human` label reads as a real person-wait without a
       // second bd read (bd-219), but never over an unreadable tree or a crash:
-      // both are states an operator must see as themselves.
+      // both are states an operator must see as themselves. It also never overrides
+      // `complete-unlanded` (bd-168 W3): that member's work is finished, the tick
+      // lands it without reading the gate (a state-less member has no gate wait), and
+      // replacing the landing commands with "Needs you" would ask a human to do work
+      // the fleet performs autonomously.
       const awaitingHuman = engagement.awaitingHuman === true;
-      const overridable = member.state !== "missing-state" && member.state !== "interrupted";
+      const overridable =
+        member.state !== "missing-state" &&
+        member.state !== "interrupted" &&
+        member.state !== "complete-unlanded";
       return awaitingHuman && overridable
         ? { ...member, engagement, state: "awaiting-human" }
         : { ...member, engagement };
@@ -1755,7 +2053,8 @@ function formatCapacity(capacity: FleetCapacityArithmetic | undefined): readonly
       `    ${contributor.fleetId}: ${contributor.members} member(s), ` +
         `${contributor.counted} counted (${contributor.live} live, ${contributor.unknown} unknown, ` +
         `${contributor.absent} absent), ${contributor.stopped} stopped, ` +
-        `${contributor.released} released; supervisor ${contributor.supervisor}`,
+        `${contributor.released} released, ${contributor.landed} landed; ` +
+        `supervisor ${contributor.supervisor}`,
     );
   }
   return lines;
@@ -1870,6 +2169,10 @@ export function formatNeedsYou(status: FleetStatus): string | undefined {
   for (const member of status.members) {
     const taskId = member.taskId;
     if (taskId === undefined) continue;
+    // A finished-but-unlanded member is the fleet's own work, not a person's: the
+    // tick lands it without reading the gate (bd-168 W3), so an open gate must not
+    // put it in "Needs you". An actual recorded stop still does.
+    if (member.state === "complete-unlanded" && member.stop === undefined) continue;
     if (
       !beadNeedsHuman(member.bead) &&
       member.engagement?.awaitingHuman !== true &&
@@ -2038,11 +2341,27 @@ function formatLeaseLine(lease: FleetLeaseView): string {
   }
 }
 
+/** Provenance line, so an inferred id is never mistaken for a recorded one (bd-168). */
+function formatTaskIdProvenance(member: FleetMemberView): string[] {
+  if (member.taskId === undefined || member.taskIdSource === undefined) return [];
+  if (member.taskIdSource === "workflow") return [];
+  const source =
+    member.taskIdSource === "worktree" ? "branch or worktree path" : "its run manifests";
+  return [`  task id: ${member.taskId} (inferred from ${source})`];
+}
+
+/** The exact landing commands for a finished-but-unlanded member (bd-168). */
+function formatLandingCommands(member: FleetMemberView): string[] {
+  if (member.state !== "complete-unlanded" || member.taskId === undefined) return [];
+  return [`  land it: belayd_fleet_merge action=enqueue task=${member.taskId} then action=drain`];
+}
+
 function formatMember(member: FleetMemberView): string[] {
   const branch = member.branch === undefined ? "detached HEAD" : member.branch;
   const lines = [
     `Member ${member.taskId ?? "(no task id)"} — ${member.state}`,
     `  worktree: ${member.worktreePath} (branch ${branch})`,
+    ...formatTaskIdProvenance(member),
   ];
 
   if (member.bead !== undefined) lines.push(formatBeadLine(member.bead));
@@ -2075,6 +2394,7 @@ function formatMember(member: FleetMemberView): string[] {
         : member.latestRuns.map((run) => `${run.phase}=${run.status}`).join(", ")
     }`,
   );
+  lines.push(...formatLandingCommands(member));
   return lines;
 }
 
@@ -2104,33 +2424,50 @@ function formatFleetHeader(status: FleetStatus): string[] {
   ];
 }
 
+/** The member blocks, the empty-view sentence, and the other-worktree list. */
+function formatMemberSections(status: FleetStatus): string[] {
+  const lines: string[] = [];
+  if (status.members.length === 0) {
+    lines.push(
+      "",
+      status.intent === undefined || status.intent.taskIds.length === 0
+        ? "No fleet members: no worktree holds Belayd workflow state."
+        : `No fleet members: no worktree is attributable to fleet ${status.fleetId}.`,
+    );
+  }
+  for (const member of status.members) {
+    lines.push("", ...formatMember(member));
+  }
+  if (status.otherWorktrees.length > 0) {
+    lines.push(
+      "",
+      `Other worktrees (${status.otherWorktrees.length}) — not members of fleet ${status.fleetId}:`,
+    );
+    for (const worktree of status.otherWorktrees) {
+      const branch = worktree.branch === undefined ? "detached HEAD" : worktree.branch;
+      const id = worktree.taskId === undefined ? "no task id" : worktree.taskId;
+      lines.push(`  ${worktree.worktreePath} (branch ${branch}, ${id})`);
+    }
+  }
+  return lines;
+}
+
+function formatWarningSection(status: FleetStatus): string[] {
+  if (status.warnings.length === 0) return [];
+  return [
+    "",
+    `Warnings (${status.warnings.length}):`,
+    ...status.warnings.map((warning) => `  - ${warning.message}`),
+  ];
+}
+
 export function formatFleetStatus(status: FleetStatus): string {
   const lines = formatFleetHeader(status);
-
   // After the header lines so "who is waiting on me" is the first thing read,
   // and before the member blocks so it is never buried in a long fleet.
   const needsYou = formatNeedsYou(status);
-  if (needsYou !== undefined) {
-    lines.push("");
-    lines.push(needsYou);
-  }
-
-  if (status.members.length === 0) {
-    lines.push("");
-    lines.push("No fleet members: no worktree holds Belayd workflow state.");
-  }
-
-  for (const member of status.members) {
-    lines.push("");
-    lines.push(...formatMember(member));
-  }
-
-  if (status.warnings.length > 0) {
-    lines.push("");
-    lines.push(`Warnings (${status.warnings.length}):`);
-    for (const warning of status.warnings) lines.push(`  - ${warning.message}`);
-  }
-
+  if (needsYou !== undefined) lines.push("", needsYou);
+  lines.push(...formatMemberSections(status), ...formatWarningSection(status));
   return lines.join("\n");
 }
 
@@ -2451,6 +2788,58 @@ function readFleetCapacity(options: {
   return { ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS, fleets };
 }
 
+/** One member's liveness, from the worktree, lease, landing and spawn evidence. */
+function capacityMemberLiveness(options: {
+  taskId: string;
+  worktree: FleetWorktreeEvidence | undefined;
+  presentPath: string | undefined;
+  lease: FleetMemberLeaseProbe | undefined;
+  recordedLanding: number | undefined;
+  intent: FleetIntent;
+  gitCommonDir: string;
+  fleetId: string;
+  now: number;
+  fs: FleetStatusFs;
+  scan: FleetProcessScan;
+  branchExistsFor: (taskId: string) => boolean;
+  onWarning?: (message: string, taskId: string) => void;
+}): FleetMemberLiveness {
+  const { taskId, worktree, presentPath } = options;
+  const onWarning = options.onWarning;
+  // Same rule as the launch probe: a worktree with no lease and no evidence this
+  // member's own execution ran is a spawn in flight — unknown and counted, never
+  // absent (bd-166). A worktree that provably existed and is gone now is absent
+  // instead, so a deleted tree stops holding a slot forever (bd-233) — unless that
+  // member's own spawn marker is live, where a relaunch reuses the surviving branch
+  // (W2). The marker is per member, so a ticking run never holds a slot open.
+  return classifyMemberLivenessInWorktree({
+    taskId,
+    worktreePath: presentPath,
+    memberRanEvidence:
+      presentPath === undefined
+        ? false
+        : memberRanInWorktree({ intent: options.intent, taskId, worktree }),
+    worktreeExisted: memberWorktreeExisted({
+      taskId,
+      branchExists: worktree !== undefined || options.branchExistsFor(taskId),
+      worktreeListed: worktree !== undefined,
+      ...(options.recordedLanding === undefined ? {} : { landedAt: options.recordedLanding }),
+      spawnInFlight: fleetSpawnInFlight({
+        gitCommonDir: options.gitCommonDir,
+        fleetId: options.fleetId,
+        taskId,
+        now: options.now,
+        fs: options.fs,
+        ...(onWarning === undefined
+          ? {}
+          : { onWarning: (message: string) => onWarning(message, taskId) }),
+      }),
+    }),
+    scan: options.scan,
+    ...(options.lease === undefined ? {} : { lease: options.lease }),
+  });
+}
+
 /** One fleet's recorded membership, classified for the capacity arithmetic. */
 function capacityFleetInput(options: {
   fleetId: string;
@@ -2467,6 +2856,10 @@ function capacityFleetInput(options: {
 }): FleetCapacityFleetInput {
   const released = new Set((options.intent.released ?? []).map((entry) => entry.taskId));
   const stopped = new Set((options.intent.run?.stopped ?? []).map((entry) => entry.taskId));
+  const landed = new Map<string, number>();
+  for (const member of options.intent.run?.members ?? []) {
+    if (member.landedAt !== undefined) landed.set(member.taskId, member.landedAt);
+  }
   const members = options.intent.taskIds.map((taskId): FleetCapacityMemberInput => {
     const worktree = options.worktrees.get(taskId);
     // `git worktree list` keeps reporting a worktree whose directory was deleted, so
@@ -2474,42 +2867,27 @@ function capacityFleetInput(options: {
     const presentPath =
       worktree !== undefined && options.fs.existsSync(worktree.path) ? worktree.path : undefined;
     const lease = options.leaseFor(taskId, presentPath);
-    const onWarning = options.onWarning;
+    const recordedLanding = landed.get(taskId);
     return {
       taskId,
-      // Same rule as the launch probe: a worktree with no lease and no evidence this
-      // member's own execution ran is a spawn in flight — unknown and counted, never
-      // absent (bd-166). A worktree that provably existed and is gone now is absent
-      // instead, so a deleted tree stops holding a slot forever (bd-233) — unless that
-      // member's own spawn marker is live, where a relaunch reuses the surviving branch
-      // (W2). The marker is per member, so a ticking run never holds a slot open.
-      liveness: classifyMemberLivenessInWorktree({
+      liveness: capacityMemberLiveness({
         taskId,
-        worktreePath: presentPath,
-        memberRanEvidence:
-          presentPath === undefined
-            ? false
-            : memberRanInWorktree({ intent: options.intent, taskId, worktree }),
-        worktreeExisted: memberWorktreeExisted({
-          taskId,
-          branchExists: worktree !== undefined || options.branchExistsFor(taskId),
-          worktreeListed: worktree !== undefined,
-          spawnInFlight: fleetSpawnInFlight({
-            gitCommonDir: options.gitCommonDir,
-            fleetId: options.fleetId,
-            taskId,
-            now: options.now,
-            fs: options.fs,
-            ...(onWarning === undefined
-              ? {}
-              : { onWarning: (message: string) => onWarning(message, taskId) }),
-          }),
-        }),
+        worktree,
+        presentPath,
+        lease,
+        recordedLanding,
+        intent: options.intent,
+        gitCommonDir: options.gitCommonDir,
+        fleetId: options.fleetId,
+        now: options.now,
+        fs: options.fs,
         scan: options.scan,
-        ...(lease === undefined ? {} : { lease }),
+        branchExistsFor: options.branchExistsFor,
+        ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
       }),
       ...(released.has(taskId) ? { released: true } : {}),
       ...(stopped.has(taskId) ? { stopped: true } : {}),
+      ...(recordedLanding === undefined ? {} : { landed: true }),
       worktreePresent: worktree !== undefined,
     };
   });

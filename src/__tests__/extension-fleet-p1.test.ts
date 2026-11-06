@@ -2177,6 +2177,75 @@ describe("fleet supervisor mode", () => {
       expect(untouched.intent?.taskIds).toEqual(["bd-31"]);
     });
 
+    it("releases a dead foreign fleet's member through the audited recovery path (bd-168)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      writeDeadFleet();
+
+      const tool = mock.tools.get("belayd_fleet_release");
+      if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
+      const released = await tool.execute(
+        "release-1",
+        { taskId: "bd-31", fleetId: "wave1" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(released.details).toHaveProperty("exitCode", 0);
+      expect(textOf(released as ToolResult)).toContain("released bd-31's capacity slot");
+
+      const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(intent).toHaveProperty("ok", true);
+      if (!intent.ok) return;
+      expect(intent.intent?.released).toEqual([
+        expect.objectContaining({ taskId: "bd-31", reason: "operator-release" }),
+      ]);
+      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
+      const actions = existsSync(auditPath)
+        ? readFileSync(auditPath, "utf8")
+            .split("\n")
+            .filter((line) => line !== "")
+            .map((line) => (JSON.parse(line) as { action: string }).action)
+        : [];
+      expect(actions).toContain("member-released-recovery");
+      expect(actions).not.toContain("member-released");
+    });
+
+    it("refuses to release a foreign fleet's member while its supervisor is live", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      writeDeadFleet();
+      writeFileSync(
+        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: "wave1",
+          taskIds: ["bd-31"],
+          createdAt: 1,
+          updatedAt: 1,
+          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+        }),
+      );
+
+      const tool = mock.tools.get("belayd_fleet_release");
+      if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
+      const refused = await tool.execute(
+        "release-1",
+        { taskId: "bd-31", fleetId: "wave1" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(refused.details).toHaveProperty("exitCode", 1);
+      expect(textOf(refused as ToolResult)).toContain("supervisor is not provably dead");
+      const untouched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "wave1" });
+      expect(untouched).toHaveProperty("ok", true);
+      if (!untouched.ok) return;
+      expect(untouched.intent?.released).toBeUndefined();
+    });
+
     it("CRITICAL/W1: prunes a member with a deleted worktree on a ticking run", async () => {
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "supervisor-session");
@@ -2261,6 +2330,55 @@ describe("fleet supervisor mode", () => {
       // bd-12 is absent (listing + deleted dir). bd-15 has neither a worktree nor a
       // branch, so it stays unknown and counted.
       expect(pruned.intent?.taskIds).toEqual(["bd-15"]);
+    });
+
+    it("W1: prunes a landed member whose clean landing removed the worktree and branch (bd-168)", async () => {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, "supervisor-session");
+      await arm(mock, ctx);
+      const launchedAt = Date.now() - 3_600_000;
+      const recorded = updateFleetIntent({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        update: (current) =>
+          current === undefined
+            ? { refuse: "no intent" }
+            : {
+                ...current,
+                taskIds: ["bd-12"],
+                run: {
+                  schemaVersion: 1,
+                  mode: "until-complete",
+                  startedAt: launchedAt,
+                  updatedAt: Date.now(),
+                  ticks: 12,
+                  members: [{ taskId: "bd-12", launchedAt, landedAt: launchedAt + 60_000 }],
+                },
+              },
+      });
+      expect(recorded).toHaveProperty("ok", true);
+      // A clean landing deleted both the worktree and the branch, so nothing on disk
+      // proves the tree existed; the run's own landedAt record is the positive
+      // evidence that must make it prunable (bd-168 #1).
+      worktree.existingBranches = new Set();
+      worktree.byBranch = {};
+
+      const tool = mock.tools.get("belayd_fleet_reconcile");
+      if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
+      const result = await tool.execute(
+        "reconcile-1",
+        { fleetId: "default", pruneDeadMembers: true },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(result.details).toHaveProperty("exitCode", 0);
+      const text = textOf(result as ToolResult);
+      expect(text).not.toContain("no proof one ever existed");
+      const pruned = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(pruned).toHaveProperty("ok", true);
+      if (!pruned.ok) return;
+      expect(pruned.intent?.taskIds).toEqual([]);
     });
 
     it("W1/W2: a listed worktree on disk and a live spawn marker are both unknown", async () => {

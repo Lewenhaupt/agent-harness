@@ -161,6 +161,13 @@ export interface FleetLaunchFleet {
    * second intent read.
    */
   released?: readonly string[];
+  /**
+   * Members whose landing this fleet's run recorded (bd-168).
+   *
+   * A landing frees the slot even when a stale worktree still exists and its
+   * liveness probe cannot classify it; a released/landed member never counts.
+   */
+  landed?: readonly string[];
 }
 
 export interface ValidateFleetLaunchInput {
@@ -1080,6 +1087,41 @@ export interface CollectFleetLaunchContextOptions {
   fs?: FleetStateFs;
 }
 
+/** One fleet's membership, release/landing bookkeeping, and supervisor state. */
+function launchFleetFromIntent(options: {
+  fleetId: string;
+  intent: FleetIntent;
+  supervisorBeat: ((fleetId: string) => SupervisorHeartbeat | undefined) | undefined;
+  now: number;
+  liveness: FleetSupervisorLiveness;
+}): FleetLaunchFleet {
+  const supervisorState = classifyFleetSupervisor({
+    supervisor: options.intent.supervisor,
+    liveness: options.liveness,
+  });
+  const released = (options.intent.released ?? []).map((entry) => entry.taskId);
+  const landed = (options.intent.run?.members ?? [])
+    .filter((member) => member.landedAt !== undefined)
+    .map((member) => member.taskId);
+  return {
+    fleetId: options.fleetId,
+    members: [...options.intent.taskIds],
+    ...(released.length === 0 ? {} : { released }),
+    ...(landed.length === 0 ? {} : { landed }),
+    supervisor: effectiveSupervisorState({
+      state: supervisorState,
+      runMode: options.intent.run !== undefined,
+      beat: options.supervisorBeat?.(options.fleetId),
+      now: options.now,
+      // A beat only proves a loop *was* alive when it was written; a provably
+      // dead pid closes the stale window immediately (bd-233), so a re-arm does
+      // not wait 10 minutes on a cancelled supervisor.
+      ...(options.intent.supervisor === undefined ? {} : { supervisor: options.intent.supervisor }),
+      liveness: options.liveness,
+    }),
+  };
+}
+
 export function collectFleetLaunchContext(
   options: CollectFleetLaunchContextOptions,
 ): FleetLaunchContext {
@@ -1102,27 +1144,15 @@ export function collectFleetLaunchContext(
       continue;
     }
     if (loaded.intent === undefined) continue;
-    const supervisorState = classifyFleetSupervisor({
-      supervisor: loaded.intent.supervisor,
-      liveness: options.liveness,
-    });
-    const released = (loaded.intent.released ?? []).map((entry) => entry.taskId);
-    fleets.push({
-      fleetId: sanitized,
-      members: [...loaded.intent.taskIds],
-      ...(released.length === 0 ? {} : { released }),
-      supervisor: effectiveSupervisorState({
-        state: supervisorState,
-        runMode: loaded.intent.run !== undefined,
-        beat: options.supervisorBeat?.(sanitized),
+    fleets.push(
+      launchFleetFromIntent({
+        fleetId: sanitized,
+        intent: loaded.intent,
+        supervisorBeat: options.supervisorBeat,
         now: options.now ?? 0,
-        // A beat only proves a loop *was* alive when it was written; a provably
-        // dead pid closes the stale window immediately (bd-233), so a re-arm does
-        // not wait 10 minutes on a cancelled supervisor.
-        ...(loaded.intent.supervisor === undefined ? {} : { supervisor: loaded.intent.supervisor }),
         liveness: options.liveness,
       }),
-    });
+    );
     if (sanitized === targetFleetId) targetIntent = loaded.intent;
   }
   return { fleets, targetIntent, targetFleetId, unknownFleets: unknownFleets.sort() };
@@ -1355,24 +1385,43 @@ export function countActiveFleetOrchestrators(options: {
   const launching = new Set(options.launchingTaskIds);
   let active = 0;
   for (const fleet of options.fleets) {
-    // Released ids are read per fleet: membership is disjoint only by convention,
-    // and a bare task-id set would let one fleet's release free the same id in
-    // another fleet that still records it as a live member.
+    // Released/landed ids are read per fleet: membership is disjoint only by
+    // convention, and a bare task-id set would let one fleet's release free the same
+    // id in another fleet that still records it as a live member.
     const released = new Set(fleet.released ?? []);
+    const landed = new Set(fleet.landed ?? []);
     for (const taskId of fleet.members) {
       if (launching.has(taskId)) continue;
-      const holds = memberHoldsCapacity({
+      const holds = fleetMemberHoldsCapacity({
+        fleet,
         taskId,
-        liveness: options.livenessFor?.(fleet.fleetId, taskId) ?? {
-          kind: "unknown",
-          reason: "no liveness probe supplied",
-        },
-        ...(released.has(taskId) ? { released: true } : {}),
+        released: released.has(taskId),
+        landed: landed.has(taskId),
+        ...(options.livenessFor === undefined ? {} : { livenessFor: options.livenessFor }),
       });
       if (holds) active += 1;
     }
   }
   return active;
+}
+
+/** One recorded member's slot, with no probe defaulting to the safe `unknown`. */
+function fleetMemberHoldsCapacity(options: {
+  fleet: FleetLaunchFleet;
+  taskId: string;
+  released: boolean;
+  landed: boolean;
+  livenessFor?: (fleetId: string, taskId: string) => FleetMemberLiveness | undefined;
+}): boolean {
+  return memberHoldsCapacity({
+    taskId: options.taskId,
+    liveness: options.livenessFor?.(options.fleet.fleetId, options.taskId) ?? {
+      kind: "unknown",
+      reason: "no liveness probe supplied",
+    },
+    ...(options.released ? { released: true } : {}),
+    ...(options.landed ? { landed: true } : {}),
+  });
 }
 
 /**

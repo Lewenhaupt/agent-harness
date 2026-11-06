@@ -612,6 +612,7 @@ describe("buildFleetStatus", () => {
       "awaiting-human": 0,
       interrupted: 0,
       idle: 0,
+      "complete-unlanded": 0,
       "missing-state": 0,
     });
   });
@@ -974,7 +975,9 @@ describe("buildFleetStatus", () => {
     const status = buildFleetStatus({
       fleetId: "fleet-1",
       intent: sampleIntent({
-        taskIds: ["bd-15"],
+        // bd-99 is the fleet member recorded in `workflow.json`; bd-12 is only the
+        // branch/run id and is not in the fleet, so its run is not this member's.
+        taskIds: ["bd-15", "bd-99"],
         run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-15" }] }),
       }),
       members: [
@@ -991,7 +994,7 @@ describe("buildFleetStatus", () => {
     expect(status.members[0]?.latestRuns).toEqual([]);
   });
 
-  it("reports runs as read when no task id can be derived", () => {
+  it("attributes a branch-less, state-less worktree from its single own run id (bd-168)", () => {
     const status = buildFleetStatus({
       fleetId: "fleet-1",
       intent: undefined,
@@ -1005,8 +1008,10 @@ describe("buildFleetStatus", () => {
       ],
     });
 
-    // Without a member id there is nothing to attribute the manifest to, so the
-    // view stays file-truth instead of hiding every run behind a missing key.
+    // The branch is gone and the state file was cleared, so the member's own run
+    // manifest is the only remaining identity; it stays attributable.
+    expect(status.members[0]).toHaveProperty("taskId", "bd-12");
+    expect(status.members[0]).toHaveProperty("taskIdSource", "runs");
     expect(status.members[0]?.latestRuns.map((run) => run.runId)).toEqual(["run-1"]);
   });
 
@@ -1106,7 +1111,7 @@ describe("buildFleetStatus", () => {
     ]);
     expect(member?.latestRuns.map((run) => run.runId)).toEqual(["own-commit"]);
     expect(member).toHaveProperty("updatedAt", 1_950);
-    expect(member).toHaveProperty("state", "missing-state");
+    expect(member).toHaveProperty("state", "complete-unlanded");
   });
 
   it("distinguishes a running run from an interrupted one", () => {
@@ -1544,9 +1549,9 @@ describe("buildFleetStatus", () => {
 
     expect(forward.warnings.map((warning) => warning.kind)).toEqual([
       "unparsed-worktree-path",
-      "task-id-mismatch",
       "missing-workflow-state",
       "corrupt-workflow-state",
+      "task-id-mismatch",
       "duplicate-task-id",
     ]);
     expect(reverse.warnings).toEqual(forward.warnings);
@@ -1607,7 +1612,7 @@ describe("formatFleetStatus", () => {
         "Fleet fleet-1",
         "  intent: bd-12, bd-15, max 3 concurrent",
         "  members: 1",
-        "  states: active=1 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=0",
+        "  states: active=1 blocked=0 awaiting-human=0 interrupted=0 idle=0 complete-unlanded=0 missing-state=0",
         "",
         "Member bd-12 — active",
         "  worktree: /repo.feat-bd-12 (branch feat/bd-12)",
@@ -1647,7 +1652,10 @@ describe("formatFleetStatus", () => {
     });
 
     const rendered = formatFleetStatus(status);
-    expect(rendered).toContain("Member (no task id) — missing-state");
+    // The directory name still names the member even with no branch and no state
+    // (bd-168): attribution no longer depends on workflow.json.
+    expect(rendered).toContain("Member bd-12 — missing-state");
+    expect(rendered).toContain("task id: bd-12 (inferred from branch or worktree path)");
     expect(rendered).toContain("branch detached HEAD");
     expect(rendered).toContain("workflow: corrupt");
     expect(rendered).toContain("last updated: unknown");
@@ -1676,6 +1684,224 @@ describe("formatFleetStatus", () => {
     expect(first).not.toContain("\u001b");
     expect(first).toContain("bd-12, bd-15, paused");
     expect(first).toContain("  - skipped entry");
+  });
+});
+
+describe("attribution through workflow archival (bd-168)", () => {
+  it("keeps a finished member attributable and names the landing commands", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          workflow: { kind: "missing" },
+          runs: [
+            sampleRun({
+              phase: "commit",
+              status: RunStatus.Completed,
+              startedAt: 3_000,
+              completedAt: 3_100,
+            }),
+          ],
+        }),
+      ],
+    });
+
+    expect(status.members).toHaveLength(1);
+    expect(status.members[0]).toHaveProperty("taskId", "bd-12");
+    expect(status.members[0]).toHaveProperty("taskIdSource", "worktree");
+    expect(status.members[0]).toHaveProperty("state", "complete-unlanded");
+    expect(status.counts["complete-unlanded"]).toBe(1);
+
+    const rendered = formatFleetStatus(status);
+    expect(rendered).toContain("Member bd-12 — complete-unlanded");
+    expect(rendered).toContain(
+      "land it: belayd_fleet_merge action=enqueue task=bd-12 then action=drain",
+    );
+    const warning = status.warnings.find((entry) => entry.kind === "missing-workflow-state");
+    expect(warning?.message).toContain("completion clears it");
+    expect(warning?.message).toContain("belayd_fleet_merge action=enqueue task=bd-12");
+  });
+
+  it("attributes a state-less worktree from its own run manifests when the branch cannot", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          worktreePath: "/repo.detached",
+          branch: undefined,
+          workflow: { kind: "missing" },
+          runs: [sampleRun({ taskId: "bd-12", phase: "commit" })],
+        }),
+      ],
+    });
+
+    expect(status.members[0]).toHaveProperty("taskId", "bd-12");
+    expect(status.members[0]).toHaveProperty("taskIdSource", "runs");
+    expect(status.members[0]).toHaveProperty("state", "complete-unlanded");
+  });
+
+  it("keeps a genuinely anonymous worktree's old wording and no id", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          worktreePath: "/repo.scratch",
+          branch: undefined,
+          workflow: { kind: "missing" },
+          runs: [],
+        }),
+      ],
+    });
+
+    expect(status.members).toHaveLength(0);
+    expect(status.otherWorktrees).toHaveLength(1);
+    expect(status.otherWorktrees[0]).toHaveProperty("taskId", undefined);
+  });
+
+  it("describes one named fleet and keeps other worktrees visible outside members", () => {
+    const status = buildFleetStatus({
+      fleetId: "wave4",
+      intent: sampleIntent({ fleetId: "wave4", taskIds: ["bd-94"] }),
+      members: [
+        sampleMember({
+          worktreePath: "/repo.feat-bd-94",
+          branch: "feat/bd-94",
+          workflow: okWorkflow({ taskId: "bd-94", branch: "feat/bd-94" }),
+        }),
+        sampleMember({
+          worktreePath: "/repo.feat-bd-119",
+          branch: "feat/bd-119",
+          workflow: okWorkflow({ taskId: "bd-119", branch: "feat/bd-119" }),
+        }),
+      ],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "default",
+            supervisor: "live",
+            members: [
+              { taskId: "bd-119", liveness: { kind: "live", pids: [42] }, worktreePresent: true },
+            ],
+          },
+          {
+            fleetId: "wave4",
+            supervisor: "live",
+            members: [{ taskId: "bd-94", liveness: { kind: "absent" }, worktreePresent: true }],
+          },
+        ],
+      },
+    });
+
+    expect(status.members.map((member) => member.taskId)).toEqual(["bd-94"]);
+    expect(status.otherWorktrees).toEqual([
+      { worktreePath: "/repo.feat-bd-119", branch: "feat/bd-119", taskId: "bd-119" },
+    ]);
+    expect(status.counts.active).toBe(1);
+    const warning = status.warnings.find((entry) => entry.kind === "not-a-member");
+    expect(warning?.message).toContain("is not a member of fleet `wave4`");
+    expect(warning?.message).toContain("belongs to fleet `default`");
+    const rendered = formatFleetStatus(status);
+    expect(rendered).toContain("members: 1");
+    expect(rendered).toContain("Other worktrees (1) — not members of fleet wave4");
+  });
+
+  it("marks a recorded landing as holding no capacity", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [],
+      capacity: {
+        ceiling: 3,
+        fleets: [
+          {
+            fleetId: "fleet-1",
+            supervisor: "live",
+            members: [
+              {
+                taskId: "bd-12",
+                liveness: { kind: "unknown", reason: "stale worktree" },
+                landed: true,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(status.capacity?.counted).toBe(0);
+    expect(status.capacity?.contributors[0]).toMatchObject({
+      counted: 0,
+      landed: 1,
+      released: 0,
+    });
+  });
+
+  it("reports blocked when a failed re-run follows the completed final phase (bd-168 W2)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          workflow: { kind: "missing" },
+          runs: [
+            sampleRun({
+              runId: "own-commit",
+              phase: "commit",
+              status: RunStatus.Completed,
+              startedAt: 1_000,
+            }),
+            sampleRun({
+              runId: "rerun-review",
+              phase: "review",
+              status: RunStatus.Failed,
+              startedAt: 2_000,
+            }),
+          ],
+        }),
+      ],
+    });
+
+    // The run loop derives `phase-failed` from the same newest manifest; status must
+    // not tell an operator to land work the loop refuses to land.
+    expect(status.members[0]).toHaveProperty("state", "blocked");
+    expect(formatFleetStatus(status)).not.toContain("land it:");
+  });
+
+  it("keeps complete-unlanded out of a gate-driven human wait (bd-168 W3)", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"] }),
+      members: [
+        sampleMember({
+          workflow: { kind: "missing" },
+          runs: [sampleRun({ phase: "commit", status: RunStatus.Completed })],
+        }),
+      ],
+    });
+    const attached = applyFleetBeadEngagement(status, {
+      ok: true,
+      entries: [
+        {
+          taskId: "bd-12",
+          engagement: {
+            comments: { state: "read" },
+            awaitingHuman: true,
+            orderingBlocker: "bd-15",
+          },
+        },
+      ],
+    });
+
+    expect(attached.members[0]).toHaveProperty("state", "complete-unlanded");
+    const rendered = formatFleetStatus(attached);
+    expect(rendered).toContain("land it: belayd_fleet_merge action=enqueue task=bd-12");
+    expect(rendered).not.toContain("Needs you");
+    // The ordering-gate fact still renders; only the person-wait is suppressed.
+    expect(rendered).toContain("waiting on: bd-15 (fleet ordering gate)");
   });
 });
 
@@ -1755,7 +1981,7 @@ describe("capacity arithmetic (bd-166)", () => {
 
     expect(text).toContain("capacity: ceiling 3, 2 free, 1 counted");
     expect(text).toContain(
-      "default: 2 member(s), 1 counted (1 live, 0 unknown, 1 absent), 0 stopped, 0 released; supervisor live",
+      "default: 2 member(s), 1 counted (1 live, 0 unknown, 1 absent), 0 stopped, 0 released, 0 landed; supervisor live",
     );
   });
 
@@ -2304,6 +2530,45 @@ describe("readFleetStatus", () => {
       worktreeExistedFor: (taskId) => taskId === "bd-15",
     });
     expect(report[0]?.liveness.kind).toBe("absent");
+  });
+
+  it("bd-168: a recorded landing is absent even with no worktree and no branch", () => {
+    // A clean landing removes both, so the run's own landedAt record is the only
+    // positive proof the tree existed. Without it the member is unknown and holds a
+    // capacity slot that no prune can ever release.
+    const launchedAt = 90_000;
+    const run = {
+      ...startFleetRun({ now: launchedAt, accept: false, members: [{ taskId: "bd-15" }] }),
+      members: [{ taskId: "bd-15", launchedAt, landedAt: 95_000 }],
+    };
+    const fs = createFakeFs({
+      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        sampleIntent({ taskIds: ["bd-15"], run }),
+      ),
+    });
+
+    const result = readFleetStatus({
+      cwd,
+      fleetId,
+      fs,
+      resolveCommonDir: () => ({ ok: true, commonDir }),
+      listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+      branchExists: () => false,
+      memberLeaseFor: () => ({ state: "absent" }),
+      scanProcesses: () => ({ ok: true, processes: [] }),
+      now: 100_000,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.capacity).toMatchObject({ counted: 0, free: 3 });
+    expect(result.value.capacity?.contributors[0]).toMatchObject({
+      members: 1,
+      absent: 1,
+      unknown: 0,
+      released: 0,
+      landed: 1,
+    });
   });
 
   it("W1: treats a listed worktree whose directory is gone as absent, not unknown", () => {
@@ -3218,8 +3483,10 @@ describe("bead ownership and human surfaces (bd-153)", () => {
     });
     const stateOfTask = (taskId: string | undefined) =>
       attached.members.find((member) => member.taskId === taskId)?.state;
-    expect(attached.members[0]?.state).toBe("interrupted");
-    expect(stateOfTask(undefined)).toBe("missing-state");
+    // Attribution now keeps the state-less member's id (bd-168), so it sorts by id
+    // instead of last; assert by task id rather than by index.
+    expect(stateOfTask("bd-15")).toBe("interrupted");
+    expect(stateOfTask("bd-12")).toBe("missing-state");
   });
 
   it("degrades engagement to exactly one fleet-level warning", () => {

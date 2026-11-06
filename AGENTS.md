@@ -1,9 +1,8 @@
 # Instructions for AI Agents
 
 Rules that apply before you touch anything, plus a pointer to the doc that owns
-each subsystem. The module map, the full build/release notes and the service
-runbooks live in `docs/repo-layout.md` — read the section you need when you need
-it instead of carrying all of it in every session.
+each subsystem. The module map, build/release notes and service runbooks live in
+`docs/repo-layout.md` — read the section you need instead of carrying all of it.
 
 ## Technology stack
 
@@ -50,23 +49,23 @@ A change is not done until:
 Tasks live in **Beads** (`bd`); the managed blocks at the end of this file carry
 the full protocol. **Never close tasks** — move finished work to `in_progress`
 with the `human` label (`bd update <ID> --status in_progress --add-label human`);
-the human closes via `wt merge`. Workflow type is resolved only from an explicit
-type argument or a namespaced `wf:<type>` label (e.g. `wf:chore`); title keywords
-and plain labels are ignored and default to `feature`.
+the human closes via `wt merge`. Workflow type comes only from an explicit type
+argument or a namespaced `wf:<type>` label (e.g. `wf:chore`); title keywords and
+plain labels default to `feature`.
 
 ## Code exploration
 
 - **Prefer `ast_grep` over `grep`/`find`** for syntax-aware searches where the tool is available (spawned sub-agents always have it; a pi-web orchestrator may not — `belayd_doctor` says which). It is read-only.
-- Use `grep`/`find` for plain text and filenames; `belayd_outline` for a symbol map with line ranges. Prefer them over hard-coded line numbers in docs and tests.
+- Use `grep`/`find` for plain text and filenames; `belayd_outline` for a symbol map with line ranges. Prefer them to hard-coded line numbers.
 - Your working directory is already the worktree root — run commands directly, never prefix `cd <absolute worktree path> &&`.
-- After an edit, do not re-read the file to find the next anchor: use `belayd_outline` or `grep -n`.
+- After an edit, use `belayd_outline` or `grep -n` for the next anchor instead of re-reading the file.
 
 ## Code style
 
 ### Functional programming
 
 - **Pure functions preferred.** Side effects (git, spawning, filesystem I/O) are confined to documented functions.
-- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary), `model-session-state.ts`, `model-state-store.ts` (the process-wide shared store, its open-failure class/retry state and the bounded pending-cooldown queue), and the two capability modules that own the model-routing state and the per-session state map: `extensions/capabilities/model.ts` and `extensions/capabilities/session-state.ts`.
+- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary), `model-session-state.ts`, `model-state-store.ts` (the shared store, its open-failure class/retry state and the bounded pending-cooldown queue), and the two capability modules owning model-routing and per-session state: `extensions/capabilities/model.ts` and `extensions/capabilities/session-state.ts`.
 - **Immutable data.** `const`, spread, `structuredClone`. No class mutation patterns.
 - **Discriminated unions for multi-outcome functions**, `{ allowed: boolean; reason?: string }` rather than a boolean with an optional string.
 - **Errors as values.** Return `{ ok: true; value } | { ok: false; error }`. Reserve `throw` for non-recoverable conditions.
@@ -91,23 +90,20 @@ and plain labels are ignored and default to `feature`.
 
 ### Never hand-roll detection heuristics
 
-Do not write code that tries to **detect a class of content** — secrets/credentials, PII,
-prompt injection, "sensitive" text, malicious input, spam, drift — using regexes, entropy
-scores, denylists or topic vocabularies. This repo already paid for that lesson: the
-sensitive-findings classifier (bd-183) grew to 2167 lines, nine review rounds each closing
-one text-evasion, 28 human gates and zero real publication decisions, and was removed.
+Never write code that **detects a class of content** — secrets, PII, prompt injection,
+"sensitive" text, malicious input, spam, drift — with regexes, entropy scores, denylists or
+topic vocabularies. The sensitive-findings classifier (bd-183) reached 2167 lines, nine
+review rounds, 28 human gates and zero real publication decisions before it was removed.
 
-- **Secrets are the scanner's job, not ours.** Use `betterleaks` (nixpkgs `betterleaks`)
-on the exact content about to leave the repo — PR body, issue/PR comment, release note.
-  It is maintained, rule-tested and adversarial by construction; our regex is neither.
-- **Judgement goes to a model or a human.** "Is this sensitive?", "is this a real defect?",
-  "may this be published?" are LLM/sub-agent or human decisions, never a rule table.
-- **Prevention is a prompt line.** Agents are told never to write a secret into a file,
-  commit, issue or PR. That is the guard; an interceptor that guesses is not.
-- Deterministic code checks stay legitimate when they check **our own artefact's shape**
-  (phase order holds, the JSON record parses, the publish gate refuses a path). The red
-  flag is a check that only stays correct with a corpus of adversarial text — that means
-  the wrong tool.
+- **Secrets: the scanner's job.** Run `betterleaks` (nixpkgs `betterleaks`) over the exact
+  content about to leave the repo — PR body, issue/PR comment, release note.
+- **Judgement: a model or a human.** "Is this sensitive?", "is this a real defect?", "may
+  this be published?" are never a rule table.
+- **Prevention: a prompt line.** Agents are told never to write a secret into a file, commit,
+  issue or PR; an interceptor that guesses is not that guard.
+- **Shape checks on our own artefacts stay legitimate** (phase order holds, the JSON record
+  parses, the publish gate refuses a path). A check that only stays correct against a corpus
+  of adversarial text is the wrong tool.
 
 ### Plannotator signal protocol
 
@@ -126,8 +122,8 @@ on the exact content about to leave the repo — PR body, issue/PR comment, rele
 
 ## Communication
 
-- **Be extremely concise.** When reporting information, sacrifice grammar for the sake of concision. Keep responses short but never drop the actual facts — include all relevant facts, omit filler words, pleasantries, and narrative padding.
-- **Match the language of the user's most recent message** — headings and summaries included. Keep code, identifiers, file paths, commands, commit messages and quoted file content exactly as written; never translate them. DeepSeek primaries drift to Chinese output non-deterministically; the static block in `SHARED_AGENT_GUIDANCE` (`src/agent-registry.ts`) is the mitigation — keep it early and never vary it, and never force a reasoning language.
+- **Be extremely concise.** Sacrifice grammar for concision, but never drop facts: include every relevant fact, omit filler, pleasantries, narrative padding.
+- **Match the language of the user's most recent message** — headings and summaries included. Keep code, identifiers, paths, commands, commit messages and quoted content exactly as written; never translate them. DeepSeek primaries drift to Chinese non-deterministically; the static block in `SHARED_AGENT_GUIDANCE` (`src/agent-registry.ts`) is the mitigation — keep it early, never vary it, never force a reasoning language.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker

@@ -189,7 +189,11 @@ liveness) and refuses `pruneDeadMembers: true`, because a prune erases another
 fleet's members from the capacity arithmetic. Two exceptions, both documented
 below: recovery authority over a provably dead fleet may prune, and to prune a
 *live* fleet you re-arm it (`/fleet <ids> --fleet <id>`) and run the reconcile —
-or `belayd_fleet_release <taskId>` — from that session.
+or `belayd_fleet_release <taskId>` — from that session. A member of a provably
+dead fleet may also be released from any session with
+`belayd_fleet_release { taskId, fleetId }` (audited `member-released-recovery`),
+which is the operator escape that avoids hand-editing `fleet.json` (bd-168); a
+live foreign supervisor keeps the refusal.
 
 The prune parameter is **`pruneDeadMembers`** (the JSON key the tool schema
 declares). The reconcile report hints at it in prose as `prune-dead-members`;
@@ -206,8 +210,10 @@ their orchestrator is still gone. A member whose worktree no longer exists needs
 
 Pruning is gated on the **member's** evidence, never on the supervisor's: a member
 is removed only when the completed scan shows no process carrying
-`belayd-<taskId>`, no live worktree lease, and no worktree that still exists (a
-positive `absent` verdict). A live supervisor is the normal caller and may prune;
+`belayd-<taskId>`, no live worktree lease, and no worktree that still exists — or
+the run recorded landing it, which proves the tree existed even after a clean
+landing removed tree and branch (bd-168) — a positive `absent` verdict. A live
+supervisor is the normal caller and may prune;
 `unknown` liveness is never pruned, and the worktree, transcript, and bead are
 left alone. A prune also drops the pruned members' `run.stopped` entries, because
 a fleet must not keep reporting "needs a human" for a member it just removed.
@@ -231,7 +237,10 @@ launch writes the member into `taskIds` *before* it creates the branch and the
 worktree, so "no worktree" alone is a spawn in flight and stays `unknown`
 (counted, never pruned). A deleted worktree leaves its `feat/<taskId>` branch
 behind, and that (or a listed worktree) is the proof: the member resolves to
-`absent`, is prunable, and stops holding a slot. Reconcile and the capacity view
+`absent`, is prunable, and stops holding a slot. A clean landing destroys that
+branch too, so the run's own `run.members[].landedAt` record is the remaining
+positive evidence: a landed member is `absent` even with no worktree and no
+branch, and prune no longer says "no proof one ever existed" (bd-168). Reconcile and the capacity view
 classify this with the same classifier and the same injected evidence, so a
 repair cannot disagree with what `belayd_fleet_status` prints. Capacity's run
 manifest evidence is execution-scoped too — only a manifest that postdates the
@@ -274,7 +283,8 @@ record is untouched, and no session becomes the supervisor by reconciling.
    prune is allowed — the cross-fleet refusal protects another *live* supervisor's
    capacity decision, and a provably dead supervisor has none to protect. Members
    whose worktree was deleted resolve to `absent` (their `feat/<taskId>` branch is
-   the proof) and free their slots. The report names each pruned id and audits
+   the proof, or the run's recorded landing when a clean landing removed both) and
+   free their slots. The report names each pruned id and audits
    `member-pruned-dead`.
 3. **Retry the members you want to keep.** `{ "fleetId": "<id>", "retryMembers": ["bd-42"] }`
    clears their recorded stop (`member-retry`); the run's next tick reconsiders

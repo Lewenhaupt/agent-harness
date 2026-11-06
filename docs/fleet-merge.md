@@ -140,7 +140,27 @@ runs the documented sequence:
    an explicit "unreadable base commit" branch that hints every remaining member,
    skips the probe, and says so in a result warning and in the `rebase-hint` audit
    detail (bd-280 S8).
-9. **release** the lock (record cleared, directory removed).
+9. **record the landing and clean up**: append `released[] { taskId, reason:
+   "merged", at }` to the intent (audited `member-merged-released`), then remove
+   the merged worktree with `git worktree remove <path>` (no `--force`) and its
+   branch with `git branch -d` (no `-D`). This runs on the clean-success path and
+   on a drain whose post-merge step threw (`step-failed`), and is idempotent: a
+   second landing attempt records no duplicate release and reports a true no-op
+   once tree and branch are gone. It deliberately does **not** run when the root
+   restore conflicts: that path merges, parks the fleet and returns before cleanup,
+   so the member stays recorded with its slot held and its worktree in place until
+   `belayd_fleet_reconcile` restores the root. A refusal (dirty tree, unmerged
+   branch) or a throwing cleanup seam is a warning and the report names the cleanup
+   command; it never fails a landed merge. A throw is reported from the inspected
+   state (`worktree … is gone`, `branch … still exists`, or `branch … state is
+   unknown` when the probe cannot answer), never as a fabricated "kept worktree".
+   Whether a refused `git branch -d` means *already gone*, *kept*, or *unverified*
+   is decided by a second tri-state `for-each-ref` probe after the refusal, never by
+   matching git's message text: the message quotes a branch name the operator chose,
+   which can contain any words (bd-168 R3). The message stays human-readable detail.
+   Skipped when the path is the root checkout (bd-168).
+10. **release** the lock (record cleared, directory removed).
+
 Every step is audited (see the table in `docs/fleet-orchestrator.md`).
 
 ### Rebase failure classification (bd-280)
@@ -211,7 +231,9 @@ is clean and the member branch is unchanged when the drain returns. A seam that
 **throws** instead of returning a value is caught at the drain boundary — in the
 merge sequence *and* in the finishers (`restoreRootStash`, `parkFleet`,
 `broadcastBaseMoved`, the queue transition) — so the drain resolves with a result
-and never rejects. The attempt is audited as `merge-step-threw` and the lock is
+and never rejects. When the throw happened after the fast-forward, the landing is
+still recorded and cleaned up exactly like the success arm, so the base moving is
+enough to free the slot (bd-168 W1). The attempt is audited as `merge-step-threw` and the lock is
 released exactly once (the release is idempotent). Two facts survive such a throw:
 - **A landed merge stays landed.** `context.mergeCommit` is set by the fast-forward
   itself; when it is present the entry is re-asserted as `merged` (idempotently) and

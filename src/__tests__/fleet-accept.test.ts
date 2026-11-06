@@ -86,6 +86,28 @@ describe("acceptLandedMember", () => {
     ]);
   });
 
+  it("still closes the bead after a drain already removed the worktree (bd-168)", async () => {
+    const calls: Call[] = [];
+    const bdCalls: Call[] = [];
+
+    const result = await acceptLandedMember(
+      baseOptions({
+        calls,
+        bdCalls,
+        worktreePath: "",
+        removeWorktree: false,
+      }),
+    );
+
+    expect(result).toMatchObject({ ok: true, beadClosed: true, worktreeRemoved: false });
+    // No spurious `git worktree remove` was attempted on the empty path.
+    expect(calls).toEqual([]);
+    expect(result.ok ? result.text : "").toContain(
+      "no worktree currently holds feat/bd-12; nothing to remove",
+    );
+    expect(bdCalls.map((call) => call.argv[0])).toContain("close");
+  });
+
   it("leaves the bead alone when acceptance is disabled (the fleet default)", async () => {
     // bd-158: a landing is not an acceptance, so the run passes closeBead=false
     // unless --accept asked for it. Nothing may be written to the bead at all —

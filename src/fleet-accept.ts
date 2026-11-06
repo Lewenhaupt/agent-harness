@@ -227,7 +227,9 @@ export async function acceptLandedMember(
       : `accepted ${options.taskId}: bead left open (accept disabled)`,
     removal.removed
       ? `removed worktree ${options.worktreePath} and merged branch ${options.branch}`
-      : `worktree ${options.worktreePath} kept`,
+      : options.worktreePath === ""
+        ? `no worktree currently holds feat/${options.taskId}; nothing to remove`
+        : `worktree ${options.worktreePath} kept`,
   ];
   return {
     ok: true,

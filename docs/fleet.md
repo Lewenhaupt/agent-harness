@@ -298,12 +298,15 @@ from this repository is in [How to Verify](#how-to-verify). Reading guide:
 | `blocked` | the newest run of a not-yet-completed phase failed |
 | `interrupted` | a run manifest is `interrupted` (crash/kill mid-phase) |
 | `idle` | every phase completed |
-| `missing-state` | no readable `.belayd/workflow.json` — including a workflow that **finished**, because completion deletes the state file and leaves the run manifests |
+| `complete-unlanded` | no readable `.belayd/workflow.json` because the workflow **finished** (completion deletes the state file and leaves the run manifests), and the final-phase run completed (bd-168). The block keeps its task id from the branch or its own runs and names the two landing commands |
+| `missing-state` | no readable `.belayd/workflow.json` and nothing proves the workflow finished |
 
-A finished workflow therefore shows `missing-state` with
-`latest runs: commit=completed, …`. Do not treat that as breakage; read the run
-line. A worktree with neither state nor manifests is the case the
-`no .belayd/workflow.json …` warning is for.
+A finished workflow therefore shows `complete-unlanded` with
+`latest runs: commit=completed, …` and an id. Do not treat that as breakage, and
+do not remove the worktree by hand: land it (`belayd_fleet_merge
+action=enqueue task=<id>` then `action=drain`). A worktree with neither state,
+manifests, nor an id in the branch is the case the `no .belayd/workflow.json …`
+warning is for.
 
 For "what is going on with **that** member, and is it stuck", the cheap
 follow-up is `belayd_workflow_digest <taskId>` — no model call, no transcript:
@@ -478,9 +481,12 @@ Operational limits, at the point you hit them:
   running member from being pruned — the bd-37 incident pruned a live member 25 s
   after its launch, which freed a slot and started a second orchestrator on one
   worktree. A member whose worktree was **deleted** resolves to `absent` because
-  its `feat/<taskId>` branch proves the tree existed (bd-233); one whose tree has
-  not been created yet stays `unknown`, because a launch may be mid-spawn. Liveness
-  that cannot be read (unreadable `/proc`, an unreadable lease) is never pruned.
+  its `feat/<taskId>` branch proves the tree existed (bd-233); a member the run
+  recorded landing (`run.members[].landedAt`) is also `absent` even after a clean
+  landing removed both the tree and the branch (bd-168), so it is prunable instead
+  of holding a slot forever. One whose tree has not been created yet stays
+  `unknown`, because a launch may be mid-spawn. Liveness that cannot be read
+  (unreadable `/proc`, an unreadable lease) is never pruned.
   The parameter is `pruneDeadMembers` (camelCase) — the refusal hint in the report
   says "re-run with prune-dead-members", which is prose, not the parameter name.
   A prune also drops the pruned members' `run.stopped` entries, so the run stops
@@ -492,9 +498,13 @@ Operational limits, at the point you hit them:
 - **Capacity counts liveness, and a prune removes the record.** Since bd-166 the
   launch counts a member only while its orchestrator is `live` or `unknown`; an
   `absent` member stops consuming a slot without being removed, and a `released`
-  member never consumes one. A prune is still how you erase the record itself.
-  Both are narrowings of the `taskIds` count, not of the member's work: the
-  worktree, transcript, and bead stay either way.
+  (including `merged`) or recorded-landing member never consumes one. A prune is
+  still how you erase the record itself. Both are narrowings of the `taskIds`
+  count, not of the member's work: the worktree, transcript, and bead stay either
+  way. A member of a foreign fleet can be released with
+  `belayd_fleet_release {taskId, fleetId}` when that fleet's supervisor is
+  provably dead (audited `member-released-recovery`); a live foreign supervisor
+  keeps the refusal.
 - **A pruned member cannot be relaunched through the fleet while its lease is
   live.** The lease names the session that owns the worktree, so a second launch is
   refused (`live orchestrator lease`) instead of creating a duplicate orchestrator.
@@ -524,10 +534,15 @@ stop the first member that needs a human, advance the deferred wave, or finish:
    run: until-complete — complete (11 tick(s))
 ```
 
-- **Landing is the merge step**: `git worktree remove` + `git branch -d`, all
-  conservative (no `--force`, no `-D`), plus the bd ordering gates the merge
-  satisfied. The bead is left `in_progress` + `human` — merging is not closing.
-  `--accept` additionally closes the bead (`bd close`).
+- **Landing is the merge step**: a successful drain removes the merged worktree
+  with `git worktree remove` (no `--force`) and the merged branch with
+  `git branch -d` (no `-D`), plus the bd ordering gates the merge satisfied
+  (bd-168). A refusal (dirty tree, unmerged branch) is a warning and the report
+  names the exact cleanup command; the merge itself never fails over cleanup. The
+  landing is recorded as `released[] {reason:"merged"}` and audited
+  `member-merged-released`, so the slot is free even if the queue entry stays. The
+  bead is left `in_progress` + `human` — merging is not closing. `--accept`
+  additionally closes the bead (`bd close`).
 - **A member that needs a human is stopped, never relaunched.** `awaiting-human`,
   failed phase, interrupted run, unreadable state, or a vanished orchestrator all
   end that member's part of the run with a reason in `belayd_fleet_status`.
@@ -536,12 +551,16 @@ stop the first member that needs a human, advance the deferred wave, or finish:
   halt is terminal for that run record: `resume` only restarts a *paused* run, so a
   halted one continues only through a re-arm (after `belayd_fleet_reconcile` for a
   parked fleet). A run stalls only when **no member's progress changed** for
-  `FLEET_RUN_MAX_IDLE_TICKS` ticks — a member moving through phases keeps the run
-  alive wave after wave, though the cap still applies to a *single* phase run: no
-  field in the member's worktree changes while one phase works, so a phase longer
-  than 60 minutes is reported as stalled (bd-172). The comparison uses each member's
-  stable progress identity (phase, phase count), never free-text output such as a
-  failure reason, and the recorded counter stops at the cap.
+  `FLEET_RUN_MAX_IDLE_TICKS` ticks **and** at least one in-flight member has no
+  live orchestrator lease — a member moving through phases keeps the run alive
+  wave after wave, and a member still renewing its lease inside one long phase is
+  not called stuck (bd-168). The comparison uses each member's stable progress
+  identity (phase, phase count), never free-text output such as a failure reason,
+  and the recorded counter stops at the cap. A run whose members all keep their
+  leases fresh is bounded by the separate, much larger
+  `FLEET_RUN_MAX_LIVE_IDLE_TICKS` (8× the ordinary cap); every stalled line states
+  each member's lease evidence (`lease fresh Ns` or `no live lease`). `run-not-ticking`
+  remains the separate supervisor-side signal in `belayd_fleet_status`.
 - **A re-arm restarts the loop.** After a supervisor restart (or a halt), `/fleet
   <ids> --fleet <id>` preserves the members and starts a new run record in place of
   the old one. The run-mode supervisor heartbeat is what makes that re-arm
@@ -569,8 +588,8 @@ worktree lease — is in `docs/fleet-run.md`.
 | Stop a member that ignores mail | `belayd_fleet_pause` `force` | SIGTERM + per-pid audit (delivery only) |
 | Come back | `belayd_fleet_resume` | clears `paused`/`park`, `resume` notes |
 | Repair after a crash | `belayd_fleet_reconcile` | queue/park repair, liveness report |
-| Give one member's slot back (keep the bead and worktree) | `belayd_fleet_release` | a `released` entry on the intent, `member-released` audit |
-| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease, no process, and no surviving worktree from `taskIds` (never `unknown`) |
+| Give one member's slot back (keep the bead and worktree) | `belayd_fleet_release` | a `released` entry on the intent, `member-released` audit. A member of a foreign fleet needs `fleetId` and that fleet's supervisor provably dead (`member-released-recovery`) |
+| Narrow the capacity count | `belayd_fleet_reconcile` `pruneDeadMembers` | removes members with no live lease, no process, and no surviving worktree — or a recorded landing — from `taskIds` (never `unknown`) |
 | Bring a stopped member back | `belayd_fleet_reconcile` `retryMembers: ["<id>"]` | clears the member's `run.stopped` entry (`member-retry` audit); the next tick reconsiders it. A member whose worktree is gone needs prune + a fresh launch |
 | Repair a fleet whose supervisor died | `belayd_fleet_reconcile` `fleetId: "<id>"` | queue/park repair, liveness report, prune and retry in that fleet. Accepted when this session supervises some fleet in this repo (audited `reconcile-cross-fleet`) or when that fleet's supervisor is **provably dead** (audited `reconcile-recovery`; a prune is allowed there, bd-233). Never takes the supervisor role |
 | Accept one member's work (close its bead) | a run with `accept: true` (or `/fleet … --accept`) | bead status, audited; the merged worktree is removed on landing either way |
@@ -688,25 +707,29 @@ Produced in this worktree:
 Fleet default
   intent: none recorded
   members: 2
-  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 missing-state=2
+  states: active=0 blocked=0 awaiting-human=0 interrupted=0 idle=0 complete-unlanded=2 missing-state=0
 
-Member (no task id) — missing-state
+Member bd-125 — complete-unlanded
   worktree: /home/hugo/git/belayd-agent-harness.feat-bd-125 (branch feat/bd-125)
+  task id: bd-125 (inferred from branch or worktree path)
   workflow: missing
   interrupted runs: 0
   last updated: 2026-10-21T22:55:47.738Z
   latest runs: commit=completed, implement=completed, proof=completed, review=completed, test=completed, userguide=completed
+  land it: belayd_fleet_merge action=enqueue task=bd-125 then action=drain
 
-Member (no task id) — missing-state
+Member bd-126 — complete-unlanded
   worktree: /home/hugo/git/belayd-agent-harness.feat-bd-126 (branch feat/bd-126)
+  task id: bd-126 (inferred from branch or worktree path)
   workflow: missing
   interrupted runs: 0
   last updated: 2026-10-22T20:12:42.382Z
   latest runs: commit=completed, implement=completed, proof=completed, review=completed, test=completed, userguide=completed
+  land it: belayd_fleet_merge action=enqueue task=bd-126 then action=drain
 
 Warnings (2):
-  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-125; that worktree drives no workflow
-  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-126; that worktree drives no workflow
+  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-125 (completion clears it); bd-125 still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=bd-125 then action=drain
+  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-126 (completion clears it); bd-126 still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=bd-126 then action=drain
 ```
 
 Read it as: both linked worktrees finished their workflow (state cleared, manifests
@@ -791,7 +814,7 @@ Fleet default
   intent: bd-12, bd-15, max 3 concurrent
   deferred: bd-19 (dependency)
   members: 2
-  states: active=1 blocked=0 awaiting-human=1 interrupted=0 idle=0 missing-state=0
+  states: active=1 blocked=0 awaiting-human=1 interrupted=0 idle=0 complete-unlanded=0 missing-state=0
 
 Member bd-12 — active
   worktree: /tmp/fleet-demo.feat-bd-12 (branch feat/bd-12)
@@ -824,7 +847,7 @@ Fleet night
   intent: bd-12, bd-15, max 3 concurrent, paused
   parked: root restore conflicted: refs/stash@{0} (stash refs/stash@{0}) — belayd_fleet_reconcile then belayd_fleet_resume
   members: 2
-  states: active=1 blocked=0 awaiting-human=1 interrupted=0 idle=0 missing-state=0
+  states: active=1 blocked=0 awaiting-human=1 interrupted=0 idle=0 complete-unlanded=0 missing-state=0
 ```
 
 The `bd read failed` warning in the first scratch view is the degrade path

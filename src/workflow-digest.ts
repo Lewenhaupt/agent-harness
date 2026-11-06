@@ -29,6 +29,7 @@ export const SUPERVISION_MEMBER_STATES = [
   "awaiting-human",
   "interrupted",
   "idle",
+  "complete-unlanded",
   "missing-state",
 ] as const;
 

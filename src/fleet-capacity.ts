@@ -35,8 +35,16 @@ export interface FleetCapacityMember {
   liveness: FleetMemberLiveness;
   /** The run stopped this member; its session is gone but its bead/worktree stay. */
   stopped?: boolean;
-  /** An operator, or a terminal run, explicitly gave this member's slot back. */
+  /** An operator, a terminal run, or a landing explicitly gave this member's slot back. */
   released?: boolean;
+  /**
+   * The fleet's run recorded this member landing (bd-168).
+   *
+   * A landing is proof the work is on the base branch, so the member cannot be
+   * running any more and holds no slot — even when a stale worktree is still on
+   * disk and its liveness probe cannot classify it.
+   */
+  landed?: boolean;
 }
 
 export interface FleetCapacityFleet {
@@ -53,8 +61,11 @@ export interface FleetCapacityContributor {
   unknown: number;
   absent: number;
   stopped: number;
+  /** Explicitly released members that have not also recorded a landing. */
   released: number;
-  /** Members that actually hold a slot (live or unknown, and not released). */
+  /** Members whose run recorded landing; a separate population from a release. */
+  landed: number;
+  /** Members that actually hold a slot (live or unknown, and neither released nor landed). */
   counted: number;
   supervisor: FleetCapacitySupervisor;
 }
@@ -75,7 +86,7 @@ export interface FleetCapacityArithmetic {
  * decision that outranks a stale liveness probe.
  */
 export function memberHoldsCapacity(member: FleetCapacityMember): boolean {
-  if (member.released === true) return false;
+  if (member.released === true || member.landed === true) return false;
   return member.liveness.kind !== "absent";
 }
 
@@ -91,19 +102,38 @@ function contributorOf(
     absent: 0,
     stopped: 0,
     released: 0,
+    landed: 0,
     counted: 0,
     supervisor: fleet.supervisor,
   };
   for (const member of fleet.members) {
     if (launching.has(member.taskId)) continue;
-    if (member.liveness.kind === "live") counts.live += 1;
-    if (member.liveness.kind === "unknown") counts.unknown += 1;
-    if (member.liveness.kind === "absent") counts.absent += 1;
-    if (member.stopped === true) counts.stopped += 1;
-    if (member.released === true) counts.released += 1;
-    if (memberHoldsCapacity(member)) counts.counted += 1;
+    addMemberCounts(counts, member);
   }
   return counts;
+}
+
+/** Add one member's classification to a fleet's rollup. */
+function addMemberCounts(counts: FleetCapacityContributor, member: FleetCapacityMember): void {
+  switch (member.liveness.kind) {
+    case "live":
+      counts.live += 1;
+      break;
+    case "unknown":
+      counts.unknown += 1;
+      break;
+    case "absent":
+      counts.absent += 1;
+      break;
+  }
+  if (member.stopped === true) counts.stopped += 1;
+  // Landed and explicitly-released members are different populations: a landing is
+  // proof the work is on the base branch, a release is an operator/run decision. A
+  // member with both (a drain also writes a `merged` release) is reported as landed
+  // only, so the summary never counts one member twice (bd-168 S4).
+  if (member.landed === true) counts.landed += 1;
+  else if (member.released === true) counts.released += 1;
+  if (memberHoldsCapacity(member)) counts.counted += 1;
 }
 
 /**

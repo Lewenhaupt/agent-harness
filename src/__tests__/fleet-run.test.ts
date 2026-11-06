@@ -24,6 +24,7 @@ import {
   FLEET_RUN_GATE_NOTICE_IDS_MAX,
   FLEET_RUN_MAX_HUMAN_WAIT_TICKS,
   FLEET_RUN_MAX_IDLE_TICKS,
+  FLEET_RUN_MAX_LIVE_IDLE_TICKS,
   FLEET_RUN_START_GRACE_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FleetRunSchema,
@@ -169,6 +170,46 @@ describe("deriveFleetMemberProgress", () => {
       workflow: { kind: "missing" },
       runs: [run({ phase: "commit", status: RunStatus.Completed })],
       now: 5_000,
+    });
+    expect(progress).toEqual({ kind: "complete" });
+  });
+
+  it("does not land when a failed re-run follows the completed final phase (bd-168 W2)", () => {
+    const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
+      workflow: { kind: "missing" },
+      runs: [
+        run({
+          runId: "own-commit",
+          phase: "commit",
+          status: RunStatus.Completed,
+          startedAt: 1_000,
+        }),
+        run({
+          runId: "rerun-review",
+          phase: "review",
+          status: RunStatus.Failed,
+          failureReason: "gate failed",
+          startedAt: 2_000,
+        }),
+      ],
+      now: 5_000,
+      // A launched member: the run trusts a terminal failure only for this
+      // execution (bd-161), exactly as the live tick does.
+      launchedAt: 500,
+    });
+    expect(progress).toMatchObject({ kind: "phase-failed", key: "failed:review" });
+  });
+
+  it("keeps a state-less completed member landable even with an open human gate (bd-168 W3)", () => {
+    // The tick deliberately skips the gate read for a state-less member; the
+    // completion rule must not turn its finished work into a human wait.
+    const progress = deriveFleetMemberProgress({
+      taskId: MEMBER,
+      workflow: { kind: "missing" },
+      runs: [run({ phase: "commit", status: RunStatus.Completed })],
+      now: 5_000,
+      humanGateOpen: true,
     });
     expect(progress).toEqual({ kind: "complete" });
   });
@@ -760,6 +801,65 @@ describe("planFleetTick", () => {
       idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
     });
     expect(action).toMatchObject({ kind: "halt", reason: "stalled" });
+  });
+
+  it("does not call a lease-renewing member stuck at the ordinary idle cap (bd-168)", () => {
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"] }),
+      observations: [
+        {
+          ...observation("bd-12", {
+            kind: "running",
+            detail: "implement still running",
+            key: "phases:1/5",
+          }),
+          leaseHeartbeatAt: 5_000 - 10_000,
+        },
+      ],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+    });
+
+    expect(action.kind).toBe("wait");
+    expect(detailOf(action)).toContain("the supervisor is ticking");
+    expect(detailOf(action)).toContain("bd-12 lease fresh 10s");
+  });
+
+  it("halts a fresh-lease run at the separate live cap, stating the lease evidence", () => {
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"] }),
+      observations: [
+        {
+          ...observation("bd-12", { kind: "running", detail: "stuck", key: "phases:1/5" }),
+          leaseHeartbeatAt: 4_000,
+        },
+      ],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_LIVE_IDLE_TICKS,
+    });
+
+    expect(action).toMatchObject({ kind: "halt", reason: "stalled" });
+    expect(detailOf(action)).toContain(`cap ${FLEET_RUN_MAX_LIVE_IDLE_TICKS}`);
+    expect(detailOf(action)).toContain("bd-12 lease fresh 1s");
+  });
+
+  it("halts when one in-flight member has no live lease, naming both kinds of evidence", () => {
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12", "bd-15"] }),
+      observations: [
+        {
+          ...observation("bd-12", { kind: "running", detail: "work", key: "phases:1/5" }),
+          leaseHeartbeatAt: 4_500,
+        },
+        observation("bd-15", { kind: "running", detail: "hung", key: "phases:1/5" }),
+      ],
+      now: 5_000,
+      idleTicks: FLEET_RUN_MAX_IDLE_TICKS,
+    });
+
+    expect(action).toMatchObject({ kind: "halt", reason: "stalled" });
+    expect(detailOf(action)).toContain("bd-12 lease fresh 0s");
+    expect(detailOf(action)).toContain("bd-15 no live lease");
   });
 
   it("skips members the run already stopped", () => {
@@ -2139,6 +2239,31 @@ describe("memberWorktreeExisted (bd-233)", () => {
         branchExists: true,
         worktreeListed: true,
         spawnInFlight: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("bd-168: a landing the run recorded proves the worktree existed", () => {
+    // A clean landing removes both the worktree and the branch, so the run's own
+    // landing record is the only positive evidence left. Without it the member is
+    // `unknown` (counted, never prunable) forever.
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: false,
+        worktreeListed: false,
+        landedAt: 5_000,
+        spawnInFlight: false,
+      }),
+    ).toBe(true);
+    // A relaunch's spawn window still wins over the landing record.
+    expect(
+      memberWorktreeExisted({
+        taskId: "bd-12",
+        branchExists: false,
+        worktreeListed: false,
+        landedAt: 5_000,
+        spawnInFlight: true,
       }),
     ).toBe(false);
   });

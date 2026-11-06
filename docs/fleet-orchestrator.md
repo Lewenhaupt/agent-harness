@@ -203,7 +203,7 @@ writes anything; deriving it keeps the supervisor honest by construction.
 | Supervisor working directory | main repo root |
 | May merge to `main`? | Yes, through a single-flight queue |
 | Dirty root at merge time | auto-stash, immediately restore; if the restore conflicts, park the fleet instead of losing work (P2: `merge-stash`/`merge-restore`; a conflicting restore keeps the stash, parks the fleet, and reports the ref) |
-| Bead status after merge | `belayd_fleet_merge` never touches a bead: the merge leaves it `in_progress` + `human`. A **run** leaves it there too (bd-158): landing resolves the member's bd ordering gates instead of closing its bead. The merged worktree is removed on every landing; `--accept` opts into closing the bead as well, audited as `fleet-landed` |
+| Bead status after merge | `belayd_fleet_merge` never touches a bead: the merge leaves it `in_progress` + `human`. A **run** leaves it there too (bd-158): landing resolves the member's bd ordering gates instead of closing its bead. A successful drain removes the merged worktree (`git worktree remove`, no `--force`) and branch (`git branch -d`), reports what it did, and records `released[] {reason:"merged"}` (bd-168); a refusal is a warning with the cleanup command. `--accept` opts into closing the bead as well, audited as `fleet-landed` |
 | Member communication | files-first mailbox, drained at turn start (members are detached pi sessions) |
 | Where merges happen | the operator's own checkout, because only the root can check out `main` |
 
@@ -528,6 +528,8 @@ complete set:
 | `ordering-gates-resolved` | once per landing / closed-bead resolve, naming the gate ids bd confirmed resolved (bd-158) |
 | `ordering-gate-unresolved` | once when a landing merged but bd refused the gate resolve: the record stays and the next tick retries (bd-158) |
 | `fleet-landed` | once per landing, with the member and base branch |
+| `member-merged-released` | once per successful drain, when the merged member was appended to `released[]` with reason `merged` (bd-168) |
+| `member-released` / `member-released-recovery` | once per operator release: the first for this session's own fleet, the second for a foreign fleet whose supervisor is provably dead (bd-168) |
 | `fleet-paused` / `fleet-pause-failed` | once per pause attempt (applied / refused or failed to write) |
 | `fleet-resumed` / `fleet-unparked` / `fleet-resume-refused` | once per resume attempt: resumed, park cleared, or refused (a park that still names a stash) |
 | `member-stopped` / `member-stop-skipped` / `member-stop-failed` / `member-stop-unavailable` | once per pid the forceful pause considered: signalled / identity changed or unreadable, so skipped / `kill` failed / process table unreadable |
@@ -728,8 +730,9 @@ the rest waiting forever.
 The locked ceiling is **3 concurrent orchestrators**, and the ceiling counts
 orchestrators, not sub-agents. `slots = max(0, capacity - activeCount)`, where
 `activeCount` counts the recorded members of **every** fleet whose orchestrator
-liveness is `live` or `unknown` (bd-166); an `absent` member or one in `released`
-does not hold a slot, though it stays in `taskIds`. Members are disjoint across
+liveness is `live` or `unknown` (bd-166); an `absent` member, one in `released`,
+or one with a recorded landing (`run.members[].landedAt`) does not hold a slot,
+though it stays in `taskIds` (bd-168). Members are disjoint across
 fleets, so the count is a sum, and a detached member of a dead-supervisor fleet
 still counts while its orchestrator is alive. The target fleet's own preserved
 (re-armed) members count too. Supervisor liveness only changes the wording of
@@ -787,9 +790,11 @@ Reconcile narrows that count through a real observation rather than a guess:
 orchestrator is proven absent — no fresh worktree lease **and** no process carrying
 the exact `belayd-<taskId>` token. The lease is primary because a pi-web
 orchestrator is a session inside the daemon and never appears in the process table
-(`docs/fleet-reconcile.md`). A live supervisor may prune — its liveness is not a
-precondition — while `unknown` liveness (unreadable `/proc`, unreadable lease) is
-never treated as gone. Pruning does not change the arithmetic: the launch count
+(`docs/fleet-reconcile.md`). A member the run recorded landing is `absent` even
+after a clean landing removed both its worktree and branch, so it is prunable
+instead of holding a slot forever (bd-168). A live supervisor may prune — its
+liveness is not a precondition — while `unknown` liveness (unreadable `/proc`,
+unreadable lease) is never treated as gone. Pruning does not change the arithmetic: the launch count
 reads each member's liveness on every launch (bd-166), so an `absent` member is
 already free and pruning only removes its record. A run narrows the count the same
 way: landing a member prunes it. A **stopped** member is still recorded and is
@@ -898,7 +903,8 @@ Per member:
 
 | Field | Source |
 |-------|--------|
-| `taskId` | `workflow.json` `taskId` (`undefined` when unreadable) |
+| `taskId` | the id attributed to the worktree: `workflow.json` `taskId`, else the branch/directory suffix, else its own run manifests (bd-168); `undefined` only when none exists |
+| `taskIdSource` | `workflow` \| `worktree` \| `runs` — provenance, so an inferred id is never mistaken for a recorded one |
 | `expectedTaskId` | task id implied by the checked-out branch, else by the worktree directory name |
 | `worktreePath`, `branch` | `git worktree list --porcelain -z` |
 | `bead` | one batched `bd show <ids> --json`: `id`, `title`, `status`, `priority`, `labels`; absent when bd is unavailable |
@@ -911,11 +917,18 @@ Per member:
 | `updatedAt` | `workflow.json` `updatedAt`, raised to the newest run timestamp when later |
 | `state` | derived, see below |
 
+`FleetStatus.members` holds only worktrees attributable to the requested fleet when
+its intent records task ids; other worktrees are listed under `otherWorktrees` and
+warned about (`not-a-member`), never dropped or attributed to the wrong fleet
+(bd-168). With no intent (or no recorded ids) the view keeps the all-worktrees
+behaviour.
+
 Derived `state` precedence:
 
 | State | Meaning |
 |-------|---------|
-| `missing-state` | no readable `.belayd/workflow.json` |
+| `complete-unlanded` | no readable state file, but the member's own final-phase run completed: finished work that is not yet landed, keeping its id from the branch/runs (bd-168) |
+| `missing-state` | no readable `.belayd/workflow.json` and no completed final-phase run |
 | `interrupted` | at least one run manifest is `interrupted` |
 | `awaiting-human` | the bead has an open bd `human` gate, or a user-completed run's report was never delivered |
 | `blocked` | the newest run of a not-yet-completed phase `failed` |
