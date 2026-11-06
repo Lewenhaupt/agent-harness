@@ -37,7 +37,7 @@ function note(overrides: Partial<FleetNote> = {}): FleetNote {
 
 function delivery(overrides: Partial<FleetNote> = {}): FleetNoteDelivery {
   const value = note({ from: "supervisor", to: "bd-12", ...overrides });
-  return { note: value, path: `/events/${value.createdAt}.json` };
+  return { note: value, seq: value.createdAt };
 }
 
 describe("buildFleetNote", () => {
@@ -115,7 +115,7 @@ describe("formatFleetInbox", () => {
       },
     });
 
-    expect(text).toContain("2 note(s) drained; 1 acknowledged, 1 still queued in inbox/");
+    expect(text).toContain("2 note(s) drained; 1 acknowledged, 1 still queued in the inbox");
     expect(text).toContain("Acknowledge failed (EACCES: permission denied)");
     // The bodies of what was consumed are still in the result.
     expect(text).toContain("plan phase finished");

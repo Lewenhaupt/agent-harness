@@ -25,7 +25,7 @@ import {
   resolveMemberFleet,
   sessionSupervisesFleetRecord,
 } from "../fleet-mode.js";
-import { fleetEventsDir, fleetInboxDir, sanitizeFleetId } from "../fleet-status.js";
+import { sanitizeFleetId } from "../fleet-status.js";
 import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
 
 const commonDir = "/repo/.git";
@@ -238,7 +238,10 @@ describe("fleet directory scan", () => {
       [intentFile("alpha")]: intentJson({ fleetId: "alpha" }),
     });
     expect(listFleetIds({ gitCommonDir: commonDir, fs })).toEqual(["alpha", "zulu"]);
-    expect(listFleetIds({ gitCommonDir: "/no-such-repo/.git", fs })).toEqual([]);
+    // A different repository has a different store, so it sees none of these.
+    expect(listFleetIds({ gitCommonDir: "/no-such-repo/.git", fs: createFakeFleetFs() })).toEqual(
+      [],
+    );
   });
 
   it("returns no fleets when the root cannot be read", () => {
@@ -352,15 +355,13 @@ describe("resolveFleetMode", () => {
     fs,
   });
 
-  it("returns the fleet this session supervises, with its mailbox paths", () => {
+  it("returns the fleet this session supervises, with the store identity it needs", () => {
     const fs = createFakeFleetFs({ [intentFile("default")]: intentJson() });
 
     const mode = resolveFleetMode(options(fs));
 
     expect(mode?.fleetId).toBe("default");
     expect(mode?.gitCommonDir).toBe(commonDir);
-    expect(mode?.inboxDir).toBe(fleetInboxDir(commonDir, "default"));
-    expect(mode?.eventsDir).toBe(fleetEventsDir(commonDir, "default"));
     expect(mode?.intent.taskIds).toEqual(["bd-12", "bd-15"]);
   });
 
@@ -429,15 +430,16 @@ describe("resolveFleetMode", () => {
     const fs = createFakeFleetFs({ [intentFile("dir-name")]: intentJson({ fleetId: "../evil" }) });
     const mode = resolveFleetMode(options(fs, "supervisor-session", "dir-name"));
     expect(mode?.fleetId).toBe(sanitizeFleetId("dir-name"));
-    expect(mode?.inboxDir).toBe(fleetInboxDir(commonDir, "dir-name"));
-    expect(mode?.inboxDir).not.toContain("evil");
+    expect(mode?.fleetId).not.toContain("evil");
+    expect(mode?.gitCommonDir).toBe(commonDir);
   });
 
   it("is not put into fleet mode by another repository's fleet", () => {
-    const fs = createFakeFleetFs({
-      "/elsewhere/.git/belayd/fleet/default/fleet.json": intentJson(),
-    });
-    expect(resolveFleetMode(options(fs))).toBe(undefined);
+    // bd-281: fleet identity is the repository store, so another checkout's row is
+    // a different store — not a directory this one scans.
+    const elsewhere = createFakeFleetFs({ [intentFile("default")]: intentJson() });
+    expect(resolveFleetMode(options(elsewhere, "supervisor-session"))?.fleetId).toBe("default");
+    expect(resolveFleetMode(options(createFakeFleetFs()))).toBe(undefined);
   });
 
   it("prefers the armed fleet when two records name this session (bd-169)", () => {

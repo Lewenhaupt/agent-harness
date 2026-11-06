@@ -19,6 +19,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// Run manifests are store rows now (bd-281), so the temp worktree needs a store.
+installTempRepoState();
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-ask-hold-test-cooldowns.json");
 

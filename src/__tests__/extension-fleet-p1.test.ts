@@ -10,32 +10,33 @@
  * stubbed: no member is really spawned here.
  */
 
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { openRepoStateStore } from "../repo-state-store.js";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
+
 import type { FleetForceStopSeams } from "../../extensions/index.js";
 import { renderFleetEscalationGateMarker } from "../bead-gates.js";
 import { writeFleetLaunchMarker } from "../fleet-state.js";
+import { legacyFleetStateFiles } from "../fleet-state-import.js";
 import { readFleetLaunchMarker } from "../fleet-status.js";
 import type { HandoffPacket } from "../handoff.js";
 import {
-  buildFleetNote,
   COMMENT_EXCERPT_MAX_CHARS,
   createFleetMergeQueue,
   drainNotes,
   enqueueNote,
   FLEET_INTENT_ORDERING_GATES_MAX,
   FLEET_LAND_REPAIR_GRACE_MS,
+  FLEET_NOTE_ADDRESS_MAX_LENGTH,
   FLEET_NOTE_BODY_MAX_LENGTH,
   FLEET_REBASE_DELEGATION_GRACE_MS,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
@@ -43,14 +44,15 @@ import {
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
-  fleetEventsDir,
-  fleetInboxDir,
+  type FleetAuditEntry,
+  type FleetIntent,
   fleetMemberSignature,
-  fleetNoteFileName,
   formatFleetRefusal,
   landRepairForMember,
+  writeFleetIntent as persistFleetIntent,
   readFleetIntent,
   readFleetMergeQueue,
+  readRecentFleetAuditEntries,
   readSupervisorHeartbeat,
   recordRunMemberLanded,
   startFleetRun,
@@ -62,8 +64,9 @@ import {
   ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
   ORCHESTRATOR_CLAIM_STALE_MS,
 } from "../orchestrator-claim.js";
+import { legacyStateFiles } from "../repo-state-import.js";
 import { RunStatus, writeRunManifest } from "../run-manifest.js";
-import { writeWorkflowState } from "../workflow-state.js";
+import { readWorkflowState, writeWorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 process.env.PI_WEB_SESSIOND_SOCKET = join(tmpdir(), "belayd-test-no-sessiond.sock");
@@ -104,6 +107,34 @@ const worktree = vi.hoisted(() => ({
    * per-member spawn window has to cover (bd-233).
    */
   onSetup: undefined as ((branch: string) => void) | undefined,
+}));
+
+/**
+ * Fault switches for the store-backed mailbox (bd-281).
+ *
+ * The file mailbox could be made unwritable from the outside (a chmod, a directory
+ * planted at a note's path); a row store cannot. These stubs make exactly the
+ * failing call fail, so the flow around it stays real: the inbox render/ack
+ * ordering, and the repair branch that stops the member when its note was not
+ * queued.
+ */
+const mailboxFault = vi.hoisted(() => ({
+  fanoutError: undefined as string | undefined,
+  ackError: undefined as string | undefined,
+}));
+
+/**
+ * Runs around the one landing transaction (bd-281).
+ *
+ * The landing is a single write, so the window the old fixture exploited (a swap
+ * between the prune and the run write) no longer exists. This is where a test puts
+ * a rival writer instead: `before` runs immediately before the transaction opens,
+ * `after` immediately after it commits — which is also how "exactly one revision
+ * bump" is measured at the landing rather than over the whole tick.
+ */
+const landingHook = vi.hoisted(() => ({
+  before: undefined as (() => void) | undefined,
+  after: undefined as (() => void) | undefined,
 }));
 
 /** Force the next N intent writes to lose their CAS race (a two-attempt failure). */
@@ -185,6 +216,45 @@ vi.mock("../../src/index.js", async (importOriginal) => {
       intentCas.beforeUpdate = undefined;
       hook?.();
       return actual.updateFleetIntent(options);
+    },
+  };
+});
+
+vi.mock("../../src/fleet-state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/fleet-state.js")>();
+  return {
+    ...actual,
+    enqueueNoteFanout: (
+      options: Parameters<typeof actual.enqueueNoteFanout>[0],
+    ): ReturnType<typeof actual.enqueueNoteFanout> =>
+      mailboxFault.fanoutError === undefined
+        ? actual.enqueueNoteFanout(options)
+        : {
+            ok: false as const,
+            error: mailboxFault.fanoutError,
+            written: [],
+            writtenRecipients: [],
+          },
+    ackNotes: (
+      options: Parameters<typeof actual.ackNotes>[0],
+    ): ReturnType<typeof actual.ackNotes> =>
+      mailboxFault.ackError === undefined
+        ? actual.ackNotes(options)
+        : {
+            ok: false as const,
+            error: mailboxFault.ackError,
+            acked: [],
+            remaining: options.deliveries,
+          },
+    landFleetMember: (
+      options: Parameters<typeof actual.landFleetMember>[0],
+    ): ReturnType<typeof actual.landFleetMember> => {
+      const before = landingHook.before;
+      landingHook.before = undefined;
+      before?.();
+      const result = actual.landFleetMember(options);
+      landingHook.after?.();
+      return result;
     },
   };
 });
@@ -662,9 +732,90 @@ async function loadFleetExtension(seams: FleetForceStopSeams = {}): Promise<Mock
  * Only defaults are restored here; a suite's own `beforeEach` still sets the
  * fixtures its cases need.
  */
+/**
+ * Seed one fleet record in the temp store (bd-281: a row, not a `fleet.json`).
+ *
+ * The record may carry a `run`; both columns commit in the same write, exactly as
+ * the launch and tick paths store them.
+ */
+function seedFleetRecord(commonDir: string, record: Record<string, unknown>): void {
+  const fleetId = typeof record.fleetId === "string" ? record.fleetId : "default";
+  const written = persistFleetIntent({
+    gitCommonDir: commonDir,
+    fleetId,
+    intent: record as unknown as FleetIntent,
+  });
+  if (!written.ok) throw new Error(written.error);
+}
+
+/** Seed a row this version cannot parse (a newer schema, a torn write). */
+function seedRawFleetRecord(fleetId: string, raw: unknown): void {
+  const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+  if (!opened.ok) throw new Error(opened.error);
+  const written = opened.store.writeFleetIntent({ fleetId, intent: raw });
+  opened.store.close();
+  if (!written.ok) throw new Error(written.error);
+}
+
+/** Read one fleet record; a missing row throws, like an unreadable `fleet.json` did. */
+function readFleetRecord(commonDir: string, fleetId = "default"): FleetIntent {
+  const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId });
+  if (!loaded.ok || loaded.intent === undefined) throw new Error("intent unreadable");
+  return loaded.intent;
+}
+
+/**
+ * Remove one fleet's intent row, modelling a record that vanished mid-operation.
+ *
+ * bd-281 removed the `fleet.json` file these tests used to `rmSync`; the store has
+ * no delete-fleet API (a fleet is retired by leaving its row), so a fixture that
+ * needs the vanished state removes the row directly from the temp store.
+ */
+function deleteFleetRecord(fleetId: string): void {
+  const path = process.env.BELAYD_REPO_STATE_FILE;
+  if (path === undefined || path === "") throw new Error("no temp repo state store");
+  const database = new DatabaseSync(path);
+  try {
+    database
+      .prepare("DELETE FROM fleet_intent WHERE fleet_id = ?")
+      .run(fleetId.replace(/[^A-Za-z0-9._-]/g, "_"));
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * The stored fleet row's revision.
+ *
+ * One landing is one bump (bd-281), so this is the counter the landing assertions use;
+ * the tick's own end-of-tick write is a separate fact and moves it again.
+ */
+function fleetRevision(fleetId = "default"): number {
+  const path = process.env.BELAYD_REPO_STATE_FILE;
+  if (path === undefined || path === "") throw new Error("no temp repo state store");
+  const opened = openRepoStateStore({ path });
+  if (!opened.ok) throw new Error(opened.error);
+  try {
+    const row = opened.store.readFleet(fleetId);
+    if (!row.ok || row.value === null) throw new Error("fleet row unreadable");
+    return row.value.revision;
+  } finally {
+    opened.store.close();
+  }
+}
+
+/** Audit entries for one fleet, oldest first (bd-281: store rows, not audit.log). */
+function auditRows(commonDir: string, fleetId = "default"): FleetAuditEntry[] {
+  return [...readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0 })];
+}
+
 async function resetProcessGlobalState(): Promise<void> {
   // The typing stub and the recorded argv both belong to one case.
   childProcess.execFileCalls = [];
+  mailboxFault.fanoutError = undefined;
+  mailboxFault.ackError = undefined;
+  landingHook.before = undefined;
+  landingHook.after = undefined;
   childProcess.bdStdout = undefined;
   childProcess.bdFailure = undefined;
   childProcess.gitAnswer = undefined;
@@ -894,17 +1045,21 @@ describe("fleet supervisor mode", () => {
   }): void {
     const fleetId = options.fleetId ?? "default";
     mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
-    writeFileSync(
-      join(commonDir, "belayd", "fleet", fleetId, "fleet.json"),
-      JSON.stringify({
+    // bd-281: the intent is a store row, so the fixture seeds the same row the
+    // launch path writes.
+    const written = persistFleetIntent({
+      gitCommonDir: commonDir,
+      fleetId,
+      intent: {
         schemaVersion: 1,
         fleetId,
         taskIds: options.taskIds ?? ["bd-12", "bd-15"],
         createdAt: 1,
         updatedAt: 1,
         ...(options.supervisor === undefined ? {} : { supervisor: options.supervisor }),
-      }),
-    );
+      } as unknown as FleetIntent,
+    });
+    if (!written.ok) throw new Error(written.error);
   }
 
   /** Arm this session through the real `/fleet` path (the only way to hold a token). */
@@ -920,19 +1075,14 @@ describe("fleet supervisor mode", () => {
   }
 
   function auditActions(): string[] {
-    const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
-    if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => (JSON.parse(line) as { action: string }).action);
+    return auditRows(commonDir).map((entry) => entry.action);
   }
 
   /** Rewrite the armed fleet record, the way a rival fleet or an operator would. */
   function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
-    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(path, JSON.stringify(mutate(intent)));
+    // bd-281: rewrite the store row; there is no fleet.json to edit any more.
+    const current = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, { ...mutate(current), fleetId: "default" });
   }
 
   function supervisorFor(sessionId: string): { sessionId: string; pid: number } {
@@ -999,7 +1149,7 @@ describe("fleet supervisor mode", () => {
     expect(intent.intent?.note).toBe("stepping away");
     expect(auditActions()).toContain("fleet-paused");
     // The members were told, through their own mailbox.
-    const events = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const events = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     expect(events).toHaveProperty("ok", true);
     if (!events.ok) return;
     expect(events.deliveries.map((delivery) => delivery.note.kind)).toEqual(["pause", "pause"]);
@@ -1041,9 +1191,8 @@ describe("fleet supervisor mode", () => {
     const ctx = makeCtx(cwd, sessionId);
     await arm(mock, ctx);
 
-    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const armed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(path, JSON.stringify({ ...armed, taskIds: ["bd-12", impossibleTaskId] }));
+    const armed = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, { ...armed, taskIds: ["bd-12", impossibleTaskId] });
 
     const paused = await mock.tools
       .get("belayd_fleet_pause")
@@ -1114,13 +1263,7 @@ describe("fleet supervisor mode", () => {
       expect(realKill.mock.calls.filter((call) => call[1] === "SIGTERM")).toEqual([]);
       expect(text).toContain("SIGTERM sent to bd-12's orchestrator pid 4321");
 
-      const entries = readFileSync(
-        join(commonDir, "belayd", "fleet", "default", "audit.log"),
-        "utf8",
-      )
-        .split("\n")
-        .filter((line) => line !== "")
-        .map((line) => JSON.parse(line) as { action: string; detail?: string });
+      const entries = auditRows(commonDir);
       const stopped = entries.find((entry) => entry.action === "member-stopped");
       if (stopped === undefined) throw new Error("no member-stopped audit entry");
       // The audit names the matched token, so the pid can be tied back to the
@@ -1142,16 +1285,12 @@ describe("fleet supervisor mode", () => {
     // member is waiting: the advance has nothing it can start. The members must be
     // reported live for their slots to count (bd-166 counts liveness, not records).
     liveness.memberTaskIds = ["bd-12", "bd-15"];
-    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const armed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(
-      path,
-      JSON.stringify({
-        ...armed,
-        maxConcurrent: 1,
-        deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
-      }),
-    );
+    const armed = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, {
+      ...armed,
+      maxConcurrent: 1,
+      deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
+    });
 
     const advanced = await mock.tools
       .get("belayd_fleet_advance")
@@ -1311,7 +1450,7 @@ describe("fleet supervisor mode", () => {
     );
   });
 
-  it("leaves a run replaced mid-repair untouched (bd-278)", async () => {
+  it("refuses the landing when a re-arm replaced the run before it commits (bd-278)", async () => {
     const sessionId = "supervisor-session";
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, sessionId);
@@ -1335,9 +1474,9 @@ describe("fleet supervisor mode", () => {
       },
     }));
 
-    // A re-arm starts a fresh run while the repair is between its prune and its run
-    // write. The prune update still sees bd-12 in `taskIds`; the update after it sees
-    // it gone, which is the update the landing record would overwrite.
+    // A re-arm starts a fresh run just before the landing transaction opens. There is
+    // no "after the prune" window any more (one write), so the rival write lands at the
+    // only boundary left: the landing must refuse instead of overwriting the new run.
     const freshHead = "e".repeat(40);
     const freshRun = {
       schemaVersion: 1,
@@ -1349,22 +1488,16 @@ describe("fleet supervisor mode", () => {
       accept: false,
       members: [{ taskId: "bd-12", launchedAt: 9_999, head: freshHead }],
     };
-    const fleetPath = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const swapAfterPrune = (): void => {
-      const current = JSON.parse(readFileSync(fleetPath, "utf8")) as Record<string, unknown>;
-      const taskIds = Array.isArray(current.taskIds) ? (current.taskIds as string[]) : [];
-      if (taskIds.includes("bd-12")) {
-        intentCas.beforeUpdate = swapAfterPrune;
-        return;
-      }
-      writeFileSync(fleetPath, JSON.stringify({ ...current, run: freshRun }));
+    // bd-281: the rival writer replaces the store row, not a fleet.json file.
+    landingHook.before = () => {
+      const current = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+      seedFleetRecord(commonDir, { ...current, run: freshRun });
     };
-    intentCas.beforeUpdate = swapAfterPrune;
 
     const reconciled = await mock.tools
       .get("belayd_fleet_reconcile")
       ?.execute("call-1", {}, undefined, undefined, ctx);
-    intentCas.beforeUpdate = undefined;
+    landingHook.before = undefined;
     expect(reconciled?.details).toHaveProperty("exitCode", 0);
 
     const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
@@ -1375,8 +1508,9 @@ describe("fleet supervisor mode", () => {
     expect(loaded.intent?.run?.members).toEqual([
       { taskId: "bd-12", launchedAt: 9_999, head: freshHead },
     ]);
+    // The landing refused rather than overwriting the new run, and said so.
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
-      "the stored run was left alone",
+      "could not record the outside-fleet landing: the stored run was replaced",
     );
   });
 
@@ -1486,7 +1620,7 @@ describe("fleet supervisor mode", () => {
     }
   });
 
-  it("leaves fleet.json readable when a sweep cannot adopt past the gate bound", async () => {
+  it("leaves the intent row readable when a sweep cannot adopt past the gate bound", async () => {
     // C1: a crash window can leave more gates in bd than `fleet.json` may record.
     // One full sweep must refuse the extra adoption (and leave that gate open, since
     // resolving it would release a dependent before its blocker landed) rather than
@@ -1615,19 +1749,19 @@ describe("fleet supervisor mode", () => {
     await arm(mock, ctx);
 
     // An in-flight entry left behind by a crash: no lock, so no merge is running.
-    const fleetDir = join(commonDir, "belayd", "fleet", "default");
-    writeFileSync(
-      join(fleetDir, "merge-queue.json"),
-      JSON.stringify({
+    // bd-281: the queue is a store row; a crash leaves the entry in-flight there.
+    writeFleetMergeQueue({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      queue: {
         schemaVersion: 1,
-        fleetId: "default",
         updatedAt: 1,
         lock: null,
         entries: [
           { taskId: "bd-12", branch: "feat/bd-12", requestedAt: 1, state: "merging", attempts: 2 },
         ],
-      }),
-    );
+      },
+    });
 
     const repaired = await mock.tools
       .get("belayd_fleet_reconcile")
@@ -1637,15 +1771,12 @@ describe("fleet supervisor mode", () => {
     expect(text).toContain("queue: bd-12 → merged");
     expect(auditActions()).toContain("queue-mark-merged");
 
-    const queue = JSON.parse(readFileSync(join(fleetDir, "merge-queue.json"), "utf8")) as {
-      lock: unknown;
-      entries: Array<{ state: string; attempts: number }>;
-    };
+    const stored = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId: "default" });
+    if (!stored.ok || stored.queue === undefined) throw new Error("queue unreadable");
     // Marked merged with its attempt count intact, and the lock reconcile took is
     // released again.
-    expect(queue.entries[0]).toMatchObject({ state: "merged", attempts: 2 });
-    expect(queue.lock).toBe(null);
-    expect(existsSync(join(fleetDir, "merge.lock.d"))).toBe(false);
+    expect(stored.queue.entries[0]).toMatchObject({ state: "merged", attempts: 2 });
+    expect(stored.queue.lock).toBe(null);
 
     const again = await mock.tools
       .get("belayd_fleet_reconcile")
@@ -1839,10 +1970,7 @@ describe("fleet supervisor mode", () => {
         taskIds: ["bd-12", "bd-15"],
         supervisor: { sessionId: "dead-session", pid: 999_999 },
       });
-      const before = readFileSync(
-        join(commonDir, "belayd", "fleet", "default", "fleet.json"),
-        "utf8",
-      );
+      const before = JSON.stringify(readFleetRecord(commonDir));
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "resumed-supervisor");
 
@@ -1853,9 +1981,7 @@ describe("fleet supervisor mode", () => {
       expect(intent.intent?.taskIds).toEqual(["bd-12", "bd-15"]);
       expect(intent.intent?.supervisor).toMatchObject({ sessionId: "resumed-supervisor" });
       // Without a re-arm, this record would be unrecoverable except by hand.
-      expect(
-        readFileSync(join(commonDir, "belayd", "fleet", "default", "fleet.json"), "utf8"),
-      ).not.toBe(before);
+      expect(JSON.stringify(readFleetRecord(commonDir))).not.toBe(before);
       expect(auditActions()).toEqual(["re-arm"]);
       // bd-12 was already running as a member: a re-arm must not spawn a second
       // orchestrator on the same bead.
@@ -1873,14 +1999,13 @@ describe("fleet supervisor mode", () => {
         taskIds: ["bd-12"],
         supervisor: { sessionId: "other-session", pid: process.pid, armToken: "their-token" },
       });
-      const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-      const before = readFileSync(path, "utf8");
+      const before = JSON.stringify(readFleetRecord(commonDir));
       const mock = await loadFleetExtension();
       const ctx = makeCtx(cwd, "intruder-session");
 
       await arm(mock, ctx, "bd-12");
 
-      expect(readFileSync(path, "utf8")).toBe(before);
+      expect(JSON.stringify(readFleetRecord(commonDir))).toBe(before);
       expect(daemon.calls).toEqual([]);
       const report = ctxNotifications.map((entry) => entry.message).join("\n");
       expect(report).toContain("already supervised by live session `other-session`");
@@ -1991,18 +2116,14 @@ describe("fleet supervisor mode", () => {
         const ctx = makeCtx(cwd, "supervisor-session");
         await arm(mock, ctx, "bd-12 bd-15");
 
-        // Make the second recipient's note path unwritable by planting a
-        // directory with the exact content-addressed filename there: the fan-out
-        // then writes bd-12 and fails on bd-15.
-        const events = fleetEventsDir(commonDir, "default");
-        const blocked = buildFleetNote({
-          kind: "note",
-          from: "supervisor",
-          to: "bd-15",
-          body: "hello fleet",
-          now: Date.now(),
-        });
-        mkdirSync(join(events, fleetNoteFileName(blocked)), { recursive: true });
+        // Make the second recipient unaddressable: the note contract bounds an
+        // address at FLEET_NOTE_ADDRESS_MAX_LENGTH, so the fan-out writes bd-12's row
+        // and is refused at bd-15's insert — the same partial broadcast a failing
+        // file write used to produce.
+        editIntent((current) => ({
+          ...current,
+          taskIds: ["bd-12", "x".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH + 1)],
+        }));
 
         const note = mock.tools.get("belayd_fleet_note");
         if (note === undefined) throw new Error("belayd_fleet_note was not registered");
@@ -2015,14 +2136,11 @@ describe("fleet supervisor mode", () => {
         );
         expect(refused.details.exitCode).toBe(1);
 
-        const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-        const entries = readFileSync(auditPath, "utf8")
-          .split("\n")
-          .filter((line) => line !== "")
-          .map((line) => JSON.parse(line) as { action: string; taskIds: string[] });
+        const entries = auditRows(commonDir);
         const partial = entries.find((entry) => entry.action === "note-partial");
         expect(partial).toBeDefined();
         expect(partial?.taskIds).toEqual(["bd-12"]);
+        expect(partial?.detail).toContain("fan-out stopped at");
       } finally {
         vi.useRealTimers();
       }
@@ -2289,14 +2407,9 @@ describe("fleet supervisor mode", () => {
   describe("release (bd-166)", () => {
     /** Every audit line for one action, with the ids it named. */
     function auditEntries(action: string): Array<{ taskIds: readonly string[] }> {
-      const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
-      if (!existsSync(path)) return [];
-      return readFileSync(path, "utf8")
-        .split("\n")
-        .filter((line) => line !== "")
-        .map((line) => JSON.parse(line) as { action: string; taskIds?: string[] })
+      return auditRows(commonDir)
         .filter((entry) => entry.action === action)
-        .map((entry) => ({ taskIds: entry.taskIds ?? [] }));
+        .map((entry) => ({ taskIds: entry.taskIds }));
     }
 
     it("gives a member's slot back while keeping it a member", async () => {
@@ -2385,17 +2498,14 @@ describe("fleet supervisor mode", () => {
     /** A second fleet whose own supervisor is long gone. */
     function writeDeadFleet(): void {
       mkdirSync(join(commonDir, "belayd", "fleet", "wave1"), { recursive: true });
-      writeFileSync(
-        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: "wave1",
-          taskIds: ["bd-31"],
-          createdAt: 1,
-          updatedAt: 1,
-          supervisor: { sessionId: "dead-wave1-session", pid: 2_147_483_646 },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        schemaVersion: 1,
+        fleetId: "wave1",
+        taskIds: ["bd-31"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "dead-wave1-session", pid: 2_147_483_646 },
+      });
     }
 
     it("AC1: recovers a sole provably dead fleet without naming it", async () => {
@@ -2458,20 +2568,26 @@ describe("fleet supervisor mode", () => {
       writeDeadFleet();
       // Give the dead fleet something to repair, so recovery authority is exercised with
       // a real repair and the S1 audit fires.
+      // bd-281: the queue holds entries; the lock is its own row.
       writeFleetMergeQueue({
         gitCommonDir: commonDir,
         fleetId: "wave1",
-        queue: {
-          ...createFleetMergeQueue(1),
-          lock: {
-            holder: "dead-wave1-session",
-            taskId: "bd-31",
-            pid: 2_147_483_646,
-            acquiredAt: 1,
-            leaseExpiresAt: 9_999_999_999_999,
-          },
-        },
+        queue: createFleetMergeQueue(1),
       });
+      const seedStore = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+      if (!seedStore.ok) throw new Error(seedStore.error);
+      const claimed = seedStore.store.acquireFleetLock({
+        fleetId: "wave1",
+        holder: "dead-wave1-session",
+        taskId: "bd-31",
+        pid: 2_147_483_646,
+        // An expired lease is the repairable state now that a record without its
+        // directory no longer exists (bd-281).
+        nowMs: 1,
+        leaseMs: 4,
+      });
+      seedStore.store.close();
+      if (!claimed.ok) throw new Error("could not seed the dead fleet's lock");
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
@@ -2485,12 +2601,8 @@ describe("fleet supervisor mode", () => {
       expect(result.details).toHaveProperty("exitCode", 0);
       expect(textOf(result as ToolResult)).toContain("Fleet `wave1` reconcile");
 
-      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
-      expect(existsSync(auditPath)).toBe(true);
-      const entries = readFileSync(auditPath, "utf8")
-        .split("\n")
-        .filter((line) => line !== "")
-        .map((line) => JSON.parse(line) as { action: string; detail?: string });
+      const entries = auditRows(commonDir, "wave1");
+      expect(entries.length).toBeGreaterThan(0);
       // bd-233: the stronger signal wins — a fleet whose supervisor is provably dead
       // is audited as a recovery, even when this session also supervises a fleet here.
       // S1: only because this pass actually repaired something.
@@ -2519,13 +2631,7 @@ describe("fleet supervisor mode", () => {
         makeCtx(cwd, "unarmed-session"),
       );
       expect(result.details).toHaveProperty("exitCode", 0);
-      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
-      const actions = existsSync(auditPath)
-        ? readFileSync(auditPath, "utf8")
-            .split("\n")
-            .filter((line) => line !== "")
-            .map((line) => (JSON.parse(line) as { action: string }).action)
-        : [];
+      const actions = auditRows(commonDir, "wave1").map((entry) => entry.action);
       expect(actions).not.toContain("reconcile-recovery");
     });
 
@@ -2553,13 +2659,7 @@ describe("fleet supervisor mode", () => {
       expect(emptied).toHaveProperty("ok", true);
       if (!emptied.ok) return;
       expect(emptied.intent?.taskIds).toEqual([]);
-      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
-      const actions = existsSync(auditPath)
-        ? readFileSync(auditPath, "utf8")
-            .split("\n")
-            .filter((line) => line !== "")
-            .map((line) => (JSON.parse(line) as { action: string }).action)
-        : [];
+      const actions = auditRows(commonDir, "wave1").map((entry) => entry.action);
       expect(actions).toContain("member-pruned-dead");
       expect(actions).toContain("reconcile-recovery");
     });
@@ -2569,17 +2669,14 @@ describe("fleet supervisor mode", () => {
       const ctx = makeCtx(cwd, "supervisor-session");
       await arm(mock, ctx);
       writeDeadFleet();
-      writeFileSync(
-        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: "wave1",
-          taskIds: ["bd-31"],
-          createdAt: 1,
-          updatedAt: 1,
-          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        schemaVersion: 1,
+        fleetId: "wave1",
+        taskIds: ["bd-31"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+      });
 
       const tool = mock.tools.get("belayd_fleet_reconcile");
       if (tool === undefined) throw new Error("belayd_fleet_reconcile was not registered");
@@ -2622,13 +2719,7 @@ describe("fleet supervisor mode", () => {
       expect(intent.intent?.released).toEqual([
         expect.objectContaining({ taskId: "bd-31", reason: "operator-release" }),
       ]);
-      const auditPath = join(commonDir, "belayd", "fleet", "wave1", "audit.log");
-      const actions = existsSync(auditPath)
-        ? readFileSync(auditPath, "utf8")
-            .split("\n")
-            .filter((line) => line !== "")
-            .map((line) => (JSON.parse(line) as { action: string }).action)
-        : [];
+      const actions = auditRows(commonDir, "wave1").map((entry) => entry.action);
       expect(actions).toContain("member-released-recovery");
       expect(actions).not.toContain("member-released");
     });
@@ -2638,17 +2729,14 @@ describe("fleet supervisor mode", () => {
       const ctx = makeCtx(cwd, "supervisor-session");
       await arm(mock, ctx);
       writeDeadFleet();
-      writeFileSync(
-        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: "wave1",
-          taskIds: ["bd-31"],
-          createdAt: 1,
-          updatedAt: 1,
-          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        schemaVersion: 1,
+        fleetId: "wave1",
+        taskIds: ["bd-31"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+      });
 
       const tool = mock.tools.get("belayd_fleet_release");
       if (tool === undefined) throw new Error("belayd_fleet_release was not registered");
@@ -2715,13 +2803,7 @@ describe("fleet supervisor mode", () => {
       expect(pruned).toHaveProperty("ok", true);
       if (!pruned.ok) return;
       expect(pruned.intent?.taskIds).toEqual([]);
-      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-      const actions = existsSync(auditPath)
-        ? readFileSync(auditPath, "utf8")
-            .split("\n")
-            .filter((line) => line !== "")
-            .map((line) => (JSON.parse(line) as { action: string }).action)
-        : [];
+      const actions = auditRows(commonDir).map((entry) => entry.action);
       // Naming the session's own fleet is not a cross-fleet operation.
       expect(actions).not.toContain("reconcile-cross-fleet");
     });
@@ -2947,13 +3029,7 @@ describe("fleet supervisor mode", () => {
       );
       expect(retried.details).toHaveProperty("exitCode", 0);
       expect(textOf(retried)).toContain("retrying bd-12");
-      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-      const actions = existsSync(auditPath)
-        ? readFileSync(auditPath, "utf8")
-            .split("\n")
-            .filter((line) => line !== "")
-            .map((line) => (JSON.parse(line) as { action: string }).action)
-        : [];
+      const actions = auditRows(commonDir).map((entry) => entry.action);
       expect(actions).toContain("member-retry");
       const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
       expect(after).toHaveProperty("ok", true);
@@ -3086,12 +3162,9 @@ describe("fleet supervisor mode", () => {
           .filter((call) => call.file === "bd" && call.args[0] === "gate")
           .map((call) => [...call.args]),
       ).toContainEqual(["gate", "resolve", "bd-940"]);
-      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-      const audited = readFileSync(auditPath, "utf8")
-        .split("\n")
-        .filter((line) => line !== "")
-        .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
-        .filter((entry) => entry.action === "escalation-gates-resolved");
+      const audited = auditRows(commonDir).filter(
+        (entry) => entry.action === "escalation-gates-resolved",
+      );
       expect(audited).toHaveLength(1);
       expect(audited[0]?.taskIds).toEqual(["bd-12"]);
       expect(audited[0]?.detail).toContain("retried member");
@@ -3130,17 +3203,14 @@ describe("fleet supervisor mode", () => {
       writeDeadFleet();
       // A *live* target supervisor, so bd-233's recovery arm cannot apply: this case
       // is about inherited authority, not about a provably dead fleet.
-      writeFileSync(
-        join(commonDir, "belayd", "fleet", "wave1", "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: "wave1",
-          taskIds: ["bd-31"],
-          createdAt: 1,
-          updatedAt: 1,
-          supervisor: { sessionId: "live-wave1-session", pid: process.pid },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        schemaVersion: 1,
+        fleetId: "wave1",
+        taskIds: ["bd-31"],
+        createdAt: 1,
+        updatedAt: 1,
+        supervisor: { sessionId: "live-wave1-session", pid: process.pid },
+      });
       // The record names this session id, but the process and token are stale: a
       // resumed session must not inherit cross-fleet authority from it.
       writeIntent({
@@ -3204,7 +3274,7 @@ describe("fleet supervisor mode", () => {
 
       expect(result.details.exitCode).toBe(0);
       expect(textOf(result)).toContain("rebase-hint from supervisor to bd-15 queued in events");
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       expect(drained).toHaveProperty("ok", true);
       if (!drained.ok) return;
       expect(drained.deliveries.map((delivery) => delivery.note.body)).toEqual([
@@ -3242,7 +3312,7 @@ describe("fleet supervisor mode", () => {
       const actorIndex = mirror?.args.indexOf("--actor") ?? -1;
       expect(mirror?.args[actorIndex + 1]).toBe("belayd:supervisor");
       // The file mailbox is still the delivery protocol, so the note is queued.
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!drained.ok) throw new Error("drain failed");
       expect(drained.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
     });
@@ -3308,15 +3378,11 @@ describe("fleet supervisor mode", () => {
       expect(result.details.exitCode).toBe(0);
       expect(textOf(result)).toContain("queued in events");
       expect(textOf(result)).not.toContain("Mirrored to");
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!drained.ok) throw new Error("drain failed");
       expect(drained.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
 
-      const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-      const entries = readFileSync(auditPath, "utf8")
-        .split("\n")
-        .filter((line) => line !== "")
-        .map((line) => JSON.parse(line) as { action: string; detail: string });
+      const entries = auditRows(commonDir);
       const failure = entries.find((entry) => entry.action === "note-mirror-failed");
       expect(failure?.detail).toContain("bd: comment write failed");
       expect(auditActions()).toContain("note");
@@ -3338,30 +3404,34 @@ describe("fleet supervisor mode", () => {
       );
       expect(written.details.exitCode).toBe(0);
       expect(textOf(written)).toContain("to 2 members (bd-12, bd-15)");
-      expect(textOf(written)).toContain("2 file(s)");
+      expect(textOf(written)).toContain("queued in events/ (2 note(s))");
 
-      const pending = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const pending = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!pending.ok) throw new Error("drain failed");
       expect(pending.deliveries.map((delivery) => delivery.note.to).sort()).toEqual([
         "bd-12",
         "bd-15",
       ]);
 
-      // Two members, drained in either order: each gets its own copy, and the
-      // sibling's copy is untouched until that member acks (ack is deferred to
+      // Two members, drained in either order: each gets its own row, and the
+      // sibling's row is untouched until that member acks (ack is deferred to
       // agent_end, so end the turn before checking the remaining mailbox).
       const first = makeMemberCtx("bd-12");
       const second = makeMemberCtx("bd-15");
       expect(await startTurn(mock, first)).toContain("main moved");
       await endTurn(mock, first);
-      const stillPending = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const stillPending = drainNotes({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
+      });
       if (!stillPending.ok) throw new Error("drain failed");
       expect(stillPending.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
 
       expect(await startTurn(mock, second)).toContain("main moved");
       // Each copy is acked once; a later drain returns nothing.
       await endTurn(mock, second);
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!drained.ok) throw new Error("drain failed");
       expect(drained.deliveries).toEqual([]);
       expect(await startTurn(mock, first)).toBe(undefined);
@@ -3387,7 +3457,7 @@ describe("fleet supervisor mode", () => {
       expect(textOf(result)).toContain("not a member of this fleet");
       expect(textOf(result)).toContain("bd-12, bd-15");
       // Nothing was written, so no immortal dead mail accumulates.
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!drained.ok) throw new Error("drain failed");
       expect(drained.deliveries).toEqual([]);
     });
@@ -3409,7 +3479,7 @@ describe("fleet supervisor mode", () => {
           memberCtx,
         );
         expect(result.details.exitCode).toBe(1);
-        expect(textOf(result)).toContain("events/ is supervisor-only");
+        expect(textOf(result)).toContain("the events channel is supervisor-only");
       }
 
       // The member's own surface still works, addressed to the supervisor only.
@@ -3479,19 +3549,18 @@ describe("fleet supervisor mode", () => {
       );
       expect(written.details.exitCode).toBe(0);
 
-      // A read-only inbox lets the drain succeed and the unlink fail, which is
-      // exactly the partial-ack case: the note was consumed for this result but
-      // is still on disk, so its content must be reported *and* named as queued.
-      const inboxDir = fleetInboxDir(commonDir, "default");
-      chmodSync(inboxDir, 0o500);
+      // The drain succeeds and the ack is refused, which is exactly the partial-ack
+      // case: the note was consumed for this result but is still queued, so its
+      // content must be reported *and* named as queued.
+      mailboxFault.ackError = "EIO: simulated ack failure";
       try {
         const drained = await inbox.execute("inbox-w5", {}, undefined, undefined, ctx);
         expect(textOf(drained)).toContain("details that must not vanish");
         expect(drained.details.exitCode).toBe(1);
-        expect(textOf(drained)).toContain("still queued in inbox/");
+        expect(textOf(drained)).toContain("still queued in the inbox");
         expect(textOf(drained)).toContain("Acknowledge failed");
       } finally {
-        chmodSync(inboxDir, 0o700);
+        mailboxFault.ackError = undefined;
       }
     });
 
@@ -3566,7 +3635,7 @@ describe("fleet supervisor mode", () => {
         ctx,
       );
       expect(long.details.exitCode).toBe(0);
-      const drained = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const drained = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
       if (!drained.ok) throw new Error("drain failed");
       expect(drained.deliveries[0]?.note.body.length).toBe(FLEET_NOTE_BODY_MAX_LENGTH);
     });
@@ -3581,7 +3650,9 @@ describe("fleet supervisor mode", () => {
       const ctx = makeMemberCtx("bd-15");
 
       const enqueued = enqueueNote({
-        dir: fleetEventsDir(commonDir, "default"),
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
         note: {
           schemaVersion: 1,
           kind: "base-moved",
@@ -3599,13 +3670,21 @@ describe("fleet supervisor mode", () => {
       expect(first).toContain("main moved to abc123");
 
       // Still on disk: injection is not consumption. A crash here replays.
-      const beforeAck = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const beforeAck = drainNotes({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
+      });
       if (!beforeAck.ok) throw new Error("drain failed");
       expect(beforeAck.deliveries).toHaveLength(1);
 
       await endTurn(mock, ctx);
 
-      const afterAck = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const afterAck = drainNotes({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
+      });
       if (!afterAck.ok) throw new Error("drain failed");
       expect(afterAck.deliveries).toEqual([]);
       expect(await startTurn(mock, ctx)).toBe(undefined);
@@ -3620,7 +3699,9 @@ describe("fleet supervisor mode", () => {
       });
       const ctx = makeMemberCtx("bd-15");
       enqueueNote({
-        dir: fleetEventsDir(commonDir, "default"),
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
         note: {
           schemaVersion: 1,
           kind: "rebase-hint",
@@ -3645,7 +3726,9 @@ describe("fleet supervisor mode", () => {
       });
       const ctx = makeMemberCtx("bd-12");
       enqueueNote({
-        dir: fleetEventsDir(commonDir, "default"),
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
         note: {
           schemaVersion: 1,
           kind: "note",
@@ -3659,7 +3742,11 @@ describe("fleet supervisor mode", () => {
       const mock = await loadFleetExtension();
       expect(await startTurn(mock, ctx)).toBe(undefined);
 
-      const remaining = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const remaining = drainNotes({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
+      });
       if (!remaining.ok) throw new Error("drain failed");
       expect(remaining.deliveries).toHaveLength(1);
       expect(remaining.deliveries[0]?.note.to).toBe("bd-15");
@@ -3672,7 +3759,9 @@ describe("fleet supervisor mode", () => {
       });
       const ctx = makeMemberCtx("bd-12");
       enqueueNote({
-        dir: fleetEventsDir(commonDir, "default"),
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
         note: {
           schemaVersion: 1,
           kind: "pause",
@@ -3696,7 +3785,9 @@ describe("fleet supervisor mode", () => {
       });
       const ctx = makeMemberCtx("bd-12");
       enqueueNote({
-        dir: fleetEventsDir(commonDir, "default"),
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
         note: {
           schemaVersion: 1,
           kind: "rebase-hint",
@@ -3713,7 +3804,11 @@ describe("fleet supervisor mode", () => {
       const subAgent = makeCtx(ctx.cwd, "bd-12-sub-plan-abc123");
       expect(await startTurn(mock, subAgent)).toBe(undefined);
 
-      const remaining = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+      const remaining = drainNotes({
+        gitCommonDir: commonDir,
+        fleetId: "default",
+        channel: "event",
+      });
       if (!remaining.ok) throw new Error("drain failed");
       expect(remaining.deliveries).toHaveLength(1);
     });
@@ -3793,7 +3888,7 @@ describe("launch tool validation", () => {
     expect(textOf(result)).toContain("not-a-bead");
     const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
     expect(intent).toEqual({ ok: true, intent: undefined });
-    expect(drainNotes({ dir: fleetInboxDir(commonDir, "default") })).toEqual({
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "inbox" })).toEqual({
       ok: true,
       deliveries: [],
       warnings: [],
@@ -3908,12 +4003,7 @@ describe("fleet publish config (bd-174.1)", () => {
   }
 
   function auditActions(): string[] {
-    const auditPath = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
-    if (!existsSync(auditPath)) return [];
-    return readFileSync(auditPath, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => (JSON.parse(line) as { action: string }).action);
+    return auditRows(commonDir, fleetId).map((entry) => entry.action);
   }
 
   function notificationText(): string {
@@ -4034,19 +4124,16 @@ describe("fleet publish config (bd-174.1)", () => {
 
   it("never re-reads the contract on a re-arm", async () => {
     mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
-    writeFileSync(
-      join(commonDir, "belayd", "fleet", fleetId, "fleet.json"),
-      JSON.stringify({
-        schemaVersion: 2,
-        fleetId,
-        taskIds: ["bd-12"],
-        createdAt: 1,
-        updatedAt: 1,
-        baseBranch: "develop",
-        publish: { mode: "pr", remote: "origin", base: "develop" },
-        supervisor: { sessionId: "dead-session", pid: 999_999 },
-      }),
-    );
+    seedFleetRecord(commonDir, {
+      schemaVersion: 2,
+      fleetId,
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      baseBranch: "develop",
+      publish: { mode: "pr", remote: "origin", base: "develop" },
+      supervisor: { sessionId: "dead-session", pid: 999_999 },
+    });
     // Both other sources now disagree with the recorded contract, which is exactly
     // the mid-run edit the freeze exists to survive.
     writeRepoConfig({ mode: "local" });
@@ -4183,11 +4270,7 @@ describe("belayd_fleet_merge", () => {
     const listed = await tool.execute("merge-4", { action: "list" }, undefined, undefined, ctx);
     expect(textOf(listed)).toContain("bd-12 (feat/bd-12): queued");
 
-    const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-    const actions = readFileSync(auditPath, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => (JSON.parse(line) as { action: string }).action);
+    const actions = auditRows(commonDir).map((entry) => entry.action);
     expect(actions).toContain("merge-enqueued");
     // No bead mutation happened: there is no bd seam in the merge family at all.
     expect(actions).not.toContain("bd-close");
@@ -4262,21 +4345,16 @@ describe("fleet run mode", () => {
 
   /** Every audit entry of one action, with the ids and detail it recorded. */
   function auditEntries(action: string): Array<{ taskIds: readonly string[]; detail: string }> {
-    const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
-    if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
+    return auditRows(commonDir)
       .filter((entry) => entry.action === action)
-      .map((entry) => ({ taskIds: entry.taskIds ?? [], detail: entry.detail ?? "" }));
+      .map((entry) => ({ taskIds: entry.taskIds, detail: entry.detail }));
   }
 
   /** Rewrite the armed fleet record, the way a rival fleet or an operator would. */
   function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
-    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(path, JSON.stringify(mutate(intent)));
+    // bd-281: rewrite the store row; there is no fleet.json to edit any more.
+    const current = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, { ...mutate(current), fleetId: "default" });
   }
 
   /**
@@ -4556,7 +4634,7 @@ describe("fleet run mode", () => {
     // engine refuses hard (`ok: false`). Capacity deferrals must not turn that into a
     // wait: the engine would refuse identically on every tick.
     mkdirSync(join(commonDir, "belayd", "fleet", "other"), { recursive: true });
-    writeFileSync(join(commonDir, "belayd", "fleet", "other", "fleet.json"), "{not json");
+    seedRawFleetRecord("other", "{not json");
     editIntent((intent) => ({
       ...intent,
       maxConcurrent: 1,
@@ -4911,7 +4989,6 @@ describe("fleet run mode", () => {
     // An unreadable dependency graph is a warning the launch engine reports after it
     // has written the plan, which is the hook point below.
     childProcess.bdStdout = (args) => (args[0] === "show" ? "{not json" : undefined);
-    const fleetFile = join(commonDir, "belayd", "fleet", "default", "fleet.json");
     // The engine's own warnings are notified after it wrote the re-planned intent and
     // before the tick re-reads it: the window a reconcile or an operator cleanup can
     // empty, which would otherwise let the tick classify from the pre-launch plan.
@@ -4927,13 +5004,16 @@ describe("fleet run mode", () => {
         afterLaunchHook = deleteAfterLaunchEngine;
         return;
       }
-      rmSync(fleetFile, { force: true });
+      deleteFleetRecord("default");
     };
     afterLaunchHook = deleteAfterLaunchEngine;
 
     await vi.advanceTimersByTimeAsync(2_000);
 
-    expect(existsSync(fleetFile)).toBe(false);
+    expect(readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" })).toHaveProperty(
+      "intent",
+      undefined,
+    );
     const lines = ctxNotifications.map((entry) => entry.message).join("\n");
     // The advance's own report is kept as the leading line, then the run stops
     // instead of classifying from the plan the advance just replaced.
@@ -4978,7 +5058,7 @@ describe("fleet run mode", () => {
     );
     // The supervisor beat is what lets a later session tell a dead run-mode
     // supervisor from a live one (the recorded pid is the shared daemon).
-    expect(existsSync(join(commonDir, "belayd", "fleet", "default", "supervisor.json"))).toBe(true);
+    expect(readSupervisorHeartbeat({ gitCommonDir: commonDir, fleetId: "default" })).toBeDefined();
   });
 
   it("names the supervisor session after the members it supervises", async () => {
@@ -5219,20 +5299,21 @@ describe("fleet run mode", () => {
    * live orchestrator, and the tick's own observation is what the drain reads.
    */
   function seedLiveMemberLease(memberDir: string): void {
-    const dir = join(memberDir, ".belayd");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "orchestrator.json"),
-      JSON.stringify({
-        schemaVersion: 1,
-        taskId: "bd-12",
-        branch: "feat/bd-12",
-        sessionId: "member-session-id",
-        pid: 4242,
-        claimedAt: Date.now(),
-        heartbeatAt: Date.now(),
-      }),
-    );
+    // The lease is a store row (bd-281); the fleet reads it from the store, so the
+    // fixture seeds the row the launch would have written.
+    const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+    if (!opened.ok) throw new Error(opened.error);
+    const written = opened.store.acquireLease({
+      taskId: "bd-12",
+      branch: "feat/bd-12",
+      sessionId: "member-session-id",
+      worktreePath: memberDir,
+      pid: 4242,
+      nowMs: Date.now(),
+      takeOverStale: true,
+    });
+    opened.store.close();
+    if (!written.ok) throw new Error(written.error);
   }
 
   /**
@@ -5244,13 +5325,26 @@ describe("fleet run mode", () => {
    * orchestrator, so the test ages it instead of pretending the session died.
    */
   function expireMemberSpawnClaim(branch: string): void {
-    const path = join(worktree.path, branch.replace(/\//g, "-"), ".belayd", "orchestrator.json");
-    if (!existsSync(path)) return;
-    const claim = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(
-      path,
-      JSON.stringify({ ...claim, heartbeatAt: Date.now() - ORCHESTRATOR_CLAIM_STALE_MS - 1 }),
-    );
+    const memberDir = join(worktree.path, branch.replace(/\//g, "-"));
+    const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+    if (!opened.ok) throw new Error(opened.error);
+    const current = opened.store.readLease({ worktreePath: memberDir });
+    if (!current.ok || current.value === null) {
+      opened.store.close();
+      return;
+    }
+    // Age the row past the stale window: that is what a stopped session leaves.
+    opened.store.acquireLease({
+      taskId: current.value.taskId,
+      branch,
+      sessionId: current.value.sessionId,
+      worktreePath: memberDir,
+      pid: current.value.pid,
+      nowMs: Date.now() - ORCHESTRATOR_CLAIM_STALE_MS - 1,
+      ttlMs: 1,
+      takeOverStale: true,
+    });
+    opened.store.close();
   }
 
   /**
@@ -5306,7 +5400,7 @@ describe("fleet run mode", () => {
       state: "failed",
       delegatedAt: expect.any(Number),
     });
-    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const notes = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     if (!notes.ok) throw new Error(notes.error);
     expect(
       notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
@@ -5373,7 +5467,7 @@ describe("fleet run mode", () => {
     expect(text).toContain("waits for that rebase");
     expect(text).not.toContain("could not land bd-12");
 
-    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const notes = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     if (!notes.ok) throw new Error(notes.error);
     expect(
       notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
@@ -5418,7 +5512,7 @@ describe("fleet run mode", () => {
     // Held, not re-drained: one rebase attempt, one hint, the same marker.
     expect(drain.rebaseAttempts()).toBe(1);
     expect(delegatedAt()).toBe(firstDelegatedAt);
-    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const notes = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     if (!notes.ok) throw new Error(notes.error);
     expect(
       notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
@@ -5801,6 +5895,15 @@ describe("fleet run mode", () => {
     expect(auditEntries("fleet-land-repair")).toEqual([]);
   });
 
+  /** The member's persisted workflow record, or a loud failure (fixture guard). */
+  function requireMemberState(
+    memberDir: string,
+  ): NonNullable<ReturnType<typeof readWorkflowState>> {
+    const state = readWorkflowState({ cwd: memberDir });
+    if (state === undefined) throw new Error("member state was not persisted");
+    return state;
+  }
+
   it("notes a live member and holds its unchanged branch until the repair grace (bd-277)", async () => {
     const memberDir = join(cwd, "member-bd-12");
     worktree.branchPath = memberDir;
@@ -5817,13 +5920,14 @@ describe("fleet run mode", () => {
     writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
     // AC 4: the note asks the member to act in its own worktree, so the record it is
     // working from must not move under it (no relaunch, no retirement, no bead write).
-    const memberStatePath = join(memberDir, ".belayd", "workflow.json");
-    const memberStateBytes = readFileSync(memberStatePath, "utf8");
+    // The record is a shared-store row (bd-281), so the comparison is the record, not
+    // the bytes of a file that no longer exists.
+    const memberStateBefore = requireMemberState(memberDir);
     await vi.advanceTimersByTimeAsync(2_000);
 
     // One orchestrator per worktree: the live member is asked by note, not relaunched.
     expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
-    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const notes = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     if (!notes.ok) throw new Error(notes.error);
     const repairs = notes.deliveries.filter((delivery) => delivery.note.kind === "land-repair");
     expect(repairs).toHaveLength(1);
@@ -5834,7 +5938,7 @@ describe("fleet run mode", () => {
     if (!noted.ok) return;
     expect(noted.intent?.run?.members?.[0]).toMatchObject({ landRepair: { attempts: 1 } });
     expect(noted.intent?.run?.stopped ?? []).toEqual([]);
-    expect(readFileSync(memberStatePath, "utf8")).toBe(memberStateBytes);
+    expect(readWorkflowState({ cwd: memberDir })).toEqual(memberStateBefore);
     expect(noted.intent?.taskIds).toEqual(["bd-12"]);
     expect(noted.intent?.released ?? []).toEqual([]);
     expect(auditEntries("members-released")).toEqual([]);
@@ -5889,7 +5993,7 @@ describe("fleet run mode", () => {
     expect(after.intent?.run?.members?.[0]?.landRepair).toBe(undefined);
     expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
     expect(auditEntries("fleet-land-repair")).toEqual([]);
-    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" })).toEqual({
       ok: true,
       deliveries: [],
       warnings: [],
@@ -5900,10 +6004,10 @@ describe("fleet run mode", () => {
     const { drain, memberDir } = await armRefusedLanding();
     writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
     seedLiveMemberLease(memberDir);
-    // Two lost compare-and-swaps: `mutateFleetIntent` retries once, so the attempt
-    // never reaches disk. Without the count there is no bound left, so the round must
-    // not be started at all.
-    intentCas.conflictsRemaining = 2;
+    // One failed transaction is now enough (bd-281 deleted the retry loop): the
+    // attempt never reaches the store. Without the count there is no bound left, so
+    // the round must not be started at all.
+    intentCas.conflictsRemaining = 1;
     try {
       await vi.advanceTimersByTimeAsync(1);
     } finally {
@@ -5930,7 +6034,7 @@ describe("fleet run mode", () => {
     // Nobody was asked: no relaunch, no note, no audit entry.
     expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
     expect(auditEntries("fleet-land-repair")).toEqual([]);
-    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" })).toEqual({
       ok: true,
       deliveries: [],
       warnings: [],
@@ -5969,7 +6073,7 @@ describe("fleet run mode", () => {
     // Nobody was asked: no relaunch, no note, no audit entry.
     expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
     expect(auditEntries("fleet-land-repair")).toEqual([]);
-    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" })).toEqual({
       ok: true,
       deliveries: [],
       warnings: [],
@@ -5980,11 +6084,14 @@ describe("fleet run mode", () => {
     const { drain, memberDir } = await armRefusedLanding();
     writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
     seedLiveMemberLease(memberDir);
-    // A live member is asked by note (one orchestrator per worktree), so a note drop
-    // that cannot be created is a member nobody told.
-    const eventsPath = fleetEventsDir(commonDir, "default");
-    writeFileSync(eventsPath, "not a directory");
-    await vi.advanceTimersByTimeAsync(1);
+    // A live member is asked by note (one orchestrator per worktree), so a note that
+    // cannot be queued is a member nobody told.
+    mailboxFault.fanoutError = "EIO: simulated note write failure";
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+    } finally {
+      mailboxFault.fanoutError = undefined;
+    }
 
     expect(drain.drains()).toBe(1);
     const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
@@ -6000,7 +6107,6 @@ describe("fleet run mode", () => {
     // The note path never relaunches and never audits a delivery it could not make.
     expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
     expect(auditEntries("fleet-land-repair")).toEqual([]);
-    expect(readFileSync(eventsPath, "utf8")).toBe("not a directory");
   });
 
   it("stops when the member branch tip cannot be read to bound a repair (bd-277)", async () => {
@@ -6251,11 +6357,7 @@ describe("fleet run mode", () => {
     expect(
       childProcess.execFileCalls.filter((call) => call.file === "bd" && call.args[0] === "close"),
     ).toEqual([]);
-    const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
-    const entries = readFileSync(auditPath, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; detail?: string });
+    const entries = auditRows(commonDir);
     const landed = entries.find((entry) => entry.action === "fleet-landed");
     expect(landed?.detail).toContain("already on main");
     expect(landed?.detail).toContain("landing happened outside the fleet");
@@ -6616,25 +6718,22 @@ describe("fleet run mode", () => {
 
     // A re-arm replaced the run while this tick's sweep was running. The compose refuses
     // to write over it, which is the compare-and-replace doing its job, not a failure.
-    const fleetPath = join(commonDir, "belayd", "fleet", "default", "fleet.json");
     intentCas.beforeUpdate = () => {
-      const current = JSON.parse(readFileSync(fleetPath, "utf8")) as Record<string, unknown>;
-      writeFileSync(
-        fleetPath,
-        JSON.stringify({
-          ...current,
-          run: {
-            schemaVersion: 1,
-            mode: "until-complete",
-            startedAt: 9_999,
-            updatedAt: 9_999,
-            ticks: 0,
-            idleTicks: 0,
-            accept: false,
-            members: [{ taskId: "bd-12", launchedAt: 9_999 }],
-          },
-        }),
-      );
+      // bd-281: the rival writer replaces the store row, not a fleet.json file.
+      const current = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+      seedFleetRecord(commonDir, {
+        ...current,
+        run: {
+          schemaVersion: 1,
+          mode: "until-complete",
+          startedAt: 9_999,
+          updatedAt: 9_999,
+          ticks: 0,
+          idleTicks: 0,
+          accept: false,
+          members: [{ taskId: "bd-12", launchedAt: 9_999 }],
+        },
+      });
     };
     try {
       await vi.advanceTimersByTimeAsync(15_000);
@@ -6836,34 +6935,20 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     git.commonDir = "";
   });
 
-  function fleetFile(fleetId = "default"): string {
-    return join(commonDir, "belayd", "fleet", fleetId, "fleet.json");
-  }
-
   function runTicks(fleetId = "default"): number | undefined {
     const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId });
     return intent.ok ? intent.intent?.run?.ticks : undefined;
   }
 
   function auditActions(fleetId = "default"): string[] {
-    const path = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
-    if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => (JSON.parse(line) as { action: string }).action);
+    return auditRows(commonDir, fleetId).map((entry) => entry.action);
   }
 
   /** The detail of every audit entry of one action, in append order. */
   function auditDetails(action: string, fleetId = "default"): string[] {
-    const path = join(commonDir, "belayd", "fleet", fleetId, "audit.log");
-    if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; detail?: string })
+    return auditRows(commonDir, fleetId)
       .filter((entry) => entry.action === action)
-      .map((entry) => entry.detail ?? "");
+      .map((entry) => entry.detail);
   }
 
   /** The persisted shape the wave2 incident left: an active run with a dead beat. */
@@ -6886,31 +6971,28 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     pidStartTime?: string;
   }): void {
     mkdirSync(join(commonDir, "belayd", "fleet", options.fleetId), { recursive: true });
-    writeFileSync(
-      join(commonDir, "belayd", "fleet", options.fleetId, "fleet.json"),
-      JSON.stringify({
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: options.fleetId,
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      supervisor: {
+        sessionId: options.supervisorSessionId,
+        pid: process.pid,
+        ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
+        armToken: "stale-arm-token",
+      },
+      run: {
         schemaVersion: 1,
-        fleetId: options.fleetId,
-        taskIds: ["bd-12"],
-        createdAt: 1,
-        updatedAt: 1,
-        supervisor: {
-          sessionId: options.supervisorSessionId,
-          pid: process.pid,
-          ...(options.pidStartTime === undefined ? {} : { pidStartTime: options.pidStartTime }),
-          armToken: "stale-arm-token",
-        },
-        run: {
-          schemaVersion: 1,
-          mode: "until-complete",
-          startedAt: 1,
-          updatedAt: options.runUpdatedAt ?? 1,
-          ticks: options.ticks ?? 3,
-          accept: false,
-          members: [{ taskId: "bd-12", launchedAt: 1 }],
-        },
-      }),
-    );
+        mode: "until-complete",
+        startedAt: 1,
+        updatedAt: options.runUpdatedAt ?? 1,
+        ticks: options.ticks ?? 3,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1 }],
+      },
+    });
     writeSupervisorHeartbeat({
       gitCommonDir: commonDir,
       fleetId: options.fleetId,
@@ -6925,32 +7007,29 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     fleetId: string,
     mutate: (intent: Record<string, unknown>) => Record<string, unknown>,
   ): void {
-    const path = join(commonDir, "belayd", "fleet", fleetId, "fleet.json");
-    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(path, JSON.stringify(mutate(intent)));
+    // bd-281: rewrite the store row; there is no fleet.json to edit any more.
+    const current = readFleetRecord(commonDir, fleetId) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, { ...mutate(current), fleetId });
   }
 
   /** An active run whose record names nobody: no supervisor record at all. */
   function seedLeaderlessRun(options: { beatAt?: number } = {}): void {
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      run: {
         schemaVersion: 1,
-        fleetId: "default",
-        taskIds: ["bd-12"],
-        createdAt: 1,
+        mode: "until-complete",
+        startedAt: 1,
         updatedAt: 1,
-        run: {
-          schemaVersion: 1,
-          mode: "until-complete",
-          startedAt: 1,
-          updatedAt: 1,
-          ticks: 3,
-          accept: false,
-          members: [{ taskId: "bd-12", launchedAt: 1 }],
-        },
-      }),
-    );
+        ticks: 3,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1 }],
+      },
+    });
     if (options.beatAt === undefined) return;
     writeSupervisorHeartbeat({
       gitCommonDir: commonDir,
@@ -6991,10 +7070,9 @@ describe("supervisor restart re-adoption (bd-169)", () => {
       sessionId: "restarted-session",
     });
     // W6: the token is never persisted outside the record it belongs to, and the
-    // beat file in particular stays token-free.
-    const beat = readFileSync(
-      join(commonDir, "belayd", "fleet", "default", "supervisor.json"),
-      "utf8",
+    // beat row in particular stays token-free.
+    const beat = JSON.stringify(
+      readSupervisorHeartbeat({ gitCommonDir: commonDir, fleetId: "default" }),
     );
     expect(beat).not.toContain("armToken");
     expect(beat).not.toContain(token ?? "");
@@ -7016,16 +7094,13 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     await command.handler("bd-12", ctx);
 
     // Another session re-armed: the record's token no longer matches this session.
-    const parsed = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+    const parsed = readFleetRecord(commonDir) as unknown as Record<string, unknown> as {
       supervisor?: Record<string, unknown>;
     };
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
-        ...parsed,
-        supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
-      }),
-    );
+    seedFleetRecord(commonDir, {
+      ...parsed,
+      supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
+    });
 
     await vi.advanceTimersByTimeAsync(16_000);
 
@@ -7046,18 +7121,15 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     const command = mock.commands.get("fleet");
     if (command === undefined) throw new Error("/fleet was not registered");
     await command.handler("bd-12", ctx);
-    const armed = readFileSync(fleetFile(), "utf8");
+    const armed = JSON.stringify(readFleetRecord(commonDir));
 
     // Rotate the record's token so the next tick loses authority and the loop dies;
     // this session still holds its own token and the active run survives.
     const parsed = JSON.parse(armed) as { supervisor?: Record<string, unknown> };
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
-        ...parsed,
-        supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
-      }),
-    );
+    seedFleetRecord(commonDir, {
+      ...parsed,
+      supervisor: { ...parsed.supervisor, armToken: "rotated-token" },
+    });
     await vi.advanceTimersByTimeAsync(16_000);
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
       "no longer the live supervisor",
@@ -7068,7 +7140,7 @@ describe("supervisor restart re-adoption (bd-169)", () => {
       ...(JSON.parse(armed) as Record<string, unknown>),
       deferred: [{ taskId: "bd-19", reason: "capacity", detail: "no free slot" }],
     };
-    writeFileSync(fleetFile(), JSON.stringify(restored));
+    seedFleetRecord(commonDir, restored);
     const ticksBefore = runTicks() ?? 0;
     const tool = mock.tools.get("belayd_fleet_advance");
     if (tool === undefined) throw new Error("belayd_fleet_advance was not registered");
@@ -7105,25 +7177,22 @@ describe("supervisor restart re-adoption (bd-169)", () => {
   it("reports an active run whose record has no usable supervisor (bd-169 W5)", async () => {
     // No session is named, so "wait for the supervisor's next start" never happens:
     // without this report the run stays unticked and silent forever.
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      run: {
         schemaVersion: 1,
-        fleetId: "default",
-        taskIds: ["bd-12"],
-        createdAt: 1,
+        mode: "until-complete",
+        startedAt: 1,
         updatedAt: 1,
-        run: {
-          schemaVersion: 1,
-          mode: "until-complete",
-          startedAt: 1,
-          updatedAt: 1,
-          ticks: 3,
-          accept: false,
-          members: [{ taskId: "bd-12", launchedAt: 1 }],
-        },
-      }),
-    );
+        ticks: 3,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1 }],
+      },
+    });
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "some-session");
 
@@ -7143,26 +7212,23 @@ describe("supervisor restart re-adoption (bd-169)", () => {
   it("distinguishes an empty supervisor session id from a missing record (bd-169)", async () => {
     // A record that exists but names no session is a different state from an intent
     // with no record at all: the audit must let a reader tell which one it saw.
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      supervisor: { sessionId: "", pid: process.pid, armToken: "stale-arm-token" },
+      run: {
         schemaVersion: 1,
-        fleetId: "default",
-        taskIds: ["bd-12"],
-        createdAt: 1,
+        mode: "until-complete",
+        startedAt: 1,
         updatedAt: 1,
-        supervisor: { sessionId: "", pid: process.pid, armToken: "stale-arm-token" },
-        run: {
-          schemaVersion: 1,
-          mode: "until-complete",
-          startedAt: 1,
-          updatedAt: 1,
-          ticks: 3,
-          accept: false,
-          members: [{ taskId: "bd-12", launchedAt: 1 }],
-        },
-      }),
-    );
+        ticks: 3,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1 }],
+      },
+    });
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "some-session");
 
@@ -7178,16 +7244,13 @@ describe("supervisor restart re-adoption (bd-169)", () => {
   });
 
   it("stays quiet about an explicit fleet that has no run record (bd-169 W5)", async () => {
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
-        schemaVersion: 1,
-        fleetId: "default",
-        taskIds: ["bd-12"],
-        createdAt: 1,
-        updatedAt: 1,
-      }),
-    );
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+    });
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "some-session");
 
@@ -7271,39 +7334,33 @@ describe("supervisor restart re-adoption (bd-169)", () => {
   it("refuses to adopt when the record gains a token between scan and write (bd-169 W4)", async () => {
     // A legacy record with no `armToken` is adoptable; the strict comparison must still
     // reject the write when another arming adds one in the window before the CAS.
-    writeFileSync(
-      fleetFile(),
-      JSON.stringify({
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "default",
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      supervisor: { sessionId: "restarted-session", pid: process.pid },
+      run: {
         schemaVersion: 1,
-        fleetId: "default",
-        taskIds: ["bd-12"],
-        createdAt: 1,
+        mode: "until-complete",
+        startedAt: 1,
         updatedAt: 1,
-        supervisor: { sessionId: "restarted-session", pid: process.pid },
-        run: {
-          schemaVersion: 1,
-          mode: "until-complete",
-          startedAt: 1,
-          updatedAt: 1,
-          ticks: 3,
-          accept: false,
-          members: [{ taskId: "bd-12", launchedAt: 1 }],
-        },
-      }),
-    );
+        ticks: 3,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1 }],
+      },
+    });
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "restarted-session");
     intentCas.beforeUpdate = () => {
-      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+      const current = readFleetRecord(commonDir) as unknown as Record<string, unknown> as {
         supervisor: Record<string, unknown>;
       };
-      writeFileSync(
-        fleetFile(),
-        JSON.stringify({
-          ...current,
-          supervisor: { ...current.supervisor, armToken: "another-arm" },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        ...current,
+        supervisor: { ...current.supervisor, armToken: "another-arm" },
+      });
     };
 
     await fireSessionStart(mock, ctx);
@@ -7334,13 +7391,13 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "restarted-session");
     intentCas.beforeUpdate = () => {
-      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+      const current = readFleetRecord(commonDir) as unknown as Record<string, unknown> as {
         supervisor: Record<string, unknown>;
       };
-      writeFileSync(
-        fleetFile(),
-        JSON.stringify({ ...current, supervisor: { ...current.supervisor, pid: process.pid + 1 } }),
-      );
+      seedFleetRecord(commonDir, {
+        ...current,
+        supervisor: { ...current.supervisor, pid: process.pid + 1 },
+      });
     };
 
     await fireSessionStart(mock, ctx);
@@ -7364,16 +7421,13 @@ describe("supervisor restart re-adoption (bd-169)", () => {
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "restarted-session");
     intentCas.beforeUpdate = () => {
-      const current = JSON.parse(readFileSync(fleetFile(), "utf8")) as {
+      const current = readFleetRecord(commonDir) as unknown as Record<string, unknown> as {
         supervisor: Record<string, unknown>;
       };
-      writeFileSync(
-        fleetFile(),
-        JSON.stringify({
-          ...current,
-          supervisor: { ...current.supervisor, pidStartTime: "2222" },
-        }),
-      );
+      seedFleetRecord(commonDir, {
+        ...current,
+        supervisor: { ...current.supervisor, pidStartTime: "2222" },
+      });
     };
 
     await fireSessionStart(mock, ctx);
@@ -7819,6 +7873,15 @@ describe("fleet ordering gates", () => {
       { id: "bd-12", dependencies: [] },
       { id: "bd-13", dependencies: [] },
     ]);
+    // bd still owns the gate after the landing drops its record, so it is the only
+    // worklist left: report the open gate, exactly as a real gate would be listed.
+    const bdWithGate = childProcess.bdStdout;
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate" && args[1] === "list") {
+        return JSON.stringify([markerGate({ id: "bd-900", blocker: "bd-12", blocked: "bd-13" })]);
+      }
+      return bdWithGate?.(args);
+    };
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "gate-landing-failed");
     const command = mock.commands.get("fleet");
@@ -7863,6 +7926,18 @@ describe("fleet ordering gates", () => {
       },
     });
 
+    // Measure the landing itself: the revision immediately before the transaction and
+    // immediately after it commits. The tick's own end-of-tick write is a separate
+    // fact, so comparing whole-tick revisions would not answer this question.
+    let revisionBeforeLanding = 0;
+    let revisionAfterLanding = 0;
+    landingHook.before = () => {
+      revisionBeforeLanding = fleetRevision();
+    };
+    landingHook.after = () => {
+      revisionAfterLanding = fleetRevision();
+    };
+
     await vi.advanceTimersByTimeAsync(2_000);
 
     const loaded = intent();
@@ -7874,23 +7949,27 @@ describe("fleet ordering gates", () => {
     expect(
       loaded.intent?.run?.members?.find((member) => member.taskId === "bd-12")?.landedAt,
     ).toEqual(expect.any(Number));
-    // No stop for bd-12: the gate resolve is retried from the record, not escalated
-    // to a human-relevant failure (bd-12 has already merged and cannot be undone).
+    // Exactly ONE revision bump for the landing, and the audit row committed with it.
+    expect(revisionAfterLanding - revisionBeforeLanding).toBe(1);
+    expect(auditRows(commonDir).filter((entry) => entry.action === "fleet-landed")).toHaveLength(1);
+    // No stop for bd-12: the bd resolve is retried by the reaper, not escalated to a
+    // human-relevant failure (bd-12 has already merged and cannot be undone).
     expect((loaded.intent?.run?.stopped ?? []).filter((entry) => entry.taskId === "bd-12")).toEqual(
       [],
     );
-    expect(loaded.intent?.orderingGates).toEqual([
-      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-900" },
-    ]);
+    // The *records* committed with the landing, so bd is the only owner of the open
+    // gate now; the failure is surfaced as a retryable warning and audited.
+    expect(loaded.intent?.orderingGates).toBeUndefined();
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
       "could not resolve its ordering gate(s)",
     );
+    expect(auditRows(commonDir).map((entry) => entry.action)).toContain("ordering-gate-unresolved");
     const failedAttempts = bdCalls((args) => args[0] === "gate" && args[1] === "resolve");
     expect(failedAttempts.length).toBeGreaterThan(0);
 
-    // bd recovers: the next tick resolves the still-recorded gate and drops it —
-    // from the record only, because the merge already happened and a second merge
-    // of the same member must be impossible.
+    // bd recovers: the next tick's crash-window sweep resolves the gate bd still
+    // reports even though the record is gone (that is the documented post-commit
+    // window), and a second merge of the same member stays impossible.
     childProcess.bdFailure = undefined;
     await vi.advanceTimersByTimeAsync(20_000);
 
@@ -8230,7 +8309,7 @@ describe("fleet ordering gates", () => {
     ]);
   });
 
-  it("names the adopted gate ids when the intent write loses its race twice", async () => {
+  it("names the adopted gate ids when the intent write cannot commit", async () => {
     // S2: a CAS failure leaves the adopted gate open in bd with no record in
     // `fleet.json`. The operator must still learn which ids to resolve by hand;
     // without them the only recovery is `bd gate list` on every member.
@@ -8257,12 +8336,13 @@ describe("fleet ordering gates", () => {
     if (command === undefined) throw new Error("/fleet was not registered");
     await command.handler("bd-12 bd-13", ctx);
 
-    // Two attempts, both lost: `mutateFleetIntent` gives up and the adoption is lost.
-    intentCas.conflictsRemaining = 2;
+    // The transaction fails once and the adoption is lost: there is no retry loop
+    // around a transaction (bd-281), so the refusal is reported with the gate ids.
+    intentCas.conflictsRemaining = 1;
     await vi.advanceTimersByTimeAsync(1);
 
     const report = ctxNotifications.map((entry) => entry.message).join("\n");
-    expect(report).toContain("changed twice");
+    expect(report).toContain("stub conflict");
     expect(report).toContain("bd-961");
   });
 
@@ -8628,10 +8708,7 @@ describe("fleet ordering gates", () => {
     expect(bdCalls((args) => args[0] === "close" || args[0] === "label")).toEqual([]);
 
     // The dependent was launched strictly after the blocker landed.
-    const audit = readFileSync(join(commonDir, "belayd", "fleet", "default", "audit.log"), "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; taskIds?: readonly string[] });
+    const audit = auditRows(commonDir);
     const firstIndex = (action: string, taskId: string): number =>
       audit.findIndex(
         (entry) => entry.action === action && entry.taskIds?.includes(taskId) === true,
@@ -8723,14 +8800,7 @@ describe("fleet ordering gates", () => {
     // landing's own write left behind); `bd gate resolve` is idempotent.
     expect(gateResolves.length).toBeGreaterThan(0);
     expect(gateResolves.every((args) => args[2] === "bd-901")).toBe(true);
-    const landedAudit = readFileSync(
-      join(commonDir, "belayd", "fleet", "default", "audit.log"),
-      "utf8",
-    )
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; detail?: string })
-      .find((entry) => entry.action === "fleet-landed");
+    const landedAudit = auditRows(commonDir).find((entry) => entry.action === "fleet-landed");
     expect(landedAudit?.detail).toContain("landing happened outside the fleet");
 
     // AC1: the dependent starts although bd still reports the edge and both beads
@@ -8751,13 +8821,7 @@ describe("fleet ordering gates", () => {
     // Acceptance never came from the fleet: no bead was closed or relabelled.
     expect(bdCalls((args) => args[0] === "close" || args[0] === "label")).toEqual([]);
 
-    const audit = readFileSync(join(commonDir, "belayd", "fleet", "default", "audit.log"), "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map(
-        (line) =>
-          JSON.parse(line) as { action: string; taskIds?: readonly string[]; detail?: string },
-      );
+    const audit = auditRows(commonDir);
     const firstIndex = (action: string, taskId: string): number =>
       audit.findIndex(
         (entry) => entry.action === action && entry.taskIds?.includes(taskId) === true,
@@ -8918,20 +8982,20 @@ describe("worktree orchestrator lease", () => {
   });
 
   function seedLiveLease(branch: string, sessionId: string): void {
-    const dir = join(worktree.path, branch.replace(/\//g, "-"), ".belayd");
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, "orchestrator.json"),
-      JSON.stringify({
-        schemaVersion: 1,
-        taskId: "bd-12",
-        branch,
-        sessionId,
-        pid: 4242,
-        claimedAt: Date.now(),
-        heartbeatAt: Date.now(),
-      }),
-    );
+    const memberDir = join(worktree.path, branch.replace(/\//g, "-"));
+    const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+    if (!opened.ok) throw new Error(opened.error);
+    const written = opened.store.acquireLease({
+      taskId: "bd-12",
+      branch,
+      sessionId,
+      worktreePath: memberDir,
+      pid: 4242,
+      nowMs: Date.now(),
+      takeOverStale: true,
+    });
+    opened.store.close();
+    if (!written.ok) throw new Error(written.error);
   }
 
   it("refuses a member whose worktree already has a live orchestrator", async () => {
@@ -9058,14 +9122,9 @@ describe("fleet escalation reap paths (bd-279)", () => {
   }
 
   function auditEntries(action: string): Array<{ taskIds: readonly string[]; detail: string }> {
-    const path = join(commonDir, "belayd", "fleet", "default", "audit.log");
-    if (!existsSync(path)) return [];
-    return readFileSync(path, "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; taskIds?: string[]; detail?: string })
+    return auditRows(commonDir)
       .filter((entry) => entry.action === action)
-      .map((entry) => ({ taskIds: entry.taskIds ?? [], detail: entry.detail ?? "" }));
+      .map((entry) => ({ taskIds: entry.taskIds, detail: entry.detail }));
   }
 
   function bdCalls(predicate: (args: readonly string[]) => boolean): string[][] {
@@ -9084,9 +9143,9 @@ describe("fleet escalation reap paths (bd-279)", () => {
   }
 
   function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
-    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
-    const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    writeFileSync(path, JSON.stringify(mutate(current)));
+    // bd-281: rewrite the store row; there is no fleet.json to edit any more.
+    const current = readFleetRecord(commonDir) as unknown as Record<string, unknown>;
+    seedFleetRecord(commonDir, { ...mutate(current), fleetId: "default" });
   }
 
   function escalationMarker(taskId: string, cause: string, round: number): string {
@@ -9157,16 +9216,13 @@ describe("fleet escalation reap paths (bd-279)", () => {
     // Another fleet holds the repository's only slot, and default's landed member
     // leaves a deferred wave that cannot start.
     mkdirSync(join(commonDir, "belayd", "fleet", "other"), { recursive: true });
-    writeFileSync(
-      join(commonDir, "belayd", "fleet", "other", "fleet.json"),
-      JSON.stringify({
-        schemaVersion: 1,
-        fleetId: "other",
-        taskIds: ["bd-15"],
-        createdAt: 1,
-        updatedAt: 1,
-      }),
-    );
+    seedFleetRecord(commonDir, {
+      schemaVersion: 1,
+      fleetId: "other",
+      taskIds: ["bd-15"],
+      createdAt: 1,
+      updatedAt: 1,
+    });
     liveness.memberTaskIds = ["bd-15"];
     stubBd();
     editIntent((current) => ({
@@ -9257,11 +9313,12 @@ describe("fleet escalation reap paths (bd-279)", () => {
     expect(after).toHaveProperty("ok", true);
     if (!after.ok) return;
     expect(after.intent?.run?.stopped ?? []).toEqual([]);
-    expect(after.intent?.orderingGates).toEqual([
-      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-900" },
-    ]);
-    // The retried failure opened no gate of any kind, and the ordering gate it could
-    // not resolve is still the only one recorded.
+    // The gate *record* committed with the landing (bd-281): bd still holds the open
+    // gate, and that is the worklist the reaper retries — no fleet record survives to
+    // be confused for a second authority.
+    expect(after.intent?.orderingGates).toBeUndefined();
+    // The retried failure opened no gate of any kind, and no record was re-created for
+    // the gate it could not resolve.
     expect(gateCreates()).toEqual([]);
     expect(escalationCreates()).toEqual([]);
   });
@@ -9405,5 +9462,97 @@ describe("fleet escalation reap paths (bd-279)", () => {
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
       "resolved 1 escalation gate(s)",
     );
+  });
+});
+
+/**
+ * The bd-281 acceptance criterion, in executable form: a live fleet runs with no
+ * workflow or fleet **execution** state written to a file.
+ *
+ * This is the criterion stated as an assertion rather than inferred from the
+ * absence of writers: a real fleet tick runs against a real temp repository, and
+ * afterwards nothing exists under `<git-common-dir>/belayd/fleet/<id>/` and
+ * `.belayd/` holds only the paths that are deliberately still files (artifacts, the
+ * proof-dir marker, repo-authored config, the rendered review
+ * findings, the handoff packet, telemetry and the github map). The proof receipt is
+ * not one of them: bd-281 stores it in `state.sqlite`.
+ */
+describe("a fleet tick writes no execution state file (bd-281 acceptance)", () => {
+  /** Every path under `root`, relative to it; [] when it does not exist. */
+  function pathsUnder(root: string): string[] {
+    if (!existsSync(root)) return [];
+    return readdirSync(root, { recursive: true }).map(String).sort();
+  }
+
+  /** Paths that are deliberately still files inside a worktree's `.belayd/`. */
+  const ALLOWED_BELAYD_ENTRIES = new Set([
+    "artifacts",
+    "proof-dir",
+    "config.json",
+    "review-findings.md",
+    "handoff.json",
+    "telemetry.json",
+    "github-map.json",
+  ]);
+
+  let cwd: string;
+  let commonDir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    cwd = mkdtempSync(join(tmpdir(), "belayd-fleet-nofiles-"));
+    commonDir = join(cwd, ".git");
+    mkdirSync(join(commonDir, "belayd", "fleet", "default"), { recursive: true });
+    git.commonDir = commonDir;
+    git.failWith = undefined;
+    worktree.byBranch = undefined;
+    worktree.path = join(cwd, "member-worktree");
+    worktree.failWith = undefined;
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.existingBranches = undefined;
+    mkdirSync(worktree.path, { recursive: true });
+    daemon.calls = [];
+    daemon.failWith = undefined;
+    childProcess.bdStdout = undefined;
+    childProcess.bdFailure = undefined;
+    ctxNotifications = [];
+    afterLaunchHook = undefined;
+  });
+
+  afterEach(() => {
+    liveness.memberTaskIds = [];
+    vi.useRealTimers();
+    childProcess.bdStdout = undefined;
+    afterLaunchHook = undefined;
+    rmSync(cwd, { recursive: true, force: true });
+    git.commonDir = "";
+  });
+
+  it("leaves the fleet directory empty and .belayd with only the allowed paths", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // Let the loop tick past the start grace so the tick itself runs and records.
+    await vi.advanceTimersByTimeAsync(121_000);
+
+    // Positive control: the tick really acted, and its record lives in the store.
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.run).toBeDefined();
+    expect(intent.intent?.run?.stopped).toEqual([expect.objectContaining({ taskId: "bd-12" })]);
+
+    // The criterion: no file under the fleet's legacy directory.
+    expect(pathsUnder(join(commonDir, "belayd", "fleet", "default"))).toEqual([]);
+    expect(legacyFleetStateFiles(commonDir)).toEqual([]);
+
+    // And nothing under `.belayd/` except the paths that are deliberately files.
+    const belaydDir = join(cwd, ".belayd");
+    const present = existsSync(belaydDir) ? readdirSync(belaydDir).map(String) : [];
+    expect(present.filter((name) => !ALLOWED_BELAYD_ENTRIES.has(name))).toEqual([]);
+    expect(legacyStateFiles(cwd)).toEqual([]);
   });
 });

@@ -1,174 +1,146 @@
 /**
- * Belayd workflow state persistence.
+ * Belayd workflow state persistence (bd-281: in the shared repository store).
  *
- * The orchestrator keeps its gate state in a `.belayd/workflow.json` state
- * file that is updated after every completed phase. On session start the
- * orchestrator reads it back and resumes from the persisted phase list.
+ * The orchestrator keeps its gate state, completed phases, phase-session ledger
+ * and review bookkeeping in the per-repository SQLite store
+ * (`src/repo-state-store.ts`, `<git-common-dir>/belayd/state.sqlite`), keyed by
+ * **task id**.
+ *
+ * This used to be `.belayd/workflow.json` inside the worktree, which is the
+ * failure bd-165 recorded: a handoff or a resumed session carried a copy of the
+ * file, so a new session read a dead workflow and claimed its dead orchestrator
+ * lease. A row keyed by task id cannot be copied — two worktrees driving the same
+ * task resolve the same row, and a stale record is visible from `updated_at` and
+ * the row generation instead of being inferred from a file.
+ *
+ * The worktree path is still recorded (and a worktree -> task binding lets a
+ * cwd-only caller find its row), but it is a *locator*, never identity.
+ *
+ * Kept as files, on purpose:
+ *
+ * - `.belayd/artifacts/` — phase deliverables injected into prompts (`src/artifacts.ts`).
+ * - `.belayd/proof-dir` — the marker pi-web-plugins reads through the browser file
+ *   API (see the SYNC WARNING in `src/proof-dir.ts`).
+ *
+ * The proof receipt is no longer one of them: bd-281 moved it into the same store,
+ * which knowingly breaks the plugin's `.belayd/proof-receipt.json` reader until
+ * bd-303 mirrors the row (see the SYNC WARNING in `src/proof-receipt.ts`).
+ *
+ * `atomicWriteJson`/`WorkflowFs` stay exported because unrelated runtime files
+ * (`.belayd/handoff.json`, fleet notes as still staged) still use the atomic
+ * write helper; nothing in this module touches the filesystem any more.
  */
 
-import { randomBytes } from "node:crypto";
-import * as nodeFs from "node:fs";
-import { dirname, join } from "node:path";
-import { z } from "zod";
+import { join } from "node:path";
+import { migrateAndGuardLegacyState } from "./repo-state-import.js";
+import {
+  type RepoStateStore,
+  type RepoWorkflowState,
+  sharedRepoStateStore,
+} from "./repo-state-store.js";
 import type { ReviewedUntrackedEntry } from "./review-context.js";
-import { isValidTaskId, type PhaseSessionRecord } from "./session-naming.js";
-import { isWorkflowComplete } from "./workflow-phases.js";
+import type { PhaseSessionRecord } from "./session-naming.js";
+import {
+  type HandedOffMarker,
+  parseHandedOffMarker,
+  parseReviewScope,
+  parseWorkflowState,
+  type ReviewScope,
+  WORKFLOW_STATE_SCHEMA_VERSION,
+  type WorkflowState,
+} from "./workflow-state-record.js";
 
-const SCHEMA_VERSION = 1;
+// The crash-safe JSON write and its fs seam stay available from here: unrelated
+// runtime files (handoff packets, telemetry) still use them, and moving the
+// import path would be a wider change than this bead. They are state-free.
+export { atomicWriteJson, type WorkflowFs } from "./atomic-json-file.js";
 
-const PhaseSessionRecordSchema = z.object({
-  base: z.string(),
-  invocations: z.number().int().positive(),
-});
-
-// Typed against the review-context entry so the persisted manifest can never
-// drift from the shape the re-review filter reads (bd-228).
-const ReviewedUntrackedEntrySchema: z.ZodType<ReviewedUntrackedEntry> = z.object({
-  path: z.string(),
-  blob: z.string(),
-});
-
-/**
- * Marker written into the *caller's* workflow state when it hands a workflow
- * off to an orchestrator session in another worktree. Its presence means the
- * caller no longer drives a workflow, so a restart must not re-arm its gate.
- */
-const HandedOffMarkerSchema = z.object({
-  taskId: z.string(),
-  branch: z.string(),
-  sessionId: z.string(),
-});
-
-const WorkflowStateSchema = z.object({
-  schemaVersion: z.literal(SCHEMA_VERSION),
-  taskId: z.string(),
-  workflowType: z.string(),
-  // Provenance for the resolved type (bd-106). Optional so a workflow.json
-  // written before this change still parses.
-  resolutionSource: z.enum(["arg", "label", "default"]).optional(),
-  matchedLabel: z.string().optional(),
-  branch: z.string(),
-  originalCwd: z.string(),
-  phaseOrder: z.array(z.string()),
-  completedPhaseNames: z.array(z.string()),
-  // Optional so a workflow.json written before bd-81 still parses (undefined
-  // ledger means every phase starts fresh on first invocation).
-  phaseSessions: z.record(z.string(), PhaseSessionRecordSchema).optional(),
-  // Optional so pre-bd-81 state parses; absent means the flag is derived from
-  // the completed phase list on resume. Persisted so a late re-review after a
-  // later phase completed still re-arms the resumable-fix directive.
-  awaitingReviewResponse: z.boolean().optional(),
-  // Revision covered by the most recent completed review (bd-113). A re-review
-  // diffs from here, so it sees only the fix round. Optional so a workflow.json
-  // written before bd-113 still parses.
-  reviewedSha: z.string().optional(),
-  // Untracked paths that review covered, with the blob hash at that moment
-  // (bd-228). Recorded in the same write as `reviewedSha`; used only to drop an
-  // already-reviewed new file from the next re-review. Optional so state
-  // written before bd-228 still parses.
-  reviewedUntracked: z.array(ReviewedUntrackedEntrySchema).optional(),
-  // Set when this session handed its workflow off to a child orchestrator
-  // (see launchWorktreeWorkflow). Optional so every workflow.json written
-  // before bd-120 still parses.
-  handedOffTo: HandedOffMarkerSchema.optional(),
-  startedAt: z.number().finite(),
-  updatedAt: z.number().finite(),
-});
-
-export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
+// The record shapes, parsers and the claimability decision are re-exported so
+// this module keeps its public surface while the importer can validate a legacy
+// file without importing the store wiring.
+export {
+  classifyWorkflowClaimability,
+  type HandedOffMarker,
+  parseHandedOffMarker,
+  parseReviewScope,
+  parseWorkflowState,
+  type ReviewScope,
+  WORKFLOW_STATE_SCHEMA_VERSION,
+  type WorkflowClaimability,
+  type WorkflowState,
+} from "./workflow-state-record.js";
 
 /**
- * The working-tree state a review task was built from (bd-228). Captured
- * before the review reads the diff and consumed when that same review
- * succeeds, so "what the reviewer saw" is what the next re-review diffs from.
+ * Test seam shared by every workflow helper: pass an opened store instead of the
+ * module's shared one. Production callers omit it.
  */
-const ReviewScopeSchema = z.object({
-  taskId: z.string(),
-  sha: z.string(),
-  untracked: z.array(ReviewedUntrackedEntrySchema),
-  capturedAt: z.number().finite(),
-});
-
-export type ReviewScope = z.infer<typeof ReviewScopeSchema>;
-
-export type HandedOffMarker = z.infer<typeof HandedOffMarkerSchema>;
-
-/**
- * Subset of node:fs sync operations workflow state persistence needs. Tests
- * inject an in-memory implementation; production uses the node:fs wrappers.
- */
-export interface WorkflowFs {
-  existsSync(path: string): boolean;
-  readFileSync(path: string): string;
-  writeFileSync(path: string, data: string, options?: { flag?: string }): void;
-  renameSync(oldPath: string, newPath: string): void;
-  mkdirSync(path: string, options?: { recursive?: boolean }): void;
-  unlinkSync(path: string): void;
+export interface WorkflowStoreSeam {
+  store?: RepoStateStore;
+  /**
+   * Identity of the workflow row. Identity is the *task*, never the worktree
+   * path: pass this when the caller knows the task (a resumed session in another
+   * worktree) so it resolves the same row instead of a copy. Omitted, the row is
+   * located through the worktree -> task binding, falling back to the worktree
+   * the record was started in.
+   */
+  taskId?: string;
 }
 
-export interface ReadWorkflowStateOptions {
+export interface ReadWorkflowStateOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
   /** Epoch-ms clock (test seam). Defaults to Date.now. */
   now?: () => number;
 }
 
-export interface WriteWorkflowStateOptions {
+export interface WriteWorkflowStateOptions extends WorkflowStoreSeam {
   cwd: string;
   state: WorkflowState;
-  fs?: WorkflowFs;
 }
 
-export interface SaveCompletedPhasesOptions {
+export interface SaveCompletedPhasesOptions extends WorkflowStoreSeam {
   cwd: string;
   completedPhaseNames: string[];
   /**
    * When provided, persisted alongside the phase list. When omitted, the value
-   * already on disk is preserved (see the `?? existing.awaitingReviewResponse`
+   * already stored is preserved (see the `?? existing.awaitingReviewResponse`
    * fallback in saveCompletedPhases), so a caller that only updates the phase
    * list never clears the flag.
    */
   awaitingReviewResponse?: boolean;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
-export interface SavePhaseSessionOptions {
+export interface SavePhaseSessionOptions extends WorkflowStoreSeam {
   cwd: string;
   phaseName: string;
   record: PhaseSessionRecord;
-  fs?: WorkflowFs;
   now?: () => number;
   /**
    * Pre-read workflow state. The caller already read it to validate the task
-   * id, so passing it here avoids a second synchronous disk read.
+   * id, so passing it here avoids a second store read.
    */
   existingState?: WorkflowState;
 }
 
-export interface ClearWorkflowStateOptions {
+export interface ClearWorkflowStateOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
 }
 
-export interface SaveHandedOffMarkerOptions {
+export interface SaveHandedOffMarkerOptions extends WorkflowStoreSeam {
   cwd: string;
   marker: HandedOffMarker;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
-export interface ClearHandedOffMarkerOptions {
+export interface ClearHandedOffMarkerOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
-export interface CallerHandoffOptions {
+export interface CallerHandoffOptions extends WorkflowStoreSeam {
   cwd: string;
-  /** The caller's own pi session id (the owner of the marker file). */
+  /** The caller's own pi session id (the owner of the marker row). */
   sessionKey: string;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
@@ -176,7 +148,7 @@ export interface WriteCallerHandoffOptions extends CallerHandoffOptions {
   marker: HandedOffMarker;
 }
 
-export interface SaveReviewedShaOptions {
+export interface SaveReviewedShaOptions extends WorkflowStoreSeam {
   cwd: string;
   sha: string;
   /**
@@ -187,13 +159,12 @@ export interface SaveReviewedShaOptions {
    */
   untracked?: readonly ReviewedUntrackedEntry[];
   /**
-   * Task id the caller expects the on-disk workflow.json to belong to. The
-   * check runs against the read immediately preceding the write, so a state
-   * swap during an earlier await cannot redirect this task's sha into another
-   * task's state. Omit to skip the identity check.
+   * Task id the caller expects the stored workflow to belong to. The check runs
+   * inside the same transaction as the write, so a state swap during an earlier
+   * await cannot redirect this task's sha into another task's record.
+   * Omit to skip the identity check.
    */
   expectedTaskId?: string;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
@@ -207,174 +178,235 @@ export type SaveReviewedShaResult =
   | { ok: false; reason: "task-mismatch"; actualTaskId: string; error: string }
   | { ok: false; reason: "write-failed"; error: string };
 
-export interface SaveReviewScopeOptions {
+export interface SaveReviewScopeOptions extends WorkflowStoreSeam {
   cwd: string;
   taskId: string;
   sha: string;
   untracked: readonly ReviewedUntrackedEntry[];
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
-export interface ReadReviewScopeOptions {
+export interface ReadReviewScopeOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
+  taskId: string;
 }
 
-export interface ClearReviewScopeOptions {
+export interface ClearReviewScopeOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
-}
-
-const nodeFsSeam: WorkflowFs = {
-  existsSync: (path) => nodeFs.existsSync(path),
-  readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
-  mkdirSync: (path, options) => nodeFs.mkdirSync(path, options),
-  unlinkSync: (path) => nodeFs.unlinkSync(path),
-};
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  taskId: string;
 }
 
 function nowMs(now?: () => number): number {
   return (now ?? Date.now)();
 }
 
+/**
+ * The directory the harness reserves for its own files. Still meaningful: it
+ * holds artifacts, the proof-dir marker, the proof receipt and the rendered
+ * review findings, and it is what the git ignore and the publish gate match on.
+ */
 export function workflowStateDir(cwd: string): string {
   return join(cwd, ".belayd");
 }
 
+/**
+ * The retired workflow state file path.
+ *
+ * Kept because the migration refusal, the publish gate and diagnostics name it;
+ * nothing reads or writes it any more (bd-281).
+ */
 export function workflowStateFilePath(cwd: string): string {
   return join(cwd, ".belayd", "workflow.json");
 }
 
 /**
- * Caller-scoped handoff marker path.
+ * Retired caller-scoped handoff marker path.
  *
- * `.belayd/workflow.json` cannot carry the marker when the child orchestrator
- * runs in the caller's own directory: the child writes that file for its own
- * workflow and would clobber the marker. A file keyed by the *caller's* session
- * id is not owned by the child, so a resumed caller still learns that it no
- * longer drives a workflow (bd-120). The id is sanitized because external
- * session ids are not guaranteed to be filesystem-safe.
+ * The marker now lives in the `workflow_handoff` table keyed by (worktree,
+ * session key). Kept for the same reasons as {@link workflowStateFilePath}.
  */
 export function callerHandoffFilePath(cwd: string, sessionKey: string): string {
   const safeKey = sessionKey.replace(/[^A-Za-z0-9._-]/g, "_");
   return join(cwd, ".belayd", `handoff-${safeKey}.json`);
 }
 
-/**
- * Pending review scope path (bd-228). Lives beside `workflow.json` so the
- * harness's git-ignore of `.belayd/` keeps it out of every change set; it is a
- * single worktree-scoped record because the newest review build owns it.
- */
+/** Retired pending review scope path (bd-228); the scope is a store row now. */
 export function reviewScopeFilePath(cwd: string): string {
   return join(cwd, ".belayd", "review-scope.json");
 }
 
 /**
- * Parse and strictly narrow a workflow state file. Corrupt JSON and a wrong
- * schema version both yield undefined — callers treat that as "no state".
+ * The store for one worktree, or null when it cannot be opened.
+ *
+ * A store failure is not a workflow failure: every caller keeps working and
+ * reports "no state", exactly as the file version did for a missing file.
+ *
+ * The first access in a worktree also runs the one-shot legacy import (bd-281).
+ * Doing it here rather than in an operator command is what makes a live worktree
+ * keep its workflow across the upgrade, and it is what makes a legacy file that
+ * appears *afterwards* a loud refusal instead of silently authoritative state.
+ * The once-per-worktree guard lives in the migration module, next to the fleet
+ * half's guard, so there is one set rather than one per caller.
  */
-export function parseWorkflowState(raw: unknown): WorkflowState | undefined {
-  const result = WorkflowStateSchema.safeParse(raw);
-  return result.success ? result.data : undefined;
+function storeFor(options: WorkflowStoreSeam & { cwd: string }): RepoStateStore | null {
+  if (options.store !== undefined) return options.store;
+  const store = sharedRepoStateStore({ cwd: options.cwd }).store;
+  if (store === null) return null;
+  migrateAndGuardLegacyState({
+    cwd: options.cwd,
+    store,
+    onImported: (summary) => {
+      console.warn(
+        `belayd: bd-281 imported ${summary.imported} legacy workflow state file(s) from ${options.cwd} into the shared repository store`,
+      );
+    },
+    onRefusal: (message) => console.warn(message),
+  });
+  return store;
 }
 
-function readWorkflowStateFile(fs: WorkflowFs, cwd: string): WorkflowState | undefined {
-  const filePath = workflowStateFilePath(cwd);
-  if (!fs.existsSync(filePath)) return undefined;
-  let text: string;
-  try {
-    text = fs.readFileSync(filePath);
-  } catch {
-    return undefined;
-  }
-  try {
-    return parseWorkflowState(JSON.parse(text));
-  } catch {
-    return undefined;
-  }
+/** The row locator: the task id when the caller knows it, else the worktree. */
+function locatorFor(options: WorkflowStoreSeam & { cwd: string }): {
+  taskId?: string;
+  worktreePath?: string;
+} {
+  return options.taskId === undefined ? { worktreePath: options.cwd } : { taskId: options.taskId };
+}
+
+/** Map the store's typed row back to the persisted workflow record shape. */
+function toWorkflowState(state: RepoWorkflowState): WorkflowState | undefined {
+  return parseWorkflowState({ schemaVersion: WORKFLOW_STATE_SCHEMA_VERSION, ...state });
+}
+
+/** Map a validated workflow record to the store's column view. */
+function toRepoWorkflowState(state: WorkflowState): RepoWorkflowState {
+  const { schemaVersion: _schemaVersion, ...rest } = state;
+  return rest;
+}
+
+function missingStateError(cwd: string): string {
+  return `No Belayd workflow state found in ${cwd}`;
 }
 
 /**
- * Read the current workflow state. Returns undefined when no state exists or
- * when it is unreadable.
+ * Read the current workflow state. Returns undefined when no state exists, the
+ * store is unavailable, or the row does not parse.
  */
 export function readWorkflowState(options: ReadWorkflowStateOptions): WorkflowState | undefined {
-  const fs = options.fs ?? nodeFsSeam;
-  return readWorkflowStateFile(fs, options.cwd);
+  const snapshot = readWorkflowStateSnapshot(options);
+  return snapshot.kind === "ok" ? snapshot.state : undefined;
 }
 
-/**
- * Whether a persisted workflow may produce a worktree-lease claim (bd-165).
- *
- * A completed or handed-off `workflow.json` is a record of a workflow that is
- * over. Claiming the one-orchestrator-per-worktree lease from it names the dead
- * task and then holds the lease for the life of the new session, so every later
- * session in that worktree is refused.
- */
-export type WorkflowClaimability =
-  | { kind: "claimable" }
-  | { kind: "inert"; reason: "handed-off" | "complete" | "invalid-task-id" };
+/** A workflow read that keeps "there is no record" apart from "the record is unreadable". */
+export type WorkflowStateSnapshot =
+  | { kind: "missing" }
+  | { kind: "ok"; state: WorkflowState }
+  | { kind: "unreadable"; error: string };
 
 /**
- * Classify a persisted workflow as claimable or inert. Pure: no I/O, so the
- * session-start ordering decision is unit-testable without a worktree.
+ * Tri-state read for consumers that surface corruption (fleet status warns on a
+ * member whose record does not parse) instead of folding it into "no state".
  */
-export function classifyWorkflowClaimability(state: WorkflowState): WorkflowClaimability {
-  // The handoff marker wins over the phase ledger: a terminal handed-off state
-  // still has to reach settleHandoffPendingItems, so it is reported as handed
-  // off even when every phase is complete.
-  if (state.handedOffTo !== undefined) return { kind: "inert", reason: "handed-off" };
-  if (isWorkflowComplete(state.completedPhaseNames, state.phaseOrder)) {
-    return { kind: "inert", reason: "complete" };
-  }
-  // A crafted/corrupt task id must never reach the `bd show ${taskId}` sink or
-  // a lease naming it.
-  if (!isValidTaskId(state.taskId)) return { kind: "inert", reason: "invalid-task-id" };
-  return { kind: "claimable" };
+export function readWorkflowStateSnapshot(
+  options: ReadWorkflowStateOptions,
+): WorkflowStateSnapshot {
+  const store = storeFor(options);
+  if (store === null) return { kind: "missing" };
+  const row = store.readWorkflow(locatorFor(options));
+  if (!row.ok) return { kind: "unreadable", error: row.error };
+  if (row.value === null) return { kind: "missing" };
+  const state = toWorkflowState(row.value.state);
+  return state === undefined
+    ? { kind: "unreadable", error: `workflow row for ${row.value.taskId} does not parse` }
+    : { kind: "ok", state };
 }
 
-/**
- * Atomically write any JSON value: temp file in the target directory, then
- * rename over the target. Shared by workflow state and run manifests so both
- * get identical crash-safety semantics.
- */
-export function atomicWriteJson(
-  path: string,
-  data: unknown,
-  fs: WorkflowFs,
-): { ok: true } | { ok: false; error: string } {
-  try {
-    fs.mkdirSync(dirname(path), { recursive: true });
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) };
-  }
-  const tmpPath = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
-    fs.renameSync(tmpPath, path);
-    return { ok: true };
-  } catch (error) {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch {
-      // Temp cleanup is best-effort; the original error is what matters.
-    }
-    return { ok: false, error: errorMessage(error) };
-  }
-}
-
-/** Persist workflow state atomically; returns an error value instead of throwing. */
+/** Persist the workflow record (upsert by task id); returns an error value instead of throwing. */
 export function writeWorkflowState(
   options: WriteWorkflowStateOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  return atomicWriteJson(workflowStateFilePath(options.cwd), options.state, fs);
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
+  }
+  // The schema stays the validation boundary on the way in: an invalid record
+  // must never become a row.
+  const parsed = parseWorkflowState(options.state);
+  if (parsed === undefined) {
+    return { ok: false, error: `refusing to persist an invalid workflow state for ${options.cwd}` };
+  }
+  const written = store.writeWorkflow({
+    state: toRepoWorkflowState(parsed),
+    worktreePath: options.cwd,
+    nowMs: parsed.updatedAt,
+  });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
+}
+
+/**
+ * Read-modify-write in one store transaction: `update` sees the row read inside
+ * the same transaction, so two sessions cannot interleave a read and a write
+ * (the file version had no compare-and-set at all).
+ */
+function mutateWorkflow(
+  options: WorkflowStoreSeam & { cwd: string; now?: () => number },
+  update: (
+    current: WorkflowState | null,
+  ) => { kind: "write"; state: WorkflowState } | { kind: "delete" },
+):
+  | { ok: true; value: WorkflowState | null }
+  | { ok: false; reason: "missing-state" | "failed"; error: string } {
+  const store = storeFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "failed",
+      error: `repo state store unavailable for ${options.cwd}`,
+    };
+  }
+  const atMs = nowMs(options.now);
+  const result = store.mutateWorkflow({
+    locator: locatorFor(options),
+    worktreePath: options.cwd,
+    nowMs: atMs,
+    update: (current) => {
+      const parsed = current === null ? null : (toWorkflowState(current.state) ?? null);
+      if (current !== null && parsed === null) {
+        return { kind: "conflict", error: `stored workflow for ${current.taskId} does not parse` };
+      }
+      const plan = update(parsed);
+      if (plan.kind === "delete") return { kind: "delete" };
+      const next = parseWorkflowState(plan.state);
+      if (next === undefined) {
+        return { kind: "conflict", error: `refusing to persist an invalid workflow state` };
+      }
+      return { kind: "write", state: toRepoWorkflowState({ ...next, updatedAt: atMs }) };
+    },
+  });
+  if (!result.ok) return { ok: false, reason: "failed", error: result.error };
+  switch (result.value.kind) {
+    case "missing":
+      return { ok: false, reason: "missing-state", error: missingStateError(options.cwd) };
+    case "conflict":
+      return { ok: false, reason: "failed", error: result.value.error };
+    case "deleted":
+      return { ok: true, value: null };
+    case "unchanged": {
+      const read = store.readWorkflow({ taskId: result.value.taskId });
+      return {
+        ok: true,
+        value: read.ok && read.value !== null ? (toWorkflowState(read.value.state) ?? null) : null,
+      };
+    }
+    case "written":
+      return { ok: true, value: toWorkflowState(result.value.state) ?? null };
+    case "task-mismatch":
+      return {
+        ok: false,
+        reason: "failed",
+        error: `workflow state belongs to task ${result.value.actualTaskId}`,
+      };
+  }
 }
 
 /**
@@ -385,18 +417,18 @@ export function writeWorkflowState(
 export function saveCompletedPhases(
   options: SaveCompletedPhasesOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
-  if (existing === undefined) {
-    return { ok: false, error: `No Belayd workflow state found in ${options.cwd}` };
-  }
-  const updated: WorkflowState = {
-    ...existing,
-    completedPhaseNames: [...options.completedPhaseNames],
-    awaitingReviewResponse: options.awaitingReviewResponse ?? existing.awaitingReviewResponse,
-    updatedAt: nowMs(options.now),
-  };
-  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+  const result = mutateWorkflow(options, (current) => {
+    if (current === null) return { kind: "delete" };
+    return {
+      kind: "write",
+      state: {
+        ...current,
+        completedPhaseNames: [...options.completedPhaseNames],
+        awaitingReviewResponse: options.awaitingReviewResponse ?? current.awaitingReviewResponse,
+      },
+    };
+  });
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
 }
 
 /**
@@ -407,24 +439,26 @@ export function saveCompletedPhases(
 export function savePhaseSession(
   options: SavePhaseSessionOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const existing =
-    options.existingState ?? readWorkflowState({ cwd: options.cwd, fs, now: options.now });
-  if (existing === undefined) {
-    return { ok: false, error: `No Belayd workflow state found in ${options.cwd}` };
-  }
-  const updated: WorkflowState = {
-    ...existing,
-    phaseSessions: {
-      ...(existing.phaseSessions ?? {}),
-      [options.phaseName]: {
-        base: options.record.base,
-        invocations: options.record.invocations,
+  const result = mutateWorkflow(options, (current) => {
+    // The caller may have read the state before an await; its own snapshot wins
+    // only when the store has no row, which is the "first invocation" case.
+    const base = current ?? options.existingState;
+    if (base === null || base === undefined) return { kind: "delete" };
+    return {
+      kind: "write",
+      state: {
+        ...base,
+        phaseSessions: {
+          ...(base.phaseSessions ?? {}),
+          [options.phaseName]: {
+            base: options.record.base,
+            invocations: options.record.invocations,
+          },
+        },
       },
-    },
-    updatedAt: nowMs(options.now),
-  };
-  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+    };
+  });
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
 }
 
 /**
@@ -435,111 +469,115 @@ export function savePhaseSession(
  * orchestrator restart.
  */
 export function saveReviewedSha(options: SaveReviewedShaOptions): SaveReviewedShaResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
-  if (existing === undefined) {
+  const store = storeFor(options);
+  if (store === null) {
     return {
       ok: false,
-      reason: "missing-state",
-      error: `No Belayd workflow state found in ${options.cwd}`,
+      reason: "write-failed",
+      error: `repo state store unavailable for ${options.cwd}`,
     };
   }
-  if (options.expectedTaskId !== undefined && existing.taskId !== options.expectedTaskId) {
+  const atMs = nowMs(options.now);
+  const result = store.mutateWorkflow({
+    locator: locatorFor(options),
+    worktreePath: options.cwd,
+    nowMs: atMs,
+    ...(options.expectedTaskId === undefined ? {} : { expectedTaskId: options.expectedTaskId }),
+    update: (current) => {
+      if (current === null) return { kind: "skip" };
+      const existing = toWorkflowState(current.state);
+      if (existing === undefined) {
+        return {
+          kind: "conflict",
+          error: `stored workflow for ${current.taskId} does not parse`,
+        };
+      }
+      const updated: WorkflowState = {
+        ...existing,
+        reviewedSha: options.sha,
+        updatedAt: atMs,
+      };
+      // Delete rather than write `[]`: an absent manifest is the documented
+      // "nothing was filtered" state, and an empty array would be a second shape
+      // for the same thing.
+      if (options.untracked !== undefined && options.untracked.length > 0) {
+        updated.reviewedUntracked = options.untracked.map((entry) => ({
+          path: entry.path,
+          blob: entry.blob,
+        }));
+      } else {
+        delete updated.reviewedUntracked;
+      }
+      return { kind: "write", state: updated };
+    },
+  });
+  if (!result.ok) {
+    return { ok: false, reason: "write-failed", error: result.error };
+  }
+  if (result.value.kind === "missing") {
+    return { ok: false, reason: "missing-state", error: missingStateError(options.cwd) };
+  }
+  if (result.value.kind === "conflict") {
+    return { ok: false, reason: "write-failed", error: result.value.error };
+  }
+  if (result.value.kind === "task-mismatch") {
     return {
       ok: false,
       reason: "task-mismatch",
-      actualTaskId: existing.taskId,
-      error: `Workflow state belongs to task ${existing.taskId}, not ${options.expectedTaskId}`,
+      actualTaskId: result.value.actualTaskId,
+      error: `Workflow state belongs to task ${result.value.actualTaskId}, not ${options.expectedTaskId}`,
     };
-  }
-  const updated: WorkflowState = {
-    ...existing,
-    reviewedSha: options.sha,
-    updatedAt: nowMs(options.now),
-  };
-  // Delete rather than write `[]`: an absent manifest is the documented
-  // "nothing was filtered" state, and an empty array would be a second shape
-  // for the same thing.
-  if (options.untracked !== undefined && options.untracked.length > 0) {
-    updated.reviewedUntracked = options.untracked.map((entry) => ({
-      path: entry.path,
-      blob: entry.blob,
-    }));
-  } else {
-    delete updated.reviewedUntracked;
-  }
-  const writeResult = writeWorkflowState({ cwd: options.cwd, state: updated, fs });
-  if (!writeResult.ok) {
-    return { ok: false, reason: "write-failed", error: writeResult.error };
   }
   return { ok: true };
 }
 
 /**
  * Read-modify-write: record the handoff marker on the caller's own state,
- * preserving its identity fields and phase ledger. A missing state file is an
- * error: the caller was not driving a workflow, so there is nothing to mark
- * and the caller can rely on `clearWorkflowState` semantics instead.
+ * preserving its identity fields and phase ledger. A missing state row is an
+ * error: the caller was not driving a workflow, so there is nothing to mark and
+ * the caller can rely on `clearWorkflowState` semantics instead.
  */
 export function saveHandedOffMarker(
   options: SaveHandedOffMarkerOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
-  if (existing === undefined) {
-    return { ok: false, error: `No Belayd workflow state found in ${options.cwd}` };
-  }
-  const updated: WorkflowState = {
-    ...existing,
-    handedOffTo: { ...options.marker },
-    updatedAt: nowMs(options.now),
-  };
-  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
+  const result = mutateWorkflow(options, (current) => {
+    if (current === null) return { kind: "delete" };
+    return { kind: "write", state: { ...current, handedOffTo: { ...options.marker } } };
+  });
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
 }
 
 /**
- * Read-modify-write: drop the handoff marker, keeping the workflow identity so
- * a session that starts a new task over the same state is not blocked by a
- * stale marker. A missing state file is a no-op success.
+ * Read-modify-write: drop the handoff marker, keeping the workflow identity so a
+ * session that starts a new task over the same state is not blocked by a stale
+ * marker. A missing row is a no-op success.
  */
 export function clearHandedOffMarker(
   options: ClearHandedOffMarkerOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const existing = readWorkflowState({ cwd: options.cwd, fs, now: options.now });
-  if (existing === undefined) return { ok: true };
-  const updated: WorkflowState = { ...existing, updatedAt: nowMs(options.now) };
-  delete updated.handedOffTo;
-  return writeWorkflowState({ cwd: options.cwd, state: updated, fs });
-}
-
-/** Parse a caller-scoped handoff marker file's contents. */
-export function parseHandedOffMarker(raw: unknown): HandedOffMarker | undefined {
-  const result = HandedOffMarkerSchema.safeParse(raw);
-  return result.success ? result.data : undefined;
-}
-
-function readCallerHandoffFile(
-  fs: WorkflowFs,
-  cwd: string,
-  sessionKey: string,
-): HandedOffMarker | undefined {
-  const filePath = callerHandoffFilePath(cwd, sessionKey);
-  if (!fs.existsSync(filePath)) return undefined;
-  try {
-    return parseHandedOffMarker(JSON.parse(fs.readFileSync(filePath)));
-  } catch {
-    return undefined;
-  }
+  const result = mutateWorkflow(options, (current) => {
+    if (current === null) return { kind: "delete" };
+    const next = { ...current };
+    delete next.handedOffTo;
+    return { kind: "write", state: next };
+  });
+  // A missing row is the documented no-op success: there is no marker to clear.
+  if (!result.ok && result.reason === "missing-state") return { ok: true };
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
 }
 
 /**
  * Read the caller-scoped marker. Returns undefined when this session never
- * handed anything off (or the file is unreadable/corrupt).
+ * handed anything off (or the row does not parse).
  */
 export function readCallerHandoff(options: CallerHandoffOptions): HandedOffMarker | undefined {
-  const fs = options.fs ?? nodeFsSeam;
-  return readCallerHandoffFile(fs, options.cwd, options.sessionKey);
+  const store = storeFor(options);
+  if (store === null) return undefined;
+  // The session key is what a restarting caller knows; the row's identity is
+  // (task, session), never the worktree path.
+  const row = store.readHandoff({ handoffKey: options.sessionKey });
+  if (!row.ok) return undefined;
+  return parseHandedOffMarker(row.value);
 }
 
 /**
@@ -551,149 +589,129 @@ export function readCallerHandoff(options: CallerHandoffOptions): HandedOffMarke
 export function writeCallerHandoff(
   options: WriteCallerHandoffOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  return atomicWriteJson(
-    callerHandoffFilePath(options.cwd, options.sessionKey),
-    { ...options.marker },
-    fs,
-  );
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
+  }
+  const written = store.writeHandoff({
+    taskId: options.marker.taskId,
+    handoffKey: options.sessionKey,
+    worktreePath: options.cwd,
+    marker: { ...options.marker },
+    nowMs: nowMs(options.now),
+  });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
 }
 
-/** Remove this caller's marker, tolerating a missing file; reports real errors. */
+/** Remove this caller's marker; a missing row is the expected success case. */
 export function clearCallerHandoff(
   options: CallerHandoffOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = callerHandoffFilePath(options.cwd, options.sessionKey);
-  try {
-    fs.unlinkSync(filePath);
-    return { ok: true };
-  } catch (error) {
-    // A missing marker is the expected success case; only surface real errors.
-    if (!fs.existsSync(filePath)) return { ok: true };
-    return { ok: false, error: errorMessage(error) };
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
   }
+  const cleared = store.clearHandoff({
+    ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
+    handoffKey: options.sessionKey,
+  });
+  return cleared.ok ? { ok: true } : { ok: false, error: cleared.error };
 }
 
 /**
- * Parse and strictly narrow a review-scope record. Invalid JSON, a wrong shape
- * and an unreadable file all yield undefined — callers treat that as "no
- * scope", which degrades the next review to a whole-change-set first review.
- */
-export function parseReviewScope(raw: unknown): ReviewScope | undefined {
-  const result = ReviewScopeSchema.safeParse(raw);
-  return result.success ? result.data : undefined;
-}
-
-/**
- * Read the pending review scope. Returns undefined when nothing was captured
- * (or the record is unreadable/corrupt).
+ * Read the pending review scope for one task. Returns undefined when nothing was
+ * captured (or the record does not parse).
+ *
+ * The scope belongs to the task, not to the directory it was captured in: a review
+ * resumed in another worktree promotes the same record instead of a copy (bd-281).
  */
 export function readReviewScope(options: ReadReviewScopeOptions): ReviewScope | undefined {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = reviewScopeFilePath(options.cwd);
-  if (!fs.existsSync(filePath)) return undefined;
-  let text: string;
-  try {
-    text = fs.readFileSync(filePath);
-  } catch {
-    return undefined;
-  }
-  try {
-    return parseReviewScope(JSON.parse(text));
-  } catch {
-    return undefined;
-  }
+  const store = storeFor(options);
+  if (store === null) return undefined;
+  const row = store.readReviewScope(options.taskId);
+  if (!row.ok) return undefined;
+  return parseReviewScope(row.value);
 }
 
 /**
- * Overwrite the pending review scope atomically. Every review build writes this
- * so only the newest build's record can ever be promoted; a stale record from
- * an earlier failed review is replaced, not reused.
+ * Overwrite the pending review scope. Every review build writes this so only the
+ * newest build's record can ever be promoted; a stale record from an earlier
+ * failed review is replaced, not reused.
  */
 export function saveReviewScope(
   options: SaveReviewScopeOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  return atomicWriteJson(
-    reviewScopeFilePath(options.cwd),
-    {
-      taskId: options.taskId,
-      sha: options.sha,
-      untracked: options.untracked.map((entry) => ({ path: entry.path, blob: entry.blob })),
-      capturedAt: nowMs(options.now),
-    },
-    fs,
-  );
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
+  }
+  const scope = {
+    taskId: options.taskId,
+    sha: options.sha,
+    untracked: options.untracked.map((entry) => ({ path: entry.path, blob: entry.blob })),
+    capturedAt: nowMs(options.now),
+  };
+  const written = store.writeReviewScope({
+    taskId: options.taskId,
+    worktreePath: options.cwd,
+    scope,
+    nowMs: scope.capturedAt,
+  });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
 }
 
-/** Consume the pending review scope: a missing file is the expected success case. */
+/** Consume the pending review scope: a missing row is the expected success case. */
 export function clearReviewScope(
   options: ClearReviewScopeOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = reviewScopeFilePath(options.cwd);
-  try {
-    fs.unlinkSync(filePath);
-    return { ok: true };
-  } catch (error) {
-    if (!fs.existsSync(filePath)) return { ok: true };
-    return { ok: false, error: errorMessage(error) };
-  }
+  const store = storeFor(options);
+  if (store === null) return { ok: true };
+  const cleared = store.clearReviewScope(options.taskId);
+  return cleared.ok ? { ok: true } : { ok: false, error: cleared.error };
 }
 
-/** Remove the current workflow state file, tolerating a missing file. */
+/** Remove the current workflow row, tolerating a missing row. */
 export function clearWorkflowState(options: ClearWorkflowStateOptions): void {
-  const fs = options.fs ?? nodeFsSeam;
-  try {
-    fs.unlinkSync(workflowStateFilePath(options.cwd));
-  } catch {
-    // Missing files are the expected success case.
-  }
+  const store = storeFor(options);
+  if (store === null) return;
+  store.clearWorkflow({ worktreePath: options.cwd });
 }
 
-/** Prefix of an archived (inert) workflow state, kept for diagnosis. */
+/**
+ * Prefix of the retired archived (inert) workflow state file. Kept for the
+ * migration refusal and for operator diagnostics of an old worktree.
+ */
 export const WORKFLOW_STATE_ARCHIVE_PREFIX = "workflow.stale-";
 
-export interface ArchiveWorkflowStateOptions {
+export interface ArchiveWorkflowStateOptions extends WorkflowStoreSeam {
   cwd: string;
-  fs?: WorkflowFs;
   now?: () => number;
 }
 
 export type ArchiveWorkflowStateResult =
-  | { ok: true; archived: false }
-  | { ok: true; archived: true; archivedPath: string }
+  | { ok: true; archived: boolean }
   | { ok: false; error: string };
 
 /**
- * Archive an inert workflow state file instead of deleting it (bd-165).
+ * Discard an inert workflow record (bd-165).
  *
- * Renaming keeps the record diagnosable after the fact — the same convention
- * `orchestrator.stale-<ts>.json` uses for a displaced lease — while still
- * removing the poison file so the next session starts lease-free. A missing
- * state file is a reported no-op (`archived: false`); a rename failure is
- * returned, never thrown.
+ * The file version renamed the record to `.belayd/workflow.stale-<ts>.json` to
+ * keep it diagnosable. A copy of executable state is exactly the bug this change
+ * removes, so the record is deleted instead: nothing reads it, and the shared
+ * store keeps the row's own history (`updated_at`, generation, the archived
+ * audit rows a fleet appends). There is no archive path to report — that field is
+ * gone rather than returning a sentinel — so callers name the task instead.
  *
- * The archive name carries a random discriminator: two archives in the same
- * worktree within one millisecond would otherwise collide, and `rename`
- * silently replaces the first record on POSIX, destroying the diagnosis.
+ * A missing row is a reported no-op (`archived: false`).
  */
 export function archiveWorkflowState(
   options: ArchiveWorkflowStateOptions,
 ): ArchiveWorkflowStateResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = workflowStateFilePath(options.cwd);
-  if (!fs.existsSync(filePath)) return { ok: true, archived: false };
-  const archivedPath = join(
-    workflowStateDir(options.cwd),
-    `${WORKFLOW_STATE_ARCHIVE_PREFIX}${nowMs(options.now)}-${randomBytes(4).toString("hex")}.json`,
-  );
-  try {
-    fs.mkdirSync(workflowStateDir(options.cwd), { recursive: true });
-    fs.renameSync(filePath, archivedPath);
-    return { ok: true, archived: true, archivedPath };
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) };
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
   }
+  const cleared = store.clearWorkflow({ worktreePath: options.cwd });
+  if (!cleared.ok) return { ok: false, error: cleared.error };
+  return { ok: true, archived: cleared.value.cleared };
 }

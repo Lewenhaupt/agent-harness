@@ -8,7 +8,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -43,14 +43,8 @@ import {
   type FleetStatus,
   type FleetStatusFs,
   type FleetWorkflowSnapshot,
-  fleetAuditLogPath,
   fleetBeadTaskIds,
-  fleetEventsDir,
-  fleetInboxDir,
-  fleetIntentFilePath,
   fleetIntentWriteRefusal,
-  fleetLaunchMarkerPath,
-  fleetMergeQueueFilePath,
   fleetStateDir,
   formatBeadOwnership,
   formatFleetLandRepairs,
@@ -65,11 +59,18 @@ import {
   sanitizeFleetId,
 } from "../fleet-status.js";
 import { ORCHESTRATOR_CLAIM_STALE_MS } from "../orchestrator-claim.js";
+import { openRepoStateStore, type RepoStateStore } from "../repo-state-store.js";
 import type { RunManifest } from "../run-manifest.js";
-import { parseRunManifest, RunStatus, runManifestPath } from "../run-manifest.js";
+import { parseRunManifest, RunStatus } from "../run-manifest.js";
+
+/** The retired runs directory, kept as the fixture key space for run manifests. */
+function runManifestPath(cwd: string, runId: string): string {
+  return join(cwd, ".belayd", "runs", `${runId}.json`);
+}
+
 import { isValidTaskId } from "../session-naming.js";
-import type { WorkflowState } from "../workflow-state.js";
-import { workflowStateFilePath } from "../workflow-state.js";
+import type { WorkflowState, WorkflowStateSnapshot } from "../workflow-state.js";
+import { parseWorkflowState, workflowStateFilePath } from "../workflow-state.js";
 import {
   parseWorktreeListPorcelain,
   parseWorktreeListPorcelainZ,
@@ -215,19 +216,55 @@ function sampleIntent(overrides: Partial<FleetIntent> = {}): FleetIntent {
 
 interface FakeFs extends FleetStatusFs {
   files: Map<string, string>;
+  /** The in-memory repo store the intent/run row lives in (bd-281). */
+  store: RepoStateStore;
   /** Directory creation instants for the capacity evidence cutoff (bd-166). */
   worktrees: Map<string, number>;
+  /** Fixture writes; the reader itself only reads (bd-281 made state store rows). */
+  writeFileSync(path: string, data: string): void;
+  renameSync(oldPath: string, newPath: string): void;
+  mkdirSync(path: string, options?: { recursive?: boolean }): void;
+  unlinkSync(path: string): void;
 }
 
 /** In-memory fs supporting the reads and the `readdirSync` that listRuns needs. */
+/** Fixture locator for a former `fleet.json`; `createFakeFs` seeds the store row. */
+function fleetIntentFileFixture(gitCommonDir: string, fleetId: string): string {
+  return join(gitCommonDir, "belayd", "fleet", sanitizeFleetId(fleetId), "fleet.json");
+}
+
+/** Seed one fleet row from a fixture's JSON text; corrupt text becomes a bad row. */
+function seedFleetIntentText(store: RepoStateStore, fleetId: string, content: string): void {
+  let parsed: unknown = content;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    // Keep the raw text as the document: it is not a record, so the reader reports
+    // the row as unreadable (the fixture intent of a corrupt file).
+  }
+  const written = store.writeFleetIntent({ fleetId: sanitizeFleetId(fleetId), intent: parsed });
+  if (!written.ok) throw new Error(written.error);
+}
+
 function createFakeFs(
   initial: Record<string, string> = {},
   worktreeCreatedAt: Record<string, number> = {},
 ): FakeFs {
   const files = new Map(Object.entries(initial));
   const worktrees = new Map(Object.entries(worktreeCreatedAt));
+  const opened = openRepoStateStore({ path: ":memory:" });
+  if (!opened.ok) throw new Error(opened.error);
+  // bd-281: a fixture naming `<fleetDir>/fleet.json` seeds the store row instead.
+  // The reader no longer opens that file, so keeping it would assert nothing; a
+  // non-JSON fixture is stored as a non-record so it reads as a corrupt row.
+  for (const [path, content] of [...files]) {
+    if (!path.endsWith("/fleet.json")) continue;
+    files.delete(path);
+    seedFleetIntentText(opened.store, basename(dirname(path)), content);
+  }
   return {
     files,
+    store: opened.store,
     worktrees,
     // A path with no recorded instant fails like a vanished directory: the reader
     // then has no cutoff, which is the conservative direction (`unknown`, counted).
@@ -276,6 +313,16 @@ function createFakeFs(
   };
 }
 
+/** Seed one spawn-marker row (bd-281: a store row, not a launch file). */
+function seedMarker(fs: FakeFs, marker: Record<string, unknown> & { taskId: string }): void {
+  const written = fs.store.writeLaunchMarker({
+    taskId: marker.taskId,
+    fleetId: "fleet-1",
+    marker,
+  });
+  if (!written.ok) throw new Error(written.error);
+}
+
 const worktreeEntries: WorktreeListEntry[] = [
   { path: "/repo", branch: "main", isMainWorktree: true },
   { path: "/repo.feat-bd-12", branch: "feat/bd-12", isMainWorktree: false },
@@ -286,11 +333,10 @@ describe("fleet state paths", () => {
     const dir = fleetStateDir("/repo/.git", "fleet-1");
 
     expect(dir).toBe(join("/repo/.git", "belayd", "fleet", "fleet-1"));
-    expect(fleetIntentFilePath("/repo/.git", "fleet-1")).toBe(join(dir, "fleet.json"));
-    expect(fleetInboxDir("/repo/.git", "fleet-1")).toBe(join(dir, "inbox"));
-    expect(fleetEventsDir("/repo/.git", "fleet-1")).toBe(join(dir, "events"));
-    expect(fleetMergeQueueFilePath("/repo/.git", "fleet-1")).toBe(join(dir, "merge-queue.json"));
-    expect(fleetAuditLogPath("/repo/.git", "fleet-1")).toBe(join(dir, "audit.log"));
+    // Every fleet fact — intent, queue, lock, audit, markers, supervisor beat and the
+    // note mailboxes — is a store row (bd-281); the directory survives only for the
+    // legacy id scan and the one-shot importer.
+    expect(fleetStateDir("/repo/.git", "fleet-1")).toBe(dir);
   });
 
   it("sanitizes ids so they cannot escape the fleet root", () => {
@@ -1637,7 +1683,7 @@ describe("formatFleetStatus", () => {
     });
 
     expect(formatFleetStatus(status)).toContain("Warnings (1):");
-    expect(formatFleetStatus(status)).toContain("no .belayd/workflow.json");
+    expect(formatFleetStatus(status)).toContain("no workflow row for");
   });
 
   it("renders a detached member with unreadable workflow state", () => {
@@ -2414,6 +2460,53 @@ describe("bead metadata (read-only bd enrichment)", () => {
   });
 });
 
+/**
+ * Workflow-state reader over the fake fs.
+ *
+ * Production reads the shared store (bd-281), so these fixtures stand in for it
+ * exactly where they used to stand in for a `.belayd/workflow.json` file: the
+ * report logic under test is unchanged.
+ */
+/**
+ * Run-manifest reader over the fake fs.
+ *
+ * Production reads the shared store (bd-281); these fixtures stand in for it where
+ * they used to stand in for `.belayd/runs/*.json`, and the report logic under test
+ * is unchanged.
+ */
+function fixtureRunsReader(fakeFs: FleetStatusFs): (cwd: string) => RunManifest[] {
+  return (cwd) => {
+    const runs: RunManifest[] = [];
+    for (const name of fakeFs.readdirSync(join(cwd, ".belayd", "runs"))) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const parsed = parseRunManifest(
+          JSON.parse(fakeFs.readFileSync(join(cwd, ".belayd", "runs", name))),
+        );
+        if (parsed !== undefined) runs.push(parsed);
+      } catch {
+        // An unparseable fixture is not a run, exactly as the store reader skips it.
+      }
+    }
+    return runs.sort((left, right) => left.startedAt - right.startedAt);
+  };
+}
+
+function fixtureWorkflowReader(fakeFs: FleetStatusFs): (cwd: string) => WorkflowStateSnapshot {
+  return (worktreePath) => {
+    const path = workflowStateFilePath(worktreePath);
+    if (!fakeFs.existsSync(path)) return { kind: "missing" };
+    try {
+      const parsed = parseWorkflowState(JSON.parse(fakeFs.readFileSync(path)));
+      return parsed === undefined
+        ? { kind: "unreadable", error: "fixture is not a workflow state" }
+        : { kind: "ok", state: parsed };
+    } catch {
+      return { kind: "unreadable", error: "fixture is not JSON" };
+    }
+  };
+}
+
 describe("readFleetStatus", () => {
   const commonDir = "/repo/.git";
   const cwd = "/repo";
@@ -2426,6 +2519,8 @@ describe("readFleetStatus", () => {
       fs,
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      readWorkflowState: fixtureWorkflowReader(fs),
+      listMemberRuns: fixtureRunsReader(fs),
     });
   }
 
@@ -2435,6 +2530,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
     });
@@ -2448,7 +2545,7 @@ describe("readFleetStatus", () => {
 
   it("reads intent, workflow state, and run manifests from the seam", () => {
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(sampleIntent()),
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(sampleIntent()),
       [workflowStateFilePath("/repo.feat-bd-12")]: JSON.stringify(sampleWorkflow()),
       [runManifestPath("/repo.feat-bd-12", "run-1")]: JSON.stringify(sampleRun()),
     });
@@ -2502,7 +2599,7 @@ describe("readFleetStatus", () => {
     // stayed `unknown` (which holds a slot) forever. Its branch outlives the worktree,
     // which proves the tree existed, so the honest verdict is `absent`.
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-15"] }),
       ),
     });
@@ -2511,6 +2608,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
       branchExists: (taskId) => taskId === "bd-15",
@@ -2552,7 +2651,7 @@ describe("readFleetStatus", () => {
       members: [{ taskId: "bd-15", launchedAt, landedAt: 95_000 }],
     };
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-15"], run }),
       ),
     });
@@ -2561,6 +2660,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
       branchExists: () => false,
@@ -2597,7 +2698,7 @@ describe("readFleetStatus", () => {
     };
     const readRun = (overrides: Partial<FleetIntent>) => {
       const fs = createFakeFs({
-        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(sampleIntent(overrides)),
+        [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(sampleIntent(overrides)),
       });
       return readFleetStatus({
         cwd,
@@ -2651,7 +2752,7 @@ describe("readFleetStatus", () => {
     // worktree prune`), so resolving a path is not proof the tree is there. The listing
     // is proof it existed, which is the `absent` verdict bd-233 documents.
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-12"], updatedAt: 2_000 }),
       ),
     });
@@ -2660,6 +2761,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       branchExists: () => false,
@@ -2689,7 +2792,7 @@ describe("readFleetStatus", () => {
     // into absence: it is `unknown` and counted, exactly as before.
     const fs = createFakeFs(
       {
-        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
           sampleIntent({ taskIds: ["bd-12"], updatedAt: 2_000 }),
         ),
       },
@@ -2700,6 +2803,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       branchExists: () => false,
@@ -2719,7 +2824,7 @@ describe("readFleetStatus", () => {
     // kept every member of a live run counted forever; the window is now the member's
     // own `launch/<taskId>` marker, so an absent member frees its slot.
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({
           taskIds: ["bd-15"],
           updatedAt: 95_000, // five seconds before "now": the run is ticking
@@ -2731,6 +2836,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
       branchExists: (taskId) => taskId === "bd-15",
@@ -2746,15 +2853,12 @@ describe("readFleetStatus", () => {
   });
 
   it("W2: only that member's live spawn marker holds its slot", () => {
-    const marker = fleetLaunchMarkerPath(commonDir, fleetId, "bd-15");
-    if (!marker.ok) throw new Error(marker.error);
-    const markerPath = marker.path;
     const fresh = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-15"], updatedAt: 95_000 }),
       ),
-      [markerPath]: JSON.stringify({ schemaVersion: 1, taskId: "bd-15", startedAt: 95_000 }),
     });
+    seedMarker(fresh, { schemaVersion: 1, taskId: "bd-15", startedAt: 95_000 });
 
     const inside = readFleetStatus({
       cwd,
@@ -2774,14 +2878,14 @@ describe("readFleetStatus", () => {
 
     // The same marker past the grace is an abandoned spawn: the member is absent again.
     const stale = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-15"], updatedAt: 95_000 }),
       ),
-      [markerPath]: JSON.stringify({
-        schemaVersion: 1,
-        taskId: "bd-15",
-        startedAt: 100_000 - FLEET_MEMBER_SPAWN_GRACE_MS - 1,
-      }),
+    });
+    seedMarker(stale, {
+      schemaVersion: 1,
+      taskId: "bd-15",
+      startedAt: 100_000 - FLEET_MEMBER_SPAWN_GRACE_MS - 1,
     });
     const expired = readFleetStatus({
       cwd,
@@ -2804,7 +2908,7 @@ describe("readFleetStatus", () => {
     // window, so the git evidence decides — but the operator must hear why no window
     // applied instead of finding a silent absence (bd-233 W3).
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd/12"] }),
       ),
     });
@@ -2813,6 +2917,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
       branchExists: () => true,
@@ -2840,7 +2946,7 @@ describe("readFleetStatus", () => {
     // manifest must postdate the worktree (its execution wrote it there).
     const fs = createFakeFs(
       {
-        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
           sampleIntent({ taskIds: ["bd-12"] }),
         ),
         [runManifestPath("/repo.feat-bd-12", "finished-commit")]: JSON.stringify(
@@ -2854,6 +2960,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       // The member's session is gone: no lease and no process, so the run manifest is
@@ -2881,7 +2989,7 @@ describe("readFleetStatus", () => {
     // about the spawn that just recorded the member: the member keeps counting.
     const fs = createFakeFs(
       {
-        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
           sampleIntent({ taskIds: ["bd-12"] }),
         ),
         [runManifestPath("/repo.feat-bd-12", "inherited-commit")]: JSON.stringify(
@@ -2895,6 +3003,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       memberLeaseFor: () => ({ state: "absent" }),
@@ -2915,7 +3025,7 @@ describe("readFleetStatus", () => {
     // No creation instant, so no cutoff: a manifest that only names the task is not
     // evidence of this execution. Never guess in the direction that frees a slot.
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-12"] }),
       ),
       [runManifestPath("/repo.feat-bd-12", "unattributed-commit")]: JSON.stringify(
@@ -2927,6 +3037,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       memberLeaseFor: () => ({ state: "absent" }),
@@ -2945,7 +3057,7 @@ describe("readFleetStatus", () => {
     // happens to postdate the tree (an in-place run in the same checkout).
     const fs = createFakeFs(
       {
-        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+        [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
           sampleIntent({
             taskIds: ["bd-12"],
             run: startFleetRun({ now: 3_000, accept: false, members: [{ taskId: "bd-12" }] }),
@@ -2962,6 +3074,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       memberLeaseFor: () => ({ state: "absent" }),
@@ -2979,7 +3093,7 @@ describe("readFleetStatus", () => {
     // completed run is present from the first second. Inherited evidence must not free
     // a slot for an orchestrator that is still being spawned.
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, fleetId)]: JSON.stringify(
         sampleIntent({ taskIds: ["bd-12"] }),
       ),
       [runManifestPath("/repo.feat-bd-12", "bd37-commit")]: JSON.stringify(
@@ -2997,6 +3111,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
       memberLeaseFor: () => ({ state: "absent" }),
@@ -3031,6 +3147,8 @@ describe("readFleetStatus", () => {
       fs,
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: parsed.entries, warnings: parsed.warnings }),
+      readWorkflowState: fixtureWorkflowReader(fs),
+      listMemberRuns: fixtureRunsReader(fs),
     });
 
     expect(result.ok).toBe(true);
@@ -3061,7 +3179,7 @@ describe("readFleetStatus", () => {
 
   it("treats a corrupt intent file as absent and warns about unreadable workflow state", () => {
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, fleetId)]: "not json",
+      [fleetIntentFileFixture(commonDir, fleetId)]: "not json",
       [workflowStateFilePath("/repo.feat-bd-12")]: "{ truncated",
     });
 
@@ -3149,7 +3267,7 @@ describe("readFleetStatus", () => {
     ["", DEFAULT_FLEET_ID],
   ])("renders the sanitized id that located the files for %j", (requested, expected) => {
     const fs = createFakeFs({
-      [fleetIntentFilePath(commonDir, expected)]: JSON.stringify(
+      [fleetIntentFileFixture(commonDir, expected)]: JSON.stringify(
         sampleIntent({ fleetId: expected }),
       ),
     });
@@ -3157,6 +3275,8 @@ describe("readFleetStatus", () => {
       cwd,
       fleetId: requested,
       fs,
+      listMemberRuns: fixtureRunsReader(fs),
+      readWorkflowState: fixtureWorkflowReader(fs),
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
     });
@@ -3183,6 +3303,10 @@ describe("read-only contract", () => {
     files: Map<string, string>;
     writes: string[];
     reads: string[];
+    writeFileSync(path: string, data?: string): void;
+    renameSync(oldPath: string, newPath: string): void;
+    mkdirSync(path: string): void;
+    unlinkSync(path: string): void;
   }
 
   /** Fake fs that records every write-shaped call so the test can assert none happen. */
@@ -3192,6 +3316,7 @@ describe("read-only contract", () => {
     const reads: string[] = [];
     return {
       files: inner.files,
+      store: inner.store,
       writes,
       reads,
       existsSync: (path) => {
@@ -3229,12 +3354,19 @@ describe("read-only contract", () => {
       fs,
       resolveCommonDir: () => ({ ok: true, commonDir }),
       listWorktrees: () => ({ ok: true, entries: worktreeEntries, warnings: [] }),
+      readWorkflowState: fixtureWorkflowReader(fs),
+      listMemberRuns: (cwd) => {
+        const parsed = parseRunManifest(
+          JSON.parse(fs.files.get(join(cwd, ".belayd", "runs", "run-1")) ?? "null"),
+        );
+        return parsed === undefined ? [] : [parsed];
+      },
     });
   }
 
   it("issues no write, rename, mkdir, or unlink for a populated fleet", () => {
     const fs = countingFs({
-      [fleetIntentFilePath(commonDir, "fleet-1")]: JSON.stringify(sampleIntent()),
+      [fleetIntentFileFixture(commonDir, "fleet-1")]: JSON.stringify(sampleIntent()),
       [workflowStateFilePath("/repo.feat-bd-12")]: JSON.stringify(sampleWorkflow()),
       [runManifestPath("/repo.feat-bd-12", "run-1")]: JSON.stringify(sampleRun()),
     });
@@ -3263,7 +3395,7 @@ describe("read-only contract", () => {
 
   it("never rewrites corrupt workflow state or a corrupt intent file", () => {
     const fs = countingFs({
-      [fleetIntentFilePath(commonDir, "fleet-1")]: "not json",
+      [fleetIntentFileFixture(commonDir, "fleet-1")]: "not json",
       [workflowStateFilePath("/repo")]: "not json",
       [workflowStateFilePath("/repo.feat-bd-12")]: "{ truncated",
     });

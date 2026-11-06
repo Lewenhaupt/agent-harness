@@ -3,15 +3,16 @@
  *
  * P0 of docs/fleet-orchestrator.md is pure observation: the supervisor is a
  * scheduler, never a phase worker, so this module reads every worktree's
- * `.belayd/workflow.json` plus its run manifests and derives one view. It
+ * workflow row plus its run manifests and derives one view. It
  * writes nothing, spawns nothing, merges nothing, and arms no gate.
  *
- * The view is *derived*: no fleet status file exists. Shared fleet state lives
- * under `<git-common-dir>/belayd/fleet/<fleetId>/` (intent, mailbox, merge
- * queue, audit log); P0 only reads the optional `fleet.json` intent.
+ * The view is *derived*: no fleet status record is written here. Shared fleet
+ * state lives in the repository store at `<git-common-dir>/belayd/state.sqlite`
+ * (intent, mailboxes, merge queue, audit rows); the fleet directory is only a
+ * legacy location the one-shot import reads. P0 only reads the fleet intent.
  */
 
-import { statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { z } from "zod";
 import { excerptComment } from "./bead-comments.js";
@@ -56,17 +57,15 @@ import {
 } from "./fleet-sessions.js";
 import { taskIdFromBranch } from "./handoff.js";
 import type { OrchestratorClaim } from "./orchestrator-claim.js";
-import {
-  orchestratorClaimPath,
-  parseOrchestratorClaim,
-  readOrchestratorClaim,
-} from "./orchestrator-claim.js";
-import type { RunManifest, RunManifestFs } from "./run-manifest.js";
-import { listRuns, RunStatus, runManifestFs } from "./run-manifest.js";
+import { readOrchestratorClaim } from "./orchestrator-claim.js";
+import type { RepoStateStore } from "./repo-state-store.js";
+import { repoStatePathForCommonDir, sharedRepoStateStore } from "./repo-state-store.js";
+import type { RunManifest } from "./run-manifest.js";
+import { listRuns, RunStatus } from "./run-manifest.js";
 import { isValidTaskId } from "./session-naming.js";
 import { DEFAULT_BASE_BRANCH, branchExists as readBranchExists } from "./stack-rebase.js";
-import type { WorkflowState } from "./workflow-state.js";
-import { parseWorkflowState, workflowStateFilePath } from "./workflow-state.js";
+import type { WorkflowState, WorkflowStateSnapshot } from "./workflow-state.js";
+import { readWorkflowStateSnapshot } from "./workflow-state.js";
 import type { GitCommonDirResult, WorktreeListEntry } from "./worktree.js";
 import {
   listWorktrees as defaultListWorktrees,
@@ -75,7 +74,7 @@ import {
 } from "./worktree.js";
 
 /**
- * `schemaVersion` of the `fleet.json` intent record. The merge queue and the
+ * `schemaVersion` of the fleet intent record. The merge queue and the
  * mailbox notes keep their own versions (`fleet-state.ts`) so bumping the
  * intent schema cannot invalidate every note already in a mailbox.
  *
@@ -125,7 +124,7 @@ export const FLEET_INTENT_ORDERING_GATES_MAX = 256;
 /** Members rendered in the one-line intent summary before it is elided. */
 export const FLEET_INTENT_SUMMARY_MAX = 8;
 
-// ── Fleet intent (fleet.json) ─────────────────────────────────────────
+// ── Fleet intent record ──────────────────────────────────────────────
 
 /**
  * Operator intent for one fleet. Absent in P0 unless a human writes it: no P0
@@ -321,7 +320,7 @@ export function parseFleetIntent(raw: unknown): FleetIntent | undefined {
 }
 
 /**
- * Why a value cannot be stored as `fleet.json`, or undefined when it can.
+ * Why a value cannot be stored as the fleet intent, or undefined when it can.
  *
  * The reader refuses a record it cannot parse, so an unvalidated write is
  * unrecoverable: one over-long or over-bound field makes the fleet intent
@@ -341,6 +340,37 @@ export function fleetIntentWriteRefusal(raw: unknown): string | undefined {
   return `invalid fleet intent (${issues.join("; ")})`;
 }
 
+/**
+ * The intent record stored in one fleet row: the intent document plus the run
+ * record that shares the row (bd-281).
+ *
+ * The two are separate columns so neither can be rewritten by accident when the
+ * other changes, and they are recombined here because every consumer reads the
+ * record the file used to hold. A run column of `{}` is the store's "no run yet"
+ * (INSERT default), not an invalid run.
+ */
+export function fleetIntentFromStoreRow(row: {
+  intent: unknown;
+  run: unknown;
+}): FleetIntent | undefined {
+  const document = row.intent;
+  if (typeof document !== "object" || document === null) return undefined;
+  const run = row.run;
+  const hasRun = typeof run === "object" && run !== null && Object.keys(run).length > 0;
+  if (!hasRun) return parseFleetIntent(document);
+  return parseFleetIntent({ ...document, run });
+}
+
+/** Read one fleet's intent row; a missing row is "no intent", a broken one too. */
+export function readFleetIntentRow(
+  store: RepoStateStore,
+  fleetId: string,
+): FleetIntent | undefined {
+  const row = store.readFleet(sanitizeFleetId(fleetId));
+  if (!row.ok || row.value === null) return undefined;
+  return fleetIntentFromStoreRow(row.value);
+}
+
 // ── Shared fleet state paths ──────────────────────────────────────────
 
 /**
@@ -353,71 +383,37 @@ export function sanitizeFleetId(fleetId: string): string {
   return sanitized === "" || sanitized === "." || sanitized === ".." ? DEFAULT_FLEET_ID : sanitized;
 }
 
-/** `<git-common-dir>/belayd/fleet/<fleetId>/` — shared by every worktree. */
+/**
+ * `<git-common-dir>/belayd/fleet/<fleetId>/` — shared by every worktree.
+ *
+ * A documented survivor of the file era: no state is written here any more. Two
+ * readers still need the path to look — `listFleetIds` still recognises a fleet from
+ * a directory a pre-store session left behind, and the one-shot importer moves those
+ * files into rows. Note mailboxes are `fleet_note` rows (bd-281), not directories.
+ */
 export function fleetStateDir(gitCommonDir: string, fleetId: string): string {
   return join(gitCommonDir, "belayd", "fleet", sanitizeFleetId(fleetId));
 }
 
-export function fleetIntentFilePath(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "fleet.json");
-}
-
-/** Member → supervisor note drop, drained at turn start (P1). Unused in P0. */
-export function fleetInboxDir(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "inbox");
-}
-
-/** Supervisor → member notification drop, drained at turn start (P1). Unused in P0. */
-export function fleetEventsDir(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "events");
-}
-
-/** Single-flight merge queue (P2). Unused in P0. */
-export function fleetMergeQueueFilePath(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "merge-queue.json");
-}
-
-/** Append-only cross-tree authority audit log (P2+). Unused in P0. */
-export function fleetAuditLogPath(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "audit.log");
-}
-
 /**
- * `<fleetDir>/launch/` — per-member spawn markers (bd-233).
+ * Why a task id cannot name a spawn marker, or undefined when it can.
  *
- * One file per member whose spawn is in flight. A marker exists only while a
- * spawner is inside `launchWorktreeWorkflow`; unlike the intent, nothing refreshes it
- * periodically, so it cannot be mistaken for a live member (the round-1 grace keyed
- * on `intent.updatedAt` was re-stamped by every 15 s tick and held every slot of a
- * running fleet forever).
+ * The marker used to be a file in `launch/`, where the id had to be one safe path
+ * component. The row store no longer needs a filename, but the **refusal is kept**
+ * (bd-233 W3): the same ids that could escape the directory are the ones a tool
+ * parameter can carry, and an unaddressable marker must stay a reported error
+ * rather than a silent absence. The accepted character set is unchanged so a fleet
+ * that worked before the move keeps working.
  */
-export function fleetLaunchMarkerDir(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "launch");
-}
-
-/**
- * The marker file for one member's spawn.
- *
- * Refuses rather than sanitises into place: a task id that does not round-trip
- * through the replacement (or that is `.`/`..`/empty) would name a file outside
- * `launch/` or the fleet directory itself. Callers must handle the refusal — a
- * write fails the spawn, a read reports "no marker" and says why (bd-233 W3).
- */
-export function fleetLaunchMarkerPath(
-  gitCommonDir: string,
-  fleetId: string,
-  taskId: string,
-): { ok: true; path: string } | { ok: false; error: string } {
+export function fleetLaunchMarkerTaskIdRefusal(taskId: string): string | undefined {
   const fileName = taskId.replace(/[^A-Za-z0-9._-]/g, "_");
   if (fileName === "" || fileName !== taskId || fileName === "." || fileName === "..") {
-    return {
-      ok: false,
-      error:
-        `\`${taskId}\` cannot name a launch marker: a marker must be one file name directly ` +
-        "under launch/ (only letters, digits, '.', '_' and '-'), never '.' or '..'",
-    };
+    return (
+      `\`${taskId}\` cannot name a launch marker: a marker must be one row keyed by a task id ` +
+      "(only letters, digits, '.', '_' and '-'), never '.' or '..'"
+    );
   }
-  return { ok: true, path: join(fleetLaunchMarkerDir(gitCommonDir, fleetId), fileName) };
+  return undefined;
 }
 
 /** Allowance for the daemon RPC + lease + prompt half of one spawn (see the grace). */
@@ -514,21 +510,19 @@ export function readFleetLaunchMarker(options: {
    */
   onWarning?: (message: string) => void;
 }): FleetLaunchMarker | undefined {
-  const fs = options.fs ?? fleetStatusFs;
-  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
-  if (!resolved.ok) {
+  const refusal = fleetLaunchMarkerTaskIdRefusal(options.taskId);
+  if (refusal !== undefined) {
     options.onWarning?.(
-      `spawn marker for ${options.taskId} is unusable (${resolved.error}); reading it as "no ` +
+      `spawn marker for ${options.taskId} is unusable (${refusal}); reading it as "no ` +
         "spawn window\" and never as absence, so this member's own git evidence decides",
     );
     return undefined;
   }
-  try {
-    if (!fs.existsSync(resolved.path)) return undefined;
-    return parseFleetLaunchMarker(JSON.parse(fs.readFileSync(resolved.path)));
-  } catch {
-    return undefined;
-  }
+  const store = fleetReaderStore(options.fs ?? fleetStatusFs, options.gitCommonDir);
+  if (store === null) return undefined;
+  const row = store.readLaunchMarker(options.taskId);
+  if (!row.ok) return undefined;
+  return parseFleetLaunchMarker(row.value);
 }
 
 /** Whether a live spawn marker holds this member out of the `absent` verdict. */
@@ -548,7 +542,7 @@ export function fleetSpawnInFlight(options: {
 
 // ── Derived member state ──────────────────────────────────────────────
 
-/** What the worktree's `.belayd/workflow.json` turned out to be. */
+/** What the worktree's workflow row turned out to be. */
 export type FleetWorkflowFile = "ok" | "missing" | "corrupt";
 
 /** Already-read workflow state for one worktree; never read inside the pure layer. */
@@ -660,7 +654,7 @@ export interface FleetMemberView {
   /**
    * Where {@link taskId} came from (bd-168).
    *
-   * Completion clears `.belayd/workflow.json`, so a finished-but-unlanded member
+   * Completion clears the workflow row, so a finished-but-unlanded member
    * has no recorded id; the branch (or its own run manifests) keeps it
    * attributable. Recording the provenance stops an inferred id being mistaken
    * for one the workflow itself wrote.
@@ -668,7 +662,7 @@ export interface FleetMemberView {
   taskIdSource?: "workflow" | "worktree" | "runs";
   /**
    * Task id implied by the checked-out branch (or the worktree directory name
-   * when the branch is unavailable). Used to flag a stale `workflow.json`.
+   * when the branch is unavailable). Used to flag a stale workflow row.
    */
   expectedTaskId: string | undefined;
   worktreePath: string;
@@ -687,7 +681,7 @@ export interface FleetMemberView {
   awaitingReviewResponse: boolean;
   latestRuns: readonly FleetPhaseRunView[];
   interruptedRunCount: number;
-  /** workflow.json `updatedAt`, raised to the newest run timestamp when that is later. */
+  /** Workflow-row `updatedAt`, raised to the newest run timestamp when that is later. */
   updatedAt: number | undefined;
   /** Orchestrator lease: the only honest evidence of a live member orchestrator. */
   lease: FleetLeaseView;
@@ -837,7 +831,7 @@ function expectedTaskIdFor(snapshot: FleetMemberSnapshot): string | undefined {
  *
  * The loop finds a member by the task id its intent launched and the branch the
  * worktree checks out. When the branch names a fleet member, that id — not a
- * possibly stale `workflow.json` task id — decides which manifests are its
+ * possibly stale workflow-row task id — decides which manifests are its
  * evidence, so both readers look at the same runs (bd-161).
  */
 function runLoopTaskId(input: {
@@ -872,7 +866,7 @@ interface MemberAttribution {
 /**
  * Attribute a worktree to a task id (bd-168).
  *
- * Completion clears `.belayd/workflow.json`, which used to erase the member's
+ * Completion clears the workflow row, which used to erase the member's
  * identity and make a finished workflow unlandable. The branch (and the directory
  * name) is the durable identity the fleet itself assigned, and a worktree's own run
  * manifests are the fallback when the branch is unavailable. A worktree whose only
@@ -955,7 +949,7 @@ function unattributedMember(
 /**
  * Attribute a worktree to a task id (bd-168).
  *
- * Completion clears `.belayd/workflow.json`, which used to erase the member's
+ * Completion clears the workflow row, which used to erase the member's
  * identity and make a finished workflow unlandable. The branch (and the directory
  * name) is the durable identity the fleet itself assigned, and a worktree's own run
  * manifests are the fallback when the branch is unavailable. A worktree whose only
@@ -1001,8 +995,9 @@ function launchedAtFor(
  * contradict the loop's own `starting`/`missing` verdict for the same worktree.
  *
  * The same filter is what keeps `latest runs` and the interrupted count honest
- * when a consumer repository commits `.belayd/runs` (bd-146): a fresh worktree
- * would otherwise check out another bead's phase runs and report them as its own.
+ * across worktrees: run rows are shared by every worktree of the repository, so
+ * another bead's runs (or an earlier execution's) are excluded by task id and
+ * launch time instead of being reported as this member's.
  */
 function memberRuns(
   snapshot: FleetMemberSnapshot,
@@ -1193,7 +1188,7 @@ interface AttributedMemberView {
  * The run member's repair record, or `undefined` when the member has landed (bd-277).
  *
  * `recordRunMemberLanded` clears the record, so this guard only matters for a hand-edited
- * or half-written `fleet.json`. It is stated once here because every surface joins the
+ * or half-written intent row. It is stated once here because every surface joins the
  * record: the member view (both the readable-workflow and the missing-state branch), the
  * run header, and the single-bead join in `extensions/capabilities/fleet.ts`
  * (`landRepairInFleet`), which reads the intent from disk and uses this same guard so work
@@ -1376,7 +1371,7 @@ function missingWorkflowWarning(member: FleetMemberView): FleetWarning {
       taskId: member.taskId,
       worktreePath: member.worktreePath,
       message:
-        `no .belayd/workflow.json in ${member.worktreePath} (completion clears it); ` +
+        `no workflow row for ${member.worktreePath} (completion clears it); ` +
         `${member.taskId} still belongs to this fleet and its work is finished — land it ` +
         `with belayd_fleet_merge action=enqueue task=${member.taskId} then action=drain`,
     };
@@ -1384,7 +1379,7 @@ function missingWorkflowWarning(member: FleetMemberView): FleetWarning {
   return {
     kind: "missing-workflow-state",
     worktreePath: member.worktreePath,
-    message: `no .belayd/workflow.json in ${member.worktreePath}; that worktree drives no workflow`,
+    message: `no workflow row for ${member.worktreePath}; that worktree drives no workflow`,
   };
 }
 
@@ -1400,7 +1395,7 @@ function collectWarnings(members: readonly FleetMemberView[]): FleetWarning[] {
         warnings.push({
           kind: "corrupt-workflow-state",
           worktreePath: member.worktreePath,
-          message: `unreadable .belayd/workflow.json in ${member.worktreePath}`,
+          message: `unreadable workflow row for ${member.worktreePath}`,
         });
         break;
       case "ok":
@@ -1928,7 +1923,7 @@ export function applyFleetBeadLookup(status: FleetStatus, lookup: FleetBeadLooku
   };
 }
 
-/** Bead statuses that prove the fleet's work is over, whatever fleet.json says. */
+/** Bead statuses that prove the fleet's work is over, whatever the intent row says. */
 const CLOSED_BEAD_STATUSES: readonly string[] = ["closed", "done"];
 
 /**
@@ -2058,7 +2053,7 @@ function formatIntent(intent: FleetIntent | undefined): string {
  *
  * The intent is the only read-only observation surface a supervisor has for a
  * member that never started, so "deferred and forgotten" must be visible here
- * rather than only in `audit.log`.
+ * rather than only in the audit log.
  */
 function formatDeferred(deferred: NonNullable<FleetIntent["deferred"]>): string | undefined {
   if (deferred.length === 0) return undefined;
@@ -2620,8 +2615,25 @@ export function formatFleetStatus(status: FleetStatus): string {
 
 // ── Reader (the only fs/git access in this module) ────────────────────
 
-/** Fs seam for the reader; compatible with the workflow-state and run-manifest seams. */
-export interface FleetStatusFs extends RunManifestFs {
+/**
+ * Fs seam for the reader.
+ *
+ * The fleet records (intent, notes, audit, launch markers) are rows in the shared store,
+ * so this seam still reads them; workflow state, leases and run manifests come from
+ * the shared store (bd-281) through their own injected readers.
+ */
+export interface FleetStatusFs {
+  existsSync(path: string): boolean;
+  readFileSync(path: string): string;
+  readdirSync(path: string): string[];
+  /**
+   * The repository store the fleet intent/run row lives in (bd-281).
+   *
+   * Production leaves it undefined and the reader opens the shared store at
+   * `<git-common-dir>/belayd/state.sqlite`; a test that drives the view from
+   * fixtures passes its own opened store so seeding needs no real repository.
+   */
+  store?: RepoStateStore;
   /**
    * Worktree `stat`, for the launch-evidence cutoff (bd-166).
    *
@@ -2632,9 +2644,11 @@ export interface FleetStatusFs extends RunManifestFs {
   statSync?(path: string): { birthtimeMs?: number; mtimeMs?: number };
 }
 
-/** The reader's default seam: the shared manifests' fs plus the capacity cutoff's stat. */
+/** The reader's default seam. */
 const fleetStatusFs: FleetStatusFs = {
-  ...runManifestFs,
+  existsSync: (path) => existsSync(path),
+  readFileSync: (path) => readFileSync(path, "utf8"),
+  readdirSync: (path) => readdirSync(path),
   statSync: (path) => statSync(path),
 };
 
@@ -2653,6 +2667,16 @@ export interface ReadFleetStatusOptions {
    * the default is the real scan the reconcile and launch paths use.
    */
   scanProcesses?: () => FleetProcessScan;
+  /**
+   * Member workflow state reader, injected so a status test can drive the report
+   * from a fixture instead of a shared store. Defaults to the store (bd-281).
+   */
+  readWorkflowState?: (cwd: string) => WorkflowStateSnapshot;
+  /**
+   * Member run-manifest reader. Defaults to the store; injected by tests that seed
+   * fixtures instead of a store (bd-281).
+   */
+  listMemberRuns?: (cwd: string) => RunManifest[];
   /**
    * Worktree lease per member, the only evidence a pi-web orchestrator produces.
    *
@@ -2679,36 +2703,27 @@ export interface ReadFleetStatusOptions {
 
 export type ReadFleetStatusResult = { ok: true; value: FleetStatus } | { ok: false; error: string };
 
-function readFleetIntentFile(
-  fs: FleetStatusFs,
-  gitCommonDir: string,
-  fleetId: string,
-): FleetIntent | undefined {
-  const filePath = fleetIntentFilePath(gitCommonDir, fleetId);
-  if (!fs.existsSync(filePath)) return undefined;
-  try {
-    return parseFleetIntent(JSON.parse(fs.readFileSync(filePath)));
-  } catch {
-    // A corrupt intent file is treated as absent: P0 only reports intent, and
-    // blocking the whole fleet view on it would hide every member.
-    return undefined;
-  }
+function fleetReaderStore(fs: FleetStatusFs, gitCommonDir: string): RepoStateStore | null {
+  if (fs.store !== undefined) return fs.store;
+  return sharedRepoStateStore({ path: repoStatePathForCommonDir(gitCommonDir) }).store;
 }
 
-function readMemberSnapshot(fs: FleetStatusFs, entry: WorktreeListEntry): FleetMemberSnapshot {
-  const workflowPath = workflowStateFilePath(entry.path);
-  let workflow: FleetWorkflowSnapshot;
-
-  if (!fs.existsSync(workflowPath)) {
-    workflow = { kind: "missing" };
-  } else {
-    try {
-      const parsed = parseWorkflowState(JSON.parse(fs.readFileSync(workflowPath)));
-      workflow = parsed === undefined ? { kind: "corrupt" } : { kind: "ok", state: parsed };
-    } catch {
-      workflow = { kind: "corrupt" };
-    }
-  }
+function readMemberSnapshot(
+  fs: FleetStatusFs,
+  entry: WorktreeListEntry,
+  readWorkflow: (cwd: string) => WorkflowStateSnapshot,
+  listMemberRuns: (cwd: string) => RunManifest[],
+): FleetMemberSnapshot {
+  // bd-281: the member's workflow state is a shared-store row keyed by task, not
+  // a workflow row bound to that worktree. The worktree path is only the
+  // locator, so a member whose workflow lives in another worktree still resolves.
+  const snapshot = readWorkflow(entry.path);
+  const workflow: FleetWorkflowSnapshot =
+    snapshot.kind === "missing"
+      ? { kind: "missing" }
+      : snapshot.kind === "ok"
+        ? { kind: "ok", state: snapshot.state }
+        : { kind: "corrupt" };
 
   const createdAt = worktreeCreatedAt(fs, entry.path);
   return {
@@ -2716,9 +2731,9 @@ function readMemberSnapshot(fs: FleetStatusFs, entry: WorktreeListEntry): FleetM
     isMainWorktree: entry.isMainWorktree,
     branch: entry.branch,
     workflow,
-    runs: listRuns({ cwd: entry.path, fs }),
+    runs: listMemberRuns(entry.path),
     ...(createdAt === undefined ? {} : { createdAt }),
-    lease: readLeaseSnapshot(fs, entry.path),
+    lease: readLeaseSnapshot(entry.path),
   };
 }
 
@@ -2738,20 +2753,18 @@ function worktreeCreatedAt(fs: FleetStatusFs, worktreePath: string): number | un
 }
 
 /** Read the worktree's orchestrator lease without applying a clock. */
-function readLeaseSnapshot(fs: FleetStatusFs, worktreePath: string): FleetLeaseSnapshot {
-  const path = orchestratorClaimPath(worktreePath);
-  if (!fs.existsSync(path)) return { state: "absent" };
-  try {
-    const parsed = parseOrchestratorClaim(JSON.parse(fs.readFileSync(path)));
-    return parsed === undefined
-      ? { state: "corrupt", error: `${path} is not an orchestrator lease` }
-      : { state: "held", claim: parsed };
-  } catch (error) {
-    return {
-      state: "corrupt",
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
+/**
+ * A member's orchestrator lease.
+ *
+ * The lease is a store row keyed by task and located by worktree (bd-281), so this
+ * reads the store rather than an orchestrator lease inside that worktree; a
+ * corrupt row is still reported as corrupt instead of as "absent".
+ */
+function readLeaseSnapshot(worktreePath: string): FleetLeaseSnapshot {
+  const read = readOrchestratorClaim({ worktreePath });
+  if (read.kind === "absent") return { state: "absent" };
+  if (read.kind === "corrupt") return { state: "corrupt", error: read.error };
+  return { state: "held", claim: read.claim };
 }
 
 /**
@@ -2764,7 +2777,7 @@ function readLeaseSnapshot(fs: FleetStatusFs, worktreePath: string): FleetLeaseS
 /** One member worktree as the capacity arithmetic needs it. */
 interface FleetWorktreeEvidence {
   path: string;
-  /** Whether `.belayd/workflow.json` exists, readable or corrupt. */
+  /** Whether the workflow row exists, readable or corrupt. */
   workflowStatePresent: boolean;
   /** Run manifests read from the worktree; attributed per task id below. */
   runs: readonly RunManifest[];
@@ -2846,33 +2859,18 @@ function leaseProbeOf(worktreePath: string | undefined, now: number): FleetMembe
 }
 
 /**
- * Fleet directory names under `<git-common-dir>/belayd/fleet`, code-unit sorted.
- *
- * A local listing, not `fleet-mode.listFleetIds`: that seam speaks the write-side
- * `FleetStateFs`, and widening this reader's read-only fs just to enumerate a
- * directory would drag the state writer's surface into the status path.
- */
-function fleetDirectoryIds(fs: FleetStatusFs, gitCommonDir: string): readonly string[] {
-  const root = join(gitCommonDir, "belayd", "fleet");
-  try {
-    if (!fs.existsSync(root)) return [];
-    return [...fs.readdirSync(root)].sort(compareCodeUnits);
-  } catch {
-    // An unreadable fleet root means "no fleet" for this reader: the status view
-    // must never throw, and the single-fleet view below still reports its intent.
-    return [];
-  }
-}
-
-/**
  * Every fleet's membership + liveness, for the capacity block (bd-166).
  *
- * One intent read per fleet directory plus one process snapshot for the whole view,
- * and the member's own worktree lease per member: the same evidence reconcile
- * trusts, so status and repair cannot disagree about what is running.
+ * The fleet set is the store's intent rows, not a directory listing: a fleet the
+ * operator launched has an intent row immediately, and none of its other facts
+ * (notes, audit, queue) live in a directory at all any more (bd-281). One intent
+ * read per fleet plus one process snapshot for the whole
+ * view, and the member's own worktree lease per member: the same evidence
+ * reconcile trusts, so status and repair cannot disagree about what is running.
  */
 function readFleetCapacity(options: {
   fs: FleetStatusFs;
+  store: RepoStateStore | null;
   gitCommonDir: string;
   targetFleetId: string;
   targetIntent: FleetIntent | undefined;
@@ -2888,14 +2886,9 @@ function readFleetCapacity(options: {
 }): FleetCapacityInput {
   const fleets: FleetCapacityFleetInput[] = [];
   let sawTarget = false;
-  for (const directoryId of fleetDirectoryIds(options.fs, options.gitCommonDir)) {
-    const fleetId = sanitizeFleetId(directoryId);
-    const intent =
-      fleetId === options.targetFleetId
-        ? options.targetIntent
-        : readFleetIntentFile(options.fs, options.gitCommonDir, fleetId);
-    if (fleetId === options.targetFleetId) sawTarget = true;
-    if (intent === undefined) continue;
+  const listed = options.store?.listFleets();
+  const fleetIds = listed?.ok === true ? listed.value : [];
+  const pushFleet = (fleetId: string, intent: FleetIntent): void => {
     fleets.push(
       capacityFleetInput({
         fleetId,
@@ -2911,28 +2904,34 @@ function readFleetCapacity(options: {
         ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
       }),
     );
+  };
+  for (const directoryId of fleetIds) {
+    const fleetId = sanitizeFleetId(directoryId);
+    if (fleetId === options.targetFleetId) sawTarget = true;
+    const intent = capacityIntentOf(options, fleetId);
+    if (intent !== undefined) pushFleet(fleetId, intent);
   }
-  // The root listing can be unreadable (or absent in an in-memory fs) while the
-  // requested intent itself read fine; the arithmetic must still describe the
-  // fleet the operator asked about.
+  // A store that cannot be opened leaves the target fleet's own intent as the only
+  // fleet the arithmetic can describe; the requested intent still read fine, so the
+  // view must report the fleet the operator asked about.
   if (!sawTarget && options.targetIntent !== undefined) {
-    fleets.push(
-      capacityFleetInput({
-        fleetId: options.targetFleetId,
-        gitCommonDir: options.gitCommonDir,
-        intent: options.targetIntent,
-        worktrees: options.worktrees,
-        scan: options.scan,
-        now: options.now,
-        leaseFor: options.leaseFor,
-        branchExistsFor: options.branchExistsFor,
-        supervisorLiveness: options.supervisorLiveness,
-        fs: options.fs,
-        ...(options.onWarning === undefined ? {} : { onWarning: options.onWarning }),
-      }),
-    );
+    pushFleet(options.targetFleetId, options.targetIntent);
   }
   return { ceiling: FLEET_MAX_CONCURRENT_ORCHESTRATORS, fleets };
+}
+
+/** One fleet's intent for the capacity view: the target's, or a store read. */
+function capacityIntentOf(
+  options: {
+    store: RepoStateStore | null;
+    targetFleetId: string;
+    targetIntent: FleetIntent | undefined;
+  },
+  fleetId: string,
+): FleetIntent | undefined {
+  if (fleetId === options.targetFleetId) return options.targetIntent;
+  if (options.store === null) return undefined;
+  return readFleetIntentRow(options.store, fleetId);
 }
 
 /** One member's liveness, from the worktree, lease, landing and spawn evidence. */
@@ -3078,11 +3077,21 @@ export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatu
   const commonDirResult = resolveCommonDir(options.cwd);
   if (!commonDirResult.ok) return { ok: false, error: commonDirResult.error };
 
+  // One store handle for the whole view: the intent row and the fleet set both
+  // come from it, so the header and the capacity arithmetic cannot disagree about
+  // which fleet exists.
+  const store = fleetReaderStore(fs, commonDirResult.commonDir);
+
   const worktreeResult = listWorktrees(options.cwd);
   if (!worktreeResult.ok) return { ok: false, error: worktreeResult.error };
 
-  const intent = readFleetIntentFile(fs, commonDirResult.commonDir, fleetId);
-  const members = worktreeResult.entries.map((entry) => readMemberSnapshot(fs, entry));
+  const intent = store === null ? undefined : readFleetIntentRow(store, fleetId);
+  const readWorkflow =
+    options.readWorkflowState ?? ((cwd: string) => readWorkflowStateSnapshot({ cwd }));
+  const listMemberRuns = options.listMemberRuns ?? ((cwd: string) => listRuns({ cwd }));
+  const members = worktreeResult.entries.map((entry) =>
+    readMemberSnapshot(fs, entry, readWorkflow, listMemberRuns),
+  );
   const worktreeWarnings: FleetWarning[] = worktreeResult.warnings.map((message) => ({
     kind: "unparsed-worktree-path",
     message,
@@ -3096,6 +3105,7 @@ export function readFleetStatus(options: ReadFleetStatusOptions): ReadFleetStatu
   const markerWarnings: FleetWarning[] = [];
   const capacity = readFleetCapacity({
     fs,
+    store,
     gitCommonDir: commonDirResult.commonDir,
     targetFleetId: fleetId,
     targetIntent: intent,

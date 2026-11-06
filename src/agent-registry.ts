@@ -44,14 +44,20 @@ export interface GateOptions {
   /** When false, the proof gate passes without artifacts (workflow declares proof optional). */
   proofRequired?: boolean;
   /**
+   * The bead the gate is running for. It is the receipt row's identity and wins
+   * over the proof dir's basename, so the gate reads the row the caller named
+   * rather than one inferred from a directory name (bd-281).
+   */
+  taskId?: string;
+  /**
    * Epoch ms when the phase run that produced this output started. The proof
    * gate uses it as a freshness floor for artifacts recovered from the task dir,
    * so a retry cannot pass on a previous attempt's leftovers.
    */
   proofRunStartMs?: number;
   /**
-   * Reads the workspace proof receipt for the proof gate. Defaults to the real
-   * file reader; tests inject a seam so the receipt branch needs no filesystem.
+   * Reads the stored proof receipt for the proof gate. Defaults to the real
+   * store reader; tests inject a seam so the receipt branch needs no database.
    */
   readProofReceipt?: ProofReceiptReader;
   /**

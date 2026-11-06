@@ -109,17 +109,18 @@ export function registerAgentPhaseTools(deps: AgentPhaseToolsDeps): void {
 }
 
 /**
- * One line naming the manifests another bead left in `.belayd/runs` (bd-242).
+ * One line naming the manifests another bead wrote into the shared run rows
+ * (bd-242).
  *
  * They are reported rather than silently dropped: an operator looking at run
- * history should see why a run they remember is not there, and see that the
- * worktree was provisioned from a checkout that had its own runs.
+ * history should see why a run they remember is not there, and see that the row
+ * belongs to another bead.
  */
 function formatForeignRunsNotice(foreign: readonly RunManifest[]): string {
   const taskIds = [...new Set(foreign.map((run) => run.taskId))].sort();
   return (
-    `**Foreign runs ignored** — ${foreign.length} manifest(s) in \`.belayd/runs\` belong to ` +
-    `another task (${taskIds.join(", ")}); inherited state, not this session's history.`
+    `**Foreign runs ignored** — ${foreign.length} manifest(s) in the repository's run rows ` +
+    `belong to another task (${taskIds.join(", ")}); another bead's state, not this session's history.`
   );
 }
 
@@ -127,11 +128,11 @@ function formatForeignRunsNotice(foreign: readonly RunManifest[]): string {
  * The run-history sections for this session's bead, plus the notices for the
  * manifests it cannot claim.
  *
- * A fresh worktree inherits `.belayd/runs` from the primary checkout
- * (`wt step copy-ignored`), so the table must be this bead's runs only (bd-242).
- * With no task id nothing can be attributed — and the pre-start window is exactly
- * where an inherited directory would otherwise be presented as this session's
- * history — so the manifests are named as unattributable instead of listed.
+ * The run rows are shared by every worktree of the repository, so the table must
+ * be this bead's runs only (bd-242). With no task id nothing can be attributed —
+ * and the pre-start window is exactly where another bead's rows would otherwise be
+ * presented as this session's history — so the manifests are named as
+ * unattributable instead of listed.
  */
 function formatRunHistorySections(taskId: string, runs: readonly RunManifest[]): string[] {
   if (taskId === "") return runs.length === 0 ? [] : [formatUnattributedRunsNotice(runs)];
@@ -162,7 +163,7 @@ function formatRunHistorySections(taskId: string, runs: readonly RunManifest[]):
 function formatUnattributedRunsNotice(runs: readonly RunManifest[]): string {
   return (
     `**Run history not shown** — no task id is recorded, so the ${runs.length} manifest(s) in ` +
-    "`.belayd/runs` cannot be attributed to this session."
+    "the repository's run rows cannot be attributed to this session."
   );
 }
 

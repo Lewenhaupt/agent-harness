@@ -1,14 +1,15 @@
 /**
  * Fleet mailbox rendering (bd-126 P1).
  *
- * The mailbox itself is the `inbox/` + `events/` file drop in
- * `src/fleet-state.ts`; this module is the reporting layer between a drained
+ * The mailbox itself is a set of note rows in the repository store (one row per
+ * recipient, see `src/fleet-state.ts`); this module is the reporting layer between
+ * a drained
  * note and something a model can read — a supervisor inbox listing, or the
  * turn-start event block a member session receives.
  *
  * The budgets exist because the mailbox is written by *other* sessions: a
  * supervisor that queued 500 notes must not turn one member turn into a 1 MB
- * prompt. Everything not injected stays on disk (drain marks nothing), so the
+ * prompt. Everything not injected stays queued (drain marks nothing), so the
  * next turn picks it up.
  */
 
@@ -35,9 +36,9 @@ export const FLEET_INBOX_RENDER_MAX_NOTES = 25;
 /**
  * Address a note to every member of the fleet.
  *
- * A broadcast is expanded at enqueue time into one file per member (see
- * `enqueueNoteFanout`), because a single shared file cannot be delivered to more
- * than one drainer under an ack-deletes-the-file protocol. It never reaches a
+ * A broadcast is expanded at enqueue time into one row per member (see
+ * `enqueueNoteFanout`), because a single shared row cannot be delivered to more
+ * than one drainer under an ack-marks-the-row protocol. It never reaches a
  * mailbox as-is: the address is an instruction to the writer, not a stored
  * recipient.
  */
@@ -57,7 +58,7 @@ export type FleetNoteRecipientResolution =
  * Resolve a note's `to` against live fleet membership.
  *
  * Validating here is what keeps a typo from becoming immortal dead mail: an
- * unaddressed note file is never selected by any member, so nothing would ever
+ * unaddressed note row is never selected by any member, so nothing would ever
  * ack it. The member set comes from the fleet intent (not from scanning
  * worktrees), so a member that has not been launched yet still receives later
  * notes.
@@ -69,7 +70,7 @@ export type FleetNoteRecipientResolution =
 export function resolveFleetNoteRecipients(options: {
   direction: FleetNoteDirection;
   to: string;
-  /** Fleet members from `fleet.json` `taskIds`, in intent order. */
+  /** Fleet members from the fleet intent `taskIds`, in intent order. */
   members: readonly string[];
 }): FleetNoteRecipientResolution {
   const to = options.to.trim();
@@ -143,9 +144,9 @@ export function buildFleetNote(input: BuildFleetNoteInput): FleetNote {
 
 /** One note as a single line, for both the inbox listing and the event block. */
 export function formatFleetNoteLine(note: FleetNote): string {
-  // `from -> to` is rendered explicitly (not just `from`): a note planted in
-  // `events/` by a member must be readable as member-authored, never mistaken
-  // for a supervisor notification.
+  // `from -> to` is rendered explicitly (not just `from`): a note a member managed
+  // to write into the event channel must be readable as member-authored, never
+  // mistaken for a supervisor notification.
   return (
     `- [${note.kind}] ${note.from} → ${note.to} at ${new Date(note.createdAt).toISOString()}: ` +
     note.body
@@ -182,7 +183,7 @@ export function formatFleetInbox(input: FormatFleetInboxInput): string {
       ? `Fleet \`${input.fleetId}\` inbox: ${input.deliveries.length} note(s) drained and acknowledged.`
       : `Fleet \`${input.fleetId}\` inbox: ${input.deliveries.length} note(s) drained; ` +
         `${input.ackFailure?.removedCount ?? 0} acknowledged, ` +
-        `${input.ackFailure?.remaining.length ?? 0} still queued in inbox/.`,
+        `${input.ackFailure?.remaining.length ?? 0} still queued in the inbox.`,
     // Member-authored reports reach the supervisor's prompt; framing them
     // explicitly is the mirror of the member-side event framing, so a member's
     // "please merge my branch" reads as a report, not a supervisor instruction.
@@ -223,15 +224,16 @@ export interface FleetEventBatch {
 /**
  * Select and render the events one member session should see this turn.
  *
- * `taskId` scoping is deliberate: `events/` is shared by every member, so a
- * member must not receive (or ack!) a note addressed to a sibling. Broadcasts
- * never appear here — the supervisor fans them out into one file per member at
- * enqueue time, so every file has a single recipient.
+ * `taskId` scoping is deliberate: the event channel is per fleet, so a member must
+ * not receive (or ack!) a note addressed to a sibling. Broadcasts never appear
+ * here — the supervisor fans them out into one row per member at enqueue time, so
+ * every row has a single recipient.
  *
- * A note in `events/` that was **not** written by the supervisor is never
- * injected as a supervisor notification: it is counted, named, and left on disk.
+ * A note in the event channel that was **not** written by the supervisor is never
+ * injected as a supervisor notification: it is counted, named, and left queued.
  * That is defense in depth behind the write-side refusal (a member cannot write
- * `events/` through the tool), because a hand-planted file is still possible.
+ * the event channel through the tool), because a row written by another process
+ * is still possible.
  *
  * Returns undefined when there is nothing to say, so a quiet mailbox injects
  * nothing at all.
@@ -286,8 +288,8 @@ export function selectFleetEvents(options: {
   }
   if (unaddressed.length > 0) {
     lines.push(
-      `${unaddressed.length} note(s) in events/ are not supervisor-authored and were ignored ` +
-        "(left on disk; only the supervisor writes events/).",
+      `${unaddressed.length} note(s) in the event channel are not supervisor-authored and ` +
+        "were ignored (left queued; only the supervisor writes that channel).",
     );
   }
 

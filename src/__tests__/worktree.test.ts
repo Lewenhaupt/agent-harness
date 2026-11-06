@@ -389,7 +389,10 @@ describe("setupWorktree", () => {
     expect(gitCalls).toContainEqual(["branch", "--set-upstream-to=main", "feat/bd-42"]);
   });
 
-  it("prunes run manifests inherited from the primary checkout (bd-242)", () => {
+  it("does not prune any run manifest: they are store rows now (bd-281)", () => {
+    // `wt step copy-ignored` still copies `.belayd/` into a new worktree, but run
+    // manifests are no longer files there: one repository store holds them, keyed by
+    // run id and filtered by task id, so there is nothing inherited to delete.
     mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
     mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
     mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
@@ -398,121 +401,6 @@ describe("setupWorktree", () => {
     const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
 
     expect(result).toBe("/repo/feat");
-    // `wt step copy-ignored` copies `.belayd/` into the new tree, so the bead's
-    // run directory would otherwise still hold the previous bead's manifests.
-    expect(deps.pruneForeignRuns).toHaveBeenCalledWith({
-      worktreePath: "/repo/feat",
-      taskId: "bd-42",
-    });
-  });
-
-  it("does not prune an already-registered worktree's own runs", () => {
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // resolveWorktreePath → found
-
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, deps);
-
-    expect(result).toBe("/repo/feat");
-    expect(deps.pruneForeignRuns).not.toHaveBeenCalled();
-  });
-
-  it("does not prune a branch that carries no bead id", () => {
-    const noBeadPorcelain = [
-      "worktree /repo/main",
-      "branch refs/heads/main",
-      "",
-      "worktree /repo/no-bead",
-      "branch refs/heads/feat/no-bead",
-      "",
-    ].join("\n");
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
-    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
-    mockedExecSync.mockReturnValueOnce(noBeadPorcelain); // final resolveWorktreePath → found
-    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
-
-    const result = setupWorktree("/repo", { branch: "feat/no-bead" }, deps);
-
-    expect(result).toBe("/repo/no-bead");
-    // No task id means no ownership claim, so nothing is deleted.
-    expect(deps.pruneForeignRuns).not.toHaveBeenCalled();
-  });
-
-  it("reports a multi-dot sub-bead branch as its own bead (bd-242 review)", () => {
-    const deepPorcelain = [
-      "worktree /repo/main",
-      "branch refs/heads/main",
-      "",
-      "worktree /repo/deep",
-      "branch refs/heads/feat/bd-42.1.2",
-      "",
-    ].join("\n");
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
-    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
-    mockedExecSync.mockReturnValueOnce(deepPorcelain); // final resolveWorktreePath → found
-    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
-
-    setupWorktree("/repo", { branch: "feat/bd-42.1.2" }, deps);
-
-    // A second-level sub-bead has its own bead id, so it prunes like any other.
-    expect(deps.pruneForeignRuns).toHaveBeenCalledWith({
-      worktreePath: "/repo/deep",
-      taskId: "bd-42.1.2",
-    });
-  });
-
-  it("warns about inherited manifests it could not delete", () => {
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
-    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
-    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
-    const pruneForeignRuns = vi.fn(() => ({
-      removed: ["mthosemh"],
-      failed: [{ runId: "stuck", error: "EBUSY" }],
-      unattributable: [],
-    }));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    setupWorktree("/repo", { branch: "feat/bd-42" }, { ...deps, pruneForeignRuns });
-
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("mthosemh"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("stuck (EBUSY)"));
-    warn.mockRestore();
-  });
-
-  it("warns about manifests it could not attribute instead of leaving them silent", () => {
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
-    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
-    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
-    const pruneForeignRuns = vi.fn(() => ({
-      removed: [],
-      failed: [],
-      // Unparseable and mismatched entries are never deleted, so the only signal
-      // that they exist is this warning (bd-242 review).
-      unattributable: ["aaa", "corrupt"],
-    }));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    setupWorktree("/repo", { branch: "feat/bd-42" }, { ...deps, pruneForeignRuns });
-
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("aaa, corrupt"));
-    warn.mockRestore();
-  });
-
-  it("does not fail when pruning the inherited runs fails", () => {
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_WITHOUT_FEAT); // resolveWorktreePath → undefined
-    mockedExecFileSync.mockReturnValueOnce("").mockReturnValueOnce(""); // branch --list, wt switch
-    mockedExecSync.mockReturnValueOnce(PORCELAIN_SINGLE); // final resolveWorktreePath → found
-    mockedExistsSync.mockReturnValueOnce(false); // directory does not exist
-    const pruneForeignRuns = vi.fn(() => {
-      throw new Error("readdir failed");
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    const result = setupWorktree("/repo", { branch: "feat/bd-42" }, { ...deps, pruneForeignRuns });
-
-    expect(result).toBe("/repo/feat");
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
   });
 
   it("does not fail when stack capture fails", () => {

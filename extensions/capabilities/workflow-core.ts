@@ -246,7 +246,7 @@ const MAX_EPOCH_ADVANCES = 1000;
 /**
  * Bead whose run manifests a directory's handoff settle may touch, or undefined.
  *
- * Completion clears `.belayd/workflow.json`, so a restarted caller's only
+ * Completion clears the workflow row, so a restarted caller's only
  * surviving record can be its branch (bd-242 review). Undefined means no owner is
  * known, and a settle with no owner must write nothing: a copy-ignored tree holds
  * the primary checkout's runs, so flipping an unattributed manifest would be a
@@ -309,7 +309,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     pi.sendMessage({ customType: "belayd-error", content: message, display: true });
   }
 
-  /** Build the workflow.json identity payload for a freshly-activated gate. */
+  /** Build the workflow-row identity payload for a freshly-activated gate. */
   function buildPersistedWorkflowState(options: {
     state: CoreSessionState;
     taskId: string;
@@ -412,8 +412,9 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       // A stale marker wins over the phase ledger on resume, so a silent failure
       // would make the restarted session refuse to drive the NEW task.
       reportHandoffProblem(
-        `Belayd could not clear the handoff marker in ${cwd}/.belayd/workflow.json ` +
-          `(${clearedMarker.error}); a restart may refuse to resume ${taskId} until it is removed.`,
+        `Belayd could not clear the handoff marker in the shared repository store ` +
+          `(${clearedMarker.error}); a restart may refuse to resume ${taskId} until ` +
+          `<git-common-dir>/belayd/state.sqlite is writable.`,
       );
     }
     // The caller-scoped marker is authoritative on resume, so it must be gone
@@ -425,7 +426,8 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     if (!clearedCallerMarker.ok) {
       reportHandoffProblem(
         `Belayd could not clear this session's handoff marker (${clearedCallerMarker.error}); ` +
-          `a restart may refuse to resume ${taskId} until ${cwd}/.belayd/handoff-<session>.json is removed.`,
+          `a restart may refuse to resume ${taskId} until the shared repository store is writable again ` +
+          `(<git-common-dir>/belayd/state.sqlite).`,
       );
     }
     state.proofBase = undefined;
@@ -1055,7 +1057,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
   /**
    * Restore the bead identity of a session that lost it across a restart.
    *
-   * Completion deletes `.belayd/workflow.json` and `session_start` clears the
+   * Completion deletes the workflow row and `session_start` clears the
    * in-memory task id, so a resumed orchestrator came back with no identity and
    * every phase tool died in subagent session naming with the raw
    * `taskId must be a non-empty string` — which killed the post-completion
@@ -1246,7 +1248,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     state.consultPhases = WORKFLOW_REGISTRY[state.workflowType].consultPhases ?? [];
     state.completedPhaseNames = [...persisted.completedPhaseNames];
     // Re-read the parent's handoff so a restart/compaction re-injects it; the
-    // packet lives beside workflow.json rather than inside it (bd-121). A
+    // packet lives beside the workflow row rather than inside it (bd-121). A
     // packet for a different task is stale (worktree reused) and must not be
     // injected into this workflow.
     const handoff = readHandoff({ cwd });
@@ -1257,8 +1259,8 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     applyToolGate(state);
 
     // Surface any phase runs that died with the previous orchestrator. Only this
-    // bead's own manifests count: a fresh worktree inherits `.belayd/runs` from the
-    // primary checkout, and flipping (or reporting) another bead's manifest would
+    // bead's own manifests count: run rows are shared by every worktree of the
+    // repository, and flipping (or reporting) another bead's manifest would
     // attribute that bead's crashed run to this workflow (bd-242).
     const interrupted = scanForInterruptedRuns({ cwd, taskId: persisted.taskId });
     if (interrupted.length > 0) {
@@ -1271,8 +1273,8 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
   /**
    * Archive a persisted workflow this session will not drive (bd-165).
    *
-   * Renaming keeps the dead record diagnosable while freeing the worktree, so
-   * the next session neither claims a lease from it nor re-arms its gate.
+   * Discarding the record frees the worktree, so the next session neither claims a
+   * lease from it nor re-arms its gate; the store keeps the row's history.
    */
   function archiveInertWorkflow(cwd: string, taskId: string): void {
     const archived = archiveWorkflowState({ cwd });
@@ -1282,13 +1284,12 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       );
       return;
     }
-    // A no-op means the file is already gone, so there is nothing to report.
+    // A no-op means the record is already gone, so there is nothing to report.
     if (!archived.archived) return;
-    // Name the archive path so the operator can find the diagnosis record
-    // without listing `.belayd/`. This runs once per inert file: the rename
-    // removes the source, so a later session cannot log it again.
+    // The record is deleted, not copied: keeping an archive of executable state is
+    // the bd-165 bug. Name the task so the operator knows what was discarded.
     console.warn(
-      `[belayd-harness] archived the inert workflow state for ${taskId} at ${archived.archivedPath}`,
+      `[belayd-harness] discarded the inert workflow state for ${taskId} (shared repository store)`,
     );
   }
 
@@ -1298,7 +1299,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
    * reaches this helper because its session has no workflow state file.
    */
   function resumeWorkflowFromDisk(state: CoreSessionState, cwd: string, sessionKey: string): void {
-    // The caller-scoped marker wins over any workflow.json: a same-directory
+    // The caller-scoped marker wins over any workflow row: a same-directory
     // handoff cannot store the marker in the shared state file (the child owns
     // it), so this file is the only reliable record for THIS session.
     const callerMarker = readCallerHandoff({ cwd, sessionKey });
@@ -1325,7 +1326,7 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       // No same-directory-child exemption is needed here: `persistHandoffMarkers`
       // writes `handedOffTo` only onto the caller's own cross-worktree state and
       // skips `saveHandedOffMarker` when the child shares this directory, so a
-      // live child's workflow.json never carries this marker at all.
+      // live child's workflow row never carries this marker at all.
       archiveInertWorkflow(cwd, persisted.taskId);
       return;
     }

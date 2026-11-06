@@ -2,7 +2,7 @@
  * Cooperative fleet pause and resume (bd-126 P4).
  *
  * A pause is **operator intent stored in the intent record**, not a supervisor
- * loop: `fleet.json` `paused` is what every starting action checks — a launch
+ * loop: the fleet intent `paused` is what every starting action checks — a launch
  * refuses (see `planFleetLaunch`), a merge drain refuses (`fleet-paused`) — so the
  * fleet stops starting new work the moment the flag is written. A parked fleet
  * (base restore conflicted) is paused for the same reason plus a recorded stash.
@@ -15,7 +15,7 @@
  * signal does and does not guarantee).
  *
  * **Resume is the only writer that clears `paused`.** Before P4 nothing cleared
- * it, so un-parking meant hand-editing `fleet.json`. Every mutation here goes
+ * it, so un-parking meant hand-editing the fleet intent. Every mutation here goes
  * through the compare-and-replace path (`updateFleetIntent`) so a concurrent
  * operator note or member prune is never silently lost.
  */
@@ -49,7 +49,7 @@ function audit(options: {
   });
   return appended.ok
     ? undefined
-    : `fleet ${options.fleetId}: could not append to audit.log (${appended.error})`;
+    : `fleet ${options.fleetId}: could not append the audit entry (${appended.error})`;
 }
 
 export interface PauseFleetInput {

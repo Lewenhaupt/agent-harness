@@ -1,20 +1,34 @@
 /**
  * Run manifests for individual phase-agent executions.
  *
- * Each phase-tool execution records a manifest in `.belayd/runs/<runId>.json`
- * so a crash mid-run can be detected on the next session start: any manifest
- * still marked "running" is flipped to "interrupted" and surfaced to the
- * orchestrator instead of silently disappearing.
+ * Each phase-tool execution records a manifest row in the per-repository execution
+ * store (bd-281, table `run_manifest`, keyed by run id) so a crash mid-run can be
+ * detected on the next session start: any manifest still marked "running" is
+ * flipped to "interrupted" and surfaced to the orchestrator instead of silently
+ * disappearing.
+ *
+ * The store replaced `.belayd/runs/<runId>.json`. That directory was *copied* into
+ * every new worktree by worktrunk's `copy-ignored` step, which is why readers had
+ * to filter inherited manifests by task id and a worktree creation had to prune
+ * them (bd-242). With one row per run in the repository-scoped store there is
+ * nothing to copy and nothing to prune: a run belongs to the bead it names, and
+ * `listRuns({taskId})` is still the filter.
+ *
+ * The read-modify-write helpers now run inside one store transaction, which is the
+ * compare-and-set the file version never had: two writers can no longer interleave
+ * a read and a write and lose each other's fields.
  */
 
-import * as nodeFs from "node:fs";
-import { join } from "node:path";
 import { z } from "zod";
-
 import { ModelTelemetryTotalsSchema } from "./model-telemetry.js";
 import { isSameOrDescendantTask } from "./owned-worktree.js";
+import {
+  type RepoRunRow,
+  type RepoStateResult,
+  type RepoStateStore,
+  sharedRepoStateStore,
+} from "./repo-state-store.js";
 import type { SkippedModel } from "./spawn-with-fallback.js";
-import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
 export enum RunStatus {
   Running = "running",
@@ -26,14 +40,14 @@ export enum RunStatus {
 const SCHEMA_VERSION = 1;
 
 /**
- * Run ids name a file inside `.belayd/runs`, so they must stay one path segment:
- * no separators, no `.`/`..`.
+ * Run ids name a row key and a session-name segment, so they must stay one path
+ * segment: no separators, no `.`/`..`.
  *
- * The write path is derived from the manifest's `runId`, so an unconstrained one
- * would let a crafted inherited manifest point a write or an unlink outside the
- * runs directory. `readRunManifest` additionally refuses a body that names a
- * different file, so a read-modify-write reads and writes the same one (bd-242
- * review).
+ * The key is derived from the manifest's `runId`, and the id also reaches a
+ * spawned session's name (a name with a separator would address a different
+ * workflow), so an unconstrained id is refused before it becomes a key.
+ * `manifestFromRow` additionally refuses a row whose body names another id, so a
+ * read-modify-write reads and writes the same row (bd-242 review).
  */
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
@@ -91,114 +105,78 @@ const RunManifestSchema = z.object({
 
 export type RunManifest = z.infer<typeof RunManifestSchema>;
 
-/** Workflow fs seam plus the directory listing that run manifests need. */
-export interface RunManifestFs extends WorkflowFs {
-  readdirSync(path: string): string[];
+/**
+ * Test seam shared by every helper: pass an opened store instead of the module's
+ * shared one. Production callers omit it.
+ */
+export interface RunManifestStoreSeam {
+  store?: RepoStateStore;
 }
 
-export interface WriteRunManifestOptions {
+export interface WriteRunManifestOptions extends RunManifestStoreSeam {
   cwd: string;
   manifest: RunManifest;
-  fs?: RunManifestFs;
 }
 
-export interface ReadRunManifestOptions {
+export interface ReadRunManifestOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
-  fs?: RunManifestFs;
 }
 
-export interface SetRunStatusOptions {
+export interface SetRunStatusOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
   status: RunStatus;
   exitCode?: number;
   failureReason?: string;
-  fs?: RunManifestFs;
   now?: () => number;
 }
 
-export interface ListRunsOptions {
+export interface ListRunsOptions extends RunManifestStoreSeam {
   cwd: string;
   /**
    * Only manifests belonging to this bead (or one of its sub-beads).
    *
-   * `.belayd/` is gitignored and worktrunk's `copy-ignored` step copies it into
-   * every new worktree, so `.belayd/runs` can hold another bead's manifests
-   * (bd-242). A caller that names its bead gets its own runs instead of the
-   * directory's contents.
+   * Run rows are shared by every worktree of the repository, so they also hold
+   * another bead's manifests (bd-242). A caller that names its bead gets its own
+   * runs instead of every worktree's.
    */
   taskId?: string;
-  fs?: RunManifestFs;
 }
 
-export interface CompleteRunByUserOptions {
+export interface CompleteRunByUserOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
   report: string;
-  fs?: RunManifestFs;
   now?: () => number;
 }
 
-export interface MarkRunDeliveredOptions {
+export interface MarkRunDeliveredOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
-  fs?: RunManifestFs;
   now?: () => number;
 }
 
-export interface ListPendingUserCompletionsOptions {
+export interface ListPendingUserCompletionsOptions extends RunManifestStoreSeam {
   cwd: string;
   /** Restrict the scan to this bead's own manifests (see {@link ListRunsOptions}). */
   taskId?: string;
-  fs?: RunManifestFs;
 }
 
-export interface ScanForInterruptedRunsOptions {
+export interface ScanForInterruptedRunsOptions extends RunManifestStoreSeam {
   cwd: string;
   /** Restrict the scan to this bead's own manifests (see {@link ListRunsOptions}). */
   taskId?: string;
-  fs?: RunManifestFs;
   now?: () => number;
 }
 
-export interface PruneForeignRunsOptions {
-  cwd: string;
-  /**
-   * The bead this worktree belongs to. Its own and its sub-beads' manifests
-   * survive; anything else is inherited state, not this worktree's history.
-   */
-  taskId: string;
-  fs?: RunManifestFs;
-}
-
-/** Outcome of a prune: what went away, what could not, and what it left alone. */
-export interface PruneForeignRunsResult {
-  /** Ids whose manifest file was deleted (sorted). */
-  removed: string[];
-  /**
-   * Foreign manifests that are still there, with the failure reason.
-   *
-   * Reported per file instead of aborting the prune: one undeletable manifest
-   * must not leave the rest of the inherited runs in place.
-   */
-  failed: { runId: string; error: string }[];
-  /**
-   * Files the prune could not attribute (see {@link RunFileListing}): unsafe ids,
-   * body/filename mismatches and unparseable JSON. Never deleted, so the caller
-   * can warn that they are accumulating.
-   */
-  unattributable: string[];
-}
-
-export interface SetRunTelemetryOptions {
+export interface SetRunTelemetryOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
   telemetry: RunTelemetryTotals;
-  fs?: RunManifestFs;
 }
 
-export interface SetRunModelSelectionOptions {
+export interface SetRunModelSelectionOptions extends RunManifestStoreSeam {
   cwd: string;
   runId: string;
   /**
@@ -211,39 +189,32 @@ export interface SetRunModelSelectionOptions {
   requestedModel: string;
   /** Candidates skipped before dispatch (possibly empty). */
   skippedModels?: SkippedModel[];
-  fs?: RunManifestFs;
 }
 
-/**
- * Production fs seam. Exported so other read-only aggregators (fleet status)
- * reuse one implementation instead of keeping a second copy that can drift.
- */
-export const runManifestFs: RunManifestFs = {
-  existsSync: (path) => nodeFs.existsSync(path),
-  readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
-  mkdirSync: (path, options) => nodeFs.mkdirSync(path, options),
-  unlinkSync: (path) => nodeFs.unlinkSync(path),
-  readdirSync: (path) => nodeFs.readdirSync(path),
-};
-
-export function runsDir(cwd: string): string {
-  return join(cwd, ".belayd", "runs");
+/** Forwarded `taskId` for the option sets that extend the runs listing. */
+function taskFilter(options: { taskId?: string }): { taskId?: string } {
+  return options.taskId === undefined ? {} : { taskId: options.taskId };
 }
 
-export function runManifestPath(cwd: string, runId: string): string {
-  return join(runsDir(cwd), `${runId}.json`);
+/** Forwarded store seam for helpers that call other helpers. */
+function storeSeam(options: RunManifestStoreSeam): RunManifestStoreSeam {
+  return options.store === undefined ? {} : { store: options.store };
 }
 
-/** Whether `runId` can name a file inside the runs directory (see {@link RUN_ID_PATTERN}). */
+/** The store for this call: the injected one, else the shared repository store. */
+function storeFor(options: RunManifestStoreSeam & { cwd: string }): RepoStateStore | null {
+  if (options.store !== undefined) return options.store;
+  return sharedRepoStateStore({ cwd: options.cwd }).store;
+}
+
+/** Whether `runId` can name a run row (see {@link RUN_ID_PATTERN}). */
 export function isSafeRunId(runId: string): boolean {
   return RUN_ID_PATTERN.test(runId);
 }
 
 /**
  * Whether a manifest is evidence about `taskId`: the same bead, or a sub-bead of
- * it (a sub-bead run can legitimately live in its parent's worktree).
+ * it (a sub-bead run legitimately names the parent's worktree).
  */
 export function runBelongsToTask(run: RunManifest, taskId: string): boolean {
   return isSameOrDescendantTask(run.taskId, taskId);
@@ -255,52 +226,90 @@ export function parseRunManifest(raw: unknown): RunManifest | undefined {
   return result.success ? result.data : undefined;
 }
 
+/** The manifest a store row holds, or undefined when the row does not parse. */
+function manifestFromRow(row: RepoRunRow | null): RunManifest | undefined {
+  if (row === null) return undefined;
+  const manifest = parseRunManifest(row.payload);
+  // The row key is the authority (bd-242): a payload naming another id would make
+  // every read-modify-write write a different row than the one it read.
+  return manifest?.runId === row.runId ? manifest : undefined;
+}
+
 export function writeRunManifest(
   options: WriteRunManifestOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
   if (!isSafeRunId(options.manifest.runId)) {
     return { ok: false, error: `unsafe run id "${options.manifest.runId}"` };
   }
-  return atomicWriteJson(
-    runManifestPath(options.cwd, options.manifest.runId),
-    options.manifest,
-    fs,
-  );
+  // The schema is the validation boundary on the way in: an invalid record must
+  // never become a row.
+  const manifest = parseRunManifest(options.manifest);
+  if (manifest === undefined) {
+    return {
+      ok: false,
+      error: `refusing to persist an invalid run manifest for ${options.manifest.runId}`,
+    };
+  }
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
+  }
+  const written = store.writeRun({ runId: manifest.runId, payload: manifest });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
 }
 
 export function readRunManifest(options: ReadRunManifestOptions): RunManifest | undefined {
-  const fs = options.fs ?? runManifestFs;
-  // A caller-supplied id is untrusted (a parsed session name, a daemon payload),
-  // so it is validated before it becomes a path.
+  // A caller-supplied id is untrusted (a parsed session name, a daemon payload), so
+  // it is validated before it becomes a key.
   if (!isSafeRunId(options.runId)) return undefined;
-  const filePath = runManifestPath(options.cwd, options.runId);
-  if (!fs.existsSync(filePath)) return undefined;
-  let text: string;
-  try {
-    text = fs.readFileSync(filePath);
-  } catch {
-    return undefined;
-  }
-  let manifest: RunManifest | undefined;
-  try {
-    manifest = parseRunManifest(JSON.parse(text));
-  } catch {
-    return undefined;
-  }
-  // The filename is the authority: a body naming another id would make every
-  // read-modify-write write a different file than the one it read, so a mismatch
-  // is as unusable as a corrupt body (bd-242 review).
-  return manifest?.runId === options.runId ? manifest : undefined;
+  const store = storeFor(options);
+  if (store === null) return undefined;
+  const row = store.readRun(options.runId);
+  if (!row.ok) return undefined;
+  return manifestFromRow(row.value);
 }
 
-/** Forwarded `taskId` for the option sets that extend the runs listing. */
-function taskFilter(options: { taskId?: string }): { taskId?: string } {
-  return options.taskId === undefined ? {} : { taskId: options.taskId };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/**
+ * Read-modify-write one run inside a single store transaction.
+ *
+ * This is the compare-and-set the file version never had: the update sees the row
+ * as it is *now*, so a status write and a telemetry write cannot lose each other.
+ */
+function mutateRunManifest(
+  options: RunManifestStoreSeam & { cwd: string; runId: string; now?: () => number },
+  update: (current: RunManifest) => RunManifest,
+): { ok: true } | { ok: false; error: string } {
+  if (!isSafeRunId(options.runId)) {
+    return { ok: false, error: `unsafe run id "${options.runId}"` };
+  }
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
+  }
+  const result: RepoStateResult<RepoRunRow | null> = store.mutateRun({
+    runId: options.runId,
+    ...(options.now === undefined ? {} : { nowMs: options.now() }),
+    update: (current) => {
+      const manifest = manifestFromRow(current);
+      if (manifest === undefined) {
+        return { kind: "skip" };
+      }
+      const next = parseRunManifest(update(manifest));
+      return next === undefined
+        ? {
+            kind: "conflict",
+            error: `the updated run manifest for ${options.runId} does not validate`,
+          }
+        : { kind: "write", payload: next };
+    },
+  });
+  if (!result.ok) return { ok: false, error: result.error };
+  // A row the record schema rejects is as unusable as a missing one (the file
+  // version behaved the same way for an unparseable body): never report success.
+  if (manifestFromRow(result.value) === undefined) {
+    return { ok: false, error: `No run manifest found for ${options.runId}` };
+  }
+  return { ok: true };
 }
 
 function terminalStatus(status: RunStatus): boolean {
@@ -318,132 +327,40 @@ function terminalStatus(status: RunStatus): boolean {
 export function setRunStatus(
   options: SetRunStatusOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
-  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
-  if (existing === undefined) {
-    return { ok: false, error: `No run manifest found for ${options.runId}` };
-  }
-  const updated: RunManifest = {
+  const atMs = (options.now ?? Date.now)();
+  return mutateRunManifest(options, (existing) => ({
     ...existing,
     status: options.status,
-    // Terminal statuses record completedAt; non-terminal transitions must drop
-    // any stale completedAt (JSON.stringify omits undefined) so a "running"
-    // manifest never carries a past completion timestamp.
-    completedAt: terminalStatus(options.status) ? (options.now ?? Date.now)() : undefined,
+    // Terminal statuses record completedAt; non-terminal transitions drop any
+    // stale completedAt so a "running" manifest never carries a past completion.
+    completedAt: terminalStatus(options.status) ? atMs : undefined,
     ...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
     // Only a Failed status carries a reason; a later Completed/Running/
-    // Interrupted transition must clear a stale one (the schema promises the
-    // field is absent outside failure).
+    // Interrupted transition must clear a stale one.
     failureReason: options.status === RunStatus.Failed ? options.failureReason : undefined,
-  };
-  return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
-}
-
-/** One manifest file, paired with the id its filename proves. */
-interface ListedRun {
-  /** The id the directory entry names — the authority for any later path. */
-  runId: string;
-  manifest: RunManifest;
-}
-
-/** A runs directory listing, split by what the filenames can attribute. */
-interface RunFileListing {
-  /** Entries that parsed and whose body names the file they live in. */
-  listed: ListedRun[];
-  /**
-   * `.json` entries nothing could attribute: unsafe ids, body/filename
-   * mismatches and unparseable JSON. They are invisible to every reader and safe
-   * to leave alone, so the count is what stops the directory silently
-   * accumulating junk (bd-242 review).
-   */
-  unattributable: string[];
+  }));
 }
 
 /**
- * The label an unattributable run file is reported under.
+ * List persisted runs sorted by start time.
  *
- * A file named exactly `.json` strips to an empty id, which renders as an
- * invisible token (`…: `) in the worktree warning, so it gets a visible label.
+ * Rows the record schema rejects are skipped rather than failing the listing, which
+ * is what the file version did for an unparseable file.
  */
-function unattributableName(runId: string): string {
-  return runId === "" ? "<unnamed>.json" : runId;
-}
-
-/**
- * Manifest files in the runs dir, sorted by run id.
- *
- * `readRunManifest` already refuses a body that names another file, so a listed
- * entry is always the file its id names; what it rejects is reported as
- * unattributable instead of listed or silently merged.
- */
-function listRunFiles(options: ListRunsOptions): RunFileListing {
-  const fs = options.fs ?? runManifestFs;
-  let entries: string[];
-  try {
-    entries = fs.readdirSync(runsDir(options.cwd));
-  } catch {
-    return { listed: [], unattributable: [] }; // missing runs dir is the initial (empty) state
-  }
-  const listing: RunFileListing = { listed: [], unattributable: [] };
-  for (const entry of entries) {
-    if (!entry.endsWith(".json")) continue;
-    const runId = entry.slice(0, -".json".length);
-    const manifest = readRunManifest({ cwd: options.cwd, runId, fs });
-    if (manifest === undefined) {
-      listing.unattributable.push(unattributableName(runId));
-      continue;
-    }
-    listing.listed.push({ runId, manifest });
-  }
-  listing.listed.sort((a, b) => (a.runId < b.runId ? -1 : a.runId > b.runId ? 1 : 0));
-  listing.unattributable.sort();
-  return listing;
-}
-
-/** List persisted runs sorted by start time; malformed files and non-.json entries are skipped. */
 export function listRuns(options: ListRunsOptions): RunManifest[] {
+  const store = storeFor(options);
+  if (store === null) return [];
+  const rows = store.listRuns();
+  if (!rows.ok) return [];
   const runs: RunManifest[] = [];
-  for (const { manifest } of listRunFiles(options).listed) {
+  for (const row of rows.value) {
+    const manifest = manifestFromRow(row);
+    if (manifest === undefined) continue;
     if (options.taskId !== undefined && !runBelongsToTask(manifest, options.taskId)) continue;
     runs.push(manifest);
   }
   runs.sort((a, b) => a.startedAt - b.startedAt);
   return runs;
-}
-
-/**
- * Delete run manifests that belong to another bead.
- *
- * Readers filter by task id (`listRuns`), but the files themselves are what a
- * caller that only counts `.belayd/runs` reads, so worktree creation drops the
- * inherited ones at the source: worktrunk's `copy-ignored` step copies
- * `.belayd/` from the primary checkout into every new worktree (bd-242).
- *
- * Only files this function could attribute are touched: an entry that does not
- * parse, whose body disagrees with its filename, or whose id cannot name a file
- * is left alone — `listRuns` already skips it, and deleting something this
- * function cannot attribute would be worse than ignoring it. Those entries are
- * reported as `unattributable` so the caller can warn instead of letting them
- * accumulate unnoticed.
- */
-export function pruneForeignRunManifests(options: PruneForeignRunsOptions): PruneForeignRunsResult {
-  const fs = options.fs ?? runManifestFs;
-  const { listed, unattributable } = listRunFiles({ cwd: options.cwd, fs });
-  const removed: string[] = [];
-  const failed: { runId: string; error: string }[] = [];
-  for (const { runId, manifest } of listed) {
-    if (runBelongsToTask(manifest, options.taskId)) continue;
-    // Delete the entry that was read, never a path derived from the body: the
-    // path's id is the filename's, so the unlink cannot leave the runs directory.
-    try {
-      fs.unlinkSync(runManifestPath(options.cwd, runId));
-    } catch (error) {
-      failed.push({ runId, error: errorMessage(error) });
-      continue;
-    }
-    removed.push(runId);
-  }
-  return { removed, failed, unattributable };
 }
 
 /**
@@ -455,36 +372,24 @@ export function pruneForeignRunManifests(options: PruneForeignRunsOptions): Prun
 export function completeRunByUser(
   options: CompleteRunByUserOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
-  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
-  if (existing === undefined) {
-    return { ok: false, error: `No run manifest found for ${options.runId}` };
-  }
-  const updated: RunManifest = {
+  return mutateRunManifest(options, (existing) => ({
     ...existing,
     status: RunStatus.Completed,
     completedAt: (options.now ?? Date.now)(),
     completionReport: options.report,
     completedBy: "user",
     failureReason: undefined,
-  };
-  return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
+  }));
 }
 
 /** Attach the current model-telemetry totals to a run manifest. */
 export function setRunTelemetry(
   options: SetRunTelemetryOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
-  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
-  if (existing === undefined) {
-    return { ok: false, error: `No run manifest found for ${options.runId}` };
-  }
-  return writeRunManifest({
-    cwd: options.cwd,
-    manifest: { ...existing, telemetry: options.telemetry },
-    fs,
-  });
+  return mutateRunManifest(options, (existing) => ({
+    ...existing,
+    telemetry: options.telemetry,
+  }));
 }
 
 /**
@@ -496,36 +401,24 @@ export function setRunTelemetry(
 export function setRunModelSelection(
   options: SetRunModelSelectionOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
-  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
-  if (existing === undefined) {
-    return { ok: false, error: `No run manifest found for ${options.runId}` };
-  }
-  return writeRunManifest({
-    cwd: options.cwd,
-    manifest: {
-      ...existing,
-      // `model` means "the model that served this run", so a run that spawned
-      // nothing leaves it as it was rather than inventing a server.
-      ...(options.model !== undefined ? { model: options.model } : {}),
-      requestedModel: options.requestedModel,
-      ...(options.skippedModels !== undefined ? { skippedModels: options.skippedModels } : {}),
-    },
-    fs,
-  });
+  return mutateRunManifest(options, (existing) => ({
+    ...existing,
+    // `model` means "the model that served this run", so a run that spawned
+    // nothing leaves it as it was rather than inventing a server.
+    ...(options.model !== undefined ? { model: options.model } : {}),
+    requestedModel: options.requestedModel,
+    ...(options.skippedModels !== undefined ? { skippedModels: options.skippedModels } : {}),
+  }));
 }
 
 /** Record that a user-completed run's report has been delivered exactly once. */
 export function markRunDelivered(
   options: MarkRunDeliveredOptions,
 ): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? runManifestFs;
-  const existing = readRunManifest({ cwd: options.cwd, runId: options.runId, fs });
-  if (existing === undefined) {
-    return { ok: false, error: `No run manifest found for ${options.runId}` };
-  }
-  const updated: RunManifest = { ...existing, deliveredAt: (options.now ?? Date.now)() };
-  return writeRunManifest({ cwd: options.cwd, manifest: updated, fs });
+  return mutateRunManifest(options, (existing) => ({
+    ...existing,
+    deliveredAt: (options.now ?? Date.now)(),
+  }));
 }
 
 /**
@@ -553,17 +446,16 @@ export function listPendingUserCompletions(
  * previous orchestrator process.
  */
 export function scanForInterruptedRuns(options: ScanForInterruptedRunsOptions): RunManifest[] {
-  const fs = options.fs ?? runManifestFs;
   const now = options.now ?? Date.now;
   const interrupted: RunManifest[] = [];
-  for (const run of listRuns({ cwd: options.cwd, fs, ...taskFilter(options) })) {
+  for (const run of listRuns({ cwd: options.cwd, ...taskFilter(options), ...storeSeam(options) })) {
     if (run.status !== RunStatus.Running) continue;
     const completedAt = now();
     const result = setRunStatus({
       cwd: options.cwd,
       runId: run.runId,
       status: RunStatus.Interrupted,
-      fs,
+      ...storeSeam(options),
       now,
     });
     if (result.ok) {

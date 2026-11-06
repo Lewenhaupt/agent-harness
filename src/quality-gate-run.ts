@@ -82,7 +82,10 @@ export interface RunQualityGateOptions {
   sessionName?: string;
   /** Telemetry sink for gate-retry spawns; defaults to the workflow store. */
   telemetry?: ModelTelemetryStore;
-  /** Task id for the metrics log; omitted for gate checks outside a workflow. */
+  /**
+   * Task id for the metrics log, and the proof gate's receipt identity when no
+   * proof dir names one; omitted for gate checks outside a workflow.
+   */
   taskId?: string;
   /** Run id the gate verdict belongs to; emitted as `gate_result.runId`. */
   runId: string;
@@ -222,6 +225,7 @@ export function gateFailureKind(feedback: string | undefined): string | undefine
 /** Gate context forwarded into `GateOptions` for the run that produced the output. */
 interface GateRunContext {
   cwd?: string;
+  taskId?: string;
   proofDir?: string;
   proofRequired?: boolean;
   proofRunStartMs?: number;
@@ -234,14 +238,15 @@ async function evaluateGate(
   result: SpawnResult,
   context: GateRunContext,
 ): Promise<{ passed: boolean; failureKind?: string; durationMs: number; feedback: string }> {
-  const { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath } = context;
+  const { cwd, taskId, proofDir, proofRequired, proofRunStartMs, userGuidePath } = context;
   const options =
     cwd !== undefined ||
+    taskId !== undefined ||
     proofDir !== undefined ||
     proofRequired !== undefined ||
     proofRunStartMs !== undefined ||
     userGuidePath !== undefined
-      ? { cwd, proofDir, proofRequired, proofRunStartMs, userGuidePath }
+      ? { cwd, taskId, proofDir, proofRequired, proofRunStartMs, userGuidePath }
       : undefined;
   const text = result.content?.[0]?.text ?? "";
   const startedAt = Date.now();
@@ -285,6 +290,7 @@ export function createQualityGateRunner(
     for (let attempt = 1; attempt <= MAX_GATE_ATTEMPTS; attempt += 1) {
       const verdict = await evaluateGate(effectiveGate, current, {
         cwd: options.cwd,
+        taskId: options.taskId,
         proofDir: options.proofDir,
         proofRequired: WORKFLOW_REGISTRY[workflowType].proofRequired,
         proofRunStartMs: options.proofRunStartMs,

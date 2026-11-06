@@ -27,7 +27,12 @@ import {
 } from "../fleet-launch.js";
 import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { classifyMemberLivenessInWorktree } from "../fleet-sessions.js";
-import { fleetDir, formatAuditEntry } from "../fleet-state.js";
+import {
+  fleetDir,
+  formatAuditEntry,
+  readFleetIntent,
+  readRecentFleetAuditEntries,
+} from "../fleet-state.js";
 import {
   FLEET_INTENT_DEFERRED_MAX,
   FLEET_INTENT_ORDERING_GATES_MAX,
@@ -38,6 +43,19 @@ import { createFakeFleetFs } from "./helpers/fake-fleet-fs.js";
 
 const commonDir = "/repo/.git";
 const fleetId = "default";
+
+/**
+ * The stored intent of one fleet (bd-281: a store row, not a `fleet.json` file).
+ *
+ * A missing row reads as `{}` because every assertion here is about a record the
+ * launch was meant to write; a test that expects absence asserts the row is null.
+ */
+function intentOfStore(fs: ReturnType<typeof createFakeFleetFs>, id = fleetId): FleetIntent {
+  // The run shares the row and is recombined by the reader, as every caller has
+  // always read it (bd-281).
+  const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: id, fs });
+  return loaded.ok && loaded.intent !== undefined ? loaded.intent : ({} as FleetIntent);
+}
 const maxChars = FLEET_MAX_CONCURRENT_ORCHESTRATORS;
 
 describe("concurrency ceiling", () => {
@@ -528,8 +546,10 @@ describe("runFleetLaunch", () => {
   };
 
   function auditLines(fs: ReturnType<typeof createFakeFleetFs>): string[] {
-    const log = fs.files.get(`${fleetDir(commonDir, fleetId)}/audit.log`) ?? "";
-    return log.split("\n").filter((line) => line !== "");
+    // bd-281: audit entries are store rows; stringify keeps the formatter assertion.
+    return readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0, fs }).map(
+      (entry) => JSON.stringify(entry),
+    );
   }
 
   it("launches two members, records the intent, and audits each action", async () => {
@@ -556,9 +576,7 @@ describe("runFleetLaunch", () => {
       "Concurrency 5 is above the ceiling of 3 orchestrators; stored 3",
     );
 
-    const intent = JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    const intent = intentOfStore(fs);
     expect(intent.taskIds).toEqual(["bd-12", "bd-15"]);
     expect(intent.maxConcurrent).toBe(maxChars);
     expect(intent.baseBranch).toBe("main");
@@ -629,7 +647,7 @@ describe("runFleetLaunch", () => {
         supervisor: { sessionId: "other-session", pid: 4242, armToken: "their-token" },
       }),
     });
-    const before = fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`);
+    const before = fs.store.readFleet(fleetId);
 
     const result = await runFleetLaunch({
       ...base,
@@ -641,7 +659,7 @@ describe("runFleetLaunch", () => {
 
     expect(result.ok).toBe(false);
     expect(result.text).toContain("already supervised by live session `other-session`");
-    expect(fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`)).toBe(before);
+    expect(fs.store.readFleet(fleetId)).toEqual(before);
     expect(auditLines(fs)).toEqual([]);
   });
 
@@ -679,9 +697,7 @@ describe("runFleetLaunch", () => {
     expect(result.text).toContain("1 existing member(s) preserved");
     expect(result.text).toContain("Preserved existing member(s): bd-12");
 
-    const intent = JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    const intent = intentOfStore(fs);
     expect(intent.taskIds).toEqual(["bd-12", "bd-15"]);
     expect(intent.supervisor).toMatchObject({ sessionId: "supervisor-session", pid: 4242 });
     // A re-arm restates supervision, not fleet policy.
@@ -720,9 +736,7 @@ describe("runFleetLaunch", () => {
 
     expect(result.ok).toBe(true);
     expect(launched).toEqual(["bd-19"]);
-    const intent = JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    const intent = intentOfStore(fs);
     expect(intent.taskIds).toEqual(["bd-12", "bd-19"]);
     const actions = auditLines(fs).map((line) => (JSON.parse(line) as { action: string }).action);
     expect(actions).toEqual(["re-arm", "schedule-planned", "launch", "member-launch"]);
@@ -730,24 +744,34 @@ describe("runFleetLaunch", () => {
 
   it("does not claim supervision when the written record does not read back (W6)", async () => {
     const fs = createFakeFleetFs();
-    // A writer that replaces the record right after the atomic rename: the
-    // read-back is the only thing that can catch it, and it must refuse to arm.
-    const realRename = fs.renameSync;
-    const realWrite = fs.writeFileSync;
-    fs.renameSync = (oldPath, newPath) => {
-      realRename(oldPath, newPath);
-      if (!newPath.endsWith("fleet.json")) return;
-      realWrite(
-        newPath,
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId,
-          taskIds: ["bd-12"],
-          createdAt: 1,
-          updatedAt: 1,
-          supervisor: { sessionId: "intruder", pid: 4242, armToken: "intruder-token" },
-        }),
-      );
+    // A writer that replaces the row right after the launch's transaction commits:
+    // the read-back is the only thing that can catch it, and it must refuse to arm.
+    const realStore = fs.store;
+    let intruded = false;
+    const intruder = {
+      schemaVersion: 1,
+      fleetId,
+      taskIds: ["bd-12"],
+      createdAt: 1,
+      updatedAt: 1,
+      baseBranch: "main",
+      publish: { mode: "local" },
+      supervisor: { sessionId: "intruder", pid: 4242, armToken: "intruder-token" },
+    };
+    fs.store = {
+      ...realStore,
+      mutateFleet: (input) => {
+        const written = realStore.mutateFleet(input);
+        intruded = true;
+        return written;
+      },
+      readFleet: (id) =>
+        intruded && id === fleetId
+          ? {
+              ok: true,
+              value: { fleetId: id, revision: 2, intent: intruder, run: {}, updatedAt: 1 },
+            }
+          : realStore.readFleet(id),
     };
 
     const result = await runFleetLaunch({
@@ -765,20 +789,21 @@ describe("runFleetLaunch", () => {
 
   it("refuses to claim supervision when the written record cannot be read back (F-gap)", async () => {
     const fs = createFakeFleetFs();
-    // The write lands, then the record becomes unreadable (a racing writer, a
-    // permission change, a torn external read). A supervisor that cannot verify its
-    // own record is not the supervisor, and this must not be reported as a
-    // content mismatch to a record that may in fact be correct.
+    // The transaction commits, then the row becomes unreadable (a racing writer, a
+    // permission change, a torn read). A supervisor that cannot verify its own
+    // record is not the supervisor, and this must not be reported as a content
+    // mismatch to a record that may in fact be correct.
+    const realStore = fs.store;
     let written = false;
-    const realRename = fs.renameSync;
-    fs.renameSync = (oldPath, newPath) => {
-      realRename(oldPath, newPath);
-      if (newPath.endsWith("fleet.json")) written = true;
-    };
-    const realRead = fs.readFileSync;
-    fs.readFileSync = (path) => {
-      if (written && path.endsWith("fleet.json")) throw new Error("EIO: cannot read back");
-      return realRead(path);
+    fs.store = {
+      ...realStore,
+      mutateFleet: (input) => {
+        const result = realStore.mutateFleet(input);
+        written = true;
+        return result;
+      },
+      readFleet: (id) =>
+        written ? { ok: false, error: "EIO: cannot read back" } : realStore.readFleet(id),
     };
 
     const result = await runFleetLaunch({
@@ -818,9 +843,7 @@ describe("runFleetLaunch", () => {
     expect(result.text).toContain("- bd-15: NOT launched — worktree creation failed");
     expect(result.text).toContain("Removed bd-15 from the fleet intent");
 
-    const intent = JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    const intent = intentOfStore(fs);
     expect(intent.taskIds).toEqual(["bd-12"]);
 
     const actions = auditLines(fs).map((line) => (JSON.parse(line) as { action: string }).action);
@@ -835,7 +858,18 @@ describe("runFleetLaunch", () => {
 
   it("recreates a vanished intent with the launch's resolved contract on the prune path", async () => {
     const fs = createFakeFleetFs();
-    const intentPath = `${fleetDir(commonDir, fleetId)}/fleet.json`;
+    // The row vanishes mid-launch: the prune's updater receives no record and must
+    // re-create it with the contract this launch already resolved.
+    const realStore = fs.store;
+    let vanished = false;
+    fs.store = {
+      ...realStore,
+      mutateFleet: (input) =>
+        realStore.mutateFleet({
+          ...input,
+          update: (current) => input.update(vanished ? null : current),
+        }),
+    };
 
     const result = await runFleetLaunch({
       ...base,
@@ -844,15 +878,14 @@ describe("runFleetLaunch", () => {
       taskIds: ["bd-12"],
       probeOwnership: () => undefined,
       launchMember: async (taskId) => {
-        // The record vanishes mid-launch, after `writeLaunchIntent` read it back.
-        fs.files.delete(intentPath);
+        vanished = true;
         return { taskId, ok: false, detail: "daemon unavailable" };
       },
       fs,
     });
 
     expect(result.ok).toBe(false);
-    const intent = JSON.parse(fs.files.get(intentPath) ?? "{}") as FleetIntent;
+    const intent = intentOfStore(fs);
     // The prune must re-freeze the contract this launch resolved, not the defaults.
     expect(intent.baseBranch).toBe("develop");
     expect(intent.publish).toEqual({ mode: "pr", remote: "fork", base: "develop" });
@@ -870,9 +903,7 @@ describe("runFleetLaunch", () => {
 
     expect(result.ok).toBe(false);
     expect(result.text).toContain("0/1 member(s) launched");
-    const intent = JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    const intent = intentOfStore(fs);
     expect(intent.taskIds).toEqual([]);
   });
 
@@ -908,8 +939,9 @@ describe("runFleetLaunch", () => {
 
   it("surfaces an audit failure as a warning instead of failing the launch", async () => {
     const fs = createFakeFleetFs();
-    fs.appendFileSync = () => {
-      throw new Error("EROFS: read-only file system");
+    fs.store = {
+      ...fs.store,
+      appendAudit: () => ({ ok: false, error: "EROFS: read-only file system" }),
     };
 
     const result = await runFleetLaunch({
@@ -922,7 +954,7 @@ describe("runFleetLaunch", () => {
 
     expect(result.ok).toBe(true);
     expect(result.warnings.length).toBeGreaterThan(0);
-    expect(result.warnings[0]).toContain("could not append to audit.log");
+    expect(result.warnings[0]).toContain("could not append");
   });
 
   it("writes one audit line in the shared substrate format", async () => {
@@ -978,17 +1010,13 @@ describe("runFleetLaunch: P3 ordering and capacity", () => {
   };
 
   function actionsOf(fs: ReturnType<typeof createFakeFleetFs>): string[] {
-    const log = fs.files.get(`${fleetDir(commonDir, fleetId)}/audit.log`) ?? "";
-    return log
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => (JSON.parse(line) as { action: string }).action);
+    return readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0, fs }).map(
+      (entry) => entry.action,
+    );
   }
 
   function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
-    return JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    return intentOfStore(fs);
   }
 
   it("launches only the free capacity and records the deferred members", async () => {
@@ -1294,8 +1322,8 @@ describe("runFleetLaunch: P3 ordering and capacity", () => {
     expect(launched).toBe(0);
     expect(result.text).toContain("orchestrator count is unknown");
     expect(result.text).toContain("abandoned");
-    // A refusal leaves no fleet directory behind.
-    expect(fs.files.has(`${fleetDir(commonDir, fleetId)}/fleet.json`)).toBe(false);
+    // A refusal leaves no intent row behind for the target fleet.
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value", null);
   });
 
   it("writes no intent when an abandoned fleet already exhausts the ceiling", async () => {
@@ -1340,9 +1368,7 @@ describe("runFleetLaunch ordering gates", () => {
   };
 
   function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
-    return JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    return intentOfStore(fs);
   }
 
   /** A seam that records what the engine asked for and mints deterministic ids. */
@@ -1533,9 +1559,10 @@ function writeIntentFile(
   taskIds: readonly string[],
   extra: Partial<FleetIntent>,
 ): void {
-  fs.files.set(
-    `${fleetDir(commonDir, targetFleetId)}/fleet.json`,
-    JSON.stringify({
+  // bd-281: the intent is a store row keyed by fleet id, not a fleet.json file.
+  const written = fs.store.writeFleetIntent({
+    fleetId: targetFleetId,
+    intent: {
       schemaVersion: 1,
       fleetId: targetFleetId,
       taskIds: [...taskIds],
@@ -1543,8 +1570,9 @@ function writeIntentFile(
       updatedAt: 1,
       baseBranch: "main",
       ...extra,
-    }),
-  );
+    },
+  });
+  if (!written.ok) throw new Error(written.error);
 }
 
 describe("countActiveFleetOrchestrators", () => {
@@ -1688,9 +1716,7 @@ describe("runFleetLaunch: liveness-aware capacity and releases (bd-166)", () => 
   };
 
   function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
-    return JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    return intentOfStore(fs);
   }
 
   it("frees an abandoned fleet's slots once its members are absent", async () => {
@@ -1899,9 +1925,7 @@ describe("intent bounds and the CAS capacity recount", () => {
   };
 
   function intentOf(fs: ReturnType<typeof createFakeFleetFs>): FleetIntent {
-    return JSON.parse(
-      fs.files.get(`${fleetDir(commonDir, fleetId)}/fleet.json`) ?? "{}",
-    ) as FleetIntent;
+    return intentOfStore(fs);
   }
 
   it("bounds the deferred list by its set union, so a full advance still fits (W1)", async () => {
@@ -1939,32 +1963,41 @@ describe("intent bounds and the CAS capacity recount", () => {
     // during `writeLaunchIntent`'s recount — the window a concurrent launch from
     // another fleet occupies.
     const otherFleet = "other";
-    const otherPath = `${fleetDir(commonDir, otherFleet)}/fleet.json`;
-    const emptyOther = JSON.stringify({
+    const emptyOther = {
       schemaVersion: 1,
       fleetId: otherFleet,
       taskIds: [],
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
-    });
-    const busyOther = JSON.stringify({
+    };
+    const busyOther = {
       schemaVersion: 1,
       fleetId: otherFleet,
       taskIds: ["bd-91", "bd-92", "bd-93"],
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
+    };
+    const fs = createFakeFleetFs({
+      [`${fleetDir(commonDir, otherFleet)}/fleet.json`]: JSON.stringify(emptyOther),
     });
-    const fs = createFakeFleetFs({ [otherPath]: emptyOther });
-    const readFile = fs.readFileSync;
+    const realStore = fs.store;
     let otherReads = 0;
-    fs.readFileSync = (path) => {
-      if (path === otherPath) {
-        otherReads += 1;
-        if (otherReads >= 2) return busyOther;
-      }
-      return readFile(path);
+    fs.store = {
+      ...realStore,
+      readFleet: (id) => {
+        if (id === otherFleet) {
+          otherReads += 1;
+          if (otherReads >= 2) {
+            return {
+              ok: true,
+              value: { fleetId: id, revision: 2, intent: busyOther, run: {}, updatedAt: 1 },
+            };
+          }
+        }
+        return realStore.readFleet(id);
+      },
     };
     let launched = 0;
 
@@ -1984,33 +2017,37 @@ describe("intent bounds and the CAS capacity recount", () => {
     expect(result.text).toContain("count changed while launching");
     expect(launched).toBe(0);
     // Nothing was recorded for this fleet: the refusal is the same CAS window.
-    expect(fs.files.has(`${fleetDir(commonDir, fleetId)}/fleet.json`)).toBe(false);
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value", null);
   });
 
   it("refuses when a foreign intent becomes unreadable during the recount (CR)", async () => {
     // The ceiling is only knowable if every fleet's member list can be read. A
-    // foreign record that reads fine while planning and then becomes corrupt is
-    // an unknown count, not a zero: assuming zero would start work past the
+    // foreign record that reads fine while planning and then becomes unreadable
+    // is an unknown count, not a zero: assuming zero would start work past the
     // ceiling of 3.
     const otherFleet = "other";
-    const otherPath = `${fleetDir(commonDir, otherFleet)}/fleet.json`;
-    const readable = JSON.stringify({
+    const readable = {
       schemaVersion: 1,
       fleetId: otherFleet,
       taskIds: ["bd-91"],
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
+    };
+    const fs = createFakeFleetFs({
+      [`${fleetDir(commonDir, otherFleet)}/fleet.json`]: JSON.stringify(readable),
     });
-    const fs = createFakeFleetFs({ [otherPath]: readable });
-    const readFile = fs.readFileSync;
+    const realStore = fs.store;
     let otherReads = 0;
-    fs.readFileSync = (path) => {
-      if (path === otherPath) {
-        otherReads += 1;
-        if (otherReads >= 2) throw new Error("EIO: fleet.json unreadable");
-      }
-      return readFile(path);
+    fs.store = {
+      ...realStore,
+      readFleet: (id) => {
+        if (id === otherFleet) {
+          otherReads += 1;
+          if (otherReads >= 2) return { ok: false, error: "EIO: fleet row unreadable" };
+        }
+        return realStore.readFleet(id);
+      },
     };
     let launched = 0;
 
@@ -2031,6 +2068,6 @@ describe("intent bounds and the CAS capacity recount", () => {
     expect(result.text).toContain(otherFleet);
     expect(launched).toBe(0);
     // The refusal is the same CAS window, so nothing was recorded.
-    expect(fs.files.has(`${fleetDir(commonDir, fleetId)}/fleet.json`)).toBe(false);
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value", null);
   });
 });

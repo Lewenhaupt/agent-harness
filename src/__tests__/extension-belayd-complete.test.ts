@@ -11,11 +11,16 @@
  * - reconcile/input-sentinel: marks the phase complete, delivers once
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-complete-test-cooldowns.json");
 
@@ -664,7 +669,7 @@ describe("orchestrator reconcile / input sentinel (bd-107)", () => {
     expect(messages.filter((m) => m.customType === "belayd-run-complete")).toHaveLength(0);
   });
 
-  it("keeps the in-memory delivered marker when the disk write fails", async () => {
+  it("does not deliver from an unavailable store, and never double-delivers a replay", async () => {
     const { api, tools, messages, handlers } = createMockPi();
     const factory = await loadExtension();
     factory(api);
@@ -690,24 +695,22 @@ describe("orchestrator reconcile / input sentinel (bd-107)", () => {
     });
     completeRunByUser({ cwd, runId: "runFail", report: "still delivered" });
 
-    const { chmodSync } = await import("node:fs");
-    const runsDirPath = join(cwd, ".belayd", "runs");
+    // bd-281 changed this failure mode: the pending completion is *read* from the
+    // same store the delivery marker is written to, so an unavailable store yields
+    // no delivery at all instead of a delivered-but-unmarked run. Safety is the
+    // same (nothing is delivered twice) and it is what this asserts.
+    writeFileSync(join(cwd, "blocked-store"), "not a directory");
+    process.env.BELAYD_REPO_STATE_FILE = join(cwd, "blocked-store", "state.sqlite");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    chmodSync(runsDirPath, 0o500);
     try {
       const inputHandler = handlers.get("input")?.[0];
       const event = { type: "input", text: "[belayd-complete:runFail]", source: "extension" };
 
       expect(inputHandler?.(event, ctx)).toEqual({ action: "handled" });
-      expect(messages.filter((m) => m.customType === "belayd-run-complete")).toHaveLength(1);
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("failed to mark run"));
-
-      // The persisted marker did not land, but the in-memory set suppresses a replay.
-      expect(readRunManifest({ cwd, runId: "runFail" })).not.toHaveProperty("deliveredAt");
-      expect(inputHandler?.(event, ctx)).toEqual({ action: "handled" });
-      expect(messages.filter((m) => m.customType === "belayd-run-complete")).toHaveLength(1);
+      expect(messages.filter((m) => m.customType === "belayd-run-complete")).toHaveLength(0);
+      expect(readRunManifest({ cwd, runId: "runFail" })).toBeUndefined();
     } finally {
-      chmodSync(runsDirPath, 0o700);
+      delete process.env.BELAYD_REPO_STATE_FILE;
       warn.mockRestore();
     }
   });

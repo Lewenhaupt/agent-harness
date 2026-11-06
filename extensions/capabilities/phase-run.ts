@@ -362,7 +362,7 @@ export function createPhaseRunner(deps: PhaseRunnerDeps): PhaseRunnerApi {
     }
     const persisted = readWorkflowState({ cwd: options.cwd });
     // The ledger is keyed by (task, phase) but stored under the cwd's single
-    // workflow.json. A phase tool may pass a `cwd` other than the one that
+    // the workflow row. A phase tool may pass a `cwd` other than the one that
     // wrote the state; without this check we'd resume another task's session
     // and then corrupt that task's ledger on write.
     if (persisted === undefined || persisted.taskId !== options.taskId) {
@@ -510,7 +510,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
    * never affect an otherwise successful review delivery.
    */
   function persistReviewedSha(options: { cwd: string; taskId: string }): void {
-    const scope = readReviewScope({ cwd: options.cwd });
+    const scope = readReviewScope({ cwd: options.cwd, taskId: options.taskId });
     if (scope === undefined) {
       // No scope means no recorded revision: the next review is a
       // whole-change-set first review, which is wider, never narrower.
@@ -528,13 +528,13 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
     }
     // Consume before promoting: a failed write then leaves no scope, so the
     // next review cannot promote a record from this one.
-    const cleared = clearReviewScope({ cwd: options.cwd });
+    const cleared = clearReviewScope({ cwd: options.cwd, taskId: options.taskId });
     if (!cleared.ok) {
       console.warn(`[belayd-harness] failed to clear the review scope: ${cleared.error}`);
     }
     // The identity check lives in saveReviewedSha so it shares the read that
     // immediately precedes the write: a state swap must not redirect this
-    // task's reviewed state into another task's workflow.json. The sha and its
+    // task's reviewed state into another task's workflow row. The sha and its
     // untracked manifest go in one write so they cannot disagree.
     const saveResult = saveReviewedSha({
       cwd: options.cwd,
@@ -701,7 +701,7 @@ Write the guide to \`${docPath}\` (create \`docs/\` when missing) using the \`wr
       state.runEpoch === epochAtStart && state.currentTaskId === taskIdAtStart;
     // Workflow state is only advanced while the gate owns the run. A report
     // run started outside a workflow (e.g. rework after completion) delivers
-    // its output but must not resurrect workflow.json or phase state.
+    // its output but must not resurrect the workflow row or phase state.
     const gateOwnsRun = (): boolean => state.gateActive && runNotSuperseded();
 
     /**

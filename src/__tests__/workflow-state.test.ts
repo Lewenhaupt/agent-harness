@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { openRepoStateStore, type RepoStateStore } from "../repo-state-store.js";
 import {
   archiveWorkflowState,
   callerHandoffFilePath,
@@ -21,7 +25,6 @@ import {
   savePhaseSession,
   saveReviewedSha,
   saveReviewScope,
-  type WorkflowFs,
   type WorkflowState,
   workflowStateDir,
   workflowStateFilePath,
@@ -29,49 +32,24 @@ import {
   writeWorkflowState,
 } from "../workflow-state.js";
 
-interface FakeFs extends WorkflowFs {
-  files: Map<string, string>;
-}
-
-function createFakeFs(initial: Record<string, string> = {}): FakeFs {
-  const files = new Map(Object.entries(initial));
-  return {
-    files,
-    existsSync(path) {
-      return files.has(path);
-    },
-    readFileSync(path) {
-      const content = files.get(path);
-      if (content === undefined) {
-        const error = new Error(`ENOENT: ${path}`) as Error & { code: string };
-        error.code = "ENOENT";
-        throw error;
-      }
-      return content;
-    },
-    writeFileSync(path, data) {
-      files.set(path, data);
-    },
-    renameSync(oldPath, newPath) {
-      const content = files.get(oldPath);
-      if (content === undefined) {
-        const error = new Error(`ENOENT: ${oldPath}`) as Error & { code: string };
-        error.code = "ENOENT";
-        throw error;
-      }
-      files.delete(oldPath);
-      files.set(newPath, content);
-    },
-    mkdirSync() {
-      // In-memory fs has no directory hierarchy to create.
-    },
-    unlinkSync(path) {
-      files.delete(path);
-    },
-  };
-}
-
 const cwd = "/tmp/worktree";
+
+let dir: string;
+let storePath: string;
+let store: RepoStateStore;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "belayd-workflow-state-"));
+  storePath = join(dir, "state.sqlite");
+  const opened = openRepoStateStore({ path: storePath });
+  if (!opened.ok) throw new Error(opened.error);
+  store = opened.store;
+});
+
+afterEach(() => {
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 function sampleState(overrides: Partial<WorkflowState> = {}): WorkflowState {
   return {
@@ -88,57 +66,102 @@ function sampleState(overrides: Partial<WorkflowState> = {}): WorkflowState {
   };
 }
 
-describe("workflow state", () => {
+/** Corrupt one stored column, the way a torn/legacy write would. */
+function corruptWorkflowColumn(taskId: string, column: string, value: string): void {
+  const database = new DatabaseSync(storePath);
+  database.prepare(`UPDATE workflow_state SET ${column} = ? WHERE task_id = ?`).run(value, taskId);
+  database.close();
+}
+
+describe("workflow state (bd-281: shared store row, keyed by task)", () => {
   it("round-trips a workflow state through write and read", () => {
-    const fs = createFakeFs();
     const state = sampleState({ completedPhaseNames: ["scout", "plan"] });
 
-    const written = writeWorkflowState({ cwd, state, fs });
+    const written = writeWorkflowState({ cwd, state, store });
     expect(written).toEqual({ ok: true });
-    expect(readWorkflowState({ cwd, fs })).toEqual(state);
+    expect(readWorkflowState({ cwd, store })).toEqual(state);
   });
 
-  it("writes atomically and leaves no temp files behind", () => {
-    const fs = createFakeFs();
-    const state = sampleState();
+  it("writes no workflow file under the worktree", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
 
-    writeWorkflowState({ cwd, state, fs });
-
-    const keys = [...fs.files.keys()];
-    expect(keys).toEqual([workflowStateFilePath(cwd)]);
-    expect(keys.some((path) => path.endsWith(".tmp"))).toBe(false);
+    // The file is the bug being removed (bd-165): state is a row now, so nothing
+    // in the worktree can be copied, committed or inherited.
+    expect(workflowStateFilePath(cwd)).toBe(join(cwd, ".belayd", "workflow.json"));
+    expect(readWorkflowState({ cwd, store })).toHaveProperty("taskId", "bd-42");
   });
 
-  it("returns undefined for corrupt JSON", () => {
-    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: "not json" });
-    expect(readWorkflowState({ cwd, fs })).toBe(undefined);
+  it("resolves the same row from another worktree when the task is known", () => {
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["scout"] }), store });
+
+    // A resumed session in a second worktree names the task, not the path.
+    const resumed = readWorkflowState({ cwd: "/tmp/other-worktree", taskId: "bd-42", store });
+    expect(resumed).toHaveProperty("completedPhaseNames", ["scout"]);
+
+    // A worktree-only lookup in the second worktree has no binding yet.
+    expect(readWorkflowState({ cwd: "/tmp/other-worktree", store })).toBe(undefined);
+
+    // Once that session writes (by task id), it binds its own worktree to the
+    // same row instead of creating a copy.
+    saveCompletedPhases({
+      cwd: "/tmp/other-worktree",
+      taskId: "bd-42",
+      store,
+      completedPhaseNames: ["scout", "plan"],
+    });
+    expect(readWorkflowState({ cwd: "/tmp/other-worktree", store })).toHaveProperty(
+      "completedPhaseNames",
+      ["scout", "plan"],
+    );
+    expect(readWorkflowState({ cwd, store })).toHaveProperty("completedPhaseNames", [
+      "scout",
+      "plan",
+    ]);
+  });
+
+  it("bumps the row generation on every write", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["scout"] }), store });
+
+    const row = store.readWorkflow({ taskId: "bd-42" });
+    expect(row.ok).toBe(true);
+    if (!row.ok || row.value === null) return;
+    expect(row.value.generation).toBe(2);
+  });
+
+  it("returns undefined for a row that does not parse", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    corruptWorkflowColumn("bd-42", "phase_order", "not json");
+
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
   });
 
   it("returns undefined for a wrong schema version", () => {
-    const fs = createFakeFs({
-      [workflowStateFilePath(cwd)]: JSON.stringify({ ...sampleState(), schemaVersion: 2 }),
-    });
-    expect(readWorkflowState({ cwd, fs })).toBe(undefined);
+    expect(parseWorkflowState({ ...sampleState(), schemaVersion: 2 })).toBe(undefined);
+    expect(parseWorkflowState(null)).toBe(undefined);
+  });
+
+  it("degrades to undefined when the store is unavailable", () => {
+    store.close();
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
   });
 
   it("saveCompletedPhases preserves identity fields and updates the timestamp", () => {
-    const fs = createFakeFs();
-    const state = sampleState({
-      completedPhaseNames: ["scout"],
-      startedAt: 5_000,
-      updatedAt: 5_000,
+    writeWorkflowState({
+      cwd,
+      state: sampleState({ completedPhaseNames: ["scout"], startedAt: 5_000, updatedAt: 5_000 }),
+      store,
     });
-    writeWorkflowState({ cwd, state, fs });
 
     const result = saveCompletedPhases({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       completedPhaseNames: ["scout", "plan"],
     });
 
     expect(result).toEqual({ ok: true });
-    const reloaded = readWorkflowState({ cwd, fs });
+    const reloaded = readWorkflowState({ cwd, store });
     expect(reloaded).toHaveProperty("taskId", "bd-42");
     expect(reloaded).toHaveProperty("startedAt", 5_000);
     expect(reloaded).toHaveProperty("completedPhaseNames", ["scout", "plan"]);
@@ -146,31 +169,29 @@ describe("workflow state", () => {
   });
 
   it("saveCompletedPhases returns an error when no state exists", () => {
-    const fs = createFakeFs();
-    const result = saveCompletedPhases({ cwd, fs, completedPhaseNames: ["scout"] });
+    const result = saveCompletedPhases({ cwd, store, completedPhaseNames: ["scout"] });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("No Belayd workflow state");
   });
 
   it("saveCompletedPhases persists the awaiting-review flag", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState(), fs });
+    writeWorkflowState({ cwd, state: sampleState(), store });
 
     saveCompletedPhases({
       cwd,
-      fs,
+      store,
       completedPhaseNames: ["implement", "review"],
       awaitingReviewResponse: true,
     });
-    expect(readWorkflowState({ cwd, fs })?.awaitingReviewResponse).toBe(true);
+    expect(readWorkflowState({ cwd, store })?.awaitingReviewResponse).toBe(true);
 
     saveCompletedPhases({
       cwd,
-      fs,
+      store,
       completedPhaseNames: ["implement", "review", "test"],
       awaitingReviewResponse: false,
     });
-    expect(readWorkflowState({ cwd, fs })?.awaitingReviewResponse).toBe(false);
+    expect(readWorkflowState({ cwd, store })?.awaitingReviewResponse).toBe(false);
   });
 
   it("parses state with and without the awaiting-review flag", () => {
@@ -183,7 +204,6 @@ describe("workflow state", () => {
   });
 
   it("saveReviewedSha round-trips the sha and preserves every other field", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({
@@ -193,13 +213,13 @@ describe("workflow state", () => {
         awaitingReviewResponse: true,
         phaseSessions: { review: { base: "rev", invocations: 2 } },
       }),
-      fs,
+      store,
     });
 
-    const result = saveReviewedSha({ cwd, fs, now: () => 9_000, sha: "abc1234" });
+    const result = saveReviewedSha({ cwd, store, now: () => 9_000, sha: "abc1234" });
 
     expect(result).toEqual({ ok: true });
-    const reloaded = readWorkflowState({ cwd, fs });
+    const reloaded = readWorkflowState({ cwd, store });
     expect(reloaded).toHaveProperty("reviewedSha", "abc1234");
     expect(reloaded).toHaveProperty("taskId", "bd-42");
     expect(reloaded).toHaveProperty("startedAt", 5_000);
@@ -210,8 +230,7 @@ describe("workflow state", () => {
   });
 
   it("saveReviewedSha returns an error when no state exists", () => {
-    const fs = createFakeFs();
-    const result = saveReviewedSha({ cwd, fs, sha: "abc1234" });
+    const result = saveReviewedSha({ cwd, store, sha: "abc1234" });
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("missing-state");
@@ -220,17 +239,15 @@ describe("workflow state", () => {
   });
 
   it("saveReviewedSha skips a mismatched expected task id without writing", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({ taskId: "bd-99", completedPhaseNames: ["implement"] }),
-      fs,
+      store,
     });
-    const before = fs.files.get(workflowStateFilePath(cwd));
 
     const result = saveReviewedSha({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       sha: "abc1234",
       expectedTaskId: "bd-42",
@@ -241,28 +258,27 @@ describe("workflow state", () => {
       expect(result.reason).toBe("task-mismatch");
       if (result.reason === "task-mismatch") expect(result.actualTaskId).toBe("bd-99");
     }
-    // The foreign state file must be byte-for-byte unchanged.
-    expect(fs.files.get(workflowStateFilePath(cwd))).toBe(before);
-    expect(readWorkflowState({ cwd, fs })?.reviewedSha).toBe(undefined);
+    // The foreign row must be unchanged: sha, timestamp and bundled manifest.
+    expect(readWorkflowState({ cwd, store })?.reviewedSha).toBe(undefined);
+    expect(readWorkflowState({ cwd, store })?.updatedAt).toBe(1_000);
   });
 
   it("saveReviewedSha persists when the expected task id matches", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-42" }), fs });
+    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-42" }), store });
 
     const result = saveReviewedSha({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       sha: "abc1234",
       expectedTaskId: "bd-42",
     });
 
     expect(result).toEqual({ ok: true });
-    expect(readWorkflowState({ cwd, fs })?.reviewedSha).toBe("abc1234");
+    expect(readWorkflowState({ cwd, store })?.reviewedSha).toBe("abc1234");
   });
 
-  it("parses a pre-bd-113 workflow.json without a reviewed sha", () => {
+  it("parses a pre-bd-113 workflow without a reviewed sha", () => {
     const raw = { ...sampleState(), completedPhaseNames: ["implement", "review"] };
     expect(parseWorkflowState(raw)?.reviewedSha).toBe(undefined);
     expect(parseWorkflowState({ ...raw, reviewedSha: "abc1234" })?.reviewedSha).toBe("abc1234");
@@ -270,16 +286,15 @@ describe("workflow state", () => {
   });
 
   it("records the reviewed sha and its untracked manifest in one write (bd-228)", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({ startedAt: 5_000, updatedAt: 5_000 }),
-      fs,
+      store,
     });
 
     const result = saveReviewedSha({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       sha: "stash1234",
       untracked: [
@@ -289,7 +304,7 @@ describe("workflow state", () => {
     });
 
     expect(result).toEqual({ ok: true });
-    const reloaded = readWorkflowState({ cwd, fs });
+    const reloaded = readWorkflowState({ cwd, store });
     expect(reloaded).toHaveProperty("reviewedSha", "stash1234");
     expect(reloaded).toHaveProperty("reviewedUntracked", [
       { path: "src/new.ts", blob: "blob1111" },
@@ -299,7 +314,6 @@ describe("workflow state", () => {
   });
 
   it("clears the reviewed untracked manifest when it is omitted or empty (bd-228)", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({
@@ -307,25 +321,29 @@ describe("workflow state", () => {
         reviewedSha: "old1234",
         reviewedUntracked: [{ path: "src/old.ts", blob: "blob0000" }],
       }),
-      fs,
+      store,
     });
 
-    expect(saveReviewedSha({ cwd, fs, sha: "abc1234" })).toEqual({ ok: true });
-    const omitted = readWorkflowState({ cwd, fs });
+    expect(saveReviewedSha({ cwd, store, sha: "abc1234" })).toEqual({ ok: true });
+    const omitted = readWorkflowState({ cwd, store });
     // A stale manifest paired with a new sha could silently drop a file from
     // scope, so recording a sha alone must clear it.
     expect(omitted).toHaveProperty("reviewedSha", "abc1234");
     expect(omitted?.reviewedUntracked).toBe(undefined);
 
     expect(
-      saveReviewedSha({ cwd, fs, sha: "abc1234", untracked: [{ path: "src/a.ts", blob: "b1" }] }),
+      saveReviewedSha({
+        cwd,
+        store,
+        sha: "abc1234",
+        untracked: [{ path: "src/a.ts", blob: "b1" }],
+      }),
     ).toEqual({ ok: true });
-    expect(saveReviewedSha({ cwd, fs, sha: "abc1234", untracked: [] })).toEqual({ ok: true });
-    expect(readWorkflowState({ cwd, fs })?.reviewedUntracked).toBe(undefined);
+    expect(saveReviewedSha({ cwd, store, sha: "abc1234", untracked: [] })).toEqual({ ok: true });
+    expect(readWorkflowState({ cwd, store })?.reviewedUntracked).toBe(undefined);
   });
 
   it("writes neither the sha nor the manifest on a task-id mismatch (bd-228)", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({
@@ -333,13 +351,12 @@ describe("workflow state", () => {
         reviewedSha: "deadbee",
         reviewedUntracked: [{ path: "src/foreign.ts", blob: "blobffff" }],
       }),
-      fs,
+      store,
     });
-    const before = fs.files.get(workflowStateFilePath(cwd));
 
     const result = saveReviewedSha({
       cwd,
-      fs,
+      store,
       sha: "abc1234",
       untracked: [{ path: "src/new.ts", blob: "blob1111" }],
       expectedTaskId: "bd-42",
@@ -347,10 +364,13 @@ describe("workflow state", () => {
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("task-mismatch");
-    expect(fs.files.get(workflowStateFilePath(cwd))).toBe(before);
+    expect(readWorkflowState({ cwd, store })).toHaveProperty("reviewedSha", "deadbee");
+    expect(readWorkflowState({ cwd, store })).toHaveProperty("reviewedUntracked", [
+      { path: "src/foreign.ts", blob: "blobffff" },
+    ]);
   });
 
-  it("parses a pre-bd-228 workflow.json without a reviewed untracked manifest", () => {
+  it("parses a pre-bd-228 workflow without a reviewed untracked manifest", () => {
     const raw = { ...sampleState(), reviewedSha: "abc1234" };
     expect(parseWorkflowState(raw)?.reviewedUntracked).toBe(undefined);
     const withManifest = {
@@ -364,11 +384,9 @@ describe("workflow state", () => {
   });
 
   it("round-trips a pending review scope (bd-228)", () => {
-    const fs = createFakeFs();
-
     const result = saveReviewScope({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       taskId: "bd-42",
       sha: "decaf00",
@@ -376,7 +394,7 @@ describe("workflow state", () => {
     });
 
     expect(result).toEqual({ ok: true });
-    expect(readReviewScope({ cwd, fs })).toEqual({
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toEqual({
       taskId: "bd-42",
       sha: "decaf00",
       untracked: [{ path: "src/new.ts", blob: "blob1111" }],
@@ -384,108 +402,76 @@ describe("workflow state", () => {
     });
   });
 
-  it("writes the review scope atomically, replacing the previous record", () => {
-    const fs = createFakeFs();
+  it("replaces the previous review scope so only the newest build can promote it", () => {
     saveReviewScope({
       cwd,
-      fs,
+      store,
       taskId: "bd-42",
       sha: "old1234",
       untracked: [{ path: "src/old.ts", blob: "blob0000" }],
     });
 
-    const result = saveReviewScope({
-      cwd,
-      fs,
-      taskId: "bd-42",
-      sha: "new1234",
-      untracked: [],
-    });
+    const result = saveReviewScope({ cwd, store, taskId: "bd-42", sha: "new1234", untracked: [] });
 
     expect(result).toEqual({ ok: true });
-    // Only the newest build's record exists: a stale scope can never be promoted.
-    expect(readReviewScope({ cwd, fs })).toHaveProperty("sha", "new1234");
-    expect(readReviewScope({ cwd, fs })).toHaveProperty("untracked", []);
-    expect([...fs.files.keys()]).toEqual([reviewScopeFilePath(cwd)]);
-    expect([...fs.files.keys()].some((path) => path.endsWith(".tmp"))).toBe(false);
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toHaveProperty("sha", "new1234");
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toHaveProperty("untracked", []);
+    // The retired file path never appears.
+    expect(reviewScopeFilePath(cwd)).toBe(join(cwd, ".belayd", "review-scope.json"));
   });
 
   it("treats a missing, corrupt or invalid review scope as no scope", () => {
-    const missing = createFakeFs();
-    expect(readReviewScope({ cwd, fs: missing })).toBe(undefined);
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toBe(undefined);
 
-    const corrupt = createFakeFs({ [reviewScopeFilePath(cwd)]: "not json" });
-    expect(readReviewScope({ cwd, fs: corrupt })).toBe(undefined);
-
-    const invalid = createFakeFs({
-      [reviewScopeFilePath(cwd)]: JSON.stringify({ taskId: "bd-42", sha: 42 }),
-    });
-    expect(readReviewScope({ cwd, fs: invalid })).toBe(undefined);
-
-    const unreadable = createFakeFs({ [reviewScopeFilePath(cwd)]: "{}" });
-    unreadable.readFileSync = () => {
-      throw new Error("EACCES");
-    };
-    expect(readReviewScope({ cwd, fs: unreadable })).toBe(undefined);
+    saveReviewScope({ cwd, store, taskId: "bd-42", sha: "abc1234", untracked: [] });
+    const database = new DatabaseSync(storePath);
+    database
+      .prepare("UPDATE review_scope SET payload = 'not json' WHERE worktree_path = ?")
+      .run(cwd);
+    database
+      .prepare("UPDATE review_scope SET payload = ? WHERE worktree_path = ?")
+      .run(JSON.stringify({ taskId: "bd-42", sha: 42 }), cwd);
+    database.close();
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toBe(undefined);
 
     expect(parseReviewScope({ taskId: "bd-42", sha: "abc1234", untracked: [] })).toBe(undefined);
   });
 
   it("reports a review-scope write failure as a value", () => {
-    const fs = createFakeFs();
-    fs.renameSync = () => {
-      throw new Error("EXDEV");
-    };
-
-    const result = saveReviewScope({ cwd, fs, taskId: "bd-42", sha: "abc1234", untracked: [] });
+    store.close();
+    const result = saveReviewScope({ cwd, store, taskId: "bd-42", sha: "abc1234", untracked: [] });
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain("EXDEV");
+    expect(result.error).toContain("closed");
   });
 
-  it("clears the pending review scope and tolerates a missing file", () => {
-    const fs = createFakeFs();
-    saveReviewScope({ cwd, fs, taskId: "bd-42", sha: "abc1234", untracked: [] });
+  it("clears the pending review scope and tolerates a missing row", () => {
+    saveReviewScope({ cwd, store, taskId: "bd-42", sha: "abc1234", untracked: [] });
 
-    expect(clearReviewScope({ cwd, fs })).toEqual({ ok: true });
-    expect(readReviewScope({ cwd, fs })).toBe(undefined);
-    expect(fs.files.has(reviewScopeFilePath(cwd))).toBe(false);
+    expect(clearReviewScope({ cwd, store, taskId: "bd-42" })).toEqual({ ok: true });
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toBe(undefined);
     // Consuming an absent scope is the expected success case.
-    expect(clearReviewScope({ cwd, fs })).toEqual({ ok: true });
-  });
-
-  it("reports a review-scope clear failure for a file that still exists", () => {
-    const fs = createFakeFs({ [reviewScopeFilePath(cwd)]: "{}" });
-    fs.unlinkSync = () => {
-      throw new Error("EACCES");
-    };
-
-    const result = clearReviewScope({ cwd, fs });
-
-    expect(result.ok).toBe(false);
-    if (result.ok) return;
-    expect(result.error).toContain("EACCES");
+    expect(clearReviewScope({ cwd, store, taskId: "bd-42" })).toEqual({ ok: true });
   });
 
   it("savePhaseSession upserts one entry and preserves identity fields", () => {
-    const fs = createFakeFs();
     writeWorkflowState({
       cwd,
       state: sampleState({ startedAt: 5_000, updatedAt: 5_000 }),
-      fs,
+      store,
     });
 
     const result = savePhaseSession({
       cwd,
-      fs,
+      store,
       now: () => 9_000,
       phaseName: "implement",
       record: { base: "belayd-bd-42-sub-implement-a", invocations: 1 },
     });
 
     expect(result).toEqual({ ok: true });
-    const reloaded = readWorkflowState({ cwd, fs });
+    const reloaded = readWorkflowState({ cwd, store });
     expect(reloaded).toHaveProperty("taskId", "bd-42");
     expect(reloaded).toHaveProperty("startedAt", 5_000);
     expect(reloaded).toHaveProperty("updatedAt", 9_000);
@@ -495,52 +481,49 @@ describe("workflow state", () => {
   });
 
   it("savePhaseSession keeps other phases' entries independent", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState(), fs });
+    writeWorkflowState({ cwd, state: sampleState(), store });
 
     savePhaseSession({
       cwd,
-      fs,
+      store,
       phaseName: "implement",
       record: { base: "impl", invocations: 1 },
     });
-    savePhaseSession({ cwd, fs, phaseName: "review", record: { base: "rev", invocations: 2 } });
+    savePhaseSession({ cwd, store, phaseName: "review", record: { base: "rev", invocations: 2 } });
     savePhaseSession({
       cwd,
-      fs,
+      store,
       phaseName: "implement",
       record: { base: "impl", invocations: 2 },
     });
 
-    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toEqual({
+    expect(readWorkflowState({ cwd, store })?.phaseSessions).toEqual({
       implement: { base: "impl", invocations: 2 },
       review: { base: "rev", invocations: 2 },
     });
   });
 
-  it("treats a pre-bd-81 workflow.json (no phaseSessions) as an empty ledger", () => {
-    const fs = createFakeFs();
+  it("treats a pre-bd-81 workflow (no phaseSessions) as an empty ledger", () => {
     // writeWorkflowState omits phaseSessions because sampleState never sets it.
-    writeWorkflowState({ cwd, state: sampleState(), fs });
-    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toBe(undefined);
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    expect(readWorkflowState({ cwd, store })?.phaseSessions).toBe(undefined);
 
     const result = savePhaseSession({
       cwd,
-      fs,
+      store,
       phaseName: "review",
       record: { base: "rev", invocations: 1 },
     });
     expect(result).toEqual({ ok: true });
-    expect(readWorkflowState({ cwd, fs })?.phaseSessions).toEqual({
+    expect(readWorkflowState({ cwd, store })?.phaseSessions).toEqual({
       review: { base: "rev", invocations: 1 },
     });
   });
 
   it("savePhaseSession returns an error when no state exists", () => {
-    const fs = createFakeFs();
     const result = savePhaseSession({
       cwd,
-      fs,
+      store,
       phaseName: "review",
       record: { base: "rev", invocations: 1 },
     });
@@ -548,84 +531,75 @@ describe("workflow state", () => {
     if (!result.ok) expect(result.error).toContain("No Belayd workflow state");
   });
 
-  it("savePhaseSession accepts a pre-read state without touching disk again", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState(), fs });
-    const existing = readWorkflowState({ cwd, fs });
+  it("savePhaseSession accepts a pre-read state", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    const existing = readWorkflowState({ cwd, store });
     expect(existing).toBeDefined();
     if (existing === undefined) return;
 
-    // A failing read would prove the existingState was ignored; replacing the
-    // reader is not possible through the seam, so assert the write landed.
     const result = savePhaseSession({
       cwd,
-      fs,
+      store,
       existingState: existing,
       phaseName: "implement",
       record: { base: "impl", invocations: 2 },
     });
     expect(result).toEqual({ ok: true });
-    expect(readWorkflowState({ cwd, fs })?.phaseSessions?.implement).toEqual({
+    expect(readWorkflowState({ cwd, store })?.phaseSessions?.implement).toEqual({
       base: "impl",
       invocations: 2,
     });
   });
 
-  it("savePhaseSession returns an error for a corrupt state file", () => {
-    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: "not json" });
+  it("savePhaseSession refuses to write over a row it cannot read", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    corruptWorkflowColumn("bd-42", "completed_phase_names", "not json");
+
     const result = savePhaseSession({
       cwd,
-      fs,
+      store,
       phaseName: "review",
       record: { base: "rev", invocations: 1 },
     });
     expect(result.ok).toBe(false);
   });
 
-  it("savePhaseSession returns an error value (no throw) when the write fails", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState(), fs });
-    fs.renameSync = () => {
-      throw new Error("disk full");
-    };
+  it("returns an error value (no throw) when the store is closed", () => {
+    store.close();
+    expect(writeWorkflowState({ cwd, state: sampleState(), store })).toHaveProperty("ok", false);
+    expect(
+      savePhaseSession({
+        cwd,
+        store,
+        phaseName: "review",
+        record: { base: "rev", invocations: 1 },
+      }),
+    ).toHaveProperty("ok", false);
+  });
 
-    const result = savePhaseSession({
+  it("refuses to persist a workflow that does not match the schema", () => {
+    const invalid = { ...sampleState(), phaseOrder: ["scout", 1] };
+    const result = writeWorkflowState({
       cwd,
-      fs,
-      phaseName: "review",
-      record: { base: "rev", invocations: 1 },
+      // The schema is the validation boundary on the way into the store.
+      state: invalid as unknown as WorkflowState,
+      store,
     });
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBe("disk full");
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
   });
 
-  it("returns an error value (no throw) when the write fails", () => {
-    const fs = createFakeFs();
-    const state = sampleState();
+  it("clearWorkflowState removes only the workflow row", () => {
+    writeWorkflowState({ cwd, state: sampleState(), store });
+    saveReviewScope({ cwd, store, taskId: "bd-42", sha: "abc1234", untracked: [] });
 
-    fs.renameSync = () => {
-      throw new Error("disk full");
-    };
+    clearWorkflowState({ cwd, store });
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
+    // Unrelated state is untouched.
+    expect(readReviewScope({ cwd, store, taskId: "bd-42" })).toHaveProperty("sha", "abc1234");
 
-    const result = writeWorkflowState({ cwd, state, fs });
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBe("disk full");
-    expect([...fs.files.keys()].some((path) => path.endsWith(".tmp"))).toBe(false);
-  });
-
-  it("clearWorkflowState removes only workflow.json and tolerates missing files", () => {
-    const fs = createFakeFs({
-      [workflowStateFilePath(cwd)]: JSON.stringify(sampleState()),
-      [`${cwd}/.belayd-task.json`]: JSON.stringify({ taskId: "bd-1" }),
-    });
-
-    clearWorkflowState({ cwd, fs });
-    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(false);
-    // The legacy file is no longer managed; only workflow.json is removed.
-    expect(fs.files.has(`${cwd}/.belayd-task.json`)).toBe(true);
-
-    // No files present: must not throw.
-    expect(() => clearWorkflowState({ cwd, fs })).not.toThrow();
+    // No row present: must not throw.
+    expect(() => clearWorkflowState({ cwd, store })).not.toThrow();
   });
 
   it("parseWorkflowState rejects malformed fields", () => {
@@ -685,7 +659,7 @@ describe("classifyWorkflowClaimability (bd-165)", () => {
 
   it("reports complete ahead of an invalid task id", () => {
     // Ordering, not preference: a finished workflow is inert whichever check
-    // fires first, and both reasons skip the claim and archive the file.
+    // fires first, and both reasons skip the claim.
     const state = sampleState({
       taskId: "bd-42;rm -rf /",
       completedPhaseNames: ["scout", "plan", "implement", "commit"],
@@ -709,63 +683,35 @@ describe("classifyWorkflowClaimability (bd-165)", () => {
   });
 });
 
-describe("archiveWorkflowState (bd-165)", () => {
-  it("renames the state to a timestamped archive instead of deleting it", () => {
-    const original = { ...sampleState(), completedPhaseNames: ["scout", "plan"] };
-    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: JSON.stringify(original) });
+describe("archiveWorkflowState (bd-165, bd-281)", () => {
+  it("discards the inert record instead of keeping a copy of executable state", () => {
+    writeWorkflowState({
+      cwd,
+      state: sampleState({ completedPhaseNames: ["scout", "plan"] }),
+      store,
+    });
 
-    const result = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
+    const result = archiveWorkflowState({ cwd, store, now: () => 7_654 });
 
     expect(result.ok).toBe(true);
     if (!result.ok || !result.archived) throw new Error("expected an archived result");
-    expect(result.archivedPath).toMatch(/workflow\.stale-7654-[0-9a-f]{8}\.json$/);
-    expect(result.archivedPath.startsWith(workflowStateDir(cwd))).toBe(true);
-    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(false);
-    expect(fs.files.get(result.archivedPath)).toBe(JSON.stringify(original));
+    // A stale *copy* of state is the bug this change removes, so the record is
+    // deleted and the return type has no archive path to mislead a caller.
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
+    expect(workflowStateDir(cwd)).toBe(join(cwd, ".belayd"));
   });
 
-  it("keeps both records when two archives land in the same millisecond", () => {
-    const fs = createFakeFs();
-    const first = { ...sampleState(), completedPhaseNames: ["scout"] };
-    const second = { ...sampleState(), completedPhaseNames: ["scout", "plan"] };
-
-    writeWorkflowState({ cwd, state: first, fs });
-    const firstResult = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
-    writeWorkflowState({ cwd, state: second, fs });
-    const secondResult = archiveWorkflowState({ cwd, fs, now: () => 7_654 });
-
-    if (!firstResult.ok || !firstResult.archived) throw new Error("first archive failed");
-    if (!secondResult.ok || !secondResult.archived) throw new Error("second archive failed");
-    expect(firstResult.archivedPath).not.toBe(secondResult.archivedPath);
-    expect(JSON.parse(fs.files.get(firstResult.archivedPath) ?? "")).toHaveProperty(
-      "completedPhaseNames",
-      ["scout"],
-    );
-    expect(JSON.parse(fs.files.get(secondResult.archivedPath) ?? "")).toHaveProperty(
-      "completedPhaseNames",
-      ["scout", "plan"],
-    );
-  });
-
-  it("reports the missing-file no-op explicitly", () => {
-    const fs = createFakeFs();
-    expect(archiveWorkflowState({ cwd, fs, now: () => 7_654 })).toEqual({
+  it("reports the missing-row no-op explicitly", () => {
+    expect(archiveWorkflowState({ cwd, store, now: () => 7_654 })).toEqual({
       ok: true,
       archived: false,
     });
-    expect(fs.files.size).toBe(0);
   });
 
-  it("returns a rename failure as a value and leaves the state in place", () => {
-    const fs = createFakeFs({ [workflowStateFilePath(cwd)]: JSON.stringify(sampleState()) });
-    fs.renameSync = () => {
-      throw new Error("disk full");
-    };
-
-    const result = archiveWorkflowState({ cwd, fs });
+  it("reports an unavailable store as a value", () => {
+    store.close();
+    const result = archiveWorkflowState({ cwd, store });
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBe("disk full");
-    expect(fs.files.has(workflowStateFilePath(cwd))).toBe(true);
   });
 });
 
@@ -778,46 +724,40 @@ describe("handoff marker", () => {
   });
 
   it("records the marker while preserving the workflow identity", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), fs });
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), store });
 
-    const saved = saveHandedOffMarker({ cwd, marker, fs });
+    const saved = saveHandedOffMarker({ cwd, store, marker });
 
     expect(saved.ok).toBe(true);
-    const persisted = readWorkflowState({ cwd, fs });
+    const persisted = readWorkflowState({ cwd, store });
     expect(persisted).toHaveProperty("taskId", "bd-42");
     expect(persisted).toHaveProperty("completedPhaseNames", ["implement"]);
     expect(persisted).toHaveProperty("handedOffTo", marker);
   });
 
   it("saveHandedOffMarker reports a missing state instead of creating one", () => {
-    const fs = createFakeFs();
-
-    const saved = saveHandedOffMarker({ cwd, marker, fs });
+    const saved = saveHandedOffMarker({ cwd, store, marker });
 
     expect(saved.ok).toBe(false);
-    expect(fs.files.size).toBe(0);
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
   });
 
   it("clears only the marker and keeps the workflow state", () => {
-    const fs = createFakeFs();
-    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), fs });
-    saveHandedOffMarker({ cwd, marker, fs });
+    writeWorkflowState({ cwd, state: sampleState({ completedPhaseNames: ["implement"] }), store });
+    saveHandedOffMarker({ cwd, store, marker });
 
-    const cleared = clearHandedOffMarker({ cwd, fs });
+    const cleared = clearHandedOffMarker({ cwd, store });
 
     expect(cleared.ok).toBe(true);
-    const persisted = readWorkflowState({ cwd, fs });
+    const persisted = readWorkflowState({ cwd, store });
     expect(persisted).toHaveProperty("taskId", "bd-42");
     expect(persisted).toHaveProperty("completedPhaseNames", ["implement"]);
     expect(persisted?.handedOffTo).toBe(undefined);
   });
 
   it("clearing a missing state is a no-op success", () => {
-    const fs = createFakeFs();
-
-    expect(clearHandedOffMarker({ cwd, fs }).ok).toBe(true);
-    expect(fs.files.size).toBe(0);
+    expect(clearHandedOffMarker({ cwd, store }).ok).toBe(true);
+    expect(readWorkflowState({ cwd, store })).toBe(undefined);
   });
 
   it("rejects a partially malformed marker", () => {
@@ -831,7 +771,7 @@ describe("caller-scoped handoff marker", () => {
   const marker = { taskId: "bd-101", branch: "feat/bd-101", sessionId: "sess-child" };
   const sessionKey = "caller-session-1";
 
-  it("uses a sanitized, caller-keyed path", () => {
+  it("keeps the retired path helper (naming the file the migration refuses)", () => {
     expect(callerHandoffFilePath(cwd, "a/b:c d")).toBe(
       join(cwd, ".belayd", "handoff-a_b_c_d.json"),
     );
@@ -840,61 +780,48 @@ describe("caller-scoped handoff marker", () => {
     );
   });
 
-  it("round-trips a marker and survives unrelated workflow.json rewrites", () => {
-    const fs = createFakeFs();
-    const written = writeCallerHandoff({ cwd, sessionKey, marker, fs });
-    // A same-directory child writes its own workflow.json over the caller's.
-    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-101" }), fs });
+  it("round-trips a marker and survives unrelated workflow rewrites", () => {
+    const written = writeCallerHandoff({ cwd, store, sessionKey, marker });
+    // A same-directory child writes its own workflow over the caller's.
+    writeWorkflowState({ cwd, state: sampleState({ taskId: "bd-101" }), store });
 
     expect(written.ok).toBe(true);
-    expect(readCallerHandoff({ cwd, sessionKey, fs })).toEqual(marker);
-    expect(readWorkflowState({ cwd, fs })?.handedOffTo).toBe(undefined);
+    expect(readCallerHandoff({ cwd, store, sessionKey })).toEqual(marker);
+    expect(readWorkflowState({ cwd, store })?.handedOffTo).toBe(undefined);
   });
 
-  it("returns undefined for another session or a corrupt file", () => {
-    const fs = createFakeFs();
-    writeCallerHandoff({ cwd, sessionKey, marker, fs });
+  it("returns undefined for another session or an unreadable row", () => {
+    writeCallerHandoff({ cwd, store, sessionKey, marker });
 
-    expect(readCallerHandoff({ cwd, sessionKey: "other-session", fs })).toBe(undefined);
+    expect(readCallerHandoff({ cwd, store, sessionKey: "other-session" })).toBe(undefined);
 
-    const corruptFs = createFakeFs({
-      [callerHandoffFilePath(cwd, sessionKey)]: JSON.stringify({ taskId: "bd-101" }),
-    });
-    expect(readCallerHandoff({ cwd, sessionKey, fs: corruptFs })).toBe(undefined);
+    const database = new DatabaseSync(storePath);
+    database
+      .prepare(
+        "UPDATE workflow_handoff SET payload = ? WHERE worktree_path = ? AND handoff_key = ?",
+      )
+      .run(JSON.stringify({ taskId: "bd-101" }), cwd, sessionKey);
+    database.close();
+    expect(readCallerHandoff({ cwd, store, sessionKey })).toBe(undefined);
   });
 
   it("clears only the caller's marker", () => {
-    const fs = createFakeFs();
-    writeCallerHandoff({ cwd, sessionKey, marker, fs });
-    writeCallerHandoff({ cwd, sessionKey: "other-session", marker, fs });
+    writeCallerHandoff({ cwd, store, sessionKey, marker });
+    writeCallerHandoff({ cwd, store, sessionKey: "other-session", marker });
 
-    expect(clearCallerHandoff({ cwd, sessionKey, fs }).ok).toBe(true);
-    expect(readCallerHandoff({ cwd, sessionKey, fs })).toBe(undefined);
-    expect(readCallerHandoff({ cwd, sessionKey: "other-session", fs })).toEqual(marker);
+    expect(clearCallerHandoff({ cwd, store, sessionKey }).ok).toBe(true);
+    expect(readCallerHandoff({ cwd, store, sessionKey })).toBe(undefined);
+    expect(readCallerHandoff({ cwd, store, sessionKey: "other-session" })).toEqual(marker);
   });
 
-  it("clearing a missing marker is a no-op success and reports a real unlink failure", () => {
-    const fs = createFakeFs();
-    expect(clearCallerHandoff({ cwd, sessionKey, fs }).ok).toBe(true);
-
-    writeCallerHandoff({ cwd, sessionKey, marker, fs });
-    fs.unlinkSync = () => {
-      throw new Error("EACCES");
-    };
-    const failed = clearCallerHandoff({ cwd, sessionKey, fs });
-    expect(failed.ok).toBe(false);
-    if (!failed.ok) expect(failed.error).toBe("EACCES");
+  it("clearing a missing marker is a no-op success", () => {
+    expect(clearCallerHandoff({ cwd, store, sessionKey }).ok).toBe(true);
   });
 
-  it("writeCallerHandoff reports a write failure instead of throwing", () => {
-    const fs = createFakeFs();
-    fs.renameSync = () => {
-      throw new Error("disk full");
-    };
-
-    const written = writeCallerHandoff({ cwd, sessionKey, marker, fs });
+  it("writeCallerHandoff reports an unavailable store instead of throwing", () => {
+    store.close();
+    const written = writeCallerHandoff({ cwd, store, sessionKey, marker });
     expect(written.ok).toBe(false);
-    if (!written.ok) expect(written.error).toBe("disk full");
   });
 
   it("parses a marker only when every field is present", () => {

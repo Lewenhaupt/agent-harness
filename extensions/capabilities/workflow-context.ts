@@ -276,9 +276,9 @@ export function registerWorkflowContext(deps: WorkflowContextDeps): void {
 
   // Fleet member delivery. Separate handler for the same reason as the
   // instruction-group handler below: the gate handler's early returns must not
-  // be able to skip it. A supervisor → member note is a file in `events/`, so it
-  // is drained here, at the start of the turn, bounded, acked once, and silent
-  // when nothing is addressed to this member.
+  // be able to skip it. A supervisor → member note is a store row addressed to
+  // this member, so it is drained here, at the start of the turn, bounded, acked
+  // once, and silent when nothing is addressed to this member.
   //
   // Human answers ride along (bd-152): when the self-poll timer cannot wake the
   // session (no daemon route), the next turn still injects the answer. Both

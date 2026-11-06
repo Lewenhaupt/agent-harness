@@ -7,7 +7,7 @@
  * still ticking, and the member worktrees it drives live in other pi-web
  * workspaces. Naming the session after the members it supervises makes the
  * supervisor identifiable in pi-web's sidebar and in `pi --resume`, without
- * adding a second surface that can disagree with `fleet.json`.
+ * adding a second surface that can disagree with the intent row.
  *
  * The name is derived, never stored: membership lives in the intent, so a rename
  * on every launch/advance/resume cannot drift from the fleet it describes.

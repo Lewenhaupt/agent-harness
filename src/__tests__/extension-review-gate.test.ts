@@ -9,7 +9,7 @@
  * review stays on the fast path and writes nothing.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -36,8 +36,22 @@ import {
   REVIEW_FIX_LOOP_REASON,
   REVIEW_NO_FINDINGS_REASON,
   REVIEW_NO_SEAM_REASON,
-  reviewFindingsRecordPath,
+  type ReviewFindingsRecord,
+  readReviewFindingsRecord,
 } from "../review-findings.js";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The disposition record is a store row now (bd-281); these tests run in temp
+// directories, so they point the store at a fresh file per test.
+installTempRepoState();
+
+/** The persisted record for the test's task, or a loud failure. */
+function recordFor(cwd: string, taskId = "bd-1"): ReviewFindingsRecord {
+  const record = readReviewFindingsRecord({ cwd, taskId });
+  if (record === undefined) throw new Error(`no review-findings record for ${taskId}`);
+  return record;
+}
+
 import type { RunDelivery } from "../run-detached.js";
 
 const ACTOR = "belayd:bd-1:orchestrator";
@@ -199,11 +213,11 @@ describe("deliverReviewFindings", () => {
     expect(comment?.stdin).toContain("No human decision is required");
     expect(comment?.stdin).not.toContain("### Question");
 
-    const record = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
+    const record = recordFor(cwd);
     expect(record.round).toBe(1);
     expect(record.reason).toBe(REVIEW_FIX_LOOP_REASON);
     expect(record.findings).toHaveLength(1);
-    expect(record.findings[0].disposition).toEqual({
+    expect(record.findings[0]).toHaveProperty("disposition", {
       kind: "deferred",
       reason: REVIEW_FIX_LOOP_REASON,
     });
@@ -227,9 +241,7 @@ describe("deliverReviewFindings", () => {
     expect(outcome).toMatchObject({ recorded: true });
     expect(state.awaitingHuman).toBeUndefined();
     expect(bd.calls.some((call) => bd.keyOf(call.argv).startsWith("gate create"))).toBe(false);
-    expect(JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8")).findings).toHaveLength(
-      1,
-    );
+    expect(recordFor(cwd).findings).toHaveLength(1);
   });
 
   it("leaves bd gate list empty after an ordinary findings review (acceptance)", async () => {
@@ -267,7 +279,7 @@ describe("deliverReviewFindings", () => {
     });
     expect(state.awaitingHuman).toBeUndefined();
     expect(bd.calls).toHaveLength(0);
-    expect(() => readFileSync(reviewFindingsRecordPath(cwd), "utf8")).toThrow();
+    expect(readReviewFindingsRecord({ cwd, taskId: "bd-1" })).toBeUndefined();
   });
 
   it("records a review that arrives while a human answer is already pending", async () => {
@@ -329,9 +341,11 @@ describe("deliverReviewFindings", () => {
   it("warns but still posts the comment when the record write fails", async () => {
     const state = makeState();
     ctx.cwd = cwd;
-    // A directory where the record file belongs makes the temp-rename fail; the
-    // comment is the human-visible trace and must survive it.
-    mkdirSync(reviewFindingsRecordPath(cwd), { recursive: true });
+    // An unusable store path is the failure the seam can express now that the
+    // record is a row: a regular file where the directory belongs, so the store
+    // cannot be created. The comment is the human-visible trace and must survive it.
+    writeFileSync(join(cwd, "blocked"), "not a directory");
+    process.env.BELAYD_REPO_STATE_FILE = join(cwd, "blocked", "state.sqlite");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const outcome = await deliverReviewFindings({
@@ -376,7 +390,7 @@ describe("deliverReviewFindings", () => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("refused to post"));
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("github-pat"));
       expect(state.awaitingHuman).toBeUndefined();
-      expect(JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8")).round).toBe(1);
+      expect(recordFor(cwd).round).toBe(1);
     } finally {
       warn.mockRestore();
     }
@@ -449,7 +463,7 @@ describe("deliverReviewFindings", () => {
       reviewText: REVIEW_WITH_FINDINGS,
     });
     expect(second).toMatchObject({ recorded: true });
-    const record = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
+    const record = recordFor(cwd);
     expect(record.round).toBe(2);
     expect(record.findings.every((finding: { round: number }) => finding.round === 2)).toBe(true);
     // Two rounds of trace, zero gates: the round counter is not tied to a wait.

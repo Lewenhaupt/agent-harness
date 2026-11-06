@@ -16,7 +16,7 @@
  *
  * - **gate** = ordering. Created at launch for every dependency edge *between two
  *   members*, resolved when the blocker **lands** (merge succeeded), signalled by
- *   `fleet.json`'s `run.members[].landedAt`.
+ *   the fleet intent's `run.members[].landedAt`.
  * - **close** = acceptance. Only `src/fleet-accept.ts` closes, only when the launch
  *   asked for it (`--accept`), and the human otherwise accepts with `wt merge`.
  *
@@ -43,7 +43,7 @@
  * ordering; see `bead-gates.ts`. It also keeps legacy ordering gates, created
  * before bd-176 and typed `human`, recognizable as ordering.
  *
- * Records: the intent (`fleet.json`) holds one `{ blocker, blocked, gateId }` per
+ * Records: the intent row holds one `{ blocker, blocked, gateId }` per
  * created gate. bd is also read as truth here (`bd gate list <blocked>`), because
  * a crash between `bd gate create` and the intent write would otherwise leave an
  * unrecorded gate that blocks a dependent forever: the next launch adopts the gate
@@ -52,7 +52,7 @@
  *
  * Trade-off, accepted explicitly: fleet ordering no longer appears in
  * `bd dep list` / `bd graph`; it lives in the gate's title/reason and in
- * `fleet.json`. An operator who wants bd's graph to show an edge can keep a plain
+ * the fleet intent. An operator who wants bd's graph to show an edge can keep a plain
  * `blocks` edge for it — and then inherits bd's close-to-unblock rule for it.
  *
  * All argv builders and parsers here are pure; the drivers take an injected
@@ -277,7 +277,7 @@ export function orderingGateBudgetRefusal(count: number): string | undefined {
   return count <= FLEET_INTENT_ORDERING_GATES_MAX
     ? undefined
     : `this fleet would record ${count} ordering gates, over the ` +
-        `${FLEET_INTENT_ORDERING_GATES_MAX}-gate bound of \`fleet.json\`; nothing was written ` +
+        `${FLEET_INTENT_ORDERING_GATES_MAX}-gate bound of the fleet intent; nothing was written ` +
         "(resolve or remove a fleet's gates before adding more members)";
 }
 
@@ -562,6 +562,21 @@ export async function resolveFleetOrderingGates(
     : { ok: false, error, resolved, remaining: [...stuck, ...untouched] };
 }
 
+/**
+ * The recorded gates one bead's landing ends, in record order.
+ *
+ * Pure on purpose (bd-281): the plan that commits a landing decides this from the
+ * record read **inside** its transaction, so the drop set can never come from a
+ * stale snapshot. Both directions count, exactly as the bd resolve does: a landing
+ * ends the gate's purpose whichever side of the edge the member is on.
+ */
+export function fleetOrderingGatesForBead(
+  gates: readonly FleetOrderingGate[],
+  beadId: string,
+): readonly FleetOrderingGate[] {
+  return gates.filter((gate) => gateMatches(gate, { beadId }));
+}
+
 /** Split the recorded gates into the ones this call resolves and the rest. */
 function selectGates(options: ResolveFleetOrderingGatesOptions): {
   selected: FleetOrderingGate[];
@@ -649,7 +664,7 @@ export type FleetOrderingGateReapScope =
 /**
  * Resolve ordering gates bd knows about for these beads, whatever the intent says.
  *
- * This is the crash-window path: a gate can exist in bd while `fleet.json` has no
+ * This is the crash-window path: a gate can exist in bd while the fleet intent has no
  * record of it (a crash between create and the intent write, a truncated record).
  * The reaper cannot find such a gate from the intent, so the beads that must not
  * stay gated are asked directly. Only gates whose marker names *this* fleet are

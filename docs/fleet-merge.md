@@ -10,9 +10,9 @@ whole surface: `docs/fleet.md`.
 
 What it guarantees:
 
-- **single-flight**: one merge at a time, enforced by an atomic
-  `mkdir merge.lock.d`, with a renewable lease as the only crash-recovery
-  authority (never a pid guess);
+- **single-flight**: one merge at a time, enforced by one conditional row claim
+  (`fleet_lock`), with a renewable lease as the only crash-recovery authority
+  (never a pid guess);
 - **safe root handling**: a dirty root is stashed and restored by its **recorded
   sha** (never `stash@{0}`, so a stash the operator pushes mid-drain survives);
   the root's branch is re-verified before every mutation, and a conflicting or
@@ -65,8 +65,8 @@ its worktree exists. Re-enqueueing an active entry is idempotent; an already
 merged entry is refused; a `failed`/`parked` entry is queued again with its
 attempt count preserved.
 
-`enqueue` never merges, never rebases, and never touches the root. It writes
-`merge-queue.json` and audits `merge-enqueued`.
+`enqueue` never merges, never rebases, and never touches the root. It writes the
+`fleet_queue` row and audits `merge-enqueued`.
 
 ### Drain
 
@@ -100,7 +100,7 @@ runs the documented sequence:
    removed is allowed. `--diff-filter=ACMRT` is what excludes deletions; a
    rename is still reported (as its destination path), so renaming proof content
    out of a proof directory is refused.
-3. **acquire** — atomically create `<fleetDir>/merge.lock.d`. A live lease from
+3. **acquire** — atomically claim the `fleet_lock` row. A live lease from
    another supervisor is refused ("held by X until T"); an expired lease is
    acquirable.
 4. **stash a dirty root** — `git stash push --include-untracked`, the stash
@@ -128,7 +128,7 @@ runs the documented sequence:
    that shifts the index between verify and drop is therefore warned about and
    audited (`merge-stash-drop-mismatch`) instead of silently dropping the wrong
    entry. A conflicting restore records `park { reason, stashRef, recordedAt }` in
-   `fleet.json`, which is what `belayd_fleet_reconcile` restores from.
+   the intent row, which is what `belayd_fleet_reconcile` restores from.
 8. **broadcast** `base-moved` and `sibling-landed` to remaining members, plus a
    `rebase-hint` to members whose **actual** branch (from git's worktree list, not
    an assumed `feat/<id>`) does not yet contain the new commit. Each recipient is
@@ -183,7 +183,7 @@ Why the rules are what they are:
 - **Committer time is the attribution signal.** A sibling's commits reach the base
   only through this drain's rebase plus `--ff-only` merge, so their committer date
   falls inside the fleet's lifetime, while base work that predates the fleet is
-  older than `fleet.json#createdAt`. With no `createdAt` the drain never claims a
+  older than the intent's `createdAt`. With no `createdAt` the drain never claims a
   contradiction. A mixed contradiction/pre-existing conflict is a contradiction: a
   person decides which work wins. The **stop** direction is unaffected by the
   evidence, but the **story** is: a person can commit to the base during a fleet,
@@ -291,7 +291,7 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 | `lock-unavailable` | another supervisor holds a live lease, or an orphaned primitive is inside its grace window |
 | `root-not-own-checkout` / `root-not-on-base` | run the drain from the root on the base branch |
 | `member-worktree-dirty` | commit or discard the member's working-tree changes first |
-| `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof and keep the receipt at `.belayd/proof-receipt.json` instead. Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. A repo that keeps text proof in git declares `{"proof":{"artifacts":"in-tree"}}` in `.belayd/config.json` and this refusal stops applying to it (see [Repo proof policy](#repo-proof-policy-bd-276)). The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
+| `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof instead (the receipt is a `proof_receipt` row in `<git-common-dir>/belayd/state.sqlite`, not a worktree file). Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. A repo that keeps text proof in git declares `{"proof":{"artifacts":"in-tree"}}` in `.belayd/config.json` and this refusal stops applying to it (see [Repo proof policy](#repo-proof-policy-bd-276)). The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
 | `paths-outside-scope` | the payload contains harness-local (`.belayd`, `.belayd/`, `.belayd-task.json`, `proof-of-work`), absolute, traversal or backslash paths, a non-ASCII/lookalike path (refused rather than guessed; rename it to ASCII), or (when the publisher declares a payload) a path outside it |
 | `publish-payload-unreadable` | the payload diff could not be computed; the drain fails closed rather than guessing |
 | `land-repair` (not a refusal) | the refusal above was **repairable**, so the run gave the member one repair round instead of stopping it (bd-277 — see [One repair round](#one-repair-round-bd-277)). The member is relaunched on its own branch with the refusal text as its task (or, when its orchestrator lease is live, sent a `land-repair` mailbox note), the attempt is recorded as `run.members[].landRepair` (`attempts: 1`, the refusal, and the branch tip at refusal time), and the landing is held while that tip is unchanged. A second refusal, or a repair that never moves the tip past `FLEET_LAND_REPAIR_GRACE_MS`, stops the member `land-failed` with the round's provenance and the refusal as its detail (see below) |
@@ -299,8 +299,10 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 ### Repo proof policy (bd-276)
 
 Proof artifacts are refused in a published payload by default (bd-181): they
-upload to the reviewing platform and the workflow keeps a receipt at
-`.belayd/proof-receipt.json`. A repository whose own policy keeps *text* evidence
+upload to the reviewing platform and the workflow keeps a receipt — a
+`proof_receipt` row in `<git-common-dir>/belayd/state.sqlite` since bd-281, not
+the retired `.belayd/proof-receipt.json` file (whose pi-web reader is broken
+until bd-303). A repository whose own policy keeps *text* evidence
 in git — `docs/proof/<bead>/` READMEs, casts, transcripts, capture scripts — is
 the case that default cannot express, and bd-181 deliberately left those repos
 "not migrated, only stopped". Every member then refuses to land, and the refusal is
@@ -342,8 +344,8 @@ the repository.
   merge queue. Draining is one explicit call per member.
 - **No automatic pause, and exactly one repair round.** `belayd_fleet_pause` writes
   the flag a drain refuses on, and `belayd_fleet_reconcile` repairs the queue
-  (expired lease, record without primitive, orphaned directory, stuck entry) — under
-  the same `merge.lock.d` primitive, never a second lock. See
+  (expired lease, stuck entry) — under the same `fleet_lock` claim, never a second
+  lock. See
   `docs/fleet-reconcile.md`. The drain itself never repairs the *repository*; the
   one exception is the bounded repair round the **run loop** gives a member whose own
   diff was refused (bd-277, below).
@@ -369,7 +371,7 @@ the refusal's prose.
 
 | Reason | Repairable? | Why |
 |--------|-------------|-----|
-| `proof-artifacts-in-diff` | yes | remove the proof files from the branch, keep `.belayd/proof-receipt.json` |
+| `proof-artifacts-in-diff` | yes | remove the proof files from the branch; the receipt is a store row, not a worktree file |
 | `paths-outside-scope` | yes | drop the out-of-scope path from the payload |
 | `gate-failed` | yes | the member's own code failed a merge gate |
 | `rebase-failed`, `rebase-delegated` | no | a real contradiction, or already the member's own rebase to resolve (bd-280) |
@@ -379,7 +381,7 @@ the refusal's prose.
 What one round looks like:
 
 1. the run records `landRepair { attempts, at, refusal, head }` on the member in
-   `fleet.json` **and persists it before asking anyone** — a crash must not leave an
+   the intent row **and persists it before asking anyone** — a crash must not leave an
    unbounded retry loop, and the record is what survives a relaunch;
 2. the member is asked: its own worktree is relaunched through the ordinary
    fleet-member launch with the refusal and the repair instruction as its task, or —
@@ -428,7 +430,6 @@ member a refusal did stop — it now applies after the repair round, not instead
 |---------|----------------|
 | `no worktree is checked out for feat/bd-12` | the member was not launched, or its worktree was removed; enqueue only after it exists |
 | `merge lock is held by … until …` | another drain is in flight. Wait for it, or for the lease to expire if that supervisor died (pid is never used for takeover) |
-| `… exists without a lock record` | a holder is inside the acquire window or crashed before writing its lease; retry after ~30 s, or remove `merge.lock.d` by hand |
 | `fleet … is paused (…)` | an operator paused it, or a previous restore conflict parked it. For a park: run `belayd_fleet_reconcile` (restores the recorded sha, then unparks) and/or `belayd_fleet_resume`. For an operator pause: `belayd_fleet_resume` |
 | `gate … failed` | fix the branch, re-enqueue it (state returns to `queued`), drain again |
 
@@ -459,16 +460,20 @@ printf '%s' '{"schemaVersion":1,"fleetId":"default","taskIds":["bd-12"],"created
   > "$root/.git/belayd/fleet/default/fleet.json"
 ```
 
+That is a *legacy* seed: the one-shot import (`bd-281-legacy-fleet-state:<git-common-dir>`)
+reads it on the first fleet resolution of that repository and refuses it
+afterwards, so seed it once in a scratch repo and delete it after the import.
+
 Then, from a supervisor session whose cwd is `$root`, enqueue `bd-12` and drain
 it. Confirm: `git -C "$root" log --oneline` gained the member commit,
-`merge-queue.json` shows `merged` with `lock: null`, `merge.lock.d` is gone, and
-`audit.log` contains `merge-acquired`, `merge-completed`, `merge-released`, and no
-`bd` action.
+the `fleet_queue` row shows `merged`, the `fleet_lock` row is gone, and the
+`fleet_audit` rows contain `merge-acquired`, `merge-completed`, `merge-released`,
+and no `bd` action.
 
 To see the parked path, dirty `$root` with a change to a file the member also
-changed, drain again, and confirm: `fleet.json` has `"paused": true`, a `note`
+changed, drain again, and confirm: the `fleet_intent` row has `"paused": true`, a `note`
 containing `refs/stash`, and `park.stashRef` equal to the reported ref;
-`git -C "$root" stash list` is non-empty, the root is clean, and `audit.log` has
+`git -C "$root" stash list` is non-empty, the root is clean, and the `fleet_audit` rows have
 `merge-restore-conflict` + `fleet-parked`. Then `belayd_fleet_reconcile` restores
 it and unparks (`fleet-unparked`).
 
@@ -535,7 +540,7 @@ it and unparks (`fleet-unparked`).
   live clock stamps each step, the lease is renewed between gates, a poisoned
   `GIT_DIR` cannot redirect the root commands, a failed post-conflict reset and a
   failed `rebase --abort` are warned, a non-convention member branch gets no
-  spurious rebase-hint, a missing `fleet.json` is never resurrected by parking,
+  spurious rebase-hint, a missing intent row is never resurrected by parking,
   and the gate runner is derived from `packageManager`/lockfile with an npm
   fallback;
 - enqueue validation, idempotence, and "no `bd` command was run by any seam"

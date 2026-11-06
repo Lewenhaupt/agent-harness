@@ -13,15 +13,7 @@
 
 import { execFileSync } from "node:child_process";
 import * as nodeFs from "node:fs";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -29,7 +21,6 @@ import { describeFleetCapacity } from "../fleet-capacity.js";
 import { FLEET_SUPERVISOR_HEARTBEAT_STALE_MS } from "../fleet-heartbeat.js";
 import { collectFleetLaunchContext, validateFleetLaunch } from "../fleet-launch.js";
 import type { FleetMergeGitRunner } from "../fleet-merge.js";
-import { FLEET_MERGE_ORPHAN_LOCK_GRACE_MS } from "../fleet-merge.js";
 import {
   diagnoseMergeQueue,
   FLEET_RECONCILE_ACTIVE_ENTRY_STATES,
@@ -51,11 +42,9 @@ import type { FleetMemberLeaseProbe, FleetProcessScan } from "../fleet-sessions.
 import type { FleetMergeQueue, FleetStateFs } from "../fleet-state.js";
 import {
   createFleetMergeQueue,
-  fleetAuditLogPath,
-  fleetIntentFilePath,
-  fleetMergeLockDir,
   readFleetIntent,
   readFleetMergeQueue,
+  readRecentFleetAuditEntries,
   withFleetLaunchMarker,
   writeFleetIntent,
   writeFleetLaunchMarker,
@@ -67,6 +56,7 @@ import {
   FLEET_SCHEMA_VERSION,
   fleetSpawnInFlight,
 } from "../fleet-status.js";
+import { openRepoStateStore, repoStatePathForCommonDir } from "../repo-state-store.js";
 import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
@@ -113,12 +103,37 @@ function readQueue(commonDir: string, fleetId: string): FleetMergeQueue | undefi
 }
 
 function auditActions(commonDir: string, fleetId: string): string[] {
-  const path = fleetAuditLogPath(commonDir, fleetId);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => (JSON.parse(line) as { action: string }).action);
+  // bd-281: audit entries are store rows, not lines in audit.log.
+  return readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0 }).map(
+    (entry) => entry.action,
+  );
+}
+
+/** Seed one merge-lock row (the retired fixture wrote it inside the queue file). */
+function seedMergeLock(
+  commonDir: string,
+  fleetId: string,
+  lock: {
+    holder: string;
+    taskId: string;
+    pid: number;
+    acquiredAt: number;
+    leaseExpiresAt: number;
+  },
+): void {
+  const opened = openRepoStateStore({ path: repoStatePathForCommonDir(commonDir) });
+  if (!opened.ok) throw new Error(opened.error);
+  const claimed = opened.store.acquireFleetLock({
+    fleetId,
+    holder: lock.holder,
+    taskId: lock.taskId,
+    pid: lock.pid,
+    nowMs: lock.acquiredAt,
+    leaseMs: Math.max(1, lock.leaseExpiresAt - lock.acquiredAt),
+    takeOverExpired: true,
+  });
+  opened.store.close();
+  if (!claimed.ok) throw new Error("could not seed the merge lock");
 }
 
 const noMembers: FleetProcessScan = { ok: true, processes: [] };
@@ -145,59 +160,12 @@ describe("diagnoseMergeQueue", () => {
     };
     const repairs = diagnoseMergeQueue({
       queue,
-      lockDirPresent: true,
-      lockDirAgeInMs: 0,
       mergedIntoBase: [],
       now,
     });
     expect(repairs.map((repair) => [repair.anomaly, repair.action])).toEqual([
       ["expired-lease", "take-over-lock"],
     ]);
-  });
-
-  it("clears a lock record whose primitive is gone, even inside its lease", () => {
-    const queue: FleetMergeQueue = {
-      ...createFleetMergeQueue(1),
-      lock: {
-        holder: "session-a",
-        taskId: "bd-12",
-        pid: 111,
-        acquiredAt: 1,
-        leaseExpiresAt: now + 60_000,
-      },
-    };
-    const repairs = diagnoseMergeQueue({
-      queue,
-      lockDirPresent: false,
-      lockDirAgeInMs: undefined,
-      mergedIntoBase: [],
-      now,
-    });
-    expect(repairs.map((repair) => repair.action)).toEqual(["clear-lock-record"]);
-  });
-
-  it("leaves an orphaned lock directory alone inside the grace window", () => {
-    const repairs = diagnoseMergeQueue({
-      queue: undefined,
-      lockDirPresent: true,
-      lockDirAgeInMs: 1_000,
-      mergedIntoBase: [],
-      now,
-      orphanGraceInMs: 60_000,
-    });
-    expect(repairs.map((repair) => repair.action)).toEqual(["leave-alone"]);
-  });
-
-  it("reclaims an orphaned lock directory past the grace window", () => {
-    const repairs = diagnoseMergeQueue({
-      queue: undefined,
-      lockDirPresent: true,
-      lockDirAgeInMs: 120_000,
-      mergedIntoBase: [],
-      now,
-      orphanGraceInMs: 60_000,
-    });
-    expect(repairs.map((repair) => repair.action)).toEqual(["remove-lock-dir"]);
   });
 
   it("marks a stuck entry merged only when git proves the branch landed", () => {
@@ -211,8 +179,6 @@ describe("diagnoseMergeQueue", () => {
     };
     const repairs = diagnoseMergeQueue({
       queue,
-      lockDirPresent: false,
-      lockDirAgeInMs: undefined,
       mergedIntoBase: ["bd-12"],
       now,
     });
@@ -239,8 +205,6 @@ describe("diagnoseMergeQueue", () => {
     expect(
       diagnoseMergeQueue({
         queue,
-        lockDirPresent: true,
-        lockDirAgeInMs: 0,
         mergedIntoBase: [],
         now,
       }),
@@ -313,10 +277,8 @@ describe("runFleetReconcile: merge queue", () => {
   it("leaves a consistent queue byte-identical and is idempotent", async () => {
     const fixture = tempCommonDir("queue-clean");
     seedIntent(fixture.commonDir, fixture.fleetId);
-    const before = readFileSync(
-      join(fixture.commonDir, "belayd", "fleet", fixture.fleetId, "fleet.json"),
-      "utf8",
-    );
+    // bd-281: a no-op reconcile must not rewrite the intent row either.
+    const before = readIntent(fixture.commonDir, fixture.fleetId);
 
     const first = await reconcile(fixture);
     expect(first).toHaveProperty("ok", true);
@@ -329,12 +291,7 @@ describe("runFleetReconcile: merge queue", () => {
     expect(second.text).toBe(first.text);
     // No queue file was created just to prove there was nothing to repair.
     expect(readQueue(fixture.commonDir, fixture.fleetId)).toBe(undefined);
-    expect(
-      readFileSync(
-        join(fixture.commonDir, "belayd", "fleet", fixture.fleetId, "fleet.json"),
-        "utf8",
-      ),
-    ).toBe(before);
+    expect(readIntent(fixture.commonDir, fixture.fleetId)).toEqual(before);
   });
 
   it("resets a stuck entry to queued, preserving its attempt count", async () => {
@@ -358,7 +315,6 @@ describe("runFleetReconcile: merge queue", () => {
     expect(entry?.lastError).toContain("reconcile");
     expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("queue-reset-queued");
     // The lock is released again, so a normal drain can proceed.
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
     expect(readQueue(fixture.commonDir, fixture.fleetId)?.lock).toBe(null);
 
     const second = await reconcile(fixture);
@@ -392,117 +348,24 @@ describe("runFleetReconcile: merge queue", () => {
     writeFleetMergeQueue({
       gitCommonDir: fixture.commonDir,
       fleetId: fixture.fleetId,
-      queue: {
-        ...createFleetMergeQueue(1),
-        lock: {
-          holder: "dead-session",
-          taskId: "bd-12",
-          pid: 111,
-          acquiredAt: 1,
-          leaseExpiresAt: 5,
-        },
-      },
+      queue: createFleetMergeQueue(1),
     });
-    mkdirSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId), { recursive: true });
+    seedMergeLock(fixture.commonDir, fixture.fleetId, {
+      holder: "dead-session",
+      taskId: "bd-12",
+      pid: 111,
+      acquiredAt: 1,
+      leaseExpiresAt: 5,
+    });
 
     const first = await reconcile(fixture);
     expect(first.repairs).toContain("queue:take-over-lock");
     expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("queue-take-over-lock");
     // Released again: reconcile holds the lock only for the repair.
     expect(readQueue(fixture.commonDir, fixture.fleetId)?.lock).toBe(null);
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
 
     const second = await reconcile(fixture);
     expect(second.repairs).toEqual([]);
-  });
-
-  it("clears a lock record whose primitive is gone", async () => {
-    const fixture = tempCommonDir("queue-record");
-    seedIntent(fixture.commonDir, fixture.fleetId);
-    writeFleetMergeQueue({
-      gitCommonDir: fixture.commonDir,
-      fleetId: fixture.fleetId,
-      queue: {
-        ...createFleetMergeQueue(1),
-        lock: {
-          holder: "crashed-session",
-          taskId: "bd-12",
-          pid: 111,
-          acquiredAt: 1,
-          leaseExpiresAt: 200_000,
-        },
-      },
-    });
-
-    const first = await reconcile(fixture);
-    expect(first.repairs).toEqual(["queue:clear-lock-record"]);
-    expect(readQueue(fixture.commonDir, fixture.fleetId)?.lock).toBe(null);
-    expect(auditActions(fixture.commonDir, fixture.fleetId)).toContain("queue-clear-lock-record");
-
-    const second = await reconcile(fixture);
-    expect(second.repairs).toEqual([]);
-  });
-
-  it("surfaces a stale lock record that could not be cleared, and does not half-repair (gap)", async () => {
-    const fixture = tempCommonDir("queue-clear-fail");
-    seedIntent(fixture.commonDir, fixture.fleetId);
-    writeFleetMergeQueue({
-      gitCommonDir: fixture.commonDir,
-      fleetId: fixture.fleetId,
-      queue: {
-        ...createFleetMergeQueue(1),
-        lock: {
-          holder: "crashed-session",
-          taskId: "bd-12",
-          pid: 111,
-          acquiredAt: 1,
-          leaseExpiresAt: 200_000,
-        },
-      },
-    });
-    const queuePath = join(
-      fixture.commonDir,
-      "belayd",
-      "fleet",
-      fixture.fleetId,
-      "merge-queue.json",
-    );
-    // The record is readable, so the repair is attempted; only the write of the
-    // repaired record fails.
-    const failingQueueFs: FleetStateFs = {
-      existsSync: (path) => nodeFs.existsSync(path),
-      readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-      statSync: (path) => {
-        const { size, mtimeMs } = nodeFs.statSync(path);
-        return { size, mtimeMs };
-      },
-      writeFileSync: (path, data, writeOptions) => nodeFs.writeFileSync(path, data, writeOptions),
-      appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
-      renameSync: (from, to) => {
-        if (to === queuePath) throw new Error("EIO: simulated queue write failure");
-        nodeFs.renameSync(from, to);
-      },
-      mkdirSync: (path, mkdirOptions) => {
-        nodeFs.mkdirSync(path, mkdirOptions);
-      },
-      unlinkSync: (path) => nodeFs.unlinkSync(path),
-      readdirSync: (path) => nodeFs.readdirSync(path),
-      rmdirSync: (path) => nodeFs.rmdirSync(path),
-    };
-
-    const result = await reconcile(fixture, {
-      git: stubGit(() => undefined),
-      fs: failingQueueFs,
-    });
-
-    // A repair that could not be written must be reported, never swallowed: the
-    // operator has to know the queue is still holding a dead lock.
-    expect(result.text).toContain("could not clear the stale lock record");
-    expect(result.text).toContain("simulated queue write failure");
-    expect(result.warnings.join("\n")).toContain("simulated queue write failure");
-    expect(result.text).toContain("the stale lock record could not be cleared");
-    expect(result.repairs).toEqual([]);
-    expect(readQueue(fixture.commonDir, fixture.fleetId)?.lock?.holder).toBe("crashed-session");
   });
 
   it("leaves a live lease alone", async () => {
@@ -511,18 +374,15 @@ describe("runFleetReconcile: merge queue", () => {
     writeFleetMergeQueue({
       gitCommonDir: fixture.commonDir,
       fleetId: fixture.fleetId,
-      queue: {
-        ...createFleetMergeQueue(1),
-        lock: {
-          holder: "live-session",
-          taskId: "bd-12",
-          pid: 111,
-          acquiredAt: 90_000,
-          leaseExpiresAt: 100_000 + 60_000,
-        },
-      },
+      queue: createFleetMergeQueue(1),
     });
-    mkdirSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId), { recursive: true });
+    seedMergeLock(fixture.commonDir, fixture.fleetId, {
+      holder: "live-session",
+      taskId: "bd-12",
+      pid: 111,
+      acquiredAt: 90_000,
+      leaseExpiresAt: 100_000 + 60_000,
+    });
 
     const result = await reconcile(fixture);
     expect(result.repairs).toEqual([]);
@@ -568,54 +428,16 @@ describe("runFleetReconcile: merge queue", () => {
     expect(readQueue(fixture.commonDir, fixture.fleetId)).toEqual(marked);
   });
 
-  it("reclaims an orphaned lock directory past the grace window, and only once", async () => {
-    const fixture = tempCommonDir("queue-orphan-stale");
-    seedIntent(fixture.commonDir, fixture.fleetId);
-    const lockDir = fleetMergeLockDir(fixture.commonDir, fixture.fleetId);
-    mkdirSync(lockDir, { recursive: true });
-    // Age the primitive past the grace: a crash between `mkdir` and the record
-    // write leaves exactly this.
-    const staleSeconds = (100_000 - FLEET_MERGE_ORPHAN_LOCK_GRACE_MS - 1000) / 1000;
-    utimesSync(lockDir, staleSeconds, staleSeconds);
-
-    const first = await reconcile(fixture);
-    expect(first.repairs).toContain("queue:remove-lock-dir");
-    // Reconcile's own lock is released again, so a drain can proceed.
-    expect(existsSync(lockDir)).toBe(false);
-    expect(readQueue(fixture.commonDir, fixture.fleetId)?.lock).toBe(null);
-
-    const second = await reconcile(fixture);
-    expect(second.repairs).toEqual([]);
-  });
-
-  it("leaves a fresh orphaned lock directory alone and says why", async () => {
-    const fixture = tempCommonDir("queue-orphan-fresh");
-    seedIntent(fixture.commonDir, fixture.fleetId);
-    const lockDir = fleetMergeLockDir(fixture.commonDir, fixture.fleetId);
-    mkdirSync(lockDir, { recursive: true });
-
-    const result = await reconcile(fixture);
-    expect(result.repairs).toEqual([]);
-    expect(result.text).toContain("left alone");
-    expect(result.text).toContain("grace window");
-    // The winner may still be between `mkdir` and its lease write.
-    expect(existsSync(lockDir)).toBe(true);
-  });
-
   it("cannot repair a parked fleet while the queue is unreadable, and says so", async () => {
     const fixture = tempCommonDir("queue-corrupt-parked");
     seedIntent(fixture.commonDir, fixture.fleetId, {
       paused: true,
       park: { reason: "restore conflicted", stashRef: "a".repeat(40), recordedAt: 5 },
     });
-    const queuePath = join(
-      fixture.commonDir,
-      "belayd",
-      "fleet",
-      fixture.fleetId,
-      "merge-queue.json",
-    );
-    writeFileSync(queuePath, "{not json");
+    const opened = openRepoStateStore({ path: repoStatePathForCommonDir(fixture.commonDir) });
+    if (!opened.ok) throw new Error(opened.error);
+    opened.store.writeFleetQueue({ fleetId: fixture.fleetId, queue: "{not json" });
+    opened.store.close();
 
     // No git command may run: without the lock the root is never touched.
     const calls: string[][] = [];
@@ -632,7 +454,6 @@ describe("runFleetReconcile: merge queue", () => {
     // The park pointer survives, so the work is still named.
     expect(readIntent(fixture.commonDir, fixture.fleetId)).toHaveProperty("park");
     expect(calls).toEqual([]);
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
 
     // A corrupt queue is not "repaired" by rewriting it, so the second pass
     // reports the same warning and applies nothing either.
@@ -782,37 +603,23 @@ describe("runFleetReconcile: parked fleet", () => {
       paused: true,
       park: { reason: "restore conflicted", stashRef: stashSha, recordedAt: 5 },
     });
-    const queuePath = join(
-      fixture.commonDir,
-      "belayd",
-      "fleet",
-      fixture.fleetId,
-      "merge-queue.json",
-    );
-    let queueWrites = 0;
+    // bd-281: the release is a lock-row DELETE, so the failing seam is the store.
+    const opened = openRepoStateStore({ path: repoStatePathForCommonDir(fixture.commonDir) });
+    if (!opened.ok) throw new Error(opened.error);
     const failingReleaseFs: FleetStateFs = {
       existsSync: (path) => nodeFs.existsSync(path),
       readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-      statSync: (path) => {
-        const { size, mtimeMs } = nodeFs.statSync(path);
-        return { size, mtimeMs };
-      },
       writeFileSync: (path, data, writeOptions) => nodeFs.writeFileSync(path, data, writeOptions),
-      appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
-      renameSync: (from, to) => {
-        if (to === queuePath) {
-          queueWrites += 1;
-          // The acquire's record landed; the release's update does not.
-          if (queueWrites > 1) throw new Error("EIO: simulated release failure");
-        }
-        nodeFs.renameSync(from, to);
-      },
+      renameSync: (from, to) => nodeFs.renameSync(from, to),
       mkdirSync: (path, mkdirOptions) => {
         nodeFs.mkdirSync(path, mkdirOptions);
       },
       unlinkSync: (path) => nodeFs.unlinkSync(path),
       readdirSync: (path) => nodeFs.readdirSync(path),
-      rmdirSync: (path) => nodeFs.rmdirSync(path),
+      store: {
+        ...opened.store,
+        releaseFleetLock: () => ({ ok: false, error: "EIO: simulated release failure" }),
+      },
     };
 
     const result = await reconcile(fixture, {
@@ -1133,21 +940,16 @@ describe("runFleetReconcile: real git fixture", () => {
 
     const commonDir = join(root, ".git");
     const fleetId = "default";
+    // The fleet dir still holds the queue, audit log and merge lock (bd-281 moved
+    // only the intent), so the fixture keeps creating it.
     mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
-    writeFileSync(
-      fleetIntentFilePath(commonDir, fleetId),
-      JSON.stringify({
-        schemaVersion: 1,
-        fleetId,
-        taskIds: ["bd-12"],
-        createdAt: 1,
-        updatedAt: 1,
-        baseBranch: "main",
-        paused: true,
-        note: "restore conflicted",
-        park: { reason: "restore conflicted", stashRef: stashSha, recordedAt: 5 },
-      }),
-    );
+    // bd-281: the intent (park pointer included) is a store row, not fleet.json.
+    seedIntent(commonDir, fleetId, {
+      taskIds: ["bd-12"],
+      paused: true,
+      note: "restore conflicted",
+      park: { reason: "restore conflicted", stashRef: stashSha, recordedAt: 5 },
+    });
 
     const result = await runFleetReconcile({
       gitCommonDir: commonDir,
@@ -1220,20 +1022,12 @@ describe("runFleetReconcile: real git fixture", () => {
     const commonDir = join(root, ".git");
     const fleetId = "default";
     mkdirSync(join(commonDir, "belayd", "fleet", fleetId), { recursive: true });
-    writeFileSync(
-      fleetIntentFilePath(commonDir, fleetId),
-      JSON.stringify({
-        schemaVersion: 1,
-        fleetId,
-        taskIds: ["bd-12"],
-        createdAt: 1,
-        updatedAt: 1,
-        baseBranch: "main",
-        paused: true,
-        note: "restore conflicted",
-        park: { reason: "restore conflicted", stashRef: recorded, recordedAt: 5 },
-      }),
-    );
+    seedIntent(commonDir, fleetId, {
+      taskIds: ["bd-12"],
+      paused: true,
+      note: "restore conflicted",
+      park: { reason: "restore conflicted", stashRef: recorded, recordedAt: 5 },
+    });
 
     // The git runner records every command so the second run's restraint is
     // asserted against what git was actually asked to do.
@@ -1254,32 +1048,32 @@ describe("runFleetReconcile: real git fixture", () => {
       }
     };
 
-    // Fail the *intent* rename once: the root restore and stash drop succeed, but
-    // the unpark CAS write does not, which is the state a crash leaves behind.
-    const intentPath = fleetIntentFilePath(commonDir, fleetId);
+    // Fail the *intent* transaction once: the root restore and stash drop succeed,
+    // but the unpark write does not, which is the state a crash leaves behind.
+    const opened = openRepoStateStore({ path: repoStatePathForCommonDir(commonDir) });
+    if (!opened.ok) throw new Error(opened.error);
+    const realStore = opened.store;
     let intentWriteFailures = 1;
     const failingIntentFs: FleetStateFs = {
       existsSync: (path) => nodeFs.existsSync(path),
       readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-      statSync: (path) => {
-        const { size, mtimeMs } = nodeFs.statSync(path);
-        return { size, mtimeMs };
-      },
       writeFileSync: (path, data, writeOptions) => nodeFs.writeFileSync(path, data, writeOptions),
-      appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
-      renameSync: (from, to) => {
-        if (to === intentPath && intentWriteFailures > 0) {
-          intentWriteFailures -= 1;
-          throw new Error("EIO: simulated intent write failure");
-        }
-        nodeFs.renameSync(from, to);
-      },
+      renameSync: (from, to) => nodeFs.renameSync(from, to),
       mkdirSync: (path, mkdirOptions) => {
         nodeFs.mkdirSync(path, mkdirOptions);
       },
       unlinkSync: (path) => nodeFs.unlinkSync(path),
       readdirSync: (path) => nodeFs.readdirSync(path),
-      rmdirSync: (path) => nodeFs.rmdirSync(path),
+      store: {
+        ...realStore,
+        mutateFleet: (input) => {
+          if (intentWriteFailures > 0) {
+            intentWriteFailures -= 1;
+            return { ok: false, error: "EIO: simulated intent write failure" };
+          }
+          return realStore.mutateFleet(input);
+        },
+      },
     };
 
     const first = await runFleetReconcile({

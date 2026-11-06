@@ -55,7 +55,8 @@ export const LAND_REPAIR_REFUSAL_MAX_CHARS = 200;
  *
  * - `proof-artifacts-in-diff` / `paths-outside-scope`: the publish gate refused the
  *   payload. The repair is to remove the proof files from the branch (or drop the
- *   out-of-scope path) and keep `.belayd/proof-receipt.json` — a commit, no judgement.
+ *   out-of-scope path) — a commit, no judgement. The proof receipt is not in the
+ *   branch: bd-281 stores it in `<git-common-dir>/belayd/state.sqlite`.
  * - `gate-failed`: the member's own code failed a gate the merge runs, so the fix is
  *   in the member's code.
  *

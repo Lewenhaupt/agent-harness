@@ -2,7 +2,7 @@
  * Bead ↔ branch ↔ worktree identity preflight.
  *
  * `belayd_start_task`, worktree creation, and the phase tools all read/write
- * the same `.belayd/workflow.json` contract. A phase run pointed at another
+ * the same workflow-row contract. A phase run pointed at another
  * task's worktree used to be accepted silently: its sub-agents were then jailed
  * in the wrong tree by the worktree guard, and agents worked around the guard
  * instead of failing. These helpers refuse that mismatch before any run starts.
@@ -48,7 +48,7 @@ export interface MatchOwnedWorktreeOptions {
   taskId: string;
   /** Branch probe for `cwd`; distinguishes detached HEAD from git failure. */
   branch: WorktreeBranch;
-  /** Persisted `.belayd/workflow.json`, or undefined when there is none. */
+  /** Persisted workflow row, or undefined when there is none. */
   persisted: WorkflowState | undefined;
 }
 
@@ -68,7 +68,7 @@ export interface AdoptableTaskIdOptions {
   handedOff: boolean;
   /** Branch probe for the session's own cwd. */
   branch: WorktreeBranch;
-  /** Persisted `.belayd/workflow.json` at that cwd, or undefined when there is none. */
+  /** Persisted workflow row at that cwd, or undefined when there is none. */
   persisted: WorkflowState | undefined;
 }
 
@@ -188,7 +188,7 @@ export function matchSessionOwnedWorktree(
 /**
  * Task id a resumed session should adopt for its own worktree, or `undefined`.
  *
- * Workflow completion deletes `.belayd/workflow.json`, and `session_start` resets
+ * Workflow completion clears the workflow row, and `session_start` resets
  * the in-memory task id, so a resumed orchestrator comes back with no identity at
  * all. Every phase tool then died in subagent session naming with the raw
  * `taskId must be a non-empty string`, which broke the post-completion rework

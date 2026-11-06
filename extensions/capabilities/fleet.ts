@@ -95,6 +95,7 @@ import {
   createFleetOrderingGates,
   type FleetOrderingGate,
   type FleetOrderingGateListResult,
+  fleetOrderingGatesForBead,
   listFleetOrderingGatesForBead,
   reapFleetOrderingGatesByPrefix,
   resolveFleetOrderingGates,
@@ -168,11 +169,12 @@ import {
   memberSessionToken,
   stopMemberSession,
 } from "../../src/fleet-sessions.js";
-import type { AckNotesResult, FleetNoteDelivery } from "../../src/fleet-state.js";
+import type { AckNotesResult, FleetNoteChannel, FleetNoteDelivery } from "../../src/fleet-state.js";
 import {
   ackNotes,
   addFleetOrderingGates,
   appendFleetAuditEntry,
+  landFleetMember as commitFleetLanding,
   drainNotes,
   dropFleetOrderingGates,
   enqueueNoteFanout,
@@ -188,7 +190,9 @@ import {
   readRecentFleetAuditEntries,
   retireFleetDeferral,
   withFleetLaunchMarker,
+  writeFleetRun,
 } from "../../src/fleet-state.js";
+import { migrateAndGuardLegacyFleetState } from "../../src/fleet-state-import.js";
 import {
   applyFleetBeadEngagement,
   applyFleetBeadLookup,
@@ -229,6 +233,7 @@ import {
   withoutSessionPin,
   withSessionPin,
 } from "../../src/pi-web-navigation.js";
+import { repoStatePathForCommonDir, sharedRepoStateStore } from "../../src/repo-state-store.js";
 import { listRuns } from "../../src/run-manifest.js";
 import { scanOutboundText, secretRefusalText, warnScanUnavailable } from "../../src/secret-scan.js";
 import { isValidTaskId } from "../../src/session-naming.js";
@@ -241,7 +246,7 @@ import type {
 } from "../../src/workflow-digest.js";
 import type { WorkflowResolutionSource, WorkflowSubType } from "../../src/workflow-registry.js";
 import { resolveWorkflowSelection } from "../../src/workflow-registry.js";
-import { readWorkflowState, workflowStateFilePath } from "../../src/workflow-state.js";
+import { readWorkflowState } from "../../src/workflow-state.js";
 import type { CoreSessionState } from "./context.js";
 import { errorText, runBdCommand, runGitCommand, textToolResult } from "./context.js";
 import { piWebEndpoint, piWebRequest } from "./daemon.js";
@@ -285,7 +290,6 @@ export interface FleetSessionState {
   pendingFleetEventAcks?: {
     fleetId: string;
     gitCommonDir: string;
-    dir: string;
     deliveries: FleetNoteDelivery[];
   };
   fleetRunTimer?: ReturnType<typeof setInterval>;
@@ -528,8 +532,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
   // ── Register fleet status (read-only fleet aggregation) tool ─────────
   // Milestone P0 of the multi-bead fleet supervisor (docs/fleet-orchestrator.md):
   // a scheduler's observation view, never a phase worker. It reads every
-  // worktree's `.belayd/workflow.json` + run manifests plus the optional fleet
-  // intent file, writes nothing, spawns nothing, merges nothing, and arms no
+  // worktree's workflow row + run manifests plus the optional fleet
+  // intent row, writes nothing, spawns nothing, merges nothing, and arms no
   // gate. Listed in GATED_TOOLS only to survive the process gate — never a
   // required workflow step, and never in PLANNING_GATED_TOOLS.
   //
@@ -713,7 +717,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * naming one would need a fleet id this surface does not receive.
    *
    * A landed member's round is history: `recordRunMemberLanded` clears it, and a
-   * hand-edited `fleet.json` must not resurrect a "repair in progress" for work already
+   * hand-edited intent must not resurrect a "repair in progress" for work already
    * on the base branch.
    */
   function landRepairInFleet(options: {
@@ -960,7 +964,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   //
   // The supervisor is a scheduler: it arms no gate, runs no phase, and owns no
   // worktree. Its only authority is the fleet family below, and every action it
-  // takes across worktrees is appended to `<fleet>/audit.log`. Nothing here merges,
+  // takes across worktrees is appended to the fleet audit row. Nothing here merges,
   // advances a wave, pauses, or mutates a bead on its own: each of those is an
   // explicit, audited call.
 
@@ -969,17 +973,48 @@ export function createFleet(deps: FleetDeps): FleetApi {
     cwd: string,
   ): { ok: true; gitCommonDir: string } | { ok: false; error: string } {
     const resolved = resolveGitCommonDir(cwd);
-    return resolved.ok ? { ok: true, gitCommonDir: resolved.commonDir } : resolved;
+    if (!resolved.ok) return resolved;
+    prepareLegacyFleetState(resolved.commonDir);
+    return { ok: true, gitCommonDir: resolved.commonDir };
+  }
+
+  /**
+   * Import a live fleet's pre-store files once, then refuse any that reappear
+   * (bd-281).
+   *
+   * This is the fleet counterpart of the workflow half's import in
+   * `src/workflow-state.ts`: the first resolution of a repository's common dir is
+   * what runs it, so a live fleet keeps its intent, queue, markers and mail across
+   * the upgrade with no operator step. The once-per-target guard lives in the
+   * migration module itself (`migrateAndGuardLegacyFleetState`), so no capability
+   * module carries migration state. It is wired here, and not in
+   * `src/fleet-state.ts`, because the record parsers the import must reuse live in
+   * modules that module already imports — a cycle, whereas this extension is a
+   * leaf.
+   */
+  function prepareLegacyFleetState(gitCommonDir: string): void {
+    const store = sharedRepoStateStore({ path: repoStatePathForCommonDir(gitCommonDir) }).store;
+    if (store === null) return;
+    migrateAndGuardLegacyFleetState({
+      gitCommonDir,
+      store,
+      onImported: (summary) => {
+        console.warn(
+          `belayd: bd-281 imported ${summary.rows} legacy fleet state row(s) for ${summary.fleets.length} fleet(s) into the shared repository store`,
+        );
+      },
+      onRefusal: (message) => console.warn(message),
+    });
   }
 
   /**
    * The fleet this session supervises, or undefined.
    *
-   * Derived from `fleet.json` on every call (session id + live, unchanged
+   * Derived from the fleet intent row on every call (session id + live, unchanged
    * supervisor process + the arm token this session minted), so no in-memory flag
    * can survive a lifecycle reset and a record left or planted by another writer
    * cannot put this session into fleet mode. The token is the only piece that is
-   * not on disk: a corrupt or malicious `fleet.json` cannot guess it.
+   * not on disk: a corrupt or malicious intent row cannot guess it.
    */
   function fleetModeFor(ctx: ExtensionContext): FleetMode | undefined {
     const common = gitCommonDirFor(ctx.cwd);
@@ -1026,7 +1061,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     // Cross-tree authority must be auditable; an unlogged action is a bug the
     // operator has to see, not a detail.
     options.ctx.ui.notify(
-      `Fleet ${options.fleetId}: could not append to audit.log (${appended.error}).`,
+      `Fleet ${options.fleetId}: could not append the audit entry (${appended.error}).`,
       "warning",
     );
     console.warn(`[belayd-harness] failed to append fleet audit entry: ${appended.error}`);
@@ -1122,16 +1157,16 @@ export function createFleet(deps: FleetDeps): FleetApi {
         ok: false,
         error:
           `Refusing to drive ${options.taskId} in ${options.worktreePath}: ${adopted.error}. ` +
-          "One orchestrator per worktree: finish or stop that session, or remove its " +
-          "`.belayd/orchestrator.json` once it is gone.",
+          "One orchestrator per worktree: finish or stop that session; its lease expires " +
+          "after the heartbeat window and is then claimable. If the shared state store is " +
+          "unwritable, fix that first — no lease can be recorded without it.",
       };
     }
     if (adopted.adopted === "stale" || adopted.adopted === "corrupt") {
+      // The displaced record is not archived: a copy of executable state is what
+      // bd-281 removed. The new row is the record of the takeover.
       options.ctx.ui.notify(
-        `Took over an abandoned orchestrator lease for ${options.taskId} in ${options.worktreePath}` +
-          (adopted.archivedPath === undefined
-            ? "."
-            : ` (previous record archived at ${adopted.archivedPath}).`),
+        `Took over an abandoned orchestrator lease for ${options.taskId} in ${options.worktreePath}.`,
         "warning",
       );
     }
@@ -1182,7 +1217,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * One fleet's run evidence for the liveness probes (bd-166).
    *
    * Only `run.members[].launchedAt` (the evidence cutoff). The spawn window is
-   * strictly per-member and comes from `launch/<taskId>` markers, never from a
+   * strictly per-member and comes from the launch-marker rows, never from a
    * fleet-record revision: `intent.updatedAt` is rewritten by every 15 s tick, so
    * keying a window on it kept every member of a running fleet `unknown` forever
    * (bd-233 review round 2).
@@ -1292,7 +1327,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
         });
         return memberRanEvidence({
           taskId,
-          workflowStatePresent: existsSync(workflowStateFilePath(worktreePath)),
+          // bd-281: the member's workflow record is a shared-store row keyed by task,
+          // so presence is a store read, not a file in that worktree.
+          workflowStatePresent: readWorkflowState({ cwd: worktreePath }) !== undefined,
           runs: listRuns({ cwd: worktreePath }),
           ...(since === undefined ? {} : { since }),
         });
@@ -1388,7 +1425,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * One fleet's run evidence, read once per probe.
    *
    * The plan read and the in-write recount both ask about the same members, so each
-   * fleet's `fleet.json` is read once per probe rather than once per member. A fleet
+   * fleet's intent row is read once per probe rather than once per member. A fleet
    * that cannot be read simply has no recorded launch: the worktree's creation
    * instant is still a cutoff, and no cutoff at all keeps the member counted.
    */
@@ -1438,30 +1475,30 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * One compare-and-replace intent update, with a single retry on a lost race.
+   * One transactional intent mutation.
+   *
+   * No retry loop: `updateFleetIntent` runs the updater inside the store's
+   * `BEGIN IMMEDIATE` (bd-281), so a lost race is not a representable outcome any
+   * more. Retrying around a transaction would only hide a bug in it.
    *
    * Returns the record that was written, so a caller whose audit entry describes the
-   * result (the readoption sweep, bd-169) reports the post-CAS values rather than the
-   * snapshot it decided from.
+   * result (the readoption sweep, bd-169) reports the post-transaction values rather
+   * than the snapshot it decided from.
    */
   function mutateFleetIntent(options: {
     gitCommonDir: string;
     fleetId: string;
     mutate: (intent: FleetIntent) => FleetIntent | { refuse: string };
   }): { ok: true; intent: FleetIntent } | { ok: false; error: string } {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const result = updateFleetIntent({
-        gitCommonDir: options.gitCommonDir,
-        fleetId: options.fleetId,
-        update: (current) =>
-          current === undefined
-            ? { refuse: `no fleet intent for \`${options.fleetId}\`` }
-            : options.mutate(current),
-      });
-      if (result.ok) return { ok: true, intent: result.intent };
-      if (result.reason !== "conflict") return { ok: false, error: result.error };
-    }
-    return { ok: false, error: "the fleet intent changed twice while updating it" };
+    const result = updateFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+      update: (current) =>
+        current === undefined
+          ? { refuse: `no fleet intent for \`${options.fleetId}\`` }
+          : options.mutate(current),
+    });
+    return result.ok ? { ok: true, intent: result.intent } : { ok: false, error: result.error };
   }
 
   /** Read every member's workflow progress plus its orchestrator lease. */
@@ -1602,17 +1639,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
       );
   }
 
-  /** Persist the run record after a tick. */
+  /** Persist the run record in the same transaction as its intent revision bump. */
   function persistFleetRun(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
     run: FleetRun;
     now: number;
   }): void {
-    const written = mutateFleetIntent({
+    const written = writeFleetRun({
       gitCommonDir: options.mode.gitCommonDir,
       fleetId: options.mode.fleetId,
-      mutate: (intent) => ({ ...intent, run: options.run, updatedAt: options.now }),
+      run: options.run,
+      now: options.now,
     });
     if (!written.ok) {
       options.ctx.ui.notify(`Fleet ${options.mode.fleetId}: ${written.error}`, "warning");
@@ -1620,23 +1658,95 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * Drop a landed member from the fleet's member list and its deferred plan.
+   * Commit one landing: the member pruned from the intent, the ordering-gate records
+   * it resolved, the run's `landedAt` and the audit row, in ONE transaction.
    *
    * Landing is the one automatic path allowed to forget a member: its branch is on
    * the base branch, so nothing is left to observe or land. A stop keeps the member
    * (see {@link retireDeferredMember}): its worktree and bead are still live.
+   *
+   * The plan is a pure fold over the record the store reads inside its transaction,
+   * so this cannot overwrite a record another session replaced between the merge and
+   * the write. A refusal rolls the whole plan back: no member dropped, no gate record
+   * dropped, no run change, no revision bump and no audit row.
    */
-  function pruneLandedMember(options: {
+  function recordFleetLanding(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
     taskId: string;
     now: number;
-  }): { ok: true } | { ok: false; error: string } {
-    return mutateFleetIntent({
+    /** Gate ids the plan drops with the landing; resolved in bd after the commit. */
+    gateIds: readonly string[];
+    /** Lifecycle facts this tick learned (outside-fleet heads) that ride the landing. */
+    heads?: readonly { taskId: string; head: string }[];
+    /** The audit row's detail; the action is always `fleet-landed`. */
+    detail: string;
+    /**
+     * Refuse unless the stored run is the one the caller read (outside-fleet sweep).
+     *
+     * The sweep proves landings from git and then writes; a re-arm can replace the
+     * record in between, and pruning a member out of a run this one never observed
+     * would be acting on a record that no longer exists.
+     */
+    observedRun?: FleetRun;
+  }): { ok: true; intent: FleetIntent; run: FleetRun } | { ok: false; error: string } {
+    const landed = commitFleetLanding({
       gitCommonDir: options.mode.gitCommonDir,
       fleetId: options.mode.fleetId,
-      mutate: (intent) => pruneLandedFleetMember(intent, options.taskId, options.now),
+      now: options.now,
+      plan: ({ intent, run }) => {
+        if (run === undefined) {
+          return {
+            kind: "conflict",
+            error: `fleet \`${options.mode.fleetId}\` has no run record to land ${options.taskId} in`,
+          };
+        }
+        const observed = options.observedRun;
+        if (
+          observed !== undefined &&
+          (run.startedAt !== observed.startedAt || run.ticks !== observed.ticks)
+        ) {
+          return { kind: "conflict", error: "the stored run was replaced" };
+        }
+        // Heads first: they are this tick's observation of the same members, and a
+        // landing that dropped them would make the next sweep re-read git.
+        const withHeads = (options.heads ?? []).reduce(
+          (acc, head) =>
+            recordRunMemberHead({
+              run: acc,
+              taskId: head.taskId,
+              head: head.head,
+              now: options.now,
+            }),
+          run,
+        );
+        return {
+          kind: "write",
+          intent: dropFleetOrderingGates(
+            pruneLandedFleetMember(intent, options.taskId, options.now),
+            options.gateIds,
+            options.now,
+          ),
+          run: recordRunMemberLanded({ run: withHeads, taskId: options.taskId, now: options.now }),
+        };
+      },
+      audit: {
+        timestamp: options.now,
+        fleetId: options.mode.fleetId,
+        actor: options.ctx.sessionManager.getSessionId(),
+        action: "fleet-landed",
+        taskIds: [options.taskId],
+        detail: options.detail,
+      },
     });
+    if (!landed.ok) return { ok: false, error: landed.error };
+    const run = landed.intent.run;
+    if (run === undefined) {
+      // Unreachable: the plan writes one. Reported rather than asserted so a future
+      // plan change cannot turn it into a crash inside a tick.
+      return { ok: false, error: `landing ${options.taskId} left no run record` };
+    }
+    return { ok: true, intent: landed.intent, run };
   }
 
   /**
@@ -1689,16 +1799,26 @@ export function createFleet(deps: FleetDeps): FleetApi {
     mode: FleetMode;
     taskId: string;
     now: number;
+    /**
+     * The recorded gates to resolve, when the caller already dropped their records.
+     *
+     * A landing commits the record drop with its own transaction, so the record is
+     * gone by the time bd is asked; the caller passes the list it committed. Absent
+     * (a manual merge, whose records still exist) means "read them back".
+     */
+    gates?: readonly { blocker: string; blocked: string; gateId: string }[];
   }): Promise<{ ok: true; resolved: number } | { ok: false; error: string }> {
-    const loaded = readFleetIntent({
-      gitCommonDir: options.mode.gitCommonDir,
-      fleetId: options.mode.fleetId,
-    });
-    if (!loaded.ok) return { ok: false, error: loaded.error };
-    const recorded = loaded.intent?.orderingGates ?? [];
-    const touching = recorded.filter(
-      (gate) => gate.blocker === options.taskId || gate.blocked === options.taskId,
-    );
+    let touching = options.gates;
+    if (touching === undefined) {
+      const loaded = readFleetIntent({
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+      });
+      if (!loaded.ok) return { ok: false, error: loaded.error };
+      touching = (loaded.intent?.orderingGates ?? []).filter(
+        (gate) => gate.blocker === options.taskId || gate.blocked === options.taskId,
+      );
+    }
     if (touching.length === 0) return { ok: true, resolved: 0 };
 
     const resolved = await resolveFleetOrderingGatesForBead({
@@ -1707,18 +1827,25 @@ export function createFleet(deps: FleetDeps): FleetApi {
       cwd: options.ctx.cwd,
       runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
     });
-    // Drop only the records bd confirmed, and by *gate id*: another gate of this
+    // Forget only the records bd confirmed, and by *gate id*: another gate of this
     // same member may still be open (a shared blocker with two dependents), and
-    // forgetting it would leave it open with nothing able to resolve it. A failed
-    // bookkeeping write is self-healing: the record survives, and the next reap
-    // sees bd report the gate as gone (`gate not found`) and drops it then.
+    // forgetting it would leave it open with nothing able to resolve it.
+    //
+    // A landing has already dropped its records inside the landing transaction, so
+    // this only writes for the callers that still hold them (a manual merge). It is
+    // deliberately not retried for the landing: a second intent write here would bump
+    // the revision a second time for one landing. If bd refused, the gate stays open
+    // and the next reap resolves it — the record being gone cannot release a
+    // dependent, only bd can.
     const gateIds = resolved.resolved.map((gate) => gate.gateId);
-    if (gateIds.length > 0) {
+    if (gateIds.length > 0 && options.gates === undefined) {
       mutateFleetIntent({
         gitCommonDir: options.mode.gitCommonDir,
         fleetId: options.mode.fleetId,
         mutate: (intent) => dropFleetOrderingGates(intent, gateIds, options.now),
       });
+    }
+    if (gateIds.length > 0) {
       auditFleetAction({
         ctx: options.ctx,
         gitCommonDir: options.mode.gitCommonDir,
@@ -1736,7 +1863,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
           ok: false,
           error:
             `could not resolve the ordering gate(s) for ${options.taskId}: ${resolved.error}` +
-            ` (${resolved.remaining.length} still recorded)`,
+            ` (${resolved.remaining.length} still open in bd)`,
         };
   }
 
@@ -1821,22 +1948,28 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
     if (merged.kind !== "merged") return merged;
 
-    // The landing is recorded before anything else can fail, because it is the one
-    // fact bd cannot express and the scheduler's `fleetLandedTaskIds` rule needs
-    // (bd-158). A merge that succeeded must never look unlanded: that would hold
-    // the member's capacity slot and stall its dependents on an event that already
-    // happened.
-    const pruned = pruneLandedMember({ ctx, mode, taskId, now });
-    if (!pruned.ok) return { kind: "refused", error: pruned.error };
-    const landed = recordRunMemberLanded({ run: options.run, taskId, now });
-    auditFleetAction({
+    // THE landing write (bd-281). One transaction holds every fleet fact the landing
+    // implies: the landed mark on the run, the member pruned out of the intent, the
+    // ordering-gate *records* it resolves, the revision bump and the audit row. It is
+    // recorded before anything else can fail, because it is the one fact bd cannot
+    // express and the scheduler's `fleetLandedTaskIds` rule needs (bd-158): a merge
+    // that succeeded must never look unlanded, which would hold the member's capacity
+    // slot and stall its dependents on an event that already happened.
+    //
+    // The gate ids are read from the intent this tick already holds, and the plan
+    // drops exactly those. A gate recorded between this read and the transaction is
+    // not dropped here; bd keeps it open, the dependent stays blocked (never released
+    // early), and the next tick's crash-window sweep adopts or reaps it.
+    const recordedGates = fleetOrderingGatesForBead(options.intent.orderingGates ?? [], taskId);
+    const landed = recordFleetLanding({
       ctx,
-      gitCommonDir: mode.gitCommonDir,
-      fleetId: mode.fleetId,
-      action: "fleet-landed",
-      taskIds: [taskId],
+      mode,
+      taskId,
+      now,
+      gateIds: recordedGates.map((gate) => gate.gateId),
       detail: `merged ${taskId} into ${mode.intent.baseBranch}`,
     });
+    if (!landed.ok) return { kind: "refused", error: landed.error };
 
     const accepted = await acceptLandedMemberOnDisk({
       ctx,
@@ -1845,14 +1978,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
       accept: options.run.accept === true,
       now,
     });
-    // bd-158: the landing, not a close, is what releases a dependent's ordering
-    // gate — so it is resolved after the land is recorded, and a failure is a
-    // *retryable* warning rather than a stop: the merge cannot be undone, the
-    // dependent is already released on the fleet side, and the tick reaper
-    // retries the resolve from the still-recorded gate (the landed member is no
-    // longer a member, which is exactly the orphan case it reaps). Stopping here
-    // would end the run `partial` on a transient bd failure and wedge a merged
-    // member forever.
+    // bd-158 ORDERING: bd keeps owning gates, and a bd write cannot join a SQLite
+    // transaction, so the gate *records* commit with the landing and the bd resolve
+    // runs after it. The window is acceptable because the resolve is idempotent and
+    // the next tick re-reaps: a crash between the commit and the resolve leaves the
+    // gate open in bd with no record, the dependent still blocked (it is never
+    // released early, which is the direction that would be unsafe), and the tick's
+    // crash-window sweep resolves a gate whose blocker is gone or adopts one whose
+    // blocker is still a member. A failed resolve is a *retryable* warning rather
+    // than a stop, for the same reason as before: the merge cannot be undone and the
+    // tick reaper owns the retry, so stopping would end the run `partial` on a
+    // transient bd failure and wedge a merged member forever.
+    //
     // bd-279: the landing cleared the member's stop (and with it the record the
     // tick's escalation check keys on), so its escalation gate is resolved here.
     const landEscalations = await reapEscalationGates({
@@ -1863,7 +2000,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       label: "landed member",
     });
     const gateLines = [
-      ...(await resolveLandedOrderingGates({ ctx, mode, taskId, now })),
+      ...(await resolveLandedOrderingGates({ ctx, mode, taskId, now, gates: recordedGates })),
       ...landEscalations.lines,
       ...landEscalations.warnings,
     ];
@@ -1874,7 +2011,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       return {
         kind: "landed",
         run: recordRunMemberStopped({
-          run: landed,
+          run: landed.run,
           taskId,
           reason: "accept-failed",
           detail: accepted.text,
@@ -1885,7 +2022,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     }
     return {
       kind: "landed",
-      run: landed,
+      run: landed.run,
       lines: [`Fleet ${mode.fleetId}: ${accepted.text}`, ...gateLines],
     };
   }
@@ -1903,6 +2040,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     mode: FleetMode;
     taskId: string;
     now: number;
+    /** The gates the landing transaction dropped a record for. */
+    gates?: readonly { blocker: string; blocked: string; gateId: string }[];
   }): Promise<readonly string[]> {
     const released = await releaseOrderingGatesForBead(options);
     if (released.ok) return [];
@@ -2732,7 +2871,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
     if (!recipients.ok)
       return { ok: false, error: `the repair note was not addressable (${recipients.error})` };
     const enqueued = enqueueNoteFanout({
-      dir: options.mode.eventsDir,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      channel: "event",
       note: buildFleetNote({
         kind: "land-repair",
         from: FLEET_NOTE_SUPERVISOR,
@@ -2937,8 +3078,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
       fleetId: mode.fleetId,
       detail:
         options.lost.kind === "gone"
-          ? "fleet.json vanished while the advance re-planned it"
-          : `fleet.json could not be read: ${options.lost.error}`,
+          ? "the fleet intent vanished while the advance re-planned it"
+          : `the fleet intent could not be read: ${options.lost.error}`,
       line:
         options.lost.kind === "gone"
           ? `Fleet ${mode.fleetId}: run loop stopped — the fleet intent for \`${mode.fleetId}\` is ` +
@@ -2987,7 +3128,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       // dependency that just became capacity, or the reverse), so the loop stops
       // instead of guessing — the same call `fleetTick` makes on an unreadable
       // intent. A read that succeeds with no record is that same hazard: the
-      // launch engine has just written `fleet.json`, so an absent one was removed
+      // launch engine has just written the intent row, so an absent one was removed
       // mid-tick (reconcile, manual cleanup) and the pre-launch deferrals are the
       // plan the advance just replaced.
       return emptyAdvanceLostRecordOutcome({
@@ -3124,7 +3265,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * - **closed beads** — a gate where either bead is `closed`/`done` (a human ran
    *   `bd close`, or `--accept` did): the wait is satisfied or moot either way, and
    *   bd would otherwise leave an open gate blocking nothing.
-   * - **unrecorded gates** — bd has a fleet-ordering gate that `fleet.json` does not
+   * - **unrecorded gates** — bd has a fleet-ordering gate that the intent row does not
    *   name (a crash between `bd gate create` and the intent write). One member bead
    *   per tick is asked directly, rotating through the fleet, so the sweep is
    *   bounded to a single extra read per tick and still reaches every member. A
@@ -3565,7 +3706,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     remaining: readonly FleetOrderingGate[];
     /** Gate ids bd confirmed resolved; the only thing the records may drop. */
     resolvedGateIds: readonly string[];
-    /** Unrecorded gates adopted into `fleet.json` so a landing can resolve them. */
+    /** Unrecorded gates adopted into the intent row so a landing can resolve them. */
     adopted: readonly FleetOrderingGate[];
     /** Plain warnings: read failures and the like, reported every pass. */
     warnings: readonly string[];
@@ -3705,7 +3846,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * Sweep bd for ordering gates `fleet.json` does not name, and adopt them.
+   * Sweep bd for ordering gates the intent row does not name, and adopt them.
    *
    * The record list cannot name a gate the fleet never wrote down, so asking bd
    * directly is the only way to close the crash window between `bd gate create` and
@@ -3951,41 +4092,49 @@ export function createFleet(deps: FleetDeps): FleetApi {
     /** The branch name or commit id git proved is on the base branch. */
     handle: string;
     now: number;
+    /** Heads this tick captured, committed with the landing instead of a second write. */
+    heads?: readonly { taskId: string; head: string }[];
   }): Promise<
     | { ok: true; intent: FleetIntent; run: FleetRun; lines: readonly string[] }
     | { ok: false; error: string }
   > {
-    const pruned = pruneLandedMember({
+    const base = options.mode.intent.baseBranch;
+    // The same one landing transaction the merge path uses: member pruned, gate
+    // records dropped, run marked, audit row appended, revision bumped once. The
+    // captured heads ride along, so the sweep needs no second run write for them.
+    //
+    // `observedRun` keeps the compose guard this path needs: a re-arm or relaunch can
+    // replace the record between the git proof and the write, and landing a member out
+    // of a run this sweep never read would act on a record that no longer exists.
+    const recordedGates = fleetOrderingGatesForBead(
+      options.intent.orderingGates ?? [],
+      options.taskId,
+    );
+    const landed = recordFleetLanding({
       ctx: options.ctx,
       mode: options.mode,
       taskId: options.taskId,
       now: options.now,
-    });
-    if (!pruned.ok) return { ok: false, error: pruned.error };
-    const run = recordRunMemberLanded({
-      run: options.run,
-      taskId: options.taskId,
-      now: options.now,
-    });
-    const base = options.mode.intent.baseBranch;
-    auditFleetAction({
-      ctx: options.ctx,
-      gitCommonDir: options.mode.gitCommonDir,
-      fleetId: options.mode.fleetId,
-      action: "fleet-landed",
-      taskIds: [options.taskId],
+      gateIds: recordedGates.map((gate) => gate.gateId),
+      observedRun: options.run,
+      ...(options.heads === undefined ? {} : { heads: options.heads }),
       detail: `${options.taskId} was already on ${base} via ${options.handle} (landing happened outside the fleet); pruned and gates resolved`,
     });
+    if (!landed.ok) return { ok: false, error: landed.error };
+    // bd after the commit, exactly as on the merge path (see the ordering note in
+    // `landFleetMember`): the records are already dropped, so the resolve is given the
+    // list it committed and never re-writes the intent.
     const gateLines = await resolveLandedOrderingGates({
       ctx: options.ctx,
       mode: options.mode,
       taskId: options.taskId,
       now: options.now,
+      gates: recordedGates,
     });
     return {
       ok: true,
-      intent: pruneLandedFleetMember(options.intent, options.taskId, options.now),
-      run,
+      intent: landed.intent,
+      run: landed.run,
       lines: [
         `Fleet ${options.mode.fleetId}: landed ${options.taskId} — ${options.handle} is already on ${base} (landing happened outside the fleet); pruned and gates resolved`,
         ...gateLines,
@@ -4012,18 +4161,50 @@ export function createFleet(deps: FleetDeps): FleetApi {
     return run;
   }
 
-  /** Record each proven landing, then prune the member and resolve its gates. */
+  /** What one outside-fleet sweep learned, and whether the record holds it. */
+  type OutsideFleetSweep = {
+    intent: FleetIntent;
+    run: FleetRun;
+    lines: readonly string[];
+    /**
+     * A landing transaction committed every fact the sweep learned.
+     *
+     * When true, the caller has nothing left to write: the landings and the heads
+     * this tick captured are already in the store, so a second run write would bump
+     * the revision again for the same landing.
+     */
+    committed: boolean;
+    /**
+     * The first landing write that failed.
+     *
+     * The tick must not act on an unrecorded landing (`fleetLandedTaskIds` reads the
+     * record), so a failure stops the tick instead of letting the plan re-defer a
+     * dependent of a member that landed for real.
+     */
+    failure?: string;
+  };
+
+  /**
+   * Record each proven landing; each one commits its own pruning, gate records and
+   * run mark in one transaction.
+   *
+   * `heads` are folded into every landing it commits: the sweep captured them this
+   * tick for members that have not landed yet, and a landing transaction is the write
+   * that records them, so the caller does not need a second run write.
+   */
   async function recordOutsideFleetLandings(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
     intent: FleetIntent;
     run: FleetRun;
     proven: readonly { taskId: string; handle: string }[];
+    heads: readonly { taskId: string; head: string }[];
     now: number;
-  }): Promise<{ intent: FleetIntent; run: FleetRun; lines: readonly string[] }> {
+  }): Promise<OutsideFleetSweep> {
     let intent = options.intent;
     let run = options.run;
     const lines: string[] = [];
+    let failure: string | undefined;
     for (const { taskId, handle } of options.proven) {
       const landed = await landAlreadyMergedMember({
         ctx: options.ctx,
@@ -4032,9 +4213,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
         run,
         taskId,
         handle,
+        heads: options.heads,
         now: options.now,
       });
       if (!landed.ok) {
+        failure = failure ?? landed.error;
         lines.push(
           `Fleet ${options.mode.fleetId}: could not record the landing of ${taskId}: ${landed.error}`,
         );
@@ -4044,14 +4227,20 @@ export function createFleet(deps: FleetDeps): FleetApi {
       run = landed.run;
       lines.push(...landed.lines);
     }
-    return { intent, run, lines };
+    return {
+      intent,
+      run,
+      lines,
+      committed: options.proven.length > 0 && failure === undefined,
+      ...(failure === undefined ? {} : { failure }),
+    };
   }
 
   /**
    * Detect members the fleet never landed but whose work is on the base branch.
    *
    * `docs/fleet.md` tells humans to accept with `wt merge`, a path that never touches
-   * `fleet.json` — that is bd-37, and the member kept its slot forever with nothing
+   * the intent row — that is bd-37, and the member kept its slot forever with nothing
    * left to observe. **Git ancestry alone is the proof (bd-278)**: bead closure is
    * the acceptance fact (bd-158), so a hand merge that leaves the bead `in_progress`
    * still resolves its ordering gates and starts the next wave.
@@ -4071,7 +4260,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     intent: FleetIntent;
     run: FleetRun;
     now: number;
-  }): Promise<{ intent: FleetIntent; run: FleetRun; lines: readonly string[] }> {
+  }): Promise<OutsideFleetSweep> {
     const landedIds = new Set(
       (options.run.members ?? [])
         .filter((member) => member.landedAt !== undefined)
@@ -4079,7 +4268,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     );
     const candidates = options.intent.taskIds.filter((taskId) => !landedIds.has(taskId));
     if (candidates.length === 0) {
-      return { intent: options.intent, run: options.run, lines: [] };
+      return { intent: options.intent, run: options.run, lines: [], committed: false };
     }
     // One answer per commit id per tick: the capture and the planner ask about the
     // same tip, and a second `merge-base` adds nothing.
@@ -4115,8 +4304,28 @@ export function createFleet(deps: FleetDeps): FleetApi {
       intent: options.intent,
       run,
       proven,
+      heads: capturedHeads(options.run, run),
       now: options.now,
     });
+  }
+
+  /**
+   * The heads this tick just captured, as (task id, head) pairs.
+   *
+   * Only the delta: a head an earlier tick already recorded must not be written again
+   * by a landing, and re-recording it would churn the run's `updatedAt` for nothing.
+   */
+  function capturedHeads(
+    before: FleetRun,
+    after: FleetRun,
+  ): readonly { taskId: string; head: string }[] {
+    const previous = new Map((before.members ?? []).map((member) => [member.taskId, member.head]));
+    const heads: { taskId: string; head: string }[] = [];
+    for (const member of after.members ?? []) {
+      if (member.head === undefined || member.head === previous.get(member.taskId)) continue;
+      heads.push({ taskId: member.taskId, head: member.head });
+    }
+    return heads;
   }
 
   /** What one tick did, and why it stopped the loop when it did. */
@@ -4204,7 +4413,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ctx: options.ctx,
       mode: options.mode,
       fleetId: options.fleetId,
-      detail: "fleet.json is gone; the run loop stopped",
+      detail: "the fleet intent is gone; the run loop stopped",
       line:
         `Fleet ${options.fleetId}: run loop stopped — the fleet record is gone, so nothing ` +
         "is ticking this run. Recover it from a session that can read the repository's " +
@@ -4218,7 +4427,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * Stop the loop because the fleet record cannot be read (bd-169).
    *
    * The sibling of {@link stopTickForMissingIntent}: a corrupt or unreadable
-   * `fleet.json` is the same lost loop, so it gets the same audit and recovery line.
+   * the intent row is the same lost loop, so it gets the same audit and recovery line.
    */
   function stopTickForUnreadableIntent(options: {
     ctx: ExtensionContext;
@@ -4230,7 +4439,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ctx: options.ctx,
       mode: options.mode,
       fleetId: options.fleetId,
-      detail: `fleet.json could not be read: ${options.error}`,
+      detail: `the fleet intent could not be read: ${options.error}`,
       line:
         `Fleet ${options.fleetId}: run loop stopped — the fleet record could not be read ` +
         `(${options.error}), so nothing is ticking this run. Recover the record, then ` +
@@ -4340,37 +4549,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
       run,
       now,
     });
-    // Write the sweep before acting, not only at the end of the tick: the advance's
-    // landing filter (`fleetLandedTaskIds`) reads `run.members[].landedAt` from the
-    // record, so a swept-but-unwritten landing made this very tick re-defer the
-    // dependent as "blocked by a bead outside this fleet" — and when the landed member
-    // was the run's last unfinished one, the run finished `partial` with no later tick
-    // to launch it (bd-278).
-    let tickIntent = swept.intent;
-    let tickRun = swept.run;
-    if (swept.run !== run) {
-      const written = writeOutsideFleetRun({
-        mode: current,
-        observed: run,
-        next: swept.run,
-        now,
-        allowActiveRun: true,
-      });
-      if (written.kind !== "written") {
-        // The loop notifies a tick's returned lines at one level, so this one carries
-        // its own: a failed `fleet.json` write warns like every other write failure in
-        // this loop, while a replaced run is the compare-and-replace doing its job and
-        // stays informational (bd-278 review). Neither acts: acting on an unrecorded
-        // landing is the defect itself — the dependent would be re-deferred and, on a
-        // run-ending tick, never launched — so the next tick re-sweeps instead.
-        ctx.ui.notify(written.line, written.kind === "failed" ? "warning" : "info");
-        return { lines: swept.lines, stop: false, acted: false };
-      }
-      // Continue from what was actually stored, so the end-of-tick persist builds on
-      // the landing instead of replacing it with the tick's pre-write snapshot.
-      tickIntent = written.intent;
-      tickRun = written.intent.run ?? swept.run;
-    }
+    const settled = settleOutsideFleetSweep({ ctx, mode: current, observed: run, swept, now });
+    if (settled.kind === "stop") return settled.outcome;
+    const { intent: tickIntent, run: tickRun } = settled;
     const observations = await readFleetMemberObservations({
       cwd: ctx.cwd,
       intent: tickIntent,
@@ -4421,7 +4602,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
     // Escalate after the action, because a stop recorded by this very tick is the
     // case the primitive exists for: the gate opens in the same pass as the stop, so
-    // a supervisor (or a human) never has to read `fleet.json` to learn what happened.
+    // a supervisor (or a human) never has to read the intent row to learn what happened.
     const escalated = await escalateFleetRun({
       ctx,
       mode: current,
@@ -4444,6 +4625,64 @@ export function createFleet(deps: FleetDeps): FleetApi {
       acted: result.acted,
       ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
     };
+  }
+
+  /**
+   * Make sure the outside-fleet sweep this tick performed is recorded before it acts.
+   *
+   * A landing commits its own record (bd-281), so a committed sweep needs no second
+   * write: the landings, their gate-record drops and the heads captured for members
+   * that have not landed yet are all in the store already, and writing the run again
+   * would bump the revision twice for one landing.
+   *
+   * A sweep that landed **nothing** still has the captured heads to record, and that
+   * is what `writeOutsideFleetRun` composes. A failed landing `transaction` or a
+   * refused compose stops the tick: acting on an unrecorded landing is the defect
+   * itself — the advance's `fleetLandedTaskIds` rule reads the record, so the
+   * dependent would be re-deferred and, on a run-ending tick, never launched.
+   */
+  function settleOutsideFleetSweep(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    observed: FleetRun;
+    swept: OutsideFleetSweep;
+    now: number;
+  }):
+    | { kind: "stop"; outcome: FleetTickLoopOutcome }
+    | { kind: "go"; intent: FleetIntent; run: FleetRun } {
+    const { ctx, mode, swept, observed } = options;
+    if (swept.failure !== undefined) {
+      const line =
+        `Fleet ${mode.fleetId}: could not record the outside-fleet landing: ` +
+        `${swept.failure}; nothing acts on it this tick`;
+      ctx.ui.notify(line, "warning");
+      console.warn(`[belayd-harness] ${line}`);
+      return {
+        kind: "stop",
+        outcome: { lines: [...swept.lines, line], stop: false, acted: false },
+      };
+    }
+    if (swept.committed || swept.run === observed) {
+      return { kind: "go", intent: swept.intent, run: swept.run };
+    }
+    const written = writeOutsideFleetRun({
+      mode,
+      observed,
+      next: swept.run,
+      now: options.now,
+      allowActiveRun: true,
+    });
+    if (written.kind !== "written") {
+      // The loop notifies a tick's returned lines at one level, so this one carries its
+      // own: a failed write warns like every other write failure in this loop, while a
+      // replaced run is the compare-and-replace doing its job and stays informational
+      // (bd-278 review).
+      ctx.ui.notify(written.line, written.kind === "failed" ? "warning" : "info");
+      return { kind: "stop", outcome: { lines: swept.lines, stop: false, acted: false } };
+    }
+    // Continue from what was actually stored, so the end-of-tick persist builds on the
+    // heads instead of replacing them with the tick's pre-write snapshot.
+    return { kind: "go", intent: written.intent, run: written.intent.run ?? swept.run };
   }
 
   /** Stop the loop's timer (the durable run record is what survives). */
@@ -5324,9 +5563,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * "narrow the parameter → resolve the mailbox → write → report".
    *
    * A supervisor → member note is ALSO written as one bd comment per recipient
-   * on the recipient's bead (bd-152). The file mailbox stays the delivery/ack
+   * on the recipient's bead (bd-152). The note row stays the delivery/ack
    * protocol — the comment is the human-visible mirror, so fleet traffic shows up
-   * in bd/Scotty instead of only in `events/` files. The author is always a
+   * in bd/Scotty instead of only in the store. The author is always a
    * `belayd:` actor, which is what keeps the mirror from ever being mistaken for
    * a human answer by the answer poll.
    */
@@ -5339,19 +5578,21 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
     const { ctx, resolved, kind } = options;
     const recipients = resolveFleetNoteRecipients({
-      direction: resolved.channel === "events" ? "supervisor-to-member" : "member-to-supervisor",
+      direction: resolved.channel === "event" ? "supervisor-to-member" : "member-to-supervisor",
       to: options.to,
       members: resolved.members,
     });
     if (!recipients.ok) return { ok: false, error: `Fleet note refused: ${recipients.error}` };
 
     const enqueued = enqueueNoteFanout({
-      dir: resolved.dir,
+      gitCommonDir: resolved.gitCommonDir,
+      fleetId: resolved.fleetId,
+      channel: resolved.channel,
       note: buildFleetNote({
         kind,
         from: resolved.from,
         // Replaced per recipient by the fan-out; kept as the caller asked so a
-        // single-recipient note is byte-identical to the old behaviour.
+        // single-recipient note is identical to the old behaviour.
         to: options.to,
         body: options.body,
         now: Date.now(),
@@ -5360,7 +5601,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
     if (!enqueued.ok) {
       // A partial fan-out means some members already have the note. The audit
-      // records exactly the recipients whose file was written — not the request
+      // records exactly the recipients whose row was written — not the request
       // — so a broadcast that reached two of three members never claims three.
       auditFleetAction({
         ctx,
@@ -5395,7 +5636,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ok: true,
       text:
         `Fleet \`${resolved.fleetId}\`: ${kind} from ${resolved.from} ${audience} queued in ` +
-        `${resolved.channel} (${enqueued.paths.length} file(s)).` +
+        `${fleetNoteChannelLabel(resolved.channel)} (${enqueued.seqs.length} note(s)).` +
         (mirrored === 0 ? "" : ` Mirrored to ${mirrored} bd comment(s).`),
     };
   }
@@ -5414,7 +5655,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     recipients: readonly string[];
     body: string;
   }): Promise<number> {
-    if (options.resolved.channel !== "events") return 0;
+    if (options.resolved.channel !== "event") return 0;
     // An explicit actor that always starts with `belayd:` — a mirror must never
     // look like a human answer even in a session whose actor does not resolve.
     const actor = resolveSessionBdActor(options.ctx) ?? "belayd:supervisor";
@@ -5450,7 +5691,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   function inboxDrainDetail(drainedCount: number, acked: AckNotesResult): string {
     if (acked.ok) return `${drainedCount} note(s) drained and acknowledged`;
     return (
-      `${drainedCount} note(s) drained; ${acked.removed.length} acknowledged, ` +
+      `${drainedCount} note(s) drained; ${acked.acked.length} acknowledged, ` +
       `${acked.remaining.length} still queued (${acked.error})`
     );
   }
@@ -5466,7 +5707,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       : {
           ackFailure: {
             error: options.acked.error,
-            removedCount: options.acked.removed.length,
+            removedCount: options.acked.acked.length,
             remaining: options.acked.remaining,
           },
         };
@@ -5596,7 +5837,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    *
    * Both callers have already merged: a manual `belayd_fleet_merge` drain, and the
    * opt-in acceptance after a landing (where the records are normally already gone
-   * — this only catches a `fleet.json` written before the resolve). A failure is a
+   * — this only catches an intent row written before the resolve). A failure is a
    * warning, not a failed merge: the work is on the base branch, and the gate stays
    * recorded for the next tick or reconcile.
    */
@@ -5619,7 +5860,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    *
    * A stale record from a dead process does not count: `fleetModeFor` re-derives
    * mode from the record, the process identity, and this session's arm token on
-   * every call, so these tools can never be driven by a planted `fleet.json`.
+   * every call, so these tools can never be driven by a planted intent row.
    */
   function fleetSupervisorOnly(toolName: string): string {
     return (
@@ -5630,7 +5871,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * Send one supervisor → member note through the validated fan-out, auditing it.
+   * Announce one note kind to every member, auditing each queued row.
    *
    * Best effort on purpose: a pause that failed to *queue* its advisory note still
    * wrote the intent flag, which is the enforceable half, so the report says which
@@ -5649,7 +5890,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
     });
     if (!recipients.ok) return [];
     const enqueued = enqueueNoteFanout({
-      dir: options.mode.eventsDir,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      channel: "event",
       note: buildFleetNote({
         kind: options.kind,
         from: FLEET_NOTE_SUPERVISOR,
@@ -5955,7 +6198,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * Audit a repair that recovery authority actually applied (bd-233, S1).
    *
    * The degradation is deliberate and loud: repair authority over a fleet whose
-   * supervisor died, never the supervisor role itself (fleet.json is untouched). A
+   * supervisor died, never the supervisor role itself (the intent row is untouched). A
    * call that repaired nothing writes nothing, so a no-op reconcile can never leave a
    * recovery claim in another fleet's log.
    */
@@ -6263,7 +6506,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
    *
    * A member of another fleet may be released when that fleet's supervisor is
    * provably dead. Without that escape the only way to clear a dead fleet's slot
-   * was a hand edit of `fleet.json`; a live foreign supervisor keeps today's
+   * was a hand edit of the intent row; a live foreign supervisor keeps today's
    * refusal, because it owns that capacity decision.
    */
   function planFleetRelease(options: {
@@ -6352,18 +6595,29 @@ export function createFleet(deps: FleetDeps): FleetApi {
     ok: true;
     gitCommonDir: string;
     fleetId: string;
-    dir: string;
-    channel: "inbox" | "events";
+    /** The store's channel; `events` in the tool parameter is `event` here. */
+    channel: FleetNoteChannel;
     from: string;
     /** Fleet members from the intent: the audience a note's `to` is checked against. */
     members: readonly string[];
   }
 
   /**
+   * The operator-facing name of a mailbox channel.
+   *
+   * A report says "queued in events/"/"inbox/" because that is the word the docs and
+   * the tool description use; the row's channel value is the singular `event`, so the
+   * trailing slash is part of the label rather than a directory.
+   */
+  function fleetNoteChannelLabel(channel: FleetNoteChannel): string {
+    return channel === "event" ? "events/" : "inbox/";
+  }
+
+  /**
    * Resolve where a note goes, who it is from, and which mailbox it lands in.
    *
-   * Defaults follow the direction of travel: a supervisor writes to `events/`
-   * (its messages are for members), a member writes to `inbox/` (its messages
+   * Defaults follow the direction of travel: a supervisor writes the event channel
+   * (its messages are for members), a member writes the inbox channel (its messages
    * are for the supervisor). The channel can be overridden explicitly, but the
    * fleet itself cannot: a session may only write into a fleet it supervises or
    * is a member of.
@@ -6407,23 +6661,25 @@ export function createFleet(deps: FleetDeps): FleetApi {
   /** Narrow the optional `channel` parameter to the two mailboxes. */
   function normalizeFleetChannel(
     raw: string | undefined,
-  ): { ok: true; channel: "inbox" | "events" | undefined } | { ok: false; error: string } {
+  ): { ok: true; channel: FleetNoteChannel | undefined } | { ok: false; error: string } {
     if (raw === undefined) return { ok: true, channel: undefined };
-    if (raw === "inbox" || raw === "events") return { ok: true, channel: raw };
+    // `events` is the tool's spelling (and the old directory name); the store's
+    // channel for the same mailbox is the singular `event`.
+    if (raw === "events") return { ok: true, channel: "event" };
+    if (raw === "inbox") return { ok: true, channel: "inbox" };
     return { ok: false, error: "channel must be `inbox` or `events`" };
   }
 
-  /** A supervisor addresses members: default mailbox `events/`. */
+  /** A supervisor addresses members: default mailbox `events`. */
   function supervisorNoteTarget(
     mode: FleetMode,
-    channel: "inbox" | "events" | undefined,
+    channel: FleetNoteChannel | undefined,
   ): FleetNoteTarget {
-    const resolved = channel ?? "events";
+    const resolved = channel ?? "event";
     return {
       ok: true,
       gitCommonDir: mode.gitCommonDir,
       fleetId: mode.fleetId,
-      dir: resolved === "inbox" ? mode.inboxDir : mode.eventsDir,
       channel: resolved,
       from: FLEET_NOTE_SUPERVISOR,
       // Deferred members are addressable too: mail queued for a member that has not
@@ -6433,12 +6689,12 @@ export function createFleet(deps: FleetDeps): FleetApi {
     };
   }
 
-  /** A member addresses the supervisor: default mailbox `inbox/`. */
+  /** A member addresses the supervisor: the inbox channel. */
   function memberNoteTarget(options: {
     ctx: ExtensionContext;
     gitCommonDir: string;
     requestedFleetId: string | undefined;
-    channel: "inbox" | "events" | undefined;
+    channel: FleetNoteChannel | undefined;
   }): FleetNoteTarget | { ok: false; error: string } {
     const { ctx } = options;
     const state = getSessionState(ctx);
@@ -6461,15 +6717,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
         error: `This session is a member of fleet \`${member.fleetId}\`, not \`${options.requestedFleetId}\`.`,
       };
     }
-    // events/ is supervisor → member only. Letting a member write it would be
-    // cross-worktree prompt injection: it could hand a sibling a fake `pause`,
+    // The event channel is supervisor → member only. Letting a member write it would
+    // be cross-worktree prompt injection: it could hand a sibling a fake `pause`,
     // `base-moved`, or `rebase-hint` that the sibling renders as supervisor
-    // instructions. The member's own surface is inbox/ → supervisor.
-    if (options.channel === "events") {
+    // instructions. The member's own surface is inbox → supervisor.
+    if (options.channel === "event") {
       return {
         ok: false,
         error:
-          "events/ is supervisor-only: a fleet member writes to the supervisor via inbox/, so it " +
+          "the events channel is supervisor-only: a fleet member writes to the supervisor's inbox, so it " +
           "cannot inject a turn-start event into a sibling's session. Use channel inbox (the " +
           "default) and address `supervisor`.",
       };
@@ -6478,7 +6734,6 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ok: true,
       gitCommonDir: member.gitCommonDir,
       fleetId: member.fleetId,
-      dir: member.inboxDir,
       channel: "inbox",
       from: memberTaskId,
       members: [...member.intent.taskIds],
@@ -6486,11 +6741,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * Member-side delivery: drain this member's `events/` at turn start.
+   * Member-side delivery: drain this member's events at turn start.
    *
-   * Files-first by design (members are detached sessions, so there is no
-   * in-memory channel). Bounded by note count and character budget, silent when
-   * nothing is addressed to this member.
+   * Store-first by design (members are detached sessions, so there is no in-memory
+   * channel). Bounded by note count and character budget, silent when nothing is
+   * addressed to this member.
    *
    * **The ack is deferred (W4).** Selection only records the deliveries on the
    * session state; `ackFleetEventsAfterTurn` removes them in `agent_end`, after
@@ -6528,7 +6783,13 @@ export function createFleet(deps: FleetDeps): FleetApi {
 
   /** Drain and select this member's events; undefined when nothing is addressed. */
   function selectMemberEvents(member: FleetMode, taskId: string): FleetEventBatch | undefined {
-    const drained = drainNotes({ dir: member.eventsDir });
+    const drained = drainNotes({
+      gitCommonDir: member.gitCommonDir,
+      fleetId: member.fleetId,
+      channel: "event",
+      // The drain narrows by address, so a member never even reads a sibling's mail.
+      target: taskId,
+    });
     if (!drained.ok) {
       console.warn(`[belayd-harness] fleet events drain failed: ${drained.error}`);
       return undefined;
@@ -6544,7 +6805,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * Remember the events this turn injected, for the `agent_end` ack.
    *
    * Accumulates, never overwrites: a turn that drains twice before `agent_end`
-   * must ack the union, not just the last batch.
+   * must ack the union, not just the last batch. The row seq is the identity, so a
+   * replayed note (same seq) is not queued twice.
    */
   function queueFleetEventAcks(
     state: FleetState,
@@ -6554,11 +6816,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
     const pending = state.pendingFleetEventAcks ?? {
       fleetId: member.fleetId,
       gitCommonDir: member.gitCommonDir,
-      dir: member.eventsDir,
       deliveries: [],
     };
     for (const delivery of deliveries) {
-      if (!pending.deliveries.some((existing) => existing.path === delivery.path)) {
+      if (!pending.deliveries.some((existing) => existing.seq === delivery.seq)) {
         pending.deliveries.push(delivery);
       }
     }
@@ -6569,9 +6830,9 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * Ack the events injected into the turn that just ended (W4).
    *
    * Runs in `agent_end`, i.e. after the model has read the message. A crash before
-   * this point leaves the files on disk and the next turn replays them: the
-   * delivery guarantee for events is at-least-once, and repeats must be treated
-   * as the same event. The delete is a cross-tree mutation, so it is audited.
+   * this point leaves the rows pending and the next turn replays them: the delivery
+   * guarantee for events is at-least-once, and repeats must be treated as the same
+   * event. The ack is a cross-tree mutation, so it is audited.
    */
   function ackFleetEventsAfterTurn(ctx: ExtensionContext): void {
     const state = getSessionState(ctx);
@@ -6581,7 +6842,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
     state.pendingFleetEventAcks = undefined;
     if (pending.deliveries.length === 0) return;
 
-    const acked = ackNotes({ dir: pending.dir, deliveries: pending.deliveries });
+    const acked = ackNotes({
+      gitCommonDir: pending.gitCommonDir,
+      fleetId: pending.fleetId,
+      deliveries: pending.deliveries,
+    });
     const taskId = inferredTaskId(ctx);
     if (acked.ok) {
       auditFleetAction({
@@ -6590,7 +6855,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         fleetId: pending.fleetId,
         action: "events-acked",
         taskIds: [taskId],
-        detail: `${acked.removed.length} event(s) acknowledged after the turn that read them`,
+        detail: `${acked.acked.length} event(s) acknowledged after the turn that read them`,
       });
       return;
     }
@@ -7163,12 +7428,12 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "best-effort `bd show --json` read plus `bd comments --json` and `bd gate list --json` " +
       "per member, all read-only and best-effort (bounded concurrency); without bd the view " +
       "still renders. fleetId selects " +
-      `<git-common-dir>/belayd/fleet/<fleetId>/fleet.json (default: ${DEFAULT_FLEET_ID}); ` +
-      "P0 never creates that file.",
+      `the fleet intent row of this repository's store (default: ${DEFAULT_FLEET_ID}); ` +
+      "P0 never creates one.",
     parameters: Type.Object({
       fleetId: Type.Optional(
         Type.String({
-          description: `Fleet intent directory name under <git-common-dir>/belayd/fleet/ (default: ${DEFAULT_FLEET_ID})`,
+          description: `Fleet id; the intent is a row in <git-common-dir>/belayd/state.sqlite (default: ${DEFAULT_FLEET_ID})`,
         }),
       ),
     }),
@@ -7177,6 +7442,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
       const requested = params.fleetId;
       const fleetId =
         requested === undefined || requested.trim() === "" ? DEFAULT_FLEET_ID : requested.trim();
+      // Import a pre-store fleet's files before the first read (bd-281): status is
+      // often the first fleet call in a session, and `readFleetStatus` resolves the
+      // common dir itself, so the guard is run here for its effect.
+      gitCommonDirFor(cwd);
       const result = readFleetStatus({ cwd, fleetId });
       if (!result.ok) return textToolResult(result.error, 1);
       const lookup = await readFleetBeads(result.value, cwd);
@@ -7195,7 +7464,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     description:
       "Launch several beads as concurrent Belayd workflows, each in its own worktree and detached " +
       "orchestrator session, and record them in the fleet intent " +
-      "(<git-common-dir>/belayd/fleet/<fleetId>/fleet.json). Validates every task id first: an " +
+      "(the fleet intent row of this repository's store). Validates every task id first: an " +
       "invalid, duplicated, already-member, or worktree-conflicting id refuses the whole launch " +
       "with no side effects, and a worktree with a live orchestrator lease is refused (one " +
       "orchestrator per worktree). Orders members by bd's blocking dependencies (blocked-by " +
@@ -7204,14 +7473,14 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "Every dependency edge between two members gets its own bd ordering gate, so a dependent " +
       "unblocks when its blocker LANDS, not when its bead is closed. " +
       "Members beyond that, or in a later wave, are deferred — reported per member and recorded " +
-      "in fleet.json — never silently dropped. By default (untilComplete) this session then runs " +
+      "in the fleet intent — never silently dropped. By default (untilComplete) this session then runs " +
       "the fleet TO COMPLETION: it lands each finished member, releases the ordering gates its " +
       "landing satisfied, and starts the next wave as dependencies clear, until every member is " +
       "landed. Landing never closes a bead: each one is left in_progress + human for you to " +
       "accept, unless accept=true (then the bead is closed and the worktree removed). " +
       "untilComplete=false keeps the explicit surface " +
       "(belayd_fleet_merge / belayd_fleet_advance on call). The launch freezes a publish " +
-      "contract into fleet.json (default local: merged work stays local, no remote and no " +
+      "contract into the fleet intent (default local: merged work stays local, no remote and no " +
       "network); the resolved value is never re-read mid-run. This session becomes the fleet " +
       "supervisor: it runs no phases and owns no worktree — observe with belayd_fleet_status, " +
       "message members with belayd_fleet_note, read reports with belayd_fleet_inbox, pause with " +
@@ -7223,7 +7492,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ]),
       fleetId: Type.Optional(
         Type.String({
-          description: `Fleet directory name under <git-common-dir>/belayd/fleet/ (default: ${DEFAULT_FLEET_ID})`,
+          description: `Fleet id; the intent is a row in <git-common-dir>/belayd/state.sqlite (default: ${DEFAULT_FLEET_ID})`,
         }),
       ),
       concurrency: Type.Optional(
@@ -7249,7 +7518,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         Type.Union([Type.Literal("local"), Type.Literal("pr"), Type.Literal("push")], {
           description:
             "Publish mode (default local: merged work stays local, no remote and no network). " +
-            "The resolved contract is frozen into fleet.json at launch and never re-read",
+            "The resolved contract is frozen into the fleet intent at launch and never re-read",
         }),
       ),
       publishRemote: Type.Optional(
@@ -7295,14 +7564,14 @@ export function createFleet(deps: FleetDeps): FleetApi {
     name: "belayd_fleet_note",
     label: "Belayd fleet note",
     description:
-      "Write fleet mailbox notes. The supervisor writes into events/ for one member or `all` " +
-      "(a broadcast is materialized as one file per member, so every member receives its own " +
-      "copy); a member writes into inbox/ and may only address `supervisor`. The target is " +
+      "Write fleet mailbox notes. The supervisor writes events for one member or `all` " +
+      "(a broadcast is materialized as one note per member, so every member receives its own " +
+      "copy); a member writes inbox and may only address `supervisor`. The target is " +
       "validated against live fleet membership, so a typo is refused instead of becoming mail " +
       "nobody ever reads. Kinds: note, rebase-hint, base-moved, sibling-landed, pause, resume. " +
-      "Delivery is files-first: a member sees queued events at the start of its next turn; the " +
-      "supervisor reads inbox/ with belayd_fleet_inbox. Body is bounded and every note is " +
-      "audited in audit.log.",
+      "Delivery is at-least-once: a member sees queued events at the start of its next turn; the " +
+      "supervisor reads inbox with belayd_fleet_inbox. The body is bounded, and every note is " +
+      "stored with its audit line in one transaction.",
     parameters: Type.Object({
       to: Type.String({
         description: "Target task id, `supervisor` (inbox only), or `all` (every member)",
@@ -7362,9 +7631,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
     name: "belayd_fleet_inbox",
     label: "Belayd fleet inbox",
     description:
-      "Drain the fleet supervisor's inbox/ (member → supervisor notes), acknowledge each note, and " +
-      "return them. At-least-once: a note is removed only after this call consumed it. Supervisor " +
-      "sessions only — events/ is delivered to members automatically at turn start.",
+      "Drain the fleet supervisor's inbox (member → supervisor notes), acknowledge each note, and " +
+      "return them. At-least-once: a note is acknowledged only after this call consumed it. " +
+      "Supervisor sessions only — the event channel is delivered to members automatically at turn " +
+      "start.",
     parameters: Type.Object({
       fleetId: Type.Optional(
         Type.String({ description: `Fleet id (default: ${DEFAULT_FLEET_ID})` }),
@@ -7389,13 +7659,22 @@ export function createFleet(deps: FleetDeps): FleetApi {
         );
       }
 
-      const drained = drainNotes({ dir: mode.inboxDir });
+      const drained = drainNotes({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        channel: "inbox",
+        target: FLEET_NOTE_SUPERVISOR,
+      });
       if (!drained.ok) return textToolResult(`Fleet inbox unavailable: ${drained.error}`, 1);
 
-      // Render first, ack second. If an unlink fails, the note bodies this call
+      // Render first, ack second. If the ack is refused, the note bodies this call
       // consumed are already in the result, and the rendered text states exactly
       // what remains queued — nothing vanishes off the record.
-      const acked = ackNotes({ dir: mode.inboxDir, deliveries: drained.deliveries });
+      const acked = ackNotes({
+        gitCommonDir: mode.gitCommonDir,
+        fleetId: mode.fleetId,
+        deliveries: drained.deliveries,
+      });
 
       if (drained.deliveries.length > 0) {
         auditFleetAction({
@@ -7420,7 +7699,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "member's branch; action=drain merges one queued member into the fleet base branch in the " +
       "operator's root checkout (rebase → project gates → fast-forward merge → base-moved " +
       "notifications), and action=list renders the queue. A dirty root is auto-stashed and " +
-      "restored; a conflicting restore parks the fleet with the stash ref in fleet.json (repair " +
+      "restored; a conflicting restore parks the fleet with the stash ref in the fleet intent (repair " +
       "with belayd_fleet_reconcile, then belayd_fleet_resume). " +
       "Merging is not closing: the bead stays in_progress + human. Supervisor sessions only.",
     parameters: Type.Object({
@@ -7468,7 +7747,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     description:
       "Pause a fleet so it starts no new work: the intent's `paused` flag is written through the " +
       "compare-and-replace path and audited (fleet-paused), launches refuse and merges refuse " +
-      "until belayd_fleet_resume. Every member also gets a `pause` note in events/ (delivered at " +
+      "until belayd_fleet_resume. Every member also gets a `pause` note in its events mailbox (delivered at " +
       "its next turn start). This is cooperative: a running phase is NOT interrupted and a member " +
       "that ignores the note keeps working. force=true additionally sends SIGTERM to each " +
       "member's orchestrator process, identified only by the exact `belayd-<taskId>` session " +
@@ -7534,7 +7813,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "the operator's stashed root work is restored (reconcile verifies the root is this " +
       "repository's own checkout on the base branch, applies the recorded sha, and unparks); " +
       "force clears the pause and leaves the stash untouched, naming the ref. Resuming a fleet " +
-      "that is already running is a successful no-op. Members get a `resume` note in events/. " +
+      "that is already running is a successful no-op. Members get a `resume` note each. " +
       "Supervisor sessions only.",
     parameters: Type.Object({
       force: Type.Optional(
@@ -7659,7 +7938,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
   /**
    * What one composed outside-fleet landing write did to the stored run.
    *
-   * Three outcomes, not a boolean: a failure is a real `fleet.json` write failure and
+   * Three outcomes, not a boolean: a failure is a real intent write failure and
    * warns like every other one in this loop, while a skip is the compare-and-replace
    * doing its job on a record another session already replaced (bd-278 review).
    */
@@ -7781,25 +8060,51 @@ export function createFleet(deps: FleetDeps): FleetApi {
       run,
       now: options.now,
     });
-    const lines = [...swept.lines];
-    let intent = swept.intent;
-    if (swept.run !== run) {
-      const written = writeOutsideFleetRun({
-        mode: options.mode,
-        observed: run,
-        next: swept.run,
-        now: options.now,
-      });
-      // Reconcile reports rather than stops: it keeps the composed record for the gate
-      // reap that follows, even when the write itself was refused.
-      if (written.kind === "written") {
-        intent = written.intent;
-      } else {
-        if (written.intent !== undefined) intent = written.intent;
-        lines.push(written.line);
-      }
+    return reportReconciledSweep({
+      ctx: options.ctx,
+      mode: options.mode,
+      observed: run,
+      swept,
+      now: options.now,
+    });
+  }
+
+  /**
+   * Persist whatever a reconcile sweep still owes, and report it (reconcile never
+   * stops: it keeps a composed record for the gate reap that follows).
+   *
+   * A landing commits itself (bd-281), so a committed sweep owes nothing; only the
+   * heads captured for members that have not landed need `writeOutsideFleetRun`. A
+   * rolled-back landing is unrecorded, so it is reported and the stored record is left
+   * as it is — the next pass re-proves the landing from git.
+   */
+  function reportReconciledSweep(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    observed: FleetRun;
+    swept: OutsideFleetSweep;
+    now: number;
+  }): { intent: FleetIntent; lines: readonly string[] } {
+    const lines = [...options.swept.lines];
+    const { swept } = options;
+    if (swept.failure !== undefined) {
+      lines.push(
+        `Fleet ${options.mode.fleetId}: could not record the outside-fleet landing: ${swept.failure}`,
+      );
+      return { intent: swept.intent, lines };
     }
-    return { intent, lines };
+    if (swept.committed || swept.run === options.observed) {
+      return { intent: swept.intent, lines };
+    }
+    const written = writeOutsideFleetRun({
+      mode: options.mode,
+      observed: options.observed,
+      next: swept.run,
+      now: options.now,
+    });
+    if (written.kind === "written") return { intent: written.intent, lines };
+    lines.push(written.line);
+    return { intent: written.intent ?? swept.intent, lines };
   }
 
   /**
@@ -7899,7 +8204,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     label: "Belayd fleet reconcile",
     description:
       "Repair a fleet after a crash, audited and idempotent. Merge queue: takes over an expired " +
-      "lease, clears a lock record whose merge.lock.d is gone, reclaims an orphaned lock " +
+      "lease, clears a lock row whose merge lease expired, reclaims an orphaned lock " +
       "directory past its grace window, and re-queues (or marks merged when git proves it landed) " +
       "an entry frozen mid-flight — all under the existing single-flight merge lock, so it never " +
       "interleaves with a merge. Parked fleet: restores the recorded stash ref when the root is " +
@@ -7907,7 +8212,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "blocks it (the stash is never discarded); a recorded sha that is no longer in `git stash " +
       "list` is reported as already restored or dropped and never applied again. Supervision: " +
       "reports the supervisor's liveness and each member's orchestrator liveness from the " +
-      "worktree lease (a member session renews `.belayd/orchestrator.json`; the process table " +
+      "worktree lease (a member session renews its lease row; the process table " +
       "cannot see a pi-web session) plus the process table for CLI-spawned runs; " +
       "prune-dead-members=true removes members whose orchestrator is provably gone (no live " +
       "lease AND no matching process AND no worktree that still exists — `unknown` is never " +
@@ -8104,7 +8409,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       "releases the gates the landing satisfied and starts the next wave until every member is " +
       "landed. Landing never closes a bead: they stay in_progress + human for you to accept. " +
       "`--manual` keeps the explicit surface; `--accept` also closes each landed bead. " +
-      "`--publish <local|pr|push>` freezes the publish contract into fleet.json (default local: " +
+      "`--publish <local|pr|push>` freezes the publish contract into the fleet intent (default local: " +
       "no remote and no network); `--publish-remote`, `--publish-base`, `--publish-ready` and " +
       "`--publish-stacks` complete a pr/push contract. " +
       "Usage: /fleet bd-12 bd-15 [--fleet <id>] [--concurrency <n>] [--manual] [--accept] " +

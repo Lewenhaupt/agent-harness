@@ -8,7 +8,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -29,6 +37,35 @@ function initRepo(dir: string): void {
     timeout: 10_000,
     stdio: "pipe",
   });
+}
+
+/** Run git in `cwd` with the ambient git-context variables stripped. */
+function git(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv = {}): string {
+  return execFileSync("git", args, {
+    cwd,
+    env: { ...gitContextFreeEnv(), ...env },
+    timeout: 10_000,
+    encoding: "utf8",
+    stdio: "pipe",
+  }).trim();
+}
+
+/**
+ * A real repository with one commit and a linked worktree beside it.
+ *
+ * The linked worktree carries a `.git` **file** ("gitdir: …") rather than a
+ * directory, which is the shape both the worktree/submodule marker check and
+ * git's own common-dir indirection have to handle.
+ */
+function initRepoWithWorktree(root: string): { repo: string; second: string } {
+  const repo = join(root, "repo");
+  initRepo(repo);
+  git(repo, ["config", "user.email", "test@example.invalid"]);
+  git(repo, ["config", "user.name", "Test"]);
+  git(repo, ["commit", "-q", "--allow-empty", "-m", "init"]);
+  const second = join(root, "second-worktree");
+  git(repo, ["worktree", "add", "-q", second]);
+  return { repo, second };
 }
 
 /**
@@ -242,6 +279,47 @@ describe("resolveGitCommonDir", () => {
     expect(result.error).toContain("not a git repository");
   });
 
+  it("classifies a spawned non-zero exit outside a repository as not-a-repository", () => {
+    const failure = Object.assign(new Error("fatal: not a git repository"), {
+      status: 128,
+      signal: null,
+    });
+    const result = resolveGitCommonDir(tmpDir, () => {
+      throw failure;
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("not-a-repository");
+  });
+
+  it("classifies a spawned non-zero exit beside a .git marker as indeterminate", () => {
+    // A broken repository exits exactly like a plain directory; the marker is
+    // what keeps it from being reported as an observed absence.
+    writeFileSync(join(tmpDir, ".git"), "gitdir: /missing-common\n");
+    const failure = Object.assign(new Error("fatal: not a git repository: (null)"), {
+      status: 128,
+    });
+    const result = resolveGitCommonDir(tmpDir, () => {
+      throw failure;
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("indeterminate");
+  });
+
+  it("classifies a git that could not be spawned as indeterminate", () => {
+    const failure = Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" });
+    const result = resolveGitCommonDir(tmpDir, () => {
+      throw failure;
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("indeterminate");
+  });
+
   it("returns an error when git reports an empty common dir", () => {
     const result = resolveGitCommonDir(tmpDir, () => "\n");
 
@@ -279,6 +357,106 @@ describe("resolveGitCommonDir", () => {
     expect(repoKey).toHaveProperty("ok", false);
     if (commonDir.ok || repoKey.ok) return;
     expect(repoKey.error).toBe(commonDir.error);
+  });
+});
+
+/**
+ * The classifier against real git (bd-281 round 12).
+ *
+ * The injected-exec cases above pin the branching around git's exit status; these
+ * pin what real git actually reports, which is what the proof gate's
+ * absent/indeterminate split depends on. Nothing here touches the network or the
+ * checkout: every repository is a temp fixture.
+ */
+describe("resolveGitCommonDir classifier with real git (bd-281)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "git-common-dir-real-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("reports the main .git dir from a linked worktree whose .git is a file", () => {
+    const { repo, second } = initRepoWithWorktree(tmpDir);
+    // The worktree/submodule shape: a `.git` file, not a directory. Both the marker
+    // walk and `resolve` have to accept it.
+    expect(existsSync(join(second, ".git"))).toBe(true);
+    expect(statSync(join(second, ".git")).isFile()).toBe(true);
+
+    const result = resolveGitCommonDir(second);
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(realpathSync(result.commonDir)).toBe(realpathSync(join(repo, ".git")));
+    // One repository, one key: a linked worktree must not namespace itself apart.
+    expect(resolveRepoKey(second)).toEqual(resolveRepoKey(repo));
+  });
+
+  it("resolves a bare repository instead of calling it an absence", () => {
+    const bare = join(tmpDir, "bare.git");
+    git(tmpDir, ["init", "-q", "--bare", bare]);
+
+    const result = resolveGitCommonDir(bare);
+
+    // A bare repo names itself as the common dir, so the probe succeeds; the
+    // documented limitation is in key derivation, never a false absence.
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(realpathSync(result.commonDir)).toBe(realpathSync(bare));
+  });
+
+  it("never turns a GIT_CEILING_DIRECTORIES refusal into an observed absence", () => {
+    const repo = join(tmpDir, "capped-repo");
+    initRepo(repo);
+    const inside = join(repo, "nested", "deeper");
+    mkdirSync(inside, { recursive: true });
+
+    const saved = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = repo;
+    try {
+      const result = resolveGitCommonDir(inside);
+
+      // git exits 128 exactly as it does outside any repository, but the ceiling is
+      // a caller-imposed refusal, not a filesystem fact: the `.git` marker above
+      // still says a repository exists, so the probe must fail closed.
+      expect(result).toHaveProperty("ok", false);
+      if (result.ok) return;
+      expect(result.reason).toBe("indeterminate");
+    } finally {
+      if (saved === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = saved;
+    }
+  });
+
+  it("stays bound to the passed cwd when GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR are inherited", () => {
+    const repo = join(tmpDir, "tmp-repo");
+    initRepo(repo);
+    const elsewhere = join(tmpDir, "other-repo");
+    initRepo(elsewhere);
+    mkdirSync(join(repo, "sub"), { recursive: true });
+
+    const saved: Record<string, string | undefined> = {};
+    for (const key of GIT_CONTEXT_ENV_KEYS) saved[key] = process.env[key];
+    process.env.GIT_DIR = join(elsewhere, ".git");
+    process.env.GIT_WORK_TREE = elsewhere;
+    process.env.GIT_COMMON_DIR = join(elsewhere, ".git");
+    try {
+      const result = resolveGitCommonDir(join(repo, "sub"));
+
+      expect(result).toHaveProperty("ok", true);
+      if (!result.ok) return;
+      // The inherited context is stripped, so the answer is the passed cwd's repo.
+      expect(realpathSync(result.commonDir)).toBe(realpathSync(join(repo, ".git")));
+    } finally {
+      for (const key of GIT_CONTEXT_ENV_KEYS) {
+        const value = saved[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 });
 

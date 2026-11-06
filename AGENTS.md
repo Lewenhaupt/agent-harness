@@ -23,7 +23,7 @@ each subsystem. The module map, build/release notes and service runbooks live in
 | How does a phase agent, retry or resume work? | `docs/subagent-sessions.md`, `docs/planning-implement-workflows.md` |
 | Which agent wrote a bead, and who is it assigned to? | `docs/beads-actor.md` |
 | How do I operate pi-web / AWS sandbox / containers? | `docs/pi-web-service.md`, `docs/aws-credential-isolation.md`, `docs/arion.md` |
-| Fleet (`/fleet`), proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
+| Fleet (`/fleet`), workflow/fleet state, proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
 | UI design pass (unslop skill, `belayd_unslop`, `$UNSLOP_HOME`) | `docs/unslop-skill.md` |
 | Secret scanning before publishing, and the no-detection-heuristics rule | `AGENTS.md` (Code style) |
 
@@ -65,7 +65,7 @@ plain labels default to `feature`.
 ### Functional programming
 
 - **Pure functions preferred.** Side effects (git, spawning, filesystem I/O) are confined to documented functions.
-- **No global mutable state.** The only module-level state is in `stale-file-guard.ts`, `spawn.ts` (cached pi binary), `model-session-state.ts`, `model-state-store.ts` (the shared store, its open-failure class/retry state and the bounded pending-cooldown queue), and the two capability modules owning model-routing and per-session state: `extensions/capabilities/model.ts` and `extensions/capabilities/session-state.ts`.
+- **No global mutable state.** Module-level state lives only in `stale-file-guard.ts`, `spawn.ts`, `model-session-state.ts`, the two SQLite stores (`model-state-store.ts` + cooldown queue, `repo-state-store.ts` + path cache), `repo-state-import.ts` (migration guard) and the capability modules for model-routing/session state: `extensions/capabilities/model.ts`, `extensions/capabilities/session-state.ts`.
 - **Immutable data.** `const`, spread, `structuredClone`. No class mutation patterns.
 - **Discriminated unions for multi-outcome functions**, `{ allowed: boolean; reason?: string }` rather than a boolean with an optional string.
 - **Errors as values.** Return `{ ok: true; value } | { ok: false; error }`. Reserve `throw` for non-recoverable conditions.

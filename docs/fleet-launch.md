@@ -241,18 +241,18 @@ the phase tools (`belayd_plan`, `belayd_implement`, `belayd_commit`, …),
 > belayd_fleet_note, and read their reports with belayd_fleet_inbox — each phase
 > runs in the member orchestrator that owns that bead's worktree.
 
-Fleet mode is **derived from `fleet.json`** on every check. The supervisor record
+Fleet mode is **derived from the fleet intent row** on every check. The supervisor record
 carries the session id, the pid, that pid's `/proc` start time, and a per-arming
 token held only in the arming session's memory. So:
 
 - a stale record from a dead process cannot put a new session into fleet mode;
 - a recycled pid does not match (the recorded start time differs);
 - pid 1 / kernel-thread pids are never accepted as a supervisor;
-- a hand-written or planted `fleet.json` that names your session and a live pid
+- a hand-written or planted intent row that names your session and a live pid
   still does not match, because it cannot carry the token you minted;
 - a restarted supervisor session must re-arm with `/fleet`, which rewrites the
   record and mints a new token;
-- deleting `fleet.json` un-arms it immediately.
+- removing the intent row un-arms it immediately.
 
 The refusal never replaces the bd-119 ownership preflight: a member worktree
 whose `.belayd/workflow.json` belongs to another bead still gets the bd-119
@@ -270,11 +270,14 @@ sender.
 | `kind` | `note`, `rebase-hint`, `base-moved`, `sibling-landed`, `pause`, `resume` (default `note`) |
 | `channel` | `inbox` (member → supervisor) or `events` (supervisor → member); defaults by direction. A member cannot use `events` |
 
-`to: "all"` is **fanned out at write time**: the supervisor gets one file per
+Both channels are `fleet_note` rows in the repository store (bd-281), keyed by
+fleet id, channel and row `seq`; there is no mailbox directory to write or copy.
+
+`to: "all"` is **fanned out at write time**: the supervisor gets one row per
 member (same body, addressed to that member), so each member receives it exactly
-once under the ack protocol. A single shared `all` file could not do that — the
-first member to ack would delete it for everyone. A partial fan-out is audited
-with the recipients whose files were **actually written** (W-A), never with the
+once under the ack protocol. A single shared `all` row could not do that — the
+first member to ack it would consume it for everyone. A partial fan-out is audited
+with the recipients whose rows were **actually written** (W-A), never with the
 intended set.
 
 **One session per member worktree (S1).** Member delivery keys on the task id in
@@ -284,24 +287,28 @@ drain and ack that member's mail — bd-119 pins a worktree to one bead and the
 launch now refuses a worktree already driven, so keep one orchestrator per
 worktree.
 
-`belayd_fleet_inbox` (supervisor only) drains `inbox/`, returns the notes, and
-acknowledges them. The rendered block frames them as **member reports, not
-supervisor instructions** (S3), mirroring the member-side event framing. Delivery
-is at-least-once: a note is removed only after the call consumed it, so a
-forgotten ack replays the note instead of losing it. The notes are **rendered
-before** the ack, so a partial ack failure still shows every consumed body and
-states exactly how many notes remain queued.
+`belayd_fleet_inbox` (supervisor only) drains the inbox channel, returns the
+notes, and acknowledges them by row `seq`. The rendered block frames them as
+**member reports, not supervisor instructions** (S3), mirroring the member-side
+event framing. Delivery is at-least-once: a note is acknowledged only after the
+call consumed it, so a forgotten ack replays the note instead of losing it. An
+already-acked `seq` is success, not an error. The notes are **rendered before**
+the ack, so a refused ack still shows every consumed body and states exactly how
+many notes remain queued.
 
-Member delivery is automatic: before a member's turn starts it drains `events/`
-and gets a `belayd-fleet-events` message containing the notes addressed to it.
-The block is bounded (at most 8 notes and 3000 characters per turn — the rest
-says "still queued" and waits on disk; the character bound also applies to the
-first note, and a legal note fits because bodies are capped at 2000 characters,
-S2), and is **acknowledged at the end of the turn**, after the model has read it
-(`agent_end`). A crash before that point
-replays the notes: events are at-least-once, so a repeat is the same event, not a
-new one. A note in `events/` that was not written by the supervisor is never
-injected (the block counts it and leaves it on disk).
+Member delivery is automatic: before a member's turn starts it drains the event
+channel addressed to its task id and gets a `belayd-fleet-events` message
+containing those notes. The block is bounded (at most 8 notes and 3000 characters
+per turn — the rest says "still queued" and waits for a later turn; the character
+bound also applies to the first note, and a legal note fits because bodies are
+capped at 2000 characters, S2), and is **acknowledged at the end of the turn**,
+after the model has read it (`agent_end`). A crash before that point replays the
+notes: events are at-least-once, so a repeat is the same event, not a new one. A
+note in the event channel that was not written by the supervisor is never
+injected (the block counts it and leaves it queued).
+
+A malformed note is **refused at insert**, not quarantined later: the row store
+has no `.corrupt` rename, and silently dropping a row is not an option.
 
 ### What it will not do
 
@@ -365,7 +372,7 @@ injected (the block counts it and leaves it on disk).
 | `this session already supervises fleet \`default\` …` | one session supervises one fleet. Keep scheduling `default`, or launch the other fleet from a different session. W-B |
 | `already a member of fleet \`x\`, whose supervisor is not running… re-arm that fleet` | the bead belongs to a dead fleet. Run `/fleet <its ids> --fleet x` there instead of launching it into a second fleet — otherwise its notes go to a mailbox no live supervisor drains. |
 | `fleet \`default\` is already supervised by live session …` | another pi session is running that fleet. Let it keep scheduling, or stop it, then re-arm. Nothing was changed. |
-| `The fleet intent … did not read back …` | another writer replaced `fleet.json` between the write and the read-back. Re-run `/fleet`; the session did not arm. |
+| `The fleet intent … did not read back …` | another writer replaced the intent row between the write and the read-back. Re-run `/fleet`; the session did not arm. |
 | `This session supervises fleet \`default\`, not \`night\`` | you passed a `fleetId` the session does not supervise. |
 | `belayd_fleet_inbox is supervisor-only` | this session is not the live supervisor (e.g. you resumed it after a restart, or the record belongs to another session). Re-arm with `/fleet`. |
 | `\`bd-51\` is not a member of this fleet; known members: …` | the `to` address is a typo. Nothing was written. |
@@ -389,13 +396,13 @@ Before launching members, confirm the *read* side (P0) sees the fleet:
 belayd_fleet_status            # should show the members and their derived state
 ```
 
-After `/fleet`, inspect what it created — this is the whole cross-tree footprint:
+After `/fleet`, inspect what it created — every fleet fact is a row in one
+store, so this is the whole cross-tree footprint:
 
 ```bash
-d=$(git rev-parse --path-format=absolute --git-common-dir)/belayd/fleet/default
-ls -1 "$d"                     # fleet.json audit.log (inbox/ events/ appear on first note)
-cat "$d/fleet.json"            # taskIds, maxConcurrent (<= 3), supervisor { sessionId, pid, pidStartTime, armToken }
-cat "$d/audit.log"             # one launch line + one line per member attempt
+sqlite3 "$(git rev-parse --path-format=absolute --git-common-dir)/belayd/state.sqlite" \
+  "select fleet_id, revision from fleet_intent;"   # the intent + run record
+sqlite3 …/state.sqlite "select timestamp, payload from fleet_audit order by seq desc limit 20;"
 ```
 
 Then message a member and watch it arrive:
@@ -404,12 +411,13 @@ Then message a member and watch it arrive:
 belayd_fleet_note { to: "bd-15", body: "main moved; rebase before review", kind: "rebase-hint" }
 ```
 
-That writes `$d/events/<to>-rebase-hint-<ts>-<hash>.json`. The member's next turn
-carries a `belayd-fleet-events` message; after that turn ends (the `agent_end`
-ack) the file is gone. A second turn shows nothing.
+That inserts a `fleet_note` row (`channel = 'event'`, `target = 'bd-15'`) together
+with its audit line, in one transaction. The member's next turn carries a
+`belayd-fleet-events` message; after that turn ends (the `agent_end` ack) the row
+is acked and a second turn shows nothing.
 
-`to: "all"` writes one file per member in `$d/events/` (same body, different
-recipient), not a single shared file.
+`to: "all"` writes one row per member (same body, different recipient), not a
+single shared row.
 
 Re-arm check: stop the supervisor process, then run `/fleet bd-12 bd-15` again in
 a fresh session. The report says `re-armed`, `fleet.json` keeps the same

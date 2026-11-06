@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildHandoff,
@@ -19,6 +22,7 @@ import {
   taskIdFromBranch,
   writeHandoff,
 } from "../handoff.js";
+import { openRepoStateStore } from "../repo-state-store.js";
 import type { GitExec } from "../stack-rebase.js";
 import { type WorkflowFs, writeWorkflowState } from "../workflow-state.js";
 
@@ -583,9 +587,12 @@ describe("collectHandoffDefault", () => {
 
   it("gathers the mechanical default from the parent session", async () => {
     const { fs } = createMemoryFs();
+    const dir = mkdtempSync(join(tmpdir(), "belayd-handoff-store-"));
+    const opened = openRepoStateStore({ path: join(dir, "state.sqlite") });
+    if (!opened.ok) throw new Error(opened.error);
     writeWorkflowState({
       cwd: CWD,
-      fs,
+      store: opened.store,
       state: {
         schemaVersion: 1,
         taskId: "bd-119",
@@ -612,6 +619,7 @@ describe("collectHandoffDefault", () => {
       transcript: [{ type: "message", message: { role: "assistant", content: "parent answer" } }],
       deps: {
         fs,
+        store: opened.store,
         exec: exec({
           "log -1 --pretty=%s": "feat: parent commit\n",
           "status --porcelain": " M src/handoff.ts\n?? docs/diagrams/x.html\n",
@@ -620,6 +628,8 @@ describe("collectHandoffDefault", () => {
         now: () => 42,
       },
     });
+    opened.store.close();
+    rmSync(dir, { recursive: true, force: true });
 
     expect(packet).toHaveProperty("taskId", "bd-121");
     expect(packet).toHaveProperty("parentTaskId", "bd-119");

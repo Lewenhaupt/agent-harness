@@ -10,6 +10,7 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseHandoff } from "../handoff.js";
+import { readWorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -393,9 +394,10 @@ describe("belayd_start_followup", () => {
       // launch whose workflow state is already persisted.
       expect(result?.details.exitCode).toBe(0);
       expect(warn.mock.calls.some(([text]) => String(text).includes("handoff"))).toBe(true);
-      // existsSync is stubbed false in this suite, so inspect the directory.
+      // The child's workflow state is a shared-store row (bd-281), so the worktree
+      // itself must hold no state file — only the surface `.belayd/` may exist.
       const belaydEntries = readdirSync(join(state.worktreeDir, ".belayd"));
-      expect(belaydEntries).toContain("workflow.json");
+      expect(belaydEntries).not.toContain("workflow.json");
       expect(belaydEntries).not.toContain("handoff.json");
 
       const promptCall = httpCalls.calls.find((call) => call.path === "/sessions/sess-999/prompt");
@@ -424,12 +426,9 @@ describe("belayd_start_followup", () => {
 
     // pi-web session processes start with cwd `/`; the persisted value is what
     // belayd_stop_task later chdirs back to, so it must be the caller's path.
-    // existsSync is stubbed false in this suite, so read the file directly.
-    const persisted = JSON.parse(
-      readFileSync(join(state.worktreeDir, ".belayd", "workflow.json"), "utf8"),
-    ) as { originalCwd?: string };
-    expect(persisted.originalCwd).toBe(cwd);
-    expect(persisted.originalCwd).not.toBe(state.worktreeDir);
+    const persisted = readWorkflowState({ cwd: state.worktreeDir });
+    expect(persisted?.originalCwd).toBe(cwd);
+    expect(persisted?.originalCwd).not.toBe(state.worktreeDir);
   });
 
   it("rejects an invalid task id before touching git", async () => {

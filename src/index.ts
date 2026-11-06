@@ -455,14 +455,12 @@ export type {
 } from "./fleet-heartbeat.js";
 export {
   classifySupervisorBeat,
-  FLEET_SUPERVISOR_HEARTBEAT_FILE,
   FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION,
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
   isFleetLoopProvablyDead,
   parseSupervisorHeartbeat,
   planSupervisorReadoption,
   readSupervisorHeartbeat,
-  supervisorHeartbeatPath,
   writeSupervisorHeartbeat,
 } from "./fleet-heartbeat.js";
 export type {
@@ -574,7 +572,6 @@ export {
   enqueueFleetMerge,
   FLEET_MERGE_FAILURE_REASONS,
   FLEET_MERGE_GATE_SCRIPTS,
-  FLEET_MERGE_ORPHAN_LOCK_GRACE_MS,
   FLEET_REBASE_DELEGATION_GRACE_MS,
   formatDrainResultText,
   formatFleetMergeDrainReport,
@@ -844,6 +841,7 @@ export type {
   FleetIntentOptions,
   FleetIntentUpdateOutcome,
   FleetIntentUpdateRefusal,
+  FleetLandingPlan,
   FleetMergeAcquireDecision,
   FleetMergeEntryState,
   FleetMergeLock,
@@ -851,10 +849,13 @@ export type {
   FleetMergeQueueEntry,
   FleetMergeQueueLoadResult,
   FleetNote,
+  FleetNoteChannel,
   FleetNoteDelivery,
   FleetNoteKind,
   FleetStateFs,
   FleetStateWriteResult,
+  LandFleetMemberOptions,
+  LandFleetMemberResult,
   RefusedFleetOrderingGate,
   UpdateFleetIntentOptions,
   UpdateFleetIntentResult,
@@ -878,7 +879,6 @@ export {
   FLEET_AUDIT_ACTION_MAX_LENGTH,
   FLEET_AUDIT_ACTOR_MAX_LENGTH,
   FLEET_AUDIT_DETAIL_MAX_LENGTH,
-  FLEET_AUDIT_TAIL_BYTES,
   FLEET_AUDIT_TASK_ID_MAX_LENGTH,
   FLEET_AUDIT_TASK_IDS_MAX,
   FLEET_MERGE_ENTRY_STATES,
@@ -886,17 +886,15 @@ export {
   FLEET_MERGE_QUEUE_SCHEMA_VERSION,
   FLEET_NOTE_ADDRESS_MAX_LENGTH,
   FLEET_NOTE_BODY_MAX_LENGTH,
-  FLEET_NOTE_FILE_MAX_BYTES,
   FLEET_NOTE_KINDS,
   FLEET_NOTE_SCHEMA_VERSION,
   fleetDir,
   fleetMemberTaskIds,
-  fleetMergeLockDir,
-  fleetNoteFileName,
   fleetRoot,
   formatAuditEntry,
   isFleetNoteKind,
   isLockExpired,
+  landFleetMember,
   parseFleetMergeQueue,
   parseFleetNote,
   pruneLandedFleetMember,
@@ -909,6 +907,19 @@ export {
   writeFleetIntent,
   writeFleetMergeQueue,
 } from "./fleet-state.js";
+export type {
+  LegacyFleetImportEntry,
+  LegacyFleetImportSummary,
+  LegacyFleetKind,
+} from "./fleet-state-import.js";
+export {
+  importLegacyFleetState,
+  LEGACY_FLEET_FILE_NAMES,
+  legacyFleetIds,
+  legacyFleetStateFiles,
+  legacyFleetStateRefusal,
+  REPO_STATE_LEGACY_FLEET_MIGRATION,
+} from "./fleet-state-import.js";
 export type {
   BeadOwnershipInput,
   BuildFleetStatusOptions,
@@ -957,13 +968,8 @@ export {
   FLEET_MEMBER_STATES,
   FLEET_SCHEMA_VERSION,
   FLEET_WARNING_KINDS,
-  fleetAuditLogPath,
   fleetBeadTaskIds,
-  fleetEventsDir,
-  fleetInboxDir,
-  fleetIntentFilePath,
   fleetLeaseView,
-  fleetMergeQueueFilePath,
   fleetStateDir,
   formatBeadOwnership,
   formatFleetLandRepairs,
@@ -1312,9 +1318,7 @@ export type {
   AcquireOrchestratorClaimResult,
   AdoptOrchestratorClaimResult,
   OrchestratorClaim,
-  OrchestratorClaimFs,
   OrchestratorClaimRead,
-  OrchestratorClaimReadFs,
   OrchestratorClaimVerdict,
 } from "./orchestrator-claim.js";
 export {
@@ -1331,7 +1335,6 @@ export {
   ORCHESTRATOR_CLAIM_PENDING_PREFIX,
   ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
   ORCHESTRATOR_CLAIM_STALE_MS,
-  orchestratorClaimFs,
   orchestratorClaimPath,
   parseOrchestratorClaim,
   readOrchestratorClaim,
@@ -1493,7 +1496,6 @@ export {
 } from "./proof-policy.js";
 export type {
   ProofReceipt,
-  ProofReceiptFs,
   ProofReceiptIoOptions,
   ProofReceiptReader,
   ProofReceiptReadResult,
@@ -1504,8 +1506,6 @@ export {
   isProofReceiptId,
   isProofReceiptReference,
   isProofReceiptUrl,
-  nodeProofReceiptFs,
-  PROOF_RECEIPT_RELATIVE_PATH,
   PROOF_RECEIPT_VERSION,
   parseProofReceipt,
   readProofReceipt,
@@ -1615,6 +1615,28 @@ export {
   parseQuotaResetSeconds,
   resolveQuotaCooldown,
 } from "./quota-failure.js";
+export type { LegacyImportEntry, LegacyImportSummary } from "./repo-state-import.js";
+export {
+  importLegacyState,
+  legacyStateFiles,
+  legacyStateRefusal,
+  REPO_STATE_LEGACY_MIGRATION,
+} from "./repo-state-import.js";
+export type {
+  RepoStateOpen,
+  RepoStateStore,
+  RepoWorkflowState,
+} from "./repo-state-store.js";
+export {
+  openRepoStateStore,
+  REPO_STATE_FILE_ENV,
+  REPO_STATE_FILE_NAME,
+  REPO_STATE_SCHEMA_VERSION,
+  resetRepoStatePaths,
+  resetSharedRepoStateStore,
+  resolveRepoStatePath,
+  sharedRepoStateStore,
+} from "./repo-state-store.js";
 export type {
   CaptureReviewedStateOptions,
   CaptureReviewedStateResult,
@@ -1667,14 +1689,9 @@ export {
   listPendingUserCompletions,
   listRuns,
   markRunDelivered,
-  type PruneForeignRunsResult,
-  pruneForeignRunManifests,
   RunStatus,
   readRunManifest,
   runBelongsToTask,
-  runManifestFs,
-  runManifestPath,
-  runsDir,
   scanForInterruptedRuns,
   setRunModelSelection,
   setRunStatus,

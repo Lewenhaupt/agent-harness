@@ -1,8 +1,8 @@
 /**
  * File transport for durable-member commands (bd-186).
  *
- * The fleet mailbox (`events/`, `inbox/`, read at turn start) already survives a
- * member being down, so cold-start delivery reuses that idea instead of
+ * The fleet mailbox (store notes, read at turn start) already survives a member
+ * being down, so cold-start delivery reuses that idea instead of
  * inventing a second one: a command that must survive is written to
  * `<memberStateDir>/commands/<requestId>.json`, drained at start/turn start,
  * applied through the same `dispatch` + `dedupe` path as the socket, and

@@ -20,9 +20,11 @@ import {
   resolveProofBase,
 } from "../proof-dir.js";
 import {
-  PROOF_RECEIPT_RELATIVE_PATH,
   PROOF_RECEIPT_VERSION,
-  serializeProofReceipt,
+  type ProofReceipt,
+  type ProofReceiptReader,
+  readProofReceipt,
+  writeProofReceipt,
 } from "../proof-receipt.js";
 import {
   extractFailingLocations,
@@ -36,6 +38,12 @@ import {
   userGuideDocPath,
   validateCastRecording,
 } from "../quality-gates.js";
+import {
+  openRepoStateStore,
+  REPO_STATE_FILE_ENV,
+  type RepoStateStore,
+  resetSharedRepoStateStore,
+} from "../repo-state-store.js";
 
 // `node:child_process` is mocked at the module boundary (repo convention) so
 // the gate commands can fail with controlled stdout/stderr shapes without
@@ -380,6 +388,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   let tmpDir: string;
   let cwd: string;
   let proofDir: string;
+  let store: RepoStateStore;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "proof-receipt-gate-"));
@@ -387,28 +396,58 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     proofDir = join(tmpDir, "external-proof", "bd-99");
     mkdirSync(join(cwd, ".belayd"), { recursive: true });
     mkdirSync(proofDir, { recursive: true });
+    const opened = openRepoStateStore({ path: join(tmpDir, "state.sqlite") });
+    if (!opened.ok) throw new Error(opened.error);
+    store = opened.store;
   });
 
   afterEach(() => {
+    store.close();
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function writeReceipt(content: string): void {
-    writeFileSync(join(cwd, PROOF_RECEIPT_RELATIVE_PATH), content, "utf-8");
+  /** The gate's reader, bound to this test's store (bd-281: a row, not a file). */
+  const readStoredReceipt: ProofReceiptReader = (options) =>
+    readProofReceipt({ ...options, store });
+
+  function writeReceipt(receipt: ProofReceipt): void {
+    const written = writeProofReceipt({ cwd, store, receipt });
+    if (!written.ok) throw new Error(written.error);
+  }
+
+  /**
+   * Write a row past the contract boundary, the way a stale or foreign writer
+   * would: the gate must validate what it reads, not trust the row.
+   */
+  function writeRawRow(taskId: string, receipt: unknown): void {
+    const written = store.writeProofReceipt({ taskId, receipt });
+    if (!written.ok) throw new Error(written.error);
+  }
+
+  /** Corrupt the stored text so it is not even JSON. */
+  async function corruptReceiptRow(): Promise<void> {
+    const { DatabaseSync } = await import("node:sqlite");
+    const raw = new DatabaseSync(store.path);
+    raw
+      .prepare(
+        `INSERT INTO proof_receipt (task_id, payload, updated_at) VALUES (?, ?, 1)
+         ON CONFLICT(task_id) DO UPDATE SET payload = excluded.payload`,
+      )
+      .run("bd-99", "{ not json");
+    raw.close();
   }
 
   it("passes a bead whose proof was uploaded with no artifact refs at all", async () => {
-    writeReceipt(
-      serializeProofReceipt({
-        version: PROOF_RECEIPT_VERSION,
-        taskId: "bd-99",
-        url: "https://proof.example.com/uploads/bd-99",
-      }),
-    );
+    writeReceipt({
+      version: PROOF_RECEIPT_VERSION,
+      taskId: "bd-99",
+      url: "https://proof.example.com/uploads/bd-99",
+    });
 
     const result = await gateProofContent("proof uploaded, no files committed", MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", true);
@@ -418,18 +457,32 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   });
 
   it("passes on an id-only receipt", async () => {
-    writeReceipt(serializeProofReceipt({ version: 1, taskId: "bd-99", id: "upload-42" }));
+    writeReceipt({ version: 1, taskId: "bd-99", id: "upload-42" });
 
     const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", true);
     expect(result.feedback).toContain("Proof receipt accepted: upload-42");
   });
 
-  it("honours a receipt line in the agent output when no receipt file exists", async () => {
+  it("resolves the row from GateOptions.taskId when the phase has no proof dir", async () => {
+    writeReceipt({ version: 1, taskId: "bd-99", id: "upload-42" });
+
+    const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
+      cwd,
+      taskId: "bd-99",
+      readProofReceipt: readStoredReceipt,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain("Proof receipt accepted: upload-42");
+  });
+
+  it("honours a receipt line in the agent output when no receipt row exists", async () => {
     const output = ["Work done.", "", "## Receipt", "receipt: https://proof.example.com/u/1"].join(
       "\n",
     );
@@ -437,6 +490,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     const result = await gateProofContent(output, MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", true);
@@ -449,6 +503,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     const result = await gateProofContent(output, MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
@@ -462,6 +517,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     const result = await gateProofContent(output, MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
@@ -473,17 +529,16 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   });
 
   it("refuses a stored receipt whose url is plain http", async () => {
-    writeReceipt(
-      serializeProofReceipt({
-        version: PROOF_RECEIPT_VERSION,
-        taskId: "bd-99",
-        url: "http://proof.example.com/uploads/bd-99",
-      }),
-    );
+    writeRawRow("bd-99", {
+      version: PROOF_RECEIPT_VERSION,
+      taskId: "bd-99",
+      url: "http://proof.example.com/uploads/bd-99",
+    });
 
     const result = await gateProofContent("proof uploaded", MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
@@ -491,30 +546,35 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     expect(result.feedback).toContain("does not match the proof receipt contract");
   });
 
-  it("refuses a receipt that names a different task", async () => {
-    writeReceipt(
-      serializeProofReceipt({ version: 1, taskId: "bd-42", url: "https://proof.example.com/42" }),
-    );
+  it("refuses a stored receipt whose payload names a different task", async () => {
+    writeRawRow("bd-99", {
+      version: 1,
+      taskId: "bd-42",
+      url: "https://proof.example.com/42",
+    });
 
     const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
     expect(result.feedback).toContain("names bd-42, not bd-99");
   });
 
-  it("fails closed on a malformed receipt file", async () => {
-    writeReceipt("{ not json");
+  it("fails closed on a corrupt receipt row", async () => {
+    await corruptReceiptRow();
 
     const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
       cwd,
       proofDir,
+      readProofReceipt: readStoredReceipt,
     } satisfies GateOptions);
 
     expect(result).toHaveProperty("passed", false);
     expect(result.feedback).toContain("Invalid proof receipt");
+    expect(result.feedback).toContain("not valid JSON");
   });
 
   it("falls back to external-root artifacts when no receipt exists (transition period)", async () => {
@@ -523,7 +583,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     const result = await gateProofContent(
       "Screenshot: proof-of-work/bd-99/shot.png\n",
       MOCK_DETAILS,
-      { cwd, proofDir } satisfies GateOptions,
+      { cwd, proofDir, readProofReceipt: readStoredReceipt } satisfies GateOptions,
     );
 
     expect(result).toHaveProperty("passed", true);
@@ -531,12 +591,12 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   });
 
   it("accepts an output line that matches the stored receipt", async () => {
-    writeReceipt(serializeProofReceipt({ version: 1, taskId: "bd-99", id: "upload-42" }));
+    writeReceipt({ version: 1, taskId: "bd-99", id: "upload-42" });
 
     const result = await gateProofContent(
       ["Done.", "", "## Receipt", "receipt: upload-42"].join("\n"),
       MOCK_DETAILS,
-      { cwd, proofDir } satisfies GateOptions,
+      { cwd, proofDir, readProofReceipt: readStoredReceipt } satisfies GateOptions,
     );
 
     expect(result).toHaveProperty("passed", true);
@@ -544,12 +604,12 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   });
 
   it("refuses an output line that does not match the stored receipt", async () => {
-    writeReceipt(serializeProofReceipt({ version: 1, taskId: "bd-99", id: "upload-42" }));
+    writeReceipt({ version: 1, taskId: "bd-99", id: "upload-42" });
 
     const result = await gateProofContent(
       ["## Receipt", "receipt: upload-99"].join("\n"),
       MOCK_DETAILS,
-      { cwd, proofDir } satisfies GateOptions,
+      { cwd, proofDir, readProofReceipt: readStoredReceipt } satisfies GateOptions,
     );
 
     expect(result).toHaveProperty("passed", false);
@@ -558,12 +618,12 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
   });
 
   it("fails closed on a malformed stored receipt even with a valid-looking output line", async () => {
-    writeReceipt("{ not json");
+    await corruptReceiptRow();
 
     const result = await gateProofContent(
       ["## Receipt", "receipt: upload-42"].join("\n"),
       MOCK_DETAILS,
-      { cwd, proofDir } satisfies GateOptions,
+      { cwd, proofDir, readProofReceipt: readStoredReceipt } satisfies GateOptions,
     );
 
     expect(result).toHaveProperty("passed", false);
@@ -575,6 +635,7 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
       const result = await gateProofContent(`## Receipt\nreceipt: ${token}\n`, MOCK_DETAILS, {
         cwd,
         proofDir,
+        readProofReceipt: readStoredReceipt,
       } satisfies GateOptions);
 
       expect(result).toHaveProperty("passed", false);
@@ -582,12 +643,54 @@ describe("gateProofContent receipt-first resolution (bd-181)", () => {
     }
   });
 
-  it("takes the receipt from an injected reader seam (no filesystem)", async () => {
+  it("prefers the explicit task id over a differing proof dir basename", async () => {
+    // The row is under the bead the caller named; the proof dir names another
+    // (stale) bead. A derived directory name must not hide the named row.
+    writeReceipt({ version: 1, taskId: "bd-99", id: "upload-42" });
+    const staleProofDir = join(tmpDir, "external-proof", "bd-42");
+    mkdirSync(staleProofDir, { recursive: true });
+
+    const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
+      cwd,
+      taskId: "bd-99",
+      proofDir: staleProofDir,
+      readProofReceipt: readStoredReceipt,
+    } satisfies GateOptions);
+
+    expect(result).toHaveProperty("passed", true);
+    expect(result.feedback).toContain("Proof receipt accepted: upload-42");
+  });
+
+  it("fails closed when the repository store cannot be opened", async () => {
+    // A resolved store path whose parent is a regular file: the open fails
+    // permanently. The gate must not read that as "no receipt" — the agent's own
+    // https URL would then become the proof.
+    const blockedParent = join(tmpDir, "blocked");
+    writeFileSync(blockedParent, "not a directory");
+    process.env[REPO_STATE_FILE_ENV] = join(blockedParent, "state.sqlite");
+    resetSharedRepoStateStore();
+    try {
+      const result = await gateProofContent(
+        ["## Receipt", "receipt: https://proof.example.com/u/1"].join("\n"),
+        MOCK_DETAILS,
+        { cwd, taskId: "bd-99" } satisfies GateOptions,
+      );
+
+      expect(result).toHaveProperty("passed", false);
+      expect(result.feedback).toContain("Invalid proof receipt");
+      expect(result.feedback).not.toContain("Proof receipt accepted");
+    } finally {
+      delete process.env[REPO_STATE_FILE_ENV];
+      resetSharedRepoStateStore();
+    }
+  });
+
+  it("takes the receipt from an injected reader seam (no store)", async () => {
     const result = await gateProofContent("no artifacts", MOCK_DETAILS, {
       cwd,
       proofDir,
-      // The seam is the only source of the receipt here: nothing was written
-      // under `cwd`, so a real reader would report "no receipt".
+      // The seam is the only source of the receipt here: no row was written, so
+      // a real reader would report "no receipt".
       readProofReceipt: () => ({
         ok: true,
         receipt: { version: 1, taskId: "bd-99", id: "upload-42" },

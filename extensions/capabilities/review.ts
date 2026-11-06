@@ -82,7 +82,7 @@ export function boundReviewDelivery(delivery: RunDelivery): RunDelivery {
  * a later one.
  */
 async function recordReviewScope(options: { cwd: string; taskId: string }): Promise<void> {
-  const cleared = clearReviewScope({ cwd: options.cwd });
+  const cleared = clearReviewScope({ cwd: options.cwd, taskId: options.taskId });
   if (!cleared.ok) {
     console.warn(`[belayd-harness] failed to clear the previous review scope: ${cleared.error}`);
   }
@@ -118,7 +118,7 @@ export async function buildReviewTask(options: {
   // Capture before collecting the diff: see recordReviewScope.
   await recordReviewScope({ cwd: options.cwd, taskId: options.taskId });
   const persisted = readWorkflowState({ cwd: options.cwd });
-  // Only this task's recorded state may scope the review; a stale workflow.json
+  // Only this task's recorded state may scope the review; a stale workflow row
   // from another task must not narrow (or widen) this task's diff. The
   // untracked manifest rides the same guard so it can never filter another
   // task's files (bd-228).

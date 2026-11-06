@@ -73,7 +73,7 @@ export interface FleetScheduleInput {
  * `external-blocker` — a bead that is not part of this fleet still blocks it.
  * `capacity` — ready to go, but every slot is taken.
  *
- * The array is the single source of truth: the `fleet.json` intent schema
+ * The array is the single source of truth: the fleet-intent schema
  * validates its persisted `deferred[].reason` against it, so a reason added here
  * cannot silently become unwritable (or an unknown persisted reason readable).
  */
@@ -634,7 +634,7 @@ type DependencyParse =
  *
  * Only `blocks` orders work. A *finished* blocker is satisfied — it cannot be a
  * reason to wait — but "finished" is not the same as "landed": landing (the merge
- * into the base branch) is recorded in `fleet.json` (`run.members[].landedAt`), and
+ * into the base branch) is recorded in the fleet intent (`run.members[].landedAt`), and
  * the fleet resolves that member's bd ordering gate at the same moment (bd-158).
  * This module stays pure, so it can only see bd's status; everything without a
  * usable id/type is malformed (reported, never turned into a fabricated edge).
@@ -686,7 +686,7 @@ function recordEdges(
  *
  * An already-finished blocker is dropped: its bead is closed/done, so it cannot be
  * a reason to wait. A blocker that merely landed keeps its edge here and is dropped
- * by the caller against `fleet.json` (`fleetLandedTaskIds`), because "landed" is the
+ * by the caller against the fleet intent (`fleetLandedTaskIds`), because "landed" is the
  * fleet's fact, not bd's. Everything unreadable degrades to "no known edges" plus a
  * warning — never a crash, never a fabricated edge.
  */

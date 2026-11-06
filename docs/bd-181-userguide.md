@@ -1,5 +1,14 @@
 # Proof receipts replace in-tree proof artifacts (bd-181)
 
+> **Superseded location (bd-281).** The receipt is no longer
+> `.belayd/proof-receipt.json`. It is a `proof_receipt` row in the shared store,
+> `<git-common-dir>/belayd/state.sqlite`, keyed by task id. The file-path steps
+> below are the bd-181 record and no longer reproduce; use
+> `readProofReceipt`/`writeProofReceipt` (which take a `taskId`) instead of
+> writing that file. `pi-web-plugins/proof-of-work/discovery.js` still reads the
+> retired file and reports no receipt until **bd-303** makes it read the SQLite
+> row.
+
 Proof-of-work used to be committed under `docs/proof/<slug>/`. bd-181 moves the
 artifact out of the repository and keeps a **receipt** instead — an id and/or an
 upload URL in `.belayd/proof-receipt.json`, a path that is gitignored, so a
@@ -12,7 +21,7 @@ Four pieces ship together:
 | Receipt contract | `src/proof-receipt.ts` | `ProofReceiptSchema` (zod, strict), `parseProofReceipt`, `readProofReceipt` / `writeProofReceipt`, `findProofReceiptRefs` |
 | Proof gate, receipt-first | `gateProofContent` in `src/quality-gates.ts` | stored receipt → agent `## Receipt` line → external proof-root artifacts, in that order |
 | Publish guard | `src/publish-gate.ts`, called by `checkPublishPayload` in `src/fleet-merge.ts` | refuses a merge payload that carries proof or out-of-scope paths |
-| Panel | `pi-web-plugins/proof-of-work/{discovery.js,panel.js}` | reads the receipt and renders it above the external proof-root listing |
+| Panel | `pi-web-plugins/proof-of-work/{discovery.js,panel.js}` | reads the receipt and renders it above the external proof-root listing — **broken since bd-281** (it still opens the retired file; bd-303 moves it to the SQLite row) |
 
 Two things bd-181 deliberately does **not** do: it has no upload executor (that
 is bd-174.3, which owns the `gh`/`git push` argv), and it does not migrate

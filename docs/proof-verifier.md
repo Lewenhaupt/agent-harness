@@ -5,7 +5,7 @@ belayd-agent-harness pi extension. It separates proof checking into two stages:
 
 1. **Deterministic form gate** — `gateProofContent` in `src/quality-gates.ts`
    remains the **only blocking** proof check (zero AI tokens). It is
-   **receipt-first** (bd-181): a stored `.belayd/proof-receipt.json` passes it
+   **receipt-first** (bd-181): a stored `proof_receipt` row passes it
    without any artifact refs; with no stored receipt an agent-authored
    `receipt: <https URL>` line passes only when it is an absolute `https:` upload
    URL (a plain `http:` URL or an id-only line fails outright). Otherwise it
@@ -20,18 +20,40 @@ belayd-agent-harness pi extension. It separates proof checking into two stages:
 ## Receipts (bd-181)
 
 Proof artifacts are phased out of repositories: they upload to the proof-of-work
-platform and the workflow keeps a receipt — an id and/or URL — in
-`src/proof-receipt.ts` / `.belayd/proof-receipt.json`. The receipt lives under
-`.belayd/`, which is gitignored, so it can never enter a diff. `parseProofReceipt`
+platform and the workflow keeps a receipt — an id and/or URL — defined in
+`src/proof-receipt.ts`. **Since bd-281 the receipt is a row in the shared
+per-repository store**, `<git-common-dir>/belayd/state.sqlite` (table
+`proof_receipt`, keyed by task id), not the retired `.belayd/proof-receipt.json`
+file. `parseProofReceipt`
 requires `version: 1`, a `taskId`, and at least one of `id`/`url` (an absolute
 `https:` URL with a non-root path — plain `http:` is rejected, matching the
 prompt — or an `id` that is a UUID or at least 8 characters of `[A-Za-z0-9]`
 containing `-`/`_`). The shape is a zod schema (`ProofReceiptSchema`) validated at
-the boundary; the browser plugin's reader mirrors it by hand.
+the boundary in both directions; the browser plugin's reader mirrors it by hand.
+
+**Known break (bd-303).** `pi-web-plugins/proof-of-work/discovery.js` still reads
+`.belayd/proof-receipt.json` through the browser file API, so its proof panel
+reports no receipt until that plugin reads the `proof_receipt` row instead. bd-281
+accepted the break on purpose (no dual write, no file fallback); see the SYNC
+WARNING in `src/proof-receipt.ts`.
+
+Absence and failure are different: a directory that is not a repository simply has
+no receipt row (the artifact branch decides), while a repository whose store
+cannot be opened is an error and the gate fails closed — an unreadable receipt must
+never let the agent's own `receipt:` URL stand in for the proof.
+
+The repository probe is classified from its process outcome, not from git's text.
+Absence is reported only when git ran, exited non-zero and no `.git` marker exists
+at the directory or any ancestor. A probe that could not run (spawn failure,
+timeout, empty output) is `indeterminate` and fails closed, and so is a spawned
+git that failed beside a `.git` marker (a `.git` file pointing at a missing common
+dir, corrupt metadata). Residual: a corrupt repository whose `.git` marker was
+removed is indistinguishable from a plain directory by this probe and resolves as
+absence. That case is named here rather than claimed to fail closed.
 
 What a receipt does and does not prove: it asserts that an upload happened and
 binds it to a task id. The gate cannot verify the upload until the reviewing
-platform exists. The stored `.belayd/proof-receipt.json` written by the harness is
+platform exists. The stored `proof_receipt` row is
 the only form that is task-bound and authoritative: a malformed or different-task
 stored receipt fails closed, and an agent-authored `receipt:` line is accepted
 when it matches the stored receipt's `id`/`url`. With no stored receipt, only an
@@ -70,8 +92,8 @@ pnpm lint
 The bd-48-specific coverage lives in:
 
 - `src/__tests__/proof-receipt.test.ts` — the receipt contract: parsing,
-  serialization, output scanning, and the injected-filesystem read/write
-  helpers.
+  serialization, output scanning, and the store-backed read/write helpers
+  (missing row vs malformed row).
 - `src/__tests__/publish-gate.test.ts` — the publish guard path classification
   and its deterministic refusal reasons.
 - `src/__tests__/proof-verification.test.ts` — artifact ref scanning,

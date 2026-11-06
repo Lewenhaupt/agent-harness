@@ -302,19 +302,23 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
       takeOverStale: true,
     });
     if (!claimed.ok) {
+      // A store failure is not a held worktree: naming the lease would send the
+      // operator to stop a session that does not exist.
+      const remedy =
+        claimed.reason === "held"
+          ? "One orchestrator per worktree — finish or stop the session that owns it; its lease " +
+            "expires after the heartbeat window and is then claimable."
+          : "The shared repository state store (<git-common-dir>/belayd/state.sqlite) is " +
+            "unwritable, so this session cannot record the lease it would hold.";
       return {
         ok: false,
-        error:
-          `Refusing to launch ${options.taskId} in ${options.worktreePath}: ${claimed.error}. ` +
-          "One orchestrator per worktree — finish or stop the session that owns it, or remove " +
-          "`.belayd/orchestrator.json` once that session is gone.",
+        error: `Refusing to launch ${options.taskId} in ${options.worktreePath}: ${claimed.error}. ${remedy}`,
       };
     }
     if (claimed.tookOverFrom !== undefined) {
       options.ctx.ui.notify(
         `Took over an abandoned orchestrator lease for ${options.taskId} in ${options.worktreePath} ` +
-          `(previous session ${claimed.tookOverFrom.sessionId}` +
-          (claimed.archivedPath === undefined ? ")." : `, archived at ${claimed.archivedPath}).`),
+          `(previous session ${claimed.tookOverFrom.sessionId}).`,
         "warning",
       );
     }
@@ -671,7 +675,7 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
   /**
    * Refusal text for a launch from inside the target worktree.
    *
-   * The child orchestrator would share this directory's `.belayd/workflow.json`
+   * The child orchestrator would share this directory's workflow row
    * and overwrite it with its own workflow, and no marker can be stored there
    * because the child owns that file. Two sessions then race on one branch
    * (bd-120), so the same-directory launch is refused unless forced.
@@ -679,11 +683,11 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
   function describeSameWorktreeRefusal(branch: string): string {
     return (
       `Refusing to launch a workflow for \`${branch}\`: this session is already inside that ` +
-      "worktree, and the workflow state file would be shared, so a second orchestrator would " +
+      "worktree, and the workflow row would be shared, so a second orchestrator would " +
       "fight this one over the same branch. One session per worktree: launch from the parent " +
       "worktree (or main), or pass force: true (--force for /belayd) to hand off here anyway " +
-      "— a forced same-directory handoff replaces this session's workflow.json and records the " +
-      "handoff in .belayd/handoff-<sessionId>.json instead."
+      "— a forced same-directory handoff replaces this session's workflow row and records the " +
+      "handoff with a caller-scoped marker instead."
     );
   }
 
@@ -714,8 +718,8 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
    * Persist the two handoff records after the child session exists.
    *
    * The caller-scoped marker is required: it is the one record the child cannot
-   * clobber (a same-directory child owns the shared `workflow.json`), and
-   * `resumeWorkflowFromDisk` consults it first. The `workflow.json` marker is a
+   * clobber (a same-directory child owns the shared workflow row), and
+   * `resumeWorkflowFromDisk` consults it first. The workflow row's marker is a
    * best-effort secondary record for a *new* session in this directory; a
    * failure there is loud but leaves this session's restart guarded.
    */
@@ -746,9 +750,9 @@ export function createLaunch(deps: LaunchDeps): LaunchApi {
     const saved = saveHandedOffMarker({ cwd: options.ctx.cwd, marker: options.marker });
     if (!saved.ok) {
       core.reportHandoffProblem(
-        `the handoff marker in ${options.ctx.cwd}/.belayd/workflow.json could not be written ` +
-          `(${saved.error}); this session's restart is still guarded by ` +
-          `.belayd/handoff-<sessionId>.json, but a new session in this directory will not see the handoff.`,
+        `the handoff marker for ${options.ctx.cwd} could not be written (${saved.error}); ` +
+          "this session's restart is still guarded by the caller-scoped marker, but a new " +
+          "session in this directory will not see the handoff.",
       );
     }
     return { ok: true };

@@ -42,7 +42,7 @@ Tool form:
 
 The launch itself is unchanged (validate → write intent → launch wave 0 →
 prune failures). What changes is what happens next: the launch writes a `run`
-record into `fleet.json` and starts the ticker.
+record into the fleet intent row and starts the ticker.
 
 ### What "complete" means
 
@@ -156,8 +156,7 @@ again.
 
 ### Recover after the supervisor dies
 
-A run-mode supervisor writes a heartbeat (`supervisor.json` in the fleet
-directory) on every tick. That heartbeat — not the recorded pid — decides whether
+A run-mode supervisor writes a heartbeat row (`fleet_supervisor`) on every tick. That heartbeat — not the recorded pid — decides whether
 another session may re-arm:
 
 ```text
@@ -184,7 +183,7 @@ re-adopts a fleet when *all three* hold:
   missing) — the same documented re-arm rule, applied automatically.
 
 Adoption mints a fresh arm token, rewrites the supervisor record and the beat,
-starts the tick loop, notifies, and appends `supervisor-readopted` to `audit.log`.
+starts the tick loop, notifies, and appends `supervisor-readopted` to the fleet audit rows.
 The write re-checks the anchors it read (run still active, record still names this
 session, and the recorded pid, process start time and arm token are **exactly**
 unchanged — a field present on one side and absent on the other counts as changed),
@@ -210,7 +209,7 @@ can never make the live loop bail.
 any more: a tick that loses authority (another session re-armed), finds the fleet
 record gone, or cannot read it notifies with the fleet id and the exact recovery
 command (`/fleet <ids> --fleet <id>`, or `belayd_fleet_advance` while the run is
-still active), writes `supervisor-lost` / `supervisor-intent-lost` to `audit.log`,
+still active), writes `supervisor-lost` / `supervisor-intent-lost` to the fleet audit rows,
 and logs to the console. The same stop inside an advance's mid-flight re-read is
 reported identically. An active run whose record names **no** usable supervisor is
 reported by the next session that starts (any session, since no session is named) —
@@ -219,7 +218,7 @@ but only when the loop is provably dead: no beat at all, or a beat older than th
 record just does not say which, so that case stays quiet and `belayd_fleet_status`
 remains the surface. The leaderless report is a wedge alarm, not a per-start pulse:
 it is written at most once per fleet per beat-stale window (deduped against the
-fleet's own `audit.log`), and the anchor is the **last report**, not the beat's
+fleet's own audit rows), and the anchor is the **last report**, not the beat's
 age: a wedge that disappears (someone beats it once) and reappears inside that
 window stays suppressed, so `belayd_fleet_status` is the surface until the window
 lapses. A fleet with no run record stays quiet, because an
@@ -404,14 +403,16 @@ branch — the shape a hand `wt merge` leaves behind. **Ancestry alone is the pr
 bead status is the *acceptance* fact (bd-158), not an ordering input: the
 repository's own accept path merges with `wt merge` and leaves the bead
 `in_progress` + `human`, so requiring a closed bead kept every ordering gate
-unresolved and every dependent deferred forever. On a proven landing the tick
-records `landedAt`, prunes the member, resolves its ordering gates, and audits
-`fleet-landed` with `landing happened outside the fleet`. A failed or missing git
+unresolved and every dependent deferred forever. On a proven landing one
+transaction records `landedAt`, prunes the member, drops its ordering-gate records
+and audits `fleet-landed` with `landing happened outside the fleet`; the bd gate
+resolve follows the commit (bd cannot join it — see the ordering note in
+`landFleetMember`). A failed or missing git
 answer means "not landed": never prune on a probe that did not answer.
 
 That landing is **written before the tick executes its own action** (bd-278). The
 advance the same tick may run filters landing edges through
-`run.members[].landedAt` read from `fleet.json`, so a landing only persisted at the
+`run.members[].landedAt` read from the intent row, so a landing only persisted at the
 end of the tick left the dependent deferred as "blocked by a bead outside this
 fleet" — and when the landed member was the run's last unfinished one, the run
 finished `partial` with no later tick to launch the dependent. A landing the tick
@@ -457,12 +458,12 @@ same ancestry-proven landing when it repairs one):
   no head was recorded, `wt merge` deleted the branch, so nothing proves it;
 - a `head` lost because the run record was replaced by a run that did not carry it.
   Re-arm now carries a carried member's record (including its `head`) into the new
-  run, so the capture rotation can still refresh it (bd-278); a `fleet.json` edited
+  run, so the capture rotation can still refresh it (bd-278); an intent row edited
   by hand or written before this change can still lack one.
 
 ### The run record
 
-`fleet.json` gains one optional field:
+The intent row gains one optional field:
 
 ```json
 "run": {
@@ -514,7 +515,7 @@ same ancestry-proven landing when it repairs one):
 ## Landing and accepting
 
 `land` runs the unchanged merge queue (`belayd_fleet_merge`'s engine): enqueue the
-member's branch, acquire `merge.lock.d`, stash a dirty root, rebase, run the
+member's branch, claim the `fleet_lock` row, stash a dirty root, rebase, run the
 project gates, `git merge --ff-only`, restore the root, notify members. A drain
 that moved the base then does this even when a later post-merge step threw
 (`step-failed`):
@@ -566,7 +567,7 @@ already discharged, and it is still recorded in bd.
 
 ### The lease
 
-`.belayd/orchestrator.json` in every worktree:
+One `orchestrator_lease` row per task id in the repository store (bd-281):
 
 ```json
 {
@@ -601,7 +602,7 @@ orchestrator is a session inside the daemon, so no process carries a
 |---|---|
 | A second launch into a worktree with a live lease | Refused before any session is created (`Refusing to launch … live orchestrator lease`) |
 | A session starting in a worktree another live session owns | Gate not armed (`Refusing to drive …`), so it cannot run phases or write the ledger |
-| A session whose `session_start` finds only an inert persisted workflow (complete, handed off, or invalid task id) | No lease claimed and no heartbeat started; the dead `workflow.json` is archived as `workflow.stale-<epoch-ms>-<hex>.json` (bd-165; see `docs/bd-165-userguide.md`) |
+| A session whose `session_start` finds only an inert persisted workflow (complete, handed off, or invalid task id) | No lease claimed and no heartbeat started; the dead workflow row is released to the store's stale record (bd-165; see `docs/bd-165-userguide.md`) |
 | A session whose `session_start` finds a pending lease | Adopts it (the spawner's session) |
 | A cold or unreadable lease | Taken over, archived, audited, and reported |
 | Losing the lease (taken over, deleted, or unwritable) | The session stops renewing, **disarms its process gate**, and reports it: phase tools refuse rather than race the session that now owns the worktree |
@@ -662,7 +663,7 @@ for a human instead of silently relaunched.
   Only a contradiction, an unrepairable reason, or a failure nobody can classify
   records `land-failed`.
 - **A delegation is deliberate and recorded.** The tick that delegates reports the
-  member's complete conflicted path list and records it in `audit.log` as
+  member's complete conflicted path list and records it in the fleet audit rows as
   `fleet-land-delegated`; the member is kept (no stop, no retirement, no worktree
   removal) while the landing holds until its branch contains the base. An
   unreadable branch verdict is a hold as well — re-draining on it would rewrite
@@ -674,11 +675,15 @@ for a human instead of silently relaunched.
   closes beads, and every close is audited. The merged worktree is removed on every
   landing either way, because that removal is hygiene, not acceptance.
 - **A failed ordering-gate resolve does not stop a landing.** The merge happened,
-  so `landedAt` is recorded and the member is pruned; the still-open gate stays in
-  `fleet.json`, shows up as `ordering gates open: …` in `belayd_fleet_status`, and
-  the next tick retries the resolve (re-running only the resolve — the merge queue
+  so one transaction records `landedAt`, prunes the member, drops its ordering-gate
+  *records* and audits the landing; the bd resolve runs after that commit (a bd write
+  cannot join a SQLite transaction), the still-open gate shows up in `bd gate list`
+  and as `ordering gates open: …` in `belayd_fleet_status`, and the next tick's
+  crash-window sweep resolves it (re-running only the bd resolve — the merge queue
   entry is already `merged`, so a second merge is impossible). Treating a transient
-  bd failure as a stop would end the run `partial` and wedge a merged member.
+  bd failure as a stop would end the run `partial` and wedge a merged member. A crash
+  in that window is safe by direction: the dependent stays blocked until bd is told,
+  never released early.
 - **Gate warnings are shown once per gate per run, up to a bound.** The rotating
   sweep rediscovers a drifted reason (bd truncated the gate `--reason`) and an
   adoption it had to refuse on every pass, and the tick loop notifies every line it
@@ -693,7 +698,7 @@ for a human instead of silently relaunched.
   `belayd_fleet_reconcile` re-reports every finding fresh — so a human sees the
   drift there and resolves it by gate id. A single run that churns that many gates
   has a larger problem than a missing warning.
-- **A stopped member stays a fleet member.** `fleet.json` `taskIds` still names it,
+- **A stopped member stays a fleet member.** The intent row's `taskIds` still names it,
   `run.stopped` carries its reason, and `belayd_fleet_status` renders both the
   `stopped …` line and its live worktree. Its deferred plan entry is retired, so an
   advance never relaunches it; fix the cause and the loop lands it if its own retry
@@ -736,6 +741,10 @@ printf '%s' '{"schemaVersion":1,"fleetId":"default","taskIds":["bd-12"],
   "stopped":[{"taskId":"bd-15","reason":"phase-failed","detail":"phase review failed","at":1792947309781}],
   "idleTicks":0}}' > "$root/.git/belayd/fleet/default/fleet.json"
 ```
+
+That is a *legacy* seed: the one-shot import (`bd-281-legacy-fleet-state:<git-common-dir>`)
+reads it on the first fleet resolution of that repository and refuses it
+afterwards, so seed it once in a scratch repo and delete it after the import.
 
 `belayd_fleet_status` renders the intent plus `run:` and `stopped …` lines. (The
 worktree walk still needs a real git repository; the fixture above only shows the

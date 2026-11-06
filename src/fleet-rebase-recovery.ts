@@ -193,7 +193,7 @@ export interface ClassifyRebaseFailureInput {
   /** Conflicted paths of the stopped rebase, with the commits that touched them. */
   conflicts: readonly RebaseConflictedPath[];
   /**
-   * When the fleet was armed (`fleet.json#createdAt`), in epoch ms.
+   * When the fleet was armed (the intent's `createdAt`), in epoch ms.
    *
    * Committer timestamps are the attribution signal, and this is why: a sibling
    * member's commits reach the base *only* through this drain's rebase plus

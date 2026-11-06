@@ -2,28 +2,38 @@
  * Integration coverage for bd-120: a caller that handed its workflow to a
  * child orchestrator must not re-activate that workflow on restart.
  *
- * Two records are involved: the caller's `.belayd/workflow.json` marker (when
- * the child runs in another worktree) and the caller-scoped
- * `.belayd/handoff-<sessionId>.json` (which survives a same-directory handoff
- * where the child owns workflow.json). The `session_start` handler consults the
- * caller-scoped file first. This test uses the real filesystem and only stubs
- * the process/daemon edges.
+ * Two records are involved: the caller's own workflow record (when the child runs
+ * in another worktree) and the caller-scoped handoff marker (which survives a
+ * same-directory handoff where the child owns the workflow record). The
+ * `session_start` handler consults the caller-scoped marker first.
+ *
+ * bd-281 moved both into the shared per-repository store, keyed by task, so the
+ * "archived copy kept for diagnosis" assertions became "the dead record is gone
+ * and no copy exists anywhere" — a copy of executable state is the bug this bead
+ * removes, not the mitigation.
  */
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { installTempRepoState } from "../src/__tests__/helpers/repo-state.js";
 import { readOrchestratorClaim } from "../src/orchestrator-claim.js";
 import {
+  callerHandoffFilePath,
   readCallerHandoff,
   readWorkflowState,
+  workflowStateFilePath,
   writeCallerHandoff,
   writeWorkflowState,
 } from "../src/workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
+
+// Temp directories are not git repositories, so the shared execution store is
+// pointed at a fresh file per test (bd-281).
+installTempRepoState();
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -74,16 +84,20 @@ function createOrchestratorCtx(cwd: string, sessionId: string): OrchestratorCtx 
   };
 }
 
-/** Archived workflow records this worktree kept for diagnosis. */
-function archivedWorkflowFiles(cwd: string): string[] {
-  return readdirSync(join(cwd, ".belayd")).filter((name) => name.startsWith("workflow.stale-"));
-}
-
-/** The one archived workflow record's parsed content. */
-function readArchivedWorkflow(cwd: string): unknown {
-  const [name] = archivedWorkflowFiles(cwd);
-  if (name === undefined) throw new Error("no archived workflow state");
-  return JSON.parse(readFileSync(join(cwd, ".belayd", name), "utf8"));
+/**
+ * The retired state paths this worktree must never contain again (bd-281).
+ *
+ * Nothing writes `.belayd/workflow.json`, `workflow.stale-*.json` or
+ * `handoff-<session>.json`; a present one would be refused by the store's own
+ * migration guard.
+ */
+function retiredStateFiles(cwd: string): string[] {
+  const present: string[] = [];
+  if (existsSync(workflowStateFilePath(cwd))) present.push(workflowStateFilePath(cwd));
+  if (existsSync(join(cwd, ".belayd", "workflow.stale-1.json"))) {
+    present.push(join(cwd, ".belayd", "workflow.stale-1.json"));
+  }
+  return present;
 }
 
 /** A ctx whose notifications are captured, so a stray refusal is detectable. */
@@ -223,15 +237,10 @@ describe("workflow handoff across a caller restart (integration)", () => {
     expect(readOrchestratorClaim({ worktreePath: cwd }).kind).toBe("absent");
     expect(notifications).toEqual([]);
 
-    // The parent's terminal record is archived, not left to poison the
-    // worktree's next session, but it is kept for diagnosis.
+    // The parent's terminal record is discarded, not left to poison the
+    // worktree's next session, and no copy of it survives anywhere.
     expect(readWorkflowState({ cwd })).toBeUndefined();
-    expect(archivedWorkflowFiles(cwd)).toHaveLength(1);
-    expect(readArchivedWorkflow(cwd)).toHaveProperty("handedOffTo", {
-      taskId: "bd-101",
-      branch: "feat/bd-101",
-      sessionId: "sess-child",
-    });
+    expect(retiredStateFiles(cwd)).toEqual([]);
   });
 
   it("archives a handed-off record whose marker names another task", async () => {
@@ -253,7 +262,7 @@ describe("workflow handoff across a caller restart (integration)", () => {
     expect(readOrchestratorClaim({ worktreePath: cwd }).kind).toBe("absent");
     expect(notifications).toEqual([]);
     expect(readWorkflowState({ cwd })).toBeUndefined();
-    expect(archivedWorkflowFiles(cwd)).toHaveLength(1);
+    expect(retiredStateFiles(cwd)).toEqual([]);
   });
 
   it("does not claim a lease from a completed workflow and archives it", async () => {
@@ -273,7 +282,7 @@ describe("workflow handoff across a caller restart (integration)", () => {
     const refusalTexts = notifications.map((entry) => entry.message).join("\n");
     expect(refusalTexts).not.toContain("Refusing to drive");
     expect(readWorkflowState({ cwd })).toBeUndefined();
-    expect(archivedWorkflowFiles(cwd)).toHaveLength(1);
+    expect(retiredStateFiles(cwd)).toEqual([]);
 
     // A later session in the same worktree is lease-free too.
     const laterHarness = await bootHarness();
@@ -303,10 +312,9 @@ describe("workflow handoff across a caller restart (integration)", () => {
     expect(readOrchestratorClaim({ worktreePath: cwd }).kind).toBe("absent");
     expect(stale.notifications).toEqual([]);
     expect(readWorkflowState({ cwd })).toBeUndefined();
-    const archivedNames = archivedWorkflowFiles(cwd);
-    expect(archivedNames).toHaveLength(1);
-    const [staleArchive] = archivedNames;
-    if (staleArchive === undefined) throw new Error("expected an archived workflow record");
+    expect(retiredStateFiles(cwd)).toEqual([]);
+    // The caller-scoped handoff marker is a row too, so nothing is left behind.
+    expect(existsSync(callerHandoffFilePath(cwd, "stale-workflow-session"))).toBe(false);
 
     // A genuinely new, in-progress bead in the same worktree must be drivable.
     writeWorkflowState({ cwd, state: baseState("bd-202") });
@@ -324,9 +332,8 @@ describe("workflow handoff across a caller restart (integration)", () => {
     expect(fresh.notifications.map((entry) => entry.message).join("\n")).not.toContain(
       "Refusing to drive",
     );
-    // The diagnosis record survives the recovery, and only it was archived.
-    expect(archivedWorkflowFiles(cwd)).toEqual([staleArchive]);
-    expect(readArchivedWorkflow(cwd)).toHaveProperty("taskId", "bd-101");
+    // The recovery left no copy behind, and the new bead owns the worktree's row.
+    expect(retiredStateFiles(cwd)).toEqual([]);
     expect(readWorkflowState({ cwd })).toHaveProperty("taskId", "bd-202");
   });
 
@@ -344,7 +351,7 @@ describe("workflow handoff across a caller restart (integration)", () => {
     if (claim.kind === "ok") expect(claim.claim.taskId).toBe("bd-103");
     // The claimable state is untouched: this session resumes it.
     expect(readWorkflowState({ cwd })).toHaveProperty("taskId", "bd-103");
-    expect(archivedWorkflowFiles(cwd)).toHaveLength(0);
+    expect(retiredStateFiles(cwd)).toEqual([]);
   });
 
   it("stops the lease heartbeat through session_shutdown", async () => {

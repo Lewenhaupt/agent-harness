@@ -12,12 +12,7 @@ import { promisify } from "node:util";
 import type { GateOptions, GateResult, QualityGate, SpawnDetails } from "./agent-registry.js";
 import { cleanTerminalOutput, parseCast } from "./cast-utils.js";
 import type { ProofReceipt, ProofReceiptReader } from "./proof-receipt.js";
-import {
-  findProofReceiptRefs,
-  isProofReceiptUrl,
-  PROOF_RECEIPT_RELATIVE_PATH,
-  readProofReceipt,
-} from "./proof-receipt.js";
+import { findProofReceiptRefs, isProofReceiptUrl, readProofReceipt } from "./proof-receipt.js";
 import {
   checkPathTraversal,
   checkProofArtifactsExist,
@@ -767,10 +762,10 @@ function noProofArtifactsFeedback(output: string, proofDir: string | undefined):
  *
  * A receipt asserts that a proof upload happened and binds it to a task id. The
  * gate cannot verify the upload (the reviewing platform is not ready), so the
- * stored, task-bound `.belayd/proof-receipt.json` file is the only authority:
+ * stored, task-bound receipt row is the only authority:
  *
  * - A stored receipt that is malformed, unreadable, or names a different task
- *   fails closed. An agent-authored line never outranks the file.
+ *   fails closed. An agent-authored line never outranks the stored row.
  * - An output `receipt:` / `## Receipt` line is accepted only when it matches
  *   the stored receipt's id or url. With no stored receipt, only an absolute
  *   `https:` upload URL is accepted (plain `http:` is rejected, matching the
@@ -789,9 +784,14 @@ function receiptGateResult(
   cwd: string,
   proofDir: string | undefined,
   readReceipt: ProofReceiptReader,
+  taskIdOverride: string | undefined,
 ): GateResult | undefined {
-  const taskId = proofDir === undefined ? undefined : basename(proofDir);
-  const stored = readReceipt({ cwd });
+  // The caller's task id is the receipt's identity and outranks the proof dir's
+  // basename: the row is keyed by task id, so a derived directory name must never
+  // hide a row the caller named explicitly. The proof dir is the fallback for a
+  // caller that has only the proof artifacts to go on.
+  const taskId = taskIdOverride ?? (proofDir === undefined ? undefined : basename(proofDir));
+  const stored = readReceipt({ cwd, ...(taskId === undefined ? {} : { taskId }) });
   if (!stored.ok) {
     return { passed: false, feedback: `Invalid proof receipt: ${stored.error}` };
   }
@@ -804,8 +804,8 @@ function receiptGateResult(
       return {
         passed: false,
         feedback:
-          `Proof receipt in ${PROOF_RECEIPT_RELATIVE_PATH} names ${storedReceipt.taskId}, ` +
-          `not ${taskId}; refusing a receipt for a different task`,
+          `Stored proof receipt names ${storedReceipt.taskId}, not ${taskId}; ` +
+          "refusing a receipt for a different task",
       };
     }
     const mismatched = refs.filter((ref) => !receiptNamesReference(storedReceipt, ref));
@@ -830,14 +830,14 @@ function receiptGateResult(
       passed: false,
       feedback:
         `Proof receipt reference ${reference} is not an upload URL and no stored receipt ` +
-        `(${PROOF_RECEIPT_RELATIVE_PATH}) backs it; provide an https upload URL or ` +
+        `(in <git-common-dir>/belayd/state.sqlite) backs it; provide an https upload URL or ` +
         "artifact refs",
     };
   }
   return { passed: true, feedback: `Proof receipt accepted: ${reference}` };
 }
 
-/** Resolve the receipt reader: the injected test seam, else the real file reader. */
+/** Resolve the receipt reader: the injected test seam, else the real store reader. */
 function proofReceiptReader(options: GateOptions | undefined): ProofReceiptReader {
   return options?.readProofReceipt ?? readProofReceipt;
 }
@@ -858,7 +858,7 @@ function receiptReference(receipt: ProofReceipt): string {
  * Resolution order: optional proofRequired, documented skip reason, then a
  * proof receipt, then artifact validation. A receipt only asserts that an
  * upload happened; the gate cannot verify the upload (the reviewing platform is
- * not ready). The stored, task-bound receipt file is the authoritative form; an
+ * not ready). The stored, task-bound receipt row is the authoritative form; an
  * output upload URL with no stored receipt is accepted but unverified, while the
  * artifact branch (existence-checked, `.cast` content-validated) remains
  * strictly stronger evidence. See `receiptGateResult`. When no receipt is
@@ -886,7 +886,13 @@ export async function gateProofContent(
   const cwd = options?.cwd ?? process.cwd();
   const proofDir = options?.proofDir !== undefined ? resolve(options.proofDir) : undefined;
 
-  const receipt = receiptGateResult(output, cwd, proofDir, proofReceiptReader(options));
+  const receipt = receiptGateResult(
+    output,
+    cwd,
+    proofDir,
+    proofReceiptReader(options),
+    options?.taskId,
+  );
   if (receipt !== undefined) return receipt;
 
   // Fail closed on traversal-shaped refs before the enumeration fallback can

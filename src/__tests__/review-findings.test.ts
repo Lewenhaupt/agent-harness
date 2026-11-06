@@ -1,15 +1,19 @@
 /**
- * Tests for the durable review-findings record (bd-175, bd-286).
+ * Tests for the durable review-findings record (bd-175, bd-286, bd-281).
  *
  * The pure half is the whole contract: what counts as a finding, what the
- * durable record looks like, and what a human reads in the comment. The one
- * side effect (`writeReviewFindingsRecord`) is exercised against a temp dir.
+ * durable record looks like, and what a human reads in the comment. The two side
+ * effects (`writeReviewFindingsRecord` / `readReviewFindingsRecord`) are exercised
+ * against a temp SQLite store: bd-281 moved the record out of `.belayd/` and keyed
+ * it by task, so a resumed review continues the same round instead of a copy.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { openRepoStateStore, type RepoStateStore } from "../repo-state-store.js";
 import {
   buildReviewFindingsRecord,
   formatReviewFindingDisposition,
@@ -17,11 +21,9 @@ import {
   hasReviewFindings,
   nextReviewRound,
   REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
-  REVIEW_FINDINGS_RECORD_RELATIVE_PATH,
   REVIEW_FIX_LOOP_REASON,
   type ReviewFindingsRecord,
   readReviewFindingsRecord,
-  reviewFindingsRecordPath,
   writeReviewFindingsRecord,
 } from "../review-findings.js";
 
@@ -270,51 +272,72 @@ describe("formatReviewFindingsComment", () => {
 });
 
 describe("writeReviewFindingsRecord / readReviewFindingsRecord", () => {
-  let cwd: string;
+  const cwd = "/tmp/worktree";
+  let dir: string;
+  let storePath: string;
+  let store: RepoStateStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
+    storePath = join(dir, "state.sqlite");
+    const opened = openRepoStateStore({ path: storePath });
+    if (!opened.ok) throw new Error(opened.error);
+    store = opened.store;
+  });
 
   afterEach(() => {
-    if (cwd !== undefined) rmSync(cwd, { recursive: true, force: true });
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
   });
 
-  it("writes the record beside the workflow state", () => {
-    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
+  it("writes the record for the task", () => {
     const record = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     if (record === undefined) throw new Error("expected a record");
-    const result = writeReviewFindingsRecord({ cwd, record });
+    const result = writeReviewFindingsRecord({ cwd, store, record });
     expect(result).toEqual({ ok: true });
-    const written = JSON.parse(readFileSync(reviewFindingsRecordPath(cwd), "utf8"));
-    expect(written.findings).toHaveLength(2);
-    expect(written.reason).toBe(REVIEW_FIX_LOOP_REASON);
-    expect(readReviewFindingsRecord({ cwd })?.round).toBe(1);
+    const written = readReviewFindingsRecord({ cwd, store, taskId: "bd-1" });
+    expect(written?.findings).toHaveLength(2);
+    expect(written?.reason).toBe(REVIEW_FIX_LOOP_REASON);
+    expect(readReviewFindingsRecord({ cwd, store, taskId: "bd-1" })?.round).toBe(1);
   });
 
-  it("reports an error and leaves no temp file behind when the rename fails", () => {
-    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
-    // A directory where the record file belongs makes rename fail after the temp
-    // write; the caller keeps the gate and the temp file must be cleaned up.
-    mkdirSync(reviewFindingsRecordPath(cwd), { recursive: true });
+  it("reports an error when the store cannot be written", () => {
     const record = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     if (record === undefined) throw new Error("expected a record");
-    const result = writeReviewFindingsRecord({ cwd, record });
+    store.close();
+    const result = writeReviewFindingsRecord({ cwd, store, record });
     expect(result.ok).toBe(false);
-    expect(readReviewFindingsRecord({ cwd })).toBeUndefined();
+    expect(readReviewFindingsRecord({ cwd, store, taskId: "bd-1" })).toBeUndefined();
   });
 
   it("advances the round from the persisted record and treats corruption as absent", () => {
-    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
-    expect(nextReviewRound({ cwd })).toBe(1);
+    expect(nextReviewRound({ cwd, store, taskId: "bd-1" })).toBe(1);
     const record = buildReviewFindingsRecord({
       taskId: "bd-1",
       text: REVIEW_WITH_FINDINGS,
       round: 1,
     });
     if (record === undefined) throw new Error("expected a record");
-    writeReviewFindingsRecord({ cwd, record });
-    expect(nextReviewRound({ cwd })).toBe(2);
+    writeReviewFindingsRecord({ cwd, store, record });
+    expect(nextReviewRound({ cwd, store, taskId: "bd-1" })).toBe(2);
 
-    writeFileSync(reviewFindingsRecordPath(cwd), "{ not json");
-    expect(readReviewFindingsRecord({ cwd })).toBeUndefined();
-    expect(nextReviewRound({ cwd })).toBe(1);
+    // A row the schema rejects is "no record", so the loop restarts instead of
+    // carrying a corrupt round forward.
+    const database = new DatabaseSync(storePath);
+    database
+      .prepare("UPDATE review_findings SET payload = '{ not json' WHERE task_id = ?")
+      .run("bd-1");
+    database.close();
+    expect(readReviewFindingsRecord({ cwd, store, taskId: "bd-1" })).toBeUndefined();
+    expect(nextReviewRound({ cwd, store, taskId: "bd-1" })).toBe(1);
+  });
+
+  it("keeps the round per task, so another bead's review cannot advance this one", () => {
+    const record = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
+    if (record === undefined) throw new Error("expected a record");
+    writeReviewFindingsRecord({ cwd, store, record });
+    expect(nextReviewRound({ cwd, store, taskId: "bd-2" })).toBe(1);
+    expect(nextReviewRound({ cwd, store, taskId: "bd-1" })).toBe(2);
   });
 
   it("reads a v1 record written by an older harness that still carries the removed fields", () => {
@@ -322,43 +345,50 @@ describe("writeReviewFindingsRecord / readReviewFindingsRecord", () => {
     // stays 1: zod strips the unknown keys, so an in-flight round written by the
     // previous build keeps its round count and findings instead of reading as
     // "no record" (which would reset the fix loop).
-    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
-    mkdirSync(join(cwd, ".belayd"), { recursive: true });
-    writeFileSync(
-      join(cwd, REVIEW_FINDINGS_RECORD_RELATIVE_PATH),
-      JSON.stringify({
-        schemaVersion: 1,
-        taskId: "bd-1",
-        phase: "review",
-        round: 2,
-        reason: REVIEW_FIX_LOOP_REASON,
-        artifactPath: REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
-        findings: [
-          {
-            finding: "`src/a.ts:12` — off-by-one in the loop bound",
-            severity: "critical",
-            phase: "review",
-            round: 2,
-            disposition: { kind: "deferred", reason: REVIEW_FIX_LOOP_REASON },
-            sensitivity: { sensitive: true, reasons: [{ kind: "security-topic", match: "token" }] },
-            publication: { kind: "withhold" },
-          },
-        ],
-      }),
-    );
-    const read = readReviewFindingsRecord({ cwd });
+    const database = new DatabaseSync(storePath);
+    database
+      .prepare(
+        "INSERT OR REPLACE INTO review_findings (task_id, payload, updated_at) VALUES (?, ?, ?)",
+      )
+      .run(
+        "bd-1",
+        JSON.stringify({
+          schemaVersion: 1,
+          taskId: "bd-1",
+          phase: "review",
+          round: 2,
+          reason: REVIEW_FIX_LOOP_REASON,
+          artifactPath: REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH,
+          findings: [
+            {
+              finding: "`src/a.ts:12` — off-by-one in the loop bound",
+              severity: "critical",
+              phase: "review",
+              round: 2,
+              disposition: { kind: "deferred", reason: REVIEW_FIX_LOOP_REASON },
+              sensitivity: {
+                sensitive: true,
+                reasons: [{ kind: "security-topic", match: "token" }],
+              },
+              publication: { kind: "withhold" },
+            },
+          ],
+        }),
+        Date.now(),
+      );
+    database.close();
+    const read = readReviewFindingsRecord({ cwd, store, taskId: "bd-1" });
     expect(read?.round).toBe(2);
     expect(read?.findings[0]?.finding).toBe("`src/a.ts:12` — off-by-one in the loop bound");
     expect(read?.findings[0]).not.toHaveProperty("sensitivity");
     expect(read?.findings[0]).not.toHaveProperty("publication");
     // The round counter keeps counting from the old record.
-    expect(nextReviewRound({ cwd })).toBe(3);
+    expect(nextReviewRound({ cwd, store, taskId: "bd-1" })).toBe(3);
   });
 
   it("reads a record written before the disposition marker", () => {
     // The marker is optional on read with no schemaVersion bump: in-flight rounds
     // written by the previous build must still load their round and findings.
-    cwd = mkdtempSync(join(tmpdir(), "belayd-review-findings-"));
     const base = buildReviewFindingsRecord({ taskId: "bd-1", text: REVIEW_WITH_FINDINGS });
     if (base === undefined) throw new Error("expected a record");
     const [baseFinding] = base.findings;
@@ -367,7 +397,7 @@ describe("writeReviewFindingsRecord / readReviewFindingsRecord", () => {
     delete legacyFinding.dispositionSource;
     const legacy: ReviewFindingsRecord = { ...base, findings: [legacyFinding] };
 
-    writeReviewFindingsRecord({ cwd, record: legacy });
-    expect(readReviewFindingsRecord({ cwd })).toEqual(legacy);
+    writeReviewFindingsRecord({ cwd, store, record: legacy });
+    expect(readReviewFindingsRecord({ cwd, store, taskId: "bd-1" })).toEqual(legacy);
   });
 });

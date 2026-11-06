@@ -4,7 +4,7 @@
  * A worktree may host at most one orchestrator session. That is the invariant
  * every phase tool already assumes (one process gate = one bead = one worktree),
  * and breaking it is not theoretical: two orchestrators on one branch share
- * `.belayd/workflow.json` and `.belayd/runs/`, so each one overwrites the other's
+ * the worktree's workflow row and run rows, so each one overwrites the other's
  * phase ledger and both spawn phase sub-agents on the same files.
  *
  * The record used to be the workflow state file, which cannot tell "a live
@@ -26,23 +26,33 @@
  *   when the session (or the daemon holding it) stops. A pid, by contrast, is
  *   shared by every session in the daemon and proves nothing.
  *
- * Split like the rest of the fleet family: parsing and classification are pure,
- * and the four side effects (create, renew, release, archive) take an injected
- * fs seam so tests never touch a real worktree.
+ * The lease is a row in the per-repository execution store (bd-281), keyed by
+ * **task id** and unique per worktree. Acquisition is one conditional
+ * `BEGIN IMMEDIATE` upsert, so two racing sessions cannot both win even in the same
+ * millisecond — that SQL is what replaced the `wx` exclusive-create trick *and* the
+ * "re-read immediately before archiving" dance the file version needed. A stale
+ * lease is cold on its own `expires_at`, so takeover is one conditional update and
+ * never an archive-and-replace of a file another session might be renewing.
+ *
+ * Split like the rest of the family: parsing and classification are pure; the four
+ * side effects (acquire, renew, release, adopt) take an injected store seam so tests
+ * never need a real worktree or a real repository.
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import {
+  type RepoLeaseAcquire,
+  type RepoStateStore,
+  sharedRepoStateStore,
+} from "./repo-state-store.js";
 
-/** Lease file name, inside the worktree's `.belayd/` directory. */
+/**
+ * Retired lease file name (bd-281).
+ *
+ * Kept because the migration refusal, the import and diagnostics name it; nothing
+ * reads or writes it any more.
+ */
 export const ORCHESTRATOR_CLAIM_FILE_NAME = "orchestrator.json";
 
 /** Prefix of an archived (dead) lease, kept beside the live one for diagnosis. */
@@ -99,41 +109,17 @@ const OrchestratorClaimSchema = z.object({
 
 export type OrchestratorClaim = z.infer<typeof OrchestratorClaimSchema>;
 
-/** The fs surface the lease needs; injected so tests never write a real `.belayd/`. */
-export interface OrchestratorClaimFs {
-  existsSync(path: string): boolean;
-  readFileSync(path: string): string;
-  /** Called with `flag: "wx"` for the atomic create; the option is part of the seam. */
-  writeFileSync(path: string, data: string, options?: { flag?: string }): void;
-  renameSync(oldPath: string, newPath: string): void;
-  unlinkSync(path: string): void;
-  mkdirSync(path: string, options?: { recursive?: boolean }): void;
+/**
+ * The store the lease reads and writes.
+ *
+ * Injected by tests; in production it is the shared per-repository store, which
+ * every worktree of the repository resolves to the same file.
+ */
+export interface OrchestratorClaimStoreSeam {
+  store?: RepoStateStore;
 }
 
-/** Read-only subset, so a pure reader (fleet status) can share the workflow fs seam. */
-export type OrchestratorClaimReadFs = Pick<OrchestratorClaimFs, "existsSync" | "readFileSync">;
-
-export const orchestratorClaimFs: OrchestratorClaimFs = {
-  existsSync: (path) => existsSync(path),
-  readFileSync: (path) => readFileSync(path, "utf8"),
-  writeFileSync: (path, data, options) =>
-    options === undefined ? writeFileSync(path, data) : writeFileSync(path, data, options),
-  renameSync: (oldPath, newPath) => renameSync(oldPath, newPath),
-  unlinkSync: (path) => unlinkSync(path),
-  mkdirSync: (path, options) => mkdirSync(path, options),
-};
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
-}
-
-/** Lease path for a worktree directory. */
+/** Retired lease path for a worktree directory (naming only). */
 export function orchestratorClaimPath(worktreePath: string): string {
   return join(worktreePath, ".belayd", ORCHESTRATOR_CLAIM_FILE_NAME);
 }
@@ -147,31 +133,54 @@ export function parseOrchestratorClaim(raw: unknown): OrchestratorClaim | undefi
 export type OrchestratorClaimRead =
   | { kind: "absent" }
   | { kind: "ok"; claim: OrchestratorClaim }
-  | { kind: "corrupt"; path: string; error: string };
+  | { kind: "corrupt"; error: string };
 
-/** Read the lease at a worktree. Absence is normal; anything unreadable is reported. */
-export function readOrchestratorClaim(options: {
-  worktreePath: string;
-  fs?: OrchestratorClaimReadFs;
-}): OrchestratorClaimRead {
-  const fs = options.fs ?? orchestratorClaimFs;
-  const path = orchestratorClaimPath(options.worktreePath);
-  let raw: string;
-  try {
-    if (!fs.existsSync(path)) return { kind: "absent" };
-    raw = fs.readFileSync(path);
-  } catch (error) {
-    return { kind: "corrupt", path, error: errorMessage(error) };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return { kind: "corrupt", path, error: `${path} is not valid JSON` };
-  }
-  const claim = parseOrchestratorClaim(parsed);
+/** The store for this call: the injected one, else the shared repository store. */
+function storeFor(
+  options: OrchestratorClaimStoreSeam & { worktreePath: string },
+): RepoStateStore | null {
+  if (options.store !== undefined) return options.store;
+  return sharedRepoStateStore({ cwd: options.worktreePath }).store;
+}
+
+/** Map a stored lease row to the persisted record shape, then validate it. */
+function claimFromRow(lease: {
+  taskId: string;
+  branch: string;
+  sessionId: string;
+  pid: number;
+  claimedAt: number;
+  heartbeatAt: number;
+}): OrchestratorClaim | undefined {
+  return parseOrchestratorClaim({
+    schemaVersion: ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
+    taskId: lease.taskId,
+    branch: lease.branch,
+    sessionId: lease.sessionId,
+    pid: lease.pid,
+    claimedAt: lease.claimedAt,
+    heartbeatAt: lease.heartbeatAt,
+  });
+}
+
+/**
+ * Read the lease for a worktree. Absence is normal; a row that does not parse is
+ * reported instead of being silently treated as free.
+ *
+ * The lookup is by worktree path as a *locator*: the lease's identity is the task
+ * it names, but "who drives this directory" is the question a session asks.
+ */
+export function readOrchestratorClaim(
+  options: OrchestratorClaimStoreSeam & { worktreePath: string },
+): OrchestratorClaimRead {
+  const store = storeFor(options);
+  if (store === null) return { kind: "absent" };
+  const row = store.readLease({ worktreePath: options.worktreePath });
+  if (!row.ok) return { kind: "corrupt", error: row.error };
+  if (row.value === null) return { kind: "absent" };
+  const claim = claimFromRow(row.value);
   return claim === undefined
-    ? { kind: "corrupt", path, error: `${path} is not an orchestrator lease` }
+    ? { kind: "corrupt", error: `the lease for ${row.value.taskId} does not parse` }
     : { kind: "ok", claim };
 }
 
@@ -185,7 +194,7 @@ export function readOrchestratorClaim(options: {
 export type OrchestratorClaimVerdict =
   | { kind: "free" }
   | { kind: "held"; claim: OrchestratorClaim; state: "live" | "stale"; sameSession: boolean }
-  | { kind: "corrupt"; path: string; error: string };
+  | { kind: "corrupt"; error: string };
 
 export function classifyOrchestratorClaim(options: {
   read: OrchestratorClaimRead;
@@ -213,7 +222,7 @@ export function describeOrchestratorClaim(verdict: OrchestratorClaimVerdict): st
     case "free":
       return "no orchestrator lease";
     case "corrupt":
-      return `unreadable orchestrator lease at ${verdict.path} (${verdict.error})`;
+      return `unreadable orchestrator lease (${verdict.error})`;
     case "held": {
       const state = verdict.state === "live" ? "live" : "stale";
       return `${state} orchestrator lease for ${verdict.claim.taskId} (session ${verdict.claim.sessionId})`;
@@ -221,7 +230,7 @@ export function describeOrchestratorClaim(verdict: OrchestratorClaimVerdict): st
   }
 }
 
-export interface AcquireOrchestratorClaimOptions {
+export interface AcquireOrchestratorClaimOptions extends OrchestratorClaimStoreSeam {
   worktreePath: string;
   taskId: string;
   branch: string;
@@ -229,25 +238,22 @@ export interface AcquireOrchestratorClaimOptions {
   pid: number;
   now: number;
   /**
-   * Take over a cold lease (or a corrupt one) instead of refusing.
+   * Take over a cold lease instead of refusing.
    *
    * A cold lease is not proof the worktree is unused — it is evidence its owner
    * stopped renewing — so takeover is a decision the caller must make explicitly
-   * and report. The old record is archived beside the live lease, never deleted.
+   * and report instead of a default.
    */
   takeOverStale?: boolean;
   staleAfterInMs?: number;
-  fs?: OrchestratorClaimFs;
 }
 
 export type AcquireOrchestratorClaimResult =
   | {
       ok: true;
       claim: OrchestratorClaim;
-      /** Set when a cold/corrupt lease was archived to make room. */
+      /** Set when a cold lease was displaced to make room. */
       tookOverFrom?: { taskId: string; sessionId: string };
-      /** Where the displaced record was archived (present whenever `tookOverFrom` is). */
-      archivedPath?: string;
     }
   | {
       ok: false;
@@ -255,89 +261,6 @@ export type AcquireOrchestratorClaimResult =
       verdict: OrchestratorClaimVerdict;
       error: string;
     };
-
-export interface AcquireOrchestratorClaimOptions {
-  worktreePath: string;
-  taskId: string;
-  branch: string;
-  sessionId: string;
-  pid: number;
-  now: number;
-  /**
-   * Take over a cold lease (or a corrupt one) instead of refusing.
-   *
-   * A cold lease is not proof the worktree is unused — it is evidence its owner
-   * stopped renewing — so takeover is a decision the caller must make explicitly
-   * and report. The old record is archived beside the live lease, never deleted.
-   */
-  takeOverStale?: boolean;
-  staleAfterInMs?: number;
-  fs?: OrchestratorClaimFs;
-}
-
-/** Directory a displaced lease is archived into (beside the live record). */
-function claimArchiveDir(worktreePath: string): string {
-  return join(worktreePath, ".belayd");
-}
-
-/** Archive a lease that is being displaced; the record is kept, never deleted. */
-function archiveClaimFile(options: {
-  fromPath: string;
-  worktreePath: string;
-  now: number;
-  suffix: string;
-  fs: OrchestratorClaimFs;
-}): string {
-  const archivedPath = join(
-    claimArchiveDir(options.worktreePath),
-    `${ORCHESTRATOR_CLAIM_ARCHIVE_PREFIX}${options.now}${options.suffix}.json`,
-  );
-  options.fs.renameSync(options.fromPath, archivedPath);
-  return archivedPath;
-}
-
-type ClaimCreateOutcome =
-  | { ok: true }
-  | { ok: false; reason: "exists" | "write-failed"; error?: string };
-
-/**
- * Create the lease file only if it does not exist.
- *
- * `wx` is the whole mutual-exclusion mechanism: two sessions racing to claim one
- * worktree have exactly one winner, even in the same millisecond, and the loser
- * can then read the winner's record and name the session it must not fight.
- */
-function createClaimExclusive(options: {
-  worktreePath: string;
-  claim: OrchestratorClaim;
-  fs: OrchestratorClaimFs;
-}): ClaimCreateOutcome {
-  const path = orchestratorClaimPath(options.worktreePath);
-  try {
-    options.fs.writeFileSync(path, `${JSON.stringify(options.claim, null, 2)}\n`, { flag: "wx" });
-    return { ok: true };
-  } catch (error) {
-    if (errorCode(error) === "EEXIST") return { ok: false, reason: "exists" };
-    return {
-      ok: false,
-      reason: "write-failed",
-      error: `could not create ${path}: ${errorMessage(error)}`,
-    };
-  }
-}
-
-/** Atomically replace the lease file (temp + rename). */
-function writeClaimAtomically(options: {
-  worktreePath: string;
-  claim: OrchestratorClaim;
-  now: number;
-  fs: OrchestratorClaimFs;
-}): void {
-  const path = orchestratorClaimPath(options.worktreePath);
-  const temp = `${path}.${options.now}.tmp`;
-  options.fs.writeFileSync(temp, `${JSON.stringify(options.claim, null, 2)}\n`);
-  options.fs.renameSync(temp, path);
-}
 
 function refuseClaim(
   reason: "held" | "corrupt" | "write-failed",
@@ -365,269 +288,213 @@ function buildClaim(options: {
   };
 }
 
-/**
- * Displace a cold or unreadable lease and take the worktree.
- *
- * Re-reads immediately before displacing: a holder that renewed between the
- * classification and this call is alive, and archiving it would hand its worktree
- * to a second orchestrator — the failure this module exists to prevent.
- */
-function takeOverDisplacedClaim(options: {
-  acquire: AcquireOrchestratorClaimOptions;
-  claim: OrchestratorClaim;
-  verdict: OrchestratorClaimVerdict;
-  fs: OrchestratorClaimFs;
-}): AcquireOrchestratorClaimResult {
-  const { acquire, verdict, fs } = options;
-  const path = orchestratorClaimPath(acquire.worktreePath);
-  const corrupt = verdict.kind === "corrupt";
-  if (verdict.kind === "held") {
-    const recheck = recheckStaleLease({ acquire, claim: verdict.claim, fs, path });
-    if (recheck !== undefined) return recheck;
-  }
-
-  const fromPath = verdict.kind === "corrupt" ? verdict.path : path;
-  try {
-    const archivedPath = archiveClaimFile({
-      fromPath,
-      worktreePath: acquire.worktreePath,
-      now: acquire.now,
-      suffix: corrupt ? ".corrupt" : ".stale",
-      fs,
-    });
-    const created = createClaimExclusive({
-      worktreePath: acquire.worktreePath,
-      claim: options.claim,
-      fs,
-    });
-    if (!created.ok) {
-      return refuseClaim(
-        "held",
-        verdict,
-        created.error ?? `${path} was re-created while it was being taken over`,
-      );
-    }
-    return {
-      ok: true,
-      claim: options.claim,
-      ...(verdict.kind === "held"
-        ? { tookOverFrom: { taskId: verdict.claim.taskId, sessionId: verdict.claim.sessionId } }
-        : {}),
-      archivedPath,
-    };
-  } catch (error) {
-    return refuseClaim("write-failed", verdict, archiveFailureText(path, error));
-  }
+/** The lease window: the caller's stale threshold, else the harness's 9 x 20 s. */
+function leaseTtlInMs(acquire: { staleAfterInMs?: number }): number {
+  return acquire.staleAfterInMs ?? ORCHESTRATOR_CLAIM_STALE_MS;
 }
 
 /**
- * Re-verify a cold lease immediately before displacing it.
+ * Claim the worktree's lease.
  *
- * A holder that renewed between the classification and the takeover is alive, and
- * archiving it would hand its worktree to a second orchestrator. `undefined` means
- * "still stale, go ahead"; a refusal means the caller must not take over.
- */
-function recheckStaleLease(options: {
-  acquire: AcquireOrchestratorClaimOptions;
-  claim: OrchestratorClaim;
-  fs: OrchestratorClaimFs;
-  path: string;
-}): AcquireOrchestratorClaimResult | undefined {
-  const fresh = readOrchestratorClaim({
-    worktreePath: options.acquire.worktreePath,
-    fs: options.fs,
-  });
-  const unchanged =
-    fresh.kind === "ok" &&
-    fresh.claim.sessionId === options.claim.sessionId &&
-    fresh.claim.heartbeatAt === options.claim.heartbeatAt;
-  if (!unchanged) {
-    return refuseClaim(
-      "held",
-      { kind: "held", claim: options.claim, state: "stale", sameSession: false },
-      `the lease at ${options.path} changed while it was being taken over`,
-    );
-  }
-  const stillStale = classifyOrchestratorClaim({
-    read: fresh,
-    now: options.acquire.now,
-    ...(options.acquire.staleAfterInMs === undefined
-      ? {}
-      : { staleAfterInMs: options.acquire.staleAfterInMs }),
-  });
-  if (stillStale.kind !== "held" || stillStale.state !== "stale") {
-    return refuseClaim("held", stillStale, `the lease at ${options.path} is no longer stale`);
-  }
-  return undefined;
-}
-
-function archiveFailureText(path: string, error: unknown): string {
-  return `could not archive the displaced lease at ${path}: ${errorMessage(error)}`;
-}
-
-/**
- * Create the lease for a worktree, atomically.
- *
- * Held leases are resolved by {@link takeOverDisplacedClaim}, which owns the
- * archive-and-replace decision so `adoptOrchestratorClaim` can share it.
+ * Mutual exclusion is the store's single conditional upsert: the row is read and
+ * written inside one `BEGIN IMMEDIATE`, so two sessions racing for one worktree
+ * still produce exactly one winner, and the loser is handed the winner's identity
+ * rather than a copy that it might later "refresh". A cold lease is taken over
+ * only when the caller says so — cold is evidence of stopped renewal, not proof of
+ * death — and the takeover is one conditional write, which is why this module no
+ * longer re-reads the record before displacing it.
  */
 export function acquireOrchestratorClaim(
   options: AcquireOrchestratorClaimOptions,
 ): AcquireOrchestratorClaimResult {
-  const fs = options.fs ?? orchestratorClaimFs;
+  const store = storeFor(options);
   const claim = buildClaim(options);
-
-  try {
-    fs.mkdirSync(claimArchiveDir(options.worktreePath), { recursive: true });
-  } catch (error) {
+  if (store === null) {
     return refuseClaim(
       "write-failed",
       { kind: "free" },
-      `could not prepare .belayd/: ${errorMessage(error)}`,
+      `repo state store unavailable for ${options.worktreePath}`,
     );
   }
 
-  const created = createClaimExclusive({ worktreePath: options.worktreePath, claim, fs });
-  if (created.ok) return { ok: true, claim };
-  if (created.reason === "write-failed") {
-    return refuseClaim(
-      "write-failed",
-      { kind: "free" },
-      created.error ?? "could not create the lease",
-    );
-  }
-
-  const verdict = classifyOrchestratorClaim({
-    read: readOrchestratorClaim({ worktreePath: options.worktreePath, fs }),
-    now: options.now,
+  const acquired = store.acquireLease({
+    taskId: options.taskId,
     sessionId: options.sessionId,
-    ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
+    branch: options.branch,
+    worktreePath: options.worktreePath,
+    pid: options.pid,
+    nowMs: options.now,
+    ttlMs: leaseTtlInMs(options),
+    ...(options.takeOverStale === true ? { takeOverStale: true } : {}),
   });
 
-  if (verdict.kind === "free") {
-    const retried = createClaimExclusive({ worktreePath: options.worktreePath, claim, fs });
-    return retried.ok
-      ? { ok: true, claim }
-      : refuseClaim(
-          "held",
-          verdict,
-          retried.error ??
-            `${orchestratorClaimPath(options.worktreePath)} was re-created while claiming it`,
-        );
+  if (acquired.ok) {
+    return {
+      ok: true,
+      claim,
+      ...(acquired.tookOverFrom === undefined ? {} : { tookOverFrom: acquired.tookOverFrom }),
+    };
   }
-  const takeoverAllowed = options.takeOverStale === true;
-  if (verdict.kind === "corrupt") {
-    return takeoverAllowed
-      ? takeOverDisplacedClaim({ acquire: options, claim, verdict, fs })
-      : refuseClaim("corrupt", verdict, describeOrchestratorClaim(verdict));
+  return refusalFor(options, store, claim, acquired);
+}
+
+/**
+ * The refusal for a store rejection, including the corrupt-row takeover.
+ *
+ * Split out of {@link acquireOrchestratorClaim} because the decision has three
+ * outcomes (free, held, unreadable holder) and each names a different remedy.
+ */
+function refusalFor(
+  options: AcquireOrchestratorClaimOptions,
+  store: RepoStateStore,
+  claim: OrchestratorClaim,
+  acquired: Extract<RepoLeaseAcquire, { ok: false }>,
+): AcquireOrchestratorClaimResult {
+  const holder = acquired.holder;
+  if (holder === null) {
+    return refuseClaim(
+      acquired.reason === "held" ? "held" : "write-failed",
+      { kind: "free" },
+      acquired.error,
+    );
   }
-  if (verdict.state === "live" || !takeoverAllowed) {
-    return refuseClaim("held", verdict, describeOrchestratorClaim(verdict));
+  const parsed = claimFromRow(holder);
+  if (parsed !== undefined) {
+    return refuseClaim(
+      acquired.reason === "held" ? "held" : "write-failed",
+      {
+        kind: "held",
+        claim: parsed,
+        state: holder.expiresAt > options.now ? "live" : "stale",
+        sameSession: holder.sessionId === options.sessionId,
+      },
+      acquired.error,
+    );
   }
-  return takeOverDisplacedClaim({ acquire: options, claim, verdict, fs });
+  // A row that no longer matches the record schema is reported as corrupt, not as a
+  // live holder. A caller that explicitly takes over stale records may replace it,
+  // and the replacement is a compare-and-swap on the exact session id it just saw,
+  // so it cannot clobber a record another session rewrote in between.
+  if (options.takeOverStale !== true) {
+    return refuseClaim("corrupt", { kind: "corrupt", error: acquired.error }, acquired.error);
+  }
+  const replaced = store.replaceLease({
+    taskId: holder.taskId === "" ? options.taskId : holder.taskId,
+    expectSessionId: holder.sessionId,
+    sessionId: options.sessionId,
+    branch: options.branch,
+    worktreePath: options.worktreePath,
+    pid: options.pid,
+    nowMs: options.now,
+    ttlMs: leaseTtlInMs(options),
+  });
+  return replaced.ok
+    ? { ok: true, claim }
+    : refuseClaim("corrupt", { kind: "corrupt", error: replaced.error }, replaced.error);
 }
 
 /**
  * Renew a lease this session owns.
  *
- * A renewal from a session that does not hold the lease is refused, never
- * allowed to "refresh" someone else's record: the freshness of a lease is the
- * only evidence that its owner is still alive.
+ * A renewal from a session that does not hold the lease is refused, never allowed
+ * to "refresh" someone else's record: the freshness of a lease is the only evidence
+ * that its owner is still alive.
  */
-export function heartbeatOrchestratorClaim(options: {
-  worktreePath: string;
-  sessionId: string;
-  now: number;
-  fs?: OrchestratorClaimFs;
-}): { ok: true; claim: OrchestratorClaim } | { ok: false; reason: string; error: string } {
-  const fs = options.fs ?? orchestratorClaimFs;
-  const read = readOrchestratorClaim({ worktreePath: options.worktreePath, fs });
-  if (read.kind === "absent") {
+export function heartbeatOrchestratorClaim(
+  options: OrchestratorClaimStoreSeam & {
+    worktreePath: string;
+    sessionId: string;
+    now: number;
+    staleAfterInMs?: number;
+  },
+): { ok: true; claim: OrchestratorClaim } | { ok: false; reason: string; error: string } {
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, reason: "write-failed", error: "repo state store unavailable" };
+  }
+  const current = store.readLease({ worktreePath: options.worktreePath });
+  if (!current.ok) return { ok: false, reason: "corrupt", error: current.error };
+  if (current.value === null) {
     return { ok: false, reason: "missing", error: "no orchestrator lease to renew" };
   }
-  if (read.kind === "corrupt") {
-    return { ok: false, reason: "corrupt", error: read.error };
-  }
-  if (read.claim.sessionId !== options.sessionId) {
-    return {
-      ok: false,
-      reason: "not-owner",
-      error: `the lease names session ${read.claim.sessionId}, not ${options.sessionId}`,
-    };
-  }
-  const next: OrchestratorClaim = {
-    ...read.claim,
-    heartbeatAt: Math.max(read.claim.heartbeatAt, options.now),
-  };
-  try {
-    writeClaimAtomically({ worktreePath: options.worktreePath, claim: next, now: options.now, fs });
-    return { ok: true, claim: next };
-  } catch (error) {
-    return {
-      ok: false,
-      reason: "write-failed",
-      error: `could not renew ${orchestratorClaimPath(options.worktreePath)}: ${errorMessage(error)}`,
-    };
-  }
+  const renewed = store.heartbeatLease({
+    taskId: current.value.taskId,
+    sessionId: options.sessionId,
+    nowMs: options.now,
+    ttlMs: leaseTtlInMs(options),
+  });
+  if (!renewed.ok) return { ok: false, reason: renewed.reason, error: renewed.error };
+  const claim = claimFromRow(renewed.lease);
+  return claim === undefined
+    ? { ok: false, reason: "corrupt", error: "the renewed lease does not parse" }
+    : { ok: true, claim };
 }
 
 /**
  * Replace a lease this session already holds.
  *
  * Used by a same-directory handoff: the caller is the worktree's orchestrator, so
- * the spawner must be able to turn the caller's lease into the child's `pending`
- * one. Refuses unless the record still names `expectSessionId`, so a lease that
- * another session took over is never silently stolen back.
+ * the spawner turns the caller's lease into the child's `pending` one. Ownership is
+ * part of the write (`WHERE session_id = ?`), so a lease another session has taken
+ * over is never silently stolen back.
  */
-export function replaceOrchestratorClaim(options: {
-  worktreePath: string;
-  expectSessionId: string;
-  taskId: string;
-  branch: string;
-  sessionId: string;
-  pid: number;
-  now: number;
-  fs?: OrchestratorClaimFs;
-}):
+export function replaceOrchestratorClaim(
+  options: OrchestratorClaimStoreSeam & {
+    worktreePath: string;
+    expectSessionId: string;
+    taskId: string;
+    branch: string;
+    sessionId: string;
+    pid: number;
+    now: number;
+    staleAfterInMs?: number;
+  },
+):
   | { ok: true; claim: OrchestratorClaim }
   | { ok: false; reason: "not-owner" | "write-failed"; error: string } {
-  const fs = options.fs ?? orchestratorClaimFs;
-  const read = readOrchestratorClaim({ worktreePath: options.worktreePath, fs });
-  if (read.kind !== "ok") {
-    return { ok: false, reason: "not-owner", error: "no orchestrator lease to replace" };
-  }
-  if (read.claim.sessionId !== options.expectSessionId) {
+  const store = storeFor(options);
+  if (store === null)
+    return { ok: false, reason: "write-failed", error: "repo state store unavailable" };
+  const replaced = store.replaceLease({
+    taskId: options.taskId,
+    expectSessionId: options.expectSessionId,
+    sessionId: options.sessionId,
+    branch: options.branch,
+    worktreePath: options.worktreePath,
+    pid: options.pid,
+    nowMs: options.now,
+    ttlMs: leaseTtlInMs(options),
+  });
+  if (!replaced.ok) {
     return {
       ok: false,
-      reason: "not-owner",
-      error: `the lease names session ${read.claim.sessionId}, not ${options.expectSessionId}`,
+      reason: replaced.reason === "not-owner" ? "not-owner" : "write-failed",
+      error: replaced.error,
     };
   }
-  const claim = buildClaim(options);
-  try {
-    writeClaimAtomically({ worktreePath: options.worktreePath, claim, now: options.now, fs });
-    return { ok: true, claim };
-  } catch (error) {
-    return { ok: false, reason: "write-failed", error: errorMessage(error) };
+  const claim = claimFromRow(replaced.lease);
+  if (claim === undefined) {
+    return { ok: false, reason: "write-failed", error: "the replaced lease does not parse" };
   }
+  return { ok: true, claim };
 }
 
 /** Remove a lease this session owns (best effort; a stale record is recoverable). */
-export function releaseOrchestratorClaim(options: {
-  worktreePath: string;
-  sessionId: string;
-  fs?: OrchestratorClaimFs;
-}): { ok: true; released: boolean } | { ok: false; error: string } {
-  const fs = options.fs ?? orchestratorClaimFs;
-  const read = readOrchestratorClaim({ worktreePath: options.worktreePath, fs });
-  if (read.kind !== "ok") return { ok: true, released: false };
-  if (read.claim.sessionId !== options.sessionId) return { ok: true, released: false };
-  try {
-    fs.unlinkSync(orchestratorClaimPath(options.worktreePath));
-    return { ok: true, released: true };
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) };
-  }
+export function releaseOrchestratorClaim(
+  options: OrchestratorClaimStoreSeam & {
+    worktreePath: string;
+    sessionId: string;
+  },
+): { ok: true; released: boolean } | { ok: false; error: string } {
+  const store = storeFor(options);
+  if (store === null) return { ok: true, released: false };
+  const released = store.releaseLease({
+    worktreePath: options.worktreePath,
+    sessionId: options.sessionId,
+  });
+  return released.ok
+    ? { ok: true, released: released.value.released }
+    : { ok: false, error: released.error };
 }
 
 export type AdoptOrchestratorClaimResult =
@@ -636,8 +503,6 @@ export type AdoptOrchestratorClaimResult =
       claim: OrchestratorClaim;
       /** How this session came to hold the lease. */
       adopted: "fresh" | "own" | "pending" | "stale" | "corrupt";
-      /** Where a displaced record was archived (`stale`/`corrupt` only). */
-      archivedPath?: string;
     }
   | { ok: false; reason: "held"; verdict: OrchestratorClaimVerdict; error: string };
 
@@ -652,21 +517,22 @@ export type AdoptOrchestratorClaimResult =
  *
  * Adoption order is what makes a concurrent double launch safe: the pending lease
  * belongs to whichever session arrives first, and the second one finds a live lease
- * for a different session and backs off.
+ * for a different session and backs off. Every step is one store transaction, so
+ * the order needs no re-read to stay correct.
  */
-export function adoptOrchestratorClaim(options: {
-  worktreePath: string;
-  taskId: string;
-  branch: string;
-  sessionId: string;
-  pid: number;
-  now: number;
-  staleAfterInMs?: number;
-  fs?: OrchestratorClaimFs;
-}): AdoptOrchestratorClaimResult {
-  const fs = options.fs ?? orchestratorClaimFs;
+export function adoptOrchestratorClaim(
+  options: OrchestratorClaimStoreSeam & {
+    worktreePath: string;
+    taskId: string;
+    branch: string;
+    sessionId: string;
+    pid: number;
+    now: number;
+    staleAfterInMs?: number;
+  },
+): AdoptOrchestratorClaimResult {
   const verdict = classifyOrchestratorClaim({
-    read: readOrchestratorClaim({ worktreePath: options.worktreePath, fs }),
+    read: readOrchestratorClaim(options),
     now: options.now,
     sessionId: options.sessionId,
     ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
@@ -675,54 +541,38 @@ export function adoptOrchestratorClaim(options: {
   switch (verdict.kind) {
     case "free":
     case "corrupt":
-      return adoptByAcquire(options, verdict.kind === "corrupt" ? "corrupt" : "fresh", fs);
+      return adoptByAcquire(options, verdict.kind === "corrupt" ? "corrupt" : "fresh");
     case "held":
-      if (verdict.sameSession) return renewAdoptedClaim(options, verdict, fs);
-      if (isPendingOrchestratorClaim(verdict.claim)) return adoptPendingClaim(options, verdict, fs);
+      if (verdict.sameSession) return renewAdoptedClaim(options, verdict);
+      if (isPendingOrchestratorClaim(verdict.claim)) return adoptPendingClaim(options, verdict);
       if (verdict.state === "live") {
         return { ok: false, reason: "held", verdict, error: describeOrchestratorClaim(verdict) };
       }
-      return adoptByAcquire(options, "stale", fs);
+      return adoptByAcquire(options, "stale");
   }
 }
 
 function adoptByAcquire(
-  options: Parameters<typeof adoptOrchestratorClaim>[0],
+  options: Omit<AcquireOrchestratorClaimOptions, "takeOverStale">,
   adopted: "fresh" | "stale" | "corrupt",
-  fs: OrchestratorClaimFs,
 ): AdoptOrchestratorClaimResult {
-  const acquired = acquireOrchestratorClaim({
-    worktreePath: options.worktreePath,
-    taskId: options.taskId,
-    branch: options.branch,
-    sessionId: options.sessionId,
-    pid: options.pid,
-    now: options.now,
-    takeOverStale: true,
-    ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
-    fs,
-  });
+  const acquired = acquireOrchestratorClaim({ ...options, takeOverStale: true });
   if (!acquired.ok) {
     return { ok: false, reason: "held", verdict: acquired.verdict, error: acquired.error };
   }
-  return {
-    ok: true,
-    claim: acquired.claim,
-    adopted,
-    ...(acquired.archivedPath === undefined ? {} : { archivedPath: acquired.archivedPath }),
-  };
+  return { ok: true, claim: acquired.claim, adopted };
 }
 
 function renewAdoptedClaim(
-  options: Parameters<typeof adoptOrchestratorClaim>[0],
-  verdict: OrchestratorClaimVerdict,
-  fs: OrchestratorClaimFs,
+  options: Omit<AcquireOrchestratorClaimOptions, "takeOverStale">,
+  verdict: Extract<OrchestratorClaimVerdict, { kind: "held" }>,
 ): AdoptOrchestratorClaimResult {
   const renewed = heartbeatOrchestratorClaim({
     worktreePath: options.worktreePath,
     sessionId: options.sessionId,
     now: options.now,
-    fs,
+    ...(options.store === undefined ? {} : { store: options.store }),
+    ...(options.staleAfterInMs === undefined ? {} : { staleAfterInMs: options.staleAfterInMs }),
   });
   if (!renewed.ok) return { ok: false, reason: "held", verdict, error: renewed.error };
   return { ok: true, claim: renewed.claim, adopted: "own" };
@@ -730,28 +580,30 @@ function renewAdoptedClaim(
 
 /** Take over the spawner's placeholder lease (the first session to start wins). */
 function adoptPendingClaim(
-  options: Parameters<typeof adoptOrchestratorClaim>[0],
+  options: Omit<AcquireOrchestratorClaimOptions, "takeOverStale">,
   verdict: Extract<OrchestratorClaimVerdict, { kind: "held" }>,
-  fs: OrchestratorClaimFs,
 ): AdoptOrchestratorClaimResult {
-  const adopted: OrchestratorClaim = {
-    ...verdict.claim,
-    sessionId: options.sessionId,
-    pid: options.pid,
-    claimedAt: options.now,
-    heartbeatAt: options.now,
-  };
-  try {
-    writeClaimAtomically({
-      worktreePath: options.worktreePath,
-      claim: adopted,
-      now: options.now,
-      fs,
-    });
-    return { ok: true, claim: adopted, adopted: "pending" };
-  } catch (error) {
-    return { ok: false, reason: "held", verdict, error: errorMessage(error) };
+  const store = storeFor(options);
+  if (store === null) {
+    return { ok: false, reason: "held", verdict, error: "repo state store unavailable" };
   }
+  const adopted = store.assignLeaseSession({
+    taskId: options.taskId,
+    worktreePath: options.worktreePath,
+    pendingSessionId: verdict.claim.sessionId,
+    sessionId: options.sessionId,
+    branch: options.branch,
+    worktreePathValue: options.worktreePath,
+    pid: options.pid,
+    nowMs: options.now,
+    ttlMs: leaseTtlInMs(options),
+  });
+  if (!adopted.ok) return { ok: false, reason: "held", verdict, error: adopted.error };
+  const claim = claimFromRow(adopted.lease);
+  if (claim === undefined) {
+    return { ok: false, reason: "held", verdict, error: "the adopted lease does not parse" };
+  }
+  return { ok: true, claim, adopted: "pending" };
 }
 
 /**
@@ -760,27 +612,27 @@ function adoptPendingClaim(
  * Idempotent: the child may have adopted the lease first (same id), and a lease
  * already naming a different session is left alone — that session owns it now.
  */
-export function assignOrchestratorClaimSession(options: {
-  worktreePath: string;
-  fromSessionId: string;
-  toSessionId: string;
-  now: number;
-  fs?: OrchestratorClaimFs;
-}): { ok: true; assigned: boolean } | { ok: false; error: string } {
-  const fs = options.fs ?? orchestratorClaimFs;
-  const read = readOrchestratorClaim({ worktreePath: options.worktreePath, fs });
-  if (read.kind !== "ok") return { ok: true, assigned: false };
-  if (read.claim.sessionId === options.toSessionId) return { ok: true, assigned: false };
-  if (read.claim.sessionId !== options.fromSessionId) return { ok: true, assigned: false };
-  try {
-    writeClaimAtomically({
-      worktreePath: options.worktreePath,
-      claim: { ...read.claim, sessionId: options.toSessionId },
-      now: options.now,
-      fs,
-    });
-    return { ok: true, assigned: true };
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) };
-  }
+export function assignOrchestratorClaimSession(
+  options: OrchestratorClaimStoreSeam & {
+    worktreePath: string;
+    fromSessionId: string;
+    toSessionId: string;
+    now: number;
+  },
+): { ok: true; assigned: boolean } | { ok: false; error: string } {
+  const store = storeFor(options);
+  if (store === null) return { ok: true, assigned: false };
+  const current = store.readLease({ worktreePath: options.worktreePath });
+  if (!current.ok) return { ok: false, error: current.error };
+  if (current.value === null) return { ok: true, assigned: false };
+  if (current.value.sessionId === options.toSessionId) return { ok: true, assigned: false };
+  if (current.value.sessionId !== options.fromSessionId) return { ok: true, assigned: false };
+  const assigned = store.assignLeaseSession({
+    taskId: current.value.taskId,
+    pendingSessionId: options.fromSessionId,
+    sessionId: options.toSessionId,
+    nowMs: options.now,
+  });
+  if (!assigned.ok) return { ok: false, error: assigned.error };
+  return { ok: true, assigned: true };
 }

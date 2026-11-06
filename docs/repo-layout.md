@@ -66,18 +66,20 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/process-gate.ts` | Process gate — enforces mandatory phase order for Belayd tasks |
 | `src/workflow-phases.ts` | Workflow phases — canonical order, phase tool names, and the pure phase-list helpers; `AwaitingHuman` (the in-memory mirror of an open `belayd_ask_human` gate) |
 | `src/workflow-registry.ts` | Workflow sub-type registry — defines 7 workflow types with phase sequences, |
-| `src/workflow-state.ts` | Belayd workflow state persistence |
+| `src/workflow-state.ts` | Workflow state over the shared repository store — gate state, phase ledger, handoff markers, review scope (bd-281); re-exports the record schema/parsers |
+| `src/workflow-state-record.ts` | The persisted workflow record: zod shapes, parsers and the claimability decision (pure, so the migration importer can validate a legacy file without the store wiring) |
 | `src/handoff.ts` | Handoff packets carried from a parent session into a spawned orchestrator |
 | `src/quality-gates.ts` | Deterministic quality gates for Belayd agents |
 | `src/quality-gate-run.ts` | Quality-gate runner — the retry loop around a phase's deterministic gates |
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
-| `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt at `.belayd/proof-receipt.json` |
+| `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt as a `proof_receipt` row in the shared store (bd-281; the pi-web plugin still reads the retired `.belayd/proof-receipt.json` until bd-303) |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
 | `src/review-findings.ts` | Durable review findings: severity/disposition record and the comment body a human reads (bd-175, bd-219) |
 | `src/secret-scan.ts` | Outbound text scan (bd-286): refuses to post a comment, gate question or fleet note that `betterleaks` flags, naming rule ids only |
 | `src/run-manifest.ts` | Run manifests for individual phase-agent executions |
+| `src/atomic-json-file.ts` | Crash-safe JSON file write (temp + rename) for the runtime files that are still files |
 | `src/workflow-digest.ts` | Deterministic workflow digest for one fleet member (bd-189, tier 2) — sections, the ranked stuck verdict, and no model or transcript seam |
 | `src/run-detached.ts` | Detached background run orchestration |
 | `src/session-naming.ts` | Session naming utilities for subagent session management |
@@ -207,19 +209,67 @@ otherwise put two repositories' same-named branches in one shared directory.
 | `src/aws-broker/scope.ts` | Sandbox and socket paths for the per-repo AWS credential broker (bd-125) |
 | `src/aws-broker/server.ts` | Unix-socket protocol and plumbing for the broker (bd-125) |
 
+#### Repository execution state (bd-281)
+
+| File | Purpose |
+|---|---|
+| `src/repo-state-store.ts` | The one per-repository execution store: `node:sqlite` in WAL at `<git-common-dir>/belayd/state.sqlite` (override `BELAYD_REPO_STATE_FILE`). Schema and typed API for workflow state, orchestrator leases, run manifests, review scope/findings, the proof receipt, fleet intent+run (revision CAS, transactional landing), merge queue + single-flight lock, notes, audit tail and launch markers. Identity is the task id, never a worktree path |
+| `src/repo-state-import.ts` | One-shot, idempotent import of the retired *worktree* files and the refusal that names `bd-281` for a legacy one present afterwards: `.belayd/workflow.json`, `orchestrator.json`, `review-findings.json`, `proof-receipt.json`, `handoff-*.json`, `review-scope.json`, `runs/*.json`, marked per worktree (`bd-281-legacy-workflow-state:<worktree>`). The receipt row is keyed by the `taskId` the legacy receipt itself names (not by the worktree), so a file naming another bead is stored under that bead. Owns the per-process migration guard both halves share (`claimMigrationTarget`). Kept free of fleet imports so every workflow caller stays out of the fleet supervisor graph |
+| `src/fleet-state-import.ts` | The fleet half of the same migration: `fleet.json`, `merge-queue.json`, a live `merge.lock.d` holder record, the `audit.log` tail, `launch/<taskId>`, `supervisor.json` and `inbox/*.json` / `events/*.json` under `<git-common-dir>/belayd/fleet/<fleetId>/`, marked per common dir (`bd-281-legacy-fleet-state:<git-common-dir>`). Every insert is absent-first *inside its transaction* through a plan helper (the audit tail through `RepoStateStore.importAudit`), so a second worktree importing the same rows adds nothing and a row a live fleet wrote after the legacy file was read is not overwritten; an expired or holder-less lock imports as no lock |
+| `src/sqlite-store-open.ts` | Shared `node:sqlite` hardening: lazy engine load, dir 0700 / file 0600, WAL + busy timeout, `user_version` schema apply inside one `BEGIN IMMEDIATE`, open-failure classification and bounded migration retry. Used by both stores |
+| `src/git-common-dir.ts` | The shared git common-dir probe, extracted so the state store can resolve it without importing the worktree/handoff graph |
+
+Rows, not files: workflow state, the orchestrator lease, run manifests
+(`src/run-manifest.ts`), the review-findings record (`src/review-findings.ts`),
+the caller handoff marker and the pending review scope, the proof receipt
+(`src/proof-receipt.ts`), plus the whole fleet
+surface (`fleet_intent`, `fleet_queue`, `fleet_lock`, `fleet_audit`,
+`fleet_launch_marker`, `fleet_supervisor`, `fleet_note`).
+
+The store is **one per repository, in the git common dir**; a directory that is
+not a repository gets no store (an error), never a worktree-local SQLite file —
+that would be a file inside a worktree and would re-create the copied-state bug.
+Identity is the task id (runs: run id; fleets: fleet id), never a worktree path,
+so two sessions in different worktrees resolve the same row instead of a copy.
+`src/workflow-state.ts` runs the worktree half of the legacy import on a
+worktree's first store access, and `extensions/capabilities/fleet.ts` runs the
+fleet half on a repository's first fleet resolution; a retired file that appears
+afterwards is refused with an error naming `bd-281`.
+
+Not state, and deliberately still files: `.belayd/artifacts/` (phase
+deliverables), `.belayd/proof-dir` (the marker pi-web-plugins reads through the
+browser file API), `.belayd/review-findings.md`
+(rendered artifact), `.belayd/config.json` (repo-authored proof policy),
+`.belayd/handoff.json`, `.belayd/telemetry.json` and `.belayd/github-map.json`.
+They are path facts and deliverables; the publish gate reads them as paths.
+
+The proof receipt is **not** in that set: bd-281 moved it into `proof_receipt`
+(schema v5) and accepted one outward break. The plugin at
+`pi-web-plugins/proof-of-work/discovery.js` still reads
+`.belayd/proof-receipt.json` through the browser file
+API, so its proof panel reports no receipt until bd-303 makes it read the
+SQLite row. There is no dual write: a mirrored file is the copied state bd-281
+removes.
+
+Writes retry a *transient* store failure (a busy or momentarily unavailable
+database) twice with a short backoff, reusing `classifyStoreFailure`; a permanent
+failure fails on the first attempt, and the retry bound keeps a genuinely busy
+store surfacing a failure instead of stalling a tick.
+
 ### Durable members (`src/durable-member/`)
 
 Read-only viewer contract plus the member-owned control plane for durable
 members (bd-186); design, authority matrix and the WAL probe:
 `docs/durable-member-panel.md`.
 
-**`node:sqlite` import boundary.** Production `src/` code imports it in two
-modules: `durable-member/standalone-store.ts` (the reference durable store) and
-`model-state-store.ts` (the shared cooldown/capacity/spend store, bd-187). The
-second is deliberately separate: it has no durable-member contract to mirror, it
-is opened read-only by design in some callers, and it must degrade to a
-permissive policy when the engine or the file is unavailable. Everything else
-reaches both through their module APIs. The plugin's mirrored `store-reader.js`
+**`node:sqlite` import boundary.** Production `src/` code imports it in three
+modules: `durable-member/standalone-store.ts` (the reference durable store),
+`model-state-store.ts` (the shared cooldown/capacity/spend store, bd-187) and
+`repo-state-store.ts` (the per-repository execution store, bd-281). The latter
+two are deliberately separate: neither has a durable-member contract to mirror,
+they are opened read-only by design in some callers, and they must degrade (a
+permissive policy, or "no state") when the engine or the file is unavailable.
+Everything else reaches all three through their module APIs. The plugin's mirrored `store-reader.js`
 also imports it. The plain-JS probe fixtures
 `test/fixtures/durable-readonly-{writer,viewer}.mjs`,
 `test/fixtures/model-state-process.mjs` and

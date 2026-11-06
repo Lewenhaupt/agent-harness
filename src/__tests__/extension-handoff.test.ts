@@ -8,19 +8,19 @@
  * the same bead and produce duplicate phase runs and apparent reverts.
  */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  callerHandoffFilePath,
   computeOrchestratorSessionName,
   readCallerHandoff,
   readWorkflowState,
   workflowStateFilePath,
   writeCallerHandoff,
 } from "../index.js";
+import { resetSharedRepoStateStore } from "../repo-state-store.js";
 import { RunStatus, readRunManifest, writeRunManifest } from "../run-manifest.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
@@ -708,25 +708,33 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
     );
   });
 
-  it("aborts the handoff when the caller-scoped marker cannot be written", async () => {
+  it("aborts the handoff when the shared store is unavailable", async () => {
     const harness = await loadPi();
     const ctx = createCtx(cwd);
     await startCallerWorkflow(harness.tools, ctx);
 
-    // Make `.belayd` a regular file so the marker write cannot create its dir.
-    const belaydPath = join(cwd, ".belayd");
-    rmSync(belaydPath, { recursive: true, force: true });
-    writeFileSync(belaydPath, "not a directory");
+    // Point the shared store at an unusable path: the marker is a store row now
+    // (bd-281), so "the marker cannot be written" means "the store is
+    // unavailable", which is the failure the caller must survive.
+    const blocked = join(cwd, "blocked-store");
+    writeFileSync(blocked, "not a directory");
+    process.env.BELAYD_REPO_STATE_FILE = join(blocked, "state.sqlite");
+    resetSharedRepoStateStore();
 
     const outcome = await harness.tools
       .get("belayd_start_followup")
       ?.execute("followup", { taskId: "bd-101", base: "main" }, undefined, undefined, ctx);
+    delete process.env.BELAYD_REPO_STATE_FILE;
+    resetSharedRepoStateStore();
 
     const text = statusText(outcome);
     expect(toolExitCode(outcome)).toBe(1);
-    // The error names the live child so the operator can clean it up.
-    expect(text).toContain("sess-child");
-    expect(text).toContain("stays armed");
+    // bd-281 put the workflow record, the lease and the caller marker in one store,
+    // so the launch now fails at its first write (the lease) and never creates a
+    // child to name. The property that matters is unchanged: no disarm without a
+    // marker, and the refusal names the store rather than a session.
+    expect(text).toContain("state store");
+    expect(text).not.toContain("One orchestrator per worktree");
     expect(harness.messages.some((m) => m.customType === "belayd-handoff")).toBe(false);
     // The caller still drives (and can still see) its workflow.
     expect(harness.activeTools).not.toEqual(FULL_TOOLS);
@@ -736,18 +744,19 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
   it("surfaces a failure to clear a stale handoff marker on a new task", async () => {
     const harness = await loadPi();
     const ctx = createCtx(cwd);
-    const sessionId = ctx.sessionManager.getSessionId();
+    const _sessionId = ctx.sessionManager.getSessionId();
     await startCallerWorkflow(harness.tools, ctx);
     await harness.tools
       .get("belayd_start_followup")
       ?.execute("followup", { taskId: "bd-101", base: "main" }, undefined, undefined, ctx);
 
-    // Replace the marker file with a non-empty directory: unlink cannot remove
-    // it, so clearing (and therefore resuming the new task) would silently fail.
-    const markerPath = callerHandoffFilePath(cwd, sessionId);
-    rmSync(markerPath, { force: true });
-    mkdirSync(markerPath);
-    writeFileSync(join(markerPath, "keep"), "x");
+    // Unreachable store: clearing (and therefore resuming the new task) fails and
+    // must be reported rather than silently ignored. The marker row is
+    // unreachable with it.
+    const blocked = join(cwd, "blocked-store");
+    writeFileSync(blocked, "not a directory");
+    process.env.BELAYD_REPO_STATE_FILE = join(blocked, "state.sqlite");
+    resetSharedRepoStateStore();
 
     await harness.tools
       .get("belayd_start_task")
@@ -758,9 +767,14 @@ describe("workflow handoff disarms the caller (bd-120)", () => {
         undefined,
         ctx,
       );
+    delete process.env.BELAYD_REPO_STATE_FILE;
+    resetSharedRepoStateStore();
 
     const problem = harness.messages.find((m) => m.customType === "belayd-error");
-    expect(problem?.content).toContain("could not clear this session's handoff marker");
+    // bd-281: with one store, the primary workflow marker is the first clear to
+    // fail, and it names the store rather than a retired file path.
+    expect(problem?.content).toContain("could not clear the handoff marker");
+    expect(problem?.content).toContain("state.sqlite");
     // The new task still arms in this process.
     expect(await runBeforeAgentStart(harness, ctx)).toContain("BELAYD WORKFLOW ACTIVE");
   });

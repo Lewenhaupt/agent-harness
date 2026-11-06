@@ -37,10 +37,32 @@
  * keep serving with a read-only state store.
  */
 
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
-import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import {
+  addColumnIfMissing,
+  asRow,
+  classifyStoreFailure,
+  errorMessage,
+  inImmediateTransaction,
+  openSqliteFile,
+  readNumber,
+  readOptionalNumber,
+  readString,
+  type SqliteDatabaseLike,
+  type StoreFailureClass,
+  tightenStoreFileModes,
+} from "./sqlite-store-open.js";
+
+// Re-exported so the hardening has exactly one implementation while the model
+// store's public surface (and its tests) keep importing it from here.
+export {
+  classifyStoreFailure,
+  type SqliteDatabaseLike,
+  type SqliteStatementLike,
+  type SqlValue,
+  type StoreFailureClass,
+} from "./sqlite-store-open.js";
 
 /** Override for the store path, matching the `BELAYD_MODEL_COOLDOWN_FILE` precedent. */
 export const MODEL_STATE_FILE_ENV = "BELAYD_MODEL_STATE_FILE";
@@ -129,27 +151,6 @@ export function cooldownProviderKey(provider: string | undefined): string {
  */
 export function modelStatePathForCooldownFile(filePath: string): string {
   return `${filePath.replace(/\.json$/i, "")}.sqlite`;
-}
-
-/** A value SQLite can bind as an anonymous parameter. */
-export type SqlValue = string | number | bigint | null;
-
-/** The subset of `node:sqlite`'s `StatementSync` this store uses. */
-export interface SqliteStatementLike {
-  run(...params: SqlValue[]): { changes: number | bigint; lastInsertRowid: number | bigint };
-  get(...params: SqlValue[]): unknown;
-  all(...params: SqlValue[]): unknown[];
-}
-
-/**
- * The subset of `node:sqlite`'s `DatabaseSync` this store uses. Declared
- * structurally so unit tests can inject a fake and so a missing `node:sqlite`
- * build is a value, not a module-load crash.
- */
-export interface SqliteDatabaseLike {
-  exec(sql: string): void;
-  prepare(sql: string): SqliteStatementLike;
-  close(): void;
 }
 
 /** Errors as values, per the repo convention. */
@@ -833,91 +834,6 @@ CREATE TABLE IF NOT EXISTS spend (
 CREATE INDEX IF NOT EXISTS spend_ts ON spend (ts);
 `;
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Whether a store failure can clear on its own.
- *
- * A transient failure (another process holds the write lock, a migration is in
- * flight, a momentary IO hiccup) is worth retrying; a permanent one (no
- * `node:sqlite`, a bad path or permission, a non-sqlite file, corruption) never
- * fixes itself and must stop retrying so a broken install cannot produce an
- * endless warning loop.
- */
-export type StoreFailureClass = "transient" | "permanent";
-
-/**
- * Errors that can clear without operator action: SQLite lock contention,
- * momentary IO and transient storage pressure. Checked after the permanent
- * patterns, so a message carrying both (a corrupt file reported while busy)
- * still fails fast.
- *
- * Both spellings the runtime can emit are covered: the errno form (`EIO`,
- * `EAGAIN`, `EBUSY`, ...) and the SQLite-class form (`SQLITE_IOERR: disk I/O
- * error`, `SQLITE_FULL: database or disk is full`, `SQLITE_BUSY_SNAPSHOT`, ...).
- * `node:sqlite` often reports only the bare errstr (`disk I/O error`) with
- * `code: "ERR_SQLITE_ERROR"`, so the message text has to carry the diagnosis.
- * Missing a transient here is expensive: the default is permanent, which turns
- * cooldown tracking off for the rest of the process.
- */
-const TRANSIENT_STORE_ERROR_PATTERN =
-  /SQLITE_BUSY|SQLITE_LOCKED|SQLITE_PROTOCOL|SQLITE_IOERR|SQLITE_FULL|SQLITE_NOMEM|SQLITE_INTERRUPT|database (?:table )?is locked|database is busy|disk I\/O error|database or disk is full|out of memory|interrupted|EIO\b|EINTR\b|EAGAIN|EBUSY|ENOMEM\b|ETXTBSY|temporar/i;
-
-/**
- * SQLite primary result codes that can clear on retry, masked out of node:sqlite's
- * extended `errcode`: BUSY(5), LOCKED(6), NOMEM(7), INTERRUPT(9), IOERR(10),
- * FULL(13) and PROTOCOL(15). CANTOPEN(14) stays permanent: its message is
- * "unable to open database file", i.e. a path/permission fault.
- */
-const TRANSIENT_SQLITE_PRIMARY_CODES: ReadonlySet<number> = new Set([5, 6, 7, 9, 10, 13, 15]);
-
-/**
- * SQLite primary codes that never fix themselves: READONLY(8), CORRUPT(11),
- * CANTOPEN(14), SCHEMA(17) and NOTADB(26).
- */
-const PERMANENT_SQLITE_PRIMARY_CODES: ReadonlySet<number> = new Set([8, 11, 14, 17, 26]);
-
-/**
- * Errors that will not clear on retry: the engine is missing, the path or its
- * parent cannot be used, the file is not a sqlite database, or the schema is
- * corrupt/unexpected. `unable to open database file` is what SQLite reports for
- * ENOTDIR/EISDIR/ENOENT parents, and `file is not a database` for SQLITE_NOTADB.
- */
-const PERMANENT_STORE_ERROR_PATTERN =
-  /SQLITE_CORRUPT|SQLITE_NOTADB|SQLITE_READONLY|disk image is malformed|ENOTDIR|EACCES|EPERM|EROFS|ENOSPC|EISDIR|ENOENT|file is not a database|unable to open database file|node:sqlite (?:unavailable|does not expose)|does not exist/i;
-
-/** node:sqlite's numeric `errcode`, reduced to its primary (non-extended) code. */
-function sqlitePrimaryCode(error: unknown): number | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const errcode = (error as { errcode?: unknown }).errcode;
-  if (typeof errcode !== "number" || !Number.isInteger(errcode)) return undefined;
-  return errcode & 0xff;
-}
-
-/**
- * Classify one store failure from its message/code.
- *
- * Permanent wins over transient so a corrupt or inaccessible store fails fast;
- * an unrecognised error is treated as permanent because the cost of being wrong
- * is a warning storm that never recovers — the single warning therefore names
- * the error and says cooldown tracking is off, so the diagnosis is actionable.
- */
-export function classifyStoreFailure(error: unknown): StoreFailureClass {
-  const code =
-    typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-  const text = `${typeof code === "string" ? code : ""} ${errorMessage(error)}`;
-  if (PERMANENT_STORE_ERROR_PATTERN.test(text)) return "permanent";
-  const primary = sqlitePrimaryCode(error);
-  if (primary !== undefined) {
-    if (TRANSIENT_SQLITE_PRIMARY_CODES.has(primary)) return "transient";
-    if (PERMANENT_SQLITE_PRIMARY_CODES.has(primary)) return "permanent";
-  }
-  if (TRANSIENT_STORE_ERROR_PATTERN.test(text)) return "transient";
-  return "permanent";
-}
-
 /**
  * Columns added to `cooldown` by schema v2, with the DDL needed to add each on
  * an existing v1 database.
@@ -931,16 +847,6 @@ const COOLDOWN_V2_COLUMNS: readonly (readonly [string, string])[] = [
   ["escalations", "INTEGER"],
   ["last_mark_ms", "INTEGER NOT NULL DEFAULT 0"],
 ];
-
-/** Column names of one table, read from the live schema. */
-function columnNames(database: SqliteDatabaseLike, table: string): Set<string> {
-  const names = new Set<string>();
-  for (const raw of database.prepare(`SELECT name FROM pragma_table_info('${table}')`).all()) {
-    const name = readString(asRow(raw) ?? {}, "name");
-    if (name !== "") names.add(name);
-  }
-  return names;
-}
 
 /**
  * Create the schema and add the v2 cooldown columns to a database created by
@@ -956,112 +862,13 @@ function columnNames(database: SqliteDatabaseLike, table: string): Set<string> {
  * a success rather than a failure.
  */
 function applySchemaOnce(database: SqliteDatabaseLike): void {
-  database.exec("BEGIN IMMEDIATE");
-  try {
+  inImmediateTransaction(database, () => {
     database.exec(SCHEMA);
-    const existing = columnNames(database, "cooldown");
     for (const [column, ddl] of COOLDOWN_V2_COLUMNS) {
-      if (existing.has(column)) continue;
-      try {
-        database.exec(`ALTER TABLE cooldown ADD COLUMN ${column} ${ddl}`);
-      } catch (error) {
-        // Another process may have added it between our read and this ALTER.
-        if (!columnNames(database, "cooldown").has(column)) throw error;
-      }
+      addColumnIfMissing(database, "cooldown", column, ddl);
     }
     database.exec(`PRAGMA user_version = ${MODEL_STATE_SCHEMA_VERSION}`);
-    database.exec("COMMIT");
-  } catch (error) {
-    try {
-      database.exec("ROLLBACK");
-    } catch {
-      /* the transaction is already gone; the original error is what matters */
-    }
-    throw error;
-  }
-}
-
-/**
- * Bounded retry for the schema step: only a retryable lock/busy failure is
- * retried (a concurrent migration or a busy WAL writer); corruption, permission
- * errors and malformed schema fail on the first attempt so the permanent-store
- * path can stop retrying instead of delaying the diagnosis.
- */
-function applySchema(database: SqliteDatabaseLike, onAttempt?: (attempt: number) => void): void {
-  for (let attempt = 1; ; attempt += 1) {
-    onAttempt?.(attempt);
-    try {
-      applySchemaOnce(database);
-      return;
-    } catch (error) {
-      if (attempt >= SCHEMA_MIGRATION_ATTEMPTS) throw error;
-      if (classifyStoreFailure(error) !== "transient") throw error;
-    }
-  }
-}
-
-/**
- * Tighten the database file and its WAL sidecars to 0600.
- *
- * WAL mode creates `-wal`/`-shm` next to the database on first write (and
- * recreates them as connections cycle); they carry the same shared budget data,
- * so leaving them at the umask default would make the state world-readable on a
- * multi-user host. Best effort: a missing sidecar or a mode we cannot change
- * must never fail a dispatch.
- */
-function tightenStoreFileModes(path: string): void {
-  for (const candidate of [path, `${path}-wal`, `${path}-shm`]) {
-    try {
-      chmodSync(candidate, 0o600);
-    } catch {
-      /* absent (no sidecar yet) or not ours to chmod */
-    }
-  }
-}
-
-function asRow(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
-function readNumber(row: Record<string, unknown>, key: string): number {
-  const value = row[key];
-  if (typeof value === "number") return value;
-  if (typeof value === "bigint") return Number(value);
-  return 0;
-}
-
-function readString(row: Record<string, unknown>, key: string): string {
-  const value = row[key];
-  return typeof value === "string" ? value : "";
-}
-
-/** A nullable INTEGER column, as a number or "not set". */
-function readOptionalNumber(row: Record<string, unknown>, key: string): number | undefined {
-  const value = row[key];
-  if (value === null || value === undefined) return undefined;
-  if (typeof value === "number") return value;
-  if (typeof value === "bigint") return Number(value);
-  return undefined;
-}
-
-/** Locate `node:sqlite` lazily: an unavailable engine is a value, not a crash. */
-function loadSqlite(): ModelStateResult<{
-  DatabaseSync: new (path: string, options?: unknown) => SqliteDatabaseLike;
-}> {
-  try {
-    const require = createRequire(import.meta.url);
-    const sqlite = require("node:sqlite") as {
-      DatabaseSync?: new (path: string, options?: unknown) => SqliteDatabaseLike;
-    };
-    if (typeof sqlite.DatabaseSync !== "function") {
-      return { ok: false, error: "node:sqlite does not expose DatabaseSync" };
-    }
-    return { ok: true, value: { DatabaseSync: sqlite.DatabaseSync } };
-  } catch (error) {
-    return { ok: false, error: `node:sqlite unavailable: ${errorMessage(error)}` };
-  }
+  });
 }
 
 export interface ModelStateStoreOptions extends Partial<ModelStateEnv> {
@@ -1092,43 +899,15 @@ function openDatabase(options: {
   database?: SqliteDatabaseLike;
   onSchemaAttempt?: (attempt: number) => void;
 }): ModelStateResult<SqliteDatabaseLike> {
-  if (options.database !== undefined) {
-    // An injected database still runs the schema step, so the migration and its
-    // retry policy are exercised against the fake rather than bypassed.
-    try {
-      applySchema(options.database, options.onSchemaAttempt);
-      return { ok: true, value: options.database };
-    } catch (error) {
-      return { ok: false, error: `could not open ${options.path}: ${errorMessage(error)}` };
-    }
-  }
-  try {
-    if (!options.readOnly) {
-      mkdirSync(dirname(options.path), { recursive: true, mode: 0o700 });
-    } else if (!existsSync(options.path)) {
-      // A read-only open of a missing file is useless; report it as unopenable
-      // instead of letting SQLite create an empty database behind the owner.
-      return { ok: false, error: `model state store ${options.path} does not exist` };
-    }
-    const sqlite = loadSqlite();
-    if (!sqlite.ok) return sqlite;
-    const database = new sqlite.value.DatabaseSync(options.path, {
-      readOnly: options.readOnly,
-      // A reader may race a writer's checkpoint; wait instead of failing.
-      timeout: 5_000,
-    });
-    if (options.readOnly) return { ok: true, value: database };
-    database.exec("PRAGMA journal_mode = WAL");
-    database.exec("PRAGMA synchronous = NORMAL");
-    database.exec("PRAGMA busy_timeout = 5000");
-    applySchema(database, options.onSchemaAttempt);
-    // WAL sidecars appear with the first WAL write, not necessarily with the
-    // journal_mode switch, so the modes are also tightened after each commit.
-    tightenStoreFileModes(options.path);
-    return { ok: true, value: database };
-  } catch (error) {
-    return { ok: false, error: `could not open ${options.path}: ${errorMessage(error)}` };
-  }
+  return openSqliteFile({
+    path: options.path,
+    readOnly: options.readOnly,
+    label: "model state store",
+    schemaAttempts: SCHEMA_MIGRATION_ATTEMPTS,
+    applySchema: applySchemaOnce,
+    ...(options.database === undefined ? {} : { database: options.database }),
+    ...(options.onSchemaAttempt === undefined ? {} : { onSchemaAttempt: options.onSchemaAttempt }),
+  });
 }
 
 /**

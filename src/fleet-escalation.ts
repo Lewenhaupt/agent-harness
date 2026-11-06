@@ -2,7 +2,7 @@
  * Fleet escalation as bd gates — one primitive for every human-relevant stop
  * (bd-279).
  *
- * Before this module a stopped member left a fact only `fleet.json` could answer:
+ * Before this module a stopped member left a fact only the fleet intent could answer:
  * `formatFleetRunStops` printed the reason and detail, but nothing on the bead
  * awaited a person, nothing was answerable, and once the run died nothing acted on
  * the line again. bd-277 paid for that three times in one wave — three members
@@ -166,7 +166,7 @@ export function fleetEscalationGateTitle(input: {
  * truncated — `slice` is applied to the prose that follows it), the member it
  * affects, the cause, what happened, and the three answers a person may choose,
  * including the exact command that records the choice. A bare "blocked" would leave
- * the person to re-derive all of that from `fleet.json`, which is the defect this
+ * the person to re-derive all of that from the fleet intent, which is the defect this
  * primitive removes.
  */
 export function fleetEscalationGateReason(input: {

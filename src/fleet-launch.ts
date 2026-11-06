@@ -72,7 +72,7 @@ import { isValidTaskId } from "./session-naming.js";
 export { FLEET_MAX_CONCURRENT_ORCHESTRATORS };
 
 export interface FleetConcurrencyResolution {
-  /** Ceiling actually stored in `fleet.json`. */
+  /** Ceiling actually stored in the fleet intent. */
   maxConcurrent: number;
   /** Requested value when it was above the ceiling and had to be clamped down. */
   clampedFrom?: number;
@@ -704,7 +704,7 @@ export function fleetUsageText(): string {
     "            either way); default: land only, leaving every bead in_progress + human",
     "            for you to accept",
     "  --publish: how merged work is published (default local: no remote, no network); the",
-    "             resolved contract is frozen into fleet.json at launch",
+    "             resolved contract is frozen into the fleet intent at launch",
     "  --publish-remote/--publish-base/--publish-ready/--publish-stacks: complete a pr/push",
     "             contract; they apply to whatever mode the config resolves to",
   ].join("\n");
@@ -1180,7 +1180,7 @@ export interface FleetOrderingGateSeam {
   /**
    * Resolve ordering gates bd reports for these beads, record or not (bd-158).
    *
-   * The crash-window path: a gate can exist in bd while `fleet.json` never got its
+   * The crash-window path: a gate can exist in bd while the intent row never got its
    * record, so a rollback that only knows the ids it recorded cannot see it.
    * `scope` is the caller's statement of what it owns: a rollback passes the edges
    * it created (never another edge's ordering), a gone member passes `whole-bead`.
@@ -1214,7 +1214,7 @@ export interface RunFleetLaunchOptions {
   pidStartTime?: string;
   /**
    * Secret minted by this session when it arms the fleet and held only in the
-   * session's memory (W6). Written into `fleet.json` so `matchesFleetSupervisor`
+   * session's memory (W6). Written into the intent row so `matchesFleetSupervisor`
    * has something only the arming session could have written.
    */
   armToken: string;
@@ -1325,7 +1325,7 @@ function audit(options: {
     },
   });
   if (appended.ok) return undefined;
-  return `fleet ${options.fleetId}: could not append to audit.log (${appended.error})`;
+  return `fleet ${options.fleetId}: could not append the audit entry (${appended.error})`;
 }
 
 /** Validated launch request: everything the side effects need. */
@@ -1747,7 +1747,7 @@ function recountLaunchCapacity(
 }
 
 /**
- * Merge the plan into `fleet.json`, then prove the record read back as written.
+ * Merge the plan into the intent row, then prove the record read back as written.
  *
  * The read-back is the second half of W6: `atomicWriteJson` guarantees the write
  * was not torn, but not that it survived a concurrent writer. A supervisor that
@@ -2321,7 +2321,7 @@ async function readDependencyGraph(options: RunFleetLaunchOptions): Promise<Flee
  *
  * Every cross-tree action (the intent write, a re-arm, the schedule, the ordering
  * gates, each launch attempt, each deferral, the prune) is appended to
- * \`audit.log\`. Nothing here merges, pauses, closes, or streams a bead, and no
+ * the fleet audit rows. Nothing here merges, pauses, closes, or streams a bead, and no
  * wave is advanced automatically.
  */
 export async function runFleetLaunch(

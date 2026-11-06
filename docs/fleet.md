@@ -39,22 +39,112 @@ per-area docs.
 The supervisor is a **scheduler**. It owns no worktree, arms no process gate, and
 runs no phase. Each member is an ordinary single-bead orchestrator with its own
 process gate, worktree, and `.belayd/` directory. Cross-tree state lives in
-`<git-common-dir>/belayd/fleet/<fleetId>/`:
+`<git-common-dir>/belayd/state.sqlite`:
 
 ```text
-fleet.json         operator intent: taskIds, maxConcurrent, paused, deferred, park, orderingGates, run record, supervisor record
-supervisor.json    run-mode supervisor heartbeat (re-arm eligibility)
-launch/            one file per member whose spawn is in flight (bd-233 spawn window)
-orchestrator.json  in each member worktree: the one-orchestrator lease
-audit.log          append-only: every cross-tree action
-inbox/             member → supervisor notes      (belayd_fleet_inbox drains + acks)
-events/            supervisor → member notes      (drained at each member's turn start)
-merge-queue.json   single-flight merge queue       merge.lock.d guards acquisition
+<git-common-dir>/belayd/state.sqlite   one row per fleet (bd-281):
+  fleet_intent        operator intent: taskIds, maxConcurrent, paused, deferred, park,
+                      orderingGates, supervisor record + the run record
+  fleet_queue         single-flight merge queue (entries; revision CAS)
+  fleet_lock          the merge lock claim (holder, task id, expiry)
+  fleet_audit         append-only: every cross-tree action (bounded tail: rows, not bytes)
+  fleet_launch_marker one row per member whose spawn is in flight (bd-233 spawn window)
+  fleet_supervisor    run-mode supervisor heartbeat (re-arm eligibility)
+  fleet_note          mailboxes: channel (event | inbox), target, author, kind, body,
+                      created/delivered/acked — one row per recipient
 ```
 
-Nothing in that directory is written by `belayd_fleet_status`; it is written by
-launch, note, merge, pause/resume, and reconcile, and only from a session that is
-the fleet's live supervisor.
+No fleet fact is a file any more. `<git-common-dir>/belayd/fleet/<fleetId>/` is
+only a legacy location: `belayd_fleet_status` still recognises a fleet from a
+directory an earlier version left, and the one-shot importer reads it.
+
+**The import-once contract (bd-281).** The first fleet resolution of a
+repository's common dir imports those legacy files into the store's rows —
+`fleet.json` into `fleet_intent` (intent column plus the `run` column),
+`merge-queue.json` into `fleet_queue`, a live `merge.lock.d` holder record into
+`fleet_lock`, the `audit.log` tail into `fleet_audit`, `launch/<taskId>` into
+`fleet_launch_marker`, `supervisor.json` into `fleet_supervisor`, and
+`inbox/*.json` / `events/*.json` into `fleet_note`. The marker is
+`bd-281-legacy-fleet-state:<git-common-dir>` — one per repository, because those
+files were already shared by every worktree. **Every insert is absent-first, and
+its existence check shares the insert's transaction:** each row goes through a
+plan helper (`mutateFleet` for the intent, `mutateFleetQueue`, `mutateSupervisor`,
+`mutateLaunchMarker`, `importNote`) whose plan is called with the row the write's
+`BEGIN IMMEDIATE` just read, so a row a live drain or supervisor wrote after the
+legacy file was read is never overwritten by the copy. The merge lock is claimed
+by `acquireFleetLock`, which reads and inserts in one transaction, and the audit
+tail is inserted through `RepoStateStore.importAudit`, which tests
+`(fleet_id, at, payload)` and inserts inside one `BEGIN IMMEDIATE`. That last one
+is why a second worktree importing the same common dir — even one racing before
+the first records its marker — adds no second row: the first writer's row is
+visible to the second's transaction, so it inserts nothing. The workflow half is
+absent-first too (a task that already has a `workflow_state` row keeps it; the
+stale file's generation is named in the skip, and the check runs in the write's
+transaction so a ledger the orchestrator advanced mid-import wins), because two
+copies of one task's phase ledger cannot be merged safely. An expired or
+holder-less `merge.lock.d` imports as **no lock** (a migration must never hand a live fleet a lock it would
+respect), an unparseable file is reported per file and skipped, a
+`*.json.corrupt` file is reported and left in place (it is evidence of a damaged
+record, not state), and every retired file still present afterwards is refused
+with an error naming `bd-281`.
+
+Nothing in the store is written by `belayd_fleet_status` — the one exception is
+the migration marker of the first fleet resolution in a repository, which is the
+import described above. Everything else is written by launch, note, merge,
+pause/resume, and reconcile, and only from a session that is the fleet's live
+supervisor.
+
+The audit tail is bounded by **rows** (`REPO_STATE_AUDIT_TAIL_ROWS`, 200), not by
+bytes. The file reader used a 64 KiB byte window because a file has no rows; the
+row bound is what a caller actually asks ("the last N entries") and does not
+change with message length.
+
+**Where workflow state lives (bd-281).** A member's *workflow* record is no longer
+`.belayd/workflow.json` inside its worktree, and neither are its orchestrator
+lease, its run manifests or its review-findings record: they are rows in the one
+per-repository store at `<git-common-dir>/belayd/state.sqlite`, keyed by **task
+id** (runs by run id). Every worktree of the repository resolves the same row, so a resumed session
+in another worktree reads the fact instead of a copy, and a stale record is
+visible from the row's `updated_at`/generation rather than inferred from a file.
+`belayd_fleet_status` reads members from that store; capacity evidence
+(`memberRanEvidence`) asks the store whether a member has a workflow record.
+
+Operationally that means:
+
+- **Back up `state.sqlite` with `.belayd/artifacts/`**, not by copying a
+  worktree; the file is never tracked and never inside a worktree.
+- The legacy files (`.belayd/workflow.json`, `orchestrator.json`,
+  `review-findings.json`, `proof-receipt.json`, `handoff-*.json`,
+  `review-scope.json`, `runs/*.json`) are
+  imported once by `bd-281-legacy-workflow-state:<worktree>` and refused
+  afterwards with an error naming `bd-281`. Delete one if it appears; do not
+  restore it. The fleet half of the same migration uses
+  `bd-281-legacy-fleet-state:<git-common-dir>` (see above).
+- **What remains a file, and why:** `.belayd/artifacts/` (phase deliverables
+  injected into prompts), the `.belayd/proof-dir` marker (read by
+  pi-web-plugins through the browser file API — see the SYNC WARNING in
+  `src/proof-dir.ts`), `.belayd/review-findings.md` (the rendered artifact a
+  posted comment names), and the repo-authored inputs `.belayd/config.json`,
+  `.belayd/handoff.json`, `.belayd/telemetry.json` and `.belayd/github-map.json`.
+  These are path facts and deliverables, not execution state, and the publish gate
+  reads them as paths.
+- **The proof receipt is a row too** (`proof_receipt`, schema v5), and that is
+  the one outward break this change accepted: the plugin at
+  `pi-web-plugins/proof-of-work/discovery.js` still reads
+  `.belayd/proof-receipt.json`, so its proof panel reports no receipt until
+  bd-303 makes it read the SQLite row. A receipt file present in an old worktree
+  is imported once by the worktree-half import and refused afterwards like every
+  other retired file.
+- The fleet intent/run (`fleet_intent`), merge queue (`fleet_queue`), merge lock
+  (`fleet_lock`), audit (`fleet_audit`), launch markers (`fleet_launch_marker`),
+  supervisor heartbeat (`fleet_supervisor`) and the note mailboxes (`fleet_note`)
+  are rows in that same store. Do not restore a retired `fleet.json`,
+  `merge-queue.json`, `merge.lock.d`, `audit.log`, `launch/` marker,
+  `supervisor.json`, or `inbox/`/`events/` directory: the store is the authority
+  for everything it holds. Two sessions in different worktrees resolve the same
+  rows, so copying state between worktrees is impossible by construction.
+- A directory that is not a git repository has no store, so a fleet-like run
+  outside git reports "no state" rather than writing a SQLite file into the tree.
 
 ### Ordering vs. acceptance (bd-158)
 
@@ -171,12 +261,15 @@ Now:
   gates resolves exactly the gates **it** created, scoped to their edges, and names
   any dependent it leaves bd-blocked together with the gate id to inspect — it
   never resolves ordering that predates it.
-- **A failed gate resolve never wedges a landed member.** The merge is recorded
-  (`landedAt`), the member is pruned, and the still-open gate stays in
-  `fleet.json` — visible in `belayd_fleet_status` as
-  `ordering gates open: bd-12 -> bd-13 (gate bd-155)` — while the next tick retries
-  the resolve. Retrying re-runs only the resolve: the merge queue entry is already
-  `merged`, so a second merge of the same member is impossible.
+- **A failed gate resolve never wedges a landed member.** The landing is one
+  transaction (store row, run `landedAt`, member pruned, its ordering-gate
+  *records* dropped, audit row, one revision bump), so bd is the only place the
+  still-open gate lives — `bd gate list` and `belayd_fleet_status`'s
+  `ordering gates open: bd-12 -> bd-13 (gate bd-155)` line. The next tick's
+  crash-window sweep resolves it, because a gate bd reports with no record and a
+  blocker that already left is exactly the orphan it reaps. Retrying re-runs only
+  the bd resolve: the merge queue entry is already `merged`, so a second merge of
+  the same member is impossible.
 - **Fleet-side advance is unchanged.** `fleetLandedTaskIds()` in
   `extensions/capabilities/fleet.ts` drops the edges of members this fleet already
   landed, so the scheduler advances a wave at the same moment the gate is
@@ -342,8 +435,8 @@ member orchestrators (different worktree workspaces) are not pinned.
 
 #### 3. Answer notes
 
-Members report up; you reply down. Both directions are files, drained at the
-reader's next turn start.
+Members report up; you reply down. Both directions are note rows
+(`fleet_note`), drained at the reader's next turn start.
 
 ```text
 belayd_fleet_note { "to": "supervisor", "body": "bd-12 is ready for review" }   // a member
@@ -351,16 +444,16 @@ belayd_fleet_note { "to": "bd-15", "body": "main moved; rebase before review", "
 belayd_fleet_note { "to": "all", "body": "pause after your current phase", "kind": "pause" }
 ```
 
-- `belayd_fleet_inbox` (supervisor only) drains and acknowledges `inbox/`. Notes
-  are rendered **before** they are acked and are framed as *member reports, not
-  supervisor instructions*.
-- A broadcast (`to: "all"`) is written as **one file per member**, so each member
+- `belayd_fleet_inbox` (supervisor only) drains and acknowledges the inbox
+  channel. Notes are rendered **before** they are acked and are framed as *member
+  reports, not supervisor instructions*.
+- A broadcast (`to: "all"`) is written as **one row per member**, so each member
   gets its own copy exactly once.
 - Delivery is **at-least-once**: a member acks at the end of the turn in which it
   read the note, so a crash replays it. Treat a repeat as the same event.
 - Addresses are validated against fleet membership (launched **and** deferred). A
-  typo is refused instead of becoming mail nobody reads. Members cannot write
-  `events/`, so no member can inject a fake instruction into a sibling's turn.
+  typo is refused instead of becoming mail nobody reads. Members cannot write the
+  event channel, so no member can inject a fake instruction into a sibling's turn.
 
 #### 4. Merge finished work
 
@@ -373,7 +466,7 @@ belayd_fleet_merge { "action": "drain" }          // oldest queued entry
 belayd_fleet_merge { "action": "list" }
 ```
 
-Drain runs preconditions → acquire `merge.lock.d` → stash a dirty root (recorded
+Drain runs preconditions → claim the `fleet_lock` row → stash a dirty root (recorded
 sha) → rebase the member onto the base → the target's own gates
 (`test`, `test:integration`, `typecheck`, `lint`, `build`, whichever exist) →
 `git merge --ff-only` → restore the stashed root → notify remaining members
@@ -527,7 +620,7 @@ Operational limits, at the point you hit them:
   Once the lease is cold, relaunch normally, or resume the old session.
 - **The intent CAS is check-then-write.** `fleet.json` updates compare the bytes
   they read and then rename, so two simultaneous supervisors can both win that
-  window (the merge lock is the only `mkdir`-based primitive). There is at most
+  window (the merge lock is a single conditional row claim). There is at most
   one live supervisor per fleet by construction — the arm token and process
   identity make a second one fail to match — but a deliberately planted record
   inside a writable fleet directory is outside that guarantee; see the threat
@@ -593,12 +686,12 @@ worktree lease — is in `docs/fleet-run.md`.
 | Start several beads without the loop | `/fleet <ids> --manual` | the same, without a `run` record |
 | Recover supervision after a pi restart | `/fleet <ids> --fleet <id>` | supervisor record + `re-arm` audit; members preserved; the run loop resumes |
 | What is every worktree doing? | `belayd_fleet_status` | nothing (read-only; no fleet dir created) |
-| Ask one member something / tell it main moved | `belayd_fleet_note` (`kind: rebase-hint`) | one file in `events/` |
-| Tell every member | `belayd_fleet_note` `to: "all"` | one file per member in `events/` |
-| Did a member report? | `belayd_fleet_inbox` | drains + acks `inbox/`, `inbox-drain` audit |
-| Land a finished member (manual fleet) | `belayd_fleet_merge` `enqueue` then `drain` | `merge-queue.json`, the base branch, `base-moved` notes |
+| Ask one member something / tell it main moved | `belayd_fleet_note` (`kind: rebase-hint`) | one `fleet_note` row (event channel) |
+| Tell every member | `belayd_fleet_note` `to: "all"` | one `fleet_note` row per member |
+| Did a member report? | `belayd_fleet_inbox` | drains + acks the inbox channel, `inbox-drain` audit |
+| Land a finished member (manual fleet) | `belayd_fleet_merge` `enqueue` then `drain` | the `fleet_queue` row, the base branch, `base-moved` notes |
 | Land + release ordering gates, automatically | the run loop (default) | the base branch, bd gates, worktree removal, `fleet-landed` audit; the bead stays `in_progress` + `human` |
-| Record a landing that happened outside the fleet (hand `wt merge`) | the run tick, `belayd_fleet_reconcile` for a fleet nothing ticks | git ancestry alone (`run.members[].head` when the branch is gone), then `landedAt`, pruning, gate resolve, `fleet-landed` audit; no bead status is read |
+| Record a landing that happened outside the fleet (hand `wt merge`) | the run tick, `belayd_fleet_reconcile` for a fleet nothing ticks | git ancestry alone (`run.members[].head` when the branch is gone), then one transaction: `landedAt`, pruning, gate-record drops, `fleet-landed` audit, one revision bump (the bd resolve follows the commit); no bead status is read |
 | What is queued / is a merge in flight? | `belayd_fleet_merge` `list` | nothing |
 | Start the deferred members | `belayd_fleet_advance` | new members, updated `deferred` |
 | Stop starting new work | `belayd_fleet_pause` | `paused`, `pause` notes, `fleet-paused` audit |
@@ -613,7 +706,8 @@ worktree lease — is in `docs/fleet-run.md`.
 | Accept the work without the loop | `wt merge`, `bd close` | bead status — `belayd_fleet_merge` itself never touches a bead |
 
 `belayd_fleet_status` and `belayd_fleet_note` work in any session that is inside a
-fleet (the supervisor writes `events/`, a member writes `inbox/`). `belayd_fleet_inbox`,
+fleet (the supervisor writes the event channel, a member writes the inbox).
+`belayd_fleet_inbox`,
 `belayd_fleet_merge`, `belayd_fleet_pause`, `belayd_fleet_resume`,
 `belayd_fleet_advance`, `belayd_fleet_reconcile`, and `belayd_fleet_release` are
 **supervisor-only**: they refuse unless `fleet.json` names this session as the live
@@ -636,10 +730,9 @@ is not this session's own is refused (re-arm that fleet and run reconcile or
 |---------|---------------|------------|
 | `Fleet \`default\` is paused (<park reason>); resume it with belayd_fleet_resume before launching more members (run belayd_fleet_reconcile first if the root work is parked)` | P2 stashed your dirty root, landed the merge, and could not restore the stash cleanly. Your work is in the stash | `belayd_fleet_reconcile` restores the recorded sha, verifies it, drops it, and unparks — or reports exactly what blocks it (root is a linked worktree, root moved off the base branch, sha gone, apply conflict). Then `belayd_fleet_resume` if the pause is still set. `resume force` clears the pause and leaves the stash, naming the ref. Never delete the stash by hand first. A run-mode ticker that halted as `parked` does not restart on resume: re-arm with `/fleet <ids> --fleet <id>` |
 | `merge lock is held by … until …` | Another drain (or a dead supervisor's lease) owns the queue | Wait, or let the lease expire — the expiry is the only takeover authority, the recorded pid is diagnostic. `belayd_fleet_reconcile` takes over an expired lease for you |
-| `<lockDir> exists without a lock record (acquisition in progress, or a holder crashed before writing its lease); retry after 30s or remove the directory by hand` | A holder crashed between `mkdir` and writing its lease, or is inside that window | Retry after ~30 s (grace window); reconcile reclaims it past the grace. Removing `merge.lock.d` by hand is safe only when no drain is running |
 | Supervisor is gone; every fleet tool says `supervisor-only` | The supervisor session died. Its lease and run record survive on disk, and a run-mode fleet's recorded pid is the shared daemon, so only the supervisor heartbeat can say it is gone | Repair it without taking over: `belayd_fleet_reconcile { "fleetId": "<id>", "pruneDeadMembers": true }` from any session once the fleet is provably dead — a cold/missing beat on a run-mode record (up to 10 minutes), or a gone pid on an explicit record (bd-233). It audits `reconcile-recovery` when it repaired something, and the members whose worktrees are gone free their slots. Then `/fleet <its ids> --fleet <id>` in a new session: re-arm rewrites the supervisor record, preserves the surviving members, and (because the intent has a `run`) starts the loop again — a new run record when the old one finished or halted. Then `belayd_fleet_status` |
 | A member is `stopped` in the run line | The loop gave up on it for a reason that needs you (`phase-failed`, `awaiting-human`, `orchestrator-missing`, `land-failed`, `accept-failed`) | Fix the cause, then `belayd_fleet_reconcile { "retryMembers": ["<id>"] }`: it clears the recorded stop so the next tick reconsiders the member and lands any work that finished. Before that: a `land-failed` stop on a refusal the member could fix itself (`proof-artifacts-in-diff`, `paths-outside-scope`, `gate-failed`) already ran its one repair round, so `belayd_fleet_status` shows `repair 1 of 1 — <refusal>` while it runs, and `retryMembers` applies after that round (bd-277). Retry only works while the run is active — on a finished or halted run the stop is left intact and the tool warns you to re-arm first. A member whose worktree is gone is stopped again: run `pruneDeadMembers` and launch it fresh. The member stays addressable (`taskIds`) until it is pruned or lands |
-| `ordering gates open: …` in the status header | This fleet still holds ordering-gate records: **normal** while the blocker has not landed, since an open gate is exactly what is holding the dependent back. When the blocker *has* landed the records should be gone, so it then names a landing whose resolve hit a transient bd failure — or a stale record left by a run nothing ticks | Nothing while the blocker is still working: the gate is doing its job. After the blocker landed, nothing either — the next tick retries the resolve and drops the record. A finished run is not ticked, but `belayd_fleet_advance` and `belayd_fleet_reconcile` reap its gate records first, and their full sweep also drops a recorded gate **bd no longer reports** (only when both of its beads answered; an unreadable answer keeps the record). If it stays, `bd gate resolve <gate-id>` and the record goes on the following tick (the manual fallback) |
+| `ordering gates open: …` in the status header | This fleet still holds ordering-gate records: **normal** while the blocker has not landed, since an open gate is exactly what is holding the dependent back. When the blocker *has* landed the fleet-side records are gone (the landing drops them in its transaction), so this line then names a **bd** gate whose resolve hit a transient failure after the commit — or a bd gate the crash-window sweep has not reached yet | Nothing while the blocker is still working: the gate is doing its job. After the blocker landed, nothing either — the next tick's sweep resolves the gate bd still reports. A finished run is not ticked, but `belayd_fleet_advance` and `belayd_fleet_reconcile` run the same sweep before they act, and their full sweep also drops a recorded gate **bd no longer reports** (only when both of its beads answered; an unreadable answer keeps the record). If it stays, `bd gate resolve <gate-id>` and the record goes on the following tick (the manual fallback) |
 | Deferred/refused with `blocked by ordering gate bd-…, which bd no longer reports` | A recorded `orderingGates` entry still names a gate bd has forgotten. The id is a **gate**, not a bead: nothing outside the fleet blocks the wave; a stale fleet-side record does | `belayd_fleet_reconcile` drops the records bd no longer has (then `belayd_fleet_advance` launches the wave). If bd still lists the gate, `bd gate resolve <gate-id>` releases it by hand |
 | `Refusing to launch … live orchestrator lease` | The worktree already has a live orchestrator session (its lease is fresh) | One orchestrator per worktree: finish or stop that session. If it is really gone, the lease goes cold after ~3 min and the next launch takes it over (the old record is archived, and the takeover is reported) |
 | Launch refused with `dependency-cycle` and a closed path (`bd-12 → bd-15 → bd-12`) | bd's `blocks` edges form a cycle; no valid order exists | `bd dep remove`, then relaunch. Nothing was created, so there is nothing to clean up |
@@ -796,7 +889,10 @@ branch's bead when no state file or session id survives), never an inherited
 one.
 
 A view with an intent, a deferral and a park — in a throwaway repository, so
-nothing here touches your checkout:
+nothing here touches your checkout. The script seeds the *pre-store* layout
+(`.belayd/workflow.json`, `.belayd/runs/`, `<git-common-dir>/belayd/fleet/<id>/`):
+that is exactly what the one-shot import reads on first use, and it is refused
+afterwards, so seed it once in a scratch repository.
 
 ```bash
 root=/tmp/fleet-demo

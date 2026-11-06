@@ -87,14 +87,14 @@ export interface SupervisionMemberFacts {
   completedPhases: readonly string[];
   pendingPhases: readonly string[];
   /**
-   * The review phase flag recorded in `workflow.json`. It is a *phase* fact and is
+   * The review phase flag recorded in the workflow row. It is a *phase* fact and is
    * deliberately not a wait trigger: since bd-219 it is set on every review
    * completion while the member runs its own fix loop, so treating it as a wait
    * described a human decision nobody was asked for. Kept on the facts so a reader
    * sees what the state file says; {@link formatWaitingOn} ignores it.
    */
   awaitingReviewResponse: boolean;
-  /** workflow.json `updatedAt`, raised to the newest run timestamp when later. */
+  /** Workflow-row `updatedAt`, raised to the newest run timestamp when later. */
   updatedAt?: number;
   lease: SupervisionLeaseFacts;
   gates: SupervisionGateFacts;

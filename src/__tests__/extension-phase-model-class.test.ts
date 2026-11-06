@@ -31,6 +31,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
+
 import { listRuns, RunStatus, writeRunManifest } from "../run-manifest.js";
 
 // ── Mocks ──────────────────────────────────────────────────────────────

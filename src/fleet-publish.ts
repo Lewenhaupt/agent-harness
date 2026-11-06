@@ -3,7 +3,7 @@
  *
  * `mode:"local"` is the default and stays deliberately inert — it resolves no
  * remote, runs no command, and touches no network. A later milestone (`bd-174.3`)
- * reads the *frozen* value recorded in `fleet.json` to drive PR/push publishing,
+ * reads the *frozen* value recorded in the fleet intent to drive PR/push publishing,
  * so this module owns only the schema and the pure resolution of flag → repo
  * config → git config → local default.
  *

@@ -613,7 +613,7 @@ function commitOwnershipError(options: {
     );
   }
 
-  // Anchor the cwd preflight on workflow.json's task. A supplied sub-bead
+  // Anchor the cwd preflight on the workflow row's task. A supplied sub-bead
   // resolves to its owning parent; an unrelated id still fails the matcher.
   const ownershipTaskId =
     taskId === "" || isSameOrDescendantTask(taskId, persisted.taskId) ? persisted.taskId : taskId;

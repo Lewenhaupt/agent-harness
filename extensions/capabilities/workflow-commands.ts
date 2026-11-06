@@ -333,10 +333,7 @@ export function registerWorkflowCommands(deps: WorkflowCommandsDeps): void {
 
       const manifest = findRunForSession({ cwd: ctx.cwd, sessionName, parsed });
       if (manifest === undefined) {
-        ctx.ui.notify(
-          `No run manifest in ${ctx.cwd}/.belayd/runs matches session ${sessionName}.`,
-          "error",
-        );
+        ctx.ui.notify(`No run manifest for ${ctx.cwd} matches session ${sessionName}.`, "error");
         return;
       }
 
@@ -501,7 +498,7 @@ export function registerWorkflowCommands(deps: WorkflowCommandsDeps): void {
     if (!ctx.sessionManager.getSessionFile() || isSubAgentSession(sessionName)) return;
 
     // P5: settle worktree ownership *before* the gate can arm. Two sessions in one
-    // worktree share `.belayd/workflow.json` and `.belayd/runs/`, so the session
+    // worktree share the workflow row and the run rows, so the session
     // that loses this race must not look like an orchestrator at all.
     //
     // A session that handed this worktree off is *not* its orchestrator: it settles

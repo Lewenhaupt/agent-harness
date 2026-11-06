@@ -7,8 +7,6 @@
  * contract as `node:fs`.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
@@ -28,24 +26,16 @@ import {
   FLEET_AUDIT_ACTION_MAX_LENGTH,
   FLEET_AUDIT_ACTOR_MAX_LENGTH,
   FLEET_AUDIT_DETAIL_MAX_LENGTH,
-  FLEET_AUDIT_TAIL_BYTES,
   FLEET_AUDIT_TASK_ID_MAX_LENGTH,
   FLEET_AUDIT_TASK_IDS_MAX,
   FLEET_MERGE_ENTRY_STATES,
   FLEET_MERGE_LEASE_MS,
   FLEET_NOTE_ADDRESS_MAX_LENGTH,
   FLEET_NOTE_BODY_MAX_LENGTH,
-  FLEET_NOTE_FILE_MAX_BYTES,
   FLEET_NOTE_KINDS,
   type FleetNote,
   type FleetStateFs,
-  fleetAuditLogPath,
   fleetDir,
-  fleetEventsDir,
-  fleetInboxDir,
-  fleetIntentFilePath,
-  fleetMergeQueueFilePath,
-  fleetNoteFileName,
   fleetRoot,
   formatAuditEntry,
   isFleetNoteKind,
@@ -74,13 +64,18 @@ import {
   FLEET_SCHEMA_VERSION,
   FLEET_SPAWN_GRACE_MARGIN_MS,
   FLEET_SPAWN_RPC_ALLOWANCE_MS,
-  fleetLaunchMarkerPath,
+  fleetLaunchMarkerTaskIdRefusal,
   fleetSpawnInFlight,
   fleetStateDir,
   isFleetSpawnInFlight,
   parseFleetLaunchMarker,
   readFleetLaunchMarker,
 } from "../fleet-status.js";
+import {
+  openRepoStateStore,
+  REPO_STATE_AUDIT_TAIL_ROWS,
+  type RepoStateStore,
+} from "../repo-state-store.js";
 import { WORKTREE_READY_TIMEOUT_MS } from "../worktree.js";
 
 const commonDir = "/repo/.git";
@@ -88,6 +83,15 @@ const fleetId = "fleet-1";
 
 interface FakeFs extends FleetStateFs {
   files: Map<string, string>;
+  /** The in-memory repo store the intent/run row lives in (bd-281). */
+  store: RepoStateStore;
+}
+
+/** One throwaway store per fake fs, so a fixture can never leak into another test. */
+function openMemoryStore(): RepoStateStore {
+  const opened = openRepoStateStore({ path: ":memory:" });
+  if (!opened.ok) throw new Error(opened.error);
+  return opened.store;
 }
 
 /** In-memory fs with the synchronous surface the fleet state layer uses. */
@@ -95,6 +99,7 @@ function createFakeFs(initial: Record<string, string> = {}): FakeFs {
   const files = new Map(Object.entries(initial));
   return {
     files,
+    store: openMemoryStore(),
     existsSync: (path) =>
       files.has(path) || [...files.keys()].some((file) => file.startsWith(`${path}/`)),
     readFileSync: (path) => {
@@ -102,16 +107,8 @@ function createFakeFs(initial: Record<string, string> = {}): FakeFs {
       if (content === undefined) throw new Error(`ENOENT: ${path}`);
       return content;
     },
-    statSync: (path) => {
-      const content = files.get(path);
-      if (content === undefined) throw new Error(`ENOENT: ${path}`);
-      return { size: Buffer.byteLength(content), mtimeMs: 0 };
-    },
     writeFileSync: (path, data) => {
       files.set(path, data);
-    },
-    appendFileSync: (path, data) => {
-      files.set(path, `${files.get(path) ?? ""}${data}`);
     },
     renameSync: (oldPath, newPath) => {
       const content = files.get(oldPath);
@@ -134,10 +131,6 @@ function createFakeFs(initial: Record<string, string> = {}): FakeFs {
         if (head !== undefined && head !== "") names.add(head);
       }
       return [...names];
-    },
-    rmdirSync: () => {
-      // The merge lock's real mkdir/rmdir primitive is exercised against a temp
-      // directory in `fleet-merge.test.ts`; this fake never models directories.
     },
   };
 }
@@ -168,11 +161,10 @@ describe("fleet state paths", () => {
     expect(fleetRoot(commonDir)).toBe(join(commonDir, "belayd", "fleet"));
     expect(dir).toBe(fleetStateDir(commonDir, fleetId));
     expect(dirname(dir)).toBe(fleetRoot(commonDir));
-    expect(fleetIntentFilePath(commonDir, fleetId)).toBe(join(dir, "fleet.json"));
-    expect(fleetInboxDir(commonDir, fleetId)).toBe(join(dir, "inbox"));
-    expect(fleetEventsDir(commonDir, fleetId)).toBe(join(dir, "events"));
-    expect(fleetMergeQueueFilePath(commonDir, fleetId)).toBe(join(dir, "merge-queue.json"));
-    expect(fleetAuditLogPath(commonDir, fleetId)).toBe(join(dir, "audit.log"));
+    // A documented survivor of the file era: no state is written there any more, and
+    // the note mailboxes are rows, but the legacy fleet-id scan and the importer
+    // still need the directory.
+    expect(fleetStateDir(commonDir, fleetId)).toBe(join(fleetRoot(commonDir), fleetId));
   });
 
   it("keeps traversal-shaped and NUL-bearing fleet ids inside the fleet root", () => {
@@ -200,8 +192,12 @@ describe("fleet state paths", () => {
   });
 });
 
-describe("fleet.json intent", () => {
-  const path = fleetIntentFilePath(commonDir, fleetId);
+describe("fleet intent store row", () => {
+  /** Seed one raw intent document, bypassing the writer's validation (a corrupt row). */
+  function seedRawRow(fs: FakeFs, raw: unknown): void {
+    const written = fs.store.writeFleetIntent({ fleetId, intent: raw });
+    if (!written.ok) throw new Error(written.error);
+  }
 
   it("round-trips a created intent through the writer and reader", () => {
     const fs = createFakeFs();
@@ -284,14 +280,16 @@ describe("fleet.json intent", () => {
     expect(intent).not.toHaveProperty("note");
   });
 
-  it("writes the sanitized directory id so the record cannot claim another fleet", () => {
+  it("writes the sanitized row id so the record cannot claim another fleet", () => {
     const fs = createFakeFs();
     const intent = createFleetIntent({ fleetId: "../evil", taskIds: [], now: 5 });
 
     expect(writeFleetIntent({ gitCommonDir: commonDir, fleetId: "../evil", intent, fs })).toEqual({
       ok: true,
     });
-    expect([...fs.files.keys()]).toEqual([fleetIntentFilePath(commonDir, "../evil")]);
+    // bd-281: the id is the row key, and no fleet.json file is written.
+    expect(fs.files.size).toBe(0);
+    expect(fs.store.readFleet(".._evil")).toHaveProperty("value.fleetId", ".._evil");
 
     const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "../evil", fs });
     expect(loaded).toHaveProperty("ok", true);
@@ -306,44 +304,50 @@ describe("fleet.json intent", () => {
       intent: undefined,
     });
 
-    fs.files.set(path, "{ truncated");
+    seedRawRow(fs, "{ truncated");
     expect(readFleetIntent({ gitCommonDir: commonDir, fleetId, fs })).toHaveProperty(
       "reason",
       "corrupt-intent",
     );
 
-    fs.files.set(path, JSON.stringify({ schemaVersion: 99, fleetId }));
+    seedRawRow(fs, { schemaVersion: 99, fleetId });
     expect(readFleetIntent({ gitCommonDir: commonDir, fleetId, fs })).toHaveProperty(
       "reason",
       "corrupt-intent",
     );
 
-    fs.files.set(path, JSON.stringify(createFleetIntent({ fleetId, taskIds: [], now: 1 })));
-    fs.readFileSync = () => {
-      throw new Error("EACCES: permission denied");
+    // A store read failure is reported as such, never as absence: a caller that
+    // cannot read the row must not decide the fleet has no intent.
+    const failing: FakeFs = {
+      ...fs,
+      store: { ...fs.store, readFleet: () => ({ ok: false, error: "EACCES: permission denied" }) },
     };
-    const failed = readFleetIntent({ gitCommonDir: commonDir, fleetId, fs });
+    const failed = readFleetIntent({ gitCommonDir: commonDir, fleetId, fs: failing });
     expect(failed).toHaveProperty("reason", "read-failed");
     if (failed.ok) return;
     expect(failed.error).toContain("EACCES");
   });
 
-  it("returns an error value when the atomic write fails", () => {
+  it("returns an error value when the store write fails", () => {
     const fs = createFakeFs();
     const intent = createFleetIntent({ fleetId, taskIds: [], now: 1 });
-    fs.writeFileSync = () => {
-      throw new Error("EROFS: read-only file system");
+    const failing: FakeFs = {
+      ...fs,
+      store: {
+        ...fs.store,
+        writeFleetIntent: () => ({ ok: false, error: "EROFS: read-only file system" }),
+      },
     };
 
-    const written = writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent, fs });
+    const written = writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent, fs: failing });
     expect(written).toHaveProperty("ok", false);
     if (written.ok) return;
     expect(written.error).toContain("EROFS");
-    // A failed atomic write leaves no intent behind.
-    expect(fs.files.has(path)).toBe(false);
+    // A failed write leaves no intent row behind.
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value", null);
   });
 
-  it("updates an existing intent in place and refuses a corrupt one", () => {
+  it("updates an existing intent in place and refuses a corrupt row", () => {
     const fs = createFakeFs();
     const intent = createFleetIntent({ fleetId, taskIds: ["bd-12"], now: 1_000 });
     writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent, fs });
@@ -363,7 +367,7 @@ describe("fleet.json intent", () => {
       true,
     );
 
-    fs.files.set(path, "not json");
+    seedRawRow(fs, "not json");
     const refused = updateFleetIntent({
       gitCommonDir: commonDir,
       fleetId,
@@ -372,7 +376,7 @@ describe("fleet.json intent", () => {
     });
     expect(refused).toHaveProperty("reason", "corrupt-intent");
     // The unreadable record is preserved rather than replaced.
-    expect(fs.files.get(path)).toBe("not json");
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value.intent", "not json");
   });
 
   it("reports a write failure from updateFleetIntent", () => {
@@ -383,15 +387,19 @@ describe("fleet.json intent", () => {
       intent: createFleetIntent({ fleetId, taskIds: [], now: 1 }),
       fs,
     });
-    fs.writeFileSync = () => {
-      throw new Error("ENOSPC: no space left on device");
+    const failing: FakeFs = {
+      ...fs,
+      store: {
+        ...fs.store,
+        mutateFleet: () => ({ ok: false, error: "ENOSPC: no space left on device" }),
+      },
     };
 
     expect(
       updateFleetIntent({
         gitCommonDir: commonDir,
         fleetId,
-        fs,
+        fs: failing,
         update: (current) => ({
           ...(current ?? createFleetIntent({ fleetId, taskIds: [], now: 1 })),
         }),
@@ -399,9 +407,9 @@ describe("fleet.json intent", () => {
     ).toHaveProperty("reason", "write-failed");
   });
 
-  it("refuses to replace a present but unparsable intent record", () => {
+  it("refuses to replace a present but unparsable intent row", () => {
     const fs = createFakeFs();
-    fs.files.set(path, JSON.stringify({ schemaVersion: 99, fleetId, taskIds: [] }));
+    seedRawRow(fs, { schemaVersion: 99, fleetId, taskIds: [] });
 
     const written = writeFleetIntent({
       gitCommonDir: commonDir,
@@ -414,7 +422,7 @@ describe("fleet.json intent", () => {
     if (written.ok) return;
     expect(written.error).toContain("refusing to replace unreadable fleet intent");
     // The newer-version record a human wrote survives untouched.
-    expect(JSON.parse(fs.files.get(path) ?? "{}")).toHaveProperty("schemaVersion", 99);
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value.intent.schemaVersion", 99);
   });
 
   it("writes a fresh intent when no record exists yet", () => {
@@ -427,12 +435,12 @@ describe("fleet.json intent", () => {
     });
 
     expect(written).toEqual({ ok: true });
-    expect(fs.files.has(path)).toBe(true);
+    expect(fs.store.readFleet(fleetId)).not.toHaveProperty("value", null);
   });
 
   it("upgrades a legacy v1 record to the current shape before writing it", () => {
     // `fleetIntentWriteRefusal` validates v2 only, so a v1 record handed to a
-    // writer (an older caller, a fixture) is migrated first: the bytes on disk are
+    // writer (an older caller, a fixture) is migrated first: the stored row is
     // always the current shape, never a v1 record the next read has to upgrade
     // again.
     const fs = createFakeFs();
@@ -447,7 +455,7 @@ describe("fleet.json intent", () => {
     expect(writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: legacy, fs })).toEqual({
       ok: true,
     });
-    expect(JSON.parse(fs.files.get(path) ?? "{}")).toEqual({
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value.intent", {
       schemaVersion: FLEET_SCHEMA_VERSION,
       fleetId,
       taskIds: ["bd-12"],
@@ -462,14 +470,14 @@ describe("fleet.json intent", () => {
     expect(writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: named, fs })).toEqual({
       ok: true,
     });
-    const stored = JSON.parse(fs.files.get(path) ?? "{}");
-    expect(stored).toHaveProperty("schemaVersion", FLEET_SCHEMA_VERSION);
-    expect(stored).toHaveProperty("baseBranch", "develop");
-    expect(stored).toHaveProperty("publish", { mode: "local" });
+    const stored = fs.store.readFleet(fleetId);
+    expect(stored).toHaveProperty("value.intent.schemaVersion", FLEET_SCHEMA_VERSION);
+    expect(stored).toHaveProperty("value.intent.baseBranch", "develop");
+    expect(stored).toHaveProperty("value.intent.publish", { mode: "local" });
 
     // Migration never upgrades an invalid record into a valid one: a v1 record over
-    // a v1 bound is still refused, and the previous bytes survive.
-    const before = fs.files.get(path);
+    // a v1 bound is still refused, and the previous row survives.
+    const before = stored.ok ? stored.value?.intent : undefined;
     const overBound = {
       ...legacy,
       taskIds: Array.from(
@@ -481,22 +489,25 @@ describe("fleet.json intent", () => {
     expect(refused).toHaveProperty("ok", false);
     if (refused.ok) return;
     expect(refused.error).toContain("invalid fleet intent");
-    expect(fs.files.get(path)).toBe(before);
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value.intent", before);
   });
 
-  it("refuses an update whose base record changed since it was read", () => {
+  it("runs each update against the row the transaction just read", () => {
+    // bd-281: the updater runs inside `BEGIN IMMEDIATE`, so an update computed from
+    // a stale snapshot still composes on a newer row instead of clobbering it.
     const fs = createFakeFs();
     const base = createFleetIntent({ fleetId, taskIds: ["bd-12"], now: 1_000 });
     writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: base, fs });
 
-    const concurrent = { ...base, note: "operator edit", updatedAt: 2_000 };
-    const originalRead = fs.readFileSync;
-    let reads = 0;
-    fs.readFileSync = (target) => {
-      reads += 1;
-      // First read is the update's base; every later read sees the newer record.
-      return reads === 1 ? originalRead(target) : JSON.stringify(concurrent);
-    };
+    // The first writer lands an operator edit after this caller read the row.
+    const snapshot = readFleetIntent({ gitCommonDir: commonDir, fleetId, fs });
+    expect(snapshot).toHaveProperty("intent.taskIds", ["bd-12"]);
+    updateFleetIntent({
+      gitCommonDir: commonDir,
+      fleetId,
+      fs,
+      update: (current) => ({ ...(current ?? base), note: "operator edit", updatedAt: 2_000 }),
+    });
 
     const updated = updateFleetIntent({
       gitCommonDir: commonDir,
@@ -505,11 +516,14 @@ describe("fleet.json intent", () => {
       update: (current) => ({ ...(current ?? base), paused: true }),
     });
 
-    expect(updated).toHaveProperty("reason", "conflict");
-    // Compare-and-replace: the concurrent write is not clobbered.
-    expect(JSON.parse(fs.files.get(path) ?? "{}")).toEqual(base);
+    expect(updated).toHaveProperty("ok", true);
+    if (!updated.ok) return;
+    // Both writes survive: the second updater saw the note it never read itself.
+    expect(updated.intent).toHaveProperty("note", "operator edit");
+    expect(updated.intent).toHaveProperty("paused", true);
+    expect(fs.store.readFleet(fleetId)).toHaveProperty("value.revision", 3);
   });
-
+  // Compare-and-replace: the concurrent write is not clobbered.
   it("prunes a landed member from both the member list and the deferred plan", () => {
     const intent = createFleetIntent({
       fleetId,
@@ -628,13 +642,13 @@ describe("fleet.json intent", () => {
 
   it("refuses to write an intent record its own reader would reject", () => {
     // C1 defence in depth: the write choke point validates against the reader's
-    // schema, so no caller can brick `fleet.json` with a record that only shows up
+    // schema, so no caller can brick the fleet row with a record that only shows up
     // as `corrupt-intent` afterwards. One over-bound write is enough to lose the
     // fleet intent permanently.
     const fs = createFakeFs();
     const base = createFleetIntent({ fleetId, taskIds: ["bd-12"], now: 1_000 });
     writeFleetIntent({ gitCommonDir: commonDir, fleetId, intent: base, fs });
-    const before = fs.files.get(path);
+    const before = fs.store.readFleet(fleetId);
     const overBound: FleetIntent = {
       ...base,
       orderingGates: Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX + 1 }, (_, index) => ({
@@ -649,7 +663,7 @@ describe("fleet.json intent", () => {
     if (written.ok) return;
     expect(written.error).toContain("invalid fleet intent");
     expect(written.error).toContain("orderingGates");
-    expect(fs.files.get(path)).toBe(before);
+    expect(fs.store.readFleet(fleetId)).toEqual(before);
 
     const updated = updateFleetIntent({
       gitCommonDir: commonDir,
@@ -660,8 +674,8 @@ describe("fleet.json intent", () => {
     expect(updated).toHaveProperty("reason", "write-failed");
     if (updated.ok) return;
     expect(updated.error).toContain("invalid fleet intent");
-    // The record on disk is untouched and still readable.
-    expect(fs.files.get(path)).toBe(before);
+    // The row is untouched and still readable.
+    expect(fs.store.readFleet(fleetId)).toEqual(before);
     expect(readFleetIntent({ gitCommonDir: commonDir, fleetId, fs })).toHaveProperty(
       "intent.taskIds",
       ["bd-12"],
@@ -689,9 +703,7 @@ describe("fleet.json intent", () => {
   });
 });
 
-describe("audit.log", () => {
-  const path = fleetAuditLogPath(commonDir, fleetId);
-
+describe("fleet audit rows", () => {
   function entry(overrides: Partial<Parameters<typeof formatAuditEntry>[0]> = {}) {
     return {
       timestamp: 1_000,
@@ -702,6 +714,12 @@ describe("audit.log", () => {
       detail: "launched bd-12",
       ...overrides,
     };
+  }
+
+  function storedActions(fs: ReturnType<typeof createFakeFs>, id = fleetId): string[] {
+    const rows = fs.store.readAudit({ fleetId: id });
+    if (!rows.ok) throw new Error(rows.error);
+    return rows.value.map((row) => (row.payload as { action: string }).action);
   }
 
   it("formats one JSONL line with a fixed key order", () => {
@@ -720,8 +738,6 @@ describe("audit.log", () => {
   it("appends without rewriting earlier entries", () => {
     const fs = createFakeFs();
     appendFleetAuditEntry({ gitCommonDir: commonDir, fleetId, entry: entry(), fs });
-    const afterFirst = fs.files.get(path) ?? "";
-
     appendFleetAuditEntry({
       gitCommonDir: commonDir,
       fleetId,
@@ -735,14 +751,11 @@ describe("audit.log", () => {
       fs,
     });
 
-    const content = fs.files.get(path) ?? "";
-    expect(content.startsWith(afterFirst)).toBe(true);
-    const lines = content.trimEnd().split("\n");
-    expect(lines).toHaveLength(3);
-    expect(lines.map((line) => JSON.parse(line).action)).toEqual(["dispatch", "note", "merge"]);
+    // bd-281: three rows in append order, not three lines in a file.
+    expect(storedActions(fs)).toEqual(["dispatch", "note", "merge"]);
   });
 
-  it("bounds detail length so one message cannot bloat the log", () => {
+  it("bounds detail length so one message cannot bloat the row", () => {
     const fs = createFakeFs();
     appendFleetAuditEntry({
       gitCommonDir: commonDir,
@@ -751,7 +764,9 @@ describe("audit.log", () => {
       fs,
     });
 
-    const record = JSON.parse(fs.files.get(path) ?? "{}");
+    const row = fs.store.readAudit({ fleetId });
+    if (!row.ok) throw new Error(row.error);
+    const record = row.value[0]?.payload as { detail: string };
     expect(record.detail.length).toBe(FLEET_AUDIT_DETAIL_MAX_LENGTH);
     expect(record.detail.endsWith("…")).toBe(true);
   });
@@ -769,7 +784,13 @@ describe("audit.log", () => {
       fs,
     });
 
-    const record = JSON.parse(fs.files.get(path) ?? "{}");
+    const row = fs.store.readAudit({ fleetId });
+    if (!row.ok) throw new Error(row.error);
+    const record = row.value[0]?.payload as {
+      actor: string;
+      action: string;
+      taskIds: string[];
+    };
     expect(record.actor.length).toBe(FLEET_AUDIT_ACTOR_MAX_LENGTH);
     expect(record.action.length).toBe(FLEET_AUDIT_ACTION_MAX_LENGTH);
     expect(record.taskIds).toHaveLength(FLEET_AUDIT_TASK_IDS_MAX);
@@ -777,7 +798,7 @@ describe("audit.log", () => {
     expect(record.action.endsWith("…")).toBe(true);
   });
 
-  it("bounds each task id so one id cannot bloat the line", () => {
+  it("bounds each task id so one id cannot bloat the entry", () => {
     const record = JSON.parse(formatAuditEntry(entry({ taskIds: ["i".repeat(5_000)] })));
 
     expect(record.taskIds).toHaveLength(1);
@@ -793,8 +814,9 @@ describe("audit.log", () => {
 
   it("returns an error value when the append fails", () => {
     const fs = createFakeFs();
-    fs.appendFileSync = () => {
-      throw new Error("EROFS: read-only file system");
+    fs.store = {
+      ...fs.store,
+      appendAudit: () => ({ ok: false, error: "EROFS: read-only file system" }),
     };
 
     const appended = appendFleetAuditEntry({
@@ -817,8 +839,9 @@ describe("audit.log", () => {
       fs,
     });
 
-    const record = JSON.parse(fs.files.get(fleetAuditLogPath(commonDir, "../evil")) ?? "{}");
-    expect(record.fleetId).toBe(".._evil");
+    const row = fs.store.readAudit({ fleetId: ".._evil" });
+    if (!row.ok) throw new Error(row.error);
+    expect((row.value[0]?.payload as { fleetId: string }).fleetId).toBe(".._evil");
   });
 
   it("reads recent entries from the tail, filtered by window and action", () => {
@@ -853,10 +876,18 @@ describe("audit.log", () => {
     ).toEqual(["merge", "supervisor-readopt-refused"]);
   });
 
-  it("tolerates a torn or missing log instead of failing the read", () => {
-    const fs = createFakeFs({
-      [path]: `${formatAuditEntry(entry({ timestamp: 9_000 }))}\n{"timestamp": 1,"action":"torn"\n`,
+  it("skips a malformed stored row and an absent fleet instead of failing the read", () => {
+    const fs = createFakeFs();
+    appendFleetAuditEntry({
+      gitCommonDir: commonDir,
+      fleetId,
+      entry: entry({ timestamp: 9_000 }),
+      fs,
     });
+    // A row this reader cannot parse is skipped, never thrown: the alarm it feeds is a
+    // dedup signal, not authority.
+    fs.store.appendAudit({ fleetId, entry: { timestamp: 1, action: "torn" } });
+
     expect(
       readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0, fs }),
     ).toHaveLength(1);
@@ -865,436 +896,287 @@ describe("audit.log", () => {
     ).toEqual([]);
   });
 
-  it("uses the bounded tail read when the seam offers one", () => {
-    const fs = createFakeFs({ [path]: "ignored\n" });
-    let requested: { path: string; bytes: number } | undefined;
-    fs.readTailSync = (tailPath, bytes) => {
-      requested = { path: tailPath, bytes };
-      return `${formatAuditEntry(entry({ timestamp: 5_000, action: "supervisor-readopt-refused" }))}\n`;
-    };
-
-    const recent = readRecentFleetAuditEntries({
-      gitCommonDir: commonDir,
-      fleetId,
-      since: 0,
-      action: "supervisor-readopt-refused",
-      fs,
-    });
-
-    expect(requested).toEqual({ path, bytes: FLEET_AUDIT_TAIL_BYTES });
-    expect(recent).toHaveLength(1);
-  });
-});
-
-/**
- * The fake fs above has no `readTailSync`, so the bounded tail read was only ever
- * exercised through injected seams. These tests run the production reader (no `fs`
- * option) against a real temp file, covering the node seam itself: the short-tail
- * case, the tail boundary of a log longer than the limit, and descriptor hygiene.
- */
-describe("audit.log tail read (real node seam)", () => {
-  const procFdDir = "/proc/self/fd";
-
-  function tempCommonDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "belayd-audit-tail-"));
-    mkdirSync(dirname(fleetAuditLogPath(dir, fleetId)), { recursive: true });
-    return dir;
-  }
-
-  function writeLog(dir: string, content: string): void {
-    writeFileSync(fleetAuditLogPath(dir, fleetId), content);
-  }
-
-  function line(overrides: Partial<Parameters<typeof formatAuditEntry>[0]> = {}): string {
-    return formatAuditEntry({
-      timestamp: 1_000,
-      fleetId,
-      actor: "session-1",
-      action: "dispatch",
-      taskIds: ["bd-12"],
-      detail: "launched bd-12",
-      ...overrides,
-    });
-  }
-
-  it("reads a log shorter than the tail limit", () => {
-    const dir = tempCommonDir();
-    try {
-      writeLog(
-        dir,
-        `${line({ action: "early" })}\n${line({ timestamp: 2_000, action: "supervisor-readopt-refused" })}\n`,
-      );
-
-      const recent = readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 });
-
-      expect(recent.map((record) => record.action)).toEqual([
-        "early",
-        "supervisor-readopt-refused",
-      ]);
-      expect(recent.map((record) => record.detail)).not.toContain("\u0000");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("reads only the tail of a log longer than the limit", () => {
-    const dir = tempCommonDir();
-    try {
-      // The early entry sits outside the window even for `since: 0`, so its absence
-      // proves the read started at the tail rather than at the head.
-      writeLog(
-        dir,
-        `${line({ action: "outside-the-tail" })}\n${"x".repeat(FLEET_AUDIT_TAIL_BYTES + 1_024)}\n` +
-          `${line({ timestamp: 2_000, action: "supervisor-readopt-refused" })}\n`,
-      );
-
-      const recent = readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 });
-
-      expect(recent.map((record) => record.action)).toEqual(["supervisor-readopt-refused"]);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it.skipIf(!existsSync(procFdDir))("closes the tail descriptor after each read", () => {
-    const dir = tempCommonDir();
-    try {
-      writeLog(dir, `${line()}\n`);
-      const before = readdirSync(procFdDir).length;
-
-      for (let index = 0; index < 32; index += 1) {
-        expect(readRecentFleetAuditEntries({ gitCommonDir: dir, fleetId, since: 0 })).toHaveLength(
-          1,
-        );
-      }
-
-      expect(readdirSync(procFdDir).length).toBe(before);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("mailbox notes", () => {
-  const inbox = fleetInboxDir(commonDir, fleetId);
-  const events = fleetEventsDir(commonDir, fleetId);
-
-  it("derives a deterministic filename from content", () => {
-    expect(fleetNoteFileName(sampleNote())).toBe(fleetNoteFileName(sampleNote()));
-    expect(fleetNoteFileName(sampleNote())).toMatch(
-      /^supervisor-note-1700000000000-[0-9a-f]{12}\.json$/,
-    );
-    expect(fleetNoteFileName(sampleNote({ kind: "rebase-hint" }))).not.toBe(
-      fleetNoteFileName(sampleNote()),
-    );
-  });
-
-  it("sanitizes every untrusted component of the filename", () => {
-    for (const to of ["../../etc/passwd", "..", "a/b", "a\\b", "evil\u0000id", ""]) {
-      const path = join(inbox, fleetNoteFileName(sampleNote({ to })));
-      expect(isInside(inbox, path)).toBe(true);
-      expect(dirname(path)).toBe(inbox);
-      expect(path).not.toContain("\u0000");
-    }
-  });
-
-  it("keeps notes whose ids sanitize identically apart by content", () => {
-    const first = fleetNoteFileName(sampleNote({ to: "a/b" }));
-    const second = fleetNoteFileName(sampleNote({ to: "a_b" }));
-    expect(first).not.toBe(second);
-  });
-
-  it("enqueues atomically and treats identical content as idempotent", () => {
+  it("bounds the read by rows, not by bytes", () => {
     const fs = createFakeFs();
-    const first = enqueueNote({ dir: inbox, note: sampleNote(), fs });
-    const second = enqueueNote({ dir: inbox, note: sampleNote(), fs });
-
-    expect(first).toHaveProperty("ok", true);
-    expect(second).toHaveProperty("ok", true);
-    if (!first.ok || !second.ok) return;
-    expect(second.path).toBe(first.path);
-    expect([...fs.files.keys()]).toEqual([first.path]);
-    // No temp file survives the atomic write.
-    expect([...fs.files.keys()].some((path) => path.endsWith(".tmp"))).toBe(false);
-  });
-
-  it("bounds an over-long body before naming the file", () => {
-    const fs = createFakeFs();
-    const enqueued = enqueueNote({
-      dir: inbox,
-      note: sampleNote({ body: "b".repeat(FLEET_NOTE_BODY_MAX_LENGTH + 500) }),
-      fs,
-    });
-
-    expect(enqueued).toHaveProperty("ok", true);
-    if (!enqueued.ok) return;
-    const stored = parseFleetNote(JSON.parse(fs.files.get(enqueued.path) ?? "{}"));
-    expect(stored?.body.length).toBe(FLEET_NOTE_BODY_MAX_LENGTH);
-    expect(stored?.body.endsWith("…")).toBe(true);
-  });
-
-  it("refuses a note whose createdAt cannot be interpolated safely", () => {
-    const fs = createFakeFs();
-
-    for (const createdAt of [
-      "../../evil",
-      "a/b",
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      undefined,
-    ]) {
-      const enqueued = enqueueNote({
-        dir: inbox,
-        note: sampleNote({ createdAt: createdAt as unknown as number }),
+    const total = REPO_STATE_AUDIT_TAIL_ROWS + 5;
+    for (let index = 0; index < total; index += 1) {
+      appendFleetAuditEntry({
+        gitCommonDir: commonDir,
+        fleetId,
+        entry: entry({ timestamp: index, action: `action-${index}` }),
         fs,
       });
-      expect(enqueued).toHaveProperty("ok", false);
     }
 
-    // Nothing was named, so nothing escaped the mailbox directory.
-    expect([...fs.files.keys()]).toEqual([]);
+    const recent = readRecentFleetAuditEntries({ gitCommonDir: commonDir, fleetId, since: 0, fs });
+    // The store's row window, oldest-first within it: the first five rows fell out.
+    expect(recent).toHaveLength(REPO_STATE_AUDIT_TAIL_ROWS);
+    expect(recent[0]?.action).toBe("action-5");
+    expect(recent.at(-1)?.action).toBe(`action-${total - 1}`);
   });
+});
 
-  it("refuses a note missing its addressing fields instead of quarantining later", () => {
-    const fs = createFakeFs();
-    const enqueued = enqueueNote({
-      dir: inbox,
-      note: sampleNote({ from: "" }),
+describe("mailbox notes (store rows)", () => {
+  /** One enqueue with the fixture's default note; `channel` decides the mailbox. */
+  function enqueue(
+    fs: FakeFs,
+    overrides: Partial<FleetNote> = {},
+    channel: "event" | "inbox" = "inbox",
+  ) {
+    return enqueueNote({
+      gitCommonDir: commonDir,
+      fleetId,
+      channel,
+      note: sampleNote(overrides),
       fs,
     });
+  }
 
-    expect(enqueued).toHaveProperty("ok", false);
-    if (enqueued.ok) return;
-    expect(enqueued.error).toContain("invalid fleet note");
-    expect([...fs.files.keys()]).toEqual([]);
-  });
+  /** Every stored note, both channels, in seq order. */
+  function storedNotes(fs: FakeFs) {
+    const events = fs.store.drainNotes({ fleetId, channel: "event" });
+    const inbox = fs.store.drainNotes({ fleetId, channel: "inbox" });
+    if (!events.ok || !inbox.ok) throw new Error("store drain failed");
+    return [...events.value, ...inbox.value];
+  }
 
-  it("round-trips through enqueue and drain without deleting the note", () => {
+  it("stores one row and audits it in the same transaction", () => {
     const fs = createFakeFs();
-    const note = sampleNote();
-    const enqueued = enqueueNote({ dir: inbox, note, fs });
+    const enqueued = enqueue(fs);
     expect(enqueued).toHaveProperty("ok", true);
     if (!enqueued.ok) return;
 
-    const drained = drainNotes({ dir: inbox, fs });
+    const rows = storedNotes(fs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      seq: enqueued.seq,
+      channel: "inbox",
+      target: "supervisor",
+      from: "bd-12",
+      kind: "note",
+      body: "plan phase finished",
+    });
+    // Nothing is written under the fleet directory any more.
+    expect(fs.files.size).toBe(0);
+    const audit = fs.store.readAudit({ fleetId });
+    expect(audit).toHaveProperty("value.length", 1);
+    expect(audit).toHaveProperty("value.0.payload.action", "note");
+  });
+
+  it("truncates an over-long body, the only repair a write makes", () => {
+    const fs = createFakeFs();
+    const enqueued = enqueue(fs, { body: "b".repeat(FLEET_NOTE_BODY_MAX_LENGTH + 500) });
+    expect(enqueued).toHaveProperty("ok", true);
+
+    const rows = storedNotes(fs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.body.length).toBe(FLEET_NOTE_BODY_MAX_LENGTH);
+    expect(rows[0]?.body.endsWith("…")).toBe(true);
+  });
+
+  it("rejects a malformed note at insert instead of quarantining it at drain", () => {
+    const fs = createFakeFs();
+
+    for (const createdAt of ["../../evil", Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      const enqueued = enqueue(fs, { createdAt: createdAt as unknown as number });
+      expect(enqueued).toHaveProperty("ok", false);
+    }
+    // A missing address is refused too: the row needs both ends of the address.
+    for (const overrides of [
+      { from: "" },
+      { to: "" },
+      { to: "t".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH + 1) },
+    ]) {
+      const refused = enqueue(fs, overrides);
+      expect(refused).toHaveProperty("ok", false);
+      if (refused.ok) return;
+      expect(refused.error).toContain("invalid fleet note");
+    }
+
+    // Nothing became a row, so no drain can ever report a corrupt note: the refusal
+    // replaced the `.corrupt` quarantine rather than moving it later.
+    expect(storedNotes(fs)).toEqual([]);
+    expect(fs.store.readAudit({ fleetId })).toHaveProperty("value.length", 0);
+  });
+
+  it("round-trips through enqueue and drain without marking the note acked", () => {
+    const fs = createFakeFs();
+    const note = sampleNote();
+    const enqueued = enqueue(fs, note);
+    expect(enqueued).toHaveProperty("ok", true);
+    if (!enqueued.ok) return;
+
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
     expect(drained).toHaveProperty("ok", true);
     if (!drained.ok) return;
     expect(drained.deliveries).toHaveLength(1);
     expect(drained.deliveries[0]?.note).toEqual(note);
-    expect(drained.deliveries[0]?.path).toBe(enqueued.path);
+    expect(drained.deliveries[0]?.seq).toBe(enqueued.seq);
     expect(drained.warnings).toEqual([]);
-    // Drain marks nothing: the file is still there for the next drain.
-    expect(fs.files.has(enqueued.path)).toBe(true);
 
     // Re-draining replays the note (at-least-once), never loses it.
-    const again = drainNotes({ dir: inbox, fs });
+    const again = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
     expect(again).toHaveProperty("ok", true);
     if (!again.ok) return;
-    expect(again.deliveries.map((delivery) => delivery.path)).toEqual([enqueued.path]);
+    expect(again.deliveries.map((delivery) => delivery.seq)).toEqual([enqueued.seq]);
   });
 
-  it("drains in deterministic filename order", () => {
+  it("drains in enqueue (seq) order", () => {
     const fs = createFakeFs();
-    enqueueNote({ dir: inbox, note: sampleNote({ createdAt: 2, to: "bd-12" }), fs });
-    enqueueNote({ dir: inbox, note: sampleNote({ createdAt: 1, to: "bd-15" }), fs });
-    enqueueNote({ dir: inbox, note: sampleNote({ createdAt: 3, to: "bd-15", kind: "pause" }), fs });
+    const first = enqueue(fs, { createdAt: 2, to: "bd-12" });
+    const second = enqueue(fs, { createdAt: 1, to: "bd-15" });
+    const third = enqueue(fs, { createdAt: 3, to: "bd-15", kind: "pause" });
+    if (!first.ok || !second.ok || !third.ok) throw new Error("enqueue failed");
 
-    const drained = drainNotes({ dir: inbox, fs });
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
     expect(drained).toHaveProperty("ok", true);
     if (!drained.ok) return;
-    const names = drained.deliveries.map((delivery) => delivery.path.split("/").pop() ?? "");
-    expect(names).toEqual([...names].sort());
-    expect(names).toHaveLength(3);
+    expect(drained.deliveries.map((delivery) => delivery.seq)).toEqual([
+      first.seq,
+      second.seq,
+      third.seq,
+    ]);
   });
 
-  it("returns nothing for an absent or empty mailbox", () => {
+  it("narrows a drain by channel, target and fleet", () => {
     const fs = createFakeFs();
-    expect(drainNotes({ dir: join(inbox, "absent"), fs })).toEqual({
+    enqueue(fs, { to: "bd-12" }, "event");
+    enqueue(fs, { to: "bd-15" }, "event");
+    enqueue(fs, { to: "supervisor" }, "inbox");
+
+    const addressed = drainNotes({
+      gitCommonDir: commonDir,
+      fleetId,
+      channel: "event",
+      target: "bd-15",
+      fs,
+    });
+    expect(addressed).toHaveProperty("ok", true);
+    if (!addressed.ok) return;
+    expect(addressed.deliveries.map((delivery) => delivery.note.to)).toEqual(["bd-15"]);
+
+    const otherFleet = drainNotes({
+      gitCommonDir: commonDir,
+      fleetId: "absent",
+      channel: "event",
+      fs,
+    });
+    expect(otherFleet).toEqual({ ok: true, deliveries: [], warnings: [] });
+  });
+
+  it("reports an unavailable store as an error value, never as an empty mailbox", () => {
+    const fs = createFakeFs();
+    enqueue(fs);
+    const drained = drainNotes({
+      gitCommonDir: commonDir,
+      fleetId,
+      channel: "inbox",
+      fs: {
+        ...fs,
+        store: {
+          ...fs.store,
+          drainNotes: () => ({ ok: false, error: "EIO: simulated read failure" }),
+        },
+      },
+    });
+    // "I could not read" must never read as "there is no mail".
+    expect(drained).toHaveProperty("ok", false);
+  });
+
+  it("acknowledges drained notes once, idempotently, by seq", () => {
+    const fs = createFakeFs();
+    const enqueued = enqueue(fs);
+    if (!enqueued.ok) throw new Error("enqueue failed");
+
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
+    if (!drained.ok) throw new Error("drain failed");
+
+    expect(
+      ackNotes({ gitCommonDir: commonDir, fleetId, deliveries: drained.deliveries, fs }),
+    ).toEqual({
+      ok: true,
+      acked: [enqueued.seq],
+    });
+    // A crash between drain and ack replays the note; a repeated ack is still success.
+    expect(
+      ackNotes({ gitCommonDir: commonDir, fleetId, deliveries: drained.deliveries, fs }),
+    ).toEqual({
+      ok: true,
+      acked: [],
+    });
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs })).toEqual({
       ok: true,
       deliveries: [],
       warnings: [],
     });
-
-    fs.files.set(join(inbox, "leftover.tmp"), "not a note");
-    expect(drainNotes({ dir: inbox, fs })).toEqual({ ok: true, deliveries: [], warnings: [] });
   });
 
-  it("quarantines a corrupt note with a warning instead of dropping it", () => {
+  it("refuses to acknowledge a seq belonging to another fleet", () => {
     const fs = createFakeFs();
-    const corruptPath = join(inbox, "bad.json");
-    fs.files.set(corruptPath, "{ truncated");
-
-    const drained = drainNotes({ dir: inbox, fs });
-    expect(drained).toHaveProperty("ok", true);
-    if (!drained.ok) return;
-    expect(drained.deliveries).toEqual([]);
-    expect(drained.warnings).toHaveLength(1);
-    expect(drained.warnings[0]).toContain("corrupt note");
-    // Content preserved under a name drain ignores, so it cannot storm warnings.
-    expect(fs.files.get(`${corruptPath}.corrupt`)).toBe("{ truncated");
-    expect(fs.files.has(corruptPath)).toBe(false);
-
-    const second = drainNotes({ dir: inbox, fs });
-    expect(second).toHaveProperty("ok", true);
-    if (!second.ok) return;
-    expect(second.warnings).toEqual([]);
-  });
-
-  it("quarantines an oversize note without reading or parsing it", () => {
-    const fs = createFakeFs();
-    const oversizePath = join(inbox, "huge.json");
-    fs.files.set(oversizePath, "x".repeat(FLEET_NOTE_FILE_MAX_BYTES + 1));
-    const enqueued = enqueueNote({ dir: inbox, note: sampleNote(), fs });
-    expect(enqueued).toHaveProperty("ok", true);
-
-    // Proves the read is bounded rather than merely capped after the fact.
-    const readPaths: string[] = [];
-    const originalRead = fs.readFileSync;
-    fs.readFileSync = (target) => {
-      readPaths.push(target);
-      return originalRead(target);
-    };
-
-    const drained = drainNotes({ dir: inbox, fs });
-    expect(drained).toHaveProperty("ok", true);
-    if (!drained.ok) return;
-
-    expect(readPaths).not.toContain(oversizePath);
-    expect(drained.deliveries).toHaveLength(1);
-    expect(drained.warnings).toHaveLength(1);
-    expect(drained.warnings[0]).toContain("oversize note");
-    expect(fs.files.has(`${oversizePath}.corrupt`)).toBe(true);
-    expect(fs.files.has(oversizePath)).toBe(false);
-  });
-
-  it("leaves a note written by another schema version in place and warns once", () => {
-    const fs = createFakeFs();
-    const newer = join(inbox, "supervisor-note-1-aaa.json");
-    const newest = join(inbox, "supervisor-note-2-bbb.json");
-    const garbage = join(inbox, "garbage.json");
-    fs.files.set(newer, JSON.stringify({ ...sampleNote(), schemaVersion: 2 }));
-    fs.files.set(newest, JSON.stringify({ ...sampleNote({ createdAt: 2 }), schemaVersion: 3 }));
-    fs.files.set(garbage, JSON.stringify({ hello: "world" }));
-
-    const drained = drainNotes({ dir: inbox, fs });
-    expect(drained).toHaveProperty("ok", true);
-    if (!drained.ok) return;
-
-    // Version drift is not corruption: live mail survives an old reader.
-    expect(fs.files.has(newer)).toBe(true);
-    expect(fs.files.has(newest)).toBe(true);
-    // Garbage still gets quarantined.
-    expect(fs.files.has(`${garbage}.corrupt`)).toBe(true);
-    expect(drained.deliveries).toEqual([]);
-
-    const versionWarnings = drained.warnings.filter((warning) =>
-      warning.includes("different note schema version"),
-    );
-    expect(versionWarnings).toHaveLength(1);
-    expect(versionWarnings[0]).toContain("2 note(s)");
-  });
-
-  it("reports an unreadable mailbox as an error value", () => {
-    const fs = createFakeFs();
-    fs.files.set(join(inbox, "a-note.json"), JSON.stringify(sampleNote()));
-    fs.readdirSync = () => {
-      throw new Error("EACCES: permission denied");
-    };
-
-    const drained = drainNotes({ dir: inbox, fs });
-    expect(drained).toHaveProperty("ok", false);
-    if (drained.ok) return;
-    expect(drained.reason).toBe("unreadable-mailbox");
-    expect(drained.error).toContain("EACCES");
-  });
-
-  it("acknowledges drained notes once and idempotently", () => {
-    const fs = createFakeFs();
-    const note = sampleNote();
-    const enqueued = enqueueNote({ dir: inbox, note, fs });
-    if (!enqueued.ok) throw new Error("enqueue failed");
-
-    const drained = drainNotes({ dir: inbox, fs });
+    enqueue(fs);
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
     if (!drained.ok) throw new Error("drain failed");
 
-    expect(ackNotes({ dir: inbox, deliveries: drained.deliveries, fs })).toEqual({
-      ok: true,
-      removed: [enqueued.path],
-    });
-    expect(fs.files.has(enqueued.path)).toBe(false);
-    // A crash between drain and ack replays the note; a repeated ack is still success.
-    expect(ackNotes({ dir: inbox, deliveries: drained.deliveries, fs })).toEqual({
-      ok: true,
-      removed: [],
-    });
-    expect(drainNotes({ dir: inbox, fs })).toEqual({ ok: true, deliveries: [], warnings: [] });
-  });
-
-  it("refuses to acknowledge a path outside the mailbox", () => {
-    const fs = createFakeFs();
-    fs.files.set("/etc/passwd", "root");
-
+    // The row key is (fleet, seq): a borrowed seq acknowledges nothing, which is the
+    // guarantee the path-containment check used to provide.
     const acked = ackNotes({
-      dir: inbox,
-      deliveries: [{ note: sampleNote(), path: "/etc/passwd" }],
+      gitCommonDir: commonDir,
+      fleetId: "other-fleet",
+      deliveries: drained.deliveries,
       fs,
     });
-    expect(acked).toHaveProperty("ok", false);
-    if (acked.ok) return;
-    expect(acked.error).toContain("not in");
-    // The refused delivery is reported as remaining, not as consumed.
-    expect(acked.removed).toEqual([]);
-    expect(acked.remaining.map((delivery) => delivery.path)).toEqual(["/etc/passwd"]);
-    expect(fs.files.has("/etc/passwd")).toBe(true);
+    expect(acked).toEqual({ ok: true, acked: [] });
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs })).toHaveProperty(
+      "ok",
+      true,
+    );
   });
 
-  it("keeps going after an unlink failure and reports consumed vs remaining (W5)", () => {
+  it("reports every delivery as queued when the ack cannot commit", () => {
     const fs = createFakeFs();
-    const first = enqueueNote({ dir: inbox, note: sampleNote({ createdAt: 1 }), fs });
-    const second = enqueueNote({ dir: inbox, note: sampleNote({ createdAt: 2 }), fs });
-    if (!first.ok || !second.ok) throw new Error("enqueue failed");
-
-    const drained = drainNotes({ dir: inbox, fs });
+    enqueue(fs);
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "inbox", fs });
     if (!drained.ok) throw new Error("drain failed");
 
-    // Fail the first unlink only: the second must still be acknowledged, and the
-    // first must be named as remaining instead of vanishing.
-    const realUnlink = fs.unlinkSync;
-    let calls = 0;
-    fs.unlinkSync = (path) => {
-      calls += 1;
-      if (calls === 1) throw new Error("EACCES: permission denied");
-      realUnlink(path);
-    };
-
-    const acked = ackNotes({ dir: inbox, deliveries: drained.deliveries, fs });
+    const acked = ackNotes({
+      gitCommonDir: commonDir,
+      fleetId,
+      deliveries: drained.deliveries,
+      fs: {
+        ...fs,
+        store: {
+          ...fs.store,
+          ackNotes: () => ({ ok: false, error: "EIO: simulated ack failure" }),
+        },
+      },
+    });
     expect(acked).toHaveProperty("ok", false);
     if (acked.ok) return;
-    expect(acked.error).toContain("EACCES");
-    expect(acked.removed).toEqual([second.path]);
-    expect(acked.remaining.map((delivery) => delivery.path)).toEqual([first.path]);
-    expect(fs.files.has(first.path)).toBe(true);
-    expect(fs.files.has(second.path)).toBe(false);
+    expect(acked.acked).toEqual([]);
+    // Nothing committed, so nothing may be reported as consumed.
+    expect(acked.remaining).toEqual(drained.deliveries);
   });
 
-  it("fans a broadcast out to one file per member, each acked exactly once (C1)", () => {
+  it("fans a broadcast out to one row per member, each acked exactly once (C1)", () => {
     const fs = createFakeFs();
     const broadcast = sampleNote({ from: "supervisor", to: "all", body: "main moved" });
 
     const fanout = enqueueNoteFanout({
-      dir: events,
+      gitCommonDir: commonDir,
+      fleetId,
+      channel: "event",
       note: broadcast,
       recipients: ["bd-12", "bd-15"],
       fs,
     });
     expect(fanout).toHaveProperty("ok", true);
     if (!fanout.ok) return;
-    expect(fanout.paths).toHaveLength(2);
-    expect(new Set(fanout.paths).size).toBe(2);
+    expect(fanout.seqs).toHaveLength(2);
+    expect(new Set(fanout.seqs).size).toBe(2);
 
-    // Either drain order: each member sees its own copy, and the other's file is
+    // Either drain order: each member sees its own row, and the sibling's row is
     // untouched until that member drains it.
-    const firstDrain = drainNotes({ dir: events, fs });
+    const firstDrain = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "event", fs });
     if (!firstDrain.ok) throw new Error("drain failed");
     expect(firstDrain.deliveries.map((delivery) => delivery.note.to).sort()).toEqual([
       "bd-12",
@@ -1305,40 +1187,40 @@ describe("mailbox notes", () => {
     );
 
     const firstAck = ackNotes({
-      dir: events,
+      gitCommonDir: commonDir,
+      fleetId,
       deliveries: [firstDrain.deliveries[0] as (typeof firstDrain.deliveries)[number]],
       fs,
     });
     expect(firstAck).toHaveProperty("ok", true);
 
-    const secondDrain = drainNotes({ dir: events, fs });
+    const secondDrain = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "event", fs });
     if (!secondDrain.ok) throw new Error("drain failed");
     // The sibling's copy survived the first ack: this is the property the single
-    // `to: "all"` file could not provide.
+    // `to: "all"` row could not provide.
     expect(secondDrain.deliveries).toHaveLength(1);
     expect(secondDrain.deliveries[0]?.note.to).not.toBe(firstDrain.deliveries[0]?.note.to);
 
-    expect(ackNotes({ dir: events, deliveries: secondDrain.deliveries, fs })).toHaveProperty(
-      "ok",
-      true,
-    );
-    expect(drainNotes({ dir: events, fs })).toEqual({ ok: true, deliveries: [], warnings: [] });
+    expect(
+      ackNotes({ gitCommonDir: commonDir, fleetId, deliveries: secondDrain.deliveries, fs }),
+    ).toHaveProperty("ok", true);
+    expect(drainNotes({ gitCommonDir: commonDir, fleetId, channel: "event", fs })).toEqual({
+      ok: true,
+      deliveries: [],
+      warnings: [],
+    });
   });
 
   it("reports a partial fan-out with the recipients it did reach", () => {
     const fs = createFakeFs();
-    const realWrite = fs.writeFileSync;
-    let writes = 0;
-    fs.writeFileSync = (path, data) => {
-      writes += 1;
-      if (writes === 2) throw new Error("ENOSPC: no space left on device");
-      realWrite(path, data);
-    };
-
+    // An unaddressable recipient stops the fan-out at insert, after the first row
+    // was stored: the same partial-send a failing file write used to produce.
     const fanout = enqueueNoteFanout({
-      dir: events,
+      gitCommonDir: commonDir,
+      fleetId,
+      channel: "event",
       note: sampleNote({ from: "supervisor", to: "all" }),
-      recipients: ["bd-12", "bd-15"],
+      recipients: ["bd-12", "x".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH + 1)],
       fs,
     });
 
@@ -1346,9 +1228,13 @@ describe("mailbox notes", () => {
     if (fanout.ok) return;
     expect(fanout.written).toHaveLength(1);
     // W-A: the audit derives its id list from this, so a partial broadcast names
-    // the recipient whose file exists, not the intended set.
+    // the recipient whose row exists, not the intended set.
     expect(fanout.writtenRecipients).toEqual(["bd-12"]);
-    expect(fanout.error).toContain("fan-out stopped at bd-15");
+    expect(fanout.error).toContain("fan-out stopped at");
+
+    const rows = storedNotes(fs);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.target).toBe("bd-12");
   });
 
   it("narrows a note kind with a real type guard, never a cast (S4)", () => {
@@ -1359,83 +1245,28 @@ describe("mailbox notes", () => {
     expect(isFleetNoteKind(7)).toBe(false);
   });
 
-  it("round-trips a maximum-size legal note without quarantining it (W-A)", () => {
+  it("keeps an unreadable row queued and reports it instead of rendering it", () => {
     const fs = createFakeFs();
-    // Every bounded field at its limit: the note is legal by schema, so the
-    // drain must deliver it — a legal note quarantined as "oversize" would mean
-    // the file cap cannot be satisfied by the schema.
-    const maximal = sampleNote({
-      to: "t".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH),
-      from: "f".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH),
-      body: "b".repeat(FLEET_NOTE_BODY_MAX_LENGTH),
+    // A row written by a newer version (an unknown kind) is not mail this reader can
+    // render, and dropping it would lose it: it stays queued and is named.
+    const written = fs.store.enqueueNote({
+      fleetId,
+      channel: "event",
+      target: "bd-12",
+      from: "supervisor",
+      kind: "shutdown",
+      body: "unplugged",
+      audit: { action: "note" },
     });
+    expect(written).toHaveProperty("ok", true);
 
-    const enqueued = enqueueNote({ dir: inbox, note: maximal, fs });
-    expect(enqueued).toHaveProperty("ok", true);
-    if (!enqueued.ok) return;
-
-    const stored = fs.files.get(enqueued.path) ?? "";
-    expect(Buffer.byteLength(stored)).toBeLessThan(FLEET_NOTE_FILE_MAX_BYTES);
-    expect(dirname(enqueued.path)).toBe(inbox);
-    expect(enqueued.path.split("/").pop() ?? "").not.toContain("invalid");
-
-    const drained = drainNotes({ dir: inbox, fs });
+    const drained = drainNotes({ gitCommonDir: commonDir, fleetId, channel: "event", fs });
     expect(drained).toHaveProperty("ok", true);
     if (!drained.ok) return;
-    expect(drained.warnings).toEqual([]);
-    expect(drained.deliveries.map((delivery) => delivery.path)).toEqual([enqueued.path]);
-    expect(drained.deliveries[0]?.note).toEqual(maximal);
-  });
-
-  it("keeps a note that exceeds the address bound out of the schema entirely", () => {
-    // The schema bound is what makes the byte arithmetic hold: without it a
-    // legal-looking record could be both schema-valid and above the file cap.
-    const fs = createFakeFs();
-    const tooLong = sampleNote({ to: "t".repeat(FLEET_NOTE_ADDRESS_MAX_LENGTH + 1) });
-
-    expect(parseFleetNote(tooLong)).toBe(undefined);
-    expect(enqueueNote({ dir: inbox, note: tooLong, fs })).toHaveProperty("ok", false);
-    expect(fs.files.size).toBe(0);
-  });
-
-  it("never lets an exported filename helper interpolate a non-finite timestamp", () => {
-    // fleetNoteFileName is exported, so a future caller that skips enqueueNote
-    // must still be unable to write outside the mailbox directory.
-    for (const createdAt of [
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      Number.NEGATIVE_INFINITY,
-      "../.." as unknown as number,
-      undefined as unknown as number,
-    ]) {
-      const name = fleetNoteFileName(sampleNote({ createdAt }));
-      const path = join(inbox, name);
-      expect(isInside(inbox, path)).toBe(true);
-      expect(dirname(path)).toBe(inbox);
-      expect(name).toContain("-invalid-");
-      expect(name).not.toContain("/");
-      expect(name).not.toContain("..");
-    }
-  });
-
-  it("fails the drain when a corrupt note cannot be quarantined", () => {
-    const fs = createFakeFs();
-    const corruptPath = join(inbox, "bad.json");
-    fs.files.set(corruptPath, "{ truncated");
-    fs.renameSync = () => {
-      throw new Error("EACCES: permission denied");
-    };
-
-    const drained = drainNotes({ dir: inbox, fs });
-    // A warning storm is what quarantine exists to prevent, so a rename that
-    // keeps failing must not be reported as a successful drain.
-    expect(drained).toHaveProperty("ok", false);
-    if (drained.ok) return;
-    expect(drained.reason).toBe("quarantine-failed");
-    expect(drained.error).toContain(corruptPath);
-    expect(drained.error).toContain("move or remove it by hand");
-    // Nothing was lost while failing: the file is still there.
-    expect(fs.files.get(corruptPath)).toBe("{ truncated");
+    expect(drained.deliveries).toEqual([]);
+    expect(drained.warnings).toHaveLength(1);
+    expect(drained.warnings[0]).toContain("unknown kind");
+    expect(storedNotes(fs)).toHaveLength(1);
   });
 
   it("only accepts known note kinds and a complete record", () => {
@@ -1448,9 +1279,7 @@ describe("mailbox notes", () => {
   });
 });
 
-describe("merge-queue.json", () => {
-  const path = fleetMergeQueueFilePath(commonDir, fleetId);
-
+describe("fleet merge queue rows", () => {
   function sampleQueue() {
     return {
       schemaVersion: 1 as const,
@@ -1482,18 +1311,30 @@ describe("merge-queue.json", () => {
     };
   }
 
-  it("round-trips a queue with a held lock", () => {
+  it("round-trips a queue whose lock is its own row", () => {
     const fs = createFakeFs();
     const queue = sampleQueue();
 
+    // bd-281: the queue row never carries a lock copy; the lock is a second row and
+    // the reader composes the record every consumer expects.
     expect(writeFleetMergeQueue({ gitCommonDir: commonDir, fleetId, queue, fs })).toEqual({
       ok: true,
     });
+    const lock = queue.lock;
+    const claimed = fs.store.acquireFleetLock({
+      fleetId,
+      holder: lock.holder,
+      taskId: lock.taskId,
+      pid: lock.pid,
+      nowMs: lock.acquiredAt,
+      leaseMs: lock.leaseExpiresAt - lock.acquiredAt,
+    });
+    expect(claimed).toHaveProperty("ok", true);
     const loaded = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId, fs });
     expect(loaded).toHaveProperty("ok", true);
     if (!loaded.ok) return;
     expect(loaded.queue).toEqual(queue);
-    expect(fs.files.has(path)).toBe(true);
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty("value.queue.lock", null);
   });
 
   it("starts empty with a free lock", () => {
@@ -1515,12 +1356,12 @@ describe("merge-queue.json", () => {
       queue: undefined,
     });
 
-    fs.files.set(path, "{ nope");
+    fs.store.writeFleetQueue({ fleetId, queue: "{ nope" });
     expect(readFleetMergeQueue({ gitCommonDir: commonDir, fleetId, fs })).toHaveProperty(
       "reason",
       "corrupt-merge-queue",
     );
-    expect(fs.files.has(path)).toBe(true);
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty("value.queue", "{ nope");
   });
 
   it("rejects malformed entries", () => {
@@ -1695,8 +1536,13 @@ describe("merge-queue.json", () => {
       fleetId,
       fs,
       update: (current) => {
-        // A competing writer (lease renewal) lands between the engine's two reads.
-        fs.files.set(path, JSON.stringify(createFleetMergeQueue(9_999)));
+        // A competing writer (lease renewal) commits between the engine's read and
+        // its revision-compared write.
+        fs.store.updateFleetQueue({
+          fleetId,
+          expectedRevision: 1,
+          queue: createFleetMergeQueue(9_999),
+        });
         return current ?? createFleetMergeQueue(1_000);
       },
     });
@@ -1704,14 +1550,17 @@ describe("merge-queue.json", () => {
     expect(conflicted).toHaveProperty("ok", false);
     if (conflicted.ok) return;
     expect(conflicted.reason).toBe("conflict");
-    expect(conflicted.error).toContain("re-read and retry");
+    expect(conflicted.error).toContain("revision conflict");
     // The competing write survives; the loser did not overwrite it.
-    expect(JSON.parse(fs.files.get(path) ?? "{}")).toEqual(createFleetMergeQueue(9_999));
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty(
+      "value.queue",
+      createFleetMergeQueue(9_999),
+    );
   });
 
   it("refuses to replace a queue it cannot parse", () => {
     const fs = createFakeFs();
-    fs.files.set(path, "{ nope");
+    fs.store.writeFleetQueue({ fleetId, queue: "{ nope" });
 
     const written = writeFleetMergeQueue({
       gitCommonDir: commonDir,
@@ -1722,7 +1571,7 @@ describe("merge-queue.json", () => {
     expect(written).toHaveProperty("ok", false);
     if (written.ok) return;
     expect(written.error).toContain("refusing to replace unreadable merge queue");
-    expect(fs.files.get(path)).toBe("{ nope");
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty("value.queue", "{ nope");
 
     const updated = updateFleetMergeQueue({
       gitCommonDir: commonDir,
@@ -1733,13 +1582,14 @@ describe("merge-queue.json", () => {
     expect(updated).toHaveProperty("ok", false);
     if (updated.ok) return;
     expect(updated.reason).toBe("corrupt-merge-queue");
-    expect(fs.files.get(path)).toBe("{ nope");
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty("value.queue", "{ nope");
   });
 
-  it("returns an error value when the atomic write fails", () => {
+  it("returns an error value when the store write fails", () => {
     const fs = createFakeFs();
-    fs.renameSync = () => {
-      throw new Error("EXDEV: cross-device link");
+    fs.store = {
+      ...fs.store,
+      writeFleetQueue: () => ({ ok: false, error: "EXDEV: cross-device link" }),
     };
 
     const written = writeFleetMergeQueue({
@@ -1751,17 +1601,22 @@ describe("merge-queue.json", () => {
     expect(written).toHaveProperty("ok", false);
     if (written.ok) return;
     expect(written.error).toContain("EXDEV");
-    expect(fs.files.has(path)).toBe(false);
+    expect(fs.store.readFleetQueue(fleetId)).toHaveProperty("value", null);
   });
 });
 
 // ── Spawn markers (bd-233 review round 2) ─────────────────────────────
 
-/** The marker path, unwrapped: these tests only use valid bead ids. */
-function markerPath(taskId: string): string {
-  const resolved = fleetLaunchMarkerPath(commonDir, fleetId, taskId);
-  if (!resolved.ok) throw new Error(resolved.error);
-  return resolved.path;
+/** Whether a marker row exists for one member. */
+function hasMarker(fs: ReturnType<typeof createFakeFs>, taskId: string): boolean {
+  const row = fs.store.readLaunchMarker(taskId);
+  return row.ok && row.value !== null;
+}
+
+/** Seed one marker row directly (hand-written or ownerless fixtures). */
+function seedMarker(fs: ReturnType<typeof createFakeFs>, taskId: string, marker: unknown): void {
+  const written = fs.store.writeLaunchMarker({ taskId, fleetId, marker });
+  if (!written.ok) throw new Error(written.error);
 }
 
 describe("fleet spawn markers (bd-233)", () => {
@@ -1778,7 +1633,7 @@ describe("fleet spawn markers (bd-233)", () => {
       fs,
     });
     expect(written).toHaveProperty("ok", true);
-    expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+    expect(hasMarker(fs, "bd-12")).toBe(true);
     expect(
       readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs }),
     ).toEqual({ schemaVersion: 1, taskId: "bd-12", startedAt: now, owner: "spawn-a" });
@@ -1861,17 +1716,14 @@ describe("fleet spawn markers (bd-233)", () => {
     expect(foreign).toHaveProperty("ok", false);
     if (foreign.ok) return;
     expect(foreign.error).toContain("spawn-b");
-    expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+    expect(hasMarker(fs, "bd-12")).toBe(true);
     expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", now, fs })).toBe(
       true,
     );
 
     // A hand-written or pre-owner marker still opens a window, so it must survive too:
     // a spawner that cannot prove it wrote it must not delete it.
-    fs.files.set(
-      markerPath("bd-15"),
-      JSON.stringify({ schemaVersion: 1, taskId: "bd-15", startedAt: now }),
-    );
+    seedMarker(fs, "bd-15", { schemaVersion: 1, taskId: "bd-15", startedAt: now });
     const ownerless = clearFleetLaunchMarker({
       gitCommonDir: commonDir,
       fleetId,
@@ -1882,7 +1734,7 @@ describe("fleet spawn markers (bd-233)", () => {
     expect(ownerless).toHaveProperty("ok", false);
     if (ownerless.ok) return;
     expect(ownerless.error).toContain("absent");
-    expect(fs.files.has(markerPath("bd-15"))).toBe(true);
+    expect(hasMarker(fs, "bd-15")).toBe(true);
     expect(fleetSpawnInFlight({ gitCommonDir: commonDir, fleetId, taskId: "bd-15", now, fs })).toBe(
       true,
     );
@@ -1890,7 +1742,7 @@ describe("fleet spawn markers (bd-233)", () => {
 
   it("reads an unparsable marker file as no window instead of throwing", () => {
     const fs = createFakeFs();
-    fs.files.set(markerPath("bd-12"), "{ not json");
+    seedMarker(fs, "bd-12", "{ not json");
 
     expect(
       readFleetLaunchMarker({ gitCommonDir: commonDir, fleetId, taskId: "bd-12", fs }),
@@ -1924,7 +1776,7 @@ describe("fleet spawn markers (bd-233)", () => {
     });
     expect(spawned).toEqual({ ok: true, value: "session-1" });
     expect(inFlightDuringSpawn).toBe(true);
-    expect(successful.files.has(markerPath("bd-12"))).toBe(false);
+    expect(hasMarker(successful, "bd-12")).toBe(false);
 
     const failing = createFakeFs();
     await expect(
@@ -1939,13 +1791,14 @@ describe("fleet spawn markers (bd-233)", () => {
         },
       }),
     ).rejects.toThrow("spawn failed");
-    expect(failing.files.has(markerPath("bd-15"))).toBe(false);
+    expect(hasMarker(failing, "bd-15")).toBe(false);
   });
 
   it("refuses to spawn when the window cannot be recorded", async () => {
     const readOnly = createFakeFs();
-    readOnly.writeFileSync = () => {
-      throw new Error("EROFS");
+    readOnly.store = {
+      ...readOnly.store,
+      writeLaunchMarker: () => ({ ok: false, error: "EROFS" }),
     };
     let spawned = false;
     const result = await withFleetLaunchMarker({
@@ -2006,7 +1859,7 @@ describe("fleet spawn markers (bd-233)", () => {
       release("session-1");
       expect(await spawner).toEqual({ ok: true, value: "session-1" });
       expect(vi.getTimerCount()).toBe(0);
-      expect(fs.files.has(markerPath("bd-12"))).toBe(false);
+      expect(hasMarker(fs, "bd-12")).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -2016,8 +1869,9 @@ describe("fleet spawn markers (bd-233)", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const fs = createFakeFs();
-      fs.unlinkSync = () => {
-        throw new Error("EACCES");
+      fs.store = {
+        ...fs.store,
+        clearLaunchMarker: () => ({ ok: false, error: "EACCES" }),
       };
       const spawned = await withFleetLaunchMarker({
         gitCommonDir: commonDir,
@@ -2032,7 +1886,7 @@ describe("fleet spawn markers (bd-233)", () => {
       expect(spawned).toHaveProperty("ok", true);
       if (!spawned.ok) return;
       expect(spawned.warning).toContain("could not be cleared");
-      expect(fs.files.has(markerPath("bd-12"))).toBe(true);
+      expect(hasMarker(fs, "bd-12")).toBe(true);
     } finally {
       warn.mockRestore();
     }
@@ -2046,11 +1900,14 @@ describe("fleet spawn markers (bd-233)", () => {
       const fs = createFakeFs();
       // The initial window write succeeds; every refresh write then fails.
       let writes = 0;
-      const realWrite = fs.writeFileSync;
-      fs.writeFileSync = (path, content) => {
-        writes += 1;
-        if (writes > 1) throw new Error("ENOSPC");
-        realWrite(path, content);
+      const realWrite = fs.store.writeLaunchMarker.bind(fs.store);
+      fs.store = {
+        ...fs.store,
+        writeLaunchMarker: (input) => {
+          writes += 1;
+          if (writes > 1) return { ok: false, error: "ENOSPC" };
+          return realWrite(input);
+        },
       };
       let release: (value: string) => void = () => undefined;
       const held = new Promise<string>((resolve) => {
@@ -2137,7 +1994,7 @@ describe("fleet spawn markers (bd-233)", () => {
 
       releaseB("session-b");
       expect(await spawnerB).toEqual({ ok: true, value: "session-b" });
-      expect(fs.files.has(markerPath("bd-12"))).toBe(false);
+      expect(hasMarker(fs, "bd-12")).toBe(false);
     } finally {
       warn.mockRestore();
       vi.useRealTimers();
@@ -2198,8 +2055,9 @@ describe("fleet spawn markers (bd-233)", () => {
       expect(vi.getTimerCount()).toBe(0);
 
       const readOnly = createFakeFs();
-      readOnly.writeFileSync = () => {
-        throw new Error("EROFS");
+      readOnly.store = {
+        ...readOnly.store,
+        writeLaunchMarker: () => ({ ok: false, error: "EROFS" }),
       };
       const refused = await withFleetLaunchMarker({
         gitCommonDir: commonDir,
@@ -2239,17 +2097,26 @@ describe("spawn grace derivation (bd-233)", () => {
 // ── Marker id containment (bd-233 review round 3) ─────────────────────
 
 describe("fleet launch marker ids (bd-233 W3)", () => {
-  it("refuses every id that does not name one file under launch/", () => {
+  it("refuses every id that could not be one row key for a spawn marker", () => {
     for (const bad of ["..", ".", "a/b", ""]) {
-      expect(fleetLaunchMarkerPath(commonDir, fleetId, bad)).toHaveProperty("ok", false);
+      expect(fleetLaunchMarkerTaskIdRefusal(bad)).toBeDefined();
     }
   });
 
-  it("keeps a valid bead id and builds the marker under launch/", () => {
-    const resolved = fleetLaunchMarkerPath(commonDir, fleetId, "bd-12");
-    expect(resolved).toHaveProperty("ok", true);
-    if (!resolved.ok) return;
-    expect(resolved.path).toBe(join(commonDir, "belayd", "fleet", fleetId, "launch", "bd-12"));
+  it("keeps a valid bead id addressable as a marker row", () => {
+    expect(fleetLaunchMarkerTaskIdRefusal("bd-12")).toBeUndefined();
+    const fs = createFakeFs();
+    expect(
+      writeFleetLaunchMarker({
+        gitCommonDir: commonDir,
+        fleetId,
+        taskId: "bd-12",
+        now: 1,
+        owner: "spawn-a",
+        fs,
+      }),
+    ).toHaveProperty("ok", true);
+    expect(hasMarker(fs, "bd-12")).toBe(true);
   });
 
   it("reads a bad id as no marker and reports why instead of throwing", () => {

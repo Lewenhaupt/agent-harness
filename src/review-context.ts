@@ -631,8 +631,8 @@ const HARNESS_STATE_PREFIX = ".belayd/";
  * `-uall` expands an untracked directory to individual files, so every entry
  * is a path `git hash-object` can hash.
  *
- * `.belayd/` is filtered out: it holds the workflow's own state (`workflow.json`,
- * `review-scope.json`, `runs/`, and the reviewer's findings scratchpad), which is
+ * `.belayd/` is filtered out: it holds the workflow's own files (the artifacts, the
+ * proof-dir marker and the reviewer's findings scratchpad), which is
  * git-ignored in this repository but must not become "a new file to review"
  * where it is not.
  */

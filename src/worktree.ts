@@ -1,17 +1,13 @@
 import { execFileSync, execSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { taskIdFromBranch } from "./handoff.js";
-import { type PruneForeignRunsResult, pruneForeignRunManifests } from "./run-manifest.js";
 import {
   DEFAULT_BASE_BRANCH,
   defaultGitExec,
   currentBranch as readCurrentBranch,
   writeStackBase,
 } from "./stack-rebase.js";
-import { gitContextFreeEnv } from "./worktree-list.js";
 
 /** Options for creating an isolated git worktree for agent processes. */
 export interface WorktreeOptions {
@@ -37,11 +33,6 @@ export interface WorktreeDeps {
   captureStack?: (input: { cwd: string; branch: string; base: string }) => void;
   /** Worktrunk project identifier used to pin the worktree layout. */
   wtProjectIdentifier?: (cwd: string) => string | undefined;
-  /**
-   * Drop run manifests another bead left in the new worktree. Tests inject this
-   * because it touches the filesystem.
-   */
-  pruneForeignRuns?: (input: { worktreePath: string; taskId: string }) => PruneForeignRunsResult;
 }
 
 /**
@@ -237,60 +228,6 @@ function captureStackForNewBranch(
 }
 
 /**
- * Delete the run manifests a new worktree inherited from the primary checkout.
- *
- * `wt step copy-ignored` copies `.belayd/` into every new worktree, so a tree
- * created for one bead checks out the previous bead's `.belayd/runs` — the
- * provenance of bd-242, where a fresh member reported bd-37's failed run.
- * Best-effort: a worktree with no `.belayd` (or an unreadable one) is already
- * correct, so a failure must not fail the setup.
- */
-function pruneInheritedRuns(
-  worktreePath: string,
-  branch: string,
-  prune: (input: { worktreePath: string; taskId: string }) => PruneForeignRunsResult,
-): void {
-  const taskId = taskIdFromBranch(branch);
-  if (taskId === undefined) return;
-  let result: PruneForeignRunsResult;
-  try {
-    result = prune({ worktreePath, taskId });
-  } catch (error) {
-    console.warn(
-      `[belayd-harness] failed to prune inherited run manifests in ${worktreePath}: ${errorMessage(error)}`,
-    );
-    return;
-  }
-  if (result.removed.length > 0) {
-    console.warn(
-      `[belayd-harness] removed ${result.removed.length} run manifest(s) inherited from another task ` +
-        `in ${worktreePath}: ${result.removed.join(", ")}`,
-    );
-  }
-  if (result.failed.length > 0) {
-    console.warn(
-      `[belayd-harness] could not delete ${result.failed.length} inherited run manifest(s) in ` +
-        `${worktreePath}: ${result.failed.map((entry) => `${entry.runId} (${entry.error})`).join("; ")}`,
-    );
-  }
-  if (result.unattributable.length > 0) {
-    console.warn(
-      `[belayd-harness] left ${result.unattributable.length} unattributable run manifest(s) in ` +
-        `${worktreePath}/.belayd/runs: ${result.unattributable.join(", ")} — no run of this ` +
-        "worktree's bead wrote them, and they cannot be deleted safely; remove them by hand if they are junk",
-    );
-  }
-}
-
-/** Production prune: report the deletions the runs directory could not complete. */
-function pruneForeignRunsIn(input: {
-  worktreePath: string;
-  taskId: string;
-}): PruneForeignRunsResult {
-  return pruneForeignRunManifests({ cwd: input.worktreePath, taskId: input.taskId });
-}
-
-/**
  * Set up the worktree for a workflow run.
  *
  * Strategy (in order):
@@ -366,13 +303,8 @@ export function setupWorktree(
     captureStack,
   );
 
-  // A tree this call created is the one that just inherited `.belayd/` from the
-  // primary checkout, so this is where foreign run manifests are dropped. An
-  // already-registered worktree (step 1) is returned untouched: its manifests
-  // are its own, and readers filter by task id anyway.
-  const prune = deps.pruneForeignRuns;
-  pruneInheritedRuns(worktreePath, options.branch, prune ?? pruneForeignRunsIn);
-
+  // No inherited run manifests to drop: bd-281 moved them into the shared store,
+  // so a new worktree's `.belayd/` copy cannot carry another bead's runs.
   return worktreePath;
 }
 
@@ -494,18 +426,17 @@ export async function awaitWorktreeReady(
   };
 }
 
-/** Discriminated result of resolving a project namespace key. */
-export type RepoKeyResult = { ok: true; key: string } | { ok: false; error: string };
-
-/**
- * Exec seam for the read-only git probes in this module (`rev-parse`,
- * `worktree list`). Production runs git; tests inject fixed stdout/throwers.
- */
-export type RepoKeyExec = (cwd: string) => string;
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+// The shared git-common-dir probe lives in a leaf module so the repository state
+// store (bd-281) can resolve it without importing this module's worktree/handoff
+// graph, which would be a cycle.
+export {
+  type GitCommonDirResult,
+  projectKeyFromRepoRoot,
+  type RepoKeyExec,
+  type RepoKeyResult,
+  resolveGitCommonDir,
+  resolveRepoKey,
+} from "./git-common-dir.js";
 
 // The worktree-list probe, its porcelain parsers and the git-context-free env
 // live in a leaf module so the AWS credential broker (which Node runs straight
@@ -523,103 +454,3 @@ export {
   type WorktreeListResult,
   worktreeListDepsFor,
 } from "./worktree-list.js";
-
-/** Discriminated result of resolving the shared git common dir. */
-export type GitCommonDirResult = { ok: true; commonDir: string } | { ok: false; error: string };
-
-/**
- * Resolve the absolute shared git common dir for `cwd`.
- *
- * Every linked worktree of one repository reports the same directory, so
- * `<git-common-dir>/belayd/...` is the one place cross-worktree fleet state can
- * live (docs/fleet-orchestrator.md). `resolveRepoKey` is derived from this same
- * probe so there is exactly one git-common-dir resolver.
- *
- * Side effect: shells out to git with a 10s timeout.
- */
-export function resolveGitCommonDir(
-  cwd: string,
-  exec: RepoKeyExec = execGitCommonDir,
-): GitCommonDirResult {
-  let commonDirRaw: string;
-  try {
-    commonDirRaw = exec(cwd).trim();
-  } catch (error) {
-    return {
-      ok: false,
-      error: `git rev-parse --git-common-dir failed in ${cwd}: ${errorMessage(error)}`,
-    };
-  }
-
-  if (commonDirRaw === "") {
-    return { ok: false, error: `git rev-parse returned an empty common dir for ${cwd}` };
-  }
-
-  return { ok: true, commonDir: resolve(cwd, commonDirRaw) };
-}
-
-/**
- * Resolve the shared git common dir for `cwd` and derive a stable project key.
- *
- * Uses `--path-format=absolute` so linked worktrees all report the main
- * repository's git dir and therefore map to the same project key.
- *
- * Known limitation: bare repositories are out of scope. For a bare repo,
- * `git rev-parse --git-common-dir` returns the bare repo directory itself,
- * so `dirname` yields its parent and two bare repos under the same parent
- * would resolve to the same key. This harness operates on normal worktrees.
- *
- * Side effect: shells out to git with a 10s timeout.
- */
-export function resolveRepoKey(cwd: string, exec: RepoKeyExec = execGitCommonDir): RepoKeyResult {
-  const commonDirResult = resolveGitCommonDir(cwd, exec);
-  if (!commonDirResult.ok) {
-    return { ok: false, error: commonDirResult.error };
-  }
-
-  // For non-bare repos, git-common-dir is the `.git` directory itself and its
-  // parent is the repo root (bare repos resolve to their parent; see above).
-  const repoRoot = dirname(commonDirResult.commonDir);
-  try {
-    return { ok: true, key: projectKeyFromRepoRoot(repoRoot) };
-  } catch (error) {
-    return {
-      ok: false,
-      error: `Failed to derive project key from ${repoRoot}: ${errorMessage(error)}`,
-    };
-  }
-}
-
-function execGitCommonDir(cwd: string): string {
-  return execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-    cwd,
-    env: gitContextFreeEnv(),
-    timeout: 10_000,
-    encoding: "utf8",
-    stdio: "pipe",
-  });
-}
-
-/**
- * Derive a filesystem-safe project key from a repository root path.
- *
- * Format: `<sanitized-basename>-<first 8 hex chars of sha256(realpath)>`.
- * The hash keeps same-named repositories in different locations distinct,
- * while the readable basename keeps directories recognizable.
- *
- * The 32-bit suffix makes collisions unlikely: two roots collide only when
- * their basenames match AND their 32-bit hashes match. A collision merely
- * merges two ephemeral proof directories — it is not data corruption.
- *
- * Deterministic for a given root; side effect: realpathSync reads the fs.
- * Throws when `repoRoot` does not exist; {@link resolveRepoKey} catches this
- * and returns an error result.
- */
-export function projectKeyFromRepoRoot(repoRoot: string): string {
-  const sanitized = basename(repoRoot).replace(/[^A-Za-z0-9._-]/g, "-");
-  // `.` and `..` survive sanitization and would create hidden/traversal-like
-  // key names, so they fall back to the literal "repo" like an empty basename.
-  const name = sanitized === "" || sanitized === "." || sanitized === ".." ? "repo" : sanitized;
-  const digest = createHash("sha256").update(realpathSync(repoRoot)).digest("hex");
-  return `${name}-${digest.slice(0, 8)}`;
-}

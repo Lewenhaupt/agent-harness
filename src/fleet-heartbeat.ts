@@ -7,14 +7,13 @@
  * the supervisor session is closed. The fleet is then wedged — `/fleet --fleet
  * <id>` refuses to re-arm because the recorded pid is alive, and nothing ticks.
  *
- * A run-mode fleet therefore also writes a beat:
- * `<git-common-dir>/belayd/fleet/<fleetId>/supervisor.json`, refreshed by the run
- * loop. A beat names the session that wrote it, so a stale beat belonging to a
+ * A run-mode fleet therefore also writes a beat row (`fleet_supervisor`, keyed by
+ * fleet id), refreshed by the run loop. A beat names the session that wrote it, so a stale beat belonging to a
  * *different* session is not mistaken for this one, and no beat at all means the
  * loop never started (or stopped for good).
  *
  * The arm token deliberately never appears here: it lives only in the arming
- * session's memory so a planted `fleet.json` cannot impersonate a supervisor
+ * session's memory so a planted intent row cannot impersonate a supervisor
  * (W6). A beat proves recency, not authority.
  *
  * The heartbeat only *widens* re-arm eligibility for fleets that have a run
@@ -22,8 +21,6 @@
  * cannot steal a fleet from a live operator.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { z } from "zod";
 import type {
   FleetSupervisorLiveness,
@@ -32,12 +29,8 @@ import type {
 } from "./fleet-mode.js";
 import { classifyFleetSupervisor } from "./fleet-mode.js";
 import { isFleetRunActive } from "./fleet-run.js";
-import type { FleetStateFs } from "./fleet-state.js";
+import { type FleetStateFs, fleetStoreFor } from "./fleet-state.js";
 import type { FleetIntent } from "./fleet-status.js";
-import { fleetStateDir } from "./fleet-status.js";
-
-/** File name inside the fleet directory. */
-export const FLEET_SUPERVISOR_HEARTBEAT_FILE = "supervisor.json";
 
 /** Schema version of the beat record. */
 export const FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION = 1;
@@ -65,43 +58,43 @@ const SupervisorHeartbeatSchema = z.object({
 
 export type SupervisorHeartbeat = z.infer<typeof SupervisorHeartbeatSchema>;
 
-/** Path of the beat record for one fleet. */
-export function supervisorHeartbeatPath(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), FLEET_SUPERVISOR_HEARTBEAT_FILE);
-}
-
 export function parseSupervisorHeartbeat(raw: unknown): SupervisorHeartbeat | undefined {
   const parsed = SupervisorHeartbeatSchema.safeParse(raw);
   return parsed.success ? parsed.data : undefined;
 }
 
-/** Default fs seam: the live filesystem. */
-const nodeSeam = {
-  existsSync: (path: string) => existsSync(path),
-  readFileSync: (path: string) => readFileSync(path, "utf8"),
-  writeFileSync: (path: string, data: string) => writeFileSync(path, data),
-  renameSync: (oldPath: string, newPath: string) => renameSync(oldPath, newPath),
-  mkdirSync: (path: string, options?: { recursive?: boolean }) => mkdirSync(path, options),
-};
-
-/** Read the beat; absence is normal (explicit fleets never write one). */
+/**
+ * Read the beat; absence is normal (explicit fleets never write one).
+ *
+ * The row is keyed by fleet id, so a beat cannot be copied between repositories and
+ * a stale one is a timestamp a reader can judge — the file it replaced was a copy
+ * that had to be located inside one fleet directory.
+ */
 export function readSupervisorHeartbeat(options: {
   gitCommonDir: string;
   fleetId: string;
   fs?: FleetStateFs;
 }): SupervisorHeartbeat | undefined {
-  const fs = options.fs ?? nodeSeam;
-  const path = supervisorHeartbeatPath(options.gitCommonDir, options.fleetId);
-  try {
-    if (!fs.existsSync(path)) return undefined;
-    return parseSupervisorHeartbeat(JSON.parse(fs.readFileSync(path)));
-  } catch {
-    // A corrupt beat is "no beat": recency is a safety signal, never a crash.
-    return undefined;
-  }
+  const store = fleetStoreFor(options);
+  if (store === null) return undefined;
+  const row = store.readSupervisor(options.fleetId);
+  if (!row.ok || row.value === null) return undefined;
+  return parseSupervisorHeartbeat({
+    schemaVersion: FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION,
+    fleetId: row.value.fleetId,
+    sessionId: row.value.sessionId,
+    pid: row.value.pid,
+    heartbeatAt: row.value.heartbeatAt,
+  });
 }
 
-/** Write the beat atomically (temp + rename, so a reader never sees half a record). */
+/**
+ * Write the beat as one upsert.
+ *
+ * The file write was temp+rename so a reader never saw half a record; a row write
+ * is a single statement, so that durability is inherent. A corrupt beat reads as
+ * "no beat": recency is a safety signal, never a crash.
+ */
 export function writeSupervisorHeartbeat(options: {
   gitCommonDir: string;
   fleetId: string;
@@ -110,7 +103,6 @@ export function writeSupervisorHeartbeat(options: {
   now: number;
   fs?: FleetStateFs;
 }): { ok: true; beat: SupervisorHeartbeat } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeSeam;
   const beat: SupervisorHeartbeat = {
     schemaVersion: FLEET_SUPERVISOR_HEARTBEAT_SCHEMA_VERSION,
     fleetId: options.fleetId,
@@ -118,17 +110,18 @@ export function writeSupervisorHeartbeat(options: {
     pid: options.pid,
     heartbeatAt: options.now,
   };
-  const dir = fleetStateDir(options.gitCommonDir, options.fleetId);
-  const path = supervisorHeartbeatPath(options.gitCommonDir, options.fleetId);
-  const temp = `${path}.${options.now}.tmp`;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(temp, `${JSON.stringify(beat, null, 2)}\n`);
-    fs.renameSync(temp, path);
-    return { ok: true, beat };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: "the repository state store is unavailable" };
   }
+  const written = store.writeSupervisor({
+    fleetId: options.fleetId,
+    sessionId: options.sessionId,
+    pid: options.pid,
+    heartbeatAt: options.now,
+    nowMs: options.now,
+  });
+  return written.ok ? { ok: true, beat } : { ok: false, error: written.error };
 }
 
 /**

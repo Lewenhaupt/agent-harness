@@ -50,7 +50,7 @@ export type FleetRunMode = (typeof FLEET_RUN_MODES)[number];
  * The merge has already happened and cannot be undone, so stopping the member
  * would record a human-relevant failure while leaving the completed work
  * unlanded in the record — and holding its capacity slot. Instead the landing is
- * recorded and the still-open gate stays in `fleet.json`, where the tick reaper
+ * recorded and the still-open gate stays in the fleet intent, where the tick reaper
  * retries the resolve and `belayd_fleet_status` shows the wedge.
  */
 export const FLEET_RUN_STOP_REASONS = [
@@ -209,14 +209,14 @@ const FleetRunMemberSchema = z.object({
    * A landing outside the fleet leaves no other git handle when `wt merge` deletes
    * the worktree *and* the branch, and a branch tip equal to the launch point proves
    * nothing (it is an ancestor of the base by construction), so only a tip that was
-   * ever ahead is recorded. Optional so every `fleet.json` written before bd-278
+   * ever ahead is recorded. Optional so every intent record written before bd-278
    * still parses.
    */
   head: z.string().min(1).max(64).optional(),
   /**
    * The one bounded repair round a refused landing was given (bd-277).
    *
-   * Optional so every `fleet.json` written before bd-277 still parses. It lives on the
+   * Optional so every intent record written before bd-277 still parses. It lives on the
    * run member rather than on the merge-queue entry because the queue entry is
    * rewritten on every re-enqueue (`nextEntryState` resets `attempts`/`delegatedAt`)
    * while this record is what survives the repair and the relaunch: it is the count
@@ -270,7 +270,7 @@ const FleetMemberSignatureSchema = z.object({
 /**
  * The persisted record of one "run until complete" loop.
  *
- * It lives inside `fleet.json` (`run`) because the loop must survive a supervisor
+ * It lives inside the fleet intent (`run`) because the loop must survive a supervisor
  * restart: after a re-arm, the new supervisor resumes from this record instead of
  * re-landing members it already landed or re-adopting ones it already gave up on.
  */
@@ -348,7 +348,7 @@ export function fleetRunStopAnswer(stop: FleetRunStop): FleetRunStopAnswer {
   const resolution = stop.resolution;
   if (resolution === undefined) return { answered: false };
   // `humanGateResolveNote` trims before storing, so a blank note can only come from a
-  // hand-edited record — and `fleet.json` is untrusted input. An empty answer must read
+  // hand-edited record — and the fleet intent is untrusted input. An empty answer must read
   // as "answered without a note", never as a note, or every renderer prints an empty
   // answer in the one surface whose job is to say what the person chose.
   const note = resolution.note?.trim();
@@ -548,16 +548,15 @@ export interface MemberRunsOptions {
 /**
  * Runs that are evidence about *this* member.
  *
- * `.belayd/` is gitignored and `.config/wt.toml` copies ignored files into a new
- * worktree, so a fresh member inherits the primary checkout's `.belayd/runs` —
- * including a failed run of another task (bd-161: an old bd-37 manifest made
- * bd-150/151/152/153 look `phase implement failed` while they were still
+ * Run rows are shared by every worktree of the repository, so a member sees
+ * another task's runs — including a failed one (bd-161: an old bd-37 manifest
+ * made bd-150/151/152/153 look `phase implement failed` while they were still
  * scouting). Three rules close that:
  *
  * - The task id, because another task's manifest is never about this member.
- * - The launch time, because re-launching the *same* task into a fresh worktree
- *   also inherits its own earlier manifests, and a manifest is written when its
- *   phase starts, so every run the member created itself starts after the launch.
+ * - The launch time, because re-launching the *same* task also sees its own
+ *   earlier runs, and a manifest is written when its phase starts, so every run
+ *   the member created itself starts after the launch.
  * - Never the launch time for a run still in flight: a live same-task run proves
  *   an execution is happening now, while the launch cutoff only drops manifests
  *   of *previous* executions. Dropping it would fall through to `missing` and
@@ -587,7 +586,7 @@ function runBelongsToMember(run: RunManifest, options: MemberRunsOptions): boole
 /**
  * Whether a member's worktree proves its session actually ran (bd-166).
  *
- * Completion deletes `.belayd/workflow.json` (`clearWorkflowState`), so a finished
+ * Completion clears the workflow row (`clearWorkflowState`), so a finished
  * member's tree looks exactly like one that was never spawned: worktree present, no
  * state file, no lease, no process. A run manifest of this task is the remaining
  * proof the session existed, and {@link runsBelongingToMember} is the ownership rule
@@ -605,7 +604,7 @@ function runBelongsToMember(run: RunManifest, options: MemberRunsOptions): boole
  */
 export function memberRanEvidence(options: {
   taskId: string;
-  /** Whether `.belayd/workflow.json` exists, readable or corrupt. */
+  /** Whether a workflow row exists for the member, readable or corrupt. */
   workflowStatePresent: boolean;
   runs: readonly RunManifest[];
   /** Newest trustworthy instant this execution could have started (epoch ms). */
@@ -726,7 +725,7 @@ export function worktreeCreatedAtFromStat(stat: {
  * Derive a member's workflow progress from files that already exist.
  *
  * The "complete" rule has two shapes because a finished workflow deletes
- * `.belayd/workflow.json` (completion clears it) while the run manifests stay: a
+ * the workflow row (completion clears it) while the run manifests stay: a
  * missing state file plus a completed final-phase run is finished work, not a
  * missing member.
  */
@@ -745,7 +744,7 @@ export function deriveFleetMemberProgress(
   if (active !== undefined) return active;
   switch (options.workflow.kind) {
     case "corrupt":
-      return { kind: "state-corrupt", detail: "unreadable .belayd/workflow.json" };
+      return { kind: "state-corrupt", detail: "unreadable workflow row" };
     case "ok":
       return progressFromWorkflow(options.workflow, options, runs);
     case "missing":
@@ -815,7 +814,7 @@ function progressFromWorkflow(
 /**
  * Progress with no state file.
  *
- * Completion clears `.belayd/workflow.json`, so a missing file plus a completed
+ * Completion clears the workflow row, so a missing record plus a completed
  * final-phase run is finished work; no runs at all is a member that never started.
  */
 function progressFromMissingState(options: DeriveFleetMemberProgressOptions): FleetMemberProgress {
@@ -2128,7 +2127,7 @@ export function releaseRunMembers(options: {
  * Recorded members whose work reached the base branch outside the fleet (bd-166).
  *
  * `docs/fleet.md` tells humans to accept with `wt merge` / `bd close`, a path that
- * never touches `fleet.json`; the member then keeps its bead, worktree, and capacity
+ * never touches the fleet intent; the member then keeps its bead, worktree, and capacity
  * slot with nothing left to observe (bd-37).
  *
  * **Git ancestry alone is the proof of a landing (bd-278).** Bead closure is the

@@ -21,9 +21,8 @@
 import * as nodeFs from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-
+import { atomicWriteJson, type WorkflowFs } from "./atomic-json-file.js";
 import type { FailureKind } from "./quota-failure.js";
-import { atomicWriteJson, type WorkflowFs } from "./workflow-state.js";
 
 const ModelPhaseStatsSchema = z.object({
   phase: z.string(),

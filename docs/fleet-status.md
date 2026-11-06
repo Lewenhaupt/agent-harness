@@ -113,19 +113,19 @@ The tool takes one optional parameter:
 
 | Param | Default | Meaning |
 |-------|---------|---------|
-| `fleetId` | `default` | Name of the fleet **intent** directory: `<git-common-dir>/belayd/fleet/<fleetId>/fleet.json`. Selects which intent record is reported. It does not filter members — the member list always covers every worktree in the repo. |
+| `fleetId` | `default` | Fleet id: which **intent row** of the repository store (`<git-common-dir>/belayd/state.sqlite`) is reported. The legacy `<git-common-dir>/belayd/fleet/<fleetId>/fleet.json` is imported once and refused afterwards (bd-281). It does not filter members — the member list always covers every worktree in the repo. |
 
-The id is trimmed and sanitized before it becomes a path segment (characters
-outside `A-Z a-z 0-9 . _ -` become `_`; empty, `.`, and `..` fall back to
-`default`). When sanitizing changed your input, the header names the sanitized
-directory that was actually read and shows the raw input alongside it:
+The id is trimmed and sanitized before it becomes a row key or a legacy path
+segment (characters outside `A-Z a-z 0-9 . _ -` become `_`; empty, `.`, and `..`
+fall back to `default`). When sanitizing changed your input, the header names the
+sanitized id that was actually read and shows the raw input alongside it:
 
 ```text
 Fleet .._evil (requested "../evil")
 ```
 
-A non-default id matters only when a human wrote an intent file for that fleet.
-P0 never creates `fleet.json`; without one, the header reads
+A non-default id matters only when a human wrote an intent for that fleet. P0
+never creates one; without an intent row the header reads
 `intent: none recorded` — and every fleet id therefore returns the same member
 list with a different header. With a real intent file the first lines read:
 
@@ -180,7 +180,7 @@ Member bd-125 — complete-unlanded
   land it: belayd_fleet_merge action=enqueue task=bd-125 then action=drain
 
 Warnings (1):
-  - no .belayd/workflow.json in /home/hugo/git/belayd-agent-harness.feat-bd-125 (completion clears it); bd-125 still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=bd-125 then action=drain
+  - no workflow row for /home/hugo/git/belayd-agent-harness.feat-bd-125 (completion clears it); bd-125 still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=bd-125 then action=drain
 ```
 
 That run is worth reading closely:
@@ -214,7 +214,7 @@ Header lines:
 | Line | Meaning |
 |------|---------|
 | `Fleet <id>` | Sanitized fleet id whose directory was read; `(requested "<raw>")` is appended only when sanitizing changed the input |
-| `intent:` | Contents of `fleet.json`, or `none recorded` |
+| `intent:` | Contents of the fleet intent row, or `none recorded` |
 | `deferred:` | Members a launch deferred, with the reason each waits (`capacity`, `dependency`, `external-blocker`), bounded to 8 entries plus `...and N more`. Omitted when nothing is deferred |
 | `released:` | Members whose capacity slot was given back while they stay in the fleet (bd-166), with the reason (`run-complete`, `run-halted`, `operator-release`, `merged`). Bounded like `deferred:`; omitted when nothing is released |
 | `capacity: ceiling 3, N free, M counted` | The repository-wide orchestrator arithmetic (bd-166): the ceiling, the free slots, and one indented line per fleet that records members — `<fleet>: N member(s), M counted (live, unknown, absent), stopped, released, landed; supervisor live\|dead\|none`. `released` and `landed` are separate populations: an operator/run release versus a recorded landing (`run.members[].landedAt`). A member with both is shown as landed only, so one member is never counted twice. "Counted" is live + unknown members not released: the number a launch subtracts. A member is `absent` (no slot) only when its own execution is accounted for: workflow state, or a run manifest that postdates the worktree's creation and the run's recorded `launchedAt`. A run manifest that merely names the task — an inherited one, or one with no cutoff available — leaves the member `unknown`, so the slot stays counted. A recorded landing (`run.members[].landedAt`) is positive evidence the tree existed, and a member in `released[]` or `landedAt` holds no slot at all (bd-168), so a fleet reporting `members: 0` contributes 0 counted slots |
@@ -272,9 +272,9 @@ Warnings (absent when there are none):
 
 | Warning text | Trigger | What to do |
 |--------------|---------|------------|
-| `no .belayd/workflow.json in <path>; that worktree drives no workflow` | A linked worktree has no state file and nothing proves its workflow finished | If it really finished but holds a different bead's runs, remove the stale worktree (`git worktree remove <path>`); if it did not, restart the task there. The member cannot be scheduled until it holds state. |
-| `no .belayd/workflow.json in <path> (completion clears it); <taskId> still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=<id> then action=drain` | A finished member whose state was archived at completion (bd-168) | Nothing is wrong: land it with the named commands. The id is preserved from the branch or the member's own runs, so the fleet can land it autonomously |
-| `unreadable .belayd/workflow.json in <path>` | The file exists but does not parse as workflow state | Inspect/replace the file. Nothing can be derived from that worktree until it parses; never edit it from a different worktree. |
+| `no workflow row for <path>; that worktree drives no workflow` | A linked worktree has no workflow row and nothing proves its workflow finished | If it really finished but holds a different bead's runs, remove the stale worktree (`git worktree remove <path>`); if it did not, restart the task there. The member cannot be scheduled until it holds state. |
+| `no workflow row for <path> (completion clears it); <taskId> still belongs to this fleet and its work is finished — land it with belayd_fleet_merge action=enqueue task=<id> then action=drain` | A finished member whose state was archived at completion (bd-168) | Nothing is wrong: land it with the named commands. The id is preserved from the branch or the member's own runs, so the fleet can land it autonomously |
+| `unreadable workflow row for <path>` | The row exists but does not parse as workflow state | Inspect/replace the row. Nothing can be derived from that worktree until it parses; never edit it from a different worktree. |
 | `<path> records <a>, but its branch or directory names <b>` | `workflow.json` `taskId` disagrees with the branch (or the worktree directory name) | The worktree holds another bead's state, or was re-branched. bd-119 phase/commit/proof tools refuse in that state, so sort out the identity before running a phase. |
 | `<taskId> is claimed by <n> worktrees: <paths>` | Two worktrees record the same `taskId` | Exactly one is real. Do not run phases in either until you know which; `bd show <taskId>` plus the branches tell you which tree owns the bead. |
 | `git worktree list entry "<path>" was skipped: non-key line(s) "…" mean the path does not round-trip through line-oriented porcelain (…git >= 2.36 `-z` is required)` | `git worktree list --porcelain -z` failed (git < 2.36 has no `-z`), so the line-oriented fallback ran and a path containing a newline cannot round-trip; the NUL form never produces this warning | Upgrade git. A skipped entry is *not reported at all*, so never read its absence as "that worktree is clean". |
@@ -300,9 +300,10 @@ fatal: not a git repository (or any of the parent directories): .git
 - It does **not** merge, rebase, stash, checkout, commit, or add/remove a
   worktree — it runs exactly two read-only git probes
   (`git rev-parse --git-common-dir`, `git worktree list --porcelain -z`).
-- It does **not** write anything: no `fleet.json`, no `audit.log`, no run
-  manifest, no `.belayd` state. It does not even create
-  `<git-common-dir>/belayd/fleet/`.
+- It does **not** write anything: no intent row, no audit row, no run manifest,
+  no `.belayd` state. It does not even create `<git-common-dir>/belayd/fleet/`.
+  (The one exception is the `migration` marker of the import described in
+  `docs/fleet.md`.)
 - It does **not** change bead status. It runs read-only `bd` calls only: one
   batched `bd show <ids> --json` for titles/statuses/owner/assignee/labels, then
   `bd comments <id> --json` and `bd gate list <id> --json` per member — never

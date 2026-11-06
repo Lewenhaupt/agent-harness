@@ -16,7 +16,7 @@
  * re-arms or disarms the mode immediately.
  *
  * **Threat model (W6).** The fleet directory is shared and writable by anyone who
- * can write the repository's git dir, so `fleet.json` is untrusted input. A
+ * can write the repository's git dir, so the intent row is untrusted input. A
  * session id is public and a long-lived pid (init, a kernel thread) is easy to
  * name, which is why identity is not enough on its own: pid 1 and the kernel
  * range are refused outright (`FLEET_MIN_SUPERVISOR_PID`), the pid's start time
@@ -39,10 +39,11 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import type { FleetStateFs } from "./fleet-state.js";
 import { fleetRoot, readFleetIntent } from "./fleet-state.js";
 import type { FleetIntent } from "./fleet-status.js";
-import { fleetEventsDir, fleetInboxDir, fleetStateDir, sanitizeFleetId } from "./fleet-status.js";
+import { sanitizeFleetId } from "./fleet-status.js";
+import { repoStatePathForCommonDir, sharedRepoStateStore } from "./repo-state-store.js";
 import { ALL_PHASE_TOOLS } from "./workflow-phases.js";
 
-/** The supervisor record stored in `fleet.json`. */
+/** The supervisor record stored in the fleet intent. */
 export type FleetSupervisorRecord = NonNullable<FleetIntent["supervisor"]>;
 
 /**
@@ -86,7 +87,7 @@ export function formatFleetRefusal(options: { toolName: string; fleetId: string 
   );
 }
 
-/** Build the supervisor record a fleet session writes into `fleet.json`. */
+/** Build the supervisor record a fleet session writes into the fleet intent. */
 export function createFleetSupervisorRecord(options: {
   sessionId: string;
   pid: number;
@@ -108,7 +109,7 @@ export function createFleetSupervisorRecord(options: {
  *
  * init (pid 1) and the kernel-thread range occupy the bottom of the pid space,
  * and they are alive forever — exactly the "any long-lived pid" a corrupt or
- * malicious `fleet.json` would name. A real supervisor is a user process well
+ * malicious intent row would name. A real supervisor is a user process well
  * above this floor. Residual risk, documented not hidden: inside a fresh pid
  * namespace (container) pids start low, so a legitimate supervisor there may be
  * below the floor and would have to re-arm from a session whose pid clears it.
@@ -208,7 +209,7 @@ export interface FleetSupervisorMatchOptions {
   pidStartTime?: (pid: number) => string | undefined;
   /**
    * The token this session minted when it armed the fleet (W6). It lives only in
-   * the session's memory, so a `fleet.json` planted by another writer — even one
+   * the session's memory, so an intent row planted by another writer — even one
    * naming this session id and a long-lived pid — cannot match it.
    */
   armToken?: string;
@@ -307,11 +308,8 @@ export function isProcessAlive(pid: number): boolean {
 export interface FleetMode {
   fleetId: string;
   intent: FleetIntent;
-  /** `<git-common-dir>` the fleet lives under, for audit appends. */
+  /** `<git-common-dir>` the fleet lives under: the key for every store row. */
   gitCommonDir: string;
-  dir: string;
-  inboxDir: string;
-  eventsDir: string;
 }
 
 export interface FleetLookupOptions {
@@ -320,8 +318,28 @@ export interface FleetLookupOptions {
   fs?: FleetStateFs;
 }
 
-/** Fleet directory names under `<git-common-dir>/belayd/fleet` (sorted, deterministic). */
+/**
+ * Fleet ids known to this repository, code-unit sorted.
+ *
+ * Two sources, because two kinds of fact still live in different places: the
+ * store's intent rows (bd-281) and directories left by the fleet-file era's
+ * notes, audit log and launch markers. A directory without an intent row is not a
+ * fleet to any reader, so listing it is harmless; missing a store row would make
+ * a freshly launched fleet unresolvable, which is not.
+ */
 export function listFleetIds(options: FleetLookupOptions): readonly string[] {
+  const ids = new Set<string>(fleetDirectoryIds(options));
+  const store =
+    options.fs?.store ??
+    sharedRepoStateStore({ path: repoStatePathForCommonDir(options.gitCommonDir) }).store;
+  const listed = store?.listFleets();
+  if (listed?.ok === true) for (const fleetId of listed.value) ids.add(fleetId);
+  // Code-unit order, matching the fleet status view: the scan must not depend
+  // on host ICU locale or readdir order.
+  return [...ids].sort();
+}
+
+function fleetDirectoryIds(options: FleetLookupOptions): readonly string[] {
   const root = fleetRoot(options.gitCommonDir);
   try {
     const fs = options.fs;
@@ -330,9 +348,7 @@ export function listFleetIds(options: FleetLookupOptions): readonly string[] {
         ? { exists: () => existsSync(root), list: () => readdirSync(root) }
         : { exists: () => fs.existsSync(root), list: () => fs.readdirSync(root) };
     if (!names.exists()) return [];
-    // Code-unit order, matching the fleet status view: the scan must not depend
-    // on host ICU locale or readdir order.
-    return [...names.list()].sort();
+    return names.list();
   } catch {
     // An unreadable fleet root means "no fleet" for a reader: no fleet path may
     // throw, because these lookups run inside the tool-call gate.
@@ -341,13 +357,12 @@ export function listFleetIds(options: FleetLookupOptions): readonly string[] {
 }
 
 function toFleetMode(gitCommonDir: string, fleetId: string, intent: FleetIntent): FleetMode {
+  // No mailbox paths: notes, audit, queue and markers are rows keyed by this
+  // identity, so the mode carries the identity rather than a directory to write into.
   return {
     fleetId: sanitizeFleetId(fleetId),
     intent,
     gitCommonDir,
-    dir: fleetStateDir(gitCommonDir, fleetId),
-    inboxDir: fleetInboxDir(gitCommonDir, fleetId),
-    eventsDir: fleetEventsDir(gitCommonDir, fleetId),
   };
 }
 

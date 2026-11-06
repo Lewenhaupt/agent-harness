@@ -8,12 +8,12 @@
  *
  * Two hard properties this module exists to deliver:
  *
- * 1. **Single-flight is a filesystem fact, not a JSON convention.** The lock
- *    record in `merge-queue.json` is only a lease; acquisition is gated on
- *    `mkdir <fleetDir>/merge.lock.d`, which fails atomically when another
- *    supervisor holds it. Expiry of the lease — never the recorded pid — is the
- *    sole takeover authority, so a crashed holder is recoverable within one
- *    lease without letting a live one be displaced by pid guessing.
+ * 1. **Single-flight is one conditional row claim.** The lease is a row in the
+ *    repository store, claimed by a single `UPDATE ... WHERE expires_at <= ? OR
+ *    holder = ?`, so exactly one supervisor wins. Expiry of the lease — never
+ *    the recorded pid — is the sole takeover authority, so a crashed holder is
+ *    recoverable within one lease without letting a live one be displaced by pid
+ *    guessing.
  * 2. **Merge in the operator's root checkout, restore the root immediately.**
  *    Only the root can hold the base branch. A dirty root is auto-stashed, the
  *    merge work runs, and the stash is restored before the lock is released. If
@@ -24,11 +24,10 @@
  * left `in_progress` + `human` for the human to accept. It has no bd seam at
  * all, so the property holds by construction.
  *
- * Split, mirroring the other fleet modules: paths, gate derivation, queue
- * rendering, and the decision helpers are pure; lock/queue/git/gate effects live
- * in functions that take injected seams (`FleetStateFs`, git runner, gate
- * runner), so tests can drive the real `mkdir` primitive and real git in
- * throwaway fixture repositories.
+ * Split, mirroring the other fleet modules: gate derivation, queue rendering and
+ * the decision helpers are pure; lock/queue/git/gate effects live in functions
+ * that take injected seams (`FleetStateFs`, git runner, gate runner), so tests
+ * can drive the real store and real git in throwaway fixture repositories.
  */
 
 import { execFile } from "node:child_process";
@@ -60,12 +59,10 @@ import type {
 } from "./fleet-state.js";
 import {
   appendFleetAuditEntry,
-  createFleetMergeLock,
   createFleetMergeQueue,
   enqueueNoteFanout,
   FLEET_MERGE_LEASE_MS,
-  fleetEventsDir,
-  fleetMergeLockDir,
+  fleetStoreFor,
   readFleetIntent,
   readFleetMergeQueue,
   updateFleetIntent,
@@ -75,6 +72,7 @@ import type { FleetIntent } from "./fleet-status.js";
 import type { ProofArtifactPolicy } from "./proof-policy.js";
 import { DEFAULT_PROOF_ARTIFACT_POLICY, readRepoProofPolicy } from "./proof-policy.js";
 import { evaluatePublishGate, isProofArtifactPathInDiff } from "./publish-gate.js";
+import type { RepoFleetLock, RepoFleetLockAcquire } from "./repo-state-store.js";
 import type { WorktreeListEntry } from "./worktree.js";
 import { gitContextFreeEnv, parseWorktreeListPorcelainZ } from "./worktree.js";
 
@@ -83,41 +81,32 @@ import { gitContextFreeEnv, parseWorktreeListPorcelainZ } from "./worktree.js";
 const nodeFsSeam: FleetStateFs = {
   existsSync: (path) => nodeFs.existsSync(path),
   readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  statSync: (path) => {
-    const { size, mtimeMs } = nodeFs.statSync(path);
-    return { size, mtimeMs };
-  },
   writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
   renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
   mkdirSync: (path, options) => {
     nodeFs.mkdirSync(path, options);
   },
   unlinkSync: (path) => nodeFs.unlinkSync(path),
   readdirSync: (path) => nodeFs.readdirSync(path),
-  rmdirSync: (path) => nodeFs.rmdirSync(path),
 };
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null) return undefined;
-  const code = (error as { code?: unknown }).code;
-  return typeof code === "string" ? code : undefined;
-}
-
 /**
- * Grace period for a `merge.lock.d` directory with no lock record.
+ * Why the old implementation needed a grace period, and why this one does not.
  *
- * The winner creates the directory and then writes the record, so a record-less
- * directory is either that in-flight window or a crash between the two. Refusing
- * briefly keeps a loser from stealing a winner's primitive; taking over after
- * the grace keeps a crash from wedging the queue forever.
+ * The retired `merge.lock.d` protocol created a directory and then wrote the lease
+ * record into `merge-queue.json`: a directory without a record was a real window
+ * (the winner between its two writes) and a crash inside it wedged the queue until
+ * a 30 s orphan-lock grace elapsed. Both states existed **only because a
+ * directory cannot carry an expiry and the record was a second write**. A
+ * transactional claim is one row with `expires_at`: it is either absent, or it names
+ * a holder and a deadline, and the deadline is the sole takeover authority. There is
+ * therefore no orphan to grace, no record-without-primitive to clear, and no
+ * create-then-record window to lose a race in.
  */
-export const FLEET_MERGE_ORPHAN_LOCK_GRACE_MS = 30 * 1000;
-
 export interface FleetMergeLockOptions {
   gitCommonDir: string;
   fleetId: string;
@@ -128,75 +117,40 @@ function lockFs(options: FleetMergeLockOptions): FleetStateFs {
   return options.fs ?? nodeFsSeam;
 }
 
-type MkdirOutcome = { kind: "created" } | { kind: "exists" } | { kind: "error"; error: string };
-
-/** Create the lock directory non-recursively: `EEXIST` means someone else holds it. */
-function createLockDir(lockDir: string, fs: FleetStateFs): MkdirOutcome {
-  try {
-    fs.mkdirSync(lockDir);
-    return { kind: "created" };
-  } catch (error) {
-    if (errorCode(error) === "EEXIST") return { kind: "exists" };
-    return { kind: "error", error: errorMessage(error) };
-  }
+/**
+ * The locked view of a row as the queue record's `lock` field.
+ *
+ * `taskId`/`pid` are diagnostics: the row keeps what the retired directory record
+ * carried so a holder is identifiable from `belayd_fleet_status` and a locked queue
+ * still renders the same way.
+ */
+function toFleetMergeLock(lock: RepoFleetLock): FleetMergeLock {
+  return {
+    holder: lock.holder,
+    taskId: lock.taskId,
+    pid: lock.pid,
+    acquiredAt: lock.acquiredAt,
+    leaseExpiresAt: lock.expiresAt,
+  };
 }
 
-/** Remove an empty lock directory; absence counts as removed (idempotent). */
-function removeLockDir(
-  lockDir: string,
-  fs: FleetStateFs,
-): { ok: true } | { ok: false; error: string } {
-  try {
-    fs.rmdirSync(lockDir);
-    return { ok: true };
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return { ok: true };
-    return { ok: false, error: errorMessage(error) };
-  }
-}
-
-/** Age of the orphaned primitive, for the grace check. */
-function lockDirAgeMs(lockDir: string, now: number, fs: FleetStateFs): number | undefined {
-  try {
-    const stat = fs.statSync(lockDir);
-    if (stat.mtimeMs === undefined) return undefined;
-    return Math.max(0, now - stat.mtimeMs);
-  } catch {
-    return undefined;
-  }
-}
-
-export interface AcquireFleetMergeOptions extends FleetMergeLockOptions {
-  /** Session id of the acquiring supervisor. */
+function lockHeld(lock: FleetMergeLock): {
+  ok: false;
+  reason: "lock-held";
+  error: string;
   holder: string;
-  taskId: string;
-  pid: number;
-  /** Epoch-ms clock supplied by the caller (no ambient clock in this layer). */
-  now: number;
-  leaseInMs?: number;
+  leaseExpiresAt: number;
+} {
+  return {
+    ok: false,
+    reason: "lock-held",
+    error:
+      `merge lock is held by ${lock.holder} for ${lock.taskId} until ` +
+      `${new Date(lock.leaseExpiresAt).toISOString()}`,
+    holder: lock.holder,
+    leaseExpiresAt: lock.leaseExpiresAt,
+  };
 }
-
-export type AcquireFleetMergeResult =
-  | {
-      ok: true;
-      lock: FleetMergeLock;
-      queue: FleetMergeQueue;
-      /** Why the lease was free: `no-queue`, `lock-free`, or `lease-expired`. */
-      reason: "no-queue" | "lock-free" | "lease-expired";
-    }
-  | {
-      ok: false;
-      reason:
-        | "lock-held"
-        | "orphan-lock-dir"
-        | "record-without-lock"
-        | "queue-unreadable"
-        | "write-failed"
-        | "lost-race";
-      error: string;
-      holder?: string;
-      leaseExpiresAt?: number;
-    };
 
 /** Audit one cross-tree action; a failure is returned so the caller can report it. */
 export function appendFleetMergeAudit(
@@ -222,234 +176,126 @@ export function appendFleetMergeAudit(
     },
   });
   if (appended.ok) return undefined;
-  return `fleet ${options.fleetId}: could not append to audit.log (${appended.error})`;
+  return `fleet ${options.fleetId}: could not append the audit entry (${appended.error})`;
+}
+
+export interface AcquireFleetMergeOptions extends FleetMergeLockOptions {
+  /** Session id of the acquiring supervisor. */
+  holder: string;
+  taskId: string;
+  pid: number;
+  /** Epoch-ms clock supplied by the caller (no ambient clock in this layer). */
+  now: number;
+  leaseInMs?: number;
+}
+
+export type AcquireFleetMergeResult =
+  | {
+      ok: true;
+      lock: FleetMergeLock;
+      queue: FleetMergeQueue;
+      /** Why the lease was free: `no-queue`, `lock-free`, or `lease-expired`. */
+      reason: "no-queue" | "lock-free" | "lease-expired";
+    }
+  | {
+      ok: false;
+      reason: "lock-held" | "queue-unreadable" | "write-failed";
+      error: string;
+      holder?: string;
+      leaseExpiresAt?: number;
+    };
+
+/** Why the lease is free: absent queue, no lock, or an expired row. */
+function freeLeaseReason(
+  queue: FleetMergeQueue | undefined,
+  now: number,
+): "no-queue" | "lock-free" | "lease-expired" {
+  const lock = queue?.lock ?? null;
+  if (lock === null) return queue === undefined ? "no-queue" : "lock-free";
+  return now >= lock.leaseExpiresAt ? "lease-expired" : "lock-free";
+}
+
+/** Map a lost claim to the refusal a drain reports. */
+function acquireFailure(acquired: RepoFleetLockAcquire): AcquireFleetMergeResult {
+  if (!acquired.ok && acquired.holder !== "") {
+    return {
+      ok: false,
+      reason: "lock-held",
+      error:
+        `merge lock is held by ${acquired.holder} until ` +
+        `${new Date(acquired.expiresAt).toISOString()}`,
+      holder: acquired.holder,
+      leaseExpiresAt: acquired.expiresAt,
+    };
+  }
+  return { ok: false, reason: "write-failed", error: "could not claim the merge lock" };
 }
 
 /**
  * Atomically acquire the single-flight merge lock.
  *
- * Order matters in both directions:
+ * The claim is one conditional upsert on `fleet_lock` (`... WHERE expires_at <= ?
+ * OR holder = ?`), so exactly one acquirer wins and the lease it records is the same
+ * statement. A live foreign lease is refused **before** the claim so the refusal can
+ * name the holder; the claim itself is still what decides, and a concurrent winner
+ * that slipped in between the read and the claim is reported as held with the holder
+ * that actually won.
  *
- * 1. Read the queue first, so an unexpired lease is refused without touching the
- *    primitive (a live holder keeps its directory untouched).
- * 2. Try `mkdir` — the atomic half. Only the process that creates the directory
- *    may write the lock record.
- * 3. On an expired lease, remove the stale primitive and retry `mkdir`; the
- *    retry can still lose to a concurrent acquirer, which is reported
- *    (`lost-race`), never assumed away.
- * 4. Write the lease record, then prove the primitive is still ours. A record
- *    without the directory is withdrawn, so a stolen primitive cannot leave two
- *    recorded holders.
- *
- * A record without the directory is *diagnosable*, not a wedge: it is reported
- * with its recovery time and becomes acquirable when that lease expires (the
- * lease remains the only takeover authority). A directory without a record is
- * the in-flight/crash case described by
- * {@link FLEET_MERGE_ORPHAN_LOCK_GRACE_MS}.
- *
- * Residual race, stated not hidden: two acquirers that both observe the same
- * expired lease can interleave remove/`mkdir`, and the loser can remove the
- * winner's fresh directory before the winner writes its record. The post-write
- * primitive check detects that and withdraws the record, and the next drain
- * retries; the merge itself only starts after a verified acquire, so no repo
- * mutation happens under an unverified lock.
+ * The lease — never a recorded pid — is the sole takeover authority: an expired row
+ * is claimed by the next acquirer, so a crashed holder is recoverable within one
+ * lease. There is no directory to reclaim and no record/primitive pair to reconcile.
  */
-/** Why a lock cannot be acquired; the reason is what the operator acts on. */
-type LockUnavailable = {
-  ok: false;
-  reason:
-    | "lock-held"
-    | "orphan-lock-dir"
-    | "record-without-lock"
-    | "queue-unreadable"
-    | "write-failed"
-    | "lost-race";
-  error: string;
-  holder?: string;
-  leaseExpiresAt?: number;
-};
-
-/**
- * Lease half of acquisition: is anyone plausibly merging right now?
- *
- * A live lease is only believable while its primitive exists — this module's
- * holder never removes the directory mid-hold, so a missing one means the lease
- * is already broken. Report that explicitly (with the recovery time) instead of a
- * misleading "held by" message; the lease deadline still remains the sole
- * takeover authority.
- */
-function preflightLock(options: {
-  queue: FleetMergeQueue | undefined;
-  fs: FleetStateFs;
-  lockDir: string;
-  now: number;
-}):
-  | { ok: true; lock: FleetMergeLock | null; reason: "no-queue" | "lock-free" | "lease-expired" }
-  | LockUnavailable {
-  const lock = options.queue?.lock ?? null;
-  if (lock === null) {
-    return {
-      ok: true,
-      lock: null,
-      reason: options.queue === undefined ? "no-queue" : "lock-free",
-    };
-  }
-  if (options.now >= lock.leaseExpiresAt) {
-    return { ok: true, lock, reason: "lease-expired" };
-  }
-  if (!options.fs.existsSync(options.lockDir)) {
-    return {
-      ok: false,
-      reason: "record-without-lock",
-      error:
-        `merge-queue.json records a lock for ${lock.holder} but ${options.lockDir} does not ` +
-        `exist; it becomes acquirable at ${new Date(lock.leaseExpiresAt).toISOString()}`,
-      holder: lock.holder,
-      leaseExpiresAt: lock.leaseExpiresAt,
-    };
-  }
-  return {
-    ok: false,
-    reason: "lock-held",
-    error:
-      `merge lock is held by ${lock.holder} for ${lock.taskId} until ` +
-      `${new Date(lock.leaseExpiresAt).toISOString()}`,
-    holder: lock.holder,
-    leaseExpiresAt: lock.leaseExpiresAt,
-  };
-}
-
-/** Remove a stale or orphaned primitive so `mkdir` can be retried. */
-function reclaimLockDir(options: {
-  fs: FleetStateFs;
-  lockDir: string;
-  lock: FleetMergeLock | null;
-  now: number;
-}): { ok: true } | LockUnavailable {
-  if (options.lock === null) {
-    // No record: either the winner is inside the create-then-write window, or it
-    // crashed between the two. Refuse briefly, take over after the grace.
-    const ageInMs = lockDirAgeMs(options.lockDir, options.now, options.fs);
-    if (ageInMs === undefined || ageInMs < FLEET_MERGE_ORPHAN_LOCK_GRACE_MS) {
-      return {
-        ok: false,
-        reason: "orphan-lock-dir",
-        error:
-          `${options.lockDir} exists without a lock record (acquisition in progress, or a holder ` +
-          `crashed before writing its lease); retry after ` +
-          `${Math.round(FLEET_MERGE_ORPHAN_LOCK_GRACE_MS / 1000)}s or remove the directory by hand`,
-      };
-    }
-  }
-  const removed = removeLockDir(options.lockDir, options.fs);
-  if (removed.ok) return { ok: true };
-  return {
-    ok: false,
-    reason: "write-failed",
-    error: `could not reclaim expired merge lock at ${options.lockDir}: ${removed.error}`,
-  };
-}
-
-/** Win the atomic primitive: `mkdir` first, reclaim-and-retry when it exists. */
-function winLockPrimitive(options: {
-  fs: FleetStateFs;
-  lockDir: string;
-  lock: FleetMergeLock | null;
-  now: number;
-}): { ok: true } | LockUnavailable {
-  const firstAttempt = createLockDir(options.lockDir, options.fs);
-  if (firstAttempt.kind === "error") {
-    return { ok: false, reason: "write-failed", error: firstAttempt.error };
-  }
-  if (firstAttempt.kind === "created") return { ok: true };
-
-  const reclaimed = reclaimLockDir(options);
-  if (!reclaimed.ok) return reclaimed;
-
-  const retry = createLockDir(options.lockDir, options.fs);
-  if (retry.kind === "error") {
-    return { ok: false, reason: "write-failed", error: retry.error };
-  }
-  if (retry.kind === "exists") {
-    return {
-      ok: false,
-      reason: "lost-race",
-      error: `another supervisor acquired ${options.lockDir} while this one was reclaiming it`,
-    };
-  }
-  return { ok: true };
-}
-
-/** Write the lease record and prove this process still holds the primitive. */
-function writeAcquireRecord(
-  options: AcquireFleetMergeOptions,
-  fs: FleetStateFs,
-  lockDir: string,
-): AcquireFleetMergeResult {
-  const record = createFleetMergeLock({
-    holder: options.holder,
-    taskId: options.taskId,
-    pid: options.pid,
-    now: options.now,
-    ...(options.leaseInMs === undefined ? {} : { leaseInMs: options.leaseInMs }),
-  });
-  const written = updateFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-    update: (current) => ({
-      ...(current ?? createFleetMergeQueue(options.now)),
-      updatedAt: options.now,
-      lock: record,
-    }),
-  });
-  if (!written.ok) {
-    removeLockDir(lockDir, fs);
-    return { ok: false, reason: "write-failed", error: written.error };
-  }
-
-  if (!fs.existsSync(lockDir)) {
-    // The record was written but the primitive is gone: another acquirer won the
-    // reclaim race. Withdraw our record instead of believing we hold the lock.
-    updateFleetMergeQueue({
-      gitCommonDir: options.gitCommonDir,
-      fleetId: options.fleetId,
-      fs,
-      update: (current) =>
-        current === undefined || current.lock?.holder !== options.holder
-          ? (current ?? createFleetMergeQueue(options.now))
-          : { ...current, updatedAt: options.now, lock: null },
-    });
-    return {
-      ok: false,
-      reason: "lost-race",
-      error: `lost the merge lock at ${lockDir} to a concurrent acquirer`,
-    };
-  }
-  return { ok: true, lock: record, queue: written.queue, reason: "lock-free" };
-}
-
 export function acquireFleetMerge(options: AcquireFleetMergeOptions): AcquireFleetMergeResult {
-  const fs = lockFs(options);
-  const lockDir = fleetMergeLockDir(options.gitCommonDir, options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "queue-unreadable",
+      error: "the repository state store is unavailable",
+    };
+  }
+  const fleetId = options.fleetId;
   const loaded = readFleetMergeQueue({
     gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
+    fleetId,
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
   if (!loaded.ok) return { ok: false, reason: "queue-unreadable", error: loaded.error };
 
-  const preflight = preflightLock({ queue: loaded.queue, fs, lockDir, now: options.now });
-  if (!preflight.ok) return preflight;
+  const current = loaded.queue?.lock ?? null;
+  const wantedReason = freeLeaseReason(loaded.queue, options.now);
+  // A live lease is refused before the claim so the message names its holder.
+  if (
+    current !== null &&
+    options.now < current.leaseExpiresAt &&
+    current.holder !== options.holder
+  ) {
+    return lockHeld(current);
+  }
 
-  const won = winLockPrimitive({ fs, lockDir, lock: preflight.lock, now: options.now });
-  if (!won.ok) return won;
-
-  const acquired = writeAcquireRecord(options, fs, lockDir);
-  // The preflight reason is the honest one ("lease-expired"), not the generic
-  // default the record writer uses.
-  return acquired.ok ? { ...acquired, reason: preflight.reason } : acquired;
+  const acquired = store.acquireFleetLock({
+    fleetId,
+    holder: options.holder,
+    taskId: options.taskId,
+    pid: options.pid,
+    nowMs: options.now,
+    leaseMs: options.leaseInMs ?? FLEET_MERGE_LEASE_MS,
+    takeOverExpired: true,
+  });
+  if (!acquired.ok) return acquireFailure(acquired);
+  const lock = toFleetMergeLock(acquired.lock);
+  return {
+    ok: true,
+    lock,
+    queue: {
+      ...(loaded.queue ?? createFleetMergeQueue(options.now)),
+      updatedAt: options.now,
+      lock,
+    },
+    reason: wantedReason,
+  };
 }
+
 export interface RenewFleetMergeLeaseOptions extends FleetMergeLockOptions {
   holder: string;
   taskId: string;
@@ -461,70 +307,56 @@ export type RenewFleetMergeLeaseResult =
   | { ok: true; lock: FleetMergeLock }
   | {
       ok: false;
-      reason: "not-holder" | "queue-unreadable" | "lock-dir-missing" | "write-failed";
+      reason: "not-holder" | "queue-unreadable" | "write-failed";
       error: string;
     };
 
 /**
  * Renew the lease while a merge is in progress (the heartbeat).
  *
- * Renewal requires the primitive to still exist: a lease extended for a holder
- * whose lock directory is gone would recreate the record-without-lock state the
- * design calls out as broken. A foreign lease is refused, never extended.
+ * The store renews only while this holder still owns an unexpired row, so a lease
+ * that lapsed is refused rather than resurrected: a holder that lost its lease must
+ * not believe it still owns the merge. A foreign lease is refused, never extended.
  */
 export function renewFleetMergeLease(
   options: RenewFleetMergeLeaseOptions,
 ): RenewFleetMergeLeaseResult {
-  const fs = lockFs(options);
-  const lockDir = fleetMergeLockDir(options.gitCommonDir, options.fleetId);
-  const loaded = readFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!loaded.ok) return { ok: false, reason: "queue-unreadable", error: loaded.error };
-
-  const current = loaded.queue?.lock ?? null;
-  if (current === null) {
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "queue-unreadable",
+      error: "the repository state store is unavailable",
+    };
+  }
+  const current = store.readFleetLock(options.fleetId);
+  if (!current.ok) return { ok: false, reason: "queue-unreadable", error: current.error };
+  if (current.value === null) {
     return { ok: false, reason: "not-holder", error: "no merge lock is held" };
   }
-  if (current.holder !== options.holder || current.taskId !== options.taskId) {
+  if (current.value.holder !== options.holder || current.value.taskId !== options.taskId) {
     return {
       ok: false,
       reason: "not-holder",
-      error: `merge lock is held by ${current.holder} for ${current.taskId}, not by this session`,
+      error: `merge lock is held by ${current.value.holder} for ${current.value.taskId}, not by this session`,
     };
   }
-  if (!fs.existsSync(lockDir)) {
+  const renewed = store.renewFleetLock({
+    fleetId: options.fleetId,
+    holder: options.holder,
+    nowMs: options.now,
+    leaseMs: options.leaseInMs ?? FLEET_MERGE_LEASE_MS,
+  });
+  if (!renewed.ok) {
     return {
       ok: false,
-      reason: "lock-dir-missing",
-      error: `merge lock record exists but ${lockDir} does not; not extending a broken lease`,
+      reason: "not-holder",
+      error:
+        `the merge lease held by ${options.holder} lapsed before it was renewed; ` +
+        "a lapsed lease is not extended",
     };
   }
-
-  const renewed: FleetMergeLock = {
-    ...current,
-    leaseExpiresAt: options.now + (options.leaseInMs ?? FLEET_MERGE_LEASE_MS),
-  };
-  const written = updateFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-    update: (queue) =>
-      queue === undefined
-        ? createFleetMergeQueue(options.now)
-        : {
-            ...queue,
-            updatedAt: options.now,
-            lock:
-              queue.lock?.holder === options.holder && queue.lock.taskId === options.taskId
-                ? renewed
-                : queue.lock,
-          },
-  });
-  if (!written.ok) return { ok: false, reason: "write-failed", error: written.error };
-  return { ok: true, lock: renewed };
+  return { ok: true, lock: toFleetMergeLock(renewed.lock) };
 }
 
 export interface ReleaseFleetMergeOptions extends FleetMergeLockOptions {
@@ -541,60 +373,38 @@ export type ReleaseFleetMergeResult =
     };
 
 /**
- * Release a held merge lock: clear the record, then remove the primitive.
+ * Release a held merge lock.
  *
  * Releasing a lock this session does not hold is refused and mutates nothing —
- * release must never become a general-purpose "unlock whatever is there". The
- * record is cleared before the directory so a concurrent acquirer can never
- * write a fresh record that this release then erases; the cost is that a loser
- * may briefly see a record-less directory (bounded by
- * {@link FLEET_MERGE_ORPHAN_LOCK_GRACE_MS}).
+ * release must never become a general-purpose "unlock whatever is there". The store
+ * deletes only the row whose holder matches, so the ownership check is part of the
+ * write rather than a read-then-delete window.
  */
 export function releaseFleetMerge(options: ReleaseFleetMergeOptions): ReleaseFleetMergeResult {
-  const fs = lockFs(options);
-  const lockDir = fleetMergeLockDir(options.gitCommonDir, options.fleetId);
-  const loaded = readFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!loaded.ok) return { ok: false, reason: "queue-unreadable", error: loaded.error };
-
-  const current = loaded.queue?.lock ?? null;
-  if (current === null) {
-    return { ok: true, released: false, warnings: [] };
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "queue-unreadable",
+      error: "the repository state store is unavailable",
+    };
   }
-  if (current.holder !== options.holder) {
+  const current = store.readFleetLock(options.fleetId);
+  if (!current.ok) return { ok: false, reason: "queue-unreadable", error: current.error };
+  if (current.value === null) return { ok: true, released: false, warnings: [] };
+  if (current.value.holder !== options.holder) {
     return {
       ok: false,
       reason: "not-holder",
-      error: `refusing to release the merge lock held by ${current.holder} for ${current.taskId}`,
+      error: `refusing to release the merge lock held by ${current.value.holder} for ${current.value.taskId}`,
     };
   }
-
-  const written = updateFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
+  const released = store.releaseFleetLock({
     fleetId: options.fleetId,
-    fs,
-    update: (queue) =>
-      queue === undefined
-        ? createFleetMergeQueue(options.now)
-        : {
-            ...queue,
-            updatedAt: options.now,
-            lock: queue.lock?.holder === options.holder ? null : queue.lock,
-          },
+    holder: options.holder,
   });
-  if (!written.ok) return { ok: false, reason: "write-failed", error: written.error };
-
-  const removed = removeLockDir(lockDir, fs);
-  const warnings = removed.ok
-    ? []
-    : [
-        `fleet ${options.fleetId}: released the lock record but could not remove ${lockDir} ` +
-          `(${removed.error}); acquisition will recover it after the orphan grace period`,
-      ];
-  return { ok: true, released: true, warnings };
+  if (!released.ok) return { ok: false, reason: "write-failed", error: released.error };
+  return { ok: true, released: released.value.released, warnings: [] };
 }
 
 // ── Merge queue: enqueue and rendering ────────────────────────────────
@@ -1282,7 +1092,7 @@ async function gitWithError(
     : { ok: false, error: commandError(result) };
 }
 
-/** Append to `audit.log`, collecting the warning instead of throwing. */
+/** Append one audit row, collecting the warning instead of throwing. */
 function auditAttempt(
   context: MergeAttemptContext,
   action: string,
@@ -1342,9 +1152,10 @@ function nextEntryState(options: {
 /**
  * Update one queue entry's state.
  *
- * A CAS conflict is retried once against the newer queue: the transition is
- * small and idempotent, and losing a state update silently would make the
- * operator's view of the merge wrong while the repository already moved.
+ * No retry: `updateFleetQueue` compares the revision inside the UPDATE, so a
+ * concurrent writer makes this transition commit nothing and report the conflict.
+ * Retrying around a transaction would hide a genuinely interleaved drain; the next
+ * drain reads the queue again and decides from what is actually stored.
  */
 function transitionEntry(options: {
   context: MergeAttemptContext;
@@ -1381,8 +1192,7 @@ function transitionEntry(options: {
       },
     });
 
-  let written = update();
-  if (!written.ok && written.reason === "conflict") written = update();
+  const written = update();
   return written.ok ? { ok: true } : { ok: false, error: written.error };
 }
 
@@ -1637,7 +1447,8 @@ async function checkMergePreconditions(
  * Proof artifacts are uploaded, never committed, so a diff that adds or
  * modifies them is exactly what the publish transition must not carry. Deleting
  * proof artifacts is *allowed* and is the documented migration path: upload the
- * proof, keep the receipt at `.belayd/proof-receipt.json`, remove the in-tree
+ * proof, keep the receipt (a row in `<git-common-dir>/belayd/state.sqlite` since
+ * bd-281), remove the in-tree
  * files. The diff is therefore read with `--diff-filter=ACMRT`, which excludes
  * deletions and leaves added/copied/modified/renamed/type-changed entries — a
  * rename is classified by its destination path, so moving proof content out of
@@ -2107,7 +1918,7 @@ async function restoreRootStash(context: MergeAttemptContext): Promise<RestoreOu
 }
 
 /**
- * Park the fleet in `fleet.json` (`paused` + the reason + the recorded stash).
+ * Park the fleet in the intent row (`paused` + the reason + the recorded stash).
  *
  * The mutation goes through the compare-and-replace path with the record read
  * *inside* the update (W5): this used to read then blind-write, so an operator
@@ -2132,7 +1943,7 @@ function parkFleet(
       if (current === undefined) {
         return {
           refuse:
-            `refusing to park fleet \`${context.options.fleetId}\`: its fleet.json is missing, ` +
+            `refusing to park fleet \`${context.options.fleetId}\`: its intent row is missing, ` +
             "so the in-memory member list may be stale; recreate/re-arm the fleet and park it " +
             "by hand",
         };
@@ -2162,7 +1973,7 @@ function parkFleet(
  *
  * `auditNote` is appended to the audit detail so a decision that was not a plain
  * per-branch probe (an unreadable base commit hinting everyone, bd-280 S8) is
- * visible in `audit.log`, not only in the note bodies.
+ * visible in the audit rows, not only in the note bodies.
  */
 function sendMergeNote(
   context: MergeAttemptContext,
@@ -2184,7 +1995,9 @@ function sendMergeNote(
     return [];
   }
   const enqueued = enqueueNoteFanout({
-    dir: fleetEventsDir(context.options.gitCommonDir, context.options.fleetId),
+    gitCommonDir: context.options.gitCommonDir,
+    fleetId: context.options.fleetId,
+    channel: "event",
     note: buildFleetNote({
       kind,
       from: "supervisor",
@@ -2227,7 +2040,7 @@ function withAuditNote(detail: string, note: string | undefined): string {
  *
  * `feat/<taskId>` is only a convention: a member on another branch would get a
  * `rebase-hint` on every drain because the convention branch does not exist. The
- * worktree's own `.belayd/workflow.json` names its task id, so the branch is
+ * worktree's own workflow row names its task id, so the branch is
  * looked up from git's worktree list instead of assumed. A member with no
  * resolvable branch is skipped — a hint about a branch that does not exist is
  * worse than none.
@@ -2248,21 +2061,26 @@ function resolveMemberBranch(options: {
   return byState?.branch;
 }
 
-/** Task id recorded in a worktree's `.belayd/workflow.json`, or undefined. */
+/**
+ * Task id bound to a worktree, or undefined.
+ *
+ * Read from the shared store's `workflow_binding` through the fleet store seam: the
+ * worktree's workflow record is a row keyed by task id (bd-281), so this stays one
+ * read that cannot see a stale copy left behind in the worktree.
+ */
 function readWorktreeTaskId(
   context: MergeAttemptContext,
   worktreePath: string,
 ): string | undefined {
-  const statePath = join(worktreePath, ".belayd", "workflow.json");
-  if (!context.fs.existsSync(statePath)) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(context.fs.readFileSync(statePath));
-    if (typeof parsed !== "object" || parsed === null) return undefined;
-    const taskId = (parsed as { taskId?: unknown }).taskId;
-    return typeof taskId === "string" && taskId !== "" ? taskId : undefined;
-  } catch {
-    return undefined;
-  }
+  const store = fleetStoreFor({
+    gitCommonDir: context.options.gitCommonDir,
+    fs: context.fs,
+  });
+  if (store === null) return undefined;
+  const row = store.readWorkflow({ worktreePath });
+  if (!row.ok || row.value === null) return undefined;
+  const taskId = row.value.taskId;
+  return taskId === "" ? undefined : taskId;
 }
 
 /** git's worktree list, or undefined (reported as a warning) when unreadable. */
@@ -2437,7 +2255,7 @@ async function broadcastAfterThrow(context: MergeAttemptContext): Promise<void> 
     context.warnings.push(
       `fleet ${context.options.fleetId}: could not send the base-moved notices for ` +
         `${context.entry.taskId} after a step threw (${describeThrown(error)}); the remaining ` +
-        "members may not know the base moved — check events/ and resend by hand",
+        "members may not know the base moved — check the fleet mailbox and resend by hand",
     );
   }
 }
@@ -3861,7 +3679,7 @@ async function finisherThrownResult(
   const entry = context.entry;
   const landed = context.mergeCommit !== undefined;
   // A landed merge's completion audit goes first: the throw came after the base
-  // branch advanced, so replaying `audit.log` in order shows the merge before the
+  // branch advanced, so replaying the audit rows in order shows the merge before the
   // step that failed on it (bd-280 S6).
   if (landed) auditMergeCompletedOnce(context);
   auditAttempt(context, "merge-step-threw", [entry.taskId], detail);

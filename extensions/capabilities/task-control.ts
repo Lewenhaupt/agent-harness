@@ -399,7 +399,7 @@ export function registerTaskStopTools(deps: TaskStopDeps): void {
         clearWorkflowState({ cwd: ctx.cwd });
       }
 
-      // Teardown always drops the packet, even when workflow.json is missing: a
+      // Teardown always drops the packet, even when the workflow row is missing: a
       // stale handoff must never be re-injected by the next workflow that runs
       // in this worktree.
       clearHandoff({ cwd: ctx.cwd });

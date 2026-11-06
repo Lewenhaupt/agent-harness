@@ -2,30 +2,31 @@
  * Shared fleet state — the cross-tree substrate of the fleet supervisor
  * (bd-126, milestones P1–P4 of docs/fleet-orchestrator.md).
  *
- * Everything cross-worktree lives under `<git-common-dir>/belayd/fleet/<fleetId>/`:
- *
- *   fleet.json        operator intent (one record, one schema)
- *   inbox/            member → supervisor notes, drained at turn start
- *   events/           supervisor → member notifications, drained at turn start
- *   launch/           per-member spawn markers (bd-233; emptied by the spawner)
- *   merge-queue.json  single-flight merge queue (P2)
- *   audit.log         append-only audit of cross-tree authority
+ * Nothing cross-worktree lives in a file any more. Every fact this module owns —
+ * the operator intent and run record, the merge queue, the single-flight lock, the
+ * supervisor beat, the launch markers, the audit trail and the note mailboxes — is
+ * a row in the shared repository store at `<git-common-dir>/belayd/state.sqlite`
+ * (bd-281). Identity is the repository, the fleet id and (for notes) the row seq,
+ * so two sessions in different worktrees read the same rows instead of inheriting
+ * copies, and a stale lease is observable from its `expires_at` rather than
+ * inferred from a file's age.
  *
  * This module is storage plus pure parsing: nothing here schedules, spawns,
  * merges, stashes, or mutates a bead. Every write is the caller's explicit
  * call — nothing in this module happens implicitly.
  *
- * Split, mirroring `fleet-status.ts`: the path helpers, note naming, audit
- * formatting, and the parsers are pure (tests pass values, no mocks); each
- * reader/writer takes an injected {@link FleetStateFs} seam.
+ * Split, mirroring `fleet-status.ts`: the note contract, audit formatting, and the
+ * parsers are pure (tests pass values, no mocks); each reader/writer takes an
+ * injected {@link FleetStateFs} seam, whose `store` carries the opened repository
+ * store in tests.
  */
 
-import { createHash, randomUUID } from "node:crypto";
-import * as nodeFs from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { z } from "zod";
 import type { FleetPublish } from "./fleet-publish.js";
 import { defaultFleetPublish } from "./fleet-publish.js";
+import type { FleetRun } from "./fleet-run.js";
 import type { FleetIntent } from "./fleet-status.js";
 import {
   FLEET_INTENT_ORDERING_GATES_MAX,
@@ -33,35 +34,25 @@ import {
   FLEET_LAUNCH_MARKER_SCHEMA_VERSION,
   FLEET_SCHEMA_VERSION,
   type FleetLaunchMarker,
-  fleetAuditLogPath,
-  fleetEventsDir,
-  fleetInboxDir,
-  fleetIntentFilePath,
+  fleetIntentFromStoreRow,
   fleetIntentWriteRefusal,
-  fleetLaunchMarkerDir,
-  fleetLaunchMarkerPath,
-  fleetMergeQueueFilePath,
+  fleetLaunchMarkerTaskIdRefusal,
   fleetStateDir,
   parseFleetIntent,
+  parseFleetLaunchMarker,
   readFleetLaunchMarker,
   sanitizeFleetId,
 } from "./fleet-status.js";
+import {
+  REPO_STATE_AUDIT_TAIL_ROWS,
+  type RepoFleetLock,
+  type RepoFleetNote,
+  type RepoStateStore,
+  repoStatePathForCommonDir,
+  sharedRepoStateStore,
+} from "./repo-state-store.js";
 import { DEFAULT_BASE_BRANCH } from "./stack-rebase.js";
 import type { WorkflowFs } from "./workflow-state.js";
-import { atomicWriteJson } from "./workflow-state.js";
-
-// Re-exported so a P1+ consumer imports the whole layout from one module. They
-// stay declared in `fleet-status.ts` because the sanitizer and the directory
-// shape must have exactly one implementation.
-export {
-  fleetAuditLogPath,
-  fleetEventsDir,
-  fleetInboxDir,
-  fleetIntentFilePath,
-  fleetLaunchMarkerDir,
-  fleetLaunchMarkerPath,
-  fleetMergeQueueFilePath,
-};
 
 // ── Paths ─────────────────────────────────────────────────────────────
 
@@ -71,109 +62,36 @@ export function fleetRoot(gitCommonDir: string): string {
 }
 
 /**
- * One fleet's state directory. Delegates to `fleetStateDir` so the id-scoped
- * layout and its sanitizer have exactly one implementation (the P0 reader's).
+ * One fleet's legacy directory.
+ *
+ * A documented survivor of the file era: no state is written there any more, but
+ * two readers still need the path to *look* — `listFleetIds` (a fleet id is still
+ * discovered from a directory left by a pre-store session) and the one-shot
+ * importer that moves those files into rows. Delegates to `fleetStateDir` so the
+ * id-scoped shape and its sanitizer have one implementation.
  */
 export function fleetDir(gitCommonDir: string, fleetId: string): string {
   return fleetStateDir(gitCommonDir, fleetId);
 }
 
-/**
- * Out-of-band single-flight primitive for the merge lock: `<fleetDir>/merge.lock.d`.
- *
- * `mkdir` is atomic on POSIX — it either creates the directory or fails with
- * `EEXIST` — which is what makes exactly one concurrent supervisor the winner.
- * The JSON lock record in `merge-queue.json` cannot do that on its own: two
- * readers can both see "lock free". The directory therefore holds nothing (the
- * record lives in the queue), so a residual directory is unambiguously an
- * orphaned primitive rather than data.
- */
-export function fleetMergeLockDir(gitCommonDir: string, fleetId: string): string {
-  return join(fleetStateDir(gitCommonDir, fleetId), "merge.lock.d");
-}
-
 // ── Filesystem seam ───────────────────────────────────────────────────
 
 /**
- * Fs surface the fleet state layer needs: the workflow-state read/write seam
- * (so `atomicWriteJson` can be reused unchanged) plus the append and
- * directory-listing operations the audit log and mailbox need.
+ * Fs surface the fleet state layer needs: the workflow-state seam (shared with the
+ * remaining runtime JSON files) plus a directory listing for the legacy fleet-id
+ * scan, and the opened store every row write goes through.
  */
 export interface FleetStateFs extends WorkflowFs {
-  appendFileSync(path: string, data: string): void;
+  /** Legacy fleet-id discovery and the importer only; no note path is read. */
   readdirSync(path: string): string[];
   /**
-   * Metadata only: the drain bounds its read before touching file content, and
-   * the merge-lock recovery ages an orphaned lock directory by its mtime.
-   * `mtimeMs` is optional so an fs seam without timestamps still works.
-   */
-  statSync(path: string): { size: number; mtimeMs?: number };
-  /** Remove an empty directory: the merge lock's `mkdir` primitive, released. */
-  rmdirSync(path: string): void;
-  /**
-   * The last `bytes` of one file, for the append-only audit log.
+   * The repository store the fleet rows live in (bd-281).
    *
-   * Optional so every existing seam keeps working (the reader then falls back to a
-   * whole-file read, which is correct but unbounded); the node seam and any
-   * production seam read only the tail, so a long-lived fleet's audit log costs a
-   * bounded read per session start.
+   * Production leaves it undefined and every call resolves the shared store at
+   * `<git-common-dir>/belayd/state.sqlite`; unit tests pass their own opened store
+   * here so a fake fs needs no real repository.
    */
-  readTailSync?(path: string, bytes: number): string;
-}
-
-const nodeFsSeam: FleetStateFs = {
-  existsSync: (path) => nodeFs.existsSync(path),
-  readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  statSync: (path) => {
-    const { size, mtimeMs } = nodeFs.statSync(path);
-    return { size, mtimeMs };
-  },
-  writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
-  renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
-  mkdirSync: (path, options) => {
-    nodeFs.mkdirSync(path, options);
-  },
-  unlinkSync: (path) => nodeFs.unlinkSync(path),
-  readdirSync: (path) => nodeFs.readdirSync(path),
-  rmdirSync: (path) => nodeFs.rmdirSync(path),
-  readTailSync: (path, bytes) => {
-    const fd = nodeFs.openSync(path, "r");
-    try {
-      const size = nodeFs.fstatSync(fd).size;
-      const length = Math.min(bytes, size);
-      const buffer = Buffer.alloc(length);
-      // One `readSync` may satisfy fewer bytes than requested (a signal-interrupted
-      // read, or a file that shrank under us). Decoding a partially filled buffer
-      // would turn the unfilled remainder into NUL padding, so keep reading until the
-      // window is full or the file ends, then decode only the bytes actually read.
-      let filled = 0;
-      let offset = size - length;
-      while (filled < length) {
-        const read = nodeFs.readSync(fd, buffer, filled, length - filled, offset);
-        if (read === 0) break;
-        filled += read;
-        offset += read;
-      }
-      return buffer.subarray(0, filled).toString("utf8");
-    } finally {
-      nodeFs.closeSync(fd);
-    }
-  },
-};
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * Locale-independent string order, matching the fleet status view. Ordering by
- * `localeCompare` would let the host ICU locale reorder mailbox drains and
- * audit-adjacent output.
- */
-function compareCodeUnits(a: string, b: string): number {
-  if (a === b) return 0;
-  return a < b ? -1 : 1;
+  store?: RepoStateStore;
 }
 
 /** Truncate to at most `limit` characters, marking that it was cut. */
@@ -185,12 +103,12 @@ function boundText(text: string, limit: number): string {
 /** Result of any fleet-state write. */
 export type FleetStateWriteResult = { ok: true } | { ok: false; error: string };
 
-// ── fleet.json intent ─────────────────────────────────────────────────
+// ── fleet intent + run record (shared store row) ──────────────────────
 
 /**
- * The stored fleet id must always match the directory that holds the record;
- * otherwise two fleet ids could claim one intent. Sanitizing here is idempotent
- * for the id the path helpers already derived.
+ * The stored fleet id must always match the row that holds the record; otherwise
+ * two fleet ids could claim one intent. Sanitizing here is idempotent for the id
+ * the path helpers already derived.
  */
 function withDirectoryFleetId(intent: FleetIntent, fleetId: string): FleetIntent {
   return { ...intent, fleetId: sanitizeFleetId(fleetId) };
@@ -211,10 +129,77 @@ function migrateLegacyIntentForWrite(intent: FleetIntent): FleetIntent {
   return parseFleetIntent(intent) ?? intent;
 }
 
+/** The record every write path lands: current schema, id bound to the row key. */
+function intentForWrite(intent: FleetIntent, fleetId: string): FleetIntent {
+  return withDirectoryFleetId(migrateLegacyIntentForWrite(intent), fleetId);
+}
+
+/**
+ * Split the record into the two stored columns.
+ *
+ * The run is a column of its own so a caller can bump either half without writing
+ * a stale copy of the other, and the intent column never carries a second copy of
+ * the run. Both land in one transaction; see {@link writeFleetRun}.
+ *
+ * Exported because the one-shot file import (bd-281) must land a legacy
+ * `fleet.json` into exactly the two columns a live write uses.
+ */
+export function splitFleetIntent(intent: FleetIntent): {
+  document: FleetIntent;
+  run: FleetIntent["run"];
+} {
+  const { run, ...document } = intent;
+  return { document, run };
+}
+
 export interface FleetIntentOptions {
   gitCommonDir: string;
   fleetId: string;
   fs?: FleetStateFs;
+  /**
+   * Test seam: an already-opened repository store. Production omits it and the
+   * shared store at `<git-common-dir>/belayd/state.sqlite` is used.
+   */
+  store?: RepoStateStore;
+  /** Epoch-ms clock for the write this call makes. Defaults to `Date.now`. */
+  now?: number;
+}
+
+/**
+ * The store a fleet intent call reads and writes.
+ *
+ * Resolved from the git common dir the caller already holds (never a worktree
+ * path): every worktree of one repository therefore resolves the same row, which
+ * is what makes a copied record impossible.
+ */
+/**
+ * The repository store these fleet facts live in.
+ *
+ * Fleet identity is the git common dir the caller already holds (never a worktree
+ * path), so every worktree resolves the same rows. Exported because the merge
+ * queue, audit, markers and heartbeat all write through it.
+ */
+export function fleetStoreFor(options: {
+  gitCommonDir: string;
+  fs?: FleetStateFs;
+  store?: RepoStateStore;
+}): RepoStateStore | null {
+  if (options.store !== undefined) return options.store;
+  if (options.fs?.store !== undefined) return options.fs.store;
+  return sharedRepoStateStore({ path: repoStatePathForCommonDir(options.gitCommonDir) }).store;
+}
+
+/** A failed intent write, with the reason the caller's next step depends on. */
+type FleetIntentUpdateFailureReason =
+  | "corrupt-intent"
+  | "read-failed"
+  | "write-failed"
+  | "conflict"
+  | "refused";
+
+interface FleetIntentUpdateFailure {
+  reason: FleetIntentUpdateFailureReason;
+  error: string;
 }
 
 /**
@@ -226,45 +211,33 @@ export type FleetIntentLoadResult =
   | { ok: false; reason: "corrupt-intent" | "read-failed"; error: string };
 
 /**
- * Raw load of `fleet.json`: the parsed record plus the exact text it came from.
+ * Read the fleet's row. Absent means "no intent"; a row this version cannot parse
+ * is reported rather than treated as absence.
  *
- * The raw text is what makes compare-and-replace possible: an updater can only
- * prove it based its change on the bytes still on disk if it kept them.
+ * The run record shares the row and is recombined into the intent here, so every
+ * existing reader keeps seeing the record the file used to hold (bd-281).
  */
-type FleetIntentRawLoad =
-  | { ok: true; raw: string | undefined; intent: FleetIntent | undefined }
-  | { ok: false; reason: "corrupt-intent" | "read-failed"; error: string };
-
-function readFleetIntentRaw(options: FleetIntentOptions): FleetIntentRawLoad {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
-
-  let raw: string;
-  try {
-    if (!fs.existsSync(filePath)) return { ok: true, raw: undefined, intent: undefined };
-    raw = fs.readFileSync(filePath);
-  } catch (error) {
-    return { ok: false, reason: "read-failed", error: errorMessage(error) };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return { ok: false, reason: "corrupt-intent", error: `${filePath} is not valid JSON` };
-  }
-
-  const intent = parseFleetIntent(parsed);
-  if (intent === undefined) {
-    return { ok: false, reason: "corrupt-intent", error: `${filePath} is not a fleet intent` };
-  }
-  return { ok: true, raw, intent };
-}
-
-/** Read `fleet.json`. Absent means "no intent"; a corrupt file is reported. */
 export function readFleetIntent(options: FleetIntentOptions): FleetIntentLoadResult {
-  const loaded = readFleetIntentRaw(options);
-  return loaded.ok ? { ok: true, intent: loaded.intent } : loaded;
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "read-failed",
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
+    };
+  }
+  const row = store.readFleet(fleetId);
+  if (!row.ok) return { ok: false, reason: "read-failed", error: row.error };
+  if (row.value === null) return { ok: true, intent: undefined };
+  const intent = fleetIntentFromStoreRow(row.value);
+  return intent === undefined
+    ? {
+        ok: false,
+        reason: "corrupt-intent",
+        error: `fleet ${fleetId} row is not a fleet intent`,
+      }
+    : { ok: true, intent };
 }
 
 export interface WriteFleetIntentOptions extends FleetIntentOptions {
@@ -272,57 +245,63 @@ export interface WriteFleetIntentOptions extends FleetIntentOptions {
 }
 
 /**
- * Replace `fleet.json` atomically (temp file + rename).
+ * Replace the stored intent, refusing a row this version cannot read.
  *
- * Absence is writable; a **present but unparsable** record is refused. The
- * single-schema guarantee only holds if every writer refuses what it cannot
- * read: replacing an unreadable file would erase operator intent (possibly
- * written by a newer schema) that this version simply does not understand.
- * Mutations should go through {@link updateFleetIntent}; this function is the
- * wholesale-replace form of the same rule.
+ * Absence is writable; a **present but unparsable** row is refused. The
+ * single-schema guarantee only holds if every writer refuses what it cannot read:
+ * replacing an unreadable record would erase operator intent (possibly written by
+ * a newer schema) that this version simply does not understand. Mutations should
+ * go through {@link updateFleetIntent}; this function is the wholesale-replace
+ * form of the same rule.
+ *
+ * A record that carries a run is written through the same transactional plan as
+ * {@link updateFleetIntent}, so its run column cannot be bumped separately. A
+ * record without one leaves any stored run untouched: an intent replace must not
+ * silently forget the loop record.
  */
 export function writeFleetIntent(options: WriteFleetIntentOptions): FleetStateWriteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
-  const current = readFleetIntentRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: `fleet ${fleetId}: the repository state store is unavailable` };
+  }
+  const current = store.readFleet(fleetId);
   if (!current.ok) {
     return {
       ok: false,
-      error: `refusing to replace unreadable fleet intent at ${filePath}: ${current.error}`,
+      error: `refusing to replace unreadable fleet intent for ${fleetId}: ${current.error}`,
     };
   }
-  return writeFleetIntentUnchecked({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    intent: options.intent,
-    fs,
-  });
-}
-
-/**
- * Module-private write with no read-first check, for callers that already
- * decided the replace is safe (the compare-and-replace path below, which just
- * compared the on-disk bytes). Never export this: it is the hole
- * {@link writeFleetIntent} exists to close.
- *
- * "Unchecked" is about the *replace*, not the *record*: the schema check runs
- * here because this is the one place every writer reaches, and a record the
- * reader would refuse must never land (it would brick the fleet intent for good —
- * see {@link fleetIntentWriteRefusal}).
- */
-function writeFleetIntentUnchecked(options: WriteFleetIntentOptions): FleetStateWriteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
-  const intent = withDirectoryFleetId(migrateLegacyIntentForWrite(options.intent), options.fleetId);
+  if (current.value !== null && fleetIntentFromStoreRow(current.value) === undefined) {
+    return {
+      ok: false,
+      error: `refusing to replace unreadable fleet intent for ${fleetId}: its row is not a fleet intent`,
+    };
+  }
+  const intent = intentForWrite(options.intent, fleetId);
   const refusal = fleetIntentWriteRefusal(intent);
   if (refusal !== undefined) {
-    return { ok: false, error: `refusing to write ${filePath}: ${refusal}` };
+    return { ok: false, error: `refusing to write fleet intent for ${fleetId}: ${refusal}` };
   }
-  return atomicWriteJson(filePath, intent, fs);
+  const { document, run } = splitFleetIntent(intent);
+  const nowMs = options.now ?? Date.now();
+  if (run === undefined) {
+    const written = store.writeFleetIntent({ fleetId, intent: document, nowMs });
+    return written.ok ? { ok: true } : { ok: false, error: written.error };
+  }
+  const written = store.mutateFleet({
+    fleetId,
+    update: () => ({ kind: "write", intent: document, run }),
+    nowMs,
+  });
+  return written.ok && written.value.kind === "written"
+    ? { ok: true }
+    : {
+        ok: false,
+        error: written.ok
+          ? `fleet ${fleetId} could not be written (${written.value.kind})`
+          : written.error,
+      };
 }
 
 /**
@@ -330,9 +309,9 @@ function writeFleetIntentUnchecked(options: WriteFleetIntentOptions): FleetState
  * missing or in a state the caller refuses to change.
  *
  * This exists so a mutation whose precondition is only decidable from the *fresh*
- * record (park, unpause, prune) can stay on the compare-and-replace path instead of
- * reading first and then writing blind: a blind write after a separate read loses
- * any update that landed in between.
+ * record (park, unpause, prune) decides it against the row read inside the same
+ * transaction: a blind write after a separate read loses any update that landed in
+ * between.
  */
 export interface FleetIntentUpdateRefusal {
   refuse: string;
@@ -354,64 +333,305 @@ export type UpdateFleetIntentResult =
   | { ok: true; intent: FleetIntent }
   | {
       ok: false;
-      reason: "corrupt-intent" | "read-failed" | "write-failed" | "conflict" | "refused";
+      reason: FleetIntentUpdateFailureReason;
       error: string;
     };
 
 /**
- * Read-modify-write `fleet.json` with compare-and-replace.
+ * Read-modify-write the fleet's row in one `BEGIN IMMEDIATE`.
  *
- * A corrupt record is refused rather than overwritten: replacing it would erase
+ * **Concurrency (W6, resolved by bd-281):** the updater runs inside the store's
+ * write transaction and the plan is committed with a revision bump, so a
+ * concurrent writer is serialised by SQLite instead of losing an update to a
+ * check-then-write window. This is *not* a race any more: the previous file path
+ * compared raw text and documented a residual window that needed an `O_EXCL`
+ * primitive; the store's transaction is that primitive.
+ *
+ * A corrupt row is refused rather than overwritten: replacing it would erase
  * operator intent the supervisor could not read.
- *
- * **Concurrency (W6):** the update only writes when the on-disk text still
- * equals the text it read, so two interleaved writers cannot silently drop one
- * update — the loser sees `conflict` and retries against the newer record.
- * Residual race, documented not hidden: this is check-then-write, not an atomic
- * CAS. Two writers can both compare successfully and then both write, and the
- * second rename wins. Closing that window needs a filesystem primitive
- * (`O_EXCL` sidecar, the same one W5's merge lock requires), which P2 must
- * supply before members — rather than only the supervisor — mutate intent.
  */
 export function updateFleetIntent(options: UpdateFleetIntentOptions): UpdateFleetIntentResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetIntentFilePath(options.gitCommonDir, options.fleetId);
-  const before = readFleetIntentRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!before.ok) return before;
-
-  const outcome = options.update(before.intent);
-  if (isUpdateRefusal(outcome)) {
-    return { ok: false, reason: "refused", error: outcome.refuse };
-  }
-  const next = withDirectoryFleetId(outcome, options.fleetId);
-
-  const current = readFleetIntentRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!current.ok) return current;
-  if (current.raw !== before.raw) {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
     return {
       ok: false,
-      reason: "conflict",
-      error: `${filePath} changed while updating; re-read and retry`,
+      reason: "read-failed",
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
     };
   }
 
-  const written = writeFleetIntentUnchecked({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    intent: next,
-    fs,
+  let failure: FleetIntentUpdateFailure | undefined;
+  // Classify the failure before opening a write transaction: an unreadable or
+  // unparsable row is “read-failed”/“corrupt-intent”, and reporting it as a write
+  // failure would send the operator to the wrong remedy. The transaction below
+  // re-reads the row, so this is diagnosis, never the value the write is based on.
+  const before = store.readFleet(fleetId);
+  if (!before.ok) return { ok: false, reason: "read-failed", error: before.error };
+  if (before.value !== null && fleetIntentFromStoreRow(before.value) === undefined) {
+    return {
+      ok: false,
+      reason: "corrupt-intent",
+      error: `fleet ${fleetId} row is not a fleet intent`,
+    };
+  }
+  const result = store.mutateFleet({
+    fleetId,
+    update: (current) => {
+      const intent = current === null ? undefined : fleetIntentFromStoreRow(current);
+      if (current !== null && intent === undefined) {
+        failure = {
+          reason: "corrupt-intent",
+          error: `fleet ${fleetId} row is not a fleet intent`,
+        };
+        return { kind: "conflict", error: failure.error };
+      }
+      const outcome = options.update(intent);
+      if (isUpdateRefusal(outcome)) {
+        failure = { reason: "refused", error: outcome.refuse };
+        return { kind: "conflict", error: outcome.refuse };
+      }
+      const next = intentForWrite(outcome, fleetId);
+      const refusal = fleetIntentWriteRefusal(next);
+      if (refusal !== undefined) {
+        failure = {
+          reason: "write-failed",
+          error: `refusing to write fleet intent for ${fleetId}: ${refusal}`,
+        };
+        return { kind: "conflict", error: failure.error };
+      }
+      const { document, run } = splitFleetIntent(next);
+      return { kind: "write", intent: document, ...(run === undefined ? {} : { run }) };
+    },
+    nowMs: options.now ?? Date.now(),
   });
-  return written.ok
-    ? { ok: true, intent: next }
-    : { ok: false, reason: "write-failed", error: written.error };
+
+  if (!result.ok) return { ok: false, reason: "write-failed", error: result.error };
+  switch (result.value.kind) {
+    case "written": {
+      const intent = fleetIntentFromStoreRow({
+        intent: result.value.intent,
+        run: result.value.run,
+      });
+      return intent === undefined
+        ? {
+            ok: false,
+            reason: "corrupt-intent",
+            error: `fleet ${fleetId} row did not read back as a fleet intent`,
+          }
+        : { ok: true, intent };
+    }
+    case "conflict":
+      return failure === undefined
+        ? { ok: false, reason: "conflict", error: result.value.error }
+        : { ok: false, ...failure };
+    case "missing":
+      return failure === undefined
+        ? { ok: false, reason: "refused", error: `no fleet intent for \`${fleetId}\`` }
+        : { ok: false, ...failure };
+    case "unchanged":
+      return failure === undefined
+        ? { ok: false, reason: "conflict", error: `fleet ${fleetId} was not changed` }
+        : { ok: false, ...failure };
+  }
+}
+
+export interface WriteFleetRunOptions extends FleetIntentOptions {
+  run: FleetRun;
+  now: number;
+}
+
+/** Write the run record, or say why the row refused it. */
+export type WriteFleetRunResult = { ok: true; intent: FleetIntent } | { ok: false; error: string };
+
+/**
+ * Commit the run record and its intent revision bump in ONE transaction (bd-281).
+ *
+ * The run has never been independent state: it is the loop's view of the intent
+ * it is driving, so a caller must not be able to store one without the other. The
+ * plan carries both columns inside `mutateFleet`'s `BEGIN IMMEDIATE`, which is the
+ * whole point of the store — the file path wrote the intent, and with it the whole
+ * run, in one blind replace with no CAS at all.
+ */
+export function writeFleetRun(options: WriteFleetRunOptions): WriteFleetRunResult {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: `fleet ${fleetId}: the repository state store is unavailable` };
+  }
+  let failure: string | undefined;
+  const result = store.mutateFleet({
+    fleetId,
+    update: (current) => {
+      const intent = current === null ? undefined : fleetIntentFromStoreRow(current);
+      if (intent === undefined || current === null) {
+        failure =
+          current === null
+            ? `no fleet intent for \`${fleetId}\``
+            : `fleet ${fleetId} row is not a fleet intent`;
+        return { kind: "conflict", error: failure };
+      }
+      const next = intentForWrite({ ...intent, run: options.run, updatedAt: options.now }, fleetId);
+      const refusal = fleetIntentWriteRefusal(next);
+      if (refusal !== undefined) {
+        failure = `refusing to write fleet intent for ${fleetId}: ${refusal}`;
+        return { kind: "conflict", error: failure };
+      }
+      const { document, run } = splitFleetIntent(next);
+      return { kind: "write", intent: document, run };
+    },
+    nowMs: options.now,
+  });
+  if (!result.ok) return { ok: false, error: result.error };
+  if (result.value.kind !== "written") {
+    return { ok: false, error: failure ?? `fleet ${fleetId} was not written` };
+  }
+  const intent = fleetIntentFromStoreRow({
+    intent: result.value.intent,
+    run: result.value.run,
+  });
+  return intent === undefined
+    ? { ok: false, error: `fleet ${fleetId} row did not read back as a fleet intent` }
+    : { ok: true, intent };
+}
+
+/**
+ * What one landing plans to commit.
+ *
+ * A refusal is the caller's own decision (a record the landing cannot safely
+ * replace); the store rolls the whole plan back either way, so a refusal leaves no
+ * half-landed member, no revision bump and no audit row.
+ */
+export type FleetLandingPlan =
+  | { kind: "write"; intent: FleetIntent; run: FleetRun }
+  | { kind: "conflict"; error: string };
+
+export interface LandFleetMemberOptions extends FleetIntentOptions {
+  /**
+   * Pure fold from the record read **inside** the transaction to the landed record.
+   *
+   * Everything a landing implies belongs here: the member pruned from the intent, the
+   * ordering-gate records it resolved, and the run's `landedAt`. The fold sees the
+   * row the transaction just read, so it never builds on a snapshot another session
+   * has already replaced.
+   */
+  plan: (current: { intent: FleetIntent; run: FleetRun | undefined }) => FleetLandingPlan;
+  /**
+   * Audit entry appended in the same commit.
+   *
+   * Mandatory: a landing is the one cross-tree fact a human audits, and an
+   * enqueue-then-audit pair is exactly the crash window this transaction removes.
+   */
+  audit: FleetAuditEntry;
+}
+
+export type LandFleetMemberResult =
+  | { ok: true; intent: FleetIntent; revision: number }
+  | { ok: false; reason: FleetIntentUpdateFailureReason; error: string };
+
+/**
+ * Record a landing: member, run record, ordering-gate records and audit in ONE
+ * transaction (bd-281).
+ *
+ * The store owns the transaction (`landFleetMember` → `BEGIN IMMEDIATE`) and bumps
+ * the revision exactly once, however many members and gate records the plan folds:
+ * there is no per-item write to bump separately. A replayed call — the store's
+ * transient retry after a commit that threw — recomputes the document the row
+ * already holds and is therefore a no-op that bumps nothing and audits nothing,
+ * while still reporting the landing. Two things deliberately stay outside, because
+ * neither can join a SQLite transaction:
+ *
+ * - The **git merge** runs before this call; a landing is only recorded once the
+ *   merge has actually happened.
+ * - The **bd gate resolve** runs after the commit. See the ordering note on the
+ *   caller in `extensions/capabilities/fleet.ts`.
+ */
+export function landFleetMember(options: LandFleetMemberOptions): LandFleetMemberResult {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "read-failed",
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
+    };
+  }
+  const nowMs = options.now ?? Date.now();
+  let failure: FleetIntentUpdateFailure | undefined;
+  const result = store.landFleetMember({
+    fleetId,
+    plan: (current) => {
+      const intent = fleetIntentFromStoreRow({ intent: current.intent, run: current.run });
+      if (intent === undefined) {
+        failure = {
+          reason: "corrupt-intent",
+          error: `fleet ${fleetId} row is not a fleet intent`,
+        };
+        return { kind: "conflict", error: failure.error };
+      }
+      const planned = options.plan({ intent, run: intent.run });
+      if (planned.kind === "conflict") {
+        failure = { reason: "conflict", error: planned.error };
+        return planned;
+      }
+      const next = intentForWrite(
+        { ...planned.intent, run: planned.run, updatedAt: nowMs },
+        fleetId,
+      );
+      const refusal = fleetIntentWriteRefusal(next);
+      if (refusal !== undefined) {
+        failure = {
+          reason: "write-failed",
+          error: `refusing to write fleet intent for ${fleetId}: ${refusal}`,
+        };
+        return { kind: "conflict", error: failure.error };
+      }
+      const { document, run } = splitFleetIntent(next);
+      return { kind: "write", intent: document, run };
+    },
+    // The row's own clock, so the audit entry cannot claim an instant the landing
+    // did not commit at.
+    audit: boundAuditEntry({ ...options.audit, fleetId, timestamp: nowMs }),
+    nowMs,
+  });
+
+  if (!result.ok) return { ok: false, reason: "write-failed", error: result.error };
+  switch (result.value.kind) {
+    case "written": {
+      const intent = fleetIntentFromStoreRow({
+        intent: result.value.intent,
+        run: result.value.run,
+      });
+      return intent === undefined
+        ? {
+            ok: false,
+            reason: "corrupt-intent",
+            error: `fleet ${fleetId} row did not read back as a fleet intent`,
+          }
+        : { ok: true, intent, revision: result.value.revision };
+    }
+    case "conflict":
+      return {
+        ok: false,
+        ...(failure ?? { reason: "conflict" as const, error: result.value.error }),
+      };
+    case "missing":
+      return {
+        ok: false,
+        ...(failure ?? {
+          reason: "refused" as const,
+          error: `no fleet intent for \`${fleetId}\``,
+        }),
+      };
+    case "unchanged":
+      return {
+        ok: false,
+        ...(failure ?? {
+          reason: "conflict" as const,
+          error: `fleet ${fleetId} was not changed`,
+        }),
+      };
+  }
 }
 
 export interface CreateFleetIntentInput {
@@ -571,7 +791,7 @@ export function addFleetOrderingGates(
       refused.push({
         gate,
         error:
-          `\`fleet.json\` already records ${FLEET_INTENT_ORDERING_GATES_MAX} ordering gates ` +
+          `the fleet intent already records ${FLEET_INTENT_ORDERING_GATES_MAX} ordering gates ` +
           "(its bound); this gate stays open in bd and is not recorded, so a human must " +
           "resolve it or prune the fleet",
       });
@@ -629,7 +849,7 @@ export function retireFleetDeferral(intent: FleetIntent, taskId: string, now: nu
   };
 }
 
-// ── audit.log ─────────────────────────────────────────────────────────
+// ── audit (store rows, bounded tail) ──────────────────────────────────
 
 /** Characters of `detail` kept in one audit line. */
 export const FLEET_AUDIT_DETAIL_MAX_LENGTH = 400;
@@ -669,17 +889,28 @@ export interface FleetAuditEntry {
  * two lines — an irrecoverable corruption in an append-only file.
  */
 export function formatAuditEntry(entry: FleetAuditEntry): string {
+  return JSON.stringify(boundAuditEntry(entry));
+}
+
+/**
+ * The record as stored: every free-text field bounded.
+ *
+ * One implementation for the JSONL formatter and the row writer, so the bound is
+ * enforced on the bytes/row whichever path an entry takes and a caller cannot store
+ * an unbounded payload the reader would then have to defend against.
+ */
+function boundAuditEntry(entry: FleetAuditEntry): FleetAuditEntry {
   const taskIds = entry.taskIds
     .slice(0, FLEET_AUDIT_TASK_IDS_MAX)
     .map((taskId) => boundText(taskId, FLEET_AUDIT_TASK_ID_MAX_LENGTH));
-  return JSON.stringify({
+  return {
     timestamp: entry.timestamp,
     fleetId: entry.fleetId,
     actor: boundText(entry.actor, FLEET_AUDIT_ACTOR_MAX_LENGTH),
     action: boundText(entry.action, FLEET_AUDIT_ACTION_MAX_LENGTH),
     taskIds,
     detail: boundText(entry.detail, FLEET_AUDIT_DETAIL_MAX_LENGTH),
-  });
+  };
 }
 
 export interface AppendFleetAuditEntryOptions extends FleetIntentOptions {
@@ -696,40 +927,34 @@ export interface AppendFleetAuditEntryOptions extends FleetIntentOptions {
 export function appendFleetAuditEntry(
   options: AppendFleetAuditEntryOptions,
 ): FleetStateWriteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetAuditLogPath(options.gitCommonDir, options.fleetId);
-  const line = formatAuditEntry({
-    ...options.entry,
-    fleetId: sanitizeFleetId(options.fleetId),
-  });
-  try {
-    fs.mkdirSync(dirname(filePath), { recursive: true });
-    fs.appendFileSync(filePath, `${line}\n`);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: errorMessage(error) };
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: `fleet ${fleetId}: the repository state store is unavailable` };
   }
+  const entry: FleetAuditEntry = boundAuditEntry({
+    ...options.entry,
+    fleetId,
+  });
+  // The row's `at` is the entry's own timestamp, so a reader sees the same instant
+  // the writer recorded and the audit never drifts from its actor's clock.
+  const written = store.appendAudit({ fleetId, entry, nowMs: entry.timestamp });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
+}
+
+/** Wrap the not-quite-a-record check without a bare cast. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 /**
- * Bytes of `audit.log` read from the tail for a "did we already say this?" check.
+ * One stored audit payload, or undefined when it is not an entry.
  *
- * An audit line is at most a few hundred bytes (every field is bounded by the
- * constants above), so 64 KiB holds hundreds of recent entries — far more than a
- * cooldown needs — while keeping a long-lived fleet's log off the read path.
+ * Exported because the one-shot file import (bd-281) must validate a legacy
+ * `audit.log` line with exactly the check this reader applies to a row, so an
+ * imported entry cannot be one the reader later rejects.
  */
-export const FLEET_AUDIT_TAIL_BYTES = 64 * 1024;
-
-/** One parsed audit line, or undefined when the line is not an entry. */
-function parseAuditLine(raw: string): FleetAuditEntry | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // A tail read starts mid-line, and a torn append can end mid-line: neither is
-    // an entry, and neither is a reason to fail a diagnostic read.
-    return undefined;
-  }
+export function parseFleetAuditEntry(parsed: unknown): FleetAuditEntry | undefined {
   if (!isRecord(parsed)) return undefined;
   const { timestamp, fleetId: entryFleetId, actor, action, taskIds, detail } = parsed;
   if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return undefined;
@@ -754,31 +979,33 @@ export interface RecentFleetAuditOptions extends FleetIntentOptions {
 }
 
 /**
- * Recent audit entries, read from a bounded tail of `audit.log`.
+ * Recent audit entries, read from a bounded tail of rows.
+ *
+ * **Semantic change from the file store (bd-281).** `audit.log` was bounded by
+ * bytes (64 KiB) because a file has no rows; the
+ * store bounds by {@link REPO_STATE_AUDIT_TAIL_ROWS}, which is what the caller
+ * actually asks ("the last N entries") and does not shrink as messages get
+ * shorter. Rows are returned oldest-first within that window, matching the file
+ * reader's order.
  *
  * Exists so a caller can ask "was this already reported recently?" (the leaderless
- * wedge alarm, bd-169) without turning the append-only log into a per-start cost.
- * Only the last {@link FLEET_AUDIT_TAIL_BYTES} are read and every unparsable line is
- * skipped, so a truncated first line or a torn append is harmless. A missing or
- * unreadable log is **no entries**: this is a dedup signal, never authority, and it
- * must not be able to break a session start.
+ * wedge alarm, bd-169). A malformed payload is skipped and an unreadable store is
+ * **no entries**: this is a dedup signal, never authority, and it must not be able
+ * to break a session start.
  */
 export function readRecentFleetAuditEntries(
   options: RecentFleetAuditOptions,
 ): readonly FleetAuditEntry[] {
-  const fs = options.fs ?? nodeFsSeam;
-  const path = fleetAuditLogPath(options.gitCommonDir, options.fleetId);
-  let raw: string;
-  try {
-    if (!fs.existsSync(path)) return [];
-    raw = fs.readTailSync?.(path, FLEET_AUDIT_TAIL_BYTES) ?? fs.readFileSync(path);
-  } catch {
-    return [];
-  }
+  const store = fleetStoreFor(options);
+  if (store === null) return [];
+  const read = store.readAudit({
+    fleetId: sanitizeFleetId(options.fleetId),
+    limit: REPO_STATE_AUDIT_TAIL_ROWS,
+  });
+  if (!read.ok) return [];
   const entries: FleetAuditEntry[] = [];
-  for (const line of raw.split("\n")) {
-    if (line === "") continue;
-    const entry = parseAuditLine(line);
+  for (const row of read.value) {
+    const entry = parseFleetAuditEntry(row.payload);
     if (entry === undefined) continue;
     if (entry.timestamp < options.since) continue;
     if (options.action !== undefined && entry.action !== options.action) continue;
@@ -787,7 +1014,7 @@ export function readRecentFleetAuditEntries(
   return entries;
 }
 
-// ── Spawn markers (launch/) ────────────────────────────────────────────
+// ── Spawn markers (store rows) ─────────────────────────────────────────
 
 /**
  * Record that a member's spawn is in flight (bd-233).
@@ -810,27 +1037,40 @@ export function writeFleetLaunchMarker(options: {
   owner: string;
   fs?: FleetStateFs;
 }): { ok: true; marker: FleetLaunchMarker } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
-  if (!resolved.ok) return resolved;
+  const refusal = fleetLaunchMarkerTaskIdRefusal(options.taskId);
+  if (refusal !== undefined) return { ok: false, error: refusal };
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: "the repository state store is unavailable" };
+  }
   const marker: FleetLaunchMarker = {
     schemaVersion: FLEET_LAUNCH_MARKER_SCHEMA_VERSION,
     taskId: options.taskId,
     startedAt: options.now,
     owner: options.owner,
   };
-  const written = atomicWriteJson(resolved.path, marker, fs);
-  return written.ok ? { ok: true, marker } : written;
+  const written = store.writeLaunchMarker({
+    taskId: options.taskId,
+    fleetId: sanitizeFleetId(options.fleetId),
+    marker,
+    nowMs: options.now,
+  });
+  return written.ok ? { ok: true, marker } : { ok: false, error: written.error };
 }
 
 /**
  * Clear a member's spawn marker; an absent marker is success (idempotent).
  *
- * Owner-scoped (bd-233 round 4): the on-disk marker is deleted only when its owner
- * matches the caller's spawn token. A relaunch overwrites the marker with its own
- * token, so the older spawn's `finally` must leave that newer window alone — it
- * reports the refusal (best effort, never throws, never deletes a foreign marker). An
- * unreadable or ownerless marker is treated the same way: not provably ours.
+ * Owner-scoped (bd-233 round 4): the row is deleted only when its owner matches the
+ * caller's spawn token. A relaunch overwrites the marker with its own token, so the
+ * older spawn's `finally` must leave that newer window alone — it reports the
+ * refusal (best effort, never throws, never deletes a foreign marker). An unreadable
+ * or ownerless marker is treated the same way: not provably ours.
+ *
+ * The owner check and the delete are two statements, so a relaunch landing between
+ * them can still lose its window; that is the documented residual race of the
+ * original file path too (see `withFleetLaunchMarker`), and closing it needs a
+ * conditional DELETE the store does not expose yet.
  */
 export function clearFleetLaunchMarker(options: {
   gitCommonDir: string;
@@ -839,30 +1079,26 @@ export function clearFleetLaunchMarker(options: {
   owner: string;
   fs?: FleetStateFs;
 }): { ok: true } | { ok: false; error: string } {
-  const fs = options.fs ?? nodeFsSeam;
-  const resolved = fleetLaunchMarkerPath(options.gitCommonDir, options.fleetId, options.taskId);
-  if (!resolved.ok) return resolved;
-  try {
-    if (!fs.existsSync(resolved.path)) return { ok: true };
-    const onDisk = readFleetLaunchMarker({
-      gitCommonDir: options.gitCommonDir,
-      fleetId: options.fleetId,
-      taskId: options.taskId,
-      fs,
-    });
-    if (onDisk?.owner !== options.owner) {
-      return {
-        ok: false,
-        error:
-          `the marker on disk belongs to another spawn (owner ${onDisk?.owner ?? "absent"}), ` +
-          "so this spawn's clear left it in place",
-      };
-    }
-    fs.unlinkSync(resolved.path);
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  const refusal = fleetLaunchMarkerTaskIdRefusal(options.taskId);
+  if (refusal !== undefined) return { ok: false, error: refusal };
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: "the repository state store is unavailable" };
   }
+  const stored = store.readLaunchMarker(options.taskId);
+  if (!stored.ok) return { ok: false, error: stored.error };
+  if (stored.value === null) return { ok: true };
+  const onDisk = parseFleetLaunchMarker(stored.value);
+  if (onDisk?.owner !== options.owner) {
+    return {
+      ok: false,
+      error:
+        `the marker on disk belongs to another spawn (owner ${onDisk?.owner ?? "absent"}), ` +
+        "so this spawn's clear left it in place",
+    };
+  }
+  const cleared = store.clearLaunchMarker(options.taskId);
+  return cleared.ok ? { ok: true } : { ok: false, error: cleared.error };
 }
 
 /**
@@ -1032,7 +1268,17 @@ export async function withFleetLaunchMarker<T>(options: {
     : { ok: true, value, warning: warnings.join("; ") };
 }
 
-// ── Mailbox (inbox/ and events/) ──────────────────────────────────────
+// ── Mailbox (store notes) ─────────────────────────────────────────────
+
+/**
+ * Which mailbox a note belongs to.
+ *
+ * `event` is supervisor → member (drained at the member's turn start), `inbox` is
+ * member → supervisor. The names match `fleet_note.channel`; the tool's `channel`
+ * parameter still spells the first one `events`, because that is the word the
+ * operator-facing documentation and the old directory used.
+ */
+export type FleetNoteChannel = "event" | "inbox";
 
 export const FLEET_NOTE_KINDS = [
   "note",
@@ -1053,38 +1299,35 @@ export type FleetNoteKind = (typeof FLEET_NOTE_KINDS)[number];
  * Real type guard for a note kind, so callers never narrow with a cast.
  *
  * The project bans `as` narrowing; a tool parameter arrives as `string`, so the
- * only honest way to reach {@link FleetNoteKind} is to check membership.
+ * only honest way to reach {@link FleetNoteKind} is to check membership. This is
+ * also the read-side guard: a row whose kind this version does not know is reported
+ * and left queued rather than rendered as something it is not.
  */
 export function isFleetNoteKind(value: unknown): value is FleetNoteKind {
   return typeof value === "string" && FLEET_NOTE_KINDS.some((kind) => kind === value);
 }
 
-/** Characters of note body kept on disk. */
-export const FLEET_NOTE_BODY_MAX_LENGTH = 2000;
+/** Characters of a note body kept; truncation is the only repair a write makes. */
+export const FLEET_NOTE_BODY_MAX_LENGTH = 2_000;
 
 /**
  * Characters kept in a note's `to`/`from` address.
  *
- * The bound exists so a *schema-legal* note can never exceed
- * {@link FLEET_NOTE_FILE_MAX_BYTES}: an unbounded address would make the drain
- * quarantine a legal note as oversize, and a long `to` would push the filename
- * component toward `ENAMETOOLONG`. Arithmetic for the worst case — every
- * character JSON-escaped as `\uXXXX` (6 bytes):
- *
- *   body     2000 chars x 6 = 12000 bytes
- *   to/from   128 chars x 6 =   768 bytes each
- *   envelope                ~   100 bytes
- *   ------------------------------------
- *   worst case              ~13636 bytes (~13.3 KiB)
- *
- * which is under 1/4 of the 64 KiB cap. Real addresses are task ids (`bd-12`,
- * `supervisor`), so 128 characters is ~10x any legitimate value.
+ * Real addresses are task ids (`bd-12`, `supervisor`), so 128 characters is ~10x
+ * any legitimate value. The bound exists because the address is now a row value an
+ * arbitrary number of readers render, not a path component: an unbounded address
+ * would let one note bloat every drain of its mailbox, which is why it is refused at
+ * insert instead of repaired.
  */
 export const FLEET_NOTE_ADDRESS_MAX_LENGTH = 128;
 
 /**
- * Note files version independently of `fleet.json`: bumping the intent schema
- * must not make every existing note unreadable (and therefore quarantined).
+ * Note records version independently of the intent: bumping the intent schema must
+ * not make every queued note unreadable.
+ *
+ * The in-memory `FleetNote` keeps the field so the pure mailbox layer (and its
+ * tests) stay one shape; a stored row no longer carries a per-note version, because
+ * the store's own `PRAGMA user_version` is the schema that applies to every row.
  */
 export const FLEET_NOTE_SCHEMA_VERSION = 1;
 
@@ -1101,61 +1344,11 @@ const FleetNoteSchema = z.object({
 
 export type FleetNote = z.infer<typeof FleetNoteSchema>;
 
-/** Parse a note file; anything not matching the contract yields undefined. */
+/** Parse a note record; anything not matching the contract yields undefined. */
 export function parseFleetNote(raw: unknown): FleetNote | undefined {
   const result = FleetNoteSchema.safeParse(raw);
   return result.success ? result.data : undefined;
 }
-
-/** Content identity of a note, hashed into its filename. */
-function noteFingerprint(note: FleetNote): string {
-  const fields = [note.schemaVersion, note.kind, note.from, note.to, note.body, note.createdAt];
-  return JSON.stringify(fields);
-}
-
-/**
- * Deterministic, collision-free note filename:
- * `<to>-<kind>-<createdAt>-<content hash>.json`.
- *
- * `to` and `kind` are sanitized by the fleet-id sanitizer (the single
- * sanitizer, never a second one), so a task id such as `../../etc` or one
- * containing NUL stays inside the mailbox directory. Sanitizing can make two
- * raw ids equal, so the content hash carries the raw components: distinct
- * notes never share a name, while re-enqueueing identical content is a no-op
- * instead of a duplicate.
- */
-export function fleetNoteFileName(note: FleetNote): string {
-  const digest = createHash("sha256").update(noteFingerprint(note)).digest("hex").slice(0, 12);
-  const to = sanitizeFleetId(note.to);
-  const kind = sanitizeFleetId(note.kind);
-  return `${to}-${kind}-${createdAtSegment(note.createdAt)}-${digest}.json`;
-}
-
-/**
- * Filename segment for `createdAt`.
- *
- * Self-defending on purpose: `fleetNoteFileName` is exported, so a future
- * caller that skips {@link enqueueNote} would otherwise interpolate an
- * unvalidated value (`"../.."`, `NaN`, a non-number via a cast) straight into a
- * path component and escape the mailbox. Anything that is not a finite number
- * becomes an inert literal instead — such a note cannot round-trip through the
- * schema anyway, so the drain quarantines it, but it must stay *inside* the
- * mailbox directory while it does.
- */
-function createdAtSegment(createdAt: number): string {
-  return typeof createdAt === "number" && Number.isFinite(createdAt)
-    ? String(createdAt)
-    : "invalid";
-}
-
-export interface EnqueueNoteOptions {
-  /** Mailbox directory: `inbox/` (member → supervisor) or `events/` (supervisor → member). */
-  dir: string;
-  note: FleetNote;
-  fs?: FleetStateFs;
-}
-
-export type EnqueueNoteResult = { ok: true; path: string } | { ok: false; error: string };
 
 /** First few schema issues, for an error a caller can actually act on. */
 function summarizeIssues(error: z.ZodError): string {
@@ -1167,16 +1360,18 @@ function summarizeIssues(error: z.ZodError): string {
 }
 
 /**
- * Materialize the note that will be written.
+ * Validate the note that will be stored, repairing only the body.
  *
- * `createdAt` is validated, never coerced or trusted: it is interpolated into
- * the filename, so a runtime non-number (`"../.."` from a cast, a P1 writer
- * building a note from external JSON) would inject `/` and `..` into the name
- * and `join(dir, ...)` would escape the mailbox. The body is the only field the
- * writer repairs (truncation is the documented contract); everything else is
- * refused rather than silently rewritten into something the caller did not ask
- * for, and a note that fails this check would otherwise be quarantined by every
- * later drain.
+ * `createdAt` and both addresses are validated, never coerced or trusted: they are
+ * row values every later drain reads back and renders, so a runtime non-number or an
+ * over-long address would be stored garbage. Truncation is the one documented
+ * repair, because a long report is still useful mail.
+ *
+ * **A malformed note is rejected here, at insert.** The file store inspected each
+ * note file at drain time and quarantined an unparseable one by renaming it to
+ * `<name>.corrupt`; the row store has no `.corrupt` analogue, and silently dropping a
+ * row is not an acceptable replacement — so the refusal happens before the row
+ * exists and there is nothing left to quarantine on the read side.
  */
 function normalizeNoteForWrite(
   note: FleetNote,
@@ -1197,41 +1392,94 @@ function normalizeNoteForWrite(
   return { ok: false, error: `invalid fleet note (${summarizeIssues(truncated.error)})` };
 }
 
-/**
- * Write one note atomically (temp + rename through `atomicWriteJson`). An
- * over-long body is truncated to {@link FLEET_NOTE_BODY_MAX_LENGTH} *before*
- * naming, so the stored note always satisfies its own schema.
- */
-export function enqueueNote(options: EnqueueNoteOptions): EnqueueNoteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const normalized = normalizeNoteForWrite(options.note);
-  if (!normalized.ok) return { ok: false, error: normalized.error };
-
-  const note = normalized.note;
-  const path = join(options.dir, fleetNoteFileName(note));
-  const written = atomicWriteJson(path, note, fs);
-  return written.ok ? { ok: true, path } : { ok: false, error: written.error };
-}
-
-export interface EnqueueNoteFanoutOptions {
-  /** Mailbox directory: `inbox/` (member → supervisor) or `events/` (supervisor → member). */
-  dir: string;
-  /** Note template; `to` is replaced per recipient. */
+export interface EnqueueNoteOptions extends FleetIntentOptions {
+  channel: FleetNoteChannel;
+  /** The note as the caller built it: `to` is the stored target, `from` the author. */
   note: FleetNote;
-  /** One note file per recipient, in the order given. */
-  recipients: readonly string[];
-  fs?: FleetStateFs;
 }
 
-export type EnqueueNoteFanoutResult =
-  | { ok: true; paths: readonly string[]; recipients: readonly string[] }
+export type EnqueueNoteResult =
+  | { ok: true; seq: number }
   | {
       ok: false;
       error: string;
-      /** Note files written before the failure. */
-      written: readonly string[];
       /**
-       * Recipients whose note file was actually written, in write order.
+       * `invalid-note` is the caller's input; `write-failed` is the store (which
+       * includes "store unavailable"). Kept so a caller can tell a rejected note
+       * from a database it should retry or report.
+       */
+      reason: "invalid-note" | "write-failed";
+    };
+
+/**
+ * Store one note and its audit line in the same transaction.
+ *
+ * Identity is the row (`fleet_id`, `channel`, `target`, autoincrement `seq`), never
+ * a directory: a handoff or a resumed session in another worktree resolves the same
+ * rows instead of carrying a copy of somebody else's mail.
+ *
+ * A repeated enqueue is a second delivery, not a no-op. The old file store
+ * deduplicated identical content through its content-addressed filename; with rows
+ * the at-least-once contract already requires a consumer to treat a repeat as the
+ * same event, so nothing depends on that dedup.
+ */
+export function enqueueNote(options: EnqueueNoteOptions): EnqueueNoteResult {
+  const normalized = normalizeNoteForWrite(options.note);
+  if (!normalized.ok) return { ok: false, error: normalized.error, reason: "invalid-note" };
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
+      reason: "write-failed",
+    };
+  }
+  const note = normalized.note;
+  // The note's own instant is the row's `created_at`: one timestamp, so a drained
+  // note is the note that was written rather than a copy stamped at insert time.
+  const atMs = note.createdAt;
+  const written = store.enqueueNote({
+    fleetId,
+    channel: options.channel,
+    target: note.to,
+    from: note.from,
+    kind: note.kind,
+    body: note.body,
+    // The audit entry travels with the insert, so the two commit together: a queued
+    // note always has its witness, and a rolled-back insert leaves no audit claim.
+    audit: boundAuditEntry({
+      timestamp: atMs,
+      fleetId,
+      actor: note.from,
+      action: "note",
+      taskIds: [note.to],
+      detail: `${options.channel} ${note.kind}`,
+    }),
+    nowMs: atMs,
+  });
+  return written.ok
+    ? { ok: true, seq: written.note.seq }
+    : { ok: false, error: written.error, reason: written.reason };
+}
+
+export interface EnqueueNoteFanoutOptions extends FleetIntentOptions {
+  channel: FleetNoteChannel;
+  /** Note template; `to` is replaced per recipient. */
+  note: FleetNote;
+  /** One row per recipient, in the order given. */
+  recipients: readonly string[];
+}
+
+export type EnqueueNoteFanoutResult =
+  | { ok: true; seqs: readonly number[]; recipients: readonly string[] }
+  | {
+      ok: false;
+      error: string;
+      /** Seqs stored before the failure. */
+      written: readonly number[];
+      /**
+       * Recipients whose note row was actually written, in write order.
        *
        * This is what the audit records: a partial fan-out that logged the
        * request instead would claim mail landed with members it never reached.
@@ -1240,28 +1488,22 @@ export type EnqueueNoteFanoutResult =
     };
 
 /**
- * Write one note file **per recipient** (fan-out).
+ * Write one note **per recipient** (fan-out).
  *
- * A single `to: "all"` file cannot represent broadcast honestly: every member
- * matches it, the first drainer acks (deletes) it, and the siblings never see
- * it. Per-recipient files are what the drain/ack protocol can actually deliver —
- * each member selects and acks only its own copy. The filename already carries
- * `to` plus a content hash, so the copies are distinct files with identical
- * bodies.
+ * A single `to: "all"` row cannot represent a broadcast honestly: every member would
+ * match it, the first drainer would ack it, and the siblings would never see it.
+ * Per-recipient rows are what the drain/ack protocol can actually deliver — each
+ * member selects and acks only its own row.
  *
  * A partial fan-out is reported as a failure that names what was written, so the
  * caller can audit exactly which members were reached rather than claiming the
  * whole broadcast landed.
  */
 export function enqueueNoteFanout(options: EnqueueNoteFanoutOptions): EnqueueNoteFanoutResult {
-  const written: string[] = [];
+  const written: number[] = [];
   const writtenRecipients: string[] = [];
   for (const recipient of options.recipients) {
-    const enqueued = enqueueNote({
-      dir: options.dir,
-      note: { ...options.note, to: recipient },
-      ...(options.fs === undefined ? {} : { fs: options.fs }),
-    });
+    const enqueued = enqueueNote({ ...options, note: { ...options.note, to: recipient } });
     if (!enqueued.ok) {
       return {
         ok: false,
@@ -1270,277 +1512,139 @@ export function enqueueNoteFanout(options: EnqueueNoteFanoutOptions): EnqueueNot
         writtenRecipients,
       };
     }
-    written.push(enqueued.path);
+    written.push(enqueued.seq);
     writtenRecipients.push(recipient);
   }
-  return { ok: true, paths: written, recipients: writtenRecipients };
+  return { ok: true, seqs: written, recipients: writtenRecipients };
 }
 
-/** A drained note plus the file holding it; the path is the ack handle. */
+/** A drained note plus its row seq; the seq is the ack handle. */
 export interface FleetNoteDelivery {
   note: FleetNote;
-  path: string;
+  seq: number;
 }
 
-/**
- * Largest note file the drain will read.
- *
- * A legal note body is at most {@link FLEET_NOTE_BODY_MAX_LENGTH} characters and
- * a legal address at most {@link FLEET_NOTE_ADDRESS_MAX_LENGTH}. Even if every
- * character is JSON-escaped as `\uXXXX` (6 bytes), a legal note is ~13.3 KiB
- * (see the address constant for the arithmetic), so 64 KiB is ~4.7x the
- * worst-case legal note: comfortably above anything a writer produces, and a
- * hard bound on the per-turn read.
- */
-export const FLEET_NOTE_FILE_MAX_BYTES = 64 * 1024;
-
-export interface DrainNotesOptions {
-  dir: string;
-  fs?: FleetStateFs;
+export interface DrainNotesOptions extends FleetIntentOptions {
+  channel: FleetNoteChannel;
+  /** Only notes addressed to this target. Omit to read the whole mailbox. */
+  target?: string;
 }
 
 export type DrainNotesResult =
   | { ok: true; deliveries: readonly FleetNoteDelivery[]; warnings: readonly string[] }
-  | { ok: false; reason: "unreadable-mailbox" | "quarantine-failed"; error: string };
+  | { ok: false; error: string };
 
-/** Wrap the not-quite-a-record check without a bare cast. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+/** Rebuild the in-memory note from its row; undefined when the kind is unknown. */
+function deliveryFromRow(row: RepoFleetNote): FleetNoteDelivery | undefined {
+  // A kind this version does not know cannot be rendered as a known notification.
+  // It stays queued (drain never deletes) and is reported, so a future reader or the
+  // operator can still act on it.
+  if (!isFleetNoteKind(row.kind)) return undefined;
+  return {
+    seq: row.seq,
+    note: {
+      schemaVersion: FLEET_NOTE_SCHEMA_VERSION,
+      kind: row.kind,
+      from: row.from,
+      to: row.target,
+      body: row.body,
+      createdAt: row.createdAt,
+    },
+  };
 }
 
 /**
- * Whether a note-shaped record was written by a *different* note schema.
+ * Read the pending notes of one mailbox (rows in `seq` order, i.e. enqueue order).
  *
- * Version drift is not corruption: when the schema bumps, an old reader that
- * renamed every newer note to `.corrupt` would destroy live mail. Such a note is
- * left in place and reported once per drain; only a record with no usable
- * version identity is garbage worth quarantining.
- */
-function isForeignNoteVersion(parsed: unknown): boolean {
-  if (!isRecord(parsed)) return false;
-  const version = parsed.schemaVersion;
-  return typeof version === "number" && version !== FLEET_NOTE_SCHEMA_VERSION;
-}
-
-/**
- * Preserve an unreadable note under a name the drain ignores, returning the
- * warning either way. Quarantine is a rename, never a delete: the content stays
- * inspectable, and it stops re-warning on every later drain (a warning storm).
+ * **Drain marks delivery and deletes nothing.** A note leaves the pending set only
+ * through {@link ackNotes}, after the caller has consumed it. Deleting inside drain
+ * would lose a note whose consumer died before using it; the price of never losing a
+ * note is at-least-once delivery, so a caller must treat a repeated note as the same
+ * event, never as a new one.
  *
- * A failed rename is escalated, not downgraded to a warning: the offending note
- * stays in the mailbox, so every later drain re-inspects it and re-reports it —
- * exactly the storm quarantine exists to prevent. The drain therefore refuses
- * to claim success and names the file the operator has to move by hand.
- */
-function quarantineNote(
-  fs: FleetStateFs,
-  path: string,
-  label: string,
-): { ok: true; warning: string } | { ok: false; error: string } {
-  const quarantinePath = `${path}.corrupt`;
-  try {
-    fs.renameSync(path, quarantinePath);
-    return { ok: true, warning: `${label} ${path} moved to ${quarantinePath}` };
-  } catch (error) {
-    return {
-      ok: false,
-      error:
-        `${label} ${path} could not be quarantined (${errorMessage(error)}); ` +
-        "it stays in the mailbox and would be reported on every drain — move or remove it by hand",
-    };
-  }
-}
-
-/** What inspecting one mailbox file produced. */
-type MailboxFileOutcome =
-  | { kind: "delivery"; delivery: FleetNoteDelivery }
-  | { kind: "warning"; warning: string }
-  | { kind: "quarantine-failed"; error: string }
-  | { kind: "foreign-version" };
-
-/** Quarantine a file and map the outcome onto the inspection result. */
-function quarantineOutcome(fs: FleetStateFs, path: string, label: string): MailboxFileOutcome {
-  const quarantined = quarantineNote(fs, path, label);
-  if (!quarantined.ok) return { kind: "quarantine-failed", error: quarantined.error };
-  return { kind: "warning", warning: quarantined.warning };
-}
-
-/**
- * Inspect one candidate note file and decide its fate.
- *
- * Kept out of the drain loop so each reason has one place: an oversize file is
- * quarantined from its size alone (never read), unreadable files are reported
- * and left alone (we cannot prove they are garbage), and a foreign schema
- * version is reported without being touched.
- */
-function inspectNoteFile(fs: FleetStateFs, dir: string, name: string): MailboxFileOutcome {
-  const path = join(dir, name);
-
-  let size: number;
-  try {
-    size = fs.statSync(path).size;
-  } catch (error) {
-    return {
-      kind: "warning",
-      warning: `note ${path} could not be inspected: ${errorMessage(error)}`,
-    };
-  }
-  if (size > FLEET_NOTE_FILE_MAX_BYTES) {
-    return quarantineOutcome(fs, path, `oversize note (${size} bytes)`);
-  }
-
-  let raw: string;
-  try {
-    raw = fs.readFileSync(path);
-  } catch (error) {
-    return { kind: "warning", warning: `note ${path} could not be read: ${errorMessage(error)}` };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return quarantineOutcome(fs, path, "corrupt note");
-  }
-
-  const note = parseFleetNote(parsed);
-  if (note !== undefined) return { kind: "delivery", delivery: { note, path } };
-  if (isForeignNoteVersion(parsed)) return { kind: "foreign-version" };
-  return quarantineOutcome(fs, path, "corrupt note");
-}
-
-/**
- * Read every pending note in one mailbox directory (code-unit sorted, so the
- * drain order is deterministic).
- *
- * **Bounded read.** The drain runs every turn, so it stats each file first and
- * quarantines anything above {@link FLEET_NOTE_FILE_MAX_BYTES} without reading
- * or parsing it: a member session dropping a multi-GB file into `inbox/` must
- * cost a `stat`, not the supervisor's memory.
- *
- * **Drain marks nothing and deletes nothing.** A delivery is removed only by
- * {@link ackNotes}, after the caller has consumed it. Deleting inside drain
- * would lose a note whose consumer died between the unlink and using it; the
- * price of never losing a note is at-least-once delivery, so a caller must
- * treat a repeated note as the same event, never as a new one.
- *
- * A corrupt (or oversize) note file is quarantined by renaming it to
- * `<name>.corrupt`; a file present under a different note schema version is
- * left in place and reported once per drain.
- *
- * **Quarantine failure fails the drain.** If a corrupt/oversize note cannot be
- * renamed away it stays in the mailbox and would be re-inspected on every later
- * drain, so the result is `reason: "quarantine-failed"` rather than a success
- * carrying a repeating warning. Nothing is lost: the file is still on disk and
- * the error names it.
+ * `warnings` is retained (and is normally empty) because the renderer is shared with
+ * the pure mailbox layer that can still have something to report. A row store cannot
+ * quarantine: a malformed note is refused at insert, so a drain has no corrupt row to
+ * find.
  */
 export function drainNotes(options: DrainNotesOptions): DrainNotesResult {
-  const fs = options.fs ?? nodeFsSeam;
-
-  let names: string[];
-  try {
-    if (!fs.existsSync(options.dir)) return { ok: true, deliveries: [], warnings: [] };
-    names = fs.readdirSync(options.dir);
-  } catch (error) {
-    return { ok: false, reason: "unreadable-mailbox", error: errorMessage(error) };
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: `fleet ${fleetId}: the repository state store is unavailable` };
   }
+  const read = store.drainNotes({
+    fleetId,
+    channel: options.channel,
+    ...(options.target === undefined ? {} : { target: options.target }),
+    ...(options.now === undefined ? {} : { nowMs: options.now }),
+  });
+  if (!read.ok) return { ok: false, error: read.error };
 
   const deliveries: FleetNoteDelivery[] = [];
   const warnings: string[] = [];
-  const quarantineFailures: string[] = [];
-  let foreignVersionCount = 0;
-
-  for (const name of [...names].sort(compareCodeUnits)) {
-    if (!name.endsWith(".json")) continue;
-
-    const outcome = inspectNoteFile(fs, options.dir, name);
-    switch (outcome.kind) {
-      case "delivery":
-        deliveries.push(outcome.delivery);
-        break;
-      case "warning":
-        warnings.push(outcome.warning);
-        break;
-      case "quarantine-failed":
-        quarantineFailures.push(outcome.error);
-        break;
-      case "foreign-version":
-        foreignVersionCount += 1;
-        break;
+  for (const row of read.value) {
+    const delivery = deliveryFromRow(row);
+    if (delivery === undefined) {
+      warnings.push(`note ${row.seq} has an unknown kind (${row.kind}); left queued`);
+      continue;
     }
+    deliveries.push(delivery);
   }
-
-  if (quarantineFailures.length > 0) {
-    return { ok: false, reason: "quarantine-failed", error: quarantineFailures.join("; ") };
-  }
-
-  if (foreignVersionCount > 0) {
-    warnings.push(
-      `${foreignVersionCount} note(s) in ${options.dir} use a different note schema version; left in place`,
-    );
-  }
-
   return { ok: true, deliveries, warnings };
 }
 
-export interface AckNotesOptions {
-  /** Mailbox directory the deliveries came from; ack only touches its children. */
-  dir: string;
+export interface AckNotesOptions extends FleetIntentOptions {
   deliveries: readonly FleetNoteDelivery[];
-  fs?: FleetStateFs;
 }
 
 export type AckNotesResult =
-  | { ok: true; removed: readonly string[] }
+  | { ok: true; acked: readonly number[] }
   | {
       ok: false;
       error: string;
-      /** Paths that were removed before/despite the failure. */
-      removed: readonly string[];
-      /** Deliveries still on disk: they will be delivered again. */
+      /** Seqs this call already acknowledged (none: a failed ack rolls back). */
+      acked: readonly number[];
+      /** Deliveries still queued: they will be delivered again. */
       remaining: readonly FleetNoteDelivery[];
     };
 
 /**
- * Remove acknowledged notes after the caller consumed them.
+ * Acknowledge consumed notes by row seq.
  *
- * Idempotent: an already-removed path is success, so a crash between drain and
- * ack replays the note on the next turn instead of losing it. Paths outside
- * `dir` are refused — ack must never become a general-purpose unlink.
+ * Idempotent and tolerant: an already-acked seq changes nothing and is not an error,
+ * so a crash between drain and ack replays the note on the next turn instead of
+ * losing it. Every seq lands in one transaction, and the UPDATE is scoped by the
+ * fleet id, so a seq belonging to another fleet is never acknowledged (that is the
+ * old path-containment check, expressed as the row key it now is).
  *
- * **Partial failure is reported, never collapsed.** The loop keeps going after
- * an unlink failure and returns what it removed plus exactly which deliveries
- * remain, because the caller has already rendered those notes into its result:
- * returning a bare error would make consumed notes vanish from the record while
- * the caller cannot tell which ones are still queued.
+ * A refused ack reports every delivery as still queued: nothing was committed, and
+ * the caller renders what it consumed either way.
  */
 export function ackNotes(options: AckNotesOptions): AckNotesResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const removed: string[] = [];
-  const remaining: FleetNoteDelivery[] = [];
-  const errors: string[] = [];
-
-  for (const delivery of options.deliveries) {
-    if (dirname(delivery.path) !== options.dir) {
-      remaining.push(delivery);
-      errors.push(`refusing to acknowledge ${delivery.path}: not in ${options.dir}`);
-      continue;
-    }
-    if (!fs.existsSync(delivery.path)) continue;
-    try {
-      fs.unlinkSync(delivery.path);
-      removed.push(delivery.path);
-    } catch (error) {
-      remaining.push(delivery);
-      errors.push(`${delivery.path}: ${errorMessage(error)}`);
-    }
+  if (options.deliveries.length === 0) return { ok: true, acked: [] };
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
+      acked: [],
+      remaining: options.deliveries,
+    };
   }
-
-  if (errors.length > 0) return { ok: false, error: errors.join("; "), removed, remaining };
-  return { ok: true, removed };
+  const acked = store.ackNotes({
+    fleetId,
+    seqs: options.deliveries.map((delivery) => delivery.seq),
+    ...(options.now === undefined ? {} : { nowMs: options.now }),
+  });
+  if (!acked.ok) {
+    return { ok: false, error: acked.error, acked: [], remaining: options.deliveries };
+  }
+  return { ok: true, acked: acked.value.seqs };
 }
 
-// ── merge-queue.json (schema only in this increment) ──────────────────
+// ── merge queue + single-flight lock (store rows) ─────────────────────
 
 export const FLEET_MERGE_QUEUE_SCHEMA_VERSION = 1;
 
@@ -1720,90 +1824,111 @@ export interface WriteFleetMergeQueueOptions extends FleetIntentOptions {
   queue: FleetMergeQueue;
 }
 
-/** Raw read of `merge-queue.json`: the parsed record plus the text it came from. */
-type FleetMergeQueueRawLoad =
-  | { ok: true; raw: string | undefined; queue: FleetMergeQueue | undefined }
+/**
+ * The lock view of a queue record, reconstructed from the `fleet_lock` row.
+ *
+ * A queue record no longer stores the lock: single-flight is that row, and a copy
+ * inside the queue document would be a second authority a release could miss.
+ * Readers still receive the composed record because every consumer (and the pure
+ * `canAcquireFleetMerge` predicate) speaks the one shape.
+ */
+function queueWithLock(
+  queue: FleetMergeQueue | undefined,
+  lock: RepoFleetLock | null,
+): FleetMergeQueue | undefined {
+  const lockView: FleetMergeLock | null =
+    lock === null
+      ? null
+      : {
+          holder: lock.holder,
+          taskId: lock.taskId,
+          pid: lock.pid,
+          acquiredAt: lock.acquiredAt,
+          leaseExpiresAt: lock.expiresAt,
+        };
+  // A lock row without a queue row is a real state (a drain claims the lock before
+  // any entry exists, and releasing the last entry can empty the queue). The lock is
+  // the fact that matters, so the view materializes an empty queue around it instead
+  // of reporting "no queue" and hiding a merge in flight.
+  if (queue === undefined) {
+    if (lockView === null) return undefined;
+    return { ...createFleetMergeQueue(lockView.acquiredAt), lock: lockView };
+  }
+  return { ...queue, lock: lockView };
+}
+
+/** One stored queue row plus the lock row that shares its fleet id. */
+type FleetMergeQueueRowLoad =
+  | {
+      ok: true;
+      revision: number | null;
+      queue: FleetMergeQueue | undefined;
+      lock: RepoFleetLock | null;
+    }
   | { ok: false; reason: "corrupt-merge-queue" | "read-failed"; error: string };
 
-function readFleetMergeQueueRaw(options: FleetIntentOptions): FleetMergeQueueRawLoad {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetMergeQueueFilePath(options.gitCommonDir, options.fleetId);
-
-  let raw: string;
-  try {
-    if (!fs.existsSync(filePath)) return { ok: true, raw: undefined, queue: undefined };
-    raw = fs.readFileSync(filePath);
-  } catch (error) {
-    return { ok: false, reason: "read-failed", error: errorMessage(error) };
+function readFleetMergeQueueRow(options: FleetIntentOptions): FleetMergeQueueRowLoad {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return {
+      ok: false,
+      reason: "read-failed",
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
+    };
   }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
+  const row = store.readFleetQueue(fleetId);
+  if (!row.ok) return { ok: false, reason: "read-failed", error: row.error };
+  // The lock row is read even when the queue row is absent: a drain claims the lock
+  // before any entry exists, and that state must still be visible.
+  const lock = store.readFleetLock(fleetId);
+  if (!lock.ok) return { ok: false, reason: "read-failed", error: lock.error };
+  if (row.value === null) {
+    return { ok: true, revision: null, queue: undefined, lock: lock.value };
+  }
+  const queue = parseFleetMergeQueue(row.value.queue);
+  if (queue === undefined) {
     return {
       ok: false,
       reason: "corrupt-merge-queue",
-      error: `${filePath} is not valid JSON`,
+      error: `fleet ${fleetId} queue row is not a merge queue`,
     };
   }
-
-  const queue = parseFleetMergeQueue(parsed);
-  if (queue === undefined) {
-    return { ok: false, reason: "corrupt-merge-queue", error: `${filePath} is not a merge queue` };
-  }
-  return { ok: true, raw, queue };
+  return { ok: true, revision: row.value.revision, queue, lock: lock.value };
 }
 
-/** Read `merge-queue.json`; absent means "no queue yet". */
+/** Read the queue; absent means "no queue yet". The lock comes from its own row. */
 export function readFleetMergeQueue(options: FleetIntentOptions): FleetMergeQueueLoadResult {
-  const loaded = readFleetMergeQueueRaw(options);
-  return loaded.ok ? { ok: true, queue: loaded.queue } : loaded;
+  const loaded = readFleetMergeQueueRow(options);
+  return loaded.ok ? { ok: true, queue: queueWithLock(loaded.queue, loaded.lock) } : loaded;
 }
 
 /**
- * Replace `merge-queue.json` atomically, refusing a record it cannot read.
+ * Replace the stored queue, refusing a row it cannot read.
  *
- * Absence is writable; a present but unparsable queue is refused for the same
- * reason `fleet.json` is: replacing it would erase a newer schema's record.
- * Mutations should go through {@link updateFleetMergeQueue}.
+ * Absence is writable; a present but unparsable row is refused for the same reason
+ * the intent row is: replacing it would erase a newer schema's record. Mutations
+ * should go through {@link updateFleetMergeQueue}. The lock column is always
+ * written as null because the lock lives in its own row.
  */
 export function writeFleetMergeQueue(options: WriteFleetMergeQueueOptions): FleetStateWriteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetMergeQueueFilePath(options.gitCommonDir, options.fleetId);
-  const current = readFleetMergeQueueRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!current.ok) {
-    return {
-      ok: false,
-      error: `refusing to replace unreadable merge queue at ${filePath}: ${current.error}`,
-    };
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
+    return { ok: false, error: `fleet ${fleetId}: the repository state store is unavailable` };
   }
-  return writeFleetMergeQueueUnchecked({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    queue: options.queue,
-    fs,
+  const current = readFleetMergeQueueRow(options);
+  if (!current.ok) {
+    return { ok: false, error: `refusing to replace unreadable merge queue: ${current.error}` };
+  }
+  const parsed = parseFleetMergeQueue(options.queue);
+  if (parsed === undefined) return { ok: false, error: "refusing to write an invalid merge queue" };
+  const written = store.writeFleetQueue({
+    fleetId,
+    queue: { ...parsed, lock: null },
+    nowMs: options.now ?? Date.now(),
   });
-}
-
-/**
- * Module-private blind replace, for callers that already compared the on-disk
- * bytes ({@link updateFleetMergeQueue}). Never export this: it is the hole the
- * compare-and-replace path closes.
- */
-function writeFleetMergeQueueUnchecked(
-  options: WriteFleetMergeQueueOptions,
-): FleetStateWriteResult {
-  const fs = options.fs ?? nodeFsSeam;
-  return atomicWriteJson(
-    fleetMergeQueueFilePath(options.gitCommonDir, options.fleetId),
-    options.queue,
-    fs,
-  );
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
 }
 
 export interface UpdateFleetMergeQueueOptions extends FleetIntentOptions {
@@ -1820,55 +1945,60 @@ export type UpdateFleetMergeQueueResult =
     };
 
 /**
- * Read-modify-write `merge-queue.json` with compare-and-replace.
+ * Read-modify-write the queue with the store's revision compare.
  *
  * The queue has three independent writers (enqueue, lease renewal, entry state
- * transition), so a blind wholesale replace drops an update whenever two of
- * them interleave: the last rename wins and the loser never learns it lost. The
- * compare against the raw bytes the update was based on turns that silent loss
- * into `reason: "conflict"`, which the caller retries against the newer queue.
+ * transition), so a blind replace drops an update whenever two interleave. The
+ * `WHERE revision = ?` in `updateFleetQueue` is the compare: a stale writer
+ * commits nothing and sees a typed failure instead of silently losing the update.
+ * This is **not** the file path's check-then-write race: the compare and the write
+ * are one statement, so the previous "residual race" note (and the caller's retry
+ * around it) is gone by construction.
  *
- * **Residual race, documented not hidden:** this is check-then-write, not an
- * atomic CAS — two writers can both compare successfully and then both rename,
- * and the second wins. Closing that window needs the same `O_EXCL`/`mkdir`
- * primitive the merge lock itself requires (see the lock schema), which P2 must
- * supply before more than one process writes this file.
+ * A missing row is the first write (revision 1); it is created rather than refused
+ * because enqueue/lease are legitimately the first writers of a fresh fleet.
  */
 export function updateFleetMergeQueue(
   options: UpdateFleetMergeQueueOptions,
 ): UpdateFleetMergeQueueResult {
-  const fs = options.fs ?? nodeFsSeam;
-  const filePath = fleetMergeQueueFilePath(options.gitCommonDir, options.fleetId);
-  const before = readFleetMergeQueueRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!before.ok) return before;
-
-  const next = options.update(before.queue);
-
-  const current = readFleetMergeQueueRaw({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs,
-  });
-  if (!current.ok) return current;
-  if (current.raw !== before.raw) {
+  const fleetId = sanitizeFleetId(options.fleetId);
+  const store = fleetStoreFor(options);
+  if (store === null) {
     return {
       ok: false,
-      reason: "conflict",
-      error: `${filePath} changed while updating; re-read and retry`,
+      reason: "read-failed",
+      error: `fleet ${fleetId}: the repository state store is unavailable`,
     };
   }
+  const before = readFleetMergeQueueRow(options);
+  if (!before.ok) return before;
 
-  const written = writeFleetMergeQueueUnchecked({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    queue: next,
-    fs,
+  const next = options.update(queueWithLock(before.queue, before.lock));
+  const parsed = parseFleetMergeQueue(next);
+  if (parsed === undefined) {
+    return { ok: false, reason: "write-failed", error: "refusing to write an invalid merge queue" };
+  }
+  const nowMs = options.now ?? Date.now();
+  if (before.revision === null) {
+    const created = store.writeFleetQueue({ fleetId, queue: { ...parsed, lock: null }, nowMs });
+    return created.ok
+      ? { ok: true, queue: queueWithLock(parsed, before.lock) ?? parsed }
+      : { ok: false, reason: "write-failed", error: created.error };
+  }
+  const written = store.updateFleetQueue({
+    fleetId,
+    expectedRevision: before.revision,
+    queue: { ...parsed, lock: null },
+    nowMs,
   });
-  return written.ok
-    ? { ok: true, queue: next }
-    : { ok: false, reason: "write-failed", error: written.error };
+  if (!written.ok) {
+    return {
+      ok: false,
+      // The store compares the revision inside the UPDATE, so a row that still
+      // exists is a concurrent write, not a broken store.
+      reason: written.error.includes("revision conflict") ? "conflict" : "write-failed",
+      error: written.error,
+    };
+  }
+  return { ok: true, queue: queueWithLock(parsed, before.lock) ?? parsed };
 }

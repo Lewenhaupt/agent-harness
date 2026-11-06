@@ -7,11 +7,12 @@
  * explicit argv array, and the message reaches git through a `-F` temp file.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readWorkflowState, writeWorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -633,9 +634,11 @@ describe("belayd_commit shell safety (bd-70)", () => {
     );
 
     // Pin the workflow to a branch, then make the tree report a different one.
-    const statePath = join(cwd, ".belayd", "workflow.json");
-    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { branch: string };
-    writeFileSync(statePath, JSON.stringify({ ...persisted, branch: "feat/owned" }));
+    // State is a shared-store row (bd-281), so the fixture rewrites the record.
+    const persisted = readWorkflowState({ cwd });
+    if (persisted === undefined) throw new Error("start_task did not persist a workflow");
+    const rewritten = writeWorkflowState({ cwd, state: { ...persisted, branch: "feat/owned" } });
+    if (!rewritten.ok) throw new Error(rewritten.error);
     mockSync.setResponder((file, args) => {
       if (file === "git" && args[0] === "branch") return "feat/other\n";
       if (file === "git" && args[0] === "config") throw new Error("no such key");
@@ -680,12 +683,13 @@ describe("belayd_commit shell safety (bd-70)", () => {
     );
 
     // The cwd itself owns bd-99, but this session is pinned to bd-42.
-    const statePath = join(cwd, ".belayd", "workflow.json");
-    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as { branch: string };
-    writeFileSync(
-      statePath,
-      JSON.stringify({ ...persisted, taskId: "bd-99", branch: "feat/owned" }),
-    );
+    const persisted = readWorkflowState({ cwd });
+    if (persisted === undefined) throw new Error("start_task did not persist a workflow");
+    const rewritten = writeWorkflowState({
+      cwd,
+      state: { ...persisted, taskId: "bd-99", branch: "feat/owned" },
+    });
+    if (!rewritten.ok) throw new Error(rewritten.error);
     mockSync.setResponder((file, args) => {
       if (file === "git" && args[0] === "branch") return "feat/owned\n";
       if (file === "git" && args[0] === "config") throw new Error("no such key");
@@ -705,11 +709,9 @@ describe("belayd_commit shell safety (bd-70)", () => {
     const stopTask = tools.get("belayd_stop_task");
     await stopTask?.execute("stop", {}, undefined, undefined, createMockCtx(cwd));
 
-    const statePath = join(cwd, ".belayd", "workflow.json");
-    mkdirSync(join(cwd, ".belayd"), { recursive: true });
-    writeFileSync(
-      statePath,
-      JSON.stringify({
+    const seeded = writeWorkflowState({
+      cwd,
+      state: {
         schemaVersion: 1,
         taskId: "bd-99",
         workflowType: "feature",
@@ -719,8 +721,9 @@ describe("belayd_commit shell safety (bd-70)", () => {
         completedPhaseNames: [],
         startedAt: 1,
         updatedAt: 1,
-      }),
-    );
+      },
+    });
+    if (!seeded.ok) throw new Error(seeded.error);
     mockSync.setResponder((file, args) => {
       if (file === "git" && args[0] === "branch") return "feat/other\n";
       if (file === "git" && args[0] === "config") throw new Error("no such key");

@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { drainFleetMerge, enqueueFleetMerge, readFleetMergeQueue } from "../src/index.js";
+import { openRepoStateStore, repoStatePathForCommonDir } from "../src/repo-state-store.js";
 import { gitContextFreeEnv } from "../src/worktree.js";
 
 function git(argv: readonly string[], cwd: string): string {
@@ -114,17 +115,22 @@ function createFleetRepo(): MergeFixture {
   const commonDir = join(root, ".git");
   const fleetDir = join(commonDir, "belayd", "fleet", fleetId);
   mkdirSync(fleetDir, { recursive: true });
-  writeFileSync(
-    join(fleetDir, "fleet.json"),
-    JSON.stringify({
+  // bd-281: the intent is a store row in the git common dir, not a fleet.json.
+  const opened = openRepoStateStore({ path: repoStatePathForCommonDir(commonDir) });
+  if (!opened.ok) throw new Error(opened.error);
+  const written = opened.store.writeFleetIntent({
+    fleetId,
+    intent: {
       schemaVersion: 1,
       fleetId,
       taskIds: ["bd-12"],
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
-    }),
-  );
+    },
+  });
+  opened.store.close();
+  if (!written.ok) throw new Error(written.error);
   return { root, memberPath, commonDir, fleetId, gateMarker };
 }
 

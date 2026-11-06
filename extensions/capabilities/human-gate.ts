@@ -1053,7 +1053,7 @@ export async function deliverReviewFindings(options: {
   const record = buildReviewFindingsRecord({
     taskId: options.taskId,
     text: options.reviewText,
-    round: nextReviewRound({ cwd: options.ctx.cwd }),
+    round: nextReviewRound({ cwd: options.ctx.cwd, taskId: options.taskId }),
   });
   if (record === undefined) {
     // Fast path: a clean review must not touch bd or the record file at all.

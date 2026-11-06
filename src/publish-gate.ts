@@ -3,11 +3,12 @@
  * the repository.
  *
  * Proof artifacts are uploaded to the proof-of-work platform; the workflow keeps
- * a receipt (`.belayd/proof-receipt.json`) instead of files in the worktree. The
- * publish step must therefore never read or carry proof. There is no publish
- * executor yet (bd-174.3 owns the `gh`/`git push` argv), so this module is the
- * deterministic local gate that step will call, and the one the merge drain
- * already calls before any mutation.
+ * a receipt in the shared per-repository store
+ * (`<git-common-dir>/belayd/state.sqlite`, bd-281) instead of files in the
+ * worktree. The publish step must therefore never read or carry proof. There is
+ * no publish executor yet (bd-174.3 owns the `gh`/`git push` argv), so this
+ * module is the deterministic local gate that step will call, and the one the
+ * merge drain already calls before any mutation.
  *
  * Everything here is pure: paths in, verdict out. No I/O, no throwing.
  *
@@ -47,8 +48,8 @@
  * is given; it is the caller's job to pass a payload that means "carried in".
  * Proof artifacts that are *added or modified* are refused
  * (`proof-artifacts-in-diff`); *deleting* proof artifacts is allowed and is the
- * documented migration path (upload the proof, keep the receipt at
- * `.belayd/proof-receipt.json`, remove the files). `drainFleetMerge` therefore
+ * documented migration path (upload the proof, keep the receipt in the store,
+ * remove the files). `drainFleetMerge` therefore
  * reads its diff with `--diff-filter=ACMRT`, which drops deletions. Renames stay
  * in that payload and are classified by their destination path, so moving proof
  * content out of a proof directory into a source path is still refused.
@@ -56,7 +57,6 @@
 
 import { isAbsolute } from "node:path";
 import { DEFAULT_PROOF_ARTIFACT_POLICY, type ProofArtifactPolicy } from "./proof-policy.js";
-import { PROOF_RECEIPT_RELATIVE_PATH } from "./proof-receipt.js";
 import { isProofArtifactPath } from "./proof-verification.js";
 
 /** Why the publish payload was refused. */
@@ -226,7 +226,8 @@ function refusal(
   const notes: string[] = [];
   if (reason === "proof-artifacts-in-diff") {
     notes.push(
-      `proof artifacts must not be published — upload them and keep the receipt at ${PROOF_RECEIPT_RELATIVE_PATH}`,
+      "proof artifacts must not be published — upload them; the receipt stays in " +
+        "<git-common-dir>/belayd/state.sqlite",
     );
     // This refusal can only happen under the strict default, so the escape hatch a
     // repo with a deliberate in-git proof policy needs belongs in the message: the

@@ -21,13 +21,15 @@
  * table here. The only human gate a workflow can open is `belayd_ask_human`.
  *
  * This module is pure except for {@link readReviewFindingsRecord} /
- * {@link writeReviewFindingsRecord}, documented best-effort side effects
- * confined to the record file.
+ * {@link writeReviewFindingsRecord}, documented best-effort side effects on the
+ * disposition record. bd-281 moved that record into the per-repository execution
+ * store (table `review_findings`, keyed by task id) so a resumed session reads the
+ * same round instead of a copy; the rendered `.belayd/review-findings.md` artifact
+ * stays a file because the posted comment names its path.
  */
-import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { z } from "zod";
+import { type RepoStateStore, sharedRepoStateStore } from "./repo-state-store.js";
 import { parseReviewFindings, type ReviewSeverity } from "./review-context.js";
 
 /**
@@ -55,7 +57,12 @@ export const REVIEW_NO_SEAM_REASON = "no review-findings seam";
 /** Where the reviewer's full findings live inside the member's worktree. */
 export const REVIEW_FINDINGS_ARTIFACT_RELATIVE_PATH = ".belayd/review-findings.md";
 
-/** Where the durable disposition record is written; named in the posted comment. */
+/**
+ * Retired disposition record path (bd-281).
+ *
+ * The record is a store row now; the constant is kept because the migration
+ * refusal, the import and older comments name it.
+ */
 export const REVIEW_FINDINGS_RECORD_RELATIVE_PATH = ".belayd/review-findings.json";
 
 /** The mandatory phase a review finding is attributed to. */
@@ -148,6 +155,12 @@ const ReviewFindingsRecordSchema = z.object({
     }),
   ),
 });
+
+/** Parse and strictly narrow a persisted record; an unknown shape is "no record". */
+export function parseReviewFindingsRecord(raw: unknown): ReviewFindingsRecord | undefined {
+  const parsed = ReviewFindingsRecordSchema.safeParse(raw);
+  return parsed.success ? parsed.data : undefined;
+}
 
 /**
  * `true` when a review reported at least one finding (the record trigger).
@@ -272,63 +285,72 @@ export function formatReviewFindingsComment(record: ReviewFindingsRecord): strin
   return lines.join("\n");
 }
 
-/** Absolute path of the durable disposition record for a worktree. */
+/** Retired absolute path of the disposition record (naming only). */
 export function reviewFindingsRecordPath(cwd: string): string {
   return join(cwd, REVIEW_FINDINGS_RECORD_RELATIVE_PATH);
 }
 
+/** Store seam: an opened store instead of the module's shared one (tests). */
+export interface ReviewFindingsStoreSeam {
+  store?: RepoStateStore;
+  /** Identity of the record: the bead, never the worktree. */
+  taskId?: string;
+}
+
+function storeFor(
+  options: ReviewFindingsStoreSeam & { cwd: string; taskId: string },
+): RepoStateStore | null {
+  if (options.store !== undefined) return options.store;
+  return sharedRepoStateStore({ cwd: options.cwd }).store;
+}
+
 /**
- * Read the durable record, if one exists and parses. A corrupt/unreadable file
- * is "no record": the trace path must be able to proceed and overwrite it.
+ * Read the durable record for a task, if one exists and parses.
+ *
+ * A record that no longer matches the schema is "no record": the trace path must
+ * be able to proceed and overwrite it.
  */
-export function readReviewFindingsRecord(options: {
-  cwd: string;
-}): ReviewFindingsRecord | undefined {
-  try {
-    const raw = JSON.parse(readFileSync(reviewFindingsRecordPath(options.cwd), "utf8"));
-    const parsed = ReviewFindingsRecordSchema.safeParse(raw);
-    return parsed.success ? parsed.data : undefined;
-  } catch {
-    return undefined;
-  }
+export function readReviewFindingsRecord(
+  options: ReviewFindingsStoreSeam & { cwd: string },
+): ReviewFindingsRecord | undefined {
+  const taskId = options.taskId;
+  if (taskId === undefined) return undefined;
+  const store = storeFor({ ...options, taskId });
+  if (store === null) return undefined;
+  const row = store.readReviewFindings(taskId);
+  if (!row.ok || row.value === undefined) return undefined;
+  return parseReviewFindingsRecord(row.value);
 }
 
 /**
  * The round a new review record should carry: one past the persisted record.
  *
- * The record file is per-worktree and overwritten each review, so the round is
- * what preserves the fix-round count across re-reviews (bd-175 review).
+ * The round is what preserves the fix-round count across re-reviews (bd-175
+ * review), and it is per task so a review resumed in another worktree continues
+ * the count instead of restarting it.
  */
-export function nextReviewRound(options: { cwd: string }): number {
+export function nextReviewRound(options: ReviewFindingsStoreSeam & { cwd: string }): number {
   return (readReviewFindingsRecord(options)?.round ?? 0) + 1;
 }
 
 /**
- * Persist the disposition record next to the workflow state, atomically.
+ * Persist the disposition record.
  *
- * Temp file in the record's own directory then `renameSync`, so a crash mid-write
- * cannot leave truncated JSON for the next reader. Best-effort on purpose: the
- * comment is the human-visible record, and a read-only worktree must not turn a
- * review delivery into a failure. The caller reports the warning and keeps
- * whatever else it wrote.
+ * Best-effort on purpose: the comment is the human-visible record, and a store
+ * failure must not turn a review delivery into a failure. The caller reports the
+ * warning and keeps whatever else it wrote.
  */
-export function writeReviewFindingsRecord(options: {
-  cwd: string;
-  record: ReviewFindingsRecord;
-}): { ok: true } | { ok: false; error: string } {
-  const path = reviewFindingsRecordPath(options.cwd);
-  const tmpPath = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(tmpPath, JSON.stringify(options.record, null, 2));
-    renameSync(tmpPath, path);
-    return { ok: true };
-  } catch (error) {
-    try {
-      unlinkSync(tmpPath);
-    } catch {
-      // Temp cleanup is best-effort; the original error is what matters.
-    }
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+export function writeReviewFindingsRecord(
+  options: ReviewFindingsStoreSeam & { cwd: string; record: ReviewFindingsRecord },
+): { ok: true } | { ok: false; error: string } {
+  const store = storeFor({ ...options, taskId: options.record.taskId });
+  if (store === null) {
+    return { ok: false, error: `repo state store unavailable for ${options.cwd}` };
   }
+  const validated = parseReviewFindingsRecord(options.record);
+  if (validated === undefined) {
+    return { ok: false, error: "refusing to persist an invalid review-findings record" };
+  }
+  const written = store.writeReviewFindings({ taskId: validated.taskId, record: validated });
+  return written.ok ? { ok: true } : { ok: false, error: written.error };
 }

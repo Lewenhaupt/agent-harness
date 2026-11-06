@@ -7,13 +7,14 @@
  * `node:child_process` is mocked so gate activation's `bd` calls are inert.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { recordRunMemberLandRepair, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { buildFleetStatus } from "../fleet-status.js";
+import { openRepoStateStore, repoStatePathForCommonDir } from "../repo-state-store.js";
 import type { WorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
@@ -32,6 +33,21 @@ const fleet = vi.hoisted(() => ({
  * expects; the stop cases point it at the temp directory they write into.
  */
 const git = vi.hoisted(() => ({ commonDir: "" }));
+
+/**
+ * Seed one fleet intent row in the repository under `commonDir` (bd-281).
+ *
+ * The intent and its run record share one store row, so a fixture no longer
+ * writes a `fleet.json` the reader would have to parse.
+ */
+function seedFleetIntent(commonDir: string, intent: Record<string, unknown>): void {
+  const opened = openRepoStateStore({ path: repoStatePathForCommonDir(commonDir) });
+  if (!opened.ok) throw new Error(opened.error);
+  const fleetId = typeof intent.fleetId === "string" ? intent.fleetId : "default";
+  const written = opened.store.writeFleetIntent({ fleetId, intent });
+  opened.store.close();
+  if (!written.ok) throw new Error(written.error);
+}
 
 // Records the `bd` lookup the tool issues; `bd show` output is injected per case.
 const bd = vi.hoisted(() => ({
@@ -821,17 +837,14 @@ describe("belayd_fleet_status tool", () => {
         detail: options.detail,
         now: 2_000,
       });
-      writeFileSync(
-        join(dir, "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: options.fleetId,
-          taskIds: [options.taskId],
-          createdAt: 1,
-          updatedAt: 1,
-          run,
-        }),
-      );
+      seedFleetIntent(cwd, {
+        schemaVersion: 1,
+        fleetId: options.fleetId,
+        taskIds: [options.taskId],
+        createdAt: 1,
+        updatedAt: 1,
+        run,
+      });
     }
 
     /** Start a session on one bead and read its status with bd unavailable. */
@@ -945,17 +958,14 @@ describe("belayd_fleet_status tool", () => {
                 landedAt: options.landedAt,
               })),
             };
-      writeFileSync(
-        join(dir, "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: options.fleetId,
-          taskIds: options.taskIds ?? [options.taskId],
-          createdAt: 1,
-          updatedAt: 1,
-          run,
-        }),
-      );
+      seedFleetIntent(cwd, {
+        schemaVersion: 1,
+        fleetId: options.fleetId,
+        taskIds: options.taskIds ?? [options.taskId],
+        createdAt: 1,
+        updatedAt: 1,
+        run,
+      });
     }
 
     async function statusFor(taskId: string, sessionId: string): Promise<string> {
@@ -1056,17 +1066,14 @@ describe("belayd_fleet_status tool", () => {
         detail: "repair 1 of 1 did not clear this (proof-artifacts-in-diff) — refused again",
         now: 3_000,
       });
-      writeFileSync(
-        join(dir, "fleet.json"),
-        JSON.stringify({
-          schemaVersion: 1,
-          fleetId: "default",
-          taskIds: ["bd-126"],
-          createdAt: 1,
-          updatedAt: 1,
-          run,
-        }),
-      );
+      seedFleetIntent(cwd, {
+        schemaVersion: 1,
+        fleetId: "default",
+        taskIds: ["bd-126"],
+        createdAt: 1,
+        updatedAt: 1,
+        run,
+      });
 
       const text = await statusFor("bd-126", "status-repair-stopped-session");
 

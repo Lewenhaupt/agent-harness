@@ -17,8 +17,17 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { openRepoStateStore } from "../repo-state-store.js";
+import { writeRunManifest } from "../run-manifest.js";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
+
 import { neutraliseTranscriptText } from "../../extensions/capabilities/supervision.js";
 import {
   TRANSCRIPT_DIGEST_SYSTEM_PROMPT,
@@ -38,7 +47,7 @@ import {
   readTranscriptSlice,
   TRANSCRIPT_PAGE_UNTRUSTED_NOTICE,
 } from "../session-transcript-file.js";
-import type { WorkflowState } from "../workflow-state.js";
+import { type WorkflowState, writeWorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -204,7 +213,12 @@ function belaydPath(cwd: string, name: string): string {
   return join(cwd, BELAYD_DIR, name);
 }
 
-/** A real `.belayd/workflow.json` — the file the fleet reader parses. */
+/**
+ * A workflow row in the shared store (bd-281) — what the fleet reader parses.
+ *
+ * It used to be a `.belayd/workflow.json` file; the fleet reads the store now, so
+ * the fixture seeds the same fact where production keeps it.
+ */
 function seedWorkflow(cwd: string, overrides: Partial<WorkflowState> = {}): void {
   const state: WorkflowState = {
     schemaVersion: 1,
@@ -218,11 +232,16 @@ function seedWorkflow(cwd: string, overrides: Partial<WorkflowState> = {}): void
     updatedAt: NOW - 6 * MINUTE,
     ...overrides,
   };
-  mkdirSync(join(cwd, BELAYD_DIR), { recursive: true });
-  writeFileSync(belaydPath(cwd, "workflow.json"), JSON.stringify(state), "utf8");
+  const written = writeWorkflowState({ cwd, state });
+  if (!written.ok) throw new Error(written.error);
 }
 
-/** A real `.belayd/orchestrator.json` — the lease the reader classifies. */
+/**
+ * A lease row in the shared store — the record the reader classifies (bd-281).
+ *
+ * The claim is still built with the persisted schema, so the fixture keeps proving
+ * the reader accepts the record shape rather than a raw row.
+ */
 function seedLease(cwd: string, heartbeatAt: number): void {
   const claim: OrchestratorClaim = {
     schemaVersion: ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
@@ -233,8 +252,23 @@ function seedLease(cwd: string, heartbeatAt: number): void {
     claimedAt: NOW - 2 * HOUR,
     heartbeatAt,
   };
-  mkdirSync(join(cwd, BELAYD_DIR), { recursive: true });
-  writeFileSync(belaydPath(cwd, "orchestrator.json"), JSON.stringify(claim), "utf8");
+  const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+  if (!opened.ok) throw new Error(opened.error);
+  const written = opened.store.acquireLease({
+    taskId: claim.taskId,
+    branch: claim.branch,
+    sessionId: claim.sessionId,
+    worktreePath: cwd,
+    pid: claim.pid,
+    // The lease's own clock is the heartbeat: a test that wants a cold lease seeds a
+    // heartbeat older than the stale window, and the store derives expiry the same
+    // way the runtime does.
+    nowMs: heartbeatAt,
+    ttlMs: ORCHESTRATOR_CLAIM_STALE_MS,
+    takeOverStale: true,
+  });
+  opened.store.close();
+  if (!written.ok) throw new Error(written.error);
 }
 
 function runManifest(overrides: Partial<RunManifest> = {}): RunManifest {
@@ -252,13 +286,10 @@ function runManifest(overrides: Partial<RunManifest> = {}): RunManifest {
   };
 }
 
+/** Seed a run manifest row; bd-281 made runs store records, not files. */
 function writeRun(cwd: string, manifest: RunManifest): void {
-  mkdirSync(join(cwd, BELAYD_DIR, "runs"), { recursive: true });
-  writeFileSync(
-    join(cwd, BELAYD_DIR, "runs", `${manifest.runId}.json`),
-    JSON.stringify(manifest),
-    "utf8",
-  );
+  const written = writeRunManifest({ cwd, manifest });
+  if (!written.ok) throw new Error(written.error);
 }
 
 function writeTelemetry(cwd: string): void {
@@ -461,23 +492,15 @@ describe("belayd_workflow_digest (bd-189)", () => {
     expect(text).toContain("not stuck: phase implement running 2m");
   });
 
-  it("reports unknown when a held lease has no readable heartbeat (W2)", async () => {
+  it("reports unknown when the stored lease is unreadable (W2)", async () => {
     seedWorkflow(cwd);
-    // A lease record without `heartbeatAt` still parses (the field is optional at
-    // the reader boundary), so this is the "cannot judge liveness" shape.
-    mkdirSync(join(cwd, BELAYD_DIR), { recursive: true });
-    writeFileSync(
-      belaydPath(cwd, "orchestrator.json"),
-      JSON.stringify({
-        schemaVersion: ORCHESTRATOR_CLAIM_SCHEMA_VERSION,
-        taskId: TASK_ID,
-        branch: `feat/${TASK_ID}`,
-        sessionId: "member-session",
-        pid: 4242,
-        claimedAt: NOW - 2 * HOUR,
-      }),
-      "utf8",
-    );
+    // bd-281 made `heartbeatAt` a NOT NULL column, so "a held lease whose freshness
+    // cannot be read" is now a row that no longer matches the record schema. It must
+    // still read as "cannot judge liveness", never as a live or a dead session.
+    seedLease(cwd, NOW);
+    const database = new DatabaseSync(process.env.BELAYD_REPO_STATE_FILE ?? "");
+    database.prepare("UPDATE orchestrator_lease SET session_id = ''").run();
+    database.close();
     const mock = await loadSupervisionExtension();
     const tool = mock.tools.get("belayd_workflow_digest");
     if (tool === undefined) throw new Error("belayd_workflow_digest was not registered");

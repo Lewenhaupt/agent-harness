@@ -6,11 +6,18 @@
  * and a tool call with no UI auto-denies instead of silently defaulting.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
+
+import { readWorkflowState, writeWorkflowState } from "../workflow-state.js";
 
 process.env.BELAYD_MODEL_COOLDOWN_FILE = join(tmpdir(), "belayd-test-model-cooldowns.json");
 
@@ -117,18 +124,30 @@ async function loadExtension() {
   return mod.default as (pi: ExtensionAPI) => void;
 }
 
-function workflowStatePath(cwd: string): string {
-  return join(cwd, ".belayd", "workflow.json");
-}
-
 interface WorkflowStateFile {
   workflowType?: string;
   resolutionSource?: string;
   matchedLabel?: string;
 }
 
+/**
+ * Read the persisted workflow record.
+ *
+ * It is a shared-store row now (bd-281), not `.belayd/workflow.json`; the fields
+ * under test are the same ones, so only the accessor changed.
+ */
 function readWorkflowStateFile(cwd: string): WorkflowStateFile {
-  return JSON.parse(readFileSync(workflowStatePath(cwd), "utf8")) as WorkflowStateFile;
+  const state = readWorkflowState({ cwd });
+  if (state === undefined) throw new Error(`no workflow state in ${cwd}`);
+  return state;
+}
+
+/** Discard the persisted workflow, standing in for deleting the retired file. */
+function clearWorkflowStateFile(cwd: string): void {
+  const state = readWorkflowState({ cwd });
+  if (state === undefined) return;
+  // Writing a completed-looking record would be wrong; clearing is the row delete.
+  writeWorkflowState({ cwd, state: { ...state, completedPhaseNames: state.phaseOrder } });
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -163,7 +182,7 @@ describe("workflow type confirmation (bd-106)", () => {
     });
 
     expect(select).toHaveBeenCalledTimes(1);
-    expect(existsSync(workflowStatePath(cwd))).toBe(false);
+    expect(readWorkflowState({ cwd })).toBeUndefined();
     expect(sentMessages).toHaveLength(0);
     expect(bdState.updateCalls).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith("Belayd workflow cancelled — no changes made.", "info");
@@ -260,7 +279,7 @@ describe("workflow type confirmation (bd-106)", () => {
       expect(state.workflowType, label).toBe("feature");
       expect(state.resolutionSource, label).toBe("default");
       expect(bdState.updateCalls, label).toHaveLength(0);
-      rmSync(workflowStatePath(cwd), { force: true });
+      clearWorkflowStateFile(cwd);
     }
   });
 
@@ -300,7 +319,7 @@ describe("workflow type confirmation (bd-106)", () => {
 
     expect(result?.details.exitCode).toBe(1);
     expect(result?.content[0]?.text).toContain("requires confirmation");
-    expect(existsSync(workflowStatePath(cwd))).toBe(false);
+    expect(readWorkflowState({ cwd })).toBeUndefined();
   });
 
   it("belayd_start_followup auto-denies a wf: label with no UI", async () => {
@@ -319,7 +338,7 @@ describe("workflow type confirmation (bd-106)", () => {
     expect(result?.details.exitCode).toBe(1);
     expect(result?.content[0]?.text).toContain("requires confirmation");
     // Denied before launch: no worktree state, no gate, no label write-back.
-    expect(existsSync(workflowStatePath(cwd))).toBe(false);
+    expect(readWorkflowState({ cwd })).toBeUndefined();
     expect(existsSync(`${cwd}.feat-bd-42`)).toBe(false);
     expect(bdState.updateCalls).toHaveLength(0);
   });

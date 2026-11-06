@@ -22,9 +22,11 @@
 import * as nodeFs from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
+import { atomicWriteJson, type WorkflowFs } from "./atomic-json-file.js";
+import type { RepoStateStore } from "./repo-state-store.js";
 import { lastAssistantText, type TranscriptEntry } from "./session-transcript.js";
 import { defaultGitExec, type GitExec } from "./stack-rebase.js";
-import { atomicWriteJson, readWorkflowState, type WorkflowFs } from "./workflow-state.js";
+import { readWorkflowState } from "./workflow-state.js";
 
 /** Bumped when the packet shape changes incompatibly; older files are ignored. */
 export const HANDOFF_SCHEMA_VERSION = 1;
@@ -152,6 +154,8 @@ export interface HandoffDefaultDeps {
   /** `bd show <taskId>` text, or undefined when the lookup fails. */
   showTask?: (taskId: string) => Promise<string | undefined>;
   fs?: WorkflowFs;
+  /** Shared workflow store (bd-281); tests inject one instead of a live store. */
+  store?: RepoStateStore;
   now?: () => number;
 }
 
@@ -602,8 +606,10 @@ export async function collectHandoffDefault(
     showTaskText(deps.showTask, input.taskId),
   ]);
 
+  // Workflow state is a store row now, so the handoff packet reads it from the
+  // shared store rather than from a file in this worktree (bd-281).
   const persisted = readWorkflowState(
-    deps.fs !== undefined ? { cwd: input.cwd, fs: deps.fs } : { cwd: input.cwd },
+    deps.store === undefined ? { cwd: input.cwd } : { cwd: input.cwd, store: deps.store },
   );
   const lastCommitSubject = gitOutput(exec, ["log", "-1", "--pretty=%s"], input.cwd);
   const dirtyFiles = gitOutput(exec, ["status", "--porcelain"], input.cwd);

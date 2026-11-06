@@ -14,19 +14,16 @@
  */
 
 import { execFileSync } from "node:child_process";
+import * as nodeFs from "node:fs";
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
-  rmdirSync,
   rmSync,
-  statSync,
   unlinkSync,
-  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,7 +40,6 @@ import {
   defaultFleetMergeGitRunner,
   drainFleetMerge,
   enqueueFleetMerge,
-  FLEET_MERGE_ORPHAN_LOCK_GRACE_MS,
   formatDrainResultText,
   formatFleetMergeQueue,
   readFleetGateCommands,
@@ -59,25 +55,36 @@ import {
   createFleetMergeLock,
   createFleetMergeQueue,
   drainNotes,
-  fleetAuditLogPath,
-  fleetEventsDir,
-  fleetMergeLockDir,
   readFleetIntent,
   readFleetMergeQueue,
+  readRecentFleetAuditEntries,
   updateFleetIntent,
   updateFleetMergeQueue,
+  writeFleetIntent as writeFleetIntentRecord,
 } from "../fleet-state.js";
-import { serializeProofReceipt } from "../proof-receipt.js";
+import { serializeProofReceipt, writeProofReceipt } from "../proof-receipt.js";
 // The receipt branch of the proof gate is asserted against the same real
 // worktree the drain reads, so "a receipt-published bead passes both gates with
 // no proof in the diff" is one end-to-end property rather than two halves.
 import { gateProofContent } from "../quality-gates.js";
+import {
+  openRepoStateStore,
+  REPO_STATE_FILE_ENV,
+  type RepoStateStore,
+  repoStatePathForCommonDir,
+  resetSharedRepoStateStore,
+} from "../repo-state-store.js";
+import { writeWorkflowState } from "../workflow-state.js";
 import { gitContextFreeEnv } from "../worktree.js";
 
 const cleanup: string[] = [];
 
 afterEach(() => {
   for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true });
+  // The receipt-published case opens the shared store through the fixture
+  // worktree, and the fixture is removed above: leaving the handle and its
+  // resolved-path cache entry behind points later tests at a deleted database.
+  resetSharedRepoStateStore();
 });
 
 function tempDir(label: string): string {
@@ -86,7 +93,7 @@ function tempDir(label: string): string {
   return dir;
 }
 
-// ── Lock primitive (real mkdir, real directory) ───────────────────────
+// ── Lock: conditional row claim, lease renewal, takeover ───────────────
 
 describe("merge lock: atomic acquire, lease renewal, takeover", () => {
   function lockFixture(): { gitCommonDir: string; fleetId: string } {
@@ -95,7 +102,7 @@ describe("merge lock: atomic acquire, lease renewal, takeover", () => {
     return { gitCommonDir, fleetId: "default" };
   }
 
-  function writeQueue(gitCommonDir: string, queue: FleetMergeQueue): void {
+  function _writeQueue(gitCommonDir: string, queue: FleetMergeQueue): void {
     const written = updateFleetMergeQueue({
       gitCommonDir,
       fleetId: "default",
@@ -104,7 +111,7 @@ describe("merge lock: atomic acquire, lease renewal, takeover", () => {
     if (!written.ok) throw new Error(written.error);
   }
 
-  it("lets exactly one of two concurrent acquires win (real mkdir)", () => {
+  it("lets exactly one of two concurrent acquires win (row claim)", () => {
     const { gitCommonDir, fleetId } = lockFixture();
 
     const first = acquireFleetMerge({
@@ -129,9 +136,6 @@ describe("merge lock: atomic acquire, lease renewal, takeover", () => {
     if (second.ok) return;
     expect(second.reason).toBe("lock-held");
     expect(second.holder).toBe("session-a");
-
-    // The primitive is a real directory, which is what made the second lose.
-    expect(existsSync(fleetMergeLockDir(gitCommonDir, fleetId))).toBe(true);
 
     const queue = readFleetMergeQueue({ gitCommonDir, fleetId });
     if (!queue.ok) throw new Error(queue.error);
@@ -161,10 +165,10 @@ describe("merge lock: atomic acquire, lease renewal, takeover", () => {
 
     const released = releaseFleetMerge({ gitCommonDir, fleetId, holder: "session-a", now: 1100 });
     expect(released).toHaveProperty("ok", true);
-    expect(existsSync(fleetMergeLockDir(gitCommonDir, fleetId))).toBe(false);
     const after = readFleetMergeQueue({ gitCommonDir, fleetId });
     if (!after.ok) throw new Error(after.error);
-    expect(after.queue?.lock).toBe(null);
+    // A fully released lock leaves neither a lock row nor a lock view.
+    expect(after.queue?.lock ?? null).toBe(null);
   });
 
   it("takes over an expired lease without consulting the recorded pid", () => {
@@ -243,102 +247,6 @@ describe("merge lock: atomic acquire, lease renewal, takeover", () => {
     expect(foreign).toHaveProperty("ok", false);
     if (foreign.ok) return;
     expect(foreign.reason).toBe("not-holder");
-  });
-
-  it("diagnoses a lock directory without a record, then recovers after the grace", () => {
-    const { gitCommonDir, fleetId } = lockFixture();
-    const lockDir = fleetMergeLockDir(gitCommonDir, fleetId);
-    mkdirSync(lockDir, { recursive: true });
-    const now = Date.now();
-
-    const blocked = acquireFleetMerge({
-      gitCommonDir,
-      fleetId,
-      holder: "session-a",
-      taskId: "bd-12",
-      pid: 111,
-      now,
-    });
-    expect(blocked).toHaveProperty("ok", false);
-    if (blocked.ok) return;
-    expect(blocked.reason).toBe("orphan-lock-dir");
-    expect(blocked.error).toContain("merge.lock.d");
-
-    // Age the primitive past the grace: a crash between mkdir and the record
-    // write must not wedge the queue.
-    const old = (now - FLEET_MERGE_ORPHAN_LOCK_GRACE_MS - 1000) / 1000;
-    utimesSync(lockDir, old, old);
-
-    const recovered = acquireFleetMerge({
-      gitCommonDir,
-      fleetId,
-      holder: "session-a",
-      taskId: "bd-12",
-      pid: 111,
-      now,
-    });
-    expect(recovered).toHaveProperty("ok", true);
-  });
-
-  it("diagnoses a record without the lock directory, and it becomes acquirable on expiry", () => {
-    const { gitCommonDir, fleetId } = lockFixture();
-    writeQueue(gitCommonDir, {
-      ...createFleetMergeQueue(1000),
-      lock: createFleetMergeLock({
-        holder: "session-a",
-        taskId: "bd-12",
-        pid: 111,
-        now: 1000,
-        leaseInMs: 5000,
-      }),
-    });
-
-    const blocked = acquireFleetMerge({
-      gitCommonDir,
-      fleetId,
-      holder: "session-b",
-      taskId: "bd-15",
-      pid: 222,
-      now: 2000,
-    });
-    expect(blocked).toHaveProperty("ok", false);
-    if (blocked.ok) return;
-    expect(blocked.reason).toBe("record-without-lock");
-    expect(blocked.error).toContain("merge.lock.d");
-
-    const recovered = acquireFleetMerge({
-      gitCommonDir,
-      fleetId,
-      holder: "session-b",
-      taskId: "bd-15",
-      pid: 222,
-      now: 6000,
-    });
-    expect(recovered).toHaveProperty("ok", true);
-  });
-
-  it("refuses to renew a lease whose primitive is gone", () => {
-    const { gitCommonDir, fleetId } = lockFixture();
-    acquireFleetMerge({
-      gitCommonDir,
-      fleetId,
-      holder: "session-a",
-      taskId: "bd-12",
-      pid: 111,
-      now: 1000,
-    });
-    rmSync(fleetMergeLockDir(gitCommonDir, fleetId), { recursive: true });
-
-    const renewed = renewFleetMergeLease({
-      gitCommonDir,
-      fleetId,
-      holder: "session-a",
-      taskId: "bd-12",
-      now: 2000,
-    });
-    expect(renewed).toHaveProperty("ok", false);
-    if (renewed.ok) return;
-    expect(renewed.reason).toBe("lock-dir-missing");
   });
 });
 
@@ -795,46 +703,59 @@ function createFixtureRepo(options: { secondMember?: boolean } = {}): FixtureRep
   return { root, commonDir, fleetId, memberPath, siblingPath };
 }
 
+/** Seed one fleet intent row (bd-281: the intent is a store row, not a file). */
 function writeFleetIntent(commonDir: string, fleetId: string, taskIds: string[]): void {
-  const dir = join(commonDir, "belayd", "fleet", fleetId);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(
-    join(dir, "fleet.json"),
-    JSON.stringify({
-      schemaVersion: 1,
+  const written = writeFleetIntentRecord({
+    gitCommonDir: commonDir,
+    fleetId,
+    intent: {
+      schemaVersion: 2,
       fleetId,
       taskIds,
       createdAt: 1,
       updatedAt: 1,
       baseBranch: "main",
-    }),
-  );
+      publish: { mode: "local" },
+    },
+  });
+  if (!written.ok) throw new Error(written.error);
 }
 
 function auditActions(fixture: FixtureRepo): string[] {
-  const path = fleetAuditLogPath(fixture.commonDir, fixture.fleetId);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => (JSON.parse(line) as { action: string }).action);
+  // bd-281: audit entries are rows in the shared store, not lines in audit.log.
+  return readRecentFleetAuditEntries({
+    gitCommonDir: fixture.commonDir,
+    fleetId: fixture.fleetId,
+    since: 0,
+  }).map((entry) => entry.action);
+}
+
+/** The lock view a reader sees, or null when the fleet holds no lock. */
+function heldLock(fixture: FixtureRepo) {
+  const loaded = readFleetMergeQueue({
+    gitCommonDir: fixture.commonDir,
+    fleetId: fixture.fleetId,
+  });
+  return loaded.ok ? (loaded.queue?.lock ?? null) : null;
 }
 
 /** The details one audit action recorded, in append order. */
 function auditDetails(fixture: FixtureRepo, action: string): string[] {
-  const path = fleetAuditLogPath(fixture.commonDir, fixture.fleetId);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => JSON.parse(line) as { action: string; detail?: string })
-    .filter((entry) => entry.action === action)
-    .map((entry) => entry.detail ?? "");
+  return readRecentFleetAuditEntries({
+    gitCommonDir: fixture.commonDir,
+    fleetId: fixture.fleetId,
+    since: 0,
+    action,
+  }).map((entry) => entry.detail);
 }
 
 /** The `to` addresses of one delivered note kind, in delivery order. */
 function noteRecipients(fixture: FixtureRepo, kind: string): string[] {
-  const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+  const events = drainNotes({
+    gitCommonDir: fixture.commonDir,
+    fleetId: fixture.fleetId,
+    channel: "event",
+  });
   if (!events.ok) throw new Error(events.error);
   return events.deliveries
     .filter((delivery) => delivery.note.kind === kind)
@@ -848,19 +769,53 @@ function noteRecipients(fixture: FixtureRepo, kind: string): string[] {
  * `fsRefusingWrite` cannot reach it; this is how a test drives the "the landed audit
  * could not be written" arm and the retry that follows it (bd-280 S6).
  */
-function fsFailingFirstAuditAppend(action: string): FleetStateFs {
-  const base = fsRefusingWrite(() => false);
+/** The store behind a fixture's git common dir (a second handle on the same file). */
+function storeOf(fixture: FixtureRepo): RepoStateStore {
+  const opened = openRepoStateStore({ path: repoStatePathForCommonDir(fixture.commonDir) });
+  if (!opened.ok) throw new Error(opened.error);
+  return opened.store;
+}
+
+/** An fs seam whose fleet store is the fixture's, with some methods overridden. */
+function fsWithStore(fixture: FixtureRepo, overrides: Partial<RepoStateStore>): FleetStateFs {
+  return { ...nodeFsSeam(), store: { ...storeOf(fixture), ...overrides } };
+}
+
+/**
+ * Refuse every queue write whose record matches `refuse`.
+ *
+ * bd-281 moved the queue into the store, so the seam to fail is `updateFleetQueue`
+ * (the previous file seam matched the JSON payload of a rename target). Every match
+ * fails, matching the old seam: a drain that retried the same transition must not
+ * slip through the second time.
+ */
+function fsRefusingQueueWrite(
+  fixture: FixtureRepo,
+  refuse: (queue: unknown) => boolean,
+): FleetStateFs {
+  const store = storeOf(fixture);
+  return fsWithStore(fixture, {
+    updateFleetQueue: (input) =>
+      refuse(input.queue)
+        ? { ok: false, error: "ENOSPC: no space left on device" }
+        : store.updateFleetQueue(input),
+  });
+}
+
+/** Fail the first audit append of one action, then accept every later one. */
+function fsFailingFirstAuditAppend(fixture: FixtureRepo, action: string): FleetStateFs {
+  const store = storeOf(fixture);
   let failed = false;
-  return {
-    ...base,
-    appendFileSync: (path, data) => {
-      if (!failed && data.includes(`"action":"${action}"`)) {
+  return fsWithStore(fixture, {
+    appendAudit: (input) => {
+      const entry = input.entry as { action?: unknown };
+      if (!failed && entry.action === action) {
         failed = true;
-        throw new Error("EIO: audit append failed");
+        return { ok: false, error: "EIO: audit append failed" };
       }
-      appendFileSync(path, data);
+      return store.appendAudit(input);
     },
-  };
+  });
 }
 
 /**
@@ -871,30 +826,42 @@ function fsFailingFirstAuditAppend(action: string): FleetStateFs {
  * that carries `delegatedAt`, or exactly the note write that carries a
  * `rebase-hint`, without breaking the reads and writes the drain needs to get there.
  */
-function fsRefusingWrite(
-  refuse: (input: { content: string; target: string }) => boolean,
-): FleetStateFs {
+function nodeFsSeam(): FleetStateFs {
   return {
     existsSync: (path) => existsSync(path),
     readFileSync: (path) => readFileSync(path, "utf8"),
-    statSync: (path) => {
-      const stat = statSync(path);
-      return { size: stat.size, mtimeMs: stat.mtimeMs };
-    },
     writeFileSync: (path, data, options) => writeFileSync(path, data, options),
-    appendFileSync: (path, data) => appendFileSync(path, data),
-    renameSync: (from, to) => {
-      if (refuse({ content: readFileSync(from, "utf8"), target: to })) {
-        throw new Error("ENOSPC: no space left on device");
-      }
-      renameSync(from, to);
-    },
+    renameSync: (from, to) => renameSync(from, to),
     mkdirSync: (path, options) => {
       mkdirSync(path, options);
     },
     unlinkSync: (path) => unlinkSync(path),
     readdirSync: (path) => readdirSync(path),
-    rmdirSync: (path) => rmdirSync(path),
+  };
+}
+
+/**
+ * An fs seam whose store refuses a note insert matching `refuse`.
+ *
+ * bd-281 moved the mailboxes into the store, so the seam to fail is `enqueueNote`
+ * (the file seam matched the JSON payload of a rename target). Every match fails,
+ * matching the old seam: a retry of the same send must not slip through the second
+ * time.
+ */
+function fsRefusingNote(
+  fixture: FixtureRepo,
+  refuse: (note: { kind: string; target: string; body: string }) => boolean,
+): FleetStateFs {
+  const store = storeOf(fixture);
+  return {
+    ...nodeFsSeam(),
+    store: {
+      ...store,
+      enqueueNote: (input) =>
+        refuse({ kind: input.kind, target: input.target, body: input.body })
+          ? { ok: false, reason: "write-failed", error: "EIO: simulated note write failure" }
+          : store.enqueueNote(input),
+    },
   };
 }
 
@@ -999,10 +966,14 @@ describe("drainFleetMerge: the documented merge sequence", () => {
       state: "merged",
       attempts: 1,
     });
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    expect(heldLock(fixture)).toBe(null);
 
     // Base-moved propagation went through the per-recipient fan-out.
-    const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    const events = drainNotes({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      channel: "event",
+    });
     if (!events.ok) throw new Error(events.error);
     const kinds = events.deliveries.map((delivery) => delivery.note.kind).sort();
     expect(kinds).toEqual(["base-moved", "rebase-hint", "sibling-landed"]);
@@ -1213,7 +1184,7 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
     expect(git(fixture.root, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
     expect(readQueue(fixture).lock).toBe(null);
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    expect(heldLock(fixture)).toBe(null);
     expect(readQueue(fixture).entries[0]).toMatchObject({ state: "failed" });
     // The member's commits still exist; only the merge was aborted.
     expect(git(fixture.memberPath, ["rev-parse", "--verify", "feat/bd-12"]).length).toBeGreaterThan(
@@ -1599,7 +1570,11 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(entry?.lastError).toContain("delegated to the member");
     expect(gate.calls).toEqual([]);
 
-    const notes = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    const notes = drainNotes({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      channel: "event",
+    });
     if (!notes.ok) throw new Error(notes.error);
     const hints = notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint");
     expect(hints).toHaveLength(1);
@@ -1646,9 +1621,12 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
         await defaultFleetMergeGitRunner(["rebase", "main"], options);
         await defaultFleetMergeGitRunner(["checkout", "--ours", "--", "conflict.txt"], options);
         await defaultFleetMergeGitRunner(["add", "--", "conflict.txt"], options);
-        rmSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId), {
-          recursive: true,
-          force: true,
+        // bd-281: a lost lock is a released/expired row, not a removed directory.
+        releaseFleetMerge({
+          gitCommonDir: fixture.commonDir,
+          fleetId: fixture.fleetId,
+          holder: "supervisor-session",
+          now: 2000,
         });
         return {
           ok: false,
@@ -1772,7 +1750,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     const result = await drain(fixture, {
       runGate: gateSpy().runGate,
       memberLease: "live",
-      fs: fsRefusingWrite(({ content }) => content.includes('"delegatedAt"')),
+      fs: fsRefusingQueueWrite(fixture, (queue) => JSON.stringify(queue).includes('"delegatedAt"')),
     });
 
     expect(result).toHaveProperty("ok", false);
@@ -1795,11 +1773,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     const result = await drain(fixture, {
       runGate: gateSpy().runGate,
       memberLease: "live",
-      fs: fsRefusingWrite(
-        ({ content, target }) =>
-          target.includes(join("fleet", fixture.fleetId, "events")) &&
-          content.includes("rebase-hint"),
-      ),
+      fs: fsRefusingNote(fixture, (note) => note.kind === "rebase-hint"),
     });
 
     expect(result).toHaveProperty("ok", false);
@@ -1838,7 +1812,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(auditActions(fixture)).toContain("merge-step-threw");
     // The lock does not outlive the drain, and the interrupted rebase is cleared.
     expect(readQueue(fixture).lock ?? null).toBeNull();
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    expect(heldLock(fixture)).toBe(null);
     assertNoRebaseLeft(fixture);
     expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
@@ -2120,7 +2094,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     // The member landed and stays landed: the throw came after the merged transition.
     expect(readQueue(fixture).entries[0]?.state).toBe("merged");
     expect(readQueue(fixture).lock ?? null).toBeNull();
-    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    expect(heldLock(fixture)).toBe(null);
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
     expect(auditActions(fixture)).toContain("merge-step-threw");
     // One landed audit and one throw: the merge happened, and the arm that found it
@@ -2161,7 +2135,11 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
 
     // The siblings were still told: their branches are on a stale base either way.
-    const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    const events = drainNotes({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      channel: "event",
+    });
     if (!events.ok) throw new Error(events.error);
     const delivered = events.deliveries.map(
       (delivery) => `${delivery.note.kind}:${delivery.note.to}`,
@@ -2202,7 +2180,11 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
 
     // The two kinds that did go out are not sent a second time by the retry.
-    const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    const events = drainNotes({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      channel: "event",
+    });
     if (!events.ok) throw new Error(events.error);
     const kinds = events.deliveries.map((delivery) => delivery.note.kind).sort();
     expect(kinds).toEqual(["base-moved", "sibling-landed"]);
@@ -2222,8 +2204,8 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     };
     // The `merged` transition is refused, so the queue entry never records the merge:
     // the landed audit must not be keyed on it (that wrote a second entry).
-    const fs = fsRefusingWrite(
-      ({ content, target }) => target.endsWith("merge-queue.json") && content.includes('"merged"'),
+    const fs = fsRefusingQueueWrite(fixture, (queue) =>
+      JSON.stringify(queue).includes('"state":"merged"'),
     );
 
     const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner, fs });
@@ -2256,7 +2238,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     const result = await drain(fixture, {
       runGate: gateSpy().runGate,
       git: gitRunner,
-      fs: fsFailingFirstAuditAppend("merge-completed"),
+      fs: fsFailingFirstAuditAppend(fixture, "merge-completed"),
     });
 
     expect(result).toHaveProperty("ok", false);
@@ -2264,7 +2246,7 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     expect(result.reason).toBe("step-failed");
     // The failed append is reported, and the landed arm wrote the entry the operator
     // greps for — the log holds one, not zero and not two.
-    expect(result.warnings.join("\n")).toContain("could not append to audit.log");
+    expect(result.warnings.join("\n")).toContain("could not append the audit entry");
     expect(auditActions(fixture).filter((action) => action === "merge-completed")).toHaveLength(1);
     expect(auditActions(fixture).filter((action) => action === "merge-step-threw")).toHaveLength(1);
     expect(readQueue(fixture).entries[0]?.state).toBe("merged");
@@ -2282,8 +2264,8 @@ describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
     // bd-19's note writes fail twice (one per kind on the first attempt), so the first
     // fan-out is partial: bd-15 was written and bd-19 was not.
     let bd19Refusals = 0;
-    const fs = fsRefusingWrite(({ content }) => {
-      if (!content.includes('"to": "bd-19"')) return false;
+    const fs = fsRefusingNote(fixture, (note) => {
+      if (note.target !== "bd-19") return false;
       bd19Refusals += 1;
       return bd19Refusals <= 2;
     });
@@ -2563,22 +2545,50 @@ describe("drainFleetMerge: root and stash safety", () => {
     enqueue(fixture);
     writeFileSync(join(fixture.root, "base.txt"), "operator changed this\n");
 
-    const fleetFile = join(fixture.commonDir, "belayd", "fleet", fixture.fleetId, "fleet.json");
+    // Simulate a record that vanished while the merge ran: the store reports no
+    // row to every later probe, which is what a deleted `fleet.json` used to mean.
+    const opened = openRepoStateStore({ path: repoStatePathForCommonDir(fixture.commonDir) });
+    if (!opened.ok) throw new Error(opened.error);
+    const realStore = opened.store;
+    let vanished = false;
+    const fs: FleetStateFs = {
+      existsSync: (path) => nodeFs.existsSync(path),
+      readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
+      writeFileSync: (path, data, writeOptions) => nodeFs.writeFileSync(path, data, writeOptions),
+      renameSync: (from, to) => nodeFs.renameSync(from, to),
+      mkdirSync: (path, mkdirOptions) => {
+        nodeFs.mkdirSync(path, mkdirOptions);
+      },
+      unlinkSync: (path) => nodeFs.unlinkSync(path),
+      readdirSync: (path) => nodeFs.readdirSync(path),
+      store: {
+        ...realStore,
+        readFleet: (id) => (vanished ? { ok: true, value: null } : realStore.readFleet(id)),
+        mutateFleet: (input) =>
+          realStore.mutateFleet({
+            ...input,
+            update: (current) => input.update(vanished ? null : current),
+          }),
+      },
+    };
     const runGate: FleetMergeGateRunner = async () => {
-      rmSync(fleetFile, { force: true });
+      vanished = true;
       return { ok: true };
     };
 
-    const result = await drain(fixture, { runGate });
+    const result = await drain(fixture, { runGate, fs });
 
     expect(result).toHaveProperty("ok", false);
     if (result.ok) return;
     expect(result.reason).toBe("restore-conflict");
     // The rest of the drain still holds: the merge landed, the root is clean.
     expect(git(fixture.root, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("main");
-    // But no stale in-memory member list was resurrected into a new fleet.json.
+    // But no stale in-memory member list was resurrected into the intent.
     expect(result.parked).toBe(false);
-    expect(existsSync(fleetFile)).toBe(false);
+    const after = readFleetIntent({ gitCommonDir: fixture.commonDir, fleetId: fixture.fleetId });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.park).toBeUndefined();
     expect(result.warnings.join("\n")).toContain("refusing to park");
   });
 });
@@ -2605,10 +2615,11 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     });
     expect(result).toHaveProperty("ok", true);
 
-    const entries = readFileSync(fleetAuditLogPath(fixture.commonDir, fixture.fleetId), "utf8")
-      .split("\n")
-      .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as { action: string; timestamp: number });
+    const entries = readRecentFleetAuditEntries({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      since: 0,
+    }).map((entry) => ({ action: entry.action, timestamp: entry.timestamp }));
     const acquired = entries.find((entry) => entry.action === "merge-acquired")?.timestamp ?? 0;
     const completed = entries.find((entry) => entry.action === "merge-completed")?.timestamp ?? 0;
     expect(acquired).toBeGreaterThan(2_000);
@@ -2692,11 +2703,23 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     const siblingPath = `${root}.work-bd-15`;
     cleanup.push(siblingPath);
     git(root, ["worktree", "add", "-q", "-b", "work/bd-15", siblingPath, "feat/bd-12"]);
-    mkdirSync(join(siblingPath, ".belayd"), { recursive: true });
-    writeFileSync(
-      join(siblingPath, ".belayd", "workflow.json"),
-      JSON.stringify({ taskId: "bd-15" }),
-    );
+    // bd-281: the worktree -> task binding is a store row, so seed it through the
+    // real writer rather than a legacy `.belayd/workflow.json` the drain no longer reads.
+    const bound = writeWorkflowState({
+      cwd: siblingPath,
+      state: {
+        schemaVersion: 1,
+        taskId: "bd-15",
+        workflowType: "feature",
+        branch: "work/bd-15",
+        originalCwd: siblingPath,
+        phaseOrder: ["scout"],
+        completedPhaseNames: [],
+        startedAt: 1,
+        updatedAt: 1,
+      },
+    });
+    if (!bound.ok) throw new Error(bound.error);
 
     const commonDir = join(root, ".git");
     writeFleetIntent(commonDir, "default", ["bd-12", "bd-15"]);
@@ -2711,7 +2734,7 @@ describe("drainFleetMerge: clock, lease, environment, branches", () => {
     const result = await drain(fixture, { runGate: gateSpy().runGate });
 
     expect(result).toHaveProperty("ok", true);
-    const events = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    const events = drainNotes({ gitCommonDir: commonDir, fleetId: "default", channel: "event" });
     if (!events.ok) throw new Error(events.error);
     const kinds = events.deliveries.map((delivery) => delivery.note.kind).sort();
     // `work/bd-15` already contains the new base, so no rebase-hint is due; the
@@ -2832,23 +2855,25 @@ describe("drainFleetMerge: publish payload guard (bd-181)", () => {
 
   it("merges a receipt-published bead whose diff carries no proof files", async () => {
     const fixture = createFixtureRepo();
-    // Mirror the real repository: `.belayd/` is gitignored, which is what makes
-    // the receipt invisible to the payload diff. Without it the untracked
-    // receipt would make the member worktree dirty and the drain would refuse
-    // for an unrelated reason.
+    // Mirror the real repository: `.belayd/` is gitignored, so a stray harness file
+    // could never dirty the member worktree (bd-281 keeps the receipt in the store,
+    // but the ignore rule is still the repository's own).
     writeFileSync(join(fixture.memberPath, ".gitignore"), ".belayd/\n");
     writeFileSync(join(fixture.memberPath, "src-change.txt"), "source change\n");
     commit(fixture.memberPath, "receipt-published change");
 
-    mkdirSync(join(fixture.memberPath, ".belayd"), { recursive: true });
-    writeFileSync(
-      join(fixture.memberPath, ".belayd", "proof-receipt.json"),
-      serializeProofReceipt({
-        version: 1,
-        taskId: "bd-12",
-        url: "https://proof.example.com/uploads/bd-12",
+    // bd-281: the receipt is a row in the repository's shared store, keyed by task
+    // id, not a file in the member worktree.
+    expect(
+      writeProofReceipt({
+        cwd: fixture.memberPath,
+        receipt: {
+          version: 1,
+          taskId: "bd-12",
+          url: "https://proof.example.com/uploads/bd-12",
+        },
       }),
-    );
+    ).toStrictEqual({ ok: true, taskId: "bd-12" });
     enqueue(fixture);
 
     // The proof gate accepts the same workspace on the strength of the receipt
@@ -2882,6 +2907,56 @@ describe("drainFleetMerge: publish payload guard (bd-181)", () => {
     // and the successful drain removed the member worktree (bd-168 #3).
     expect(existsSync(join(fixture.root, ".belayd", "proof-receipt.json"))).toBe(false);
     expect(existsSync(fixture.memberPath)).toBe(false);
+  });
+
+  it("does not accept a receipt-published bead when the store cannot be opened", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, ".gitignore"), ".belayd/\n");
+    writeFileSync(join(fixture.memberPath, "src-change.txt"), "source change\n");
+    commit(fixture.memberPath, "receipt-published change");
+    // The row is there; the store that holds it becomes unopenable for this check.
+    expect(
+      writeProofReceipt({
+        cwd: fixture.memberPath,
+        receipt: {
+          version: 1,
+          taskId: "bd-12",
+          url: "https://proof.example.com/uploads/bd-12",
+        },
+      }),
+    ).toStrictEqual({ ok: true, taskId: "bd-12" });
+
+    const storeDir = tempDir("failed-receipt-store");
+    writeFileSync(join(storeDir, "blocked"), "not a directory");
+    process.env[REPO_STATE_FILE_ENV] = join(storeDir, "blocked", "state.sqlite");
+    resetSharedRepoStateStore();
+    try {
+      // The fleet's proof acceptance is this gate: a broken store must fail
+      // closed, never read as "this bead published no receipt".
+      const proof = await gateProofContent(
+        "Proof uploaded; nothing committed.\n",
+        {
+          messages: [],
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: 0,
+            turns: 0,
+            toolCalls: 0,
+          },
+          exitCode: 0,
+        },
+        { cwd: fixture.memberPath, proofDir: join(tmpdir(), "belayd-external-proof", "bd-12") },
+      );
+      expect(proof).toHaveProperty("passed", false);
+      expect(proof.feedback).toContain("Invalid proof receipt");
+      expect(proof.feedback).not.toContain("Proof receipt accepted");
+    } finally {
+      delete process.env[REPO_STATE_FILE_ENV];
+      resetSharedRepoStateStore();
+    }
   });
 
   it("refuses a payload that commits the receipt file itself", async () => {

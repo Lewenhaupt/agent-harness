@@ -18,7 +18,7 @@
  *    found, and releases it. When a live holder exists, reconcile repairs nothing
  *    and says so.
  * 2. **Parked fleet.** A conflicting root restore parks the fleet with the applied
- *    stash ref in `fleet.json`. Reconcile retries that restore from the recorded
+ *    stash ref in the fleet intent. Reconcile retries that restore from the recorded
  *    sha (never a position), or reports exactly what blocks it. The work is never
  *    discarded: a failed retry leaves the stash untouched and the fleet parked.
  * 3. **Supervision.** Member liveness is established from the process table
@@ -38,12 +38,7 @@ import * as nodeFs from "node:fs";
 import type { SupervisorHeartbeat } from "./fleet-heartbeat.js";
 import { isFleetLoopProvablyDead } from "./fleet-heartbeat.js";
 import type { FleetMergeGitRunner } from "./fleet-merge.js";
-import {
-  acquireFleetMerge,
-  FLEET_MERGE_ORPHAN_LOCK_GRACE_MS,
-  releaseFleetMerge,
-  restoreRecordedStash,
-} from "./fleet-merge.js";
+import { acquireFleetMerge, releaseFleetMerge, restoreRecordedStash } from "./fleet-merge.js";
 import type { FleetSupervisorLiveness, FleetSupervisorState } from "./fleet-mode.js";
 import { classifyFleetSupervisor } from "./fleet-mode.js";
 import type {
@@ -65,7 +60,6 @@ import {
   createFleetMergeQueue,
   dropFleetOrderingGates,
   FLEET_MERGE_LEASE_MS,
-  fleetMergeLockDir,
   readFleetIntent,
   readFleetMergeQueue,
   updateFleetIntent,
@@ -77,19 +71,13 @@ import type { FleetIntent } from "./fleet-status.js";
 const nodeFsSeam: FleetStateFs = {
   existsSync: (path) => nodeFs.existsSync(path),
   readFileSync: (path) => nodeFs.readFileSync(path, "utf8"),
-  statSync: (path) => {
-    const { size, mtimeMs } = nodeFs.statSync(path);
-    return { size, mtimeMs };
-  },
   writeFileSync: (path, data, options) => nodeFs.writeFileSync(path, data, options),
-  appendFileSync: (path, data) => nodeFs.appendFileSync(path, data),
   renameSync: (oldPath, newPath) => nodeFs.renameSync(oldPath, newPath),
   mkdirSync: (path, options) => {
     nodeFs.mkdirSync(path, options);
   },
   unlinkSync: (path) => nodeFs.unlinkSync(path),
   readdirSync: (path) => nodeFs.readdirSync(path),
-  rmdirSync: (path) => nodeFs.rmdirSync(path),
 };
 
 // ── Merge-queue diagnosis (pure) ──────────────────────────────────────
@@ -103,18 +91,11 @@ const nodeFsSeam: FleetStateFs = {
 export const FLEET_RECONCILE_ACTIVE_ENTRY_STATES = ["rebasing", "gating", "merging"] as const;
 
 /** What the queue looked like when it was inspected. */
-export type FleetQueueAnomaly =
-  | "expired-lease"
-  | "record-without-lock"
-  | "orphan-lock-dir"
-  | "entry-stuck"
-  | "entry-merged-unrecorded";
+export type FleetQueueAnomaly = "expired-lease" | "entry-stuck" | "entry-merged-unrecorded";
 
 /** What reconcile does about it. `leave-alone` is a decision, not an omission. */
 export type FleetQueueRepairAction =
   | "take-over-lock"
-  | "clear-lock-record"
-  | "remove-lock-dir"
   | "reset-queued"
   | "mark-merged"
   | "leave-alone";
@@ -129,70 +110,40 @@ export interface FleetQueueRepair {
 
 export interface DiagnoseMergeQueueInput {
   queue: FleetMergeQueue | undefined;
-  /** Whether `<fleetDir>/merge.lock.d` exists (the acquisition authority). */
-  lockDirPresent: boolean;
-  /** Age of the lock directory when it exists and its mtime is readable. */
-  lockDirAgeInMs: number | undefined;
   /** Entries whose branch git proved is already an ancestor of the base. */
   mergedIntoBase: readonly string[];
   now: number;
-  orphanGraceInMs?: number;
 }
 
-/** Whether a held lock is still inside its lease and backed by its primitive. */
-function lockIsLive(options: {
-  queue: FleetMergeQueue | undefined;
-  lockDirPresent: boolean;
-  now: number;
-}): boolean {
+/** Whether a held lock is still inside its lease. */
+function lockIsLive(options: { queue: FleetMergeQueue | undefined; now: number }): boolean {
   const lock = options.queue?.lock ?? null;
   if (lock === null) return false;
-  return options.now < lock.leaseExpiresAt && options.lockDirPresent;
+  return options.now < lock.leaseExpiresAt;
 }
 
-/** Repairs for the lock record / lock directory pair. */
+/**
+ * Repairs for the lock row.
+ *
+ * The retired protocol also had to diagnose two states that cannot exist in a row:
+ * a lease record without its `merge.lock.d` primitive, and a primitive without a
+ * record. Both existed because acquisition was two writes; the row's lease is the
+ * acquisition, and its deadline is the only takeover authority. An expired lease is
+ * therefore the single case left, and taking it over is the same rule
+ * `acquireFleetMerge` applies.
+ */
 function diagnoseLockState(input: DiagnoseMergeQueueInput): FleetQueueRepair[] {
-  const grace = input.orphanGraceInMs ?? FLEET_MERGE_ORPHAN_LOCK_GRACE_MS;
   const lock = input.queue?.lock ?? null;
-
-  if (lock === null) {
-    if (!input.lockDirPresent) return [];
-    const stale = input.lockDirAgeInMs !== undefined && input.lockDirAgeInMs >= grace;
-    return [
-      {
-        anomaly: "orphan-lock-dir",
-        action: stale ? "remove-lock-dir" : "leave-alone",
-        reason: stale
-          ? `the lock directory is ${Math.round((input.lockDirAgeInMs ?? 0) / 1000)}s old and no ` +
-            "lock record names a holder; it is a crashed acquisition and is reclaimed"
-          : `the lock directory is inside the ${Math.round(grace / 1000)}s grace window: an ` +
-            "acquirer may still be between creating the directory and writing its lease",
-      },
-    ];
-  }
-  if (input.now >= lock.leaseExpiresAt) {
-    return [
-      {
-        anomaly: "expired-lease",
-        action: "take-over-lock",
-        reason:
-          `the lease held by ${lock.holder} for ${lock.taskId} expired at ` +
-          `${new Date(lock.leaseExpiresAt).toISOString()} and was not renewed`,
-      },
-    ];
-  }
-  if (!input.lockDirPresent) {
-    return [
-      {
-        anomaly: "record-without-lock",
-        action: "clear-lock-record",
-        reason:
-          "the lock record is not backed by merge.lock.d, and the directory is the acquisition " +
-          "authority: no merge can be in flight under this protocol",
-      },
-    ];
-  }
-  return [];
+  if (lock === null || input.now < lock.leaseExpiresAt) return [];
+  return [
+    {
+      anomaly: "expired-lease",
+      action: "take-over-lock",
+      reason:
+        `the lease held by ${lock.holder} for ${lock.taskId} expired at ` +
+        `${new Date(lock.leaseExpiresAt).toISOString()} and was not renewed`,
+    },
+  ];
 }
 
 /** Repairs for entries frozen in an in-flight state with no live lock. */
@@ -231,10 +182,6 @@ function diagnoseStuckEntries(input: DiagnoseMergeQueueInput): FleetQueueRepair[
  *
  * - an expired lease → take the lock over (the lease is the only takeover
  *   authority, so this is the same rule `acquireFleetMerge` applies);
- * - a record without its primitive → clear the record: `mkdir` is the acquisition
- *   authority, so without the directory no merge can be in flight;
- * - a primitive without a record → leave it inside the grace window (a winner may
- *   still be between `mkdir` and writing its lease) and remove it after;
  * - an entry frozen in an in-flight state while no lock is live → `mark-merged`
  *   when git proves the branch already landed, otherwise `reset-queued` with the
  *   attempt count preserved (a retry is a new attempt, not a new entry).
@@ -243,9 +190,7 @@ export function diagnoseMergeQueue(input: DiagnoseMergeQueueInput): readonly Fle
   const repairs = diagnoseLockState(input);
   // An in-flight entry is only an anomaly when no lock is live: while a holder is
   // inside its lease, an in-flight state is exactly what is expected.
-  if (lockIsLive({ queue: input.queue, lockDirPresent: input.lockDirPresent, now: input.now })) {
-    return repairs;
-  }
+  if (lockIsLive({ queue: input.queue, now: input.now })) return repairs;
   return [...repairs, ...diagnoseStuckEntries(input)];
 }
 
@@ -283,22 +228,7 @@ function auditReconcile(options: {
   });
   return appended.ok
     ? undefined
-    : `fleet ${options.fleetId}: could not append to audit.log (${appended.error})`;
-}
-
-/** Age of the lock directory, or undefined when it does not exist / has no mtime. */
-function lockDirAgeInMs(options: {
-  fs: FleetStateFs;
-  lockDir: string;
-  now: number;
-}): number | undefined {
-  if (!options.fs.existsSync(options.lockDir)) return undefined;
-  try {
-    const { mtimeMs } = options.fs.statSync(options.lockDir);
-    return mtimeMs === undefined ? undefined : Math.max(0, options.now - mtimeMs);
-  } catch {
-    return undefined;
-  }
+    : `fleet ${options.fleetId}: could not append the audit entry (${appended.error})`;
 }
 
 /** git-prove which queued branches already landed on the base. */
@@ -373,7 +303,6 @@ export interface RunFleetReconcileOptions {
   /** Whether the member's worktree provably existed (bd-233: deleted tree). */
   memberWorktreeExistedFor?: (taskId: string) => boolean;
   leaseInMs?: number;
-  orphanGraceInMs?: number;
   /**
    * Remove members whose orchestrator session is provably gone (positive `absent`
    * evidence; `unknown` liveness never qualifies, and the supervisor's own
@@ -470,45 +399,6 @@ function acquireForReconcile(options: RunFleetReconcileOptions):
   };
 }
 
-/**
- * Clear a lock record whose `merge.lock.d` primitive is gone.
- *
- * This repair runs **without** holding the lock, and says why: the anomaly is the
- * absence of the primitive, so there is nothing to race with. The CAS update only
- * clears the exact record that was diagnosed (same holder/task/acquiredAt), so a
- * concurrent acquirer's fresh record is never dropped.
- */
-function clearLockRecordWithoutPrimitive(options: {
-  gitCommonDir: string;
-  fleetId: string;
-  fs: FleetStateFs;
-  expected: NonNullable<FleetMergeQueue["lock"]>;
-  now: number;
-}): { ok: true } | { ok: false; error: string } {
-  let cleared = false;
-  const written = updateFleetMergeQueue({
-    gitCommonDir: options.gitCommonDir,
-    fleetId: options.fleetId,
-    fs: options.fs,
-    update: (current) => {
-      const lock = current?.lock ?? null;
-      if (
-        current === undefined ||
-        lock === null ||
-        lock.holder !== options.expected.holder ||
-        lock.taskId !== options.expected.taskId ||
-        lock.acquiredAt !== options.expected.acquiredAt
-      ) {
-        return current ?? createFleetMergeQueue(options.now);
-      }
-      cleared = true;
-      return { ...current, lock: null, updatedAt: options.now };
-    },
-  });
-  if (!written.ok) return { ok: false, error: written.error };
-  return cleared ? { ok: true } : { ok: false, error: "the lock record changed while reconciling" };
-}
-
 /** Apply the entry-state repairs the diagnosis asked for, under the held lock. */
 function applyEntryRepairs(options: {
   run: ReconcileRun;
@@ -592,7 +482,7 @@ function handWrittenPause(): ParkRepairResult {
   return {
     kind: "blocked",
     text:
-      "- park: the fleet is paused but no stash ref is recorded in fleet.json `park` " +
+      "- park: the fleet is paused but no stash ref is recorded in the intent's `park` " +
       "(a hand-written pause), so there is no restore to retry; `belayd_fleet_resume` clears " +
       "the pause (use force if the stash is already back)",
   };
@@ -1460,10 +1350,7 @@ async function reconcileSupervision(options: {
 interface QueueInspection {
   queue: FleetMergeQueue | undefined;
   lock: FleetMergeQueue["lock"];
-  dirPresent: boolean;
   repairs: readonly FleetQueueRepair[];
-  /** Orphaned directory inside its grace window: a decision to leave it alone. */
-  heldOrphan?: FleetQueueRepair;
 }
 
 type QueueInspectionResult =
@@ -1489,8 +1376,6 @@ async function inspectQueue(options: {
   });
   if (!queue.ok) return { ok: false, error: queue.error };
 
-  const lockDir = fleetMergeLockDir(options.reconcile.gitCommonDir, options.reconcile.fleetId);
-  const dirPresent = options.fs.existsSync(lockDir);
   const activeEntries = (queue.queue?.entries ?? []).filter((entry) =>
     FLEET_RECONCILE_ACTIVE_ENTRY_STATES.some((state) => state === entry.state),
   );
@@ -1502,82 +1387,25 @@ async function inspectQueue(options: {
   });
   const repairs = diagnoseMergeQueue({
     queue: queue.queue,
-    lockDirPresent: dirPresent,
-    lockDirAgeInMs: lockDirAgeInMs({ fs: options.fs, lockDir, now: options.reconcile.now }),
     mergedIntoBase: merged,
     now: options.reconcile.now,
-    ...(options.reconcile.orphanGraceInMs === undefined
-      ? {}
-      : { orphanGraceInMs: options.reconcile.orphanGraceInMs }),
   });
-  const heldOrphan = repairs.find(
-    (repair) => repair.anomaly === "orphan-lock-dir" && repair.action === "leave-alone",
-  );
   return {
     ok: true,
     inspection: {
       queue: queue.queue,
       lock: queue.queue?.lock ?? null,
-      dirPresent,
       repairs,
-      ...(heldOrphan === undefined ? {} : { heldOrphan }),
     },
   };
 }
 
-/** Clear the stale lock record, returning whether the queue is repairable at all. */
-function clearStaleLockRecord(options: {
-  run: ReconcileRun;
-  reconcile: RunFleetReconcileOptions;
-  inspection: QueueInspection;
-  fs: FleetStateFs;
-}): boolean {
-  const repair = options.inspection.repairs.find(
-    (candidate) => candidate.action === "clear-lock-record",
-  );
-  const lock = options.inspection.lock;
-  if (repair === undefined || lock === null) return true;
-
-  const cleared = clearLockRecordWithoutPrimitive({
-    gitCommonDir: options.reconcile.gitCommonDir,
-    fleetId: options.reconcile.fleetId,
-    fs: options.fs,
-    expected: lock,
-    now: options.reconcile.now,
-  });
-  if (!cleared.ok) {
-    options.run.lines.push(`- queue: could not clear the stale lock record (${cleared.error})`);
-    options.run.warnings.push(cleared.error);
-    return false;
-  }
-  options.run.repairs.push("queue:clear-lock-record");
-  options.run.lines.push(`- queue: cleared the lock record (${repair.reason})`);
-  const auditWarning = auditReconcile({
-    gitCommonDir: options.reconcile.gitCommonDir,
-    fleetId: options.reconcile.fleetId,
-    sessionId: options.reconcile.sessionId,
-    now: options.reconcile.now,
-    action: "queue-clear-lock-record",
-    taskIds: [],
-    detail: repair.reason,
-    fs: options.fs,
-  });
-  if (auditWarning !== undefined) options.run.warnings.push(auditWarning);
-  return true;
-}
-
 /** Whether anything in the inspection actually needs the merge lock held. */
-function needsMergeLock(
-  inspection: QueueInspection,
-  parked: boolean,
-  repairable: boolean,
-): boolean {
-  if (!repairable) return false;
+function needsMergeLock(inspection: QueueInspection, parked: boolean): boolean {
   if (parked) return true;
   return inspection.repairs.some(
     (repair) =>
       repair.action === "take-over-lock" ||
-      repair.action === "remove-lock-dir" ||
       repair.action === "reset-queued" ||
       repair.action === "mark-merged",
   );
@@ -1588,25 +1416,15 @@ function reportNoRepair(options: {
   run: ReconcileRun;
   inspection: QueueInspection;
   parked: boolean;
-  repairable: boolean;
   now: number;
 }): void {
   const { run, inspection } = options;
-  if (!options.repairable) {
-    run.lines.push(
-      "- queue: not repaired — the stale lock record could not be cleared (see warnings)",
-    );
-  } else if (
-    inspection.lock !== null &&
-    lockIsLive({ queue: inspection.queue, lockDirPresent: inspection.dirPresent, now: options.now })
-  ) {
+  if (inspection.lock !== null && lockIsLive({ queue: inspection.queue, now: options.now })) {
     const lock = inspection.lock;
     run.lines.push(
       `- queue: lock held by ${lock.holder} for ${lock.taskId} until ` +
         `${new Date(lock.leaseExpiresAt).toISOString()}; left alone`,
     );
-  } else if (inspection.heldOrphan !== undefined) {
-    run.lines.push(`- queue: left alone — ${inspection.heldOrphan.reason}`);
   } else {
     run.lines.push("- queue: consistent (no lock, no in-flight entries)");
   }
@@ -1642,10 +1460,6 @@ async function repairUnderLock(options: {
       fs,
     });
     if (auditWarning !== undefined) run.warnings.push(auditWarning);
-  }
-  if (inspection.repairs.some((repair) => repair.action === "remove-lock-dir")) {
-    run.repairs.push("queue:remove-lock-dir");
-    run.lines.push("- queue: reclaimed an orphaned lock directory while acquiring");
   }
   applyEntryRepairs({
     run,
@@ -1688,20 +1502,14 @@ async function reconcileQueueAndPark(options: {
   }
   const inspection = inspected.inspection;
 
-  const repairable = clearStaleLockRecord({ run, reconcile, inspection, fs });
-  if (!needsMergeLock(inspection, parked, repairable)) {
-    reportNoRepair({ run, inspection, parked, repairable, now: reconcile.now });
+  if (!needsMergeLock(inspection, parked)) {
+    reportNoRepair({ run, inspection, parked, now: reconcile.now });
     return;
   }
 
   const acquired = acquireForReconcile(reconcile);
   if (!acquired.ok) {
-    const held = inspection.heldOrphan;
-    run.lines.push(
-      `- queue: not repaired — ${acquired.text}` +
-        (held === undefined ? "" : ` (${held.anomaly}: ${held.reason})`),
-    );
-    if (held !== undefined) run.warnings.push(held.reason);
+    run.lines.push(`- queue: not repaired — ${acquired.text}`);
     if (parked) {
       run.lines.push("- park: not repaired — the root checkout is shared with the held merge lock");
     }

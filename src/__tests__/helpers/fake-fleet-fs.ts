@@ -6,35 +6,55 @@
  * under a path makes that path "exist".
  */
 
-import { basename } from "node:path";
+import { basename, dirname } from "node:path";
 import type { FleetStateFs } from "../../fleet-state.js";
+import { openRepoStateStore, type RepoStateStore } from "../../repo-state-store.js";
 
 export interface FakeFleetFs extends FleetStateFs {
   files: Map<string, string>;
+  /** The in-memory repo store the intent/run row lives in (bd-281). */
+  store: RepoStateStore;
+}
+
+/** One throwaway store per fake fs, so cases sharing `/repo/.git` cannot leak rows. */
+function openMemoryStore(): RepoStateStore {
+  const opened = openRepoStateStore({ path: ":memory:" });
+  if (!opened.ok) throw new Error(opened.error);
+  return opened.store;
 }
 
 export function createFakeFleetFs(initial: Record<string, string> = {}): FakeFleetFs {
   const files = new Map(Object.entries(initial));
+  const store = openMemoryStore();
+  // bd-281: a fixture naming `<fleetDir>/fleet.json` seeds the store row instead.
+  // No reader opens that file any more, so carrying it would make a seed silently
+  // ineffective; a non-JSON fixture becomes a non-record row (a corrupt record).
+  for (const [path, content] of [...files]) {
+    if (!path.endsWith("/fleet.json")) continue;
+    files.delete(path);
+    let document: unknown = content;
+    try {
+      document = JSON.parse(content);
+    } catch {
+      // Keep the raw text: it is not a record, so the reader reports it as corrupt.
+    }
+    const fleetId = basename(dirname(path));
+    const written = store.writeFleetIntent({ fleetId, intent: document });
+    if (!written.ok) throw new Error(written.error);
+  }
   const exists = (path: string): boolean =>
     files.has(path) || [...files.keys()].some((file) => file.startsWith(`${path}/`));
   return {
     files,
+    store,
     existsSync: exists,
     readFileSync: (path) => {
       const content = files.get(path);
       if (content === undefined) throw new Error(`ENOENT: ${path}`);
       return content;
     },
-    statSync: (path) => {
-      const content = files.get(path);
-      if (content === undefined) throw new Error(`ENOENT: ${path}`);
-      return { size: Buffer.byteLength(content), mtimeMs: 0 };
-    },
     writeFileSync: (path, data) => {
       files.set(path, data);
-    },
-    appendFileSync: (path, data) => {
-      files.set(path, `${files.get(path) ?? ""}${data}`);
     },
     renameSync: (oldPath, newPath) => {
       const content = files.get(oldPath);
@@ -47,10 +67,6 @@ export function createFakeFleetFs(initial: Record<string, string> = {}): FakeFle
     },
     unlinkSync: (path) => {
       files.delete(path);
-    },
-    rmdirSync: () => {
-      // Directories are implicit in the in-memory fs; the lock primitive is
-      // exercised against a real temp dir in `fleet-merge.test.ts` instead.
     },
     readdirSync: (path) => {
       const prefix = path.endsWith("/") ? path : `${path}/`;

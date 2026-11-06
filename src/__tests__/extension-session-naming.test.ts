@@ -12,6 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { openRepoStateStore } from "../repo-state-store.js";
+import { installTempRepoState } from "./helpers/repo-state.js";
+
+// The repository state store lives in a git common dir; these tests run in temp
+// directories, so they point it at a fresh file (bd-281).
+installTempRepoState();
+
 import { buildHandoff, handoffFilePath, writeHandoff } from "../handoff.js";
 import { REVIEW_SECTION_LIMITS } from "../review-context.js";
 import { REVIEW_FIX_LOOP_REASON, readReviewFindingsRecord } from "../review-findings.js";
@@ -26,9 +33,7 @@ import {
   clearReviewScope,
   readReviewScope,
   readWorkflowState as readWorkflowStateFromDisk,
-  saveReviewScope,
   type WorkflowState,
-  workflowStateFilePath,
   writeWorkflowState,
 } from "../workflow-state.js";
 
@@ -2618,16 +2623,17 @@ describe("session_start resume from disk (bd-40)", () => {
       cwd,
       state: featureState({ completedPhaseNames: [...FEATURE_PHASES] }),
     });
-    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
+    // State is a shared-store row now (bd-281), not a file in the worktree.
+    expect(readWorkflowStateFromDisk({ cwd })).toBeDefined();
 
     const { eventHandlers } = await bootWithCwd(cwd);
     const ctx = createResumeCtx({ cwd });
 
     await fireSessionStart(eventHandlers, ctx);
 
-    // A finished workflow must not resurrect the gate; the stale state file
-    // is removed so a later start_task writes fresh.
-    expect(existsSync(workflowStateFilePath(cwd))).toBe(false);
+    // A finished workflow must not resurrect the gate; the stale record is
+    // discarded so a later start_task writes fresh.
+    expect(readWorkflowStateFromDisk({ cwd })).toBeUndefined();
     const message = await gateContextMessage(eventHandlers, ctx);
     expect(message).toBeUndefined();
   });
@@ -2684,7 +2690,6 @@ describe("session_start resume from disk (bd-40)", () => {
 
     expect(message).toBeUndefined();
     // State file is untouched (not migrated/cleared) because resume was skipped.
-    expect(existsSync(workflowStateFilePath(cwd))).toBe(true);
     expect(readWorkflowStateFromDisk({ cwd })).toHaveProperty("taskId", "bd-42");
   });
 
@@ -2697,7 +2702,7 @@ describe("session_start resume from disk (bd-40)", () => {
     await fireSessionStart(eventHandlers, ctx);
     const message = await gateContextMessage(eventHandlers, ctx);
     expect(message).toBeUndefined();
-    expect(existsSync(workflowStateFilePath(cwd))).toBe(false);
+    expect(readWorkflowStateFromDisk({ cwd })).toBeUndefined();
   });
 
   it("persists a completed phase to workflow.json only after its run succeeds (success path)", async () => {
@@ -3353,7 +3358,8 @@ describe("session_start resume from disk (bd-40)", () => {
     // Model a scope that never survived to completion: the promotion must
     // record nothing rather than invent a baseline.
     mockSpawnAgentProcess.mockImplementationOnce(async () => {
-      clearReviewScope({ cwd });
+      // The scope belongs to the task (bd-281), so consuming it names bd-42.
+      clearReviewScope({ cwd, taskId: "bd-42" });
       return successfulSpawn();
     });
     await runPhase("review", "first review");
@@ -3383,15 +3389,26 @@ describe("session_start resume from disk (bd-40)", () => {
       ?.execute("start", { taskId: "bd-42" }, undefined, undefined, ctx);
     await runPhase("implement", "implement");
 
+    // bd-281 keyed the scope by task, so a foreign *task's* scope can no longer
+    // even be read by this task. The surviving hazard is a row whose recorded
+    // task disagrees with the workflow consuming it, which is what this seeds: a
+    // bd-42-keyed row whose payload names bd-99 (a stale/corrupt capture).
     mockSpawnAgentProcess.mockImplementationOnce(async () => {
-      saveReviewScope({ cwd, taskId: "bd-99", sha: "deadbee", untracked: [] });
+      const opened = openRepoStateStore({ path: process.env.BELAYD_REPO_STATE_FILE ?? "" });
+      if (!opened.ok) throw new Error(opened.error);
+      opened.store.writeReviewScope({
+        taskId: "bd-42",
+        worktreePath: cwd,
+        scope: { taskId: "bd-99", sha: "deadbee", untracked: [], capturedAt: 1 },
+      });
+      opened.store.close();
       return successfulSpawn();
     });
     await runPhase("review", "first review");
 
     expect(readWorkflowStateFromDisk({ cwd })?.reviewedSha).toBe(undefined);
-    // Not ours to consume: the foreign record is left for its own workflow.
-    expect(readReviewScope({ cwd })).toHaveProperty("taskId", "bd-99");
+    // Not ours to consume: the foreign record is left in place.
+    expect(readReviewScope({ cwd, taskId: "bd-42" })).toHaveProperty("taskId", "bd-99");
   });
 
   it("bounds a delivered review and drops its narration bullets (bd-113)", async () => {
@@ -3473,7 +3490,7 @@ describe("session_start resume from disk (bd-40)", () => {
     // ...and the same real delivery is the trace, not a question: a phase run
     // writes the disposition record and posts the authored comment, and never
     // creates the human gate that used to stop the member.
-    const record = readReviewFindingsRecord({ cwd });
+    const record = readReviewFindingsRecord({ cwd, taskId: "bd-42" });
     expect(record?.round).toBe(1);
     expect(record?.reason).toBe(REVIEW_FIX_LOOP_REASON);
     const reviewComment = reviewCalls.find(

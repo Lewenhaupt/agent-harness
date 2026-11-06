@@ -6,13 +6,16 @@
  * holder is alive, a cold lease can be taken over (and is archived, never deleted),
  * and a lease that is renewed during the takeover window is not displaced.
  *
- * Real files in a temp directory, no mocks: the atomic-create path (`wx`) is the
- * mutual exclusion, so it has to be the real one under test.
+ * bd-281 moved the lease into the shared repository store, where one conditional
+ * `BEGIN IMMEDIATE` upsert is the mutual exclusion. These tests drive a real
+ * SQLite file in a temp directory (no mocks), so the atomicity under test is the
+ * real one.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   acquireOrchestratorClaim,
@@ -24,21 +27,33 @@ import {
   isPendingOrchestratorClaim,
   ORCHESTRATOR_CLAIM_PENDING_PREFIX,
   ORCHESTRATOR_CLAIM_STALE_MS,
-  orchestratorClaimPath,
   readOrchestratorClaim,
   releaseOrchestratorClaim,
   replaceOrchestratorClaim,
 } from "../orchestrator-claim.js";
+import { openRepoStateStore, type RepoStateStore } from "../repo-state-store.js";
 
 let worktree: string;
+let store: RepoStateStore;
 
 beforeEach(() => {
   worktree = mkdtempSync(join(tmpdir(), "belayd-claim-"));
+  const opened = openRepoStateStore({ path: join(worktree, "state.sqlite") });
+  if (!opened.ok) throw new Error(opened.error);
+  store = opened.store;
 });
 
 afterEach(() => {
+  store.close();
   rmSync(worktree, { recursive: true, force: true });
 });
+
+/** The lease's persisted record, as the store holds it. */
+function leaseRow(sessionId: string): { sessionId: string } | null {
+  const row = store.readLease({ worktreePath: worktree });
+  if (!row.ok || row.value === null) return null;
+  return row.value.sessionId === sessionId ? { sessionId: row.value.sessionId } : null;
+}
 
 function acquire(options: {
   sessionId: string;
@@ -47,6 +62,7 @@ function acquire(options: {
   takeOverStale?: boolean;
 }) {
   return acquireOrchestratorClaim({
+    store,
     worktreePath: worktree,
     taskId: options.taskId ?? "bd-12",
     branch: "feat/bd-12",
@@ -62,7 +78,7 @@ describe("acquireOrchestratorClaim", () => {
     const acquired = acquire({ sessionId: "session-a" });
     expect(acquired).toHaveProperty("ok", true);
 
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind).toBe("ok");
     if (read.kind !== "ok") return;
     expect(read.claim).toMatchObject({
@@ -90,7 +106,7 @@ describe("acquireOrchestratorClaim", () => {
     });
     expect(describeOrchestratorClaim(second.verdict)).toContain("live orchestrator lease");
     // The holder's record is untouched.
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe("session-a");
   });
 
@@ -104,7 +120,7 @@ describe("acquireOrchestratorClaim", () => {
     expect(refused.verdict).toMatchObject({ kind: "held", state: "stale" });
   });
 
-  it("takes over a cold lease and archives the displaced record", () => {
+  it("takes over a cold lease and reports the displaced holder", () => {
     expect(acquire({ sessionId: "session-a", now: 1_000 })).toHaveProperty("ok", true);
     const staleNow = 1_000 + ORCHESTRATOR_CLAIM_STALE_MS + 1;
 
@@ -112,31 +128,35 @@ describe("acquireOrchestratorClaim", () => {
     expect(taken).toHaveProperty("ok", true);
     if (!taken.ok) return;
     expect(taken.tookOverFrom).toEqual({ taskId: "bd-12", sessionId: "session-a" });
-    expect(taken.archivedPath).toBeTypeOf("string");
-
-    const archived = readdirSync(join(worktree, ".belayd")).filter((name) =>
-      name.startsWith("orchestrator.stale-"),
-    );
-    expect(archived.length).toBe(1);
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    // No copy of the displaced record is kept: the takeover is a single write.
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe("session-b");
+    expect(leaseRow("session-a")).toBe(null);
   });
 
-  it("archives an unreadable lease instead of overwriting it silently", () => {
-    mkdirSync(join(worktree, ".belayd"), { recursive: true });
-    writeFileSync(orchestratorClaimPath(worktree), "{ not json");
+  it("refuses an unreadable lease unless the caller opts into a takeover", () => {
+    // A row that no longer matches the record schema is the store analogue of a
+    // corrupt lease: it is reported, never treated as free.
+    expect(acquire({ sessionId: "session-a", now: 1_000 })).toHaveProperty("ok", true);
+    const database = new DatabaseSync(join(worktree, "state.sqlite"));
+    database.prepare("UPDATE orchestrator_lease SET session_id = ''").run();
+    database.close();
 
-    const refused = acquire({ sessionId: "session-a", now: 1_000 });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
+    expect(read.kind).toBe("corrupt");
+
+    const refused = acquire({ sessionId: "session-a", now: 1_100 });
     expect(refused).toHaveProperty("ok", false);
     if (refused.ok) return;
     expect(refused.reason).toBe("corrupt");
 
-    const taken = acquire({ sessionId: "session-a", now: 1_100, takeOverStale: true });
+    // With an explicit takeover the row is replaced instead of blocking forever.
+    const taken = acquire({ sessionId: "session-b", now: 1_200, takeOverStale: true });
     expect(taken).toHaveProperty("ok", true);
-    const corrupt = readdirSync(join(worktree, ".belayd")).filter((name) =>
-      name.includes(".corrupt"),
-    );
-    expect(corrupt.length).toBe(1);
+    expect(readOrchestratorClaim({ worktreePath: worktree, store })).toMatchObject({
+      kind: "ok",
+      claim: { sessionId: "session-b" },
+    });
   });
 });
 
@@ -146,6 +166,7 @@ describe("heartbeatOrchestratorClaim", () => {
 
     const renewed = heartbeatOrchestratorClaim({
       worktreePath: worktree,
+      store,
       sessionId: "session-a",
       now: 2_000,
     });
@@ -155,6 +176,7 @@ describe("heartbeatOrchestratorClaim", () => {
 
     const other = heartbeatOrchestratorClaim({
       worktreePath: worktree,
+      store,
       sessionId: "session-b",
       now: 3_000,
     });
@@ -166,13 +188,14 @@ describe("heartbeatOrchestratorClaim", () => {
   it("reports a missing lease instead of creating one", () => {
     const result = heartbeatOrchestratorClaim({
       worktreePath: worktree,
+      store,
       sessionId: "session-a",
       now: 1_000,
     });
     expect(result).toHaveProperty("ok", false);
     if (result.ok) return;
     expect(result.reason).toBe("missing");
-    expect(existsSync(orchestratorClaimPath(worktree))).toBe(false);
+    expect(store.readLease({ worktreePath: worktree })).toHaveProperty("value", null);
   });
 });
 
@@ -180,6 +203,7 @@ describe("adoptOrchestratorClaim", () => {
   function adopt(sessionId: string, now: number) {
     return adoptOrchestratorClaim({
       worktreePath: worktree,
+      store,
       taskId: "bd-12",
       branch: "feat/bd-12",
       sessionId,
@@ -207,7 +231,7 @@ describe("adoptOrchestratorClaim", () => {
   it("adopts the spawner's pending lease", () => {
     const pendingId = `${ORCHESTRATOR_CLAIM_PENDING_PREFIX}spawn-token`;
     expect(acquire({ sessionId: pendingId, now: 1_000 })).toHaveProperty("ok", true);
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" && isPendingOrchestratorClaim(read.claim)).toBe(true);
 
     const adopted = adopt("session-a", 1_100);
@@ -231,7 +255,6 @@ describe("adoptOrchestratorClaim", () => {
     expect(adopted).toHaveProperty("ok", true);
     if (!adopted.ok) return;
     expect(adopted.adopted).toBe("stale");
-    expect(adopted.archivedPath).toBeTypeOf("string");
   });
 });
 
@@ -239,13 +262,17 @@ describe("releaseOrchestratorClaim", () => {
   it("removes only the owner's lease", () => {
     expect(acquire({ sessionId: "session-a", now: 1_000 })).toHaveProperty("ok", true);
 
-    const wrong = releaseOrchestratorClaim({ worktreePath: worktree, sessionId: "session-b" });
+    const wrong = releaseOrchestratorClaim({
+      worktreePath: worktree,
+      store,
+      sessionId: "session-b",
+    });
     expect(wrong).toEqual({ ok: true, released: false });
-    expect(existsSync(orchestratorClaimPath(worktree))).toBe(true);
+    expect(leaseRow("session-a")).not.toBe(null);
 
-    const own = releaseOrchestratorClaim({ worktreePath: worktree, sessionId: "session-a" });
+    const own = releaseOrchestratorClaim({ worktreePath: worktree, store, sessionId: "session-a" });
     expect(own).toEqual({ ok: true, released: true });
-    expect(existsSync(orchestratorClaimPath(worktree))).toBe(false);
+    expect(store.readLease({ worktreePath: worktree })).toHaveProperty("value", null);
   });
 });
 
@@ -256,12 +283,13 @@ describe("assignOrchestratorClaimSession", () => {
 
     const assigned = assignOrchestratorClaimSession({
       worktreePath: worktree,
+      store,
       fromSessionId: pendingId,
       toSessionId: "session-real",
       now: 1_100,
     });
     expect(assigned).toEqual({ ok: true, assigned: true });
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe("session-real");
   });
 
@@ -269,6 +297,7 @@ describe("assignOrchestratorClaimSession", () => {
     expect(acquire({ sessionId: "session-real", now: 1_000 })).toHaveProperty("ok", true);
     const assigned = assignOrchestratorClaimSession({
       worktreePath: worktree,
+      store,
       fromSessionId: `${ORCHESTRATOR_CLAIM_PENDING_PREFIX}spawn-token`,
       toSessionId: "session-real",
       now: 1_100,
@@ -280,12 +309,13 @@ describe("assignOrchestratorClaimSession", () => {
     expect(acquire({ sessionId: "session-other", now: 1_000 })).toHaveProperty("ok", true);
     const assigned = assignOrchestratorClaimSession({
       worktreePath: worktree,
+      store,
       fromSessionId: `${ORCHESTRATOR_CLAIM_PENDING_PREFIX}spawn-token`,
       toSessionId: "session-real",
       now: 1_100,
     });
     expect(assigned).toEqual({ ok: true, assigned: false });
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe("session-other");
   });
 });
@@ -298,21 +328,21 @@ describe("classifyOrchestratorClaim", () => {
 
     expect(
       classifyOrchestratorClaim({
-        read: { kind: "corrupt", path: "/x", error: "boom" },
+        read: { kind: "corrupt", error: "boom" },
         now: 1_000,
       }),
     ).toMatchObject({ kind: "corrupt", error: "boom" });
 
     expect(acquire({ sessionId: "session-a", now: 1_000 })).toHaveProperty("ok", true);
     const fresh = classifyOrchestratorClaim({
-      read: readOrchestratorClaim({ worktreePath: worktree }),
+      read: readOrchestratorClaim({ worktreePath: worktree, store }),
       now: 1_100,
       sessionId: "session-a",
     });
     expect(fresh).toMatchObject({ kind: "held", state: "live", sameSession: true });
 
     const cold = classifyOrchestratorClaim({
-      read: readOrchestratorClaim({ worktreePath: worktree }),
+      read: readOrchestratorClaim({ worktreePath: worktree, store }),
       now: 1_000 + ORCHESTRATOR_CLAIM_STALE_MS + 1,
     });
     expect(cold).toMatchObject({ kind: "held", state: "stale", sameSession: false });
@@ -325,6 +355,7 @@ describe("replaceOrchestratorClaim", () => {
 
     const replaced = replaceOrchestratorClaim({
       worktreePath: worktree,
+      store,
       expectSessionId: "session-a",
       taskId: "bd-12",
       branch: "feat/bd-12",
@@ -333,7 +364,7 @@ describe("replaceOrchestratorClaim", () => {
       now: 1_100,
     });
     expect(replaced).toHaveProperty("ok", true);
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe(
       `${ORCHESTRATOR_CLAIM_PENDING_PREFIX}spawn-token`,
     );
@@ -344,6 +375,7 @@ describe("replaceOrchestratorClaim", () => {
 
     const replaced = replaceOrchestratorClaim({
       worktreePath: worktree,
+      store,
       expectSessionId: "session-a",
       taskId: "bd-12",
       branch: "feat/bd-12",
@@ -354,7 +386,7 @@ describe("replaceOrchestratorClaim", () => {
     expect(replaced).toHaveProperty("ok", false);
     if (replaced.ok) return;
     expect(replaced.reason).toBe("not-owner");
-    const read = readOrchestratorClaim({ worktreePath: worktree });
+    const read = readOrchestratorClaim({ worktreePath: worktree, store });
     expect(read.kind === "ok" ? read.claim.sessionId : "").toBe("session-other");
   });
 });

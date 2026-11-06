@@ -1,7 +1,7 @@
 /**
  * Member-session liveness for the fleet supervisor (bd-126 P4).
  *
- * A fleet member is a **detached pi session**, so nothing in `fleet.json` proves
+ * A fleet member is a **detached pi session**, so nothing in the fleet intent proves
  * it is still running: the intent records members, not processes. The only honest
  * liveness evidence is therefore the process table — a member orchestrator is
  * spawned with `--session-id belayd-<taskId>` (`src/spawn.ts`,
@@ -192,7 +192,7 @@ export function classifyMemberLivenessFromScan(options: {
  * middle of that sequence the worktree exists but carries neither a lease nor
  * evidence of a session. A bare worktree is therefore a spawn in flight —
  * `unknown`, counted — not an absent member. Completion deletes
- * `.belayd/workflow.json` (`clearWorkflowState`) while the run manifests stay, so
+ * the workflow row (`clearWorkflowState`) while the run rows and manifests stay, so
  * the caller injects `memberRanEvidence` (state file present **or** a run manifest
  * of this task); keying on the state file alone would count a finished member
  * forever (bd-166).
@@ -212,7 +212,7 @@ export function classifyMemberLivenessInWorktree(options: {
   worktreePath: string | undefined;
   /**
    * Whether anything in the worktree proves this member's session existed: a
-   * `.belayd/workflow.json` (readable or corrupt) or a run manifest of this task
+   * workflow row (readable or corrupt) or a run manifest of this task
    * (`memberRanEvidence`, `fleet-run.ts`).
    *
    * Injected, not read here: the classifier stays free of worktree I/O, and the
