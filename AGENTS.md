@@ -26,6 +26,7 @@ it instead of carrying all of it in every session.
 | How do I operate pi-web / AWS sandbox / containers? | `docs/pi-web-service.md`, `docs/aws-credential-isolation.md`, `docs/arion.md` |
 | Fleet (`/fleet`), proof, review scoping, models | `docs/fleet.md`, `docs/proof-verifier.md`, `docs/diff-scoped-review.md`, `docs/model-capacity-and-telemetry.md` |
 | UI design pass (unslop skill, `belayd_unslop`, `$UNSLOP_HOME`) | `docs/unslop-skill.md` |
+| Secret scanning before publishing, and the no-detection-heuristics rule | `AGENTS.md` (Code style) |
 
 ## Build and acceptance
 
@@ -87,6 +88,26 @@ and plain labels are ignored and default to `feature`.
 ### Comments
 
 - Explain why, not what. No commented-out code.
+
+### Never hand-roll detection heuristics
+
+Do not write code that tries to **detect a class of content** — secrets/credentials, PII,
+prompt injection, "sensitive" text, malicious input, spam, drift — using regexes, entropy
+scores, denylists or topic vocabularies. This repo already paid for that lesson: the
+sensitive-findings classifier (bd-183) grew to 2167 lines, nine review rounds each closing
+one text-evasion, 28 human gates and zero real publication decisions, and was removed.
+
+- **Secrets are the scanner's job, not ours.** Use `betterleaks` (nixpkgs `betterleaks`)
+on the exact content about to leave the repo — PR body, issue/PR comment, release note.
+  It is maintained, rule-tested and adversarial by construction; our regex is neither.
+- **Judgement goes to a model or a human.** "Is this sensitive?", "is this a real defect?",
+  "may this be published?" are LLM/sub-agent or human decisions, never a rule table.
+- **Prevention is a prompt line.** Agents are told never to write a secret into a file,
+  commit, issue or PR. That is the guard; an interceptor that guesses is not.
+- Deterministic code checks stay legitimate when they check **our own artefact's shape**
+  (phase order holds, the JSON record parses, the publish gate refuses a path). The red
+  flag is a check that only stays correct with a corpus of adversarial text — that means
+  the wrong tool.
 
 ### Plannotator signal protocol
 

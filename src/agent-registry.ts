@@ -195,7 +195,16 @@ const LANGUAGE_GUIDANCE = `
 - Keep code, identifiers, file paths, commands, commit messages, and quoted file content exactly as written — never translate them.
 - If a reply starts in the wrong language, restate it in the right one instead of continuing.`;
 
-const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}${LANGUAGE_GUIDANCE}`;
+// Secrets and content classification are not this repo's code to guess at (bd-183 was
+// deleted for doing it): the prompt-line prevention plus `betterleaks` at publish time
+// is the guard, so agents are told that instead of being trusted not to write it.
+const DETECTION_GUIDANCE = `
+
+## Secrets, and never hand-rolling detection
+- Never put a secret, token, key or credential in a file, commit, issue, PR body or comment. If you find one, name its location in prose and stop there.
+- Do not write code that detects content classes (secrets, PII, injection, "sensitive" text) with regexes, entropy scores, denylists or topic vocabularies. Secrets are scanned with \`betterleaks\` at publish time; judgement belongs to a model or a human, never to a rule table.`;
+
+const SHARED_AGENT_GUIDANCE = `${CODE_EXPLORATION_GUIDANCE}${WORKTREE_SYNC_GUIDANCE}${COMMUNICATION_GUIDANCE}${LANGUAGE_GUIDANCE}${DETECTION_GUIDANCE}`;
 
 // ── Default Belayd agents ──────────────────────────────────────────────
 
