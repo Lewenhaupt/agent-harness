@@ -17,6 +17,40 @@ belayd-agent-harness pi extension. It separates proof checking into two stages:
    non-blocking** `{ reasonable: true|false, reason }` verdict. It never gates a
    proof retry.
 
+## Disabled by default (bd-309)
+
+The verdict stage is **not registered** unless `BELAYD_PROOF_VERIFIER=1`
+(`src/proof-verifier-env.ts`). Measured use decided the default: 175 recorded
+runs across this repository and the proof-of-work platform produced 144
+`reasonable: true`, **one** `reasonable: false`, five verdicts missing the
+`reasonable:` line entirely and ~25 runs with no output at all — while nothing
+consumed the verdict except prose (the state field and the
+`[belayd:proof-verifier]` bead comment appended at commit time). An extra judge
+run per proof phase bought a note almost nobody read.
+
+The switch is honoured everywhere the tool was advertised, so a dark deployment
+never points a session at a tool it cannot call:
+
+- `registerProof` registers nothing when the flag is off
+  (`extensions/capabilities/proof.ts`);
+- `workflowGateToolSet({ …, proofVerifierEnabled })` drops it from the gated
+  surface (`src/role-tools.ts`);
+- the `belayd_proof_verifier` guidance lines and the proof-phase sentence in
+  the gate text are suppressed (`extensions/capabilities/workflow-context.ts`,
+  `workflow-core.ts`).
+
+Nothing else changes: the deterministic gate above, the receipt contract and
+`src/proof-verification.ts` (artifact refs, `.cast` validation, change context)
+are unconditional. Re-enable per deployment with:
+
+```bash
+BELAYD_PROOF_VERIFIER=1 pi
+```
+
+Unset, empty, `0`, `false`, `off`, `no` and any other spelling leaves the verdict
+stage off. The repository test suite sets the flag in
+`src/__tests__/setup-env.ts` so the verifier suites keep their coverage.
+
 ## Receipts (bd-181)
 
 Proof artifacts are phased out of repositories: they upload to the proof-of-work
@@ -100,7 +134,10 @@ The bd-48-specific coverage lives in:
   path-traversal guards, `.cast` extraction, `How to Verify` section
   extraction, and `buildVerifierPrompt` fencing.
 - `src/__tests__/extension-proof-verifier.test.ts` — tool registration, the
-  zero-token skip path, and non-blocking verdict behavior.
+  `BELAYD_PROOF_VERIFIER` switch (no registration and no gated surface when
+  off), the zero-token skip path, and non-blocking verdict behavior.
+- `src/__tests__/proof-verifier-env.test.ts` — the flag parser: default off,
+  enable spellings, and the tool-name constant the registries share.
 - `src/__tests__/cast-utils.test.ts` — ANSI/OSC stripping and asciicast parsing.
 
 Run the focused suites directly:
@@ -111,9 +148,9 @@ pnpm vitest run src/__tests__/proof-verification.test.ts src/__tests__/extension
 
 ### 2. Confirm the tool registration (no phase tool)
 
-In any pi session with the harness extension loaded, the verifier tool must
-exist **outside** the phase-tool registration loop (it is deliberately not in
-`DEFAULT_AGENTS`). From a gated session:
+With `BELAYD_PROOF_VERIFIER=1` set, the verifier tool must exist **outside** the
+phase-tool registration loop (it is deliberately not in `DEFAULT_AGENTS`). With
+the flag unset it must not exist at all. From a gated session:
 
 ```text
 belayd_status

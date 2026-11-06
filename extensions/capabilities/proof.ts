@@ -32,6 +32,7 @@ import {
   findWorkspaceRoot,
   scanProofRefs,
 } from "../../src/proof-verification.js";
+import { isProofVerifierEnabled } from "../../src/proof-verifier-env.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
 import { generateShortRunId } from "../../src/session-naming.js";
 import type { SpawnWithFallbackOptions } from "../../src/spawn-with-fallback.js";
@@ -244,8 +245,17 @@ export async function runProofVerifier(options: {
   }
 }
 
-/** Register `belayd_proof_verifier`; the composer supplies the pi API. */
+/**
+ * Register `belayd_proof_verifier`; the composer supplies the pi API.
+ *
+ * The tool ships dark: it is registered only when `BELAYD_PROOF_VERIFIER` says
+ * so (`src/proof-verifier-env.ts`). Leaving it unregistered, rather than
+ * registering a refusal, keeps the tool out of the per-request catalog and out
+ * of `pi.setActiveTools` surfaces entirely.
+ */
 export function registerProof(pi: ExtensionAPI, deps: ProofDeps): void {
+  if (!isProofVerifierEnabled(process.env)) return;
+
   pi.registerTool({
     name: "belayd_proof_verifier",
     label: "Proof verifier",

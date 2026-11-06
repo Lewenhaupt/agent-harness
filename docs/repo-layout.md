@@ -74,6 +74,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
 | `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt as a `proof_receipt` row in the shared store (bd-281; the pi-web plugin still reads the retired `.belayd/proof-receipt.json` until bd-303) |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
+| `src/proof-verifier-env.ts` | `BELAYD_PROOF_VERIFIER` switch (bd-309): the advisory verifier's verdict stage is dark unless explicitly enabled; the tool name constant the registries share |
 | `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
 | `src/review-context.ts` | Review scoping, output bounding, line-numbered diff and reviewer process rules (bd-113, bd-159) |
 | `src/review-findings.ts` | Durable review findings: severity/disposition record and the comment body a human reads (bd-175, bd-219) |
@@ -327,7 +328,7 @@ order so pi hook/tool order is unchanged.
 | `human-gate.ts` | `belayd_ask_human`, human-answer poll/detection/settlement, gate reaping; the review-findings delivery (`deliverReviewFindings`: record + comment, no gate) and `postChannelBody`, the choke point every outbound question and findings comment passes through |
 | `metrics.ts` | `belayd_metrics` DuckDB queries over the metrics log |
 | `outline.ts` | `belayd_outline` symbol map |
-| `proof.ts` | Proof dirs and `belayd_proof_verifier` (the receipt contract lives in `src/proof-receipt.ts`) |
+| `proof.ts` | Proof dirs and `belayd_proof_verifier` (dark unless `BELAYD_PROOF_VERIFIER=1`, bd-309; the receipt contract lives in `src/proof-receipt.ts`) |
 | `unslop.ts` | `belayd_unslop` UI-design tool (`belayd-unslop` agent, out of `DEFAULT_AGENTS`) |
 | `review.ts` | Review scoping/build (`buildReviewTask`), bounded review delivery, review↔fix guidance |
 | `session-state.ts` | Per-session state store (generic over the composed type), ask-hold, beads-actor attribution, run tracking, status formatting |

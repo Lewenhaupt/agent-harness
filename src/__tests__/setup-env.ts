@@ -18,3 +18,11 @@ process.env.BELAYD_METRICS = "0";
  * plain `pi` CLI run, which has no web server at all).
  */
 process.env.PI_WEB_PORT = "";
+
+/**
+ * The advisory proof verifier ships dark (see `src/proof-verifier-env.ts`), and
+ * five suites drive the real composer to exercise it. Enable it here so those
+ * keep their coverage; the switch itself is covered by its own suite, which
+ * unsets the variable.
+ */
+process.env.BELAYD_PROOF_VERIFIER = "1";

@@ -18,6 +18,7 @@ import {
   manageInstructionGroupsWarning,
   NO_GROUP_REGISTERED_WARNING,
 } from "../../src/instruction-groups.js";
+import { isProofVerifierEnabled } from "../../src/proof-verifier-env.js";
 import { parseSubagentSessionName } from "../../src/session-naming.js";
 import { getNextPhase } from "../../src/workflow-phases.js";
 import type { CoreSessionState } from "./context.js";
@@ -60,6 +61,10 @@ export interface WorkflowContextDeps {
 
 export function registerWorkflowContext(deps: WorkflowContextDeps): void {
   const { pi, getSessionState, core, humanGateDeps, fleetEventsMessage } = deps;
+
+  // The verifier guidance lines must follow the deployment switch that decides
+  // whether the tool is registered at all (src/proof-verifier-env.ts).
+  const proofVerifierEnabled = isProofVerifierEnabled(process.env);
 
   /** Build the planning-mode context message, or undefined when inactive. */
   function planningContextMessage(state: CoreSessionState): TurnMessage | undefined {
@@ -121,7 +126,7 @@ export function registerWorkflowContext(deps: WorkflowContextDeps): void {
 
   /** Proof-verifier guidance lines, returned only for proof workflows. */
   function proofVerifierGuidanceLines(phaseOrder: readonly string[]): string[] {
-    if (!phaseOrder.includes("proof")) return [];
+    if (!proofVerifierEnabled || !phaseOrder.includes("proof")) return [];
     return [
       "",
       "**Proof verifier** (after `belayd_proof`):",

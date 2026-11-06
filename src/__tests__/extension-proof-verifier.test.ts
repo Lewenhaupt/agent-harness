@@ -3,6 +3,7 @@
  *
  * Drives the real extension factory with a mocked spawn and asserts:
  * - `belayd_proof_verifier` is registered and present in GATED_TOOLS
+ * - the tool is not registered at all when `BELAYD_PROOF_VERIFIER` is unset
  * - the skip path returns exitCode 0 without spawning when there are no
  *   artifact references and no change context
  * - a completed proof phase captures output and the verifier records a
@@ -301,5 +302,38 @@ describe("belayd_proof_verifier (bd-48)", () => {
     const options = mockSpawnAgentWithFallback.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(options.detached).toBe(false);
     expect(options.sessionName).toMatch(/^belayd-proof-verifier-/);
+  });
+});
+
+describe("belayd_proof_verifier deployment switch", () => {
+  let workDir: string;
+  const saved = process.env.BELAYD_PROOF_VERIFIER;
+
+  beforeEach(() => {
+    workDir = mkdtempSync(join(tmpdir(), "belayd-pv-off-test-"));
+    delete process.env.BELAYD_PROOF_VERIFIER;
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env.BELAYD_PROOF_VERIFIER;
+    else process.env.BELAYD_PROOF_VERIFIER = saved;
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("registers nothing and offers no gate surface when the switch is off", async () => {
+    const { api, tools, activeTools } = createMockPi();
+    const factory = await loadExtension();
+    factory(api);
+
+    expect(tools.has("belayd_proof_verifier")).toBe(false);
+
+    await tools
+      .get("belayd_start_task")
+      ?.execute("call-off", { taskId: "bd-48" }, undefined, undefined, makeCtx("pv-off", workDir));
+
+    // The gate text names the tool only through the guidance lines, which follow
+    // the same switch, so the gated surface must not carry it either.
+    expect(activeTools()).not.toContain("belayd_proof_verifier");
+    expect(activeTools()).toContain("belayd_commit");
   });
 });

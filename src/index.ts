@@ -1540,6 +1540,11 @@ export {
   resolveProofRefInDir,
   scanProofRefs,
 } from "./proof-verification.js";
+export {
+  isProofVerifierEnabled,
+  PROOF_VERIFIER_ENV,
+  PROOF_VERIFIER_TOOL,
+} from "./proof-verifier-env.js";
 export type {
   CapacityAcquisition,
   CapacityConfig,

@@ -24,6 +24,7 @@ import {
   type readWorktreeBranch,
   type WorktreeBranch,
 } from "../../src/owned-worktree.js";
+import { isProofVerifierEnabled } from "../../src/proof-verifier-env.js";
 import { userGuideDocPath } from "../../src/quality-gates.js";
 import { PLANNING_TOOL_SET, workflowGateToolSet } from "../../src/role-tools.js";
 import type { RunDelivery } from "../../src/run-detached.js";
@@ -265,6 +266,12 @@ function directoryOwnerTaskId(input: {
 export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
   const { pi, getSessionState, gate, readWorktreeBranch } = deps;
 
+  // The advisory proof verifier ships dark (src/proof-verifier-env.ts). The gate
+  // surface and the proof-phase sentence both name it, so both follow the same
+  // deployment switch — otherwise a dark session is told about a tool it cannot
+  // call.
+  const proofVerifierEnabled = isProofVerifierEnabled(process.env);
+
   /** Point the session state at a workflow's ordered phases and consult set. */
   function applyWorkflowConfig(state: CoreSessionState): void {
     state.phaseOrder = getPhasesForType(state.workflowType);
@@ -289,7 +296,13 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
       if (state.fullTools === undefined) state.fullTools = pi.getActiveTools();
       const phases =
         state.phaseOrder.length > 0 ? state.phaseOrder : getPhasesForType(state.workflowType);
-      pi.setActiveTools(workflowGateToolSet({ phases, consultPhases: state.consultPhases }));
+      pi.setActiveTools(
+        workflowGateToolSet({
+          phases,
+          consultPhases: state.consultPhases,
+          proofVerifierEnabled,
+        }),
+      );
       return;
     }
     if (state.fullTools !== undefined) {
@@ -738,7 +751,11 @@ export function createWorkflowCore(deps: WorkflowCoreDeps): WorkflowCoreApi {
     if (phases.includes("proof")) {
       lines.push(
         "",
-        "A `belayd_proof_verifier` tool is available after the proof phase — it is an advisory, non-blocking review of proof relevance and plausibility.",
+        ...(proofVerifierEnabled
+          ? [
+              "A `belayd_proof_verifier` tool is available after the proof phase — it is an advisory, non-blocking review of proof relevance and plausibility.",
+            ]
+          : []),
         "For UI changes, the `belayd_proof` task MUST require both a Playwright trace and playwright-cli screenshots of the changed pages; a missing test-runner browser is not a skip reason.",
       );
     }

@@ -13,6 +13,8 @@
  * exact contents instead of trusting a list that drifts in `extensions/index.ts`.
  */
 
+import { PROOF_VERIFIER_TOOL } from "./proof-verifier-env.js";
+
 /** Tools a workflow orchestrator always keeps, independent of workflow type.
  *
  * `belayd_start_task` and `belayd_stop_planning` are deliberately absent: a gated
@@ -32,7 +34,7 @@ export const WORKFLOW_CONTROL_TOOLS: readonly string[] = [
   "belayd_status",
   "belayd_ask_human",
   "belayd_doctor",
-  "belayd_proof_verifier",
+  PROOF_VERIFIER_TOOL,
   "bd",
   "read",
   "grep",
@@ -129,6 +131,13 @@ export interface WorkflowToolSetInput {
   phases: readonly string[];
   /** Phases whose tools stay callable without gating progress. */
   consultPhases?: readonly string[];
+  /**
+   * Whether the advisory proof verifier is registered in this deployment
+   * (`BELAYD_PROOF_VERIFIER`). Defaults to enabled so a caller that does not
+   * know about the flag keeps the historical surface; the composer always
+   * passes the resolved value.
+   */
+  proofVerifierEnabled?: boolean;
 }
 
 /**
@@ -145,7 +154,9 @@ export function workflowGateToolSet(input: WorkflowToolSetInput): string[] {
   );
   return dedupe([
     ...phaseTools,
-    ...WORKFLOW_CONTROL_TOOLS,
+    ...WORKFLOW_CONTROL_TOOLS.filter(
+      (tool) => input.proofVerifierEnabled !== false || tool !== PROOF_VERIFIER_TOOL,
+    ),
     ...MEMBER_FLEET_TOOLS,
     ...CONSULT_TOOLS,
   ]);

@@ -96,6 +96,16 @@ describe("workflowGateToolSet", () => {
 
     expect(tools.filter((tool) => tool === "belayd_implement")).toHaveLength(1);
   });
+
+  it("omits the proof verifier when the deployment leaves it dark", () => {
+    const enabled = workflowGateToolSet({ phases: ["implement"], proofVerifierEnabled: true });
+    const disabled = workflowGateToolSet({ phases: ["implement"], proofVerifierEnabled: false });
+
+    expect(enabled).toContain("belayd_proof_verifier");
+    expect(disabled).not.toContain("belayd_proof_verifier");
+    // Only the verifier is switchable: the rest of the control surface is not.
+    expect(disabled).toEqual(enabled.filter((tool) => tool !== "belayd_proof_verifier"));
+  });
 });
 
 describe("PLANNING_TOOL_SET", () => {
