@@ -1340,7 +1340,10 @@ export function recordRunMemberStopped(options: {
       {
         taskId: options.taskId,
         reason: options.reason,
-        detail: options.detail.slice(0, FLEET_RUN_DETAIL_MAX_LENGTH),
+        // A land-failed detail can now carry a rebase conflict's path list (bd-280),
+        // so it is bounded at a separator instead of mid-path: a stop that cuts a
+        // path in half names a file nobody can find.
+        detail: boundRunDetail(options.detail),
         at: options.now,
       },
     ],

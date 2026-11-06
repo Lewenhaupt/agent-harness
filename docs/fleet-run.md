@@ -571,8 +571,21 @@ for a human instead of silently relaunched.
 - **One landing per tick.** A tick that lands runs the project gates for minutes; a
   second tick is skipped while one is in flight (`fleetTickInFlight`). Three
   finished members land on three ticks.
-- **Gates are not retried.** A gate/rebase/merge refusal stops the member with
+- **Gates are not retried.** A gate/merge refusal stops the member with
   `land-failed`. Retrying with no new information would burn the same minutes again.
+  A **rebase** failure is the one exception, and it is classified first: a stale
+  state is cleared and retried once, generated paths are regenerated, and a
+  conflict a live member can resolve is delegated back to it with a `rebase-hint`
+  instead of a stop (bd-280, `docs/fleet-merge.md`). Only a contradiction, or a
+  failure nobody can classify, records `land-failed`.
+- **A delegation is deliberate and recorded.** The tick that delegates reports the
+  member's complete conflicted path list and records it in `audit.log` as
+  `fleet-land-delegated`; the member is kept (no stop, no retirement, no worktree
+  removal) while the landing holds until its branch contains the base. An
+  unreadable branch verdict is a hold as well — re-draining on it would rewrite
+  `delegatedAt` and re-send the hint every tick, so the grace window could never
+  expire. A member stopped by a land attempt is not retried, and a delegation whose
+  grace expires is a stop — not a silent retry.
 - **`accept` is the run's decision, not the merge engine's.** `belayd_fleet_merge`
   keeps "merging is not closing"; only a run with `accept: true` (opt-in, bd-158)
   closes beads, and every close is audited. The merged worktree is removed on every

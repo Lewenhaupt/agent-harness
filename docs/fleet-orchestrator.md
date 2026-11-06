@@ -513,12 +513,15 @@ complete set:
 | `merge-stash` / `merge-restore` | once when a dirty root is stashed, and once when it is restored |
 | `merge-restore-conflict` | once when restoring the stashed root conflicts (the stash is kept) |
 | `fleet-parked` | once when the fleet is parked because the root restore conflicted |
-| `merge-rebase-failed` | once when the member branch cannot be rebased onto the base |
+| `merge-rebase-failed` | once when the member branch cannot be rebased onto the base and the drain stops for it (a contradiction or an unclassified failure), or when a delegation could not be recorded |
+| `merge-rebase-classified` | once per **classified** failed rebase — the first attempt, a recovery retry's failure, and the `unknown` fall-through — naming the class (`not-a-conflict`, `generated`, `contradiction`, `delegable`, `unknown`) and the conflicted paths, so the decision is visible even when the drain recovers. A failure whose conflicted paths cannot be read has no class and is audited as `merge-rebase-failed` only |
+| `merge-rebase-recovered` | once when a failed rebase was repaired rather than stopped: the stale state was cleared and the retry succeeded, or the generated paths were regenerated from the base side (bd-280) |
+| `merge-step-threw` | once when a seam threw instead of returning a failure — in the merge sequence or in a finisher (`restoreRootStash`, `parkFleet`, the broadcast, the queue transition); the lock is released exactly once, any stopped rebase cleared, a landed merge stays `merged`, and the drain returns a defined refusal (`step-failed`, or the primary refusal with the throw appended) (bd-280). A throw after the merge also re-attempts the base-move broadcast best-effort (a second throw is a warning on the result, never a second failure) (bd-280 S5) |
 | `merge-gate-failed` | once when a project gate fails on the rebased result (or the gate commands cannot be read) |
 | `merge-failed` | once when the fast-forward merge itself fails |
-| `merge-completed` | once when the base branch advanced, with the merge commit |
+| `merge-completed` | once when the base branch advanced, with the merge commit — written by the success finisher, or by the landed-but-threw arm when the throw hit before it; the marker is a per-attempt flag set only when the append succeeded, so a failed append is retried rather than lost and one merge never yields two entries (bd-280 S6) |
 | `merge-stash-drop-mismatch` | once when the entry git reports as dropped is not the recorded sha (an interloper `stash push` shifted the index between verify and drop) |
-| `base-moved` / `sibling-landed` / `rebase-hint` | once per broadcast kind, naming the members whose note files were written |
+| `base-moved` / `sibling-landed` / `rebase-hint` | once per broadcast kind, naming the members whose note files were written — plus one entry per resumed recipient set when a partial fan-out is completed on the landed-but-threw arm. A `rebase-hint` sent because the merge commit was unreadable says so in its detail (bd-280 S7/S8) |
 | `schedule-planned` / `member-deferred` / `capacity-blocked` | once per launch or advance: the plan, and one per deferred member with its reason |
 | `ordering-gates` | once per launch that created (or adopted) bd ordering gates, naming each `blocker->blocked (gate)` |
 | `ordering-gates-adopted` | once per tick/reconcile sweep that wrote a record for a gate bd already had (the crash window between `bd gate create` and the intent write), naming each `blocker->blocked (gate)` |
@@ -667,6 +670,19 @@ A failed drain leaves the root on the base branch, no stash discarded, the lock
 released, the member worktree's commits intact (a failed rebase is aborted), and
 an honest report. The only repo mutation that can outlive a *gate* failure is the
 member's content-preserving rebase onto the base, which the report names.
+
+**A failed rebase is classified, not just reported (bd-280).** The drain reads the
+stopped rebase and acts on the class: stale state is cleared and retried once,
+derived paths (lockfiles, build trees, snapshots) are regenerated from the base
+side, a conflict with pre-existing base work is delegated to a member whose lease
+is live (a `rebase-hint`, no stop, one delegation per entry), and only a
+contradiction with a commit that landed during this fleet — or an unclassifiable
+failure — stops the member. The stop text names a landed sibling only when the run
+record proves one; otherwise it says base work committed after the fleet started.
+A delegation the queue cannot record, or whose hint could not be written, stops
+instead of claiming a member was asked. The canonical step-by-step (including why
+committer time is the attribution signal) is
+[`docs/fleet-merge.md`](fleet-merge.md#rebase-failure-classification-bd-280).
 
 ## P3: ordering, waves, and capacity-aware launch
 

@@ -36,6 +36,7 @@ import {
   enqueueNote,
   FLEET_INTENT_ORDERING_GATES_MAX,
   FLEET_NOTE_BODY_MAX_LENGTH,
+  FLEET_REBASE_DELEGATION_GRACE_MS,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
@@ -230,6 +231,20 @@ const childProcess = vi.hoisted(() => ({
   bdStdout: undefined as ((args: readonly string[]) => string | undefined) | undefined,
   /** bd failure text for tests that pin a failed write (a gate resolve, say). */
   bdFailure: undefined as ((args: readonly string[]) => string | undefined) | undefined,
+  /**
+   * Answers for one git call, so a test can drive a real merge drain (bd-280).
+   *
+   * The file-wide default is "empty stdout, success", which no drain can get past
+   * its preconditions with; a test states only the probes it asserts on. `failWith`
+   * makes that one command fail, which is how a rebase conflict is simulated
+   * without a repository.
+   */
+  gitAnswer: undefined as
+    | ((input: {
+        args: readonly string[];
+        cwd: string;
+      }) => { stdout?: string; failWith?: string } | undefined)
+    | undefined,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -241,11 +256,19 @@ vi.mock("node:child_process", async (importOriginal) => {
   return {
     ...actual,
     execFile: vi.fn(
-      (file: string, args: readonly string[], _options: unknown, callback: unknown) => {
+      (file: string, args: readonly string[], rawOptions: unknown, callback: unknown) => {
         const done = callback as (error: Error | null, stdout: string, stderr: string) => void;
         const record = { file, args: [...args], stdin: "" };
         childProcess.execFileCalls.push(record);
         const bdFailure = file === "bd" ? childProcess.bdFailure?.(args) : undefined;
+        const gitAnswer = gitAnswerFor(file, args, rawOptions);
+        // A stubbed git failure settles right away: the fleet merge runner never
+        // closes stdin, so waiting for it (as the bd path below does) would leave
+        // the call pending forever.
+        if (gitAnswer?.failWith !== undefined) {
+          done(new Error(gitAnswer.failWith), gitAnswer.stdout ?? "", "");
+          return { stdin: { on: () => {}, end: () => {} } };
+        }
         const fails =
           bdFailure !== undefined ||
           (childProcess.failBdComment && file === "bd" && args[0] === "comment");
@@ -256,7 +279,7 @@ vi.mock("node:child_process", async (importOriginal) => {
         // awaiting test resumes — and a failing comment rejects on that close,
         // where the real child would have failed.
         if (!fails)
-          done(null, (file === "bd" ? childProcess.bdStdout?.(args) : undefined) ?? "", "");
+          done(null, (file === "bd" ? childProcess.bdStdout?.(args) : gitAnswer?.stdout) ?? "", "");
         const childStdin = {
           on: () => {},
           end: (chunk?: string) => {
@@ -283,6 +306,131 @@ vi.mock("node:child_process", async (importOriginal) => {
     }),
   };
 });
+
+/** A stubbed merge-drain git answer (`undefined` keeps the empty default). */
+type DrainGitAnswer = { stdout?: string; failWith?: string } | undefined;
+
+interface DrainGitProbe {
+  matches: (args: readonly string[], cwd: string) => boolean;
+  answer: (args: readonly string[], cwd: string) => DrainGitAnswer;
+}
+
+/**
+ * The git probes a real merge drain issues, as a rule table (bd-280).
+ *
+ * Each probe is its own matcher so the stub stays readable, and every unlisted
+ * argv keeps the file-wide "empty stdout, success" default: a test states only the
+ * facts it asserts on. The rebase fails, the base carries a commit that predates the
+ * fleet, and the base's side of the conflicted path is old — the pre-existing-base-
+ * work shape a live member is asked to resolve itself (`delegable`).
+ */
+function drainGitProbes(options: {
+  commonDir: string;
+  memberDir: string;
+  onRebase: () => void;
+  /** Conflicted paths the stopped rebase reports (default: one source path). */
+  conflictedPaths?: readonly string[];
+  /** Make the branch-containment probe fail instead of answering. */
+  branchProbeFails?: boolean;
+}): readonly DrainGitProbe[] {
+  const headSha = "a".repeat(40);
+  const memberBaseSha = "b".repeat(40);
+  const conflictedPaths = options.conflictedPaths ?? ["conflict.txt"];
+  const isRevParse = (args: readonly string[], ...flags: string[]): boolean =>
+    args[0] === "rev-parse" && flags.every((flag) => args.includes(flag));
+  return [
+    {
+      matches: (args) => isRevParse(args, "--absolute-git-dir"),
+      answer: () => ({ stdout: `${options.commonDir}\n` }),
+    },
+    {
+      matches: (args) => isRevParse(args, "--path-format=absolute"),
+      answer: () => ({ stdout: `${options.commonDir}\n` }),
+    },
+    {
+      matches: (args) => isRevParse(args, "--abbrev-ref"),
+      answer: (_args, cwd) => ({ stdout: cwd === options.memberDir ? "feat/bd-12\n" : "main\n" }),
+    },
+    {
+      matches: (args) => args[0] === "worktree" && args[1] === "list",
+      answer: (_args, cwd) => ({
+        stdout:
+          `worktree ${cwd}\0HEAD ${headSha}\0branch refs/heads/main\0\0` +
+          `worktree ${options.memberDir}\0HEAD ${headSha}\0branch refs/heads/feat/bd-12\0\0`,
+      }),
+    },
+    {
+      // The guard asks about `main^{commit}` and `feat/bd-12^{commit}`: the base is
+      // one commit and the member's branch is another, which the `merge-base`
+      // answer reports as *not based* until the member rebases.
+      matches: (args) => isRevParse(args, "--verify"),
+      answer: (args) => ({
+        stdout: `${args.includes("main^{commit}") ? headSha : memberBaseSha}\n`,
+      }),
+    },
+    {
+      matches: (args) => args[0] === "merge-base",
+      answer: () =>
+        options.branchProbeFails === true
+          ? { failWith: "fatal: not a git repository" }
+          : { stdout: `${memberBaseSha}\n` },
+    },
+    {
+      // Before the plain `status` rule: this is the stopped rebase's conflicted path,
+      // which is only readable before anything aborts it.
+      matches: (args) => args.includes("status") && args.includes("-z"),
+      answer: () => ({
+        stdout: `${conflictedPaths.map((path) => `UU ${path}`).join("\0")}\0`,
+      }),
+    },
+    { matches: (args) => args[0] === "status", answer: () => ({ stdout: "" }) },
+    {
+      // Committer dates come in seconds, so `2` is 1970: older than any armed fleet.
+      matches: (args) => args[0] === "-c" && args[2] === "log",
+      answer: () => ({ stdout: `${"c".repeat(40)} 2\n` }),
+    },
+    {
+      matches: (args, cwd) =>
+        args[0] === "rebase" && args[1] === "main" && cwd === options.memberDir,
+      answer: () => {
+        options.onRebase();
+        return { failWith: "CONFLICT (content): Merge conflict in conflict.txt" };
+      },
+    },
+  ];
+}
+
+/** Bind {@link drainGitProbes} to the child-process mock, counting rebase attempts. */
+function stubDrainGit(options: {
+  commonDir: string;
+  memberDir: string;
+  conflictedPaths?: readonly string[];
+  branchProbeFails?: boolean;
+}): {
+  rebaseAttempts: () => number;
+} {
+  let rebaseAttempts = 0;
+  const probes = drainGitProbes({
+    ...options,
+    onRebase: () => {
+      rebaseAttempts += 1;
+    },
+  });
+  childProcess.gitAnswer = ({ args, cwd }) =>
+    probes.find((probe) => probe.matches(args, cwd))?.answer(args, cwd);
+  return { rebaseAttempts: () => rebaseAttempts };
+}
+
+/** The stubbed answer for one git call, or undefined for the empty default. */
+function gitAnswerFor(
+  file: string,
+  args: readonly string[],
+  rawOptions: unknown,
+): { stdout?: string; failWith?: string } | undefined {
+  if (file !== "git") return undefined;
+  const cwd = (rawOptions as { cwd?: string } | undefined)?.cwd ?? "";
+  return childProcess.gitAnswer?.({ args, cwd });
+}
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -401,6 +549,7 @@ async function resetProcessGlobalState(): Promise<void> {
   childProcess.execFileCalls = [];
   childProcess.bdStdout = undefined;
   childProcess.bdFailure = undefined;
+  childProcess.gitAnswer = undefined;
   // Stop a leaked run loop before dropping its session: the loop closes over the
   // state object, so the store's dispose hook is what clears its timer.
   const mod = await import("../../extensions/index.js");
@@ -4441,6 +4590,277 @@ describe("fleet run mode", () => {
       landedAt: expect.any(Number),
     });
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).not.toContain(
+      "could not land bd-12",
+    );
+  });
+
+  /**
+   * Seed a live orchestrator lease in a member worktree (bd-280 delegation).
+   *
+   * Written after the launch: the launch path refuses a worktree that already has a
+   * live orchestrator, and the tick's own observation is what the drain reads.
+   */
+  function seedLiveMemberLease(memberDir: string): void {
+    const dir = join(memberDir, ".belayd");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "orchestrator.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        taskId: "bd-12",
+        branch: "feat/bd-12",
+        sessionId: "member-session-id",
+        pid: 4242,
+        claimedAt: Date.now(),
+        heartbeatAt: Date.now(),
+      }),
+    );
+  }
+
+  /**
+   * Answer the git probes a real merge drain issues, and count its rebase attempts.
+   *
+   * See {@link drainGitProbes} for what the stub states: a failed rebase, base work
+   * that predates the fleet, and a member branch that does not contain the base.
+   */
+  function stubDelegatingDrainGit(
+    memberDir: string,
+    options: { conflictedPaths?: readonly string[]; branchProbeFails?: boolean } = {},
+  ): { rebaseAttempts: () => number } {
+    return stubDrainGit({ commonDir, memberDir, ...options });
+  }
+
+  it("delegates a resolvable rebase instead of stopping the member (bd-280)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const drain = stubDelegatingDrainGit(memberDir);
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // The drain classified the conflict as the member's own to resolve and said so
+    // in one line naming the member — no `land-failed` stop, no retirement.
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("asked bd-12 to resolve its own rebase");
+    expect(text).not.toContain("could not land bd-12");
+    expect(drain.rebaseAttempts()).toBe(1);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    // The run is still live and the member is still a member: nothing was stopped.
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    expect(after.intent?.taskIds).toEqual(["bd-12"]);
+    expect(after.intent?.deferred ?? []).toEqual([]);
+
+    // The queue carries the delegation, and exactly one rebase-hint reached it.
+    const queue = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(queue).toHaveProperty("ok", true);
+    if (!queue.ok) return;
+    expect(queue.queue?.entries[0]).toMatchObject({
+      taskId: "bd-12",
+      state: "failed",
+      delegatedAt: expect.any(Number),
+    });
+    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    if (!notes.ok) throw new Error(notes.error);
+    expect(
+      notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
+    ).toHaveLength(1);
+  });
+
+  it("records a delegated member's complete conflicted-path list (bd-280 W5)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    // More paths than the bounded stop text names, so the audit is the only place
+    // the operator can still see all of them.
+    const conflictedPaths = Array.from({ length: 7 }, (_, index) => `src/conflict-${index + 1}.ts`);
+    stubDelegatingDrainGit(memberDir, { conflictedPaths });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // The tick line is bounded but states how many paths there are.
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("in 7 paths");
+    expect(text).toContain("(+2 more)");
+
+    // The durable record carries every path, so acting on the delegation does not
+    // depend on reading the bounded line.
+    const delegated = auditEntries("fleet-land-delegated");
+    expect(delegated).toHaveLength(1);
+    expect(delegated[0]?.taskIds).toEqual(["bd-12"]);
+    expect(delegated[0]?.detail).toContain("(7 paths)");
+    for (const path of conflictedPaths) expect(delegated[0]?.detail).toContain(path);
+  });
+
+  it("does not re-drain a delegated member whose branch still lacks the base (bd-280)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const drain = stubDelegatingDrainGit(memberDir);
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(drain.rebaseAttempts()).toBe(1);
+
+    // The next tick sees the same finished member and no stop. Draining again would
+    // be the same rebase against the same base — the guard makes it a hold, and a
+    // hold is not an action, so the loop falls back to the normal tick interval.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    expect(drain.rebaseAttempts()).toBe(1);
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("waits for that rebase");
+    expect(text).not.toContain("could not land bd-12");
+
+    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    if (!notes.ok) throw new Error(notes.error);
+    expect(
+      notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
+    ).toHaveLength(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    expect(after.intent?.taskIds).toEqual(["bd-12"]);
+  });
+
+  it("holds a delegated member when the branch probe fails, and still stops at the grace (bd-280 S4)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    // The probe cannot answer at all (`merge-base` fails): the landing must not fall
+    // through to a drain, which would re-send the hint and rewrite `delegatedAt` on
+    // every tick and so starve the grace window forever.
+    const drain = stubDelegatingDrainGit(memberDir, { branchProbeFails: true });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(drain.rebaseAttempts()).toBe(1);
+
+    const delegatedAt = () => {
+      const queue = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId: "default" });
+      if (!queue.ok) throw new Error(queue.error);
+      return queue.queue?.entries[0]?.delegatedAt;
+    };
+    const firstDelegatedAt = delegatedAt();
+    expect(firstDelegatedAt).toEqual(expect.any(Number));
+
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    // Held, not re-drained: one rebase attempt, one hint, the same marker.
+    expect(drain.rebaseAttempts()).toBe(1);
+    expect(delegatedAt()).toBe(firstDelegatedAt);
+    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    if (!notes.ok) throw new Error(notes.error);
+    expect(
+      notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint"),
+    ).toHaveLength(1);
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("could not verify");
+    expect(text).not.toContain("could not land bd-12");
+
+    // The wait is still bounded: with the probe still failing, the grace expires and
+    // the member is stopped for a human instead of looping forever.
+    const queue = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId: "default" });
+    if (!queue.ok || queue.queue === undefined) throw new Error("queue unreadable");
+    const entry = queue.queue.entries[0];
+    if (entry === undefined) throw new Error("no queue entry");
+    const written = writeFleetMergeQueue({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      queue: {
+        ...queue.queue,
+        entries: [{ ...entry, delegatedAt: Date.now() - FLEET_REBASE_DELEGATION_GRACE_MS - 1 }],
+      },
+    });
+    expect(written).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    expect(drain.rebaseAttempts()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "land-failed" }),
+    ]);
+    expect(after.intent?.run?.stopped?.[0]?.detail).toContain("stopping it for a human");
+  });
+
+  it("stops a delegated member whose rebase never arrives (bd-280 grace)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const drain = stubDelegatingDrainGit(memberDir);
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Age the delegation past its grace instead of ticking through it: the wait has
+    // to end, because a live member that never rebases leaves nobody who can decide.
+    const queue = readFleetMergeQueue({ gitCommonDir: commonDir, fleetId: "default" });
+    if (!queue.ok || queue.queue === undefined) throw new Error("queue unreadable");
+    const entry = queue.queue.entries[0];
+    if (entry === undefined) throw new Error("no queue entry");
+    const written = writeFleetMergeQueue({
+      gitCommonDir: commonDir,
+      fleetId: "default",
+      queue: {
+        ...queue.queue,
+        entries: [{ ...entry, delegatedAt: Date.now() - FLEET_REBASE_DELEGATION_GRACE_MS - 1 }],
+      },
+    });
+    expect(written).toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    expect(drain.rebaseAttempts()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped).toEqual([
+      expect.objectContaining({ taskId: "bd-12", reason: "land-failed" }),
+    ]);
+    const stopped = after.intent?.run?.stopped?.[0];
+    expect(stopped?.detail).toContain("stopping it for a human");
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
       "could not land bd-12",
     );
   });

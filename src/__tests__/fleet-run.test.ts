@@ -1398,6 +1398,32 @@ describe("run record", () => {
     expect(finished).toMatchObject({ outcome: "complete", finishedAt: 2_000 });
     expect(isFleetRunActive(finished)).toBe(false);
   });
+
+  it("bounds a land-stop detail at a separator, never mid-path (bd-280 S2)", () => {
+    // A land-failed detail can carry a rebase conflict's path list, so the bound is
+    // the tail-preserving one: a hard slice would end inside a file name.
+    const paths = Array.from(
+      { length: 40 },
+      (_, index) => `src/path-${String(index).padStart(3, "0")}-component.ts`,
+    );
+    const detail = `conflicted paths: ${paths.join(", ")}`;
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail,
+      now: 2_000,
+    });
+    const bounded = stopped.stopped?.[0]?.detail ?? "";
+    expect(bounded.length).toBeLessThanOrEqual(FLEET_RUN_DETAIL_MAX_LENGTH);
+    expect(bounded.length).toBeLessThan(detail.length);
+    expect(detail.startsWith(bounded)).toBe(true);
+    // The cut landed on a separator, so the last path in the record is whole.
+    expect(bounded.endsWith(".ts")).toBe(true);
+    // A hard slice of the same detail would not: that is the shape this fixes.
+    expect(detail.slice(0, FLEET_RUN_DETAIL_MAX_LENGTH).endsWith(".ts")).toBe(false);
+    expect(bounded).not.toContain(paths[paths.length - 1]);
+  });
 });
 
 describe("rendering", () => {

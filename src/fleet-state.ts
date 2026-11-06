@@ -1562,6 +1562,15 @@ const FleetMergeEntrySchema = z.object({
   attempts: z.number().int().nonnegative(),
   updatedAt: z.number().finite().optional(),
   lastError: z.string().optional(),
+  /**
+   * When the drain handed this entry's rebase conflict to the member itself
+   * (bd-280), in epoch ms.
+   *
+   * It is what stops a re-drain with no new information: while the member's branch
+   * does not yet contain the base, a land attempt is a hold, not a retry against an
+   * unchanged base. Cleared by the next `rebasing` transition.
+   */
+  delegatedAt: z.number().finite().optional(),
 });
 
 export type FleetMergeQueueEntry = z.infer<typeof FleetMergeEntrySchema>;

@@ -59,9 +59,11 @@ import {
   selectFleetEvents,
 } from "../../src/fleet-mailbox.js";
 import {
+  checkMemberBranchContainsBase,
   defaultFleetMergeGitRunner,
   drainFleetMerge,
   enqueueFleetMerge,
+  FLEET_REBASE_DELEGATION_GRACE_MS,
   formatDrainResultText,
   formatFleetMergeQueue,
 } from "../../src/fleet-merge.js";
@@ -95,6 +97,7 @@ import type {
   FleetPublishStackComposition,
 } from "../../src/fleet-publish.js";
 import { readFleetPublishConfig, resolveFleetPublish } from "../../src/fleet-publish.js";
+import { formatBoundedPathDetail, formatRebasePathList } from "../../src/fleet-rebase-recovery.js";
 import type { SupervisorRecovery } from "../../src/fleet-reconcile.js";
 import {
   reconcileAuthority,
@@ -155,6 +158,7 @@ import {
   drainNotes,
   dropFleetOrderingGates,
   enqueueNoteFanout,
+  FLEET_AUDIT_DETAIL_MAX_LENGTH,
   FLEET_NOTE_KINDS,
   type FleetMergeQueueEntry,
   type FleetNoteKind,
@@ -1600,6 +1604,31 @@ export function createFleet(deps: FleetDeps): FleetApi {
         };
   }
 
+  /** A rebase conflict handed to the member's own orchestrator (bd-280). */
+  type DrainDelegation = { taskId: string; paths: readonly string[] };
+
+  /**
+   * What a member merge did, in the terms the tick acts on.
+   *
+   * `deferred` is the no-new-information hold: the queue entry was delegated and
+   * the member's branch still does not contain the base, so draining again would
+   * re-run the same rebase against an unchanged base. It is not a failure and must
+   * not stop the member. `abandoned` is that same wait after its grace expired:
+   * nobody is going to decide, so the member stops for a human.
+   */
+  type MemberMergeOutcome =
+    | { kind: "merged" }
+    | { kind: "refused"; error: string; delegated?: DrainDelegation }
+    | { kind: "deferred"; detail: string }
+    | { kind: "abandoned"; detail: string };
+
+  /** What one land attempt produced, so a delegation is never read as a refusal. */
+  type LandMemberOutcome =
+    | { kind: "landed"; run: FleetRun; lines: readonly string[] }
+    | { kind: "refused"; error: string; delegated?: DrainDelegation }
+    | { kind: "deferred"; detail: string }
+    | { kind: "abandoned"; detail: string };
+
   /** Land one finished member: merge, accept, and drop it from the member list. */
   async function landFleetMember(options: {
     ctx: ExtensionContext;
@@ -1608,12 +1637,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
     run: FleetRun;
     taskId: string;
     now: number;
-  }): Promise<
-    { ok: true; run: FleetRun; lines: readonly string[] } | { ok: false; error: string }
-  > {
+    /** The tick's lease observation for this member (bd-280). */
+    memberLease?: FleetMemberClaim;
+  }): Promise<LandMemberOutcome> {
     const { ctx, mode, taskId, now } = options;
-    const merged = await mergeLandedMember({ ctx, mode, taskId, now });
-    if (!merged.ok) return merged;
+    const merged = await mergeLandedMember({
+      ctx,
+      mode,
+      taskId,
+      now,
+      ...(options.memberLease === undefined ? {} : { memberLease: options.memberLease }),
+    });
+    if (merged.kind !== "merged") return merged;
 
     // The landing is recorded before anything else can fail, because it is the one
     // fact bd cannot express and the scheduler's `fleetLandedTaskIds` rule needs
@@ -1621,7 +1656,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     // the member's capacity slot and stall its dependents on an event that already
     // happened.
     const pruned = pruneLandedMember({ ctx, mode, taskId, now });
-    if (!pruned.ok) return { ok: false, error: pruned.error };
+    if (!pruned.ok) return { kind: "refused", error: pruned.error };
     const landed = recordRunMemberLanded({ run: options.run, taskId, now });
     auditFleetAction({
       ctx,
@@ -1666,7 +1701,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       // The work landed, so the member is out of the member list; only the bead
       // (or the worktree) still needs a human, which is what the stop records.
       return {
-        ok: true,
+        kind: "landed",
         run: recordRunMemberStopped({
           run: landed,
           taskId,
@@ -1678,7 +1713,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       };
     }
     return {
-      ok: true,
+      kind: "landed",
       run: landed,
       lines: [`Fleet ${mode.fleetId}: ${accepted.text}`, ...gateLines],
     };
@@ -1714,22 +1749,107 @@ export function createFleet(deps: FleetDeps): FleetApi {
     ];
   }
 
-  /** Queue and drain one member's merge; a failure here is a `land-failed` stop. */
+  /** Queue and drain one member's merge; a refusal is reported to the tick. */
   async function mergeLandedMember(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
     taskId: string;
     now: number;
-  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    memberLease?: FleetMemberClaim;
+  }): Promise<MemberMergeOutcome> {
     const entry = memberQueueEntry(options.mode, options.taskId);
     // A member whose queue entry already says `merged` landed on an earlier tick
     // (or before a supervisor restart); re-merging it would re-run the gates.
-    if (entry?.state === "merged") return { ok: true };
-    if (entry === undefined) {
+    if (entry?.state === "merged") return { kind: "merged" };
+
+    const awaiting =
+      entry === undefined
+        ? { held: false as const }
+        : await memberAwaitingOwnRebase({ ...options, entry });
+    if (awaiting.held) {
+      return awaiting.expired
+        ? { kind: "abandoned", detail: awaiting.detail }
+        : { kind: "deferred", detail: awaiting.detail };
+    }
+
+    // A `failed`/`parked` entry has to be queued again before a drain can select
+    // it (`selectQueuedEntry` only drains `queued`). Reaching this point means the
+    // member either resolved the conflict it was asked about or carries a failure
+    // the tick is deliberately retrying, so this is a new attempt, not a repeat.
+    if (entry === undefined || entry.state === "failed" || entry.state === "parked") {
       const queued = enqueueMemberMerge(options);
-      if (!queued.ok) return queued;
+      if (!queued.ok) return { kind: "refused", error: queued.error };
     }
     return drainMemberMerge(options);
+  }
+
+  /**
+   * Whether a delegated member still owes its own rebase (bd-280).
+   *
+   * The drain is the fallback, so re-draining a branch that does not contain the
+   * base yet is the same conflict against the same base: minutes of gating with no
+   * new information. This is the guard that makes the delegation a hold rather
+   * than a per-tick retry loop.
+   *
+   * An **unreadable** verdict is a hold too (bd-280 S4). Falling through to a drain
+   * would re-write `delegatedAt` and re-send the `rebase-hint` on every tick, so a
+   * permanently failing probe would starve the grace window and the member would
+   * never reach the stop a human needs to see. The hold is bounded by
+   * {@link FLEET_REBASE_DELEGATION_GRACE_MS} whatever the verdict says: a live
+   * member that never rebases leaves nobody who can decide, so the wait ends as a
+   * stop for a human instead of a silent loop.
+   */
+  async function memberAwaitingOwnRebase(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+    entry: FleetMergeQueueEntry;
+  }): Promise<{ held: false } | { held: true; detail: string; expired: boolean }> {
+    const entry = options.entry;
+    const delegatedAt = entry.delegatedAt;
+    if (entry.state !== "failed" || delegatedAt === undefined) return { held: false };
+    const baseBranch = options.mode.intent.baseBranch;
+    const based = await checkMemberBranchContainsBase({
+      cwd: options.ctx.cwd,
+      baseBranch,
+      branch: entry.branch,
+      git: defaultFleetMergeGitRunner,
+    });
+    // The member answered the request: drain it (the next `rebasing` transition
+    // clears `delegatedAt`). Checked before the grace so a late rebase still lands.
+    if (based.ok && based.based) return { held: false };
+    const since = new Date(delegatedAt).toISOString();
+    const graceInMinutes = Math.round(FLEET_REBASE_DELEGATION_GRACE_MS / 60_000);
+    if (options.now - delegatedAt >= FLEET_REBASE_DELEGATION_GRACE_MS) {
+      return {
+        held: true,
+        expired: true,
+        detail:
+          `\`${options.taskId}\` was asked at ${since} to rebase ${entry.branch} onto ` +
+          `${baseBranch} itself and has not after ${graceInMinutes} min; stopping it for a ` +
+          "human instead of waiting on a rebase that is not happening" +
+          (based.ok ? "" : ` (the branch probe also failed: ${based.error})`),
+      };
+    }
+    if (!based.ok) {
+      return {
+        held: true,
+        expired: false,
+        detail:
+          `\`${options.taskId}\` was asked at ${since} to rebase ${entry.branch} onto ` +
+          `${baseBranch} itself; could not verify whether it has (${based.error}), so the ` +
+          "landing waits instead of re-running a rebase against a base it cannot read",
+      };
+    }
+    return {
+      held: true,
+      expired: false,
+      detail:
+        `\`${options.taskId}\` was asked at ${since} to rebase ${entry.branch} onto ` +
+        `${baseBranch} itself and has not yet; the landing waits for that rebase rather ` +
+        "than retrying it against an unchanged base",
+    };
   }
 
   function memberQueueEntry(mode: FleetMode, taskId: string): FleetMergeQueueEntry | undefined {
@@ -1765,7 +1885,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     mode: FleetMode;
     taskId: string;
     now: number;
-  }): Promise<{ ok: true } | { ok: false; error: string }> {
+    memberLease?: FleetMemberClaim;
+  }): Promise<MemberMergeOutcome> {
     const drained = await drainFleetMerge({
       gitCommonDir: options.mode.gitCommonDir,
       fleetId: options.mode.fleetId,
@@ -1774,12 +1895,19 @@ export function createFleet(deps: FleetDeps): FleetApi {
       rootCwd: options.ctx.cwd,
       taskId: options.taskId,
       now: options.now,
+      ...(options.memberLease === undefined ? {} : { memberLease: options.memberLease }),
     });
     for (const warning of drained.warnings) {
       options.ctx.ui.notify(warning, "warning");
       console.warn(`[belayd-harness] ${warning}`);
     }
-    return drained.ok ? { ok: true } : { ok: false, error: formatDrainResultText(drained) };
+    if (drained.ok) return { kind: "merged" };
+    // The delegated arm is a *non-stop* refusal: the member was asked to resolve
+    // its own rebase, so the tick must not record a stop or retire it (bd-280).
+    const error = formatDrainResultText(drained);
+    return drained.delegated === undefined
+      ? { kind: "refused", error }
+      : { kind: "refused", error, delegated: drained.delegated };
   }
 
   /** Accept a landed member: close its bead (when enabled) and remove its worktree. */
@@ -1949,6 +2077,12 @@ export function createFleet(deps: FleetDeps): FleetApi {
     options: FleetTickContext,
     action: Extract<FleetTickAction, { kind: "land" }>,
   ): Promise<FleetTickOutcome> {
+    const fleetId = options.mode.fleetId;
+    // The lease state is the tick's own observation, taken before the drain; a
+    // drain can outlast it, which is why only classification reads it.
+    const memberLease = options.observations.find(
+      (observation) => observation.taskId === action.taskId,
+    )?.claim;
     const landed = await landFleetMember({
       ctx: options.ctx,
       mode: options.mode,
@@ -1956,31 +2090,90 @@ export function createFleet(deps: FleetDeps): FleetApi {
       run: options.run,
       taskId: action.taskId,
       now: options.now,
+      ...(memberLease === undefined ? {} : { memberLease }),
     });
-    if (landed.ok) {
-      return { run: landed.run, lines: landed.lines, stop: false, acted: true };
+    switch (landed.kind) {
+      case "landed":
+        return { run: landed.run, lines: landed.lines, stop: false, acted: true };
+      case "deferred":
+        // No drain ran and nothing changed: the member still owes its own rebase.
+        // `acted: false` is deliberate — an acting tick is re-scheduled in 2 s and
+        // resets the idle counter, which would turn a member that ignores its hint
+        // into an unbounded fast loop.
+        return {
+          run: options.run,
+          lines: [`Fleet ${fleetId}: ${landed.detail}`],
+          stop: false,
+          acted: false,
+        };
+      case "abandoned":
+        // The delegation's grace expired with the member still not rebased: nobody
+        // alive can decide any more, so this is the ordinary land stop.
+        return landStoppedOutcome(options, action.taskId, landed.detail);
+      case "refused": {
+        if (landed.delegated !== undefined) {
+          // The member was asked to resolve its own rebase: do not stop it and do
+          // not retire it — the note went to that member and its worktree, branch,
+          // and bead are all still the only copy of the work (bd-280). The drain
+          // only delegates when the hint was actually written, so "asked" is true.
+          const paths = landed.delegated.paths;
+          const line =
+            `Fleet ${fleetId}: asked ${action.taskId} to resolve its own rebase: it conflicts ` +
+            `with base work that predates this fleet in ${paths.length} path` +
+            `${paths.length === 1 ? "" : "s"} (${formatRebasePathList(paths)}); not stopped`;
+          // The bounded line loses every path past the fifth, so the audit carries
+          // the complete list (or the count plus as many as its cap allows): a
+          // delegation nobody can act on is a silent stop (bd-280 W5).
+          auditFleetAction({
+            ctx: options.ctx,
+            gitCommonDir: options.mode.gitCommonDir,
+            fleetId,
+            action: "fleet-land-delegated",
+            taskIds: [action.taskId],
+            detail: formatBoundedPathDetail({
+              prefix: `delegated ${action.taskId}'s rebase to the member`,
+              paths,
+              budget: FLEET_AUDIT_DETAIL_MAX_LENGTH,
+            }),
+          });
+          return { run: options.run, lines: [line], stop: false, acted: true };
+        }
+        return landStoppedOutcome(options, action.taskId, landed.error);
+      }
     }
-    // A merge or gate refusal is not retried: the next tick would re-run the same
-    // minutes of gating against the same failure. The member is stopped for a human
-    // but stays a member — its worktree, branch, and bead are all still there, and
-    // dropping it is what made a sibling's blocker look like an outsider.
+  }
+
+  /**
+   * Stop a member on a refused land attempt (bd-280 keeps this for the refusal and
+   * the expired delegation, and uses it for nothing else).
+   *
+   * A merge or gate refusal is not retried: the next tick would re-run the same
+   * minutes of gating against the same failure. The member is stopped for a human
+   * but stays a member — its worktree, branch, and bead are all still there, and
+   * dropping it is what made a sibling's blocker look like an outsider.
+   */
+  function landStoppedOutcome(
+    options: FleetTickContext,
+    taskId: string,
+    detail: string,
+  ): FleetTickOutcome {
     const retired = retireDeferredMember({
       ctx: options.ctx,
       mode: options.mode,
-      taskId: action.taskId,
+      taskId,
       now: options.now,
     });
     const fleetId = options.mode.fleetId;
     return {
       run: recordRunMemberStopped({
         run: options.run,
-        taskId: action.taskId,
+        taskId,
         reason: "land-failed",
-        detail: landed.error,
+        detail,
         now: options.now,
       }),
       lines: [
-        `Fleet ${fleetId}: could not land ${action.taskId}: ${landed.error}`,
+        `Fleet ${fleetId}: could not land ${taskId}: ${detail}`,
         ...(retired.ok ? [] : [`Fleet ${fleetId}: ${retired.error}`]),
       ],
       stop: false,

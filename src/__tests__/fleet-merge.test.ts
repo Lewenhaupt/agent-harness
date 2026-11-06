@@ -15,18 +15,28 @@
 
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  renameSync,
+  rmdirSync,
   rmSync,
+  statSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { FleetMergeGateRunner, FleetMergeGitRunner } from "../fleet-merge.js";
+import type {
+  FleetMergeGateRunner,
+  FleetMergeGitRunner,
+  FleetMergeRegenerateRunner,
+} from "../fleet-merge.js";
 import {
   acquireFleetMerge,
   checkRootCheckout,
@@ -43,7 +53,8 @@ import {
   resolveFleetGateRunner,
   restoreRecordedStash,
 } from "../fleet-merge.js";
-import type { FleetMergeQueue } from "../fleet-state.js";
+import type { FleetMemberClaim } from "../fleet-run.js";
+import type { FleetMergeQueue, FleetStateFs } from "../fleet-state.js";
 import {
   createFleetMergeLock,
   createFleetMergeQueue,
@@ -809,6 +820,84 @@ function auditActions(fixture: FixtureRepo): string[] {
     .map((line) => (JSON.parse(line) as { action: string }).action);
 }
 
+/** The details one audit action recorded, in append order. */
+function auditDetails(fixture: FixtureRepo, action: string): string[] {
+  const path = fleetAuditLogPath(fixture.commonDir, fixture.fleetId);
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as { action: string; detail?: string })
+    .filter((entry) => entry.action === action)
+    .map((entry) => entry.detail ?? "");
+}
+
+/** The `to` addresses of one delivered note kind, in delivery order. */
+function noteRecipients(fixture: FixtureRepo, kind: string): string[] {
+  const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+  if (!events.ok) throw new Error(events.error);
+  return events.deliveries
+    .filter((delivery) => delivery.note.kind === kind)
+    .map((delivery) => delivery.note.to);
+}
+
+/**
+ * An fs seam whose **first** append of one audit action throws.
+ *
+ * The audit append goes through `appendFileSync`, not `atomicWriteJson`, so
+ * `fsRefusingWrite` cannot reach it; this is how a test drives the "the landed audit
+ * could not be written" arm and the retry that follows it (bd-280 S6).
+ */
+function fsFailingFirstAuditAppend(action: string): FleetStateFs {
+  const base = fsRefusingWrite(() => false);
+  let failed = false;
+  return {
+    ...base,
+    appendFileSync: (path, data) => {
+      if (!failed && data.includes(`"action":"${action}"`)) {
+        failed = true;
+        throw new Error("EIO: audit append failed");
+      }
+      appendFileSync(path, data);
+    },
+  };
+}
+
+/**
+ * An fs seam that refuses the atomic write whose payload matches `refuse`.
+ *
+ * `atomicWriteJson` writes a temp file then renames it, so the payload is the only
+ * place to tell one write from another: a test can fail exactly the queue write
+ * that carries `delegatedAt`, or exactly the note write that carries a
+ * `rebase-hint`, without breaking the reads and writes the drain needs to get there.
+ */
+function fsRefusingWrite(
+  refuse: (input: { content: string; target: string }) => boolean,
+): FleetStateFs {
+  return {
+    existsSync: (path) => existsSync(path),
+    readFileSync: (path) => readFileSync(path, "utf8"),
+    statSync: (path) => {
+      const stat = statSync(path);
+      return { size: stat.size, mtimeMs: stat.mtimeMs };
+    },
+    writeFileSync: (path, data, options) => writeFileSync(path, data, options),
+    appendFileSync: (path, data) => appendFileSync(path, data),
+    renameSync: (from, to) => {
+      if (refuse({ content: readFileSync(from, "utf8"), target: to })) {
+        throw new Error("ENOSPC: no space left on device");
+      }
+      renameSync(from, to);
+    },
+    mkdirSync: (path, options) => {
+      mkdirSync(path, options);
+    },
+    unlinkSync: (path) => unlinkSync(path),
+    readdirSync: (path) => readdirSync(path),
+    rmdirSync: (path) => rmdirSync(path),
+  };
+}
+
 function readQueue(fixture: FixtureRepo): FleetMergeQueue {
   const loaded = readFleetMergeQueue({
     gitCommonDir: fixture.commonDir,
@@ -848,7 +937,13 @@ function gateSpy(options: { failAt?: string } = {}): {
 
 async function drain(
   fixture: FixtureRepo,
-  options: { runGate?: FleetMergeGateRunner; git?: FleetMergeGitRunner } = {},
+  options: {
+    runGate?: FleetMergeGateRunner;
+    git?: FleetMergeGitRunner;
+    regenerate?: FleetMergeRegenerateRunner;
+    memberLease?: FleetMemberClaim;
+    fs?: FleetStateFs;
+  } = {},
 ) {
   return drainFleetMerge({
     gitCommonDir: fixture.commonDir,
@@ -859,6 +954,9 @@ async function drain(
     now: 2000,
     ...(options.runGate === undefined ? {} : { runGate: options.runGate }),
     ...(options.git === undefined ? {} : { git: options.git }),
+    ...(options.regenerate === undefined ? {} : { regenerate: options.regenerate }),
+    ...(options.memberLease === undefined ? {} : { memberLease: options.memberLease }),
+    ...(options.fs === undefined ? {} : { fs: options.fs }),
   });
 }
 
@@ -917,6 +1015,8 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     ]) {
       expect(actions).toContain(action);
     }
+    // The landed audit is written exactly once per merge (bd-280 S6).
+    expect(actions.filter((action) => action === "merge-completed")).toHaveLength(1);
 
     // Merging is not closing: no bd command was run by any seam.
     expect(commands.every((argv) => argv[0] !== "bd")).toBe(true);
@@ -1181,11 +1281,21 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     expect(result).toHaveProperty("ok", false);
     if (result.ok) return;
     expect(result.reason).toBe("rebase-failed");
+    // Both sides are named: this is the class a person decides. No run record proves
+    // a sibling landed here, so the base commit is narrated as base work committed
+    // after the fleet started, never as a member-vs-member contradiction (W2).
+    expect(result.paths).toEqual(["conflict.txt"]);
+    expect(result.text).toContain("real contradiction");
+    expect(result.text).toContain("base work committed after this fleet started");
+    expect(result.text).toContain(memberHead.slice(0, 12));
+    expect(result.text).toContain(rootHead.slice(0, 12));
     expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
     expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
     expect(git(fixture.root, ["status", "--porcelain"])).toBe("");
     expect(readQueue(fixture).entries[0]?.state).toBe("failed");
-    expect(auditActions(fixture)).toContain("merge-rebase-failed");
+    const actions = auditActions(fixture);
+    expect(actions).toContain("merge-rebase-failed");
+    expect(actions).toContain("merge-rebase-classified");
   });
 
   it("refuses to drain a paused fleet", async () => {
@@ -1215,6 +1325,762 @@ describe("drainFleetMerge: the documented merge sequence", () => {
     expect(result).toHaveProperty("ok", false);
     if (result.ok) return;
     expect(result.reason).toBe("no-queued-entry");
+  });
+});
+
+// ── Rebase failure classification (bd-280) ────────────────────────────
+
+describe("drainFleetMerge: rebase failure classification (bd-280)", () => {
+  /**
+   * A member and a base that both changed `path`, so the drain's rebase conflicts.
+   *
+   * `createdAt` is left at the fixture default (1) unless a test overrides it, so
+   * the base-side commit reads as work that landed *after* the fleet started — the
+   * sibling case. A test that wants pre-existing base work moves `createdAt` past
+   * the commits instead.
+   */
+  function createConflictFixture(options: { path?: string } = {}): {
+    fixture: FixtureRepo;
+    memberSha: string;
+    baseSha: string;
+  } {
+    const path = options.path ?? "conflict.txt";
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, path), "member version\n");
+    const memberSha = commit(fixture.memberPath, "member conflict commit");
+    writeFileSync(join(fixture.root, path), "base version\n");
+    const baseSha = commit(fixture.root, "base conflict commit");
+    enqueue(fixture);
+    return { fixture, memberSha, baseSha };
+  }
+
+  /** Move the fleet's start past the fixture's commits (pre-existing base work). */
+  function startFleetAfterCommits(fixture: FixtureRepo): void {
+    const createdAt = Date.now() + 60_000;
+    const written = updateFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      update: (current) => {
+        if (current === undefined) throw new Error("fleet intent missing in fixture");
+        return { ...current, createdAt, updatedAt: createdAt };
+      },
+    });
+    if (!written.ok) throw new Error(written.error);
+  }
+
+  /** The path git would leave a stopped rebase state at, resolved for the check. */
+  function rebaseStatePath(memberPath: string): string {
+    const raw = git(memberPath, ["rev-parse", "--git-path", "rebase-merge"]);
+    return raw.startsWith("/") ? raw : join(memberPath, raw);
+  }
+
+  function assertNoRebaseLeft(fixture: FixtureRepo): void {
+    expect(existsSync(rebaseStatePath(fixture.memberPath))).toBe(false);
+    expect(git(fixture.memberPath, ["status", "--porcelain"])).toBe("");
+  }
+
+  it("recovers a failure with no conflicted paths and retries exactly once", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+    const gate = gateSpy();
+
+    // A transient no-conflict failure (a stale index lock, a crashed earlier
+    // attempt): the first rebase fails without touching the index, the retry is a
+    // real `git rebase` and succeeds.
+    let rebaseAttempts = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "rebase" && argv[1] === "main") {
+        rebaseAttempts += 1;
+        if (rebaseAttempts === 1) {
+          return {
+            ok: false,
+            error: "fatal: Unable to create '.git/index.lock': File exists.",
+            stdout: "",
+            stderr: "fatal: Unable to create '.git/index.lock': File exists.",
+          };
+        }
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gate.runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(rebaseAttempts).toBe(2);
+    expect(gate.calls.length).toBeGreaterThan(0);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+    const actions = auditActions(fixture);
+    expect(actions).toContain("merge-rebase-classified");
+    expect(actions).toContain("merge-rebase-recovered");
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("stops after one failed recovery retry, with no second retry", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const memberHead = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+    // The base has to move for the rebase to have anything to do; otherwise git
+    // reports "up to date" and the failure under test never happens.
+    writeFileSync(join(fixture.root, "base-extra.txt"), "base moved\n");
+    commit(fixture.root, "base moves");
+
+    // A live index lock is what a crashed attempt leaves behind; nothing is
+    // conflicted, so this is the stale-state class, and the retry proves the lock
+    // is still held. Deleting the lock is not ours to do: a live member's process
+    // can hold it.
+    const indexPath = git(fixture.memberPath, ["rev-parse", "--git-path", "index"]);
+    const lockPath = `${indexPath.startsWith("/") ? indexPath : join(fixture.memberPath, indexPath)}.lock`;
+    writeFileSync(lockPath, "");
+
+    let rebaseAttempts = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "rebase" && argv[1] === "main") rebaseAttempts += 1;
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result.text).toContain("retry:");
+    expect(result.text).toContain("index.lock");
+    expect(rebaseAttempts).toBe(2);
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
+    expect(readQueue(fixture).entries[0]?.state).toBe("failed");
+
+    rmSync(lockPath, { force: true });
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("regenerates a conflict confined to generated paths and continues the merge", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, "pnpm-lock.yaml"), "lockfileVersion: 2\n");
+    const memberSha = commit(fixture.memberPath, "member edits the lockfile");
+    writeFileSync(join(fixture.root, "pnpm-lock.yaml"), "lockfileVersion: 3\n");
+    commit(fixture.root, "base edits the lockfile");
+    enqueue(fixture);
+
+    const regenerations: Array<{ paths: readonly string[]; installRequired: boolean }> = [];
+    const regenerate: FleetMergeRegenerateRunner = async (input) => {
+      regenerations.push({ paths: input.paths, installRequired: input.installRequired });
+      // The seam stands in for the package manager: the base side is already in
+      // the index, so the regenerated content is what the test asserts on.
+      return { ok: true };
+    };
+    const gate = gateSpy();
+
+    const result = await drain(fixture, { runGate: gate.runGate, regenerate });
+
+    expect(result).toHaveProperty("ok", true);
+    if (!result.ok) return;
+    expect(regenerations).toEqual([{ paths: ["pnpm-lock.yaml"], installRequired: true }]);
+    // The rebased member branch carries the base's lockfile; the member's lockfile
+    // commit became empty and git dropped it during the continue, which is the
+    // honest outcome of regenerating that change wholesale.
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(
+      git(fixture.memberPath, ["rev-parse", "feat/bd-12"]),
+    );
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).not.toBe(memberSha);
+    expect(git(fixture.root, ["log", "-1", "--format=%s"])).toBe("member bd-12");
+    expect(git(fixture.root, ["show", "HEAD:pnpm-lock.yaml"])).toBe("lockfileVersion: 3");
+    expect(gate.calls.length).toBeGreaterThan(0);
+    const actions = auditActions(fixture);
+    expect(actions).toContain("merge-rebase-recovered");
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("aborts a generated-path recovery that fails, naming the step", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, "pnpm-lock.yaml"), "lockfileVersion: 2\n");
+    commit(fixture.memberPath, "member edits the lockfile");
+    writeFileSync(join(fixture.root, "pnpm-lock.yaml"), "lockfileVersion: 3\n");
+    const rootHead = commit(fixture.root, "base edits the lockfile");
+    enqueue(fixture);
+    const memberHead = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+    const gate = gateSpy();
+
+    const result = await drain(fixture, {
+      runGate: gate.runGate,
+      regenerate: async () => ({ ok: false, error: "`pnpm install` failed: ENOSPC" }),
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result.paths).toEqual(["pnpm-lock.yaml"]);
+    expect(result.text).toContain("could not be regenerated");
+    expect(result.text).toContain("ENOSPC");
+    expect(gate.calls).toEqual([]);
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
+    expect(readQueue(fixture).entries[0]?.state).toBe("failed");
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("delegates a conflict with pre-existing base work to a live member", async () => {
+    const { fixture, memberSha, baseSha } = createConflictFixture();
+    startFleetAfterCommits(fixture);
+    const gate = gateSpy();
+
+    const result = await drain(fixture, {
+      runGate: gate.runGate,
+      memberLease: "live" as FleetMemberClaim,
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-delegated");
+    // The complete conflicted list travels with the delegation, not only the
+    // bounded text the operator sees (W5).
+    expect(result.delegated).toEqual({ taskId: "bd-12", paths: ["conflict.txt"] });
+    expect(result.paths).toEqual(["conflict.txt"]);
+    expect(result.text).toContain("delegated to the member");
+    expect(result.text).toContain(baseSha.slice(0, 12));
+    // Not stopped, not merged: the entry is what carries the delegation forward.
+    const entry = readQueue(fixture).entries[0];
+    expect(entry?.state).toBe("failed");
+    expect(entry?.delegatedAt).toEqual(expect.any(Number));
+    expect(entry?.lastError).toContain("delegated to the member");
+    expect(gate.calls).toEqual([]);
+
+    const notes = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    if (!notes.ok) throw new Error(notes.error);
+    const hints = notes.deliveries.filter((delivery) => delivery.note.kind === "rebase-hint");
+    expect(hints).toHaveLength(1);
+    expect(hints[0]?.note.to).toBe("bd-12");
+    expect(hints[0]?.note.body).toContain("Resolve the conflict");
+
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberSha);
+    expect(existsSync(rebaseStatePath(fixture.memberPath))).toBe(false);
+    expect(git(fixture.memberPath, ["status", "--porcelain"])).toBe("");
+    expect(auditActions(fixture)).toContain("merge-rebase-classified");
+  });
+
+  it("stops as unknown when nobody alive can decide the conflict", async () => {
+    const { fixture, memberSha } = createConflictFixture();
+    startFleetAfterCommits(fixture);
+
+    // A stale lease: the member cannot resolve its own rebase any more.
+    const result = await drain(fixture, { runGate: gateSpy().runGate, memberLease: "stale" });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result.paths).toEqual(["conflict.txt"]);
+    expect(result.text).toContain("conflicted paths: conflict.txt");
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberSha);
+    expect(existsSync(rebaseStatePath(fixture.memberPath))).toBe(false);
+    expect(git(fixture.memberPath, ["status", "--porcelain"])).toBe("");
+    const actions = auditActions(fixture);
+    expect(actions).toContain("merge-rebase-failed");
+  });
+
+  it("clears a stopped rebase before reporting a lost lock (bd-280 C1)", async () => {
+    const { fixture } = createConflictFixture();
+    const memberHead = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    let rebaseAttempts = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "rebase" && argv[1] === "main") {
+        rebaseAttempts += 1;
+        // A crashed attempt left a real stopped rebase behind, and something staged
+        // its resolution before dying: the state exists, nothing is conflicted — the
+        // stale-state class. The lease is lost at the same moment, which used to
+        // return before the state was cleared.
+        await defaultFleetMergeGitRunner(["rebase", "main"], options);
+        await defaultFleetMergeGitRunner(["checkout", "--ours", "--", "conflict.txt"], options);
+        await defaultFleetMergeGitRunner(["add", "--", "conflict.txt"], options);
+        rmSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId), {
+          recursive: true,
+          force: true,
+        });
+        return {
+          ok: false,
+          error: "fatal: It seems that there is already a rebase-merge directory",
+          stdout: "",
+          stderr: "",
+        };
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("lock-unavailable");
+    expect(rebaseAttempts).toBe(1);
+    // The invariant every other class keeps: the stopped rebase is cleared. The
+    // worktree is not handed to the next attempt mid-rebase.
+    expect(existsSync(rebaseStatePath(fixture.memberPath))).toBe(false);
+    expect(git(fixture.memberPath, ["status", "--porcelain"])).toBe("");
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
+  });
+
+  it("classifies a recovery retry's conflict instead of binning it as unknown (bd-280 W1)", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, "pnpm-lock.yaml"), "lockfileVersion: 2\n");
+    commit(fixture.memberPath, "member edits the lockfile");
+    writeFileSync(join(fixture.root, "pnpm-lock.yaml"), "lockfileVersion: 3\n");
+    commit(fixture.root, "base edits the lockfile");
+    enqueue(fixture);
+
+    let rebaseAttempts = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "rebase" && argv[1] === "main") {
+        rebaseAttempts += 1;
+        // The first attempt dies on a stale state and never produces a conflict; the
+        // retry is a real rebase, and it conflicts on the generated path.
+        if (rebaseAttempts === 1) {
+          return {
+            ok: false,
+            error: "fatal: Unable to create '.git/index.lock': File exists.",
+            stdout: "",
+            stderr: "",
+          };
+        }
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+    const regenerations: Array<readonly string[]> = [];
+
+    const result = await drain(fixture, {
+      runGate: gateSpy().runGate,
+      git: gitRunner,
+      regenerate: async (input) => {
+        regenerations.push(input.paths);
+        return { ok: true };
+      },
+    });
+
+    // The retry's failure is classified like any other: generated paths are
+    // regenerated and the merge continues, instead of a hard stop as `unknown`.
+    expect(result).toHaveProperty("ok", true);
+    expect(rebaseAttempts).toBe(2);
+    expect(regenerations).toEqual([["pnpm-lock.yaml"]]);
+    // Once per failed rebase, so both the first attempt and the retry are audited.
+    expect(auditDetails(fixture, "merge-rebase-classified")).toEqual([
+      "not-a-conflict: ",
+      "generated: pnpm-lock.yaml",
+    ]);
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("names the landed sibling the run record proves (bd-280 W2)", async () => {
+    const { fixture, memberSha, baseSha } = createConflictFixture();
+    // A sibling landed through this fleet before bd-12's rebase, and that landing is
+    // the run record's proof: only then may the stop text call the base work a
+    // land, and name whose it is.
+    const written = updateFleetIntent({
+      gitCommonDir: fixture.commonDir,
+      fleetId: fixture.fleetId,
+      update: (current) => {
+        if (current === undefined) throw new Error("fleet intent missing in fixture");
+        return {
+          ...current,
+          run: {
+            schemaVersion: 1,
+            mode: "until-complete",
+            startedAt: 1,
+            updatedAt: 2,
+            ticks: 1,
+            members: [
+              { taskId: "bd-15", launchedAt: 1, landedAt: 2 },
+              { taskId: "bd-12", launchedAt: 1 },
+            ],
+          },
+        };
+      },
+    });
+    if (!written.ok) throw new Error(written.error);
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result.text).toContain("vs landed bd-15");
+    expect(result.text).toContain(memberSha.slice(0, 12));
+    expect(result.text).toContain(baseSha.slice(0, 12));
+    expect(result.paths).toEqual(["conflict.txt"]);
+  });
+
+  it("stops when the queue cannot record the delegation (bd-280 W3)", async () => {
+    const { fixture } = createConflictFixture();
+    startFleetAfterCommits(fixture);
+
+    // The `failed` transition that carries `delegatedAt` cannot be written: reporting
+    // a delegation nothing durable records would re-run the rebase (and a fresh
+    // hint) on every acting tick.
+    const result = await drain(fixture, {
+      runGate: gateSpy().runGate,
+      memberLease: "live",
+      fs: fsRefusingWrite(({ content }) => content.includes('"delegatedAt"')),
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result).not.toHaveProperty("delegated");
+    expect(result.paths).toEqual(["conflict.txt"]);
+    expect(result.text).toContain("could not be recorded");
+    expect(readQueue(fixture).entries[0]?.delegatedAt).toBeUndefined();
+    assertNoRebaseLeft(fixture);
+    expect(auditDetails(fixture, "merge-rebase-failed")).toHaveLength(1);
+  });
+
+  it("stops when the rebase-hint could not be written (bd-280 W4)", async () => {
+    const { fixture, memberSha } = createConflictFixture();
+    startFleetAfterCommits(fixture);
+
+    // A member that was never asked cannot be expected to act, so a failed hint is a
+    // stop, not a delegation with an honest footnote.
+    const result = await drain(fixture, {
+      runGate: gateSpy().runGate,
+      memberLease: "live",
+      fs: fsRefusingWrite(
+        ({ content, target }) =>
+          target.includes(join("fleet", fixture.fleetId, "events")) &&
+          content.includes("rebase-hint"),
+      ),
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("rebase-failed");
+    expect(result).not.toHaveProperty("delegated");
+    expect(result.text).toContain("rebase-hint could not be written");
+    expect(readQueue(fixture).entries[0]).toMatchObject({ state: "failed" });
+    expect(readQueue(fixture).entries[0]?.delegatedAt).toBeUndefined();
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberSha);
+    assertNoRebaseLeft(fixture);
+  });
+
+  it("releases the lock and clears the rebase when a merge step throws (bd-280 W6)", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.memberPath, "pnpm-lock.yaml"), "lockfileVersion: 2\n");
+    commit(fixture.memberPath, "member edits the lockfile");
+    writeFileSync(join(fixture.root, "pnpm-lock.yaml"), "lockfileVersion: 3\n");
+    commit(fixture.root, "base edits the lockfile");
+    enqueue(fixture);
+    const memberHead = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+    const rootHead = git(fixture.root, ["rev-parse", "HEAD"]);
+
+    const result = await drain(fixture, {
+      runGate: gateSpy().runGate,
+      regenerate: async () => {
+        throw new Error("regenerate exploded");
+      },
+    });
+
+    // A throwing seam yields a defined refusal instead of a rejected promise.
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain("regenerate exploded");
+    expect(auditActions(fixture)).toContain("merge-step-threw");
+    // The lock does not outlive the drain, and the interrupted rebase is cleared.
+    expect(readQueue(fixture).lock ?? null).toBeNull();
+    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    assertNoRebaseLeft(fixture);
+    expect(git(fixture.memberPath, ["rev-parse", "feat/bd-12"])).toBe(memberHead);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
+  });
+
+  it("keeps a merge that landed when a step after it throws (bd-280 WF)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    let fastForwarded = false;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "merge" && argv[1] === "--ff-only") fastForwarded = true;
+      // The base branch has already advanced, but reading its new HEAD throws: the
+      // merge happened, so the refusal must say so instead of recording a failure.
+      if (fastForwarded && argv[0] === "rev-parse" && argv[1] === "HEAD") {
+        throw new Error("rev-parse seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain("merged bd-12 into main at an unreadable sha");
+    expect(result.text).toContain("rev-parse seam exploded");
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    expect(readQueue(fixture).lock ?? null).toBeNull();
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+    // The landed merge still gets its one completion entry, even though the throw hit
+    // before the success finisher could write it (bd-280 S6).
+    expect(auditActions(fixture).filter((action) => action === "merge-completed")).toHaveLength(1);
+    expect(auditDetails(fixture, "merge-completed")[0]).toContain("at an unreadable sha");
+    // An unreadable base commit is named, not probed: every remaining member is hinted
+    // without asking git to compare against an empty sha (bd-280 S8).
+    expect(noteRecipients(fixture, "rebase-hint")).toEqual(["bd-15"]);
+    expect(auditDetails(fixture, "rebase-hint")[0]).toContain("the merge commit was unreadable");
+    expect(result.warnings.join("\n")).toContain("every remaining member was sent a rebase-hint");
+  });
+
+  it("reports a finisher throw after the merge as landed, never as failed (bd-280 WF)", async () => {
+    const fixture = createFixtureRepo();
+    // A dirty root is stashed before the rebase, so the restore is a post-merge step
+    // this test can make throw.
+    writeFileSync(join(fixture.root, "operator-work.txt"), "uncommitted\n");
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "stash" && argv[1] === "apply") {
+        throw new Error("restore seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    // A throw in the finisher must not reject the drain.
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain(`merged bd-12 into main at ${memberTip.slice(0, 12)}`);
+    expect(result.text).toContain("the merge landed and is not retried");
+    expect(result.text).toContain("restore seam exploded");
+    // The member landed and stays landed: the throw came after the merged transition.
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    expect(readQueue(fixture).lock ?? null).toBeNull();
+    expect(existsSync(fleetMergeLockDir(fixture.commonDir, fixture.fleetId))).toBe(false);
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+    expect(auditActions(fixture)).toContain("merge-step-threw");
+    // One landed audit and one throw: the merge happened, and the arm that found it
+    // landed did not write a second completion entry (bd-280 S6).
+    expect(auditActions(fixture).filter((action) => action === "merge-completed")).toHaveLength(1);
+    expect(auditActions(fixture).filter((action) => action === "merge-step-threw")).toHaveLength(1);
+  });
+
+  it("broadcasts the base move when a finisher throws after the merge (bd-280 S5)", async () => {
+    const fixture = createFixtureRepo();
+    // Two members remain: bd-15 and bd-19, both still on the pre-merge base, so each
+    // is due a `base-moved`, a `sibling-landed` and a `rebase-hint`.
+    const thirdPath = `${fixture.root}.feat-bd-19`;
+    cleanup.push(thirdPath);
+    git(fixture.root, ["worktree", "add", "-q", "-b", "feat/bd-19", thirdPath]);
+    writeFleetIntent(fixture.commonDir, fixture.fleetId, ["bd-12", "bd-15", "bd-19"]);
+    // A dirty root is stashed before the rebase, so the restore is a post-merge step
+    // this test can make throw.
+    writeFileSync(join(fixture.root, "operator-work.txt"), "uncommitted\n");
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "stash" && argv[1] === "apply") {
+        throw new Error("restore seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    // The throw is reported as a landed merge, not as a rejected drain.
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain("the merge landed and is not retried");
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+
+    // The siblings were still told: their branches are on a stale base either way.
+    const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    if (!events.ok) throw new Error(events.error);
+    const delivered = events.deliveries.map(
+      (delivery) => `${delivery.note.kind}:${delivery.note.to}`,
+    );
+    expect(delivered.sort()).toEqual([
+      "base-moved:bd-15",
+      "base-moved:bd-19",
+      "rebase-hint:bd-15",
+      "rebase-hint:bd-19",
+      "sibling-landed:bd-15",
+      "sibling-landed:bd-19",
+    ]);
+  });
+
+  it("turns a broadcast throw after the merge into a warning, never a second failure (bd-280 S5)", async () => {
+    const fixture = createFixtureRepo();
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    // The fan-out writes its notes and then the branch probe throws, so the retry on
+    // the landed arm finds those notices already recorded and does not repeat them.
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "merge-base" && argv.includes("--is-ancestor")) {
+        throw new Error("branch probe exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain("the merge landed and is not retried");
+    expect(result.warnings.join("\n")).toContain("could not send the base-moved notices");
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    expect(readQueue(fixture).lock ?? null).toBeNull();
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+
+    // The two kinds that did go out are not sent a second time by the retry.
+    const events = drainNotes({ dir: fleetEventsDir(fixture.commonDir, fixture.fleetId) });
+    if (!events.ok) throw new Error(events.error);
+    const kinds = events.deliveries.map((delivery) => delivery.note.kind).sort();
+    expect(kinds).toEqual(["base-moved", "sibling-landed"]);
+  });
+
+  it("audits one merge-completed when the merged transition failed and a finisher throws (bd-280 S6)", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.root, "operator-work.txt"), "uncommitted\n");
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "stash" && argv[1] === "apply") {
+        throw new Error("restore seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+    // The `merged` transition is refused, so the queue entry never records the merge:
+    // the landed audit must not be keyed on it (that wrote a second entry).
+    const fs = fsRefusingWrite(
+      ({ content, target }) => target.endsWith("merge-queue.json") && content.includes('"merged"'),
+    );
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner, fs });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.text).toContain("the merge landed and is not retried");
+    // The entry never recorded `merged` (it stays at the pre-merge `merging`); the
+    // merge still landed on the base branch.
+    expect(readQueue(fixture).entries[0]?.state).toBe("merging");
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+    expect(auditActions(fixture).filter((action) => action === "merge-completed")).toHaveLength(1);
+    expect(auditActions(fixture).filter((action) => action === "merge-step-threw")).toHaveLength(1);
+  });
+
+  it("retries a merge-completed audit whose own append failed (bd-280 S6)", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.root, "operator-work.txt"), "uncommitted\n");
+    enqueue(fixture);
+    const memberTip = git(fixture.memberPath, ["rev-parse", "feat/bd-12"]);
+
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "stash" && argv[1] === "apply") {
+        throw new Error("restore seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, {
+      runGate: gateSpy().runGate,
+      git: gitRunner,
+      fs: fsFailingFirstAuditAppend("merge-completed"),
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    // The failed append is reported, and the landed arm wrote the entry the operator
+    // greps for — the log holds one, not zero and not two.
+    expect(result.warnings.join("\n")).toContain("could not append to audit.log");
+    expect(auditActions(fixture).filter((action) => action === "merge-completed")).toHaveLength(1);
+    expect(auditActions(fixture).filter((action) => action === "merge-step-threw")).toHaveLength(1);
+    expect(readQueue(fixture).entries[0]?.state).toBe("merged");
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(memberTip);
+  });
+
+  it("resumes a partial broadcast with only the members it missed (bd-280 S7)", async () => {
+    const fixture = createFixtureRepo();
+    const thirdPath = `${fixture.root}.feat-bd-19`;
+    cleanup.push(thirdPath);
+    git(fixture.root, ["worktree", "add", "-q", "-b", "feat/bd-19", thirdPath]);
+    writeFleetIntent(fixture.commonDir, fixture.fleetId, ["bd-12", "bd-15", "bd-19"]);
+    enqueue(fixture);
+
+    // bd-19's note writes fail twice (one per kind on the first attempt), so the first
+    // fan-out is partial: bd-15 was written and bd-19 was not.
+    let bd19Refusals = 0;
+    const fs = fsRefusingWrite(({ content }) => {
+      if (!content.includes('"to": "bd-19"')) return false;
+      bd19Refusals += 1;
+      return bd19Refusals <= 2;
+    });
+    // The branch probe throws once, after the two partial fan-outs, so the retry is
+    // the landed arm's.
+    let probes = 0;
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "merge-base" && argv.includes("--is-ancestor")) {
+        probes += 1;
+        if (probes === 1) throw new Error("branch probe exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, { runGate: gateSpy().runGate, git: gitRunner, fs });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    expect(result.reason).toBe("step-failed");
+    expect(result.warnings.join("\n")).toContain("partially sent to bd-15");
+    // Every member got every kind exactly once: the retry wrote only the missing
+    // recipient and never a second file for bd-15.
+    expect(noteRecipients(fixture, "base-moved").sort()).toEqual(["bd-15", "bd-19"]);
+    expect(noteRecipients(fixture, "sibling-landed").sort()).toEqual(["bd-15", "bd-19"]);
+    expect(noteRecipients(fixture, "rebase-hint").sort()).toEqual(["bd-15", "bd-19"]);
+    expect(
+      auditDetails(fixture, "base-moved").some((detail) => detail.startsWith("partial fan-out")),
+    ).toBe(true);
+  });
+
+  it("keeps the primary reason when the failure finisher throws (bd-280 WF)", async () => {
+    const fixture = createFixtureRepo();
+    writeFileSync(join(fixture.root, "operator-work.txt"), "uncommitted\n");
+    enqueue(fixture);
+    const rootHead = git(fixture.root, ["rev-parse", "HEAD"]);
+
+    const gitRunner: FleetMergeGitRunner = async (argv, options) => {
+      if (argv[0] === "stash" && argv[1] === "apply") {
+        throw new Error("restore seam exploded");
+      }
+      return defaultFleetMergeGitRunner(argv, options);
+    };
+
+    const result = await drain(fixture, {
+      runGate: gateSpy({ failAt: "test" }).runGate,
+      git: gitRunner,
+    });
+
+    expect(result).toHaveProperty("ok", false);
+    if (result.ok) return;
+    // The gate refusal is what the operator has to fix; the cleanup throw is added
+    // to it rather than replacing it.
+    expect(result.reason).toBe("gate-failed");
+    expect(result.text).toContain("gate exploded");
+    expect(result.text).toContain("finishing this drain also threw");
+    expect(result.text).toContain("restore seam exploded");
+    expect(readQueue(fixture).entries[0]?.state).toBe("failed");
+    expect(readQueue(fixture).lock ?? null).toBeNull();
+    expect(auditActions(fixture)).toContain("merge-step-threw");
+    // Nothing reached the base branch: the ff-merge never ran.
+    expect(git(fixture.root, ["rev-parse", "HEAD"])).toBe(rootHead);
   });
 });
 

@@ -367,6 +367,12 @@ sha) → rebase the member onto the base → the target's own gates
 `git merge --ff-only` → restore the stashed root → notify remaining members
 (`base-moved`, `sibling-landed`, `rebase-hint`) → release.
 
+A rebase that fails is classified before anything else happens: a stale state is
+cleared and retried once, generated paths are regenerated, a conflict a live
+member can resolve is delegated to it with a `rebase-hint` (no stop), and only a
+contradiction with work that landed during the fleet stops the member. See
+[`docs/fleet-merge.md`](fleet-merge.md#rebase-failure-classification-bd-280).
+
 - **Run it from the repository root.** Only the root can check out the base
   branch; a linked worktree is refused.
 - **Single-flight.** The lease is 30 min and is renewed before every gate; a live

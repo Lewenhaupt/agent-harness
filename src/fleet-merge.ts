@@ -33,12 +33,23 @@
 
 import { execFile } from "node:child_process";
 import * as nodeFs from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
   buildFleetNote,
   FLEET_NOTE_BROADCAST,
   resolveFleetNoteRecipients,
 } from "./fleet-mailbox.js";
+import {
+  classifyGeneratedPath,
+  classifyRebaseFailure,
+  type FleetRebaseClass,
+  formatRebasePathList,
+  parseConflictedPaths,
+  type RebaseCommitFact,
+  type RebaseConflictedPath,
+  rebaseConflictText,
+} from "./fleet-rebase-recovery.js";
+import type { FleetMemberClaim } from "./fleet-run.js";
 import type {
   FleetMergeEntryState,
   FleetMergeLock,
@@ -825,6 +836,9 @@ export function enqueueFleetMerge(options: EnqueueFleetMergeOptions): EnqueueFle
     };
   }
 
+  // `delegatedAt` is deliberately not carried over: enqueueing again is the
+  // retry that a delegation was waiting for, so its no-new-information marker
+  // must not survive it (bd-280).
   const entry: FleetMergeQueueEntry = {
     taskId: options.taskId,
     branch: options.branch,
@@ -989,6 +1003,77 @@ export const defaultFleetMergeGateRunner: FleetMergeGateRunner = (options) =>
       : { ok: false as const, error: result.error || result.stderr.trim() },
   );
 
+/**
+ * How long a delegated rebase may go unanswered before the member is stopped.
+ *
+ * A delegation deliberately records no stop, so nothing else bounds the wait: a
+ * live member that never rebases would leave the run landing forever. After this
+ * grace the person is the only one left who can decide, which is exactly the case
+ * a `land-failed` stop (and its bd-279 escalation gate) exists for.
+ */
+export const FLEET_REBASE_DELEGATION_GRACE_MS = 30 * 60 * 1000;
+
+/** Facts the regeneration step needs; the seam receives them instead of reading. */
+export interface FleetMergeRegenerateOptions {
+  /** The member worktree the rebase is stopped in: regeneration runs there. */
+  cwd: string;
+  /** Generated paths that were conflicted and are now taken from the base side. */
+  paths: readonly string[];
+  /** Package manager the merge target declares (S1); never assumed to be pnpm. */
+  runner: FleetGateRunnerName;
+  /** Any conflicted path is a lockfile, so dependencies must be reinstalled. */
+  installRequired: boolean;
+  /** Any conflicted path is a build/derived tree, so the project must be rebuilt. */
+  buildRequired: boolean;
+  /** Whether the merge target declares the `build` script a rebuild needs. */
+  hasBuildScript: boolean;
+}
+
+/**
+ * Regeneration seam for a rebase whose only conflicts were generated paths
+ * (bd-280). Injected so unit tests never run a package manager.
+ */
+export type FleetMergeRegenerateRunner = (
+  options: FleetMergeRegenerateOptions,
+) => Promise<{ ok: true } | { ok: false; error: string }>;
+
+/**
+ * Default regeneration: reinstall the lockfile and/or rebuild the derived tree.
+ *
+ * The base side of a generated path is the truth (it was produced by a landed
+ * member or by the base itself), so the artifact is recreated from the base's
+ * manifest rather than merged. Snapshots alone need no command: their base side
+ * is taken and the project's own gates decide whether it is still correct.
+ */
+export const defaultFleetMergeRegenerateRunner: FleetMergeRegenerateRunner = async (options) => {
+  if (options.installRequired) {
+    const installed = await runFileCommand(options.runner, ["install"], {
+      cwd: options.cwd,
+      env: gitContextFreeEnv(),
+    });
+    if (!installed.ok) {
+      return {
+        ok: false,
+        error: `\`${options.runner} install\` failed: ${commandError(installed)}`,
+      };
+    }
+  }
+  if (!options.buildRequired) return { ok: true };
+  if (!options.hasBuildScript) {
+    return {
+      ok: false,
+      error: "the merge target declares no `build` script to regenerate the derived tree",
+    };
+  }
+  const built = await runFileCommand(options.runner, ["run", "build"], {
+    cwd: options.cwd,
+    env: gitContextFreeEnv(),
+  });
+  return built.ok
+    ? { ok: true }
+    : { ok: false, error: `\`${options.runner} run build\` failed: ${commandError(built)}` };
+};
+
 // ── Drain: the documented merge sequence ──────────────────────────────
 
 export interface DrainFleetMergeOptions extends FleetMergeLockOptions {
@@ -1014,6 +1099,21 @@ export interface DrainFleetMergeOptions extends FleetMergeLockOptions {
   leaseInMs?: number;
   git?: FleetMergeGitRunner;
   runGate?: FleetMergeGateRunner;
+  /**
+   * Regenerate derived content for a rebase that only conflicts on it (bd-280).
+   * Defaults to {@link defaultFleetMergeRegenerateRunner}.
+   */
+  regenerate?: FleetMergeRegenerateRunner;
+  /**
+   * The member's orchestrator lease as the *tick* observed it (bd-280).
+   *
+   * Only classification reads it, and only to decide whether a resolvable
+   * conflict can be delegated to the member instead of stopping the fleet. Caveat:
+   * it is a snapshot from before the drain, and a drain can outlast it — a lease
+   * that dies mid-drain still gets the note, which a dead member's next
+   * orchestrator will read.
+   */
+  memberLease?: FleetMemberClaim;
 }
 
 export interface FleetMergeBroadcast {
@@ -1042,6 +1142,12 @@ export type FleetMergeFailureReason =
   | "publish-payload-unreadable"
   | "stash-failed"
   | "rebase-failed"
+  // bd-280: the rebase conflict is resolvable by the member's own orchestrator,
+  // so the drain asked it to rebase instead of stopping it for a human.
+  | "rebase-delegated"
+  // A merge-step seam threw instead of returning a value. Defined so a throwing
+  // seam cannot turn into an unhandled rejection that leaks the merge lock.
+  | "step-failed"
   | "gate-failed"
   | "merge-failed"
   | "restore-conflict"
@@ -1065,11 +1171,18 @@ export type DrainFleetMergeResult =
       text: string;
       taskId?: string;
       /**
-       * Complete offending path list for a publish refusal, sorted. `text` is
-       * bounded to one readable line; callers that render a report must use this
-       * field to show every path.
+       * Complete offending path list, sorted. `text` is bounded to one readable
+       * line; callers that render a report must use this field to show every path.
+       * Carried by a publish refusal *and* by a rebase conflict (bd-280).
        */
       paths?: readonly string[];
+      /**
+       * Set when a rebase conflict was delegated to the member's own orchestrator
+       * (bd-280). It carries the complete conflicted path list so the caller can
+       * report and record it even though `text` is bounded. The member is not
+       * stopped, so the caller must not record one.
+       */
+      delegated?: { taskId: string; paths: readonly string[] };
       /** Set when the root was stashed; always reported, never hidden. */
       stashRef?: string;
       parked: boolean;
@@ -1086,17 +1199,39 @@ interface MergeAttemptContext {
   /** Live clock: every timestamp in a drain comes from here (W1). */
   clock: () => number;
   warnings: string[];
+  /**
+   * Whether the lock was already released, so the release is idempotent.
+   *
+   * The drain's `finally` releases it as a belt for a throwing seam; without this
+   * the finishers' own release would then run twice.
+   */
+  lockReleased: boolean;
   stashRef?: string;
   mergeCommit?: string;
   gateNames?: readonly string[];
   broadcast: FleetMergeBroadcast;
+  /**
+   * Whether `merge-completed` has been written for this drain attempt (bd-280).
+   *
+   * A per-attempt marker, deliberately not derived from the queue entry: the queue
+   * writes are best-effort (each failure is a warning), so an entry still reading
+   * `rebasing` says nothing about whether the landed audit was written — keying the
+   * audit on it both duplicated the entry (the `merged` transition failed, then a
+   * later step threw) and lost it (the audit append failed, the entry was `merged`
+   * and the landed arm skipped). This flag records what this attempt actually did;
+   * it is set only when the append succeeded, so a failed append can be retried by
+   * the landed arm. See {@link auditMergeCompletedOnce}.
+   */
+  mergeCompletionAudited: boolean;
 }
 
 interface MergeCheckFailure {
   reason: FleetMergeFailureReason;
   text: string;
-  /** Offending paths when the refusal is path-shaped (publish gate only). */
+  /** Offending paths when the refusal is path-shaped (publish or rebase gate). */
   paths?: readonly string[];
+  /** Set when a rebase conflict was handed to the member instead of stopping it. */
+  delegated?: { taskId: string; paths: readonly string[] };
 }
 
 /** Run one git command; undefined means it failed (stdout is the error text). */
@@ -1116,6 +1251,11 @@ function commandError(result: FleetMergeCommandResult): string {
   return stderr === undefined || stderr === "" ? result.error : stderr;
 }
 
+/** One line from a thrown (rather than returned) seam failure. */
+function describeThrown(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function gitWithError(
   context: MergeAttemptContext,
   argv: readonly string[],
@@ -1133,7 +1273,7 @@ function auditAttempt(
   action: string,
   taskIds: readonly string[],
   detail: string,
-): void {
+): boolean {
   const warning = appendFleetMergeAudit({
     gitCommonDir: context.options.gitCommonDir,
     fleetId: context.options.fleetId,
@@ -1144,7 +1284,9 @@ function auditAttempt(
     taskIds,
     detail,
   });
-  if (warning !== undefined) context.warnings.push(warning);
+  if (warning === undefined) return true;
+  context.warnings.push(warning);
+  return false;
 }
 
 /**
@@ -1152,22 +1294,33 @@ function auditAttempt(
  *
  * A rebasing transition counts a new attempt; a rebasing/merged transition also
  * clears a stale failure message so a recovered entry does not keep reporting
- * the previous attempt's error.
+ * the previous attempt's error. A rebasing transition drops `delegatedAt` too:
+ * rebasing again means the delegation that parked the previous attempt was
+ * answered, so its no-new-information window must not survive it.
  */
 function nextEntryState(options: {
   entry: FleetMergeQueueEntry;
   state: FleetMergeEntryState;
   lastError: string | undefined;
   now: number;
+  delegatedAt?: number;
 }): FleetMergeQueueEntry {
+  const entry = options.entry;
   const clearsError = options.state === "rebasing" || options.state === "merged";
   const error = clearsError ? undefined : options.lastError;
+  const delegatedAt =
+    options.state === "rebasing" ? undefined : (options.delegatedAt ?? entry.delegatedAt);
+  // Rebuilt field by field: a spread of `entry` would keep a `delegatedAt` the
+  // rebasing transition is supposed to drop.
   return {
-    ...options.entry,
+    taskId: entry.taskId,
+    branch: entry.branch,
+    requestedAt: entry.requestedAt,
     state: options.state,
-    attempts: options.state === "rebasing" ? options.entry.attempts + 1 : options.entry.attempts,
+    attempts: options.state === "rebasing" ? entry.attempts + 1 : entry.attempts,
     updatedAt: options.now,
     ...(error === undefined ? {} : { lastError: error }),
+    ...(delegatedAt === undefined ? {} : { delegatedAt }),
   };
 }
 
@@ -1178,11 +1331,13 @@ function nextEntryState(options: {
  * small and idempotent, and losing a state update silently would make the
  * operator's view of the merge wrong while the repository already moved.
  */
-function transitionEntry(
-  context: MergeAttemptContext,
-  state: FleetMergeEntryState,
-  lastError: string | undefined,
-): { ok: true } | { ok: false; error: string } {
+function transitionEntry(options: {
+  context: MergeAttemptContext;
+  state: FleetMergeEntryState;
+  lastError: string | undefined;
+  delegatedAt?: number;
+}): { ok: true } | { ok: false; error: string } {
+  const context = options.context;
   const update = () =>
     updateFleetMergeQueue({
       gitCommonDir: context.options.gitCommonDir,
@@ -1196,7 +1351,15 @@ function transitionEntry(
           updatedAt: now,
           entries: base.entries.map((entry) =>
             entry.taskId === context.entry.taskId
-              ? nextEntryState({ entry, state, lastError, now })
+              ? nextEntryState({
+                  entry,
+                  state: options.state,
+                  lastError: options.lastError,
+                  now,
+                  ...(options.delegatedAt === undefined
+                    ? {}
+                    : { delegatedAt: options.delegatedAt }),
+                })
               : entry,
           ),
         };
@@ -1206,6 +1369,53 @@ function transitionEntry(
   let written = update();
   if (!written.ok && written.reason === "conflict") written = update();
   return written.ok ? { ok: true } : { ok: false, error: written.error };
+}
+
+export type MemberBranchBaseVerdict = { ok: true; based: boolean } | { ok: false; error: string };
+
+/**
+ * Whether a member branch already contains the base branch (bd-280).
+ *
+ * Compared by shas — `merge-base <base> <branch>` against the base's own commit —
+ * rather than `merge-base --is-ancestor`'s exit code, because this module's git
+ * seams return failures as values: an exit code that means "not an ancestor" is
+ * indistinguishable from a real git failure, and the caller would then retry a
+ * merge against a base the member still has not caught up with.
+ *
+ * The two `rev-parse --verify` probes are what make "unknown" expressible: a
+ * missing branch or base must not look like "not based", because the caller's
+ * guard only holds back a *proven* stale branch.
+ */
+export async function checkMemberBranchContainsBase(options: {
+  cwd: string;
+  baseBranch: string;
+  branch: string;
+  git: FleetMergeGitRunner;
+}): Promise<MemberBranchBaseVerdict> {
+  const base = await options.git(
+    ["rev-parse", "--verify", "--quiet", `${options.baseBranch}^{commit}`],
+    { cwd: options.cwd },
+  );
+  if (!base.ok) return { ok: false, error: commandError(base) };
+  const baseSha = base.stdout.trim();
+  if (baseSha === "") {
+    return { ok: false, error: `could not resolve ${options.baseBranch} in ${options.cwd}` };
+  }
+
+  const branch = await options.git(
+    ["rev-parse", "--verify", "--quiet", `${options.branch}^{commit}`],
+    { cwd: options.cwd },
+  );
+  if (!branch.ok) return { ok: false, error: commandError(branch) };
+  if (branch.stdout.trim() === "") {
+    return { ok: false, error: `could not resolve ${options.branch} in ${options.cwd}` };
+  }
+
+  const mergeBase = await options.git(["merge-base", options.baseBranch, options.branch], {
+    cwd: options.cwd,
+  });
+  if (!mergeBase.ok) return { ok: false, error: commandError(mergeBase) };
+  return { ok: true, based: mergeBase.stdout.trim() === baseSha };
 }
 
 /** Resolve the worktree path checked out on `branch`, from git's own listing. */
@@ -1905,12 +2115,19 @@ function parkFleet(
   return { ok: true };
 }
 
-/** Send one supervisor → member note kind through the existing fan-out. */
+/**
+ * Send one supervisor → member note kind through the existing fan-out.
+ *
+ * `auditNote` is appended to the audit detail so a decision that was not a plain
+ * per-branch probe (an unreadable base commit hinting everyone, bd-280 S8) is
+ * visible in `audit.log`, not only in the note bodies.
+ */
 function sendMergeNote(
   context: MergeAttemptContext,
   taskIds: readonly string[],
   kind: FleetNoteKind,
   body: string,
+  auditNote?: string,
 ): readonly string[] {
   if (taskIds.length === 0) return [];
   const recipients = resolveFleetNoteRecipients({
@@ -1941,16 +2158,26 @@ function sendMergeNote(
       `fleet ${context.options.fleetId}: ${kind} partially sent to ` +
         `${enqueued.writtenRecipients.join(", ") || "nobody"} (${enqueued.error})`,
     );
-    auditAttempt(context, kind, enqueued.writtenRecipients, `partial fan-out: ${enqueued.error}`);
+    auditAttempt(
+      context,
+      kind,
+      enqueued.writtenRecipients,
+      withAuditNote(`partial fan-out: ${enqueued.error}`, auditNote),
+    );
     return enqueued.writtenRecipients;
   }
   auditAttempt(
     context,
     kind,
     enqueued.recipients,
-    `sent to ${enqueued.recipients.length} member(s)`,
+    withAuditNote(`sent to ${enqueued.recipients.length} member(s)`, auditNote),
   );
   return enqueued.recipients;
+}
+
+/** `detail` plus an optional reason, so a plain send keeps its exact old wording. */
+function withAuditNote(detail: string, note: string | undefined): string {
+  return note === undefined ? detail : `${detail}; ${note}`;
 }
 
 /**
@@ -2022,6 +2249,13 @@ async function listWorktreesForBroadcast(
  * there is no second addressing path: every remaining member gets one
  * `base-moved` and one `sibling-landed`, and members whose branch does not yet
  * contain the new base commit also get a `rebase-hint`.
+ *
+ * Recipients are recorded in `context.broadcast` as soon as their note file is
+ * written, and every send is narrowed to the recipients **not** recorded yet, so a
+ * fan-out that threw or stopped on one member's unwritable directory (the
+ * landed-but-threw arm retries it, bd-280 S5) resumes with exactly the missing
+ * members: nobody is sent a second file, and nobody is skipped because a sibling
+ * got theirs (bd-280 S7).
  */
 async function broadcastBaseMoved(context: MergeAttemptContext): Promise<void> {
   const mergeCommit = context.mergeCommit;
@@ -2031,39 +2265,139 @@ async function broadcastBaseMoved(context: MergeAttemptContext): Promise<void> {
 
   const base = context.baseBranch;
   const merged = context.entry.taskId;
-  const baseMoved = sendMergeNote(
-    context,
-    remaining,
-    "base-moved",
-    `${base} moved to ${mergeCommit.slice(0, 12)} after ${merged} merged. Rebase your branch ` +
-      `onto ${base} before continuing.`,
-  );
-  const siblingLanded = sendMergeNote(
-    context,
-    remaining,
-    "sibling-landed",
-    `${merged} landed on ${base} (${mergeCommit.slice(0, 12)}). Your branch is unchanged; ` +
-      "this is a premise update, not an instruction to merge.",
-  );
+  // A note names the commit the members should contain, so an unreadable HEAD (a seam
+  // threw between the merge and the `rev-parse`) must still read as a move, not as an
+  // empty sha.
+  const sha = mergeCommit === "" ? "a new commit" : mergeCommit.slice(0, 12);
+  const baseMovedDue = notYetSent(context, "baseMoved", remaining);
+  if (baseMovedDue.length > 0) {
+    const written = sendMergeNote(
+      context,
+      baseMovedDue,
+      "base-moved",
+      `${base} moved to ${sha} after ${merged} merged. Rebase your branch ` +
+        `onto ${base} before continuing.`,
+    );
+    context.broadcast = {
+      ...context.broadcast,
+      baseMoved: [...context.broadcast.baseMoved, ...written],
+    };
+  }
 
+  const siblingLandedDue = notYetSent(context, "siblingLanded", remaining);
+  if (siblingLandedDue.length > 0) {
+    const written = sendMergeNote(
+      context,
+      siblingLandedDue,
+      "sibling-landed",
+      `${merged} landed on ${base} (${sha}). Your branch is unchanged; ` +
+        "this is a premise update, not an instruction to merge.",
+    );
+    context.broadcast = {
+      ...context.broadcast,
+      siblingLanded: [...context.broadcast.siblingLanded, ...written],
+    };
+  }
+
+  const hintDue = notYetSent(context, "rebaseHint", remaining);
+  if (hintDue.length === 0) return;
+  const probe = await membersBehindBase({ context, taskIds: hintDue, mergeCommit });
+  if (probe.basis !== undefined) context.warnings.push(probe.basis);
+  if (probe.behind.length === 0) return;
+  const written = sendMergeNote(
+    context,
+    probe.behind,
+    "rebase-hint",
+    `${base} moved to ${sha} and your branch does not contain it yet. ` +
+      "Rebase onto the new base before your next phase.",
+    probe.unreadableBaseCommit
+      ? "the merge commit was unreadable, so every remaining member was hinted"
+      : undefined,
+  );
+  context.broadcast = {
+    ...context.broadcast,
+    rebaseHint: [...context.broadcast.rebaseHint, ...written],
+  };
+}
+
+/** `taskIds` minus the ones whose note file for `kind` is already recorded. */
+function notYetSent(
+  context: MergeAttemptContext,
+  kind: "baseMoved" | "siblingLanded" | "rebaseHint",
+  taskIds: readonly string[],
+): readonly string[] {
+  const sent = context.broadcast[kind];
+  return taskIds.filter((taskId) => !sent.includes(taskId));
+}
+
+/**
+ * Which of `taskIds` do not contain `mergeCommit` yet (bd-280).
+ *
+ * An unreadable merge commit is named rather than probed: `merge-base --is-ancestor
+ * "" <branch>` fails for every member, so the per-member probe would turn a git
+ * error into "everyone gets a rebase-hint" by accident (bd-280 S8). The explicit
+ * branch hints the whole set, skips the probe (and the worktree listing it needs),
+ * and returns the sentence that becomes both a warning on the result and the audit
+ * detail's note, so the reason is visible to the operator and to a log reader.
+ */
+async function membersBehindBase(options: {
+  context: MergeAttemptContext;
+  taskIds: readonly string[];
+  mergeCommit: string;
+}): Promise<{
+  behind: readonly string[];
+  unreadableBaseCommit: boolean;
+  /** Why the whole set was hinted; a warning on the drain result. */
+  basis?: string;
+}> {
+  const context = options.context;
+  if (options.mergeCommit === "") {
+    return {
+      behind: options.taskIds,
+      unreadableBaseCommit: true,
+      basis:
+        `fleet ${context.options.fleetId}: the merge commit could not be read, so every ` +
+        `remaining member was sent a rebase-hint instead of probing its branch`,
+    };
+  }
   const worktrees = (await listWorktreesForBroadcast(context)) ?? [];
-  const notBased: string[] = [];
-  for (const taskId of remaining) {
+  const behind: string[] = [];
+  for (const taskId of options.taskIds) {
     const branch = resolveMemberBranch({ context, taskId, worktrees });
     if (branch === undefined) continue;
-    const contained = await context.git(["merge-base", "--is-ancestor", mergeCommit, branch], {
-      cwd: context.options.rootCwd,
-    });
-    if (!contained.ok) notBased.push(taskId);
+    const contained = await context.git(
+      ["merge-base", "--is-ancestor", options.mergeCommit, branch],
+      { cwd: context.options.rootCwd },
+    );
+    if (!contained.ok) behind.push(taskId);
   }
-  const rebaseHint = sendMergeNote(
-    context,
-    notBased,
-    "rebase-hint",
-    `${base} moved to ${mergeCommit.slice(0, 12)} and your branch does not contain it yet. ` +
-      "Rebase onto the new base before your next phase.",
-  );
-  context.broadcast = { baseMoved, siblingLanded, rebaseHint };
+  return { behind, unreadableBaseCommit: false };
+}
+
+/**
+ * Best-effort base-move fan-out for a drain that threw after the merge (bd-280 S5).
+ *
+ * The merge already moved the base, so every remaining member is now planning on a
+ * stale one: leaving the notices unsent costs each of them the premise update their
+ * next phase needs, and the refusal text can only tell the operator to do it by
+ * hand. It is best-effort on purpose — the throw that got us here may come from the
+ * very seams this fan-out uses, so a failure becomes a warning on the landed result
+ * rather than a second failure or a rejected promise. Nothing here can move the
+ * entry off `merged` or re-run a merge: it reads git and writes notes only, and
+ * {@link broadcastBaseMoved} records each recipient it has written, so a fan-out
+ * that already ran (a throw *after* the broadcast) is not repeated and a partial one
+ * resumes with the members it missed.
+ */
+async function broadcastAfterThrow(context: MergeAttemptContext): Promise<void> {
+  try {
+    await broadcastBaseMoved(context);
+  } catch (error) {
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: could not send the base-moved notices for ` +
+        `${context.entry.taskId} after a step threw (${describeThrown(error)}); the remaining ` +
+        "members may not know the base moved — check events/ and resend by hand",
+    );
+  }
 }
 
 /**
@@ -2145,12 +2479,437 @@ async function renewBeforeMutation(
   return undefined;
 }
 
-/** Rebase the member branch onto the base; refusals are returned, never thrown. */
+/** `--format` for commit facts: sha plus committer seconds, one per line. */
+const REBASE_COMMIT_FORMAT = "%H %ct";
+
+/** How many commits per side are read for attribution. */
+const REBASE_COMMIT_READ_LIMIT = "20";
+
+/** Parse `git log --format=%H %ct` output into commit facts. */
+function parseCommitFacts(stdout: string): readonly RebaseCommitFact[] {
+  const facts: RebaseCommitFact[] = [];
+  for (const line of stdout.split("\n")) {
+    const [sha, seconds] = line.trim().split(" ");
+    if (sha === undefined || sha === "" || seconds === undefined) continue;
+    const committedAtInSeconds = Number(seconds);
+    if (!Number.isFinite(committedAtInSeconds)) continue;
+    facts.push({ sha, committedAt: committedAtInSeconds * 1000 });
+  }
+  return facts;
+}
+
+/** One revision's commits that touched one path; unreadable commits become a warning. */
+async function readPathCommits(
+  context: MergeAttemptContext,
+  cwd: string,
+  revisionRange: string,
+  path: string,
+): Promise<readonly RebaseCommitFact[]> {
+  const logged = await gitWithError(
+    context,
+    [
+      "-c",
+      "core.quotePath=false",
+      "log",
+      revisionRange,
+      `--format=${REBASE_COMMIT_FORMAT}`,
+      "-n",
+      REBASE_COMMIT_READ_LIMIT,
+      "--",
+      path,
+    ],
+    cwd,
+  );
+  if (logged.ok) return parseCommitFacts(logged.stdout);
+  // Attribution is the only thing lost here, and it must not abort the drain: an
+  // unreadable `log` degrades the class (never claims a contradiction it cannot
+  // name) and says so, rather than guessing a sibling's work.
+  context.warnings.push(
+    `fleet ${context.options.fleetId}: could not read the commits of ${path} in ${cwd} ` +
+      `(${logged.error}); the rebase conflict is classified without them`,
+  );
+  return [];
+}
+
+/**
+ * The conflicts of a stopped rebase, with each side's commits.
+ *
+ * Must be called while the rebase is stopped: once it is aborted or continued the
+ * unmerged index is gone, and with it every fact the classification is built on.
+ */
+async function readRebaseConflicts(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+): Promise<
+  { ok: true; conflicts: readonly RebaseConflictedPath[] } | { ok: false; error: string }
+> {
+  const status = await gitWithError(
+    context,
+    ["-c", "core.quotePath=false", "status", "--porcelain", "-z"],
+    memberWorktree,
+  );
+  if (!status.ok) return { ok: false, error: status.error };
+
+  const conflicts: RebaseConflictedPath[] = [];
+  for (const path of parseConflictedPaths(status.stdout)) {
+    conflicts.push({
+      path,
+      // The member's own commits are read from the *branch*, not from `HEAD`: a
+      // stopped rebase has HEAD detached at the base, so `base..HEAD` is empty
+      // exactly while the conflict exists. The branch ref still points at the
+      // member's tip until the rebase finishes.
+      memberCommits: await readPathCommits(
+        context,
+        context.options.rootCwd,
+        `${context.baseBranch}..${context.entry.branch}`,
+        path,
+      ),
+      baseCommits: await readPathCommits(
+        context,
+        context.options.rootCwd,
+        context.baseBranch,
+        path,
+      ),
+    });
+  }
+  return { ok: true, conflicts };
+}
+
+/** Whether the member worktree actually has a rebase in progress, and where. */
+async function rebaseInProgress(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+): Promise<boolean> {
+  for (const name of ["rebase-merge", "rebase-apply"]) {
+    const gitPath = await gitOk(context, ["rev-parse", "--git-path", name], memberWorktree);
+    if (gitPath === undefined || gitPath.trim() === "") continue;
+    const raw = gitPath.trim();
+    // `--git-path` is absolute inside a linked worktree and relative to the
+    // worktree in a plain one, so both forms have to resolve before the existence
+    // check can answer for the worktree we mean.
+    const resolved = isAbsolute(raw) ? raw : resolve(memberWorktree, raw);
+    if (context.fs.existsSync(resolved)) return true;
+  }
+  return false;
+}
+
+/** Abort the stopped rebase, warning (W6) when git refuses. */
+async function abortRebase(context: MergeAttemptContext, memberWorktree: string): Promise<void> {
+  const aborted = await gitWithError(context, ["rebase", "--abort"], memberWorktree);
+  if (aborted.ok) return;
+  // A failed abort leaves the member mid-rebase; the next action would hit an
+  // unexplained "rebase in progress" (W6), so say it here.
+  context.warnings.push(
+    `fleet ${context.options.fleetId}: could not abort the rebase in ${memberWorktree} ` +
+      `(${aborted.error}); that worktree is probably still mid-rebase`,
+  );
+}
+
+/** Stop a classified rebase with the failure the caller records. */
+function rebaseClassFailure(
+  context: MergeAttemptContext,
+  rebaseClass: FleetRebaseClass,
+  reason: string,
+): MergeCheckFailure {
+  const text = rebaseConflictText({
+    rebaseClass,
+    branch: context.entry.branch,
+    baseBranch: context.baseBranch,
+    reason,
+  });
+  const paths = "paths" in rebaseClass ? rebaseClass.paths : [];
+  auditAttempt(context, "merge-rebase-failed", [context.entry.taskId], text);
+  return {
+    reason: "rebase-failed",
+    text,
+    ...(paths.length === 0 ? {} : { paths }),
+  };
+}
+
+/**
+ * The stale-state class: clear what a crashed attempt left, then retry once.
+ *
+ * Clearing is the new information the "never retry an unchanged base" rule needs:
+ * with no conflicted paths the first attempt failed before it produced a conflict
+ * (an index lock, a leftover `.git/rebase-merge`), so the same command against the
+ * same base is a different situation afterwards. It is deliberately bounded — one
+ * recovery, one retry per drain — and a retry that fails is classified like any
+ * other failure, never retried a second time.
+ *
+ * `.git/index.lock` is never deleted: a live member process can hold it, and
+ * removing a live lock is how concurrent writers corrupt an index.
+ */
+async function recoverStaleRebase(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  reason: string,
+): Promise<MergeCheckFailure | undefined> {
+  const renewed = await renewBeforeMutation(context);
+  // The stopped rebase is cleared *before* a lost lock is returned: the drain's
+  // invariant is that every exit either clears the stopped rebase or parks the
+  // entry with its paths recorded, and a lost lock is still an exit (bd-280 C1).
+  // The other classes abort first for the same reason.
+  if (await rebaseInProgress(context, memberWorktree)) {
+    await abortRebase(context, memberWorktree);
+  }
+  if (renewed !== undefined) return renewed;
+
+  const retried = await gitWithError(context, ["rebase", context.baseBranch], memberWorktree);
+  if (retried.ok) {
+    auditAttempt(
+      context,
+      "merge-rebase-recovered",
+      [context.entry.taskId],
+      `cleared the stale rebase state and retried once: ${reason}`,
+    );
+    return undefined;
+  }
+
+  // The retry produced a new failure, not a second chance: classify it and
+  // dispatch through the same class→action mapping, with the retry bound spent.
+  return handleRebaseFailure(context, memberWorktree, {
+    reason: `first attempt: ${reason}; retry: ${retried.error}`,
+    allowRecovery: false,
+  });
+}
+
+/**
+ * The generated class: take the base side of derived paths, regenerate, continue.
+ *
+ * `checkout --ours` during a rebase is the *base* side (HEAD is the upstream being
+ * rebased onto), which is why this is not an auto-resolution of anyone's source: a
+ * lockfile, a build tree, or a snapshot is an artifact of a command, and the base's
+ * artifact is recreated from the base's manifest. Every failure aborts the rebase
+ * and stops with the step that failed named.
+ */
+async function regenerateRebaseConflict(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  rebaseClass: Extract<FleetRebaseClass, { kind: "generated" }>,
+): Promise<MergeCheckFailure | undefined> {
+  const renewed = await renewBeforeMutation(context);
+  if (renewed !== undefined) {
+    await abortRebase(context, memberWorktree);
+    return renewed;
+  }
+
+  const checkedOut = await gitWithError(
+    context,
+    ["checkout", "--ours", "--", ...rebaseClass.paths],
+    memberWorktree,
+  );
+  if (!checkedOut.ok) {
+    await abortRebase(context, memberWorktree);
+    return rebaseClassFailure(
+      context,
+      rebaseClass,
+      `could not take the base side of the generated paths: ${checkedOut.error}`,
+    );
+  }
+
+  const kinds = rebaseClass.paths.map((path) => classifyGeneratedPath(path));
+  const gates = readFleetGateCommands({ rootCwd: context.options.rootCwd, fs: context.fs });
+  const regenerate = context.options.regenerate ?? defaultFleetMergeRegenerateRunner;
+  const regenerated = await regenerate({
+    cwd: memberWorktree,
+    paths: rebaseClass.paths,
+    runner: gates.ok ? gates.runner : "npm",
+    installRequired: kinds.includes("lockfile"),
+    buildRequired: kinds.includes("derived"),
+    hasBuildScript: gates.ok && gates.commands.some((gate) => gate.name === "build"),
+  });
+  if (!regenerated.ok) {
+    await abortRebase(context, memberWorktree);
+    return rebaseClassFailure(context, rebaseClass, `regeneration failed: ${regenerated.error}`);
+  }
+
+  const added = await gitWithError(context, ["add", "--", ...rebaseClass.paths], memberWorktree);
+  if (!added.ok) {
+    await abortRebase(context, memberWorktree);
+    return rebaseClassFailure(
+      context,
+      rebaseClass,
+      `could not stage the regenerated paths: ${added.error}`,
+    );
+  }
+
+  // `core.editor=true` keeps the continue fully non-interactive: a rebase that
+  // opens an editor under the supervisor would hang until the command timeout.
+  const continued = await gitWithError(
+    context,
+    ["-c", "core.editor=true", "rebase", "--continue"],
+    memberWorktree,
+  );
+  if (continued.ok) {
+    auditAttempt(
+      context,
+      "merge-rebase-recovered",
+      [context.entry.taskId],
+      `regenerated ${formatRebasePathList(rebaseClass.paths)} from the base side`,
+    );
+    return undefined;
+  }
+  await abortRebase(context, memberWorktree);
+  return rebaseClassFailure(context, rebaseClass, `rebase --continue failed: ${continued.error}`);
+}
+
+/**
+ * The delegation class: ask the member to resolve it, and do not stop the fleet.
+ *
+ * The drain already broadcasts a `rebase-hint` on every success, so self-rebase is
+ * the designed first line; this is the same request for the fallback that failed.
+ * The entry is left `failed` with `delegatedAt` so a later tick can tell "still
+ * waiting for the member" from "try again": that marker is what keeps a re-drain
+ * from retrying against a base the member has not caught up with.
+ */
+async function delegateRebase(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  rebaseClass: Extract<FleetRebaseClass, { kind: "delegable" }>,
+): Promise<MergeCheckFailure> {
+  const renewed = await renewBeforeMutation(context);
+  // The abort happens even when the lease was lost: leaving the member mid-rebase
+  // would hand the next attempt an unexplained "rebase in progress" (W6). The lost
+  // lease then wins as the reason, because nothing further may be attempted.
+  await abortRebase(context, memberWorktree);
+  if (renewed !== undefined) return renewed;
+  const sent = sendMergeNote(
+    context,
+    [context.entry.taskId],
+    "rebase-hint",
+    `${context.baseBranch} and your branch conflict in ${formatRebasePathList(rebaseClass.paths)}. ` +
+      `Resolve the conflict against ${context.baseBranch}, re-run your own gates, and tell the ` +
+      "supervisor to land again; this is your rebase to resolve, not the operator's.",
+  );
+  if (!sent.includes(context.entry.taskId)) {
+    // A delegation is a request, and a member that was never asked cannot be
+    // expected to act: delegating without a note would park the landing for the
+    // whole grace window and then stop it anyway. Stop now instead, with the note
+    // failure as the reason (bd-280 W4) — the alternative is a tick that claims a
+    // member was asked when nothing reached it.
+    return rebaseClassFailure(
+      context,
+      rebaseClass,
+      "the rebase-hint could not be written to the member, so nobody was asked to resolve " +
+        "this conflict",
+    );
+  }
+  const text = rebaseConflictText({
+    rebaseClass,
+    branch: context.entry.branch,
+    baseBranch: context.baseBranch,
+  });
+  return {
+    reason: "rebase-delegated",
+    text,
+    paths: rebaseClass.paths,
+    // The complete list travels with the delegation: the bounded `text` loses it
+    // past five paths, and the tick must still be able to report and record it.
+    delegated: { taskId: context.entry.taskId, paths: rebaseClass.paths },
+  };
+}
+
+/** Abort the stopped rebase, then report the class as the failure it is. */
+async function stopRebase(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  rebaseClass: FleetRebaseClass,
+  reason: string,
+): Promise<MergeCheckFailure> {
+  // bd-279 opens the escalation gate from the resulting `land-failed` stop on the
+  // next tick; there is deliberately no gate code here.
+  await abortRebase(context, memberWorktree);
+  return rebaseClassFailure(context, rebaseClass, reason);
+}
+
+/**
+ * The members this run already landed, which is the only proof of a sibling's work.
+ *
+ * `landedAt` is written when the drain merged the member, so a member named here
+ * put commits on the base through this fleet. Base commits without such a member
+ * are still inside the fleet window (a person can commit too) but nothing proves
+ * who wrote them, so the stop text must not claim a sibling (bd-280 W2).
+ */
+function landedSiblingTaskIds(context: MergeAttemptContext): readonly string[] {
+  const members = context.intent.run?.members ?? [];
+  return members
+    .filter((member) => member.landedAt !== undefined && member.taskId !== context.entry.taskId)
+    .map((member) => member.taskId);
+}
+
+/**
+ * The one decision point for a failed rebase: read it, classify it, act on the class.
+ *
+ * Shared by the first attempt and by a failed recovery retry (bd-280 W1): a retry
+ * that conflicts again is a new failure to classify, so a generated conflict is
+ * regenerated and a delegable one delegated rather than being binned as `unknown`.
+ * `allowRecovery` is the only difference between them — the one-retry bound is per
+ * drain, so a retry's failure never retries again.
+ */
+async function handleRebaseFailure(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  options: { reason: string; allowRecovery: boolean },
+): Promise<MergeCheckFailure | undefined> {
+  const read = await readRebaseConflicts(context, memberWorktree);
+  if (!read.ok) {
+    await abortRebase(context, memberWorktree);
+    const text =
+      `rebase of ${context.entry.branch} onto ${context.baseBranch} failed and its conflicted ` +
+      `paths could not be read: ${read.error}`;
+    auditAttempt(context, "merge-rebase-failed", [context.entry.taskId], text);
+    return { reason: "rebase-failed", text };
+  }
+
+  const rebaseClass = classifyRebaseFailure({
+    conflicts: read.conflicts,
+    fleetStartedAt: context.intent.createdAt,
+    memberLive: context.options.memberLease === "live",
+    landedSiblings: landedSiblingTaskIds(context),
+  });
+  // Emitted for every failure — the first attempt, a recovery retry's, and the
+  // `unknown` fall-through — so the audit says what the drain decided even when
+  // the decision was to stop.
+  auditAttempt(
+    context,
+    "merge-rebase-classified",
+    [context.entry.taskId],
+    `${rebaseClass.kind}: ${formatRebasePathList(read.conflicts.map((conflict) => conflict.path))}`,
+  );
+
+  switch (rebaseClass.kind) {
+    case "not-a-conflict":
+      return options.allowRecovery
+        ? recoverStaleRebase(context, memberWorktree, options.reason)
+        : stopRebase(context, memberWorktree, rebaseClass, options.reason);
+    case "generated":
+      return regenerateRebaseConflict(context, memberWorktree, rebaseClass);
+    case "delegable":
+      return delegateRebase(context, memberWorktree, rebaseClass);
+    case "contradiction":
+    case "unknown":
+      return stopRebase(context, memberWorktree, rebaseClass, options.reason);
+  }
+}
+
+/**
+ * Rebase the member branch onto the base, classifying a failure before acting.
+ *
+ * Before bd-280 every non-zero exit aborted and stopped the member. The class is
+ * read from the stopped rebase (the only moment the conflicted index exists) and
+ * decides: clear-and-retry a stale state, regenerate derived paths, delegate to a
+ * live member, or stop with the facts. Only the last two can leave the entry
+ * failed; only `contradiction`/`unknown` stop the fleet.
+ */
 async function rebaseMember(
   context: MergeAttemptContext,
   memberWorktree: string,
 ): Promise<MergeCheckFailure | undefined> {
-  const transitioned = transitionEntry(context, "rebasing", undefined);
+  const transitioned = transitionEntry({
+    context,
+    state: "rebasing",
+    lastError: undefined,
+  });
   if (!transitioned.ok) {
     return { reason: "queue-write-failed", text: transitioned.error };
   }
@@ -2160,18 +2919,10 @@ async function rebaseMember(
   const rebased = await gitWithError(context, ["rebase", context.baseBranch], memberWorktree);
   if (rebased.ok) return undefined;
 
-  const aborted = await gitWithError(context, ["rebase", "--abort"], memberWorktree);
-  if (!aborted.ok) {
-    // A failed abort leaves the member mid-rebase; the next action would hit an
-    // unexplained "rebase in progress" (W6), so say it here.
-    context.warnings.push(
-      `fleet ${context.options.fleetId}: could not abort the rebase in ${memberWorktree} ` +
-        `(${aborted.error}); that worktree is probably still mid-rebase`,
-    );
-  }
-  const text = `rebase of ${context.entry.branch} onto ${context.baseBranch} failed: ${rebased.error}`;
-  auditAttempt(context, "merge-rebase-failed", [context.entry.taskId], text);
-  return { reason: "rebase-failed", text };
+  return handleRebaseFailure(context, memberWorktree, {
+    reason: rebased.error,
+    allowRecovery: true,
+  });
 }
 
 /** Run the project's gates against the rebased member worktree. */
@@ -2185,7 +2936,7 @@ async function runMergeGates(
     auditAttempt(context, "merge-gate-failed", [context.entry.taskId], text);
     return { reason: "gate-commands-missing", text };
   }
-  const transitioned = transitionEntry(context, "gating", undefined);
+  const transitioned = transitionEntry({ context, state: "gating", lastError: undefined });
   if (!transitioned.ok) {
     return { reason: "queue-write-failed", text: transitioned.error };
   }
@@ -2216,7 +2967,7 @@ async function runMergeGates(
 
 /** Fast-forward the root checkout to the rebased member branch. */
 async function mergeMember(context: MergeAttemptContext): Promise<MergeCheckFailure | undefined> {
-  const transitioned = transitionEntry(context, "merging", undefined);
+  const transitioned = transitionEntry({ context, state: "merging", lastError: undefined });
   if (!transitioned.ok) {
     return { reason: "queue-write-failed", text: transitioned.error };
   }
@@ -2238,6 +2989,10 @@ async function mergeMember(context: MergeAttemptContext): Promise<MergeCheckFail
     auditAttempt(context, "merge-failed", [context.entry.taskId], text);
     return { reason: "merge-failed", text };
   }
+  // The fast-forward is the point of no return, so the marker is set before HEAD is
+  // read: a seam that throws in between must never be reported as a merge that did
+  // not happen (bd-280 WF).
+  context.mergeCommit = "";
   const head = await gitOk(context, ["rev-parse", "HEAD"], context.options.rootCwd);
   context.mergeCommit = head?.trim() ?? "";
   return undefined;
@@ -2245,13 +3000,28 @@ async function mergeMember(context: MergeAttemptContext): Promise<MergeCheckFail
 
 /** Release the lock and collect any warning; never throws. */
 function releaseForDrain(context: MergeAttemptContext): void {
-  const released = releaseFleetMerge({
-    gitCommonDir: context.options.gitCommonDir,
-    fleetId: context.options.fleetId,
-    fs: context.fs,
-    holder: context.options.sessionId,
-    now: context.clock(),
-  });
+  // Idempotent so the drain's `finally` can hold the belt-and-braces release
+  // without double-releasing (and without a second warning) after a finisher.
+  if (context.lockReleased) return;
+  context.lockReleased = true;
+  let released: ReleaseFleetMergeResult;
+  try {
+    released = releaseFleetMerge({
+      gitCommonDir: context.options.gitCommonDir,
+      fleetId: context.options.fleetId,
+      fs: context.fs,
+      holder: context.options.sessionId,
+      now: context.clock(),
+    });
+  } catch (error) {
+    // A hostile fs seam must not reject the drain from its own cleanup: the lease
+    // expires on its own, which is the documented fallback (bd-280 WF).
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: releasing the merge lock threw ` +
+        `(${describeThrown(error)}); it becomes acquirable when its lease expires`,
+    );
+    return;
+  }
   if (!released.ok) {
     context.warnings.push(
       `fleet ${context.options.fleetId}: could not release the merge lock (${released.error}); ` +
@@ -2334,6 +3104,7 @@ function drainFailure(options: {
   text: string;
   taskId?: string;
   paths?: readonly string[];
+  delegated?: { taskId: string; paths: readonly string[] };
   parked?: boolean;
   warnings: readonly string[];
 }): DrainFleetMergeResult {
@@ -2343,6 +3114,7 @@ function drainFailure(options: {
     text: options.text,
     ...(options.taskId === undefined ? {} : { taskId: options.taskId }),
     ...(options.paths === undefined ? {} : { paths: options.paths }),
+    ...(options.delegated === undefined ? {} : { delegated: options.delegated }),
     parked: options.parked ?? false,
     warnings: options.warnings,
   };
@@ -2442,7 +3214,9 @@ function prepareDrainContext(
       entry,
       clock,
       warnings: [],
+      lockReleased: false,
       broadcast: { baseMoved: [], siblingLanded: [], rebaseHint: [] },
+      mergeCompletionAudited: false,
     },
   };
 }
@@ -2457,8 +3231,40 @@ function drainRefusal(
     text: failure.text,
     taskId: context.entry.taskId,
     ...(failure.paths === undefined ? {} : { paths: failure.paths }),
+    ...(failure.delegated === undefined ? {} : { delegated: failure.delegated }),
     warnings: context.warnings,
   });
+}
+
+/**
+ * Reconcile a failure with the `failed` transition it needed (bd-280 W3/S3).
+ *
+ * A delegation is only self-limiting once the queue carries `delegatedAt`, which is
+ * exactly what the tick's hold keys on. If that write failed, reporting a delegation
+ * would re-run the whole rebase and send a fresh hint every couple of seconds, so the
+ * result is downgraded to the stop the conflict would have been had nobody been able
+ * to decide: the rebase is already aborted and the paths are recorded. The single
+ * `merge-rebase-failed` entry is written here, after the text is final, so it cannot
+ * read as two events for one failure.
+ */
+function recordedFailedState(
+  context: MergeAttemptContext,
+  rawFailure: MergeCheckFailure,
+  transition: { ok: true } | { ok: false; error: string },
+): MergeCheckFailure {
+  if (transition.ok) return rawFailure;
+  context.warnings.push(transition.error);
+  if (rawFailure.delegated === undefined) return rawFailure;
+  const failure: MergeCheckFailure = {
+    reason: "rebase-failed",
+    text:
+      `rebase of ${context.entry.branch} onto ${context.baseBranch} conflicted and the ` +
+      `delegation could not be recorded in the merge queue (${transition.error}); ` +
+      "stopping for a human instead of re-asking the member on every tick",
+    ...(rawFailure.paths === undefined ? {} : { paths: rawFailure.paths }),
+  };
+  auditAttempt(context, "merge-rebase-failed", [context.entry.taskId], failure.text);
+  return failure;
 }
 
 /**
@@ -2469,10 +3275,29 @@ function drainRefusal(
  */
 async function finishFailedDrain(
   context: MergeAttemptContext,
-  failure: MergeCheckFailure,
+  rawFailure: MergeCheckFailure,
 ): Promise<DrainFleetMergeResult> {
-  const transitioned = transitionEntry(context, "failed", failure.text);
-  if (!transitioned.ok) context.warnings.push(transitioned.error);
+  // A failure reported after the fast-forward moved the base is not a failed merge:
+  // this is the same rule a throwing finisher follows, reached through the sequence
+  // (a step between the merge and the finishers threw). Keeping the entry `merged`
+  // is what stops a landed member from looking unmerged to every later tick.
+  if (context.mergeCommit !== undefined) {
+    auditMergeCompletedOnce(context);
+    return mergedAfterThrowResult(context, rawFailure.text);
+  }
+  const failure = recordedFailedState(
+    context,
+    rawFailure,
+    transitionEntry({
+      context,
+      state: "failed",
+      lastError: rawFailure.text,
+      // A delegated failure records the marker here so the queue itself says "the
+      // member owes this rebase", not just the run's stop list (which has no entry
+      // for it: the member is deliberately not stopped).
+      ...(rawFailure.delegated === undefined ? {} : { delegatedAt: context.clock() }),
+    }),
+  );
 
   const restore = await restoreRootStash(context);
   let parked = false;
@@ -2494,6 +3319,7 @@ async function finishFailedDrain(
     text,
     taskId: context.entry.taskId,
     ...(failure.paths === undefined ? {} : { paths: failure.paths }),
+    ...(failure.delegated === undefined ? {} : { delegated: failure.delegated }),
     ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
     parked,
     warnings: context.warnings,
@@ -2508,14 +3334,15 @@ async function finishFailedDrain(
 async function finishSuccessfulDrain(context: MergeAttemptContext): Promise<DrainFleetMergeResult> {
   const entry = context.entry;
   const mergeCommit = context.mergeCommit ?? "";
-  const mergedTransition = transitionEntry(context, "merged", undefined);
-  if (!mergedTransition.ok) context.warnings.push(mergedTransition.error);
-  auditAttempt(
+  const mergedTransition = transitionEntry({
     context,
-    "merge-completed",
-    [entry.taskId],
-    `merged ${entry.branch} into ${context.baseBranch} at ${mergeCommit}`,
-  );
+    state: "merged",
+    lastError: undefined,
+  });
+  if (!mergedTransition.ok) context.warnings.push(mergedTransition.error);
+  // The audit lives in one helper so the landed arms cannot add a second entry for a
+  // merge this attempt already recorded (bd-280 S6).
+  auditMergeCompletedOnce(context);
 
   const restore = await restoreRootStash(context);
   let parked = false;
@@ -2620,13 +3447,238 @@ export async function drainFleetMerge(
     return drainRefusal(context, stillQueued);
   }
 
-  const stashed = await stashRootIfDirty(context);
-  if (stashed !== undefined) return finishFailedDrain(context, stashed);
+  try {
+    const stashed = await stashRootIfDirty(context);
+    if (stashed !== undefined) return await finishGuarded(context, stashed);
 
-  const failed = await attemptMergeSequence(context, preconditions.memberWorktree);
-  if (failed !== undefined) return finishFailedDrain(context, failed);
+    let failed: MergeCheckFailure | undefined;
+    try {
+      failed = await attemptMergeSequence(context, preconditions.memberWorktree);
+    } catch (error) {
+      // The seams are supposed to return failures as values, and every one of them
+      // does; this is the belt for the one that does not. Without it a throw escapes
+      // with the merge lock held and the member possibly mid-rebase, and the caller
+      // gets a rejected promise instead of a result (bd-280 W6).
+      failed = await thrownStepFailure(context, preconditions.memberWorktree, error);
+    }
+    return await finishGuarded(context, failed);
+  } finally {
+    // The finishers release the lock on every defined path; this holds the same
+    // invariant when a finisher's own seam throws, so a rejected promise can never
+    // leave the fleet single-flight forever (bd-280 W6).
+    releaseForDrain(context);
+  }
+}
 
-  return finishSuccessfulDrain(context);
+/**
+ * Run the finisher for this attempt, converting a seam throw into a result
+ * (bd-280 WF).
+ *
+ * The finishers call the same fs/git seams as the sequence, and `drainFleetMerge`
+ * promises a result, never a rejected promise. `undefined` means the sequence
+ * landed the member; anything else is the refusal it stopped for.
+ */
+async function finishGuarded(
+  context: MergeAttemptContext,
+  failure: MergeCheckFailure | undefined,
+): Promise<DrainFleetMergeResult> {
+  try {
+    return failure === undefined
+      ? await finishSuccessfulDrain(context)
+      : await finishFailedDrain(context, failure);
+  } catch (error) {
+    return finisherThrownResult(context, failure, error);
+  }
+}
+
+/**
+ * Report a finisher that threw instead of returning a result (bd-280 WF).
+ *
+ * Two facts survive any such throw: `context.mergeCommit` is set by the
+ * fast-forward itself, so its presence means the base branch really advanced; and
+ * a drain that was already refusing keeps that refusal as its reason, because a
+ * cleanup failure must not mask what the operator has to fix.
+ */
+async function finisherThrownResult(
+  context: MergeAttemptContext,
+  primary: MergeCheckFailure | undefined,
+  error: unknown,
+): Promise<DrainFleetMergeResult> {
+  const detail = describeThrown(error);
+  const entry = context.entry;
+  const landed = context.mergeCommit !== undefined;
+  // A landed merge's completion audit goes first: the throw came after the base
+  // branch advanced, so replaying `audit.log` in order shows the merge before the
+  // step that failed on it (bd-280 S6).
+  if (landed) auditMergeCompletedOnce(context);
+  auditAttempt(context, "merge-step-threw", [entry.taskId], detail);
+
+  if (landed) return mergedAfterThrowResult(context, detail);
+
+  // Nothing reached the base branch. A delegation the record write dropped is not a
+  // delegation any more (bd-280 W3), so it becomes the stop it would have been; every
+  // other refusal keeps its reason and gains only the cleanup note.
+  if (primary?.delegated !== undefined) {
+    const text =
+      `rebase of ${entry.branch} onto ${context.baseBranch} conflicted and the delegation ` +
+      `could not be recorded (${detail}); stopping for a human instead of re-asking the ` +
+      "member on every tick";
+    reassertFailedEntry(context, text);
+    return drainFailure({
+      reason: "rebase-failed",
+      text,
+      taskId: entry.taskId,
+      ...(primary.paths === undefined ? {} : { paths: primary.paths }),
+      ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
+      warnings: context.warnings,
+    });
+  }
+  const primaryText =
+    primary?.text ?? `finishing the merge attempt for ${entry.branch} threw before reporting`;
+  reassertFailedEntry(context, primaryText);
+  return drainFailure({
+    reason: primary?.reason ?? "step-failed",
+    text:
+      `${primaryText}\nfinishing this drain also threw (${detail}); the merge lock was released, ` +
+      "but the queue record or the root restore may be incomplete — inspect them before retrying",
+    taskId: entry.taskId,
+    ...(primary?.paths === undefined ? {} : { paths: primary.paths }),
+    ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
+    warnings: context.warnings,
+  });
+}
+
+/**
+ * Report a failure that happened *after* the fast-forward moved the base branch.
+ *
+ * `context.mergeCommit` is set by the merge itself, so its presence means the
+ * member's work is on the base: the entry is re-asserted as `merged` (idempotently,
+ * so a throw inside the transition cannot leave it unfinished) and never downgraded
+ * to `failed`, and the text says the merge happened. The caller has already audited
+ * the throw as `merge-step-threw`.
+ *
+ * The base-move fan-out is then attempted best-effort: a throw after the merge is
+ * exactly when the remaining members would otherwise never learn that the base
+ * moved (bd-280 S5).
+ */
+async function mergedAfterThrowResult(
+  context: MergeAttemptContext,
+  detail: string,
+): Promise<DrainFleetMergeResult> {
+  const entry = context.entry;
+  reassertMergedEntry(context);
+  await broadcastAfterThrow(context);
+  context.warnings.push(
+    `fleet ${context.options.fleetId}: a step after merging ${entry.taskId} failed (${detail}); ` +
+      "the merge is landed and is not retried",
+  );
+  const mergeCommit = context.mergeCommit ?? "";
+  const sha = mergeCommit === "" ? "an unreadable sha" : mergeCommit.slice(0, 12);
+  return drainFailure({
+    reason: "step-failed",
+    text:
+      `merged ${entry.taskId} into ${context.baseBranch} at ${sha}, but ${detail}; ` +
+      "the merge landed and is not retried — the remaining members were told about the new " +
+      "base best-effort, so finish any other pending cleanup (the root restore) by hand",
+    taskId: entry.taskId,
+    ...(context.stashRef === undefined ? {} : { stashRef: context.stashRef }),
+    warnings: context.warnings,
+  });
+}
+
+/** The `merge-completed` detail: what landed, where, and at which commit. */
+function mergeCompletedDetail(context: MergeAttemptContext): string {
+  const mergeCommit = context.mergeCommit ?? "";
+  const sha = mergeCommit === "" ? "an unreadable sha" : mergeCommit;
+  return `merged ${context.entry.branch} into ${context.baseBranch} at ${sha}`;
+}
+
+/**
+ * The `merge-completed` audit for a landed merge, written at most once per drain
+ * attempt (bd-280 S6).
+ *
+ * The marker is {@link MergeAttemptContext.mergeCompletionAudited}, never the queue
+ * entry: the entry's writes are best-effort, so it is either missing (`rebasing`
+ * after a failed `merged` transition) or present (`merged`, while the audit append
+ * that follows it failed) in exactly the cases where the audit must still be honest.
+ * The flag is set only when the append returned success, so the landed arm retries a
+ * failed append once — a landed merge must not lose the one entry an operator greps
+ * for — and every landed arm (the success finisher, the landed throw, the failure
+ * finisher) consults the same flag, so a merge can never be audited twice.
+ */
+function auditMergeCompletedOnce(context: MergeAttemptContext): void {
+  if (context.mergeCompletionAudited) return;
+  const written = auditAttempt(
+    context,
+    "merge-completed",
+    [context.entry.taskId],
+    mergeCompletedDetail(context),
+  );
+  if (written) context.mergeCompletionAudited = true;
+}
+
+/** Re-assert `merged` for an entry whose merge already reached the base branch. */
+function reassertMergedEntry(context: MergeAttemptContext): void {
+  try {
+    const recorded = transitionEntry({ context, state: "merged", lastError: undefined });
+    if (!recorded.ok) context.warnings.push(recorded.error);
+  } catch (error) {
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: could not re-record ${context.entry.taskId} as merged ` +
+        `after a finisher threw (${describeThrown(error)}); the base branch advanced, so treat ` +
+        "the merge as landed",
+    );
+  }
+}
+
+/** Best-effort `failed` state for a drain that could not finish its own report. */
+function reassertFailedEntry(context: MergeAttemptContext, text: string): void {
+  try {
+    const recorded = transitionEntry({ context, state: "failed", lastError: text });
+    if (!recorded.ok) context.warnings.push(recorded.error);
+  } catch (error) {
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: could not record ${context.entry.taskId} as failed ` +
+        `(${describeThrown(error)}); the queue entry may still read as in flight`,
+    );
+  }
+}
+
+/**
+ * Turn a thrown merge-step seam into the failure the drain records (bd-280 W6).
+ *
+ * The rebase is the step that mutates the member worktree, so a throw is followed
+ * by a best-effort abort: the "no worktree left mid-rebase" invariant every
+ * classified path keeps applies here too. Both calls are guarded because the seam
+ * that threw may be the very one they would use.
+ */
+async function thrownStepFailure(
+  context: MergeAttemptContext,
+  memberWorktree: string,
+  error: unknown,
+): Promise<MergeCheckFailure> {
+  const detail = error instanceof Error ? error.message : String(error);
+  context.warnings.push(
+    `fleet ${context.options.fleetId}: a merge step for ${context.entry.taskId} threw (${detail}); ` +
+      "releasing the merge lock and clearing any stopped rebase",
+  );
+  auditAttempt(context, "merge-step-threw", [context.entry.taskId], detail);
+  try {
+    if (await rebaseInProgress(context, memberWorktree)) {
+      await abortRebase(context, memberWorktree);
+    }
+  } catch (nested) {
+    const nestedDetail = nested instanceof Error ? nested.message : String(nested);
+    context.warnings.push(
+      `fleet ${context.options.fleetId}: could not clear the rebase in ${memberWorktree} after ` +
+        `that throw (${nestedDetail}); it may still be mid-rebase, so the next attempt needs ` +
+        "`git rebase --abort` there",
+    );
+  }
+  return {
+    reason: "step-failed",
+    text: `a merge step for ${context.entry.branch} threw: ${detail}`,
+  };
 }
 
 /** Steps after the lock is held; the first failure wins. */
