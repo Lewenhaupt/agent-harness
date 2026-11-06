@@ -19,6 +19,7 @@ import { reportMemberLiveness } from "../fleet-reconcile.js";
 import {
   FLEET_RUN_STALE_TICK_MS,
   FLEET_RUN_STOP_REASONS,
+  recordRunMemberLandRepair,
   recordRunMemberStopped,
   recordRunStopResolution,
   startFleetRun,
@@ -52,6 +53,7 @@ import {
   fleetMergeQueueFilePath,
   fleetStateDir,
   formatBeadOwnership,
+  formatFleetLandRepairs,
   formatFleetStatus,
   formatNeedsYou,
   NEEDS_YOU_EXCERPT_MAX_CHARS,
@@ -4155,5 +4157,256 @@ describe("formatBeadOwnership (belayd_status section)", () => {
     expect(section?.startsWith("bead detail unavailable (bd read failed): ")).toBe(true);
     expect(section).not.toContain("\n");
     expect((section ?? "").length).toBeLessThan(400);
+  });
+});
+
+describe("repair round rendering (bd-277)", () => {
+  function member(taskId: string): FleetMemberSnapshot {
+    const branch = `feat/${taskId}`;
+    return sampleMember({
+      worktreePath: `/repo.${taskId}`,
+      branch,
+      workflow: okWorkflow({ taskId, branch }),
+    });
+  }
+
+  function repairingRun(options: { stopped?: boolean } = {}) {
+    const started = startFleetRun({
+      now: 1_000,
+      accept: false,
+      members: [{ taskId: "bd-12" }],
+    });
+    const recorded = recordRunMemberLandRepair({
+      run: started,
+      taskId: "bd-12",
+      refusal: "publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+      head: "a".repeat(40),
+      now: 2_000,
+    });
+    if (!recorded.ok) throw new Error("expected the round to be recorded");
+    const repaired = recorded.run;
+    return options.stopped === true
+      ? recordRunMemberStopped({
+          run: repaired,
+          taskId: "bd-12",
+          reason: "land-failed",
+          detail: "publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+          now: 3_000,
+        })
+      : repaired;
+  }
+
+  it("shows the repair attempt with the member and in the run header", () => {
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: repairingRun() }),
+      members: [member("bd-12")],
+    });
+    const rendered = formatFleetStatus(status);
+
+    // AC 5: the attempt, not only a stop that has not happened.
+    expect(rendered).toContain(
+      "  repair 1 of 1 — publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+    );
+    // The header names it too, so a supervisor scanning the run sees a member that is
+    // mid-repair rather than an ordinary member.
+    expect(rendered).toContain(
+      "  repairing bd-12 (repair 1 of 1 — publish gate refused: proof-artifacts-in-diff: docs/proof/x.png)",
+    );
+    // A member in a repair round needs nobody: it was asked to fix its own diff.
+    expect(formatNeedsYou(status)).toBe(undefined);
+    expect(formatFleetLandRepairs(repairingRun())).toHaveLength(1);
+  });
+
+  it("shows the round for a member whose workflow file completion cleared (bd-168)", () => {
+    // Completion clears `.belayd/workflow.json`, so the member a refused landing is
+    // about usually has no state file. bd-168 made that member attributable, which is
+    // what lets the round join it by task id; omitting the join would hide the round
+    // for the most common repair case.
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: repairingRun() }),
+      members: [sampleMember({ workflow: { kind: "missing" } })],
+    });
+    const rendered = formatFleetStatus(status);
+
+    expect(status.members[0]).toHaveProperty("state", "missing-state");
+    expect(status.members[0]).toHaveProperty("taskId", "bd-12");
+    expect(rendered).toContain("Member bd-12 — missing-state");
+    expect(rendered).toContain(
+      "  repair 1 of 1 — publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+    );
+    expect(rendered).toContain("  repairing bd-12 (repair 1 of 1 —");
+  });
+
+  it("suppresses the round for a stateless member the run did stop", () => {
+    // The record is written before the ask, so a stateless member can keep its
+    // `landRepair` beside a later stop; the stop is the truth on every surface.
+    const stopped = repairingRun({ stopped: true });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: stopped }),
+      members: [sampleMember({ workflow: { kind: "missing" } })],
+    });
+    const rendered = formatFleetStatus(status);
+
+    expect(status.members[0]).toHaveProperty("state", "missing-state");
+    expect(status.members[0]?.stop?.reason).toBe("land-failed");
+    expect(status.members[0]?.landRepair).toBe(undefined);
+    expect(rendered).toContain("  stopped bd-12 (land-failed): publish gate refused");
+    expect(rendered).not.toContain("repair 1 of 1");
+    expect(rendered).not.toContain("repairing bd-12");
+  });
+
+  it("renders no round for a member whose record also says it landed (bd-277 S2)", () => {
+    // `recordRunMemberLanded` clears the record, so `landedAt` beside `landRepair` is a
+    // hand-edited or half-written `fleet.json`. The single-bead join refuses that record
+    // (`landRepairInFleet`); the member view (both branches) and the header must agree,
+    // or work already on the base branch reads as "repair in progress".
+    const repairing = repairingRun();
+    const landedRun = {
+      ...repairing,
+      members: (repairing.members ?? []).map((member) => ({ ...member, landedAt: 3_000 })),
+    };
+
+    const withState = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: landedRun }),
+      members: [member("bd-12")],
+    });
+    expect(withState.members[0]?.landRepair).toBe(undefined);
+    expect(formatFleetStatus(withState)).not.toContain("repair");
+
+    // The same rule on the missing-state branch (completion clears the state file).
+    const stateless = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: landedRun }),
+      members: [sampleMember({ workflow: { kind: "missing" } })],
+    });
+    expect(stateless.members[0]).toHaveProperty("state", "missing-state");
+    expect(stateless.members[0]?.landRepair).toBe(undefined);
+    expect(formatFleetStatus(stateless)).not.toContain("repair");
+
+    // The header states the rule itself, so it is checked directly too.
+    expect(formatFleetLandRepairs(landedRun)).toEqual([]);
+  });
+
+  it("still renders a recorded land-failed stop exactly as today", () => {
+    const stopped = repairingRun({ stopped: true });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: stopped }),
+      members: [member("bd-12")],
+    });
+    const rendered = formatFleetStatus(status);
+
+    // The stop is the newer, actionable fact, so it renders in its own shape and the
+    // repair line never appears beside it — not in the header, not in the member block,
+    // not in "Needs you". A record that kept its `landRepair` after the stop (as
+    // `recordRunMemberStopped` deliberately does) must not read as two pending facts
+    // (bd-277 review W1).
+    expect(rendered).toContain(
+      "  stopped bd-12 (land-failed): publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+    );
+    expect(rendered).not.toContain("repair 1 of 1");
+    expect(rendered).not.toContain("repairing bd-12");
+    // The member view itself drops the round for a stopped member, so no consumer can
+    // render it back.
+    expect(status.members[0]?.landRepair).toBe(undefined);
+    expect(formatFleetLandRepairs(stopped)).toEqual([]);
+    expect(formatNeedsYou(status) ?? "").toContain("stopped land-failed");
+  });
+
+  it("suppresses a repair round in every surface when any stop supersedes it", () => {
+    // Not just `land-failed`: `recordRunMemberStopped` keeps `landRepair` whatever it
+    // records, so a phase-failed member mid-repair would otherwise print both.
+    const stopped = recordRunMemberStopped({
+      run: repairingRun(),
+      taskId: "bd-12",
+      reason: "phase-failed",
+      detail: "phase implement failed: gate failed",
+      now: 3_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: stopped }),
+      members: [member("bd-12")],
+    });
+    expect(formatFleetStatus(status)).not.toContain("repair 1 of 1");
+    expect(formatFleetLandRepairs(stopped)).toEqual([]);
+    const section = formatBeadOwnership({
+      cwdTaskId: "bd-12",
+      stop: stopped.stopped?.[0],
+      landRepair: {
+        attempts: 1,
+        at: 2_000,
+        refusal: "publish gate refused: proof-artifacts-in-diff",
+        head: "a".repeat(40),
+      },
+    });
+    expect(section ?? "").toContain("- stop: phase-failed");
+    expect(section ?? "").not.toContain("repair 1 of 1");
+  });
+
+  it("suppresses the round for the ask-failure stop as well", () => {
+    // The record is written before the ask for crash safety, so a repair nobody could
+    // be asked leaves `landRepair` behind with a stop; the stop is the truth.
+    const stopped = recordRunMemberStopped({
+      run: repairingRun(),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail:
+        "could not ask bd-12 to repair its landing (the repair launch was refused) — " +
+        "publish gate refused: proof-artifacts-in-diff",
+      now: 3_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: stopped }),
+      members: [member("bd-12")],
+    });
+    const rendered = formatFleetStatus(status);
+    expect(rendered).toContain("could not ask bd-12 to repair its landing");
+    expect(rendered).not.toContain("repair 1 of 1");
+    expect(formatFleetLandRepairs(stopped)).toEqual([]);
+  });
+
+  it("renders a plain land-failed stop with no repair record unchanged (bd-279)", () => {
+    const stopped = recordRunMemberStopped({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      reason: "land-failed",
+      detail: "publish gate refused: proof-artifacts-in-diff",
+      now: 2_000,
+    });
+    const status = buildFleetStatus({
+      fleetId: "fleet-1",
+      intent: sampleIntent({ taskIds: ["bd-12"], run: stopped }),
+      members: [member("bd-12")],
+    });
+    const rendered = formatFleetStatus(status);
+    expect(rendered).toContain("  stopped bd-12 (land-failed): publish gate refused");
+    expect(rendered).not.toContain("repair");
+    expect(formatFleetLandRepairs(stopped)).toEqual([]);
+    // Exactly the bd-279 stop line, no repair suffix and no extra blank-line shape.
+    expect(rendered.split("\n").filter((line) => line.includes("stopped bd-12"))).toEqual([
+      "  stopped bd-12 (land-failed): publish gate refused: proof-artifacts-in-diff",
+    ]);
+  });
+
+  it("renders the repair round in the single-bead section", () => {
+    const section =
+      formatBeadOwnership({
+        cwdTaskId: "bd-12",
+        landRepair: {
+          attempts: 1,
+          at: 2_000,
+          refusal: "publish gate refused: proof-artifacts-in-diff",
+          head: "a".repeat(40),
+        },
+      }) ?? "";
+    expect(section).toContain("- repair 1 of 1 — publish gate refused: proof-artifacts-in-diff");
+    // A repair round is not a reason to say a human is needed.
+    expect(section).not.toContain("**Needs you**");
   });
 });

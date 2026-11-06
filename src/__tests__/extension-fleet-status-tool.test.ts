@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
+import { recordRunMemberLandRepair, recordRunMemberStopped, startFleetRun } from "../fleet-run.js";
 import { buildFleetStatus } from "../fleet-status.js";
 import type { WorkflowState } from "../workflow-state.js";
 
@@ -901,6 +901,177 @@ describe("belayd_fleet_status tool", () => {
 
       expect(text).toContain("- stop: land-failed — the owning fleet's stop");
       expect(text).not.toContain("another fleet's stop");
+    });
+  });
+
+  describe("the repair round join (bd-277)", () => {
+    /**
+     * Write one fleet intent whose run member carries a `landRepair` record.
+     *
+     * `taskIds` and `landedAt` are the two facts the single-bead lookup scopes on: a
+     * run member record outlives membership (`prune`/`land` keep it), so the record
+     * alone is not proof the round belongs to this fleet.
+     */
+    function writeRepairingFleet(options: {
+      fleetId: string;
+      taskId: string;
+      refusal: string;
+      taskIds?: readonly string[];
+      landedAt?: number;
+    }): void {
+      const dir = join(cwd, "belayd", "fleet", options.fleetId);
+      mkdirSync(dir, { recursive: true });
+      const launched = startFleetRun({
+        now: 1_000,
+        accept: false,
+        members: [{ taskId: options.taskId }],
+      });
+      const recorded = recordRunMemberLandRepair({
+        run: launched,
+        taskId: options.taskId,
+        refusal: options.refusal,
+        head: "a".repeat(40),
+        now: 2_000,
+      });
+      if (!recorded.ok) throw new Error("expected the round to be recorded");
+      const repaired = recorded.run;
+      const run =
+        options.landedAt === undefined
+          ? repaired
+          : {
+              ...repaired,
+              members: (repaired.members ?? []).map((member) => ({
+                ...member,
+                landedAt: options.landedAt,
+              })),
+            };
+      writeFileSync(
+        join(dir, "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: options.fleetId,
+          taskIds: options.taskIds ?? [options.taskId],
+          createdAt: 1,
+          updatedAt: 1,
+          run,
+        }),
+      );
+    }
+
+    async function statusFor(taskId: string, sessionId: string): Promise<string> {
+      const mock = await loadFleetExtension();
+      const startTask = mock.tools.get("belayd_start_task");
+      const status = mock.tools.get("belayd_status");
+      if (startTask === undefined || status === undefined) {
+        throw new Error("belayd_start_task / belayd_status were not registered");
+      }
+      await startTask.execute(
+        "repair-1",
+        { taskId },
+        undefined,
+        undefined,
+        makeCtx(cwd, sessionId),
+      );
+      bd.failWith = "spawn bd ENOENT";
+      return textOf(
+        await status.execute("repair-2", {}, undefined, undefined, makeCtx(cwd, sessionId)),
+      );
+    }
+
+    it("reads the repair round for the viewed bead out of its own fleet", async () => {
+      git.commonDir = cwd;
+      writeRepairingFleet({
+        fleetId: "default",
+        taskId: "bd-126",
+        refusal: "publish gate refused: proof-artifacts-in-diff",
+      });
+
+      const text = await statusFor("bd-126", "status-repair-session");
+
+      expect(text).toContain("- repair 1 of 1 — publish gate refused: proof-artifacts-in-diff");
+      // A round is not a human wait: nobody is being asked to do anything (bd-277 W1).
+      expect(text).not.toContain("Needs you");
+      expect(text).not.toContain("- stop: ");
+    });
+
+    it("does not read a record from a fleet that no longer lists the member", async () => {
+      // Two fleets over one repository, both with a run member for bd-126 — the shape a
+      // pruned member leaves behind in the fleet that ran it. Only the fleet whose
+      // `taskIds` still names the member can be driving it (bd-277 review S3).
+      git.commonDir = cwd;
+      writeRepairingFleet({
+        fleetId: "alpha",
+        taskId: "bd-126",
+        refusal: "a pruned fleet's round",
+        taskIds: [],
+      });
+      writeRepairingFleet({
+        fleetId: "beta",
+        taskId: "bd-126",
+        refusal: "the owning fleet's round",
+      });
+
+      const text = await statusFor("bd-126", "status-repair-scope-session");
+
+      expect(text).toContain("- repair 1 of 1 — the owning fleet's round");
+      expect(text).not.toContain("a pruned fleet's round");
+    });
+
+    it("does not render a landed member's stale record", async () => {
+      // A landed member's round is history the landing already answered; a hand-edited
+      // record must not resurrect "repair in progress" for work on the base branch.
+      git.commonDir = cwd;
+      writeRepairingFleet({
+        fleetId: "default",
+        taskId: "bd-126",
+        refusal: "stale round of a landed member",
+        landedAt: 3_000,
+      });
+
+      const text = await statusFor("bd-126", "status-repair-landed-session");
+
+      expect(text).not.toContain("- repair ");
+      expect(text).not.toContain("stale round of a landed member");
+    });
+
+    it("renders only the stop when the member has both a round and a stop", async () => {
+      // The second-refusal/ask-failure shape: `recordRunMemberStopped` keeps the round,
+      // so the stop must suppress it rather than print two pending facts (bd-277 W1).
+      git.commonDir = cwd;
+      const dir = join(cwd, "belayd", "fleet", "default");
+      mkdirSync(dir, { recursive: true });
+      const recorded = recordRunMemberLandRepair({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-126" }] }),
+        taskId: "bd-126",
+        refusal: "publish gate refused: proof-artifacts-in-diff",
+        head: "a".repeat(40),
+        now: 2_000,
+      });
+      if (!recorded.ok) throw new Error("expected the round to be recorded");
+      const repaired = recorded.run;
+      const run = recordRunMemberStopped({
+        run: repaired,
+        taskId: "bd-126",
+        reason: "land-failed",
+        detail: "repair 1 of 1 did not clear this (proof-artifacts-in-diff) — refused again",
+        now: 3_000,
+      });
+      writeFileSync(
+        join(dir, "fleet.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          fleetId: "default",
+          taskIds: ["bd-126"],
+          createdAt: 1,
+          updatedAt: 1,
+          run,
+        }),
+      );
+
+      const text = await statusFor("bd-126", "status-repair-stopped-session");
+
+      expect(text).toContain("- stop: land-failed — repair 1 of 1 did not clear this");
+      expect(text).not.toContain("- repair ");
     });
   });
 });

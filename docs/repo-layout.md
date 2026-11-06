@@ -35,6 +35,16 @@ Never hand-roll detection heuristics in this repo: the permanent rule lives in
 `DETECTION_GUIDANCE` block of `src/agent-registry.ts`. Anything that needs
 judgement goes to a person or a sub-agent, never to a rule table.
 
+The rule exists because detection was tried here and failed: the sensitive-findings
+classifier (bd-183) grew to 2167 lines over nine review rounds — each closing one text
+evasion — and produced 28 human gates and zero real publication decisions before it was
+deleted. `betterleaks` is maintained, rule-tested and adversarial by construction; our
+regex was neither, so the scanner replaced the classifier rather than the rule.
+
+Deterministic checks stay legitimate when they check **our own artefact's shape** (phase
+order holds, the record parses, the publish gate refuses a path). The red flag is a check
+that only stays correct with a corpus of adversarial text: that means the wrong tool.
+
 ## Module map
 
 The table is generated from each file's leading docblock, so it describes what the
@@ -165,6 +175,7 @@ otherwise put two repositories' same-named branches in one shared directory.
 | `src/fleet-escalation.ts` | One described bd escalation gate per human-relevant stop (the seven stop reasons, a parked fleet), idempotent per bead/cause/round (bd-279) |
 | `src/fleet-heartbeat.ts` | Supervisor heartbeat for a run-mode fleet (bd-126 P5) |
 | `src/fleet-launch.ts` | Fleet launch: the decision half of `belayd_fleet_launch` / `/fleet` (bd-126 P1) |
+| `src/fleet-land-repair.ts` | One bounded repair round for a refused landing: which refusals a commit in the member's own diff can clear, and the task text that asks for it (bd-277) |
 | `src/fleet-mailbox.ts` | Fleet mailbox rendering (bd-126 P1) |
 | `src/fleet-merge.ts` | Fleet merge queue — P2 of the fleet supervisor (bd-126); refuses a payload that carries proof (bd-181) |
 | `src/fleet-mode.ts` | Fleet supervisor mode (bd-126 P1) |

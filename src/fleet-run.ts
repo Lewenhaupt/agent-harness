@@ -179,6 +179,22 @@ export const FLEET_RUN_STALE_TICK_INTERVALS = 10;
 
 export const FLEET_RUN_STALE_TICK_MS = FLEET_RUN_TICK_INTERVAL_MS * FLEET_RUN_STALE_TICK_INTERVALS;
 
+/**
+ * One recorded repair round for a refused landing (bd-277).
+ *
+ * `head` is the member branch tip at refusal time: the repair is only proven by the
+ * branch moving, so it is what holds the landing (unchanged tip) and what ends the
+ * hold (a moved tip). `at` bounds the hold, and `refusal` is the drain's own words so
+ * the member — and every status surface — is told what was refused without asking the
+ * queue again.
+ */
+const FleetRunMemberLandRepairSchema = z.object({
+  attempts: z.number().int().nonnegative(),
+  at: z.number().finite(),
+  refusal: z.string().max(FLEET_RUN_DETAIL_MAX_LENGTH),
+  head: z.string().min(1).max(64),
+});
+
 const FleetRunMemberSchema = z.object({
   taskId: z.string().min(1).max(128),
   /** When the fleet launched this member; the start-grace window is measured from here. */
@@ -187,6 +203,16 @@ const FleetRunMemberSchema = z.object({
   sessionId: z.string().max(256).optional(),
   /** Set once this run merged the member into the base branch. */
   landedAt: z.number().finite().optional(),
+  /**
+   * The one bounded repair round a refused landing was given (bd-277).
+   *
+   * Optional so every `fleet.json` written before bd-277 still parses. It lives on the
+   * run member rather than on the merge-queue entry because the queue entry is
+   * rewritten on every re-enqueue (`nextEntryState` resets `attempts`/`delegatedAt`)
+   * while this record is what survives the repair and the relaunch: it is the count
+   * that makes a second refusal terminal.
+   */
+  landRepair: FleetRunMemberLandRepairSchema.optional(),
 });
 
 const FleetRunStopSchema = z.object({
@@ -294,6 +320,7 @@ export const FleetRunSchema = z.object({
 export type FleetRun = z.infer<typeof FleetRunSchema>;
 
 export type FleetRunMember = z.infer<typeof FleetRunMemberSchema>;
+export type FleetRunMemberLandRepair = z.infer<typeof FleetRunMemberLandRepairSchema>;
 export type FleetRunStop = z.infer<typeof FleetRunStopSchema>;
 
 /**
@@ -1417,6 +1444,11 @@ export function recordRunMemberLaunched(options: {
   sessionId?: string;
 }): FleetRun {
   const members = options.run.members ?? [];
+  const existing = members.find((member) => member.taskId === options.taskId);
+  // A recorded repair round survives a relaunch on purpose: the bound is per member
+  // per run (bd-277), and a member that could reset it by being launched again would
+  // get an unbounded sequence of repair rounds through the front door.
+  const repair = existing?.landRepair;
   const rest = members.filter((member) => member.taskId !== options.taskId);
   return {
     ...options.run,
@@ -1427,10 +1459,84 @@ export function recordRunMemberLaunched(options: {
         taskId: options.taskId,
         launchedAt: options.launchedAt,
         ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+        ...(repair === undefined ? {} : { landRepair: repair }),
       },
     ],
     stopped: (options.run.stopped ?? []).filter((entry) => entry.taskId !== options.taskId),
   };
+}
+
+/**
+ * What recording a repair round produced (bd-277).
+ *
+ * The `ok: false` arm means the run does not list the member, so no round was written: the
+ * caller must not ask anybody to repair, because an unrecorded attempt would leave the
+ * loop unbounded. It deliberately omits `run`: the unrecorded run is the one the caller
+ * passed, so a caller that ignores the discriminant cannot mistake it for a recorded one.
+ */
+export type RecordRunMemberLandRepairResult =
+  | { ok: true; run: FleetRun }
+  | { ok: false; error: string };
+
+/**
+ * Record the repair round a refused landing was given (bd-277).
+ *
+ * Written *before* the member is asked (the caller persists it before spawning), so a
+ * crash mid-repair leaves the attempt counted and the next tick cannot start a second
+ * round. The attempt count is incremented here, never set by the caller: the record is
+ * the only thing that bounds the loop, so it must derive from what is already stored.
+ *
+ * Only a member the run already lists gets a round. Synthesising one would invent a
+ * `launchedAt` and with it a start-grace window for a member no tick ever launched — a
+ * record that claims work the run never did. The absent case is returned as `ok: false`
+ * with the reason rather than thrown or silently dropped, because the caller has to fall
+ * back to the terminal stop instead of asking a member the run cannot bound.
+ */
+export function recordRunMemberLandRepair(options: {
+  run: FleetRun;
+  taskId: string;
+  refusal: string;
+  head: string;
+  now: number;
+}): RecordRunMemberLandRepairResult {
+  const members = options.run.members ?? [];
+  const existing = members.find((member) => member.taskId === options.taskId);
+  if (existing === undefined) {
+    return {
+      ok: false,
+      error: `\`${options.taskId}\` is not a member of this run, so no repair round was recorded`,
+    };
+  }
+  const attempts = (existing.landRepair?.attempts ?? 0) + 1;
+  return {
+    ok: true,
+    run: {
+      ...options.run,
+      updatedAt: options.now,
+      members: [
+        ...members.filter((member) => member.taskId !== options.taskId),
+        {
+          ...existing,
+          landRepair: {
+            attempts,
+            at: options.now,
+            // Bounded like every other free-text record field, at a separator rather
+            // than mid-word: the refusal is quoted to the member and in status.
+            refusal: boundRunDetail(options.refusal),
+            head: options.head,
+          },
+        },
+      ],
+    },
+  };
+}
+
+/** The recorded repair round for one member, if it was given one. */
+export function landRepairForMember(
+  run: FleetRun | undefined,
+  taskId: string,
+): FleetRunMemberLandRepair | undefined {
+  return (run?.members ?? []).find((member) => member.taskId === taskId)?.landRepair;
 }
 
 /** Record that a member landed (merged) so a later tick never merges it again. */
@@ -1441,10 +1547,12 @@ export function recordRunMemberLanded(options: {
 }): FleetRun {
   const members = options.run.members ?? [];
   const existing = members.find((member) => member.taskId === options.taskId);
+  // The landing is what a repair round was for: dropping the record here means a
+  // landed member carries no stale "repair 1 of 1" into the run's display.
   const next: FleetRunMember =
     existing === undefined
       ? { taskId: options.taskId, launchedAt: options.now, landedAt: options.now }
-      : { ...existing, landedAt: options.now };
+      : { ...existing, landedAt: options.now, landRepair: undefined };
   return {
     ...options.run,
     updatedAt: options.now,

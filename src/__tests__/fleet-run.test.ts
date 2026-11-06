@@ -38,6 +38,7 @@ import {
   formatFleetRunLine,
   formatFleetRunStops,
   isFleetRunActive,
+  landRepairForMember,
   memberEvidenceCutoff,
   memberRanEvidence,
   memberWorktreeExisted,
@@ -47,6 +48,7 @@ import {
   recordFleetGateNotices,
   recordFleetTickProgress,
   recordRunMemberLanded,
+  recordRunMemberLandRepair,
   recordRunMemberLaunched,
   recordRunMemberStopped,
   recordRunStopGate,
@@ -1482,6 +1484,113 @@ describe("run record", () => {
     const landed = recordRunMemberLanded({ run: stopped, taskId: "bd-12", now: 3_000 });
     expect(landed.stopped).toEqual([]);
     expect(landed.members?.[0]).toMatchObject({ taskId: "bd-12", landedAt: 3_000 });
+  });
+
+  it("records one repair round on the member and keeps it across a relaunch (bd-277)", () => {
+    // The record is the loop's only bound: it must be counted on the member, survive
+    // the repair relaunch, and disappear once the member lands.
+    const started = startFleetRun({ now: 1_000, accept: true, members: [{ taskId: "bd-12" }] });
+    const recorded = recordRunMemberLandRepair({
+      run: started,
+      taskId: "bd-12",
+      refusal: "publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+      head: "a".repeat(40),
+      now: 2_000,
+    });
+    expect(recorded.ok).toBe(true);
+    if (!recorded.ok) throw new Error("expected the round to be recorded");
+    expect(landRepairForMember(recorded.run, "bd-12")).toEqual({
+      attempts: 1,
+      at: 2_000,
+      refusal: "publish gate refused: proof-artifacts-in-diff: docs/proof/x.png",
+      head: "a".repeat(40),
+    });
+
+    // A relaunch must not reset the attempt: otherwise a member could get unbounded
+    // repair rounds by being launched again.
+    const relaunched = recordRunMemberLaunched({
+      run: recorded.run,
+      taskId: "bd-12",
+      launchedAt: 3_000,
+      sessionId: "s-2",
+    });
+    expect(landRepairForMember(relaunched, "bd-12")?.attempts).toBe(1);
+
+    // A second record increments rather than replacing the count.
+    const twice = recordRunMemberLandRepair({
+      run: relaunched,
+      taskId: "bd-12",
+      refusal: "publish gate refused again",
+      head: "b".repeat(40),
+      now: 4_000,
+    });
+    expect(twice.ok).toBe(true);
+    if (!twice.ok) throw new Error("expected the second round to be recorded");
+    expect(landRepairForMember(twice.run, "bd-12")?.attempts).toBe(2);
+
+    // The landing is what the repair was for: no stale "repair 1 of 1" survives it.
+    const landed = recordRunMemberLanded({ run: twice.run, taskId: "bd-12", now: 5_000 });
+    expect(landRepairForMember(landed, "bd-12")).toBeUndefined();
+  });
+
+  it("refuses to synthesise a run member for a repair round (bd-277 S3)", () => {
+    // A round for a member the run does not list used to invent `launchedAt: now`, which
+    // fabricated both a launch and a start-grace window for work no tick ever did. The
+    // absent case is observable so the caller can fall back to the terminal stop.
+    const started = startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] });
+    const absent = recordRunMemberLandRepair({
+      run: started,
+      taskId: "bd-99",
+      refusal: "publish gate refused: proof-artifacts-in-diff",
+      head: "a".repeat(40),
+      now: 2_000,
+    });
+
+    expect(absent.ok).toBe(false);
+    if (absent.ok) throw new Error("expected the round to be refused");
+    expect(absent.error).toContain("not a member of this run");
+    // The run is untouched: no member, no fabricated launch instant, no round.
+    expect(started.members).toEqual([{ taskId: "bd-12", launchedAt: 1_000 }]);
+    expect(landRepairForMember(started, "bd-99")).toBeUndefined();
+  });
+
+  it("parses a run record with a repair round, and one written before bd-277", () => {
+    // `landRepair` is optional so every `fleet.json` in the wild still parses: an
+    // unparseable run record would freeze a live fleet on its own history.
+    const member = { taskId: "bd-12", launchedAt: 1_000, landedAt: undefined };
+    const withoutRepair = FleetRunSchema.safeParse({
+      schemaVersion: 1,
+      mode: "until-complete",
+      startedAt: 1_000,
+      updatedAt: 1_000,
+      ticks: 0,
+      members: [member],
+    });
+    expect(withoutRepair.success).toBe(true);
+    expect(withoutRepair.success ? withoutRepair.data.members?.[0] : undefined).not.toHaveProperty(
+      "landRepair",
+    );
+
+    const withRepair = FleetRunSchema.safeParse({
+      schemaVersion: 1,
+      mode: "until-complete",
+      startedAt: 1_000,
+      updatedAt: 1_000,
+      ticks: 0,
+      members: [
+        {
+          ...member,
+          landRepair: { attempts: 1, at: 2_000, refusal: "refused", head: "c".repeat(40) },
+        },
+      ],
+    });
+    expect(withRepair.success).toBe(true);
+    expect(withRepair.success ? withRepair.data.members?.[0]?.landRepair : undefined).toEqual({
+      attempts: 1,
+      at: 2_000,
+      refusal: "refused",
+      head: "c".repeat(40),
+    });
   });
 
   it("counts ticks and resets the idle counter on progress", () => {

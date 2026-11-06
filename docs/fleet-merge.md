@@ -294,6 +294,7 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 | `proof-artifacts-in-diff` | the branch still carries proof files it *adds or modifies* (`docs/proof/`, `proof/`, `proof-of-work/`, or an accepted proof extension); upload the proof and keep the receipt at `.belayd/proof-receipt.json` instead. Deleting proof artifacts is allowed — the payload diff is read with `--diff-filter=ACMRT`, so removals never reach the gate. A repo that keeps text proof in git declares `{"proof":{"artifacts":"in-tree"}}` in `.belayd/config.json` and this refusal stops applying to it (see [Repo proof policy](#repo-proof-policy-bd-276)). The diff is NUL-delimited with `core.quotePath=false`, so paths with spaces or non-ASCII characters are classified correctly rather than as git C-quoted literals |
 | `paths-outside-scope` | the payload contains harness-local (`.belayd`, `.belayd/`, `.belayd-task.json`, `proof-of-work`), absolute, traversal or backslash paths, a non-ASCII/lookalike path (refused rather than guessed; rename it to ASCII), or (when the publisher declares a payload) a path outside it |
 | `publish-payload-unreadable` | the payload diff could not be computed; the drain fails closed rather than guessing |
+| `land-repair` (not a refusal) | the refusal above was **repairable**, so the run gave the member one repair round instead of stopping it (bd-277 — see [One repair round](#one-repair-round-bd-277)). The member is relaunched on its own branch with the refusal text as its task (or, when its orchestrator lease is live, sent a `land-repair` mailbox note), the attempt is recorded as `run.members[].landRepair` (`attempts: 1`, the refusal, and the branch tip at refusal time), and the landing is held while that tip is unchanged. A second refusal, or a repair that never moves the tip past `FLEET_LAND_REPAIR_GRACE_MS`, stops the member `land-failed` with the round's provenance and the refusal as its detail (see below) |
 
 ### Repo proof policy (bd-276)
 
@@ -339,10 +340,13 @@ the repository.
 - **No ordering/parallelism inside the queue.** Merges are explicit, one at a
   time, in enqueue order. P3 orders *launches* (see `docs/fleet-launch.md`), not the
   merge queue. Draining is one explicit call per member.
-- **No automatic pause or repair.** `belayd_fleet_pause` writes the flag a drain
-  refuses on, and `belayd_fleet_reconcile` repairs the queue (expired lease, record
-  without primitive, orphaned directory, stuck entry) — under the same
-  `merge.lock.d` primitive, never a second lock. See `docs/fleet-reconcile.md`.
+- **No automatic pause, and exactly one repair round.** `belayd_fleet_pause` writes
+  the flag a drain refuses on, and `belayd_fleet_reconcile` repairs the queue
+  (expired lease, record without primitive, orphaned directory, stuck entry) — under
+  the same `merge.lock.d` primitive, never a second lock. See
+  `docs/fleet-reconcile.md`. The drain itself never repairs the *repository*; the
+  one exception is the bounded repair round the **run loop** gives a member whose own
+  diff was refused (bd-277, below).
 - **No `bd` mutation.** Merging is not closing; there is no bd seam in
   `src/fleet-merge.ts`.
 - **No merge outside the root**, and no merge when the root is a linked worktree.
@@ -354,6 +358,69 @@ the repository.
   bounded to one.
 - **No phase work.** The supervisor still arms no gate and refuses the phase,
   proof, and commit tools.
+
+### One repair round (bd-277)
+
+A refusal whose cause is a mechanical defect in the member's **own diff** is not a
+reason to end the member: it is one commit away from landing. The run loop therefore
+gives it a single repair round before the ordinary stop, classified by the drain's
+enumerated `FleetMergeFailureReason` (`src/fleet-land-repair.ts`) — never by reading
+the refusal's prose.
+
+| Reason | Repairable? | Why |
+|--------|-------------|-----|
+| `proof-artifacts-in-diff` | yes | remove the proof files from the branch, keep `.belayd/proof-receipt.json` |
+| `paths-outside-scope` | yes | drop the out-of-scope path from the payload |
+| `gate-failed` | yes | the member's own code failed a merge gate |
+| `rebase-failed`, `rebase-delegated` | no | a real contradiction, or already the member's own rebase to resolve (bd-280) |
+| `fleet-paused` | no | a person paused the fleet |
+| `lock-unavailable`, `queue-unreadable`, `intent-unreadable`, `entry-not-queued`, `queue-write-failed`, `intent-write-failed`, `no-queued-entry`, `member-*`, `root-*`, `gate-commands-missing`, `publish-payload-unreadable`, `stash-failed`, `step-failed`, `merge-failed`, `restore-conflict` | no | the supervisor's or the operator's condition, not something a commit can change |
+
+What one round looks like:
+
+1. the run records `landRepair { attempts, at, refusal, head }` on the member in
+   `fleet.json` **and persists it before asking anyone** — a crash must not leave an
+   unbounded retry loop, and the record is what survives a relaunch;
+2. the member is asked: its own worktree is relaunched through the ordinary
+   fleet-member launch with the refusal and the repair instruction as its task, or —
+   when its orchestrator lease was live at the tick, where a relaunch would be refused
+   by the one-orchestrator-per-worktree rule — the same task goes to its mailbox as a
+   `land-repair` note;
+3. the landing is **held** while the member's branch tip still equals the recorded
+   `head` **and** something is visibly working the repair — a starting member, or one
+   with a live orchestrator lease (including a member whose workflow already says
+   complete: that is the mailbox path). A hold is not an action: it re-schedules at the
+   normal tick interval. It is bounded by `FLEET_LAND_REPAIR_GRACE_MS` (30 min): past it
+   with the tip unchanged, the member stops `land-failed` with the tip as evidence — a
+   repair that changed nothing is not a reason to wait forever;
+4. when the tip moves, the branch is drained again. A second refusal stops the member,
+   and so does a repair nobody could be asked to make. Both stops lead with the round's
+   provenance — the marker that `planLandRepair` or the ask-failure arm produces
+   (`repair 1 of 1 did not clear this (<reason>)`, `<reason> is not something a commit
+   in the member's own diff can change`, or `could not ask <task> to repair its landing
+   (<why>)`) — then ` — ` and the refusal. The order matters because the run record
+   bounds a stop detail at 400 characters from the front: the refusal is measured
+   against the room the marker leaves, so the marker's identity and the gate's reason
+   survive even when the refusal is cut. The cut is at a word boundary, so an unspaced
+   path is never split; a path that contains a space can be cut inside it. A marker's
+   parenthesised reason is bounded too (120 characters for an ask failure, then `…`),
+   so the identity — not the marker's whole text — is what survives. The round is one,
+   not a loop.
+
+If neither the relaunch nor the note could be recorded, the member stops immediately
+with the refusal *and* the reason nobody could ask it: a repair nobody was told about
+is a silent stop. The same applies to a member the run does not list: a round is only
+recorded on a member the run already has, so an unlisted one is never given the
+fabricated `launchedAt` a synthesised member would imply — it stops with
+`could not ask <task> to repair its landing (<task> is not a member of this run …)`
+instead of being asked.
+
+A member in a repair round keeps its bead, worktree, transcript, mailbox and capacity
+slot, and `belayd_fleet_status` renders `repair 1 of 1 — <refusal>` with the member
+(not in "Needs you": nobody is being waited on).
+
+`belayd_fleet_reconcile {"retryMembers":[…]}` is still the manual revival for a
+member a refusal did stop — it now applies after the repair round, not instead of it.
 
 ### Common situations
 
@@ -489,3 +556,20 @@ next tick holds instead of re-draining while the member's branch still lacks the
 base; a delegation aged past its grace stops the member for a human; and a
 delegation with more than five conflicted paths still records every path in the
 `fleet-land-delegated` audit detail.
+
+`src/__tests__/fleet-land-repair.test.ts` (pure, bd-277): every
+`FleetMergeFailureReason` is classified, so a new reason cannot default into either
+side; the repair set is exactly `proof-artifacts-in-diff`, `paths-outside-scope` and
+`gate-failed`; a real conflict, a paused fleet and a queue/state reason stay
+terminal; `planLandRepair` repairs once and stops on the second refusal (and
+immediately for a reason no commit can change); the repair task quotes the refusal
+(bounded to the note budget) and names the refused paths it shows, stating how many
+there were; a refusal is classified by its reason and never by its prose.
+
+`src/__tests__/extension-fleet-p1.test.ts` (wiring, bd-277): a repairable refusal
+records `landRepair` with no `land-failed` stop, relaunches the member's own worktree
+once (recording the relaunch), and audits `fleet-land-repair`; a second refusal stops
+the member with the provenance and the bounded refusal as its detail; a contradiction
+stops it with no repair round; a paused fleet repairs nothing; and a live member is
+sent a `land-repair` note instead of a relaunch, holds the unchanged branch, and stops
+once the repair grace expires with the tip unchanged.

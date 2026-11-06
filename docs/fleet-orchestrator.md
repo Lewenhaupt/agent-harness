@@ -530,6 +530,7 @@ complete set:
 | `fleet-landed` | once per landing, with the member and base branch |
 | `member-merged-released` | once per successful drain, when the merged member was appended to `released[]` with reason `merged` (bd-168) |
 | `member-released` / `member-released-recovery` | once per operator release: the first for this session's own fleet, the second for a foreign fleet whose supervisor is provably dead (bd-168) |
+| `fleet-land-repair` | once when a member is asked to repair its own refused landing (bd-277): whether it was relaunched or sent a `land-repair` note, and the bounded refusal it was asked about. The attempt itself is recorded on `run.members[].landRepair` |
 | `fleet-paused` / `fleet-pause-failed` | once per pause attempt (applied / refused or failed to write) |
 | `fleet-resumed` / `fleet-unparked` / `fleet-resume-refused` | once per resume attempt: resumed, park cleared, or refused (a park that still names a stash) |
 | `member-stopped` / `member-stop-skipped` / `member-stop-failed` / `member-stop-unavailable` | once per pid the forceful pause considered: signalled / identity changed or unreadable, so skipped / `kill` failed / process table unreadable |

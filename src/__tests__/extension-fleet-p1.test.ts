@@ -35,8 +35,11 @@ import {
   drainNotes,
   enqueueNote,
   FLEET_INTENT_ORDERING_GATES_MAX,
+  FLEET_LAND_REPAIR_GRACE_MS,
   FLEET_NOTE_BODY_MAX_LENGTH,
   FLEET_REBASE_DELEGATION_GRACE_MS,
+  FLEET_RUN_ACTION_TICK_INTERVAL_MS,
+  FLEET_RUN_DETAIL_MAX_LENGTH,
   FLEET_RUN_MAX_IDLE_TICKS,
   FLEET_RUN_TICK_INTERVAL_MS,
   FLEET_SUPERVISOR_HEARTBEAT_STALE_MS,
@@ -45,6 +48,7 @@ import {
   fleetMemberSignature,
   fleetNoteFileName,
   formatFleetRefusal,
+  landRepairForMember,
   readFleetIntent,
   readFleetMergeQueue,
   readSupervisorHeartbeat,
@@ -54,7 +58,10 @@ import {
   writeFleetMergeQueue,
   writeSupervisorHeartbeat,
 } from "../index.js";
-import { ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS } from "../orchestrator-claim.js";
+import {
+  ORCHESTRATOR_CLAIM_HEARTBEAT_INTERVAL_MS,
+  ORCHESTRATOR_CLAIM_STALE_MS,
+} from "../orchestrator-claim.js";
 import { RunStatus, writeRunManifest } from "../run-manifest.js";
 import { writeWorkflowState } from "../workflow-state.js";
 
@@ -332,6 +339,15 @@ function drainGitProbes(options: {
   conflictedPaths?: readonly string[];
   /** Make the branch-containment probe fail instead of answering. */
   branchProbeFails?: boolean;
+  /**
+   * Committer date (epoch seconds) of the base side of the conflict.
+   *
+   * The default `2` is 1970: older than any armed fleet, which is what makes the
+   * conflict `delegable` (base work predates this fleet). A recent value makes it a
+   * `contradiction` — base work committed after the fleet started (bd-277's
+   * "a real conflict" case).
+   */
+  baseCommitAt?: number;
 }): readonly DrainGitProbe[] {
   const headSha = "a".repeat(40);
   const memberBaseSha = "b".repeat(40);
@@ -387,7 +403,7 @@ function drainGitProbes(options: {
     {
       // Committer dates come in seconds, so `2` is 1970: older than any armed fleet.
       matches: (args) => args[0] === "-c" && args[2] === "log",
-      answer: () => ({ stdout: `${"c".repeat(40)} 2\n` }),
+      answer: () => ({ stdout: `${"c".repeat(40)} ${options.baseCommitAt ?? 2}\n` }),
     },
     {
       matches: (args, cwd) =>
@@ -406,6 +422,7 @@ function stubDrainGit(options: {
   memberDir: string;
   conflictedPaths?: readonly string[];
   branchProbeFails?: boolean;
+  baseCommitAt?: number;
 }): {
   rebaseAttempts: () => number;
 } {
@@ -419,6 +436,101 @@ function stubDrainGit(options: {
   childProcess.gitAnswer = ({ args, cwd }) =>
     probes.find((probe) => probe.matches(args, cwd))?.answer(args, cwd);
   return { rebaseAttempts: () => rebaseAttempts };
+}
+
+/**
+ * Answer the git probes a merge drain issues up to a *publish refusal* (bd-277).
+ *
+ * Every precondition passes — the root is the repository's own checkout on `main`, the
+ * member worktree is clean and on its own branch — and the payload diff carries proof
+ * artifacts, so the drain refuses with `proof-artifacts-in-diff` before it mutates
+ * anything. `head` is the member branch tip the repair round reads back.
+ */
+function stubRefusingPayloadGit(options: {
+  commonDir: string;
+  memberDir: string;
+  head: string;
+  changedPaths?: readonly string[];
+  /** `git status --porcelain` output in the member worktree (default: clean). */
+  statusOutput?: string;
+}): {
+  drains: () => number;
+  /** Move the member branch: a repair is only proven by this tip changing. */
+  setHead: (head: string) => void;
+  /**
+   * Make the member-branch tip probe fail.
+   *
+   * `rev-parse --verify feat/bd-12^{commit}` is the probe the repair hold and the ask
+   * both read; every other `--verify` the drain issues keeps answering, so a test can
+   * make exactly the tip unreadable.
+   */
+  setHeadProbeFails: (fails: boolean) => void;
+} {
+  const baseSha = "b".repeat(40);
+  const changedPaths = options.changedPaths ?? ["docs/proof/run.png"];
+  const branchProbe = "feat/bd-12^{commit}";
+  let head = options.head;
+  let headProbeFails = false;
+  let drains = 0;
+  const isRevParse = (args: readonly string[], ...flags: string[]): boolean =>
+    args[0] === "rev-parse" && flags.every((flag) => args.includes(flag));
+  const probes: readonly DrainGitProbe[] = [
+    {
+      matches: (args) => isRevParse(args, "--absolute-git-dir"),
+      answer: () => ({ stdout: `${options.commonDir}\n` }),
+    },
+    {
+      matches: (args) => isRevParse(args, "--path-format=absolute"),
+      answer: () => ({ stdout: `${options.commonDir}\n` }),
+    },
+    {
+      matches: (args) => isRevParse(args, "--abbrev-ref"),
+      answer: (_args, cwd) => ({ stdout: cwd === options.memberDir ? "feat/bd-12\n" : "main\n" }),
+    },
+    {
+      matches: (args) => args[0] === "worktree" && args[1] === "list",
+      answer: (_args, cwd) => ({
+        stdout:
+          `worktree ${cwd}\0HEAD ${baseSha}\0branch refs/heads/main\0\0` +
+          `worktree ${options.memberDir}\0HEAD ${head}\0branch refs/heads/feat/bd-12\0\0`,
+      }),
+    },
+    {
+      // The base and the member branch resolve to different shas: the repair round's
+      // own `rev-parse` of the member branch is the same probe as the drain's.
+      matches: (args) => isRevParse(args, "--verify"),
+      answer: (args) => {
+        if (headProbeFails && args.includes(branchProbe)) {
+          return { failWith: `fatal: ambiguous argument '${branchProbe}'` };
+        }
+        return {
+          stdout: `${args.some((arg) => String(arg).startsWith("main")) ? baseSha : head}\n`,
+        };
+      },
+    },
+    {
+      matches: (args) => args[0] === "status",
+      answer: () => ({ stdout: options.statusOutput ?? "" }),
+    },
+    {
+      matches: (args) => args[0] === "-c" && args[2] === "diff",
+      answer: () => {
+        drains += 1;
+        return { stdout: `${changedPaths.join("\0")}\0` };
+      },
+    },
+  ];
+  childProcess.gitAnswer = ({ args, cwd }) =>
+    probes.find((probe) => probe.matches(args, cwd))?.answer(args, cwd);
+  return {
+    drains: () => drains,
+    setHead: (next) => {
+      head = next;
+    },
+    setHeadProbeFails: (fails) => {
+      headProbeFails = fails;
+    },
+  };
 }
 
 /** The stubbed answer for one git call, or undefined for the empty default. */
@@ -3859,6 +3971,85 @@ describe("fleet run mode", () => {
   }
 
   /**
+   * Rewrite the recorded repair round's own clock (bd-277).
+   *
+   * Ticking through thirty minutes of fake time would run a hundred holds; the record
+   * owns the clock, so moving its `at` is the same state an old round reaches. The
+   * absolute form is what makes the grace boundary assertable at one millisecond: the
+   * tick reads `now` when it fires, so `at` is set against the tick that will observe
+   * it, never against a wall clock the test does not control.
+   */
+  function setRepairRoundAt(at: number): void {
+    editIntent((current) => {
+      const run = current.run as
+        | { members?: Array<{ taskId: string; landRepair?: { at: number } }> }
+        | undefined;
+      if (run?.members === undefined) return current;
+      const members = run.members.map((member) =>
+        member.landRepair === undefined
+          ? member
+          : { ...member, landRepair: { ...member.landRepair, at } },
+      );
+      return { ...current, run: { ...run, members } };
+    });
+  }
+
+  /** Age the run's recorded repair round by `milliseconds` from now. */
+  function ageRepairRound(milliseconds: number): void {
+    setRepairRoundAt(Date.now() - milliseconds);
+  }
+
+  /**
+   * The `now` of the tick that asked for the repair.
+   *
+   * Read back from the record rather than assumed: the first tick fires when the fake
+   * clock advances, so the test cannot know its instant a priori. Asserting on this
+   * value is also what makes the grace-boundary arithmetic self-checking.
+   */
+  function repairRoundAt(): number {
+    const read = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    if (!read.ok) throw new Error(`intent unreadable: ${read.error}`);
+    const at = read.intent?.run?.members?.[0]?.landRepair?.at;
+    if (at === undefined) throw new Error("no repair round was recorded");
+    return at;
+  }
+
+  /**
+   * Arm a one-member run and replace git with the publish-refusal probes (bd-277).
+   *
+   * The member's worktree is the directory the launch's lease write and the tick's own
+   * lease probe both read (`feat-bd-12`), so the repair round's hold observes the same
+   * claim production writes.
+   */
+  async function armRefusedLanding(
+    options: { statusOutput?: string; headProbeFails?: boolean } = {},
+  ): Promise<{
+    drain: {
+      drains: () => number;
+      setHead: (head: string) => void;
+      setHeadProbeFails: (fails: boolean) => void;
+    };
+    memberDir: string;
+  }> {
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const drain = stubRefusingPayloadGit({
+      commonDir,
+      memberDir,
+      head: "d".repeat(40),
+      ...(options.statusOutput === undefined ? {} : { statusOutput: options.statusOutput }),
+    });
+    if (options.headProbeFails === true) drain.setHeadProbeFails(true);
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    return { drain, memberDir };
+  }
+
+  /**
    * Start a run whose only member then stops itself, ready for the advance cases.
    *
    * No worktree is resolvable for the member, so once the start grace passes the
@@ -4736,6 +4927,24 @@ describe("fleet run mode", () => {
   }
 
   /**
+   * Age the lease the *launch* wrote in its worktree, so a repair relaunch may take it.
+   *
+   * A member whose work is complete has a session that stopped renewing its lease; the
+   * real relaunch takes that cold record over. The stubbed launch writes a fresh one
+   * (pid = this test process, heartbeat = now), which is indistinguishable from a live
+   * orchestrator, so the test ages it instead of pretending the session died.
+   */
+  function expireMemberSpawnClaim(branch: string): void {
+    const path = join(worktree.path, branch.replace(/\//g, "-"), ".belayd", "orchestrator.json");
+    if (!existsSync(path)) return;
+    const claim = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(
+      path,
+      JSON.stringify({ ...claim, heartbeatAt: Date.now() - ORCHESTRATOR_CLAIM_STALE_MS - 1 }),
+    );
+  }
+
+  /**
    * Answer the git probes a real merge drain issues, and count its rebase attempts.
    *
    * See {@link drainGitProbes} for what the stub states: a failed rebase, base work
@@ -4981,6 +5190,641 @@ describe("fleet run mode", () => {
     expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
       "could not land bd-12",
     );
+  });
+
+  it("asks a member to repair a repairable refused landing instead of stopping it (bd-277)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    mkdirSync(memberDir, { recursive: true });
+    const head = "d".repeat(40);
+    const drain = stubRefusingPayloadGit({ commonDir, memberDir, head });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    expireMemberSpawnClaim("feat/bd-12");
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    // One tick: the first is scheduled 1 ms after the arm.
+    await vi.advanceTimersByTimeAsync(1);
+
+    // AC 1: the refusal was classified by its reason, the member was asked to fix its
+    // own diff, and nothing was stopped or retired.
+    expect(drain.drains()).toBe(1);
+    const text = ctxNotifications.map((entry) => entry.message).join("\n");
+    expect(text).toContain("asked bd-12 to repair its refused landing (repair 1 of 1)");
+    expect(text).toContain("proof-artifacts-in-diff");
+    expect(text).not.toContain("could not land bd-12");
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    expect(after.intent?.taskIds).toEqual(["bd-12"]);
+    expect(after.intent?.deferred ?? []).toEqual([]);
+    expect(after.intent?.run?.members?.[0]).toMatchObject({
+      taskId: "bd-12",
+      landRepair: {
+        attempts: 1,
+        head,
+        refusal: expect.stringContaining("proof-artifacts-in-diff"),
+      },
+    });
+
+    // One launch at /fleet and one repair relaunch through the same spawn path.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(2);
+    const audited = auditEntries("fleet-land-repair");
+    expect(audited).toHaveLength(1);
+    expect(audited[0]?.taskIds).toEqual(["bd-12"]);
+    expect(audited[0]?.detail).toContain("repair 1 of 1");
+
+    // AC 4: membership and capacity are untouched. The member keeps its worktree, bead,
+    // session and capacity slot — nothing was released, retired, or closed.
+    expect(existsSync(memberDir)).toBe(true);
+    expect(after.intent?.released ?? []).toEqual([]);
+    expect(after.intent?.run?.members?.[0]?.landedAt).toBe(undefined);
+    expect(auditEntries("members-released")).toEqual([]);
+    // No bead transition: closing is the landing's job and nothing landed.
+    expect(
+      childProcess.execFileCalls.filter((call) => call.file === "bd" && call.args[0] === "close"),
+    ).toEqual([]);
+    expect(
+      childProcess.execFileCalls.filter(
+        (call) => call.file === "bd" && call.args.includes("--status"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("records the repair relaunch, holds on its fresh claim, then stops on a second refusal (bd-277 W4/S2)", async () => {
+    // The production layout: the member's worktree *is* the directory the launch claims
+    // and the tick's lease probe reads, so the repair relaunch's fresh `pending:` claim is
+    // visible to the next tick. The old fake put them in different directories, which let
+    // tick 2 re-drain a route production never takes.
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const drain = stubRefusingPayloadGit({ commonDir, memberDir, head: "d".repeat(40) });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    // Name the pre-repair session explicitly, so "the record was rewritten" is a fact the
+    // assertions can see rather than two timestamps that happen to be equal under fake
+    // timers.
+    editIntent((current) => {
+      const run = current.run as { members?: Array<Record<string, unknown>> };
+      return {
+        ...current,
+        run: {
+          ...run,
+          members: (run.members ?? []).map((member) => ({
+            ...member,
+            launchedAt: 1,
+            sessionId: "dead-session",
+          })),
+        },
+      };
+    });
+    // The member's pre-repair session is gone, which is why its work is finished but its
+    // claim is cold: the repair round takes the worktree over.
+    expireMemberSpawnClaim("feat/bd-12");
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(1);
+
+    // W4: the relaunch is recorded as a launch of this member (fresh start-grace clock and
+    // the session that now owns the worktree), and it did not reset the attempt or stop
+    // anything.
+    const relaunched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(relaunched).toHaveProperty("ok", true);
+    if (!relaunched.ok) return;
+    const relaunchedMember = relaunched.intent?.run?.members?.[0];
+    expect(relaunchedMember).toMatchObject({
+      taskId: "bd-12",
+      sessionId: "member-session-id",
+      landRepair: { attempts: 1 },
+    });
+    expect(relaunchedMember?.launchedAt).toBeGreaterThan(1);
+    expect(relaunched.intent?.run?.stopped ?? []).toEqual([]);
+    expect(drain.drains()).toBe(1);
+
+    // The repair session finished its turn without committing: the member reads complete
+    // while the fresh claim is live, so the landing is HELD — no drain, no stop, and the
+    // tick did not act.
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(drain.drains()).toBe(1);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "has not moved yet",
+    );
+    const held = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(held).toHaveProperty("ok", true);
+    if (!held.ok) return;
+    expect(held.intent?.run?.stopped ?? []).toEqual([]);
+
+    // The claim decays (that session is gone too) with the tip unchanged: the next tick
+    // drains, is refused again, and the spent round stops the member.
+    expireMemberSpawnClaim("feat/bd-12");
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    expect(drain.drains()).toBe(2);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    // AC 2: the provenance leads, so the bounded record still says which round spent the
+    // attempt and still names the refusal.
+    expect(stopped[0]?.detail.startsWith("repair 1 of 1 did not clear this")).toBe(true);
+    expect(stopped[0]?.detail).toContain("proof-artifacts-in-diff");
+    expect(stopped[0]?.detail).toContain("docs/proof/run.png");
+    // No third attempt was asked: the relaunch count is still the original plus one.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(2);
+  });
+
+  it("keeps the second-refusal provenance through the 400-char record bound (bd-277 W2)", async () => {
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    // A refusal carrying a full path list is far longer than the record's 400-character
+    // detail bound, which is exactly the case a suffix marker used to lose.
+    const changedPaths = Array.from(
+      { length: 40 },
+      (_, index) => `docs/proof/capture-${String(index).padStart(3, "0")}-screenshot.png`,
+    );
+    stubRefusingPayloadGit({ commonDir, memberDir, head: "d".repeat(40), changedPaths });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    expireMemberSpawnClaim("feat/bd-12");
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(1);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    expireMemberSpawnClaim("feat/bd-12");
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const detail = after.intent?.run?.stopped?.[0]?.detail ?? "";
+    expect(detail.startsWith("repair 1 of 1 did not clear this (proof-artifacts-in-diff) — ")).toBe(
+      true,
+    );
+    expect(detail.length).toBeLessThanOrEqual(FLEET_RUN_DETAIL_MAX_LENGTH);
+    expect(detail).toContain("docs/proof/capture-000-screenshot.png");
+    // The cut is inside the refusal's own list and at a word boundary: every
+    // path-shaped token is either a whole path from the list or the ellipsis marker.
+    const tokens = detail.split(" ").filter((token) => token.includes("/"));
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const token of tokens) {
+      const cleaned = token.replace(/[,;]$/, "");
+      if (cleaned.endsWith("…")) continue;
+      expect(changedPaths).toContain(cleaned);
+    }
+    expect(detail.endsWith("…")).toBe(true);
+  });
+
+  it("keeps the ask-failure provenance through the record bound (bd-277 W2)", async () => {
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    const changedPaths = Array.from(
+      { length: 40 },
+      (_, index) => `docs/proof/capture-${String(index).padStart(3, "0")}-screenshot.png`,
+    );
+    stubRefusingPayloadGit({ commonDir, memberDir, head: "d".repeat(40), changedPaths });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    expireMemberSpawnClaim("feat/bd-12");
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    // The repair relaunch cannot start: the worktree setup fails, so nobody was asked.
+    worktree.failWith = "wt is not installed";
+    await vi.advanceTimersByTimeAsync(1);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const detail = after.intent?.run?.stopped?.[0]?.detail ?? "";
+    expect(detail.startsWith("could not ask bd-12 to repair its landing (")).toBe(true);
+    expect(detail).toContain("proof-artifacts-in-diff");
+    expect(detail.length).toBeLessThanOrEqual(FLEET_RUN_DETAIL_MAX_LENGTH);
+    // Same bound rules as the second refusal: the marker leads, and the refusal is cut
+    // at a word boundary inside its own path list, never inside a path.
+    const tokens = detail.split(" ").filter((token) => token.includes("/"));
+    expect(tokens.length).toBeGreaterThan(0);
+    for (const token of tokens) {
+      const cleaned = token.replace(/[,;]$/, "");
+      if (cleaned.endsWith("…")) continue;
+      expect(changedPaths).toContain(cleaned);
+    }
+    // The round was recorded before the ask (crash safety) and the stop is what a status
+    // surface shows: the member is not presented as still repairing (W1).
+    expect(after.intent?.run?.members?.[0]?.landRepair?.attempts).toBe(1);
+    expect(after.intent?.run?.stopped?.[0]).toMatchObject({ reason: "land-failed" });
+  });
+
+  it("stops a real conflict with no repair round (bd-277 AC3)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    // Base work committed after the fleet started, so the rebase conflict is a real
+    // contradiction: a person decides, and no commit in the member's diff can.
+    const drain = stubDrainGit({
+      commonDir,
+      memberDir,
+      baseCommitAt: Math.floor(Date.now() / 1000) + 60,
+    });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(drain.rebaseAttempts()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail).toContain("real contradiction");
+    expect(after.intent?.run?.members?.[0]?.landRepair).toBe(undefined);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+  });
+
+  it("repairs nothing when the fleet is paused (bd-277 AC3)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    mkdirSync(memberDir, { recursive: true });
+    const drain = stubRefusingPayloadGit({ commonDir, memberDir, head: "d".repeat(40) });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    editIntent((current) => ({ ...current, paused: true, note: "stepping away" }));
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // A paused fleet halts before any land action: no drain, no repair round.
+    expect(drain.drains()).toBe(0);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.run?.members?.[0]?.landRepair).toBe(undefined);
+    expect(after.intent?.run?.stopped ?? []).toEqual([]);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+  });
+
+  it("notes a live member and holds its unchanged branch until the repair grace (bd-277)", async () => {
+    const memberDir = join(cwd, "member-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    mkdirSync(memberDir, { recursive: true });
+    const drain = stubRefusingPayloadGit({ commonDir, memberDir, head: "d".repeat(40) });
+
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+    seedLiveMemberLease(memberDir);
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    // AC 4: the note asks the member to act in its own worktree, so the record it is
+    // working from must not move under it (no relaunch, no retirement, no bead write).
+    const memberStatePath = join(memberDir, ".belayd", "workflow.json");
+    const memberStateBytes = readFileSync(memberStatePath, "utf8");
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // One orchestrator per worktree: the live member is asked by note, not relaunched.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    const notes = drainNotes({ dir: fleetEventsDir(commonDir, "default") });
+    if (!notes.ok) throw new Error(notes.error);
+    const repairs = notes.deliveries.filter((delivery) => delivery.note.kind === "land-repair");
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]?.note.to).toBe("bd-12");
+    expect(repairs[0]?.note.body).toContain("proof-artifacts-in-diff");
+    const noted = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(noted).toHaveProperty("ok", true);
+    if (!noted.ok) return;
+    expect(noted.intent?.run?.members?.[0]).toMatchObject({ landRepair: { attempts: 1 } });
+    expect(noted.intent?.run?.stopped ?? []).toEqual([]);
+    expect(readFileSync(memberStatePath, "utf8")).toBe(memberStateBytes);
+    expect(noted.intent?.taskIds).toEqual(["bd-12"]);
+    expect(noted.intent?.released ?? []).toEqual([]);
+    expect(auditEntries("members-released")).toEqual([]);
+    expect(existsSync(memberDir)).toBe(true);
+
+    // The unchanged branch is held, not re-drained: the registered attempt would turn
+    // a repeat into an immediate stop before the member could commit.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+    expect(drain.drains()).toBe(1);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "has not moved yet",
+    );
+    const held = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(held).toHaveProperty("ok", true);
+    if (!held.ok) return;
+    expect(held.intent?.run?.stopped ?? []).toEqual([]);
+
+    // A repair that changes nothing ends as the ordinary land stop once the grace
+    // expires: nobody is left who could decide.
+    ageRepairRound(FLEET_LAND_REPAIR_GRACE_MS + 1_000);
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail).toContain("still at");
+    expect(stopped[0]?.detail).toContain("stopping it for a human");
+  });
+
+  it("stops a dirty member worktree with no repair round (bd-277 AC3)", async () => {
+    // A queue/state refusal is the supervisor's condition, not a defect in the
+    // member's diff: the member keeps today's terminal stop and no round is spent.
+    const { drain, memberDir } = await armRefusedLanding({
+      statusOutput: " M docs/proof/run.png\n",
+    });
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(drain.drains()).toBe(0);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    // The provenance leads even on a terminal reason, so the record says why no round
+    // was worth spending.
+    expect(stopped[0]?.detail.startsWith("member-worktree-dirty is not something")).toBe(true);
+    expect(stopped[0]?.detail).toContain("uncommitted changes");
+    expect(after.intent?.run?.members?.[0]?.landRepair).toBe(undefined);
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+      ok: true,
+      deliveries: [],
+      warnings: [],
+    });
+  });
+
+  it("stops without asking when the repair attempt cannot be persisted (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    // Two lost compare-and-swaps: `mutateFleetIntent` retries once, so the attempt
+    // never reaches disk. Without the count there is no bound left, so the round must
+    // not be started at all.
+    intentCas.conflictsRemaining = 2;
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+    } finally {
+      intentCas.conflictsRemaining = 0;
+    }
+
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail.startsWith("could not ask bd-12 to repair its landing (")).toBe(true);
+    expect(stopped[0]?.detail).toContain("could not record the repair attempt");
+    expect(stopped[0]?.detail).toContain("proof-artifacts-in-diff");
+    expect(stopped[0]?.detail.length).toBeLessThanOrEqual(FLEET_RUN_DETAIL_MAX_LENGTH);
+    // The attempt rides on the run the tick persisted: a first-write failure narrows
+    // the crash-safety window, it does not un-spend the round.
+    expect(after.intent?.run?.members?.[0]).toMatchObject({
+      taskId: "bd-12",
+      landRepair: { attempts: 1 },
+    });
+    // Nobody was asked: no relaunch, no note, no audit entry.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+      ok: true,
+      deliveries: [],
+      warnings: [],
+    });
+  });
+
+  it("stops without asking when the run does not list the member it would repair (bd-277 S3)", async () => {
+    // A round for a member the run does not list cannot bound anything: it used to
+    // synthesise the member (inventing a `launchedAt` and a start-grace window) so the
+    // attempt counted against a launch the run never did. The round is refused now, and
+    // the member keeps today's terminal stop with the refusal text.
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    // Hand-edited or half-written code record: the task is still a fleet member whose
+    // branch is complete, but `run.members` no longer lists it.
+    editIntent((current) => {
+      const run = current.run as { members?: unknown[] } | undefined;
+      return { ...current, run: { ...run, members: [] } };
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail.startsWith("could not ask bd-12 to repair its landing (")).toBe(true);
+    expect(stopped[0]?.detail).toContain("is not a member of this run");
+    expect(stopped[0]?.detail).toContain("proof-artifacts-in-diff");
+    // No fabricated member and no round: the run is what the tick found.
+    expect(after.intent?.run?.members).toEqual([]);
+    expect(landRepairForMember(after.intent?.run, "bd-12")).toBe(undefined);
+    // Nobody was asked: no relaunch, no note, no audit entry.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+    expect(drainNotes({ dir: fleetEventsDir(commonDir, "default") })).toEqual({
+      ok: true,
+      deliveries: [],
+      warnings: [],
+    });
+  });
+
+  it("stops without asking when the repair note cannot be written (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    // A live member is asked by note (one orchestrator per worktree), so a note drop
+    // that cannot be created is a member nobody told.
+    const eventsPath = fleetEventsDir(commonDir, "default");
+    writeFileSync(eventsPath, "not a directory");
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail.startsWith("could not ask bd-12 to repair its landing (")).toBe(true);
+    expect(stopped[0]?.detail).toContain("the repair note could not be written");
+    expect(stopped[0]?.detail).toContain("proof-artifacts-in-diff");
+    expect(after.intent?.run?.members?.[0]?.landRepair?.attempts).toBe(1);
+    // The note path never relaunches and never audits a delivery it could not make.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+    expect(readFileSync(eventsPath, "utf8")).toBe("not a directory");
+  });
+
+  it("stops when the member branch tip cannot be read to bound a repair (bd-277)", async () => {
+    // Without the tip there is no way to tell a repair from an unchanged branch, so
+    // the round could not be bounded and must not be started.
+    const { drain, memberDir } = await armRefusedLanding({ headProbeFails: true });
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail.startsWith("could not ask bd-12 to repair its landing (")).toBe(true);
+    expect(stopped[0]?.detail).toContain("could not read feat/bd-12's tip to bound a repair");
+    expect(after.intent?.run?.members?.[0]?.landRepair).toBe(undefined);
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toEqual([]);
+  });
+
+  it("holds on an unreadable branch tip, then stops at the repair grace (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(drain.drains()).toBe(1);
+
+    // "I could not look" must never read as "the branch moved": the landing holds
+    // instead of draining a diff nobody repaired.
+    drain.setHeadProbeFails(true);
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_ACTION_TICK_INTERVAL_MS);
+    expect(drain.drains()).toBe(1);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "the branch probe failed",
+    );
+    const held = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(held).toHaveProperty("ok", true);
+    if (!held.ok) return;
+    expect(held.intent?.run?.stopped ?? []).toEqual([]);
+
+    // Past the grace the same unreadable tip ends the hold: the stop carries the probe
+    // failure as the evidence that nobody could have decided.
+    setRepairRoundAt(Date.now() - FLEET_LAND_REPAIR_GRACE_MS - 1_000);
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS + 1_000);
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail).toContain("still at");
+    expect(stopped[0]?.detail).toContain("the branch probe also failed");
+    expect(stopped[0]?.detail).toContain("stopping it for a human");
+  });
+
+  it("ends the repair hold exactly at FLEET_LAND_REPAIR_GRACE_MS (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(drain.drains()).toBe(1);
+
+    // The record's `at` is the asking tick's own clock and the ask acted, so the next
+    // tick fires one action interval later. Aging the record against *that* instant is
+    // what makes the boundary exact however the fake clock starts.
+    const askedAt = repairRoundAt();
+    const nextTickAt = askedAt + FLEET_RUN_ACTION_TICK_INTERVAL_MS;
+    setRepairRoundAt(nextTickAt - FLEET_LAND_REPAIR_GRACE_MS);
+    await vi.advanceTimersByTimeAsync(nextTickAt - Date.now());
+
+    expect(drain.drains()).toBe(1);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail).toContain("still at");
+    expect(stopped[0]?.detail).toContain("after 30 min");
+  });
+
+  it("still holds one millisecond before the repair grace (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(drain.drains()).toBe(1);
+
+    const askedAt = repairRoundAt();
+    const nextTickAt = askedAt + FLEET_RUN_ACTION_TICK_INTERVAL_MS;
+    setRepairRoundAt(nextTickAt - (FLEET_LAND_REPAIR_GRACE_MS - 1));
+    await vi.advanceTimersByTimeAsync(nextTickAt - Date.now());
+
+    // One millisecond short of the grace is still a hold: the member was asked and
+    // nothing says it has stopped working yet.
+    expect(drain.drains()).toBe(1);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "has not moved yet",
+    );
+    const held = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(held).toHaveProperty("ok", true);
+    if (!held.ok) return;
+    expect(held.intent?.run?.stopped ?? []).toEqual([]);
+  });
+
+  it("drains again once the repair moves the branch tip (bd-277)", async () => {
+    const { drain, memberDir } = await armRefusedLanding();
+    writeMemberState({ cwd: memberDir, completedPhaseNames: ["plan", "implement"] });
+    seedLiveMemberLease(memberDir);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(drain.drains()).toBe(1);
+
+    // The member committed its repair: the tip moved, so the hold is answered and the
+    // landing is the next thing that should happen — here the same refusal again, which
+    // is what spends the round and stops the member.
+    drain.setHead("e".repeat(40));
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_ACTION_TICK_INTERVAL_MS);
+
+    expect(drain.drains()).toBe(2);
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const stopped = after.intent?.run?.stopped ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({ taskId: "bd-12", reason: "land-failed" });
+    expect(stopped[0]?.detail.startsWith("repair 1 of 1 did not clear this")).toBe(true);
+    // The moved tip answered the round; it did not buy a second one.
+    expect(daemon.calls.filter((call) => call.path === "/sessions")).toHaveLength(1);
+    expect(auditEntries("fleet-land-repair")).toHaveLength(1);
   });
 
   it("leaves beads for the human with --no-accept", async () => {

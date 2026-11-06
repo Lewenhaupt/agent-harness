@@ -1122,38 +1122,51 @@ export interface FleetMergeBroadcast {
   rebaseHint: readonly string[];
 }
 
-export type FleetMergeFailureReason =
-  | "fleet-paused"
-  | "queue-unreadable"
-  | "no-queued-entry"
-  | "intent-unreadable"
-  | "lock-unavailable"
-  | "root-not-own-checkout"
-  | "root-not-on-base"
-  | "member-worktree-missing"
-  | "member-worktree-dirty"
-  | "member-branch-mismatch"
-  | "member-branch-missing"
-  | "gate-commands-missing"
+/**
+ * Every way a drain can refuse a landing, enumerated at runtime as well as in the
+ * type.
+ *
+ * The tuple exists because a refusal's *class* now decides behaviour (bd-277: one
+ * repair round for a defect in the member's own diff, a terminal stop for anything
+ * else), so the classifier needs the complete list to stay exhaustive: a new reason
+ * added to {@link FleetMergeFailureReason} fails `src/fleet-land-repair.ts`'s
+ * classification until someone decides which side it is on.
+ */
+export const FLEET_MERGE_FAILURE_REASONS = [
+  "fleet-paused",
+  "queue-unreadable",
+  "no-queued-entry",
+  "intent-unreadable",
+  "lock-unavailable",
+  "root-not-own-checkout",
+  "root-not-on-base",
+  "member-worktree-missing",
+  "member-worktree-dirty",
+  "member-branch-mismatch",
+  "member-branch-missing",
+  "gate-commands-missing",
   // bd-181: the publish payload is refused rather than carried (proof must be
   // uploaded, never published as files).
-  | "proof-artifacts-in-diff"
-  | "paths-outside-scope"
-  | "publish-payload-unreadable"
-  | "stash-failed"
-  | "rebase-failed"
+  "proof-artifacts-in-diff",
+  "paths-outside-scope",
+  "publish-payload-unreadable",
+  "stash-failed",
+  "rebase-failed",
   // bd-280: the rebase conflict is resolvable by the member's own orchestrator,
   // so the drain asked it to rebase instead of stopping it for a human.
-  | "rebase-delegated"
+  "rebase-delegated",
   // A merge-step seam threw instead of returning a value. Defined so a throwing
   // seam cannot turn into an unhandled rejection that leaks the merge lock.
-  | "step-failed"
-  | "gate-failed"
-  | "merge-failed"
-  | "restore-conflict"
-  | "entry-not-queued"
-  | "queue-write-failed"
-  | "intent-write-failed";
+  "step-failed",
+  "gate-failed",
+  "merge-failed",
+  "restore-conflict",
+  "entry-not-queued",
+  "queue-write-failed",
+  "intent-write-failed",
+] as const;
+
+export type FleetMergeFailureReason = (typeof FLEET_MERGE_FAILURE_REASONS)[number];
 
 export type DrainFleetMergeResult =
   | {
@@ -1418,6 +1431,33 @@ export async function checkMemberBranchContainsBase(options: {
   });
   if (!mergeBase.ok) return { ok: false, error: commandError(mergeBase) };
   return { ok: true, based: mergeBase.stdout.trim() === baseSha };
+}
+
+/**
+ * The commit one branch currently points at, or the reason it could not be read.
+ *
+ * A plain `rev-parse` of the branch ref (not `HEAD`): the caller compares this over
+ * time to answer "did anything land on this branch since?", so it must be the
+ * branch's own tip even when no worktree has it checked out. Failures are values
+ * like every other seam in this module — a failed probe must never read as "the tip
+ * is unchanged", because that would turn "I could not look" into "nothing happened"
+ * for the caller that stops a member on it (bd-277).
+ */
+export async function readBranchHead(options: {
+  cwd: string;
+  branch: string;
+  git: FleetMergeGitRunner;
+}): Promise<{ ok: true; head: string } | { ok: false; error: string }> {
+  const resolved = await options.git(
+    ["rev-parse", "--verify", "--quiet", `${options.branch}^{commit}`],
+    { cwd: options.cwd },
+  );
+  if (!resolved.ok) return { ok: false, error: commandError(resolved) };
+  const head = resolved.stdout.trim();
+  if (head === "") {
+    return { ok: false, error: `could not resolve ${options.branch} in ${options.cwd}` };
+  }
+  return { ok: true, head };
 }
 
 /** Resolve the worktree path checked out on `branch`, from git's own listing. */

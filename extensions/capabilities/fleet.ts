@@ -42,6 +42,14 @@ import {
   writeSupervisorHeartbeat,
 } from "../../src/fleet-heartbeat.js";
 import {
+  boundLandRepairRefusal,
+  boundLandRepairText,
+  FLEET_LAND_REPAIR_GRACE_MS,
+  fleetLandRepairTask,
+  MAX_LAND_REPAIR_ATTEMPTS,
+  planLandRepair,
+} from "../../src/fleet-land-repair.js";
+import {
   type FleetMemberLaunchOutcome,
   parseFleetCommandArgs,
   parseFleetTaskIds,
@@ -64,8 +72,10 @@ import {
   drainFleetMerge,
   enqueueFleetMerge,
   FLEET_REBASE_DELEGATION_GRACE_MS,
+  type FleetMergeFailureReason,
   formatDrainResultText,
   formatFleetMergeQueue,
+  readBranchHead,
 } from "../../src/fleet-merge.js";
 import {
   createFleetSupervisorRecord,
@@ -118,6 +128,7 @@ import {
   type FleetMemberObservation,
   type FleetMemberReleaseReason,
   type FleetRun,
+  type FleetRunMemberLandRepair,
   type FleetRunStop,
   type FleetTickAction,
   type FleetWorkflowProgressSnapshot,
@@ -125,6 +136,7 @@ import {
   fleetMemberBranch,
   fleetTickProgress,
   isFleetRunActive,
+  landRepairForMember,
   memberEvidenceCutoff,
   memberRanEvidence,
   memberWorktreeExisted,
@@ -134,6 +146,7 @@ import {
   recordFleetGateNotices,
   recordFleetTickProgress,
   recordRunMemberLanded,
+  recordRunMemberLandRepair,
   recordRunMemberLaunched,
   recordRunMemberStopped,
   releaseRunMembers,
@@ -186,6 +199,7 @@ import {
   fleetSpawnInFlight,
   formatBeadOwnership,
   formatFleetStatus,
+  memberLandRepair,
   sanitizeFleetId,
 } from "../../src/fleet-status.js";
 import {
@@ -347,6 +361,15 @@ const ORDERING_SWEEP_CONCURRENCY = 3;
  * the very stall/halt decisions the tick exists to make.
  */
 const MEMBER_GATE_READ_CONCURRENCY = 4;
+
+/**
+ * Characters of the ask failure kept in a stop's provenance marker (bd-277).
+ *
+ * The marker leads the stop detail, so it is bounded on its own: a launch refusal can
+ * be a long paragraph about live orchestrator leases, and it must not push the drain
+ * refusal — the thing the member has to fix — out of the record.
+ */
+const REPAIR_ASK_ERROR_MAX_CHARS = 120;
 
 /**
  * Map with a small fixed concurrency, preserving input order in the result.
@@ -566,6 +589,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         beadLookup,
         engagementLookup,
         stop: findRecordedStop({ taskId, cwd }),
+        landRepair: findRecordedLandRepair({ taskId, cwd }),
       }),
     );
   }
@@ -582,13 +606,16 @@ export function createFleet(deps: FleetDeps): FleetApi {
     beadLookup: FleetBeadLookup;
     engagementLookup: FleetEngagementLookup;
     stop: FleetRunStop | undefined;
+    landRepair: FleetRunMemberLandRepair | undefined;
   }): BeadOwnershipInput {
     const lowered = options.taskId.toLowerCase();
     const withStop = options.stop === undefined ? {} : { stop: options.stop };
+    const withRepair = options.landRepair === undefined ? {} : { landRepair: options.landRepair };
     if (!options.beadLookup.ok) {
       return {
         cwdTaskId: options.taskId,
         ...withStop,
+        ...withRepair,
         error: options.beadLookup.error,
       };
     }
@@ -601,6 +628,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         cwdTaskId: options.taskId,
         ...withBead,
         ...withStop,
+        ...withRepair,
         error: options.engagementLookup.error,
       };
     }
@@ -612,6 +640,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       ...withBead,
       ...(engagement === undefined ? {} : { engagement }),
       ...withStop,
+      ...withRepair,
     };
   }
 
@@ -640,6 +669,66 @@ export function createFleet(deps: FleetDeps): FleetApi {
       if (stop !== undefined) return stop;
     }
     return undefined;
+  }
+
+  /**
+   * The run's repair round for a bead, from the fleet intents of this repository.
+   *
+   * The single-bead mirror of {@link formatFleetLandRepairs}: a member waiting to land
+   * after a refused landing has no stop, so this record is the only thing that explains
+   * why its turn was refused and what the one repair commit is for (bd-277).
+   */
+  function findRecordedLandRepair(options: {
+    taskId: string;
+    cwd: string;
+  }): FleetRunMemberLandRepair | undefined {
+    const resolved = resolveGitCommonDir(options.cwd);
+    if (!resolved.ok) return undefined;
+    const taskId = options.taskId.toLowerCase();
+    for (const directoryId of listFleetIds({ gitCommonDir: resolved.commonDir })) {
+      const repair = landRepairInFleet({
+        gitCommonDir: resolved.commonDir,
+        fleetId: directoryId,
+        taskId,
+      });
+      if (repair !== undefined) return repair;
+    }
+    return undefined;
+  }
+
+  /**
+   * One fleet's repair round for a member, if that fleet may speak for it.
+   *
+   * Membership is the scope this surface has: `belayd_status` reads one bead and knows no
+   * fleet id, so a fleet whose `taskIds` does not name the member cannot be the one
+   * driving it. Without that check a run-member record that outlived membership (a member
+   * pruned from one fleet, or a second fleet over the same repository) would render
+   * another fleet's round — the bd-168 family of cross-fleet attribution. Two fleets that
+   * *both* list the member remain ambiguous here and resolve to the first by fleet id;
+   * naming one would need a fleet id this surface does not receive.
+   *
+   * A landed member's round is history: `recordRunMemberLanded` clears it, and a
+   * hand-edited `fleet.json` must not resurrect a "repair in progress" for work already
+   * on the base branch.
+   */
+  function landRepairInFleet(options: {
+    gitCommonDir: string;
+    fleetId: string;
+    taskId: string;
+  }): FleetRunMemberLandRepair | undefined {
+    const loaded = readFleetIntent({
+      gitCommonDir: options.gitCommonDir,
+      fleetId: options.fleetId,
+    });
+    if (!loaded.ok || loaded.intent === undefined) return undefined;
+    if (!loaded.intent.taskIds.some((taskId) => taskId.toLowerCase() === options.taskId)) {
+      return undefined;
+    }
+    return memberLandRepair(
+      (loaded.intent.run?.members ?? []).find(
+        (entry) => entry.taskId.toLowerCase() === options.taskId,
+      ),
+    );
   }
 
   function findBead(taskId: string, cwd: string): Promise<FleetBeadLookup> {
@@ -1652,17 +1741,41 @@ export function createFleet(deps: FleetDeps): FleetApi {
    * re-run the same rebase against an unchanged base. It is not a failure and must
    * not stop the member. `abandoned` is that same wait after its grace expired:
    * nobody is going to decide, so the member stops for a human.
+   *
+   * `reason` is the drain's enumerated verdict, threaded through so the tick can
+   * classify a refusal (bd-277) without reading its prose. It is absent for the
+   * failure arms that never came from a drain (a refused enqueue), which are always
+   * terminal: those are the supervisor's condition, not the member's diff.
+   *
+   * `text` is the drain's readable refusal *without* the appended path list, so the
+   * repair task can quote it and build its own bounded path section from `paths`
+   * instead of carrying the list twice. `error` is the full text (list included) and
+   * stays what a stop detail renders.
    */
   type MemberMergeOutcome =
     | { kind: "merged" }
-    | { kind: "refused"; error: string; delegated?: DrainDelegation }
+    | {
+        kind: "refused";
+        error: string;
+        text?: string;
+        reason?: FleetMergeFailureReason;
+        paths?: readonly string[];
+        delegated?: DrainDelegation;
+      }
     | { kind: "deferred"; detail: string }
     | { kind: "abandoned"; detail: string };
 
   /** What one land attempt produced, so a delegation is never read as a refusal. */
   type LandMemberOutcome =
     | { kind: "landed"; run: FleetRun; lines: readonly string[] }
-    | { kind: "refused"; error: string; delegated?: DrainDelegation }
+    | {
+        kind: "refused";
+        error: string;
+        text?: string;
+        reason?: FleetMergeFailureReason;
+        paths?: readonly string[];
+        delegated?: DrainDelegation;
+      }
     | { kind: "deferred"; detail: string }
     | { kind: "abandoned"; detail: string };
 
@@ -1676,6 +1789,13 @@ export function createFleet(deps: FleetDeps): FleetApi {
     now: number;
     /** The tick's lease observation for this member (bd-280). */
     memberLease?: FleetMemberClaim;
+    /**
+     * The tick's full observation for this member, read before any drain (bd-277).
+     *
+     * Only the repair hold reads its `progress.kind`: an unchanged branch with a live
+     * or starting member is a repair in flight, not a reason to drain again.
+     */
+    memberObservation?: FleetMemberObservation;
   }): Promise<LandMemberOutcome> {
     const { ctx, mode, taskId, now } = options;
     const merged = await mergeLandedMember({
@@ -1683,7 +1803,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
       mode,
       taskId,
       now,
+      run: options.run,
       ...(options.memberLease === undefined ? {} : { memberLease: options.memberLease }),
+      ...(options.memberObservation === undefined
+        ? {}
+        : { memberObservation: options.memberObservation }),
     });
     if (merged.kind !== "merged") return merged;
 
@@ -1792,12 +1916,41 @@ export function createFleet(deps: FleetDeps): FleetApi {
     mode: FleetMode;
     taskId: string;
     now: number;
+    run: FleetRun;
     memberLease?: FleetMemberClaim;
+    memberObservation?: FleetMemberObservation;
   }): Promise<MemberMergeOutcome> {
     const entry = memberQueueEntry(options.mode, options.taskId);
     // A member whose queue entry already says `merged` landed on an earlier tick
     // (or before a supervisor restart); re-merging it would re-run the gates.
     if (entry?.state === "merged") return { kind: "merged" };
+    return queueAndDrainMember(options, entry);
+  }
+
+  /**
+   * The attempt itself, once the entry is known not to be `merged`.
+   *
+   * Split from {@link mergeLandedMember} so the tick's own decision stays readable:
+   * the repair hold (bd-277) answers the newer question first, then the bd-280
+   * delegation hold, then whatever queue state the drain needs.
+   */
+  async function queueAndDrainMember(
+    options: {
+      ctx: ExtensionContext;
+      mode: FleetMode;
+      taskId: string;
+      now: number;
+      run: FleetRun;
+      memberLease?: FleetMemberClaim;
+      memberObservation?: FleetMemberObservation;
+    },
+    entry: FleetMergeQueueEntry | undefined,
+  ): Promise<MemberMergeOutcome> {
+    // bd-277: a recorded repair round holds the landing until the member's branch
+    // moves. This runs before the delegation guard because it is the newer question:
+    // the member was asked to repair, not to rebase.
+    const repairing = await memberAwaitingLandRepair(options);
+    if (repairing !== undefined) return repairing;
 
     const awaiting =
       entry === undefined
@@ -1818,6 +1971,72 @@ export function createFleet(deps: FleetDeps): FleetApi {
       if (!queued.ok) return { kind: "refused", error: queued.error };
     }
     return drainMemberMerge(options);
+  }
+
+  /**
+   * Whether a member given a repair round is still working it (bd-277).
+   *
+   * The repair is proven by the member's own branch moving, and the drain must not run
+   * against the unchanged branch in the meantime: re-draining would re-run the publish
+   * gate and the gates on a diff nobody changed, and the recorded attempt would turn
+   * that repeat into an immediate stop before the member had a chance to commit.
+   *
+   * The hold only applies while something is visibly driving the worktree — a starting
+   * member, or one whose orchestrator lease is live. That second case *includes* a
+   * member whose workflow already says complete: a live lease on a complete member is
+   * exactly the mailbox delivery path, where the member was told to repair through its
+   * inbox rather than relaunched.
+   *
+   * Bounded by {@link FLEET_LAND_REPAIR_GRACE_MS}: a member that never moves its branch
+   * leaves nobody who can decide, so the hold ends as the ordinary `land-failed` stop
+   * with the unchanged tip as evidence. An unreadable tip is a hold too (bd-280 S4 in
+   * `memberAwaitingOwnRebase`): a probe that cannot answer must not be read as "the
+   * branch moved", which would drain a diff nobody repaired.
+   */
+  async function memberAwaitingLandRepair(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+    run: FleetRun;
+    memberLease?: FleetMemberClaim;
+    memberObservation?: FleetMemberObservation;
+  }): Promise<MemberMergeOutcome | undefined> {
+    const repair = landRepairForMember(options.run, options.taskId);
+    if (repair === undefined) return undefined;
+    const working =
+      options.memberObservation?.progress.kind === "starting" || options.memberLease === "live";
+    if (!working) return undefined;
+
+    const branch = fleetMemberBranch(options.taskId);
+    const since = new Date(repair.at).toISOString();
+    const graceInMinutes = Math.round(FLEET_LAND_REPAIR_GRACE_MS / 60_000);
+    const head = await readBranchHead({
+      cwd: options.ctx.cwd,
+      branch,
+      git: defaultFleetMergeGitRunner,
+    });
+    // The member answered: its branch moved, so the repair is committed and the drain
+    // is the next thing that should happen (a second refusal then stops it).
+    if (head.ok && head.head !== repair.head) return undefined;
+    if (options.now - repair.at >= FLEET_LAND_REPAIR_GRACE_MS) {
+      return {
+        kind: "abandoned",
+        detail:
+          `\`${options.taskId}\` was asked at ${since} to repair its refused landing and ` +
+          `${branch} is still at ${repair.head} after ${graceInMinutes} min; stopping it for a ` +
+          "human instead of waiting on a repair that is not happening" +
+          (head.ok ? "" : ` (the branch probe also failed: ${head.error})`),
+      };
+    }
+    return {
+      kind: "deferred",
+      detail:
+        `\`${options.taskId}\` was asked at ${since} to repair its refused landing and ` +
+        `${branch} has not moved yet; the landing waits for that repair instead of ` +
+        "draining the unchanged branch again" +
+        (head.ok ? "" : ` (the branch probe failed: ${head.error})`),
+    };
   }
 
   /**
@@ -1942,9 +2161,17 @@ export function createFleet(deps: FleetDeps): FleetApi {
     // The delegated arm is a *non-stop* refusal: the member was asked to resolve
     // its own rebase, so the tick must not record a stop or retire it (bd-280).
     const error = formatDrainResultText(drained);
-    return drained.delegated === undefined
-      ? { kind: "refused", error }
-      : { kind: "refused", error, delegated: drained.delegated };
+    // The enumerated reason and the refused path list travel with the refusal so the
+    // tick can classify it (bd-277) and the repair task can name the same paths
+    // without parsing the bounded line above.
+    return {
+      kind: "refused",
+      error,
+      text: drained.text,
+      reason: drained.reason,
+      ...(drained.paths === undefined ? {} : { paths: drained.paths }),
+      ...(drained.delegated === undefined ? {} : { delegated: drained.delegated }),
+    };
   }
 
   /** Accept a landed member: close its bead (when enabled) and remove its worktree. */
@@ -2117,9 +2344,10 @@ export function createFleet(deps: FleetDeps): FleetApi {
     const fleetId = options.mode.fleetId;
     // The lease state is the tick's own observation, taken before the drain; a
     // drain can outlast it, which is why only classification reads it.
-    const memberLease = options.observations.find(
+    const memberObservation = options.observations.find(
       (observation) => observation.taskId === action.taskId,
-    )?.claim;
+    );
+    const memberLease = memberObservation?.claim;
     const landed = await landFleetMember({
       ctx: options.ctx,
       mode: options.mode,
@@ -2128,6 +2356,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       taskId: action.taskId,
       now: options.now,
       ...(memberLease === undefined ? {} : { memberLease }),
+      ...(memberObservation === undefined ? {} : { memberObservation }),
     });
     switch (landed.kind) {
       case "landed":
@@ -2175,9 +2404,379 @@ export function createFleet(deps: FleetDeps): FleetApi {
           });
           return { run: options.run, lines: [line], stop: false, acted: true };
         }
-        return landStoppedOutcome(options, action.taskId, landed.error);
+        return refuseLandTick(options, action, landed);
       }
     }
+  }
+
+  /**
+   * A non-delegated land refusal: one bounded repair round, then today's stop.
+   *
+   * The repair round exists for a refusal whose cause is a mechanical defect in the
+   * member's own diff (bd-277) — the publish gate refusing proof artifacts, a path
+   * outside the fleet's scope, the member's own code failing a gate. Those are a
+   * commit away from landing, so the member is asked to make it instead of dying with
+   * the run. Every other refusal keeps the terminal behaviour: a contradiction, a
+   * paused fleet and a queue/state error are the supervisor's or a person's decision,
+   * and retrying them burns the same minutes of gating on the same failure.
+   *
+   * The stop path is deliberately the *existing* `landStoppedOutcome`: a second
+   * refusal records exactly the `land-failed` stop, reason and blocked command the
+   * member always got, with the repair history as the only extra words.
+   */
+  async function refuseLandTick(
+    options: FleetTickContext,
+    action: Extract<FleetTickAction, { kind: "land" }>,
+    landed: Extract<LandMemberOutcome, { kind: "refused" }>,
+  ): Promise<FleetTickOutcome> {
+    const reason = landed.reason;
+    // No enumerated reason means the refusal never reached a drain (a refused
+    // enqueue): nothing the member could commit can change it.
+    if (reason === undefined) return landStoppedOutcome(options, action.taskId, landed.error);
+    const attemptsSoFar = landRepairForMember(options.run, action.taskId)?.attempts ?? 0;
+    const plan = planLandRepair({ reason, attemptsSoFar });
+    if (plan.kind === "stop") {
+      return landStoppedOutcome(
+        options,
+        action.taskId,
+        repairStopDetail(plan.detail, landed.error),
+      );
+    }
+    const memberLease = options.observations.find((entry) => entry.taskId === action.taskId)?.claim;
+    const repaired = await askMemberToRepairLanding({
+      ctx: options.ctx,
+      mode: options.mode,
+      run: options.run,
+      taskId: action.taskId,
+      now: options.now,
+      reason,
+      // The drain's readable text without its appended path list: this text is quoted
+      // to the member and stored as the round's refusal, and the task builds its own
+      // bounded path section from `paths`. The stop detail below keeps `landed.error`,
+      // which does carry the list.
+      refusal: landed.text ?? landed.error,
+      ...(landed.paths === undefined ? {} : { paths: landed.paths }),
+      ...(memberLease === undefined ? {} : { memberLease }),
+    });
+    if (repaired.ok) {
+      return { run: repaired.run, lines: [repaired.line], stop: false, acted: true };
+    }
+    return landStoppedOutcome(
+      { ...options, run: repaired.run },
+      action.taskId,
+      repairStopDetail(
+        `could not ask ${action.taskId} to repair its landing ` +
+          `(${boundLandRepairText(repaired.error, REPAIR_ASK_ERROR_MAX_CHARS)})`,
+        landed.error,
+      ),
+    );
+  }
+
+  /**
+   * Record the repair attempt and persist it, or say why nobody may be asked.
+   *
+   * One decision per failure arm, in the order the contract requires:
+   *
+   * - a member the run does not list gets no round at all. Synthesising one would invent
+   *   the launch it never had (with its start-grace window), and asking without a recorded
+   *   attempt would leave the loop unbounded — so nobody is asked and the caller stops the
+   *   member with the refusal, exactly as before bd-277;
+   * - the write has to land before the ask: the count is the loop's only bound, so it must
+   *   survive a supervisor crash between spawning the repair and the next tick persisting
+   *   the run. A failed write still returns the run the round rides on, so the tick's own
+   *   persist narrows the crash-safety window rather than un-spending the round.
+   */
+  function recordRepairAttempt(options: {
+    mode: FleetMode;
+    run: FleetRun;
+    taskId: string;
+    refusal: string;
+    head: string;
+    now: number;
+  }): { ok: true; run: FleetRun } | { ok: false; error: string; run: FleetRun } {
+    const attempt = recordRunMemberLandRepair({
+      run: options.run,
+      taskId: options.taskId,
+      refusal: options.refusal,
+      head: options.head,
+      now: options.now,
+    });
+    if (!attempt.ok) {
+      return {
+        ok: false,
+        error:
+          `\`${options.taskId}\` is not a member of this run, so the repair round could not ` +
+          "be recorded and nobody was asked to repair it",
+        run: options.run,
+      };
+    }
+    const persisted = persistRepairAttempt({
+      mode: options.mode,
+      run: attempt.run,
+      now: options.now,
+    });
+    return persisted.ok
+      ? { ok: true, run: attempt.run }
+      : {
+          ok: false,
+          error: `could not record the repair attempt (${persisted.error})`,
+          run: attempt.run,
+        };
+  }
+
+  /**
+   * Ask a member to repair its refused landing (bd-277: the effectful half).
+   *
+   * Three things happen in a fixed order, and the order is the contract:
+   *
+   * 1. the branch tip is read, because a repair is only proven by that sha moving;
+   * 2. the attempt is recorded on the run member **and persisted** before the member is
+   *    asked — a crash between the two would otherwise leave an attempt nobody counted.
+   *    A member the run does not list cannot be recorded at all, so it is not asked:
+   *    an unrecorded round would be unbounded (see `recordRunMemberLandRepair`);
+   * 3. the member is asked, by relaunching its own worktree or — when its orchestrator
+   *    is still live — by putting the same task in its fleet mailbox.
+   *
+   * A member nobody could ask is not left landable: it stops with the refusal *and* the
+   * reason it could not be asked (the bd-280 precedent — a delegation that reached
+   * nobody is a silent stop).
+   *
+   * bd-174.13 debt: this reuses the full `launchWorktreeWorkflow`, so the repair round
+   * re-runs the member's phases instead of a phase-less fix round. That is acceptable
+   * here (a repair that re-runs the phases still lands) and should switch to the light
+   * mode once bd-174.13 lands one.
+   */
+  async function askMemberToRepairLanding(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    run: FleetRun;
+    taskId: string;
+    now: number;
+    reason: FleetMergeFailureReason;
+    refusal: string;
+    paths?: readonly string[];
+    memberLease?: FleetMemberClaim;
+  }): Promise<
+    { ok: true; run: FleetRun; line: string } | { ok: false; error: string; run: FleetRun }
+  > {
+    const { ctx, mode, taskId, now } = options;
+    const branch = fleetMemberBranch(taskId);
+    const head = await readBranchHead({
+      cwd: ctx.cwd,
+      branch,
+      git: defaultFleetMergeGitRunner,
+    });
+    if (!head.ok) {
+      // Without the tip there is no way to tell a repair from an unchanged branch, so
+      // the round could not be bounded: stop now rather than hold forever.
+      return {
+        ok: false,
+        error: `could not read ${branch}'s tip to bound a repair (${head.error})`,
+        run: options.run,
+      };
+    }
+    const task = fleetLandRepairTask({
+      taskId,
+      reason: options.reason,
+      refusal: options.refusal,
+      ...(options.paths === undefined ? {} : { paths: options.paths }),
+    });
+    const attempt = recordRepairAttempt({
+      mode,
+      run: options.run,
+      taskId,
+      refusal: options.refusal,
+      head: head.head,
+      now,
+    });
+    if (!attempt.ok) return attempt;
+    const recorded = attempt.run;
+    // One orchestrator per worktree: a launch would be refused by the member's own live
+    // lease, so the same task goes to the mailbox that member drains each turn.
+    const noted = options.memberLease === "live";
+    const asked = noted
+      ? deliverLandRepairNote({ mode, taskId, now, body: task })
+      : await relaunchMemberForRepair({ ctx, mode, taskId, handoff: task });
+    const sessionId = asked.ok ? asked.sessionId : undefined;
+    const relaunchedRun = recordRepairRelaunch({
+      ctx,
+      mode,
+      taskId,
+      now,
+      run: recorded,
+      sessionId,
+    });
+    if (!asked.ok) return { ok: false, error: asked.error, run: relaunchedRun };
+
+    const repair = landRepairForMember(relaunchedRun, taskId);
+    const summary =
+      `(repair ${repair?.attempts ?? 1} of ${MAX_LAND_REPAIR_ATTEMPTS}): ` +
+      boundLandRepairRefusal(options.refusal);
+    auditFleetAction({
+      ctx,
+      gitCommonDir: mode.gitCommonDir,
+      fleetId: mode.fleetId,
+      action: "fleet-land-repair",
+      taskIds: [taskId],
+      detail: `${noted ? "noted" : "relaunched"} ${taskId} to repair its refused landing ${summary}`,
+    });
+    return {
+      ok: true,
+      run: relaunchedRun,
+      line: `Fleet ${mode.fleetId}: asked ${taskId} to repair its refused landing ${summary}`,
+    };
+  }
+
+  /**
+   * Persist the repair attempt before the member is asked (bd-277).
+   *
+   * The count is the loop's only bound, so it must exist on disk before anything is
+   * spawned: a crash between the two must not leave a member that can be asked again and
+   * again. A failure is returned, never thrown, and the caller stops the member.
+   */
+  function persistRepairAttempt(options: {
+    mode: FleetMode;
+    run: FleetRun;
+    now: number;
+  }): { ok: true } | { ok: false; error: string } {
+    const written = mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (intent) => ({ ...intent, run: options.run, updatedAt: options.now }),
+    });
+    return written.ok ? { ok: true } : { ok: false, error: written.error };
+  }
+
+  /**
+   * Record a repair relaunch as a launch of the member, and persist it (bd-277 W4).
+   *
+   * `launchedAt` is the start-grace clock the tick observes and `sessionId` names the
+   * session that now owns the worktree; without this the run keeps naming the dead
+   * pre-repair session, and the hold's "is anything visibly working this?" question reads
+   * a stale claim. `recordRunMemberLaunched` preserves the member's `landRepair` (the
+   * attempt count must not reset), filters a stop only for a member that had one (a
+   * repair round is never recorded for a stopped member), and touches neither `taskIds`
+   * nor any lease: capacity and lease bookkeeping belong to the spawn marker and the
+   * worktree claim the launch itself already wrote.
+   *
+   * A second CAS write, not a reuse of the first: the first had to commit *before* the
+   * ask (crash safety), and the session id only exists after the spawn. This write
+   * composes on the intent it re-reads (`mutateFleetIntent` retries a concurrent write
+   * and re-applies), so the `landRepair` the first window recorded is the base of this
+   * one rather than something it overwrites. A failure here is a warning, not a stop:
+   * the member is already working, and only the new session identity is missing until the
+   * tick's own persist.
+   */
+  function recordRepairRelaunch(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+    run: FleetRun;
+    sessionId?: string;
+  }): FleetRun {
+    const sessionId = options.sessionId;
+    if (sessionId === undefined) return options.run;
+    const relaunched = recordRunMemberLaunched({
+      run: options.run,
+      taskId: options.taskId,
+      launchedAt: options.now,
+      sessionId,
+    });
+    const written = mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (intent) => ({
+        ...intent,
+        run: recordRunMemberLaunched({
+          run: intent.run ?? relaunched,
+          taskId: options.taskId,
+          launchedAt: options.now,
+          sessionId,
+        }),
+        updatedAt: options.now,
+      }),
+    });
+    if (!written.ok) {
+      options.ctx.ui.notify(
+        `Fleet ${options.mode.fleetId}: could not record ${options.taskId}'s repair relaunch ` +
+          `(${written.error})`,
+        "warning",
+      );
+    }
+    return relaunched;
+  }
+
+  /** Put the repair task in a live member's mailbox, so its next turn acts on it. */
+  function deliverLandRepairNote(options: {
+    mode: FleetMode;
+    taskId: string;
+    now: number;
+    body: string;
+  }): { ok: true; sessionId?: string } | { ok: false; error: string } {
+    const recipients = resolveFleetNoteRecipients({
+      direction: "supervisor-to-member",
+      to: options.taskId,
+      members: fleetMemberTaskIds(options.mode.intent),
+    });
+    if (!recipients.ok)
+      return { ok: false, error: `the repair note was not addressable (${recipients.error})` };
+    const enqueued = enqueueNoteFanout({
+      dir: options.mode.eventsDir,
+      note: buildFleetNote({
+        kind: "land-repair",
+        from: FLEET_NOTE_SUPERVISOR,
+        to: options.taskId,
+        body: options.body,
+        now: options.now,
+      }),
+      recipients: recipients.recipients,
+    });
+    if (!enqueued.ok)
+      return { ok: false, error: `the repair note could not be written (${enqueued.error})` };
+    return enqueued.recipients.includes(options.taskId)
+      ? { ok: true }
+      : { ok: false, error: `the repair note reached nobody (${options.taskId} was not written)` };
+  }
+
+  /** Relaunch the member's own worktree with the repair task as its handoff. */
+  async function relaunchMemberForRepair(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    taskId: string;
+    handoff: string;
+  }): Promise<{ ok: true; sessionId?: string } | { ok: false; error: string }> {
+    const launched = await launchFleetMember({
+      ctx: options.ctx,
+      taskId: options.taskId,
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      base: options.mode.intent.baseBranch,
+      handoff: options.handoff,
+    });
+    if (!launched.ok) {
+      return { ok: false, error: `the repair launch was refused (${launched.detail})` };
+    }
+    return launched.sessionId === undefined
+      ? { ok: true }
+      : { ok: true, sessionId: launched.sessionId };
+  }
+
+  /**
+   * A repair-related stop detail whose provenance survives the record's own bound (bd-277).
+   *
+   * `recordRunMemberStopped` bounds a detail at `FLEET_RUN_DETAIL_MAX_LENGTH` from the
+   * front, and a drain refusal carrying a `Refused paths (N):` list is longer than the
+   * room a *suffix* would leave — so the provenance ("repair 1 of 1 did not clear this",
+   * "could not ask <task> to repair its landing") would be the first thing cut. The
+   * provenance therefore leads, and the refusal is bounded here to the room that leaves:
+   * the record's bound never has to cut anything, the marker always survives, and the
+   * cut lands at a word boundary inside the refusal's own list, never inside a path.
+   */
+  function repairStopDetail(marker: string, refusal: string): string {
+    const separator = " — ";
+    const budget = Math.max(1, FLEET_RUN_DETAIL_MAX_LENGTH - marker.length - separator.length);
+    return `${marker}${separator}${boundLandRepairText(refusal, budget)}`;
   }
 
   /**
@@ -3967,6 +4566,13 @@ export function createFleet(deps: FleetDeps): FleetApi {
     gitCommonDir: string;
     fleetId: string;
     base?: string;
+    /**
+     * The task this launch exists for, when it is not the member's first one (bd-277).
+     *
+     * A repair round relaunches the member's own worktree with the drain's refusal and
+     * the repair instruction as the handoff; the ordinary launch passes nothing.
+     */
+    handoff?: string;
   }): Promise<FleetMemberLaunchOutcome> {
     const spawned = await withFleetLaunchMarker({
       gitCommonDir: options.gitCommonDir,
@@ -3985,6 +4591,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     ctx: ExtensionContext;
     taskId: string;
     base?: string;
+    handoff?: string;
   }): Promise<FleetMemberLaunchOutcome> {
     const { ctx, taskId } = options;
     try {
@@ -4000,6 +4607,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         workflowType: resolution.type,
         branch: fleetMemberBranch(taskId),
         ...(options.base === undefined ? {} : { base: options.base }),
+        ...(options.handoff === undefined ? {} : { handoff: options.handoff }),
         resolutionSource: resolution.source,
         ...(resolution.matchedLabel === undefined ? {} : { matchedLabel: resolution.matchedLabel }),
         role: "fleet-member",

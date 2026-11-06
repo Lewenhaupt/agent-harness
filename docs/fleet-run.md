@@ -588,13 +588,31 @@ for a human instead of silently relaunched.
 - **One landing per tick.** A tick that lands runs the project gates for minutes; a
   second tick is skipped while one is in flight (`fleetTickInFlight`). Three
   finished members land on three ticks.
-- **Gates are not retried.** A gate/merge refusal stops the member with
-  `land-failed`. Retrying with no new information would burn the same minutes again.
-  A **rebase** failure is the one exception, and it is classified first: a stale
-  state is cleared and retried once, generated paths are regenerated, and a
-  conflict a live member can resolve is delegated back to it with a `rebase-hint`
-  instead of a stop (bd-280, `docs/fleet-merge.md`). Only a contradiction, or a
-  failure nobody can classify, records `land-failed`.
+- **Gates are not retried, with one bounded exception.** A gate/merge refusal stops
+  the member with `land-failed`. Retrying with no new information would burn the same
+  minutes again. Two exceptions are classified first, both by the drain's enumerated
+  reason rather than by its prose:
+  - a **rebase** failure (bd-280): a stale state is cleared and retried once,
+    generated paths are regenerated, and a conflict a live member can resolve is
+    delegated back to it with a `rebase-hint` instead of a stop;
+  - a refusal whose cause is a mechanical defect in the member's **own diff**
+    (`proof-artifacts-in-diff`, `paths-outside-scope`, `gate-failed`) gets one repair
+    round (bd-277): the member is relaunched on its own branch with the refusal as its
+    task (or sent a `land-repair` note when its lease is live), the attempt is
+    recorded as `run.members[].landRepair`, and the landing holds while its branch tip
+    is unchanged — for at most `FLEET_LAND_REPAIR_GRACE_MS` (30 min), after which the
+    member stops `land-failed`. A second refusal stops it, and the stop detail leads
+    with the round's provenance — `planLandRepair`'s own detail (`repair 1 of 1 did not
+    clear this (<reason>)`, or `<reason> is not something a commit in the member's own
+    diff can change` for a terminal reason), or the ask-failure arm's (`could not ask
+    <task> to repair its landing (<why>)`) — then the refusal, which is bounded against
+    the record's 400-character detail budget so the marker's identity and the gate
+    reason survive, with as much of its path list as fits. The marker's parenthesised
+    reason is bounded too (120 characters for an ask failure, then `…`), and the
+    refusal is cut at a word boundary, so a path with no whitespace is never split.
+
+  Only a contradiction, an unrepairable reason, or a failure nobody can classify
+  records `land-failed`.
 - **A delegation is deliberate and recorded.** The tick that delegates reports the
   member's complete conflicted path list and records it in `audit.log` as
   `fleet-land-delegated`; the member is kept (no stop, no retirement, no worktree

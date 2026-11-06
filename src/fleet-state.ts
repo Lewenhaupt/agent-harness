@@ -1041,6 +1041,10 @@ export const FLEET_NOTE_KINDS = [
   "sibling-landed",
   "pause",
   "resume",
+  // bd-277: the supervisor's ask to repair a refused landing, delivered to a member
+  // whose orchestrator is still live (a relaunch of its worktree would be refused by
+  // the one-orchestrator-per-worktree lease).
+  "land-repair",
 ] as const;
 
 export type FleetNoteKind = (typeof FLEET_NOTE_KINDS)[number];

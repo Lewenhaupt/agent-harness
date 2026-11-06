@@ -17,6 +17,7 @@ import { z } from "zod";
 import { excerptComment } from "./bead-comments.js";
 import type { FleetCapacityArithmetic, FleetCapacitySupervisor } from "./fleet-capacity.js";
 import { describeFleetCapacity, FLEET_MAX_CONCURRENT_ORCHESTRATORS } from "./fleet-capacity.js";
+import { formatLandRepairStatus } from "./fleet-land-repair.js";
 import type { FleetSupervisorLiveness } from "./fleet-mode.js";
 import { classifyFleetSupervisor, isProcessAlive, readProcessStartTime } from "./fleet-mode.js";
 import { defaultFleetPublish, FleetPublishSchema } from "./fleet-publish.js";
@@ -25,6 +26,9 @@ import {
   FLEET_RUN_STALE_TICK_INTERVALS,
   FLEET_RUN_STALE_TICK_MS,
   FLEET_RUN_TICK_INTERVAL_MS,
+  type FleetRun,
+  type FleetRunMember,
+  type FleetRunMemberLandRepair,
   FleetRunSchema,
   type FleetRunStop,
   fleetMemberBranch,
@@ -701,6 +705,15 @@ export interface FleetMemberView {
    * no human is needed.
    */
   stop?: FleetRunStop;
+  /**
+   * The repair round the run gave this member's refused landing (bd-277).
+   *
+   * A member in a repair round is *not* stopped and needs nobody: it was asked to fix
+   * its own diff, so this is rendered in the member's own block rather than in
+   * "Needs you". Absent means no repair round was ever asked for — not that the
+   * landing succeeded.
+   */
+  landRepair?: FleetRunMemberLandRepair;
   state: FleetMemberState;
 }
 
@@ -1169,6 +1182,61 @@ interface AttributedMemberView {
   belongsToIntent: boolean;
 }
 
+/**
+ * The run member's repair record, or `undefined` when the member has landed (bd-277).
+ *
+ * `recordRunMemberLanded` clears the record, so this guard only matters for a hand-edited
+ * or half-written `fleet.json`. It is stated once here because every surface joins the
+ * record: the member view (both the readable-workflow and the missing-state branch), the
+ * run header, and the single-bead join in `extensions/capabilities/fleet.ts`
+ * (`landRepairInFleet`), which reads the intent from disk and uses this same guard so work
+ * already on the base branch never reads as "repairing".
+ */
+export function memberLandRepair(
+  member: FleetRunMember | undefined,
+): FleetRunMemberLandRepair | undefined {
+  if (member === undefined || member.landedAt !== undefined) return undefined;
+  return member.landRepair;
+}
+
+/**
+ * The run's recorded repair round for one member, if it was given one (bd-277).
+ *
+ * Same join as {@link stopForMember}, but it must not be confused with a stop: a member
+ * in a repair round is still expected to act, which is why it is rendered with the
+ * member rather than in "Needs you". A stop is applied to it by
+ * {@link currentLandRepair}, a landing by {@link memberLandRepair}.
+ */
+function landRepairOfMember(
+  intent: FleetIntent | undefined,
+  taskId: string | undefined,
+): FleetRunMemberLandRepair | undefined {
+  if (intent === undefined || taskId === undefined) return undefined;
+  return memberLandRepair((intent.run?.members ?? []).find((entry) => entry.taskId === taskId));
+}
+
+/**
+ * The repair round worth rendering, or `undefined` when a stop supersedes it (bd-277).
+ *
+ * `recordRunMemberStopped` deliberately keeps `landRepair` on the member — it is the
+ * history of how the member got there — so rendering it unguarded prints
+ * `repair 1 of 1 — <refusal>` beside the stop that already replaced the round (a second
+ * refusal, or a repair nobody could be asked). That reads as though both are pending,
+ * which is exactly what the run header's own list refuses to do.
+ *
+ * The rule is stated once, here, and all four surfaces that render the record pass it
+ * through this function with the member's own stop: the member view's join, the member
+ * block, the run header (`formatFleetLandRepairs`), and the single-bead section. The
+ * companion rule — a landed member keeps no round — is stated once in
+ * {@link memberLandRepair}.
+ */
+export function currentLandRepair(
+  repair: FleetRunMemberLandRepair | undefined,
+  stop: FleetRunStop | undefined,
+): FleetRunMemberLandRepair | undefined {
+  return stop === undefined ? repair : undefined;
+}
+
 /** Build a member view and keep the attribution that produced it (bd-168 S1). */
 function attributedMemberView(
   snapshot: FleetMemberSnapshot,
@@ -1183,6 +1251,12 @@ function attributedMemberView(
   const taskIdSource = attribution.source === undefined ? {} : { taskIdSource: attribution.source };
 
   if (snapshot.workflow.kind !== "ok") {
+    // A member with no workflow file can still be attributed (bd-168) and therefore
+    // still carry a stop or a repair round (bd-277): completion clears the state file,
+    // which is exactly the member a refused landing is about, so omitting the join here
+    // would hide the round for the most common repair case.
+    const stop = stopForMember(intent, taskId);
+    const landRepair = currentLandRepair(landRepairOfMember(intent, taskId), stop);
     return {
       belongsToIntent: attribution.belongsToIntent,
       view: {
@@ -1201,6 +1275,8 @@ function attributedMemberView(
         interruptedRunCount,
         updatedAt: runTimestamp,
         lease: fleetLeaseView(snapshot.lease),
+        ...(stop === undefined ? {} : { stop }),
+        ...(landRepair === undefined ? {} : { landRepair }),
         state: deriveFleetMemberState({
           workflow: snapshot.workflow,
           runs,
@@ -1218,6 +1294,7 @@ function attributedMemberView(
   // Absent flag means "not awaiting" (pre-bd-81 state files predate the field).
   const awaitingReviewResponse = state.awaitingReviewResponse === true;
   const stop = stopForMember(intent, state.taskId);
+  const landRepair = currentLandRepair(landRepairOfMember(intent, state.taskId), stop);
 
   return {
     belongsToIntent: attribution.belongsToIntent,
@@ -1239,6 +1316,7 @@ function attributedMemberView(
         runTimestamp === undefined ? state.updatedAt : Math.max(state.updatedAt, runTimestamp),
       lease: fleetLeaseView(snapshot.lease),
       ...(stop === undefined ? {} : { stop }),
+      ...(landRepair === undefined ? {} : { landRepair }),
       state: deriveFleetMemberState({
         workflow: snapshot.workflow,
         runs,
@@ -2252,6 +2330,8 @@ export interface BeadOwnershipInput {
   stop?: FleetRunStop;
   /** Bounded read failure, rendered instead of the ownership columns. */
   error?: string;
+  /** The run's repair round for this bead, when one was recorded (bd-277). */
+  landRepair?: FleetRunMemberLandRepair;
 }
 
 /**
@@ -2274,6 +2354,22 @@ function ownershipStopLine(stop: FleetRunStop): string {
 }
 
 /**
+ * Whether the section has anything to print besides a read failure.
+ *
+ * A repair round (bd-277) counts: it is the only explanation a member's own session
+ * gets for a landing that never reached the bead, so a section that dropped it would
+ * print nothing for the one state where the session could still act.
+ */
+function ownershipHasData(input: BeadOwnershipInput): boolean {
+  return (
+    input.bead !== undefined ||
+    input.engagement !== undefined ||
+    input.stop !== undefined ||
+    currentLandRepair(input.landRepair, input.stop) !== undefined
+  );
+}
+
+/**
  * Ownership/human section for `belayd_status` (one bead, markdown).
  *
  * Undefined when there is nothing to say — no task id, or no bead/engagement was
@@ -2285,9 +2381,7 @@ function ownershipStopLine(stop: FleetRunStop): string {
  */
 export function formatBeadOwnership(input: BeadOwnershipInput): string | undefined {
   if (input.cwdTaskId === "") return undefined;
-  const hasData =
-    input.bead !== undefined || input.engagement !== undefined || input.stop !== undefined;
-  if (!hasData) {
+  if (!ownershipHasData(input)) {
     return input.error === undefined
       ? undefined
       : `bead detail unavailable (bd read failed): ${boundLookupError(input.error)}`;
@@ -2310,6 +2404,14 @@ export function formatBeadOwnership(input: BeadOwnershipInput): string | undefin
     lines.push(`bead engagement unavailable (bd read failed): ${boundLookupError(input.error)}`);
   }
   if (input.stop !== undefined) lines.push(ownershipStopLine(input.stop));
+  // A repair round is not a stop and does not need a human: it is stated so the
+  // session reading its own status knows the landing was refused once and that one
+  // repair commit is all it has (bd-277). A stop supersedes it — the stop is the
+  // current truth, the round is the history — so both are never printed.
+  const landRepair = currentLandRepair(input.landRepair, input.stop);
+  if (landRepair !== undefined) {
+    lines.push(`- ${formatLandRepairStatus(landRepair)}`);
+  }
   const needsHuman =
     beadNeedsHuman(input.bead) ||
     input.engagement?.awaitingHuman === true ||
@@ -2366,6 +2468,15 @@ function formatMember(member: FleetMemberView): string[] {
 
   if (member.bead !== undefined) lines.push(formatBeadLine(member.bead));
   lines.push(...formatOwnershipLines(member));
+  // The repair round renders with the member, not in "Needs you": the member was
+  // asked to fix its own diff and still owes an action, so nobody is being waited on
+  // (bd-277). A stopped member prints only its stop (see `currentLandRepair`); the
+  // view already drops the round for one, and this guard keeps the surface honest even
+  // for a member assembled elsewhere.
+  const landRepair = currentLandRepair(member.landRepair, member.stop);
+  if (landRepair !== undefined) {
+    lines.push(`  ${formatLandRepairStatus(landRepair)}`);
+  }
 
   if (member.workflowFile === "ok") {
     const completedInOrder = member.phaseOrder.filter((phase) =>
@@ -2402,6 +2513,31 @@ function formatMember(member: FleetMemberView): string[] {
  * Deterministic plain text (no ANSI) for a pi tool result. Members are already
  * sorted by task id; warnings keep that order with duplicate-task warnings last.
  */
+/**
+ * The repair rounds in flight, as header lines (bd-277).
+ *
+ * A member in a repair round is not stopped, so `formatFleetRunStops` says nothing
+ * about it: without this line the run header would show the member as an ordinary
+ * member and the repair would only exist in its block, far from the run's own line.
+ *
+ * The decision is not restated here: each member's record goes through
+ * {@link currentLandRepair} and {@link memberLandRepair} with that member's own stop,
+ * exactly as the member block and the single-bead section do, so the surfaces cannot
+ * drift.
+ */
+export function formatFleetLandRepairs(run: FleetRun | undefined): readonly string[] {
+  if (run === undefined) return [];
+  const stopped = run.stopped ?? [];
+  const lines: string[] = [];
+  for (const member of run.members ?? []) {
+    const stop = stopped.find((entry) => entry.taskId === member.taskId);
+    const repair = currentLandRepair(memberLandRepair(member), stop);
+    if (repair === undefined) continue;
+    lines.push(`repairing ${member.taskId} (${formatLandRepairStatus(repair)})`);
+  }
+  return lines;
+}
+
 /** The header block: intent facts, then membership counts and capacity. */
 function formatFleetHeader(status: FleetStatus): string[] {
   const intentFacts = [
@@ -2418,6 +2554,7 @@ function formatFleetHeader(status: FleetStatus): string[] {
     `  intent: ${formatIntent(status.intent)}`,
     ...intentFacts.map((line) => `  ${line}`),
     ...formatFleetRunStops(status.intent?.run).map((line) => `  ${line}`),
+    ...formatFleetLandRepairs(status.intent?.run).map((line) => `  ${line}`),
     `  members: ${status.members.length}`,
     `  states: ${formatCounts(status.counts)}`,
     ...formatCapacity(status.capacity),
