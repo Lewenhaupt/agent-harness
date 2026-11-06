@@ -10,6 +10,26 @@ export function defineProofPanelElement() {
 }
 
 /**
+ * The plugin peer that reads the receipt for this workspace.
+ *
+ * The documented browser v5 path is `context.backend.forScope(...)` with the
+ * workspace's own ids; a host that already attached the paired peer to the
+ * workspace context supplies `context.peer` instead. Either way the request
+ * carries workspace scope, which the server module needs to locate the store.
+ */
+export function receiptPeer(context) {
+  const backend = context.backend;
+  if (backend !== undefined && backend !== null && typeof backend.forScope === "function") {
+    return backend.forScope({
+      kind: "workspace",
+      projectId: context.workspace.projectId,
+      workspaceId: context.workspace.id,
+    });
+  }
+  return context.peer;
+}
+
+/**
  * Proof-of-work artifact viewer: two-pane layout with a sidebar listing
  * task directories and their files, and a viewer for rendering individual
  * artifacts. Supports .cast (asciinema-player), .webm, images, .md, and
@@ -28,6 +48,8 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   selectedFilePath;
   fileContent;
   scanToken = 0;
+  /** Cancels the in-flight receipt request; a newer scan replaces it. */
+  receiptAbort;
   /** Blob URLs created for cast playback; revoked on disconnect. */
   blobUrls = new Set();
   /** Asciinema player instances { element, instance } for cleanup. */
@@ -134,7 +156,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
 
     // A receipt is read on every scan: it is small, and a stale receipt would
     // claim an upload that no longer describes the bead.
-    const receipt = await resolveProofReceipt(context.files);
+    const receipt = await this.readReceipt(context, token);
     if (!this.isCurrentScan(context, token)) return;
     this.receipt = receipt;
 
@@ -329,6 +351,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   }
 
   resetScanState() {
+    this.abortReceiptRead();
     this.destroyPlayers();
     this.listing = undefined;
     this.proofRoot = undefined;
@@ -342,6 +365,36 @@ class PiWebProofOfWorkPanel extends HTMLElement {
 
   isCurrentScan(context, token) {
     return token === this.scanToken && this.contextValue !== undefined && contextKey(this.contextValue) === contextKey(context);
+  }
+
+  /**
+   * Cancel a pending receipt read. Called when a newer scan starts, the context
+   * changes or the panel disconnects, so a hung peer request is cancelled
+   * instead of holding the request open until it times out.
+   */
+  abortReceiptRead() {
+    const controller = this.receiptAbort;
+    if (controller === undefined) return;
+    this.receiptAbort = undefined;
+    controller.abort();
+  }
+
+  /**
+   * Read the receipt for this scan, tied to the scan's lifetime.
+   *
+   * The request carries the scan's `AbortSignal`; a superseded scan's result is
+   * still dropped by `scanToken` in the caller, so an abort that raced a slow
+   * response can never render a stale receipt.
+   */
+  async readReceipt(context, token) {
+    this.abortReceiptRead();
+    const controller = new AbortController();
+    this.receiptAbort = controller;
+    try {
+      return await resolveProofReceipt(receiptPeer(context), { signal: controller.signal });
+    } finally {
+      if (this.receiptAbort === controller) this.receiptAbort = undefined;
+    }
   }
 
   renderAll() {
@@ -420,6 +473,10 @@ class PiWebProofOfWorkPanel extends HTMLElement {
     if (receipt.kind === "invalid") {
       return `<div class="status error small"><strong>Proof receipt unreadable.</strong><pre>${escapeHtml(receipt.detail)}</pre></div>`;
     }
+    // `unavailable` means the host exposes no plugin peer at all (an older
+    // pi-web), so there is no receipt to show and nothing to report: the
+    // artifacts below stay exactly as they were.
+    if (receipt.kind !== "receipt") return "";
     const { taskId, id, url } = receipt.receipt;
     const idRow =
       id === undefined
@@ -690,6 +747,7 @@ class PiWebProofOfWorkPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this.abortReceiptRead();
     this.destroyPlayers();
   }
 }

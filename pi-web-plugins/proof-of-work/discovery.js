@@ -1,11 +1,10 @@
 
 export const PROOF_OF_WORK_ROOT = "proof-of-work";
 
-// SYNC WARNING: The receipt path, JSON shape and reference shape below are a
+// SYNC WARNING: The receipt JSON shape and reference shape below are a
 // cross-component contract duplicated in `src/proof-receipt.ts`
-// (`PROOF_RECEIPT_RELATIVE_PATH`, `ProofReceiptSchema` (zod), `isProofReceiptId`
-// and `isProofReceiptUrl`). The receipt lives at ".belayd/proof-receipt.json"
-// and holds one JSON object:
+// (`ProofReceiptSchema` (zod), `isProofReceiptId` and `isProofReceiptUrl`). The
+// receipt is one JSON object:
 // `{ version: 1, taskId: string, id?: string, url?: string, uploadedAt?: string,
 // artifactCount?: number }` with at least one of `id`/`url`. An `id` is a UUID
 // or >= 8 chars of `[A-Za-z0-9]` containing `-`/`_`; a `url` is an absolute
@@ -15,12 +14,26 @@ export const PROOF_OF_WORK_ROOT = "proof-of-work";
 // platform id later is a `PROOF_RECEIPT_VERSION` bump in `src/proof-receipt.ts`
 // (mirrored here), never a local tweak.
 //
+// Since bd-303 the receipt is a row, not a file: the harness stores that JSON as
+// the `payload` text of a `proof_receipt` row in
+// `<git-common-dir>/belayd/state.sqlite`, keyed by the task id bound to the
+// worktree (`workflow_binding`). This browser file cannot open that store, so
+// `resolveProofReceipt` asks this package's server module
+// (`server-plugin.js` -> `store-reader.js`) for the row and validates the text
+// here. The retired `.belayd/proof-receipt.json` path must not come back: the
+// browser file API cannot see the store, and a mirrored file would be the
+// copied state bd-281 removed.
+//
 // This file cannot import zod or the TypeScript module, so `normalizeProofReceipt`
 // below is the hand-rolled mirror of `ProofReceiptSchema`. It must be kept in
 // sync with the zod schema in `src/proof-receipt.ts` — strict key set, the
 // `version: 1` literal, the at-least-one-reference rule, the id shape, and the
-// https-only url rule — and vice versa.
-export const PROOF_RECEIPT_PATH = ".belayd/proof-receipt.json";
+// https-only url rule — and vice versa. The parity test
+// `src/__tests__/proof-receipt-parity.test.ts` drives both sides over the same
+// cases.
+
+/** Operation name the server module serves; mirrored in `server-plugin.js`. */
+export const PROOF_RECEIPT_OPERATION = "receipt";
 
 // SYNC WARNING: The marker path and file format below are a cross-component
 // contract duplicated in `src/proof-dir.ts` (`PROOF_DIR_MARKER_RELATIVE_PATH`).
@@ -173,30 +186,66 @@ function normalizeProofReceipt(raw) {
 }
 
 /**
- * Read the proof receipt from the (gitignored) workspace receipt file.
+ * Read the proof receipt through this package's server module.
  *
- * A missing file is `{ kind: "none" }` — the platform does not exist for most
- * beads yet, so the panel falls back to the external proof root. Malformed,
- * denied or binary content is `{ kind: "invalid", detail }`. Never rejects.
+ * `peer` is the scoped plugin peer of the panel's workspace context. A host
+ * that exposes no peer cannot serve the store, so the result is
+ * `{ kind: "unavailable" }` and the panel renders without a receipt instead of
+ * failing. `{ kind: "none" }` is the normal case (no living bead binding, no
+ * upload yet, or no store file yet), so the panel falls back to the external
+ * proof root. Unparseable or contract-violating payloads and any failed request
+ * are `{ kind: "invalid", detail }`, which the panel shows as an unreadable
+ * receipt. Never rejects.
+ *
+ * `options.signal` cancels the request when its scan is superseded. A read the
+ * caller cancelled is `{ kind: "none" }`, not an error: the panel must not
+ * report an unreadable receipt for a request a newer scan abandoned. A failure
+ * is judged by that signal alone, never by an error's name — a transport that
+ * surfaces a peer disconnect as an `AbortError` is still a failed read and keeps
+ * its detail.
  */
-export async function resolveProofReceipt(files) {
-  let file;
-  try {
-    file = await files.readFile(PROOF_RECEIPT_PATH);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (message === "Path does not exist") return { kind: "none" };
-    return { kind: "invalid", detail: message };
+export async function resolveProofReceipt(peer, options = {}) {
+  const signal = options.signal;
+  if (signal !== undefined && signal.aborted) return { kind: "none" };
+  if (peer === undefined || peer === null || typeof peer.request !== "function") {
+    return {
+      kind: "unavailable",
+      detail: "this pi-web host does not expose plugin peers",
+    };
   }
 
-  if (file.binary) return { kind: "invalid", detail: "proof receipt is binary" };
-  if (typeof file.content !== "string") {
-    return { kind: "invalid", detail: "proof receipt has no text content" };
+  let result;
+  try {
+    result = await peer.request(
+      PROOF_RECEIPT_OPERATION,
+      {},
+      signal === undefined ? undefined : { signal },
+    );
+  } catch (error) {
+    // Cancellation is the caller's own signal being aborted, nothing else: an
+    // `AbortError` name can also come from a transport that gave up, and that
+    // must keep the detail the panel shows as unreadable.
+    if (signal !== undefined && signal.aborted) return { kind: "none" };
+    return { kind: "invalid", detail: error instanceof Error ? error.message : String(error) };
+  }
+
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return { kind: "invalid", detail: "proof receipt request returned no result" };
+  }
+  if (result.kind === "none") return { kind: "none" };
+  if (result.kind === "unavailable") {
+    return {
+      kind: "invalid",
+      detail: typeof result.detail === "string" ? result.detail : "proof receipt store is unavailable",
+    };
+  }
+  if (result.kind !== "receipt" || typeof result.payload !== "string") {
+    return { kind: "invalid", detail: "proof receipt request returned an unknown result" };
   }
 
   let raw;
   try {
-    raw = JSON.parse(file.content);
+    raw = JSON.parse(result.payload);
   } catch {
     return { kind: "invalid", detail: "proof receipt is not valid JSON" };
   }

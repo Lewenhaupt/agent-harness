@@ -18,11 +18,11 @@ JavaScript with no build step — these checks read it directly from source.
 # Regression guard: derives the accepted browser apiVersions from the installed
 # host artifact (not a hardcoded number) and asserts the plugin declares one.
 pnpm vitest run pi-web-plugins/proof-of-work/pi-web-plugin.test.js
-# Expected: Test Files  1 passed (1); Tests  2 passed (2)
+# Expected: Test Files  1 passed (1); Tests  4 passed (4)
 
 # What the plugin declares:
 grep -n apiVersion pi-web-plugins/proof-of-work/pi-web-plugin.js
-# Expected: 4:  apiVersion: 4,
+# Expected: apiVersion: 5,
 
 # What the installed host accepts (the PiWebPlugin contract):
 grep -n "apiVersion" node_modules/@jmfederico/pi-web/dist/plugin-api.d.ts
@@ -34,14 +34,13 @@ grep -n "apiVersion" node_modules/@jmfederico/pi-web/dist/plugin-api.d.ts
 ```
 
 `pi-web-plugin.test.js` parses the accepted values out of the host contract and
-asserts membership, so a pi-web bump that drops a legacy apiVersion makes the
-guard **fail** until the plugin is migrated too — it never silently passes. The
-plugin still declares v4: pi-web 1.202610.5 documents v4 as deprecated but
-supported, and the host logs a once-per-plugin deprecation diagnostic for it.
-Migrating to v5 is tracked as bd-129. To migrate, set `apiVersion` in
-`pi-web-plugins/proof-of-work/pi-web-plugin.js` to a version the installed host
-accepts, then re-run the command above. If the bump also changes the pinned
-`@jmfederico/pi-web` devDependency, see
+asserts membership, so a pi-web bump that drops a version makes the guard
+**fail** until the plugin is migrated too — it never silently passes. The same
+test parses the server contract (`PiWebServerPlugin`) and checks the server
+entry, so both entries move together. The plugin deliberately targets v5 (v4 is
+deprecated): only v5 panel contexts carry the scoped backend/peer the receipt
+read needs, and the bump closed bd-129's v4-deprecation item for this plugin.
+If a bump also changes the pinned `@jmfederico/pi-web` devDependency, see
 [Regenerating `pnpm-lock.yaml` after a pi-web bump](#regenerating-pnpm-lockyaml-after-a-pi-web-bump)
 below.
 
@@ -176,7 +175,7 @@ echo "Test artifacts created in $PROOF_BASE/TASK-1/"
    - **Fixed vs. unfixed (bd-88).** If the tab never appears and the browser
      console shows `Failed to register PI WEB plugin proof-of-work during validate`
      together with `Unsupported browser plugin API version for proof-of-work: 2
-     (expected 4)`, the plugin's `apiVersion` predates the installed host. Re-run
+     (expected 5)`, the plugin's `apiVersion` predates the installed host. Re-run
      step 1; a correct fix is a tab that opens and lists `TASK-1`, not one that is
      absent. See also *"Unsupported browser plugin API version"* under
      Troubleshooting.
@@ -346,7 +345,11 @@ mkdir -p ~/.pi-web/plugins
 ln -sf /absolute/path/to/pi-web-plugins/proof-of-work ~/.pi-web/plugins/proof-of-work
 ```
 
-No server restart needed. The plugin is discovered automatically on the next browser page load.
+No browser-side restart is needed: the plugin is discovered automatically on the
+next browser page load. The receipt read does run in the session daemon (the
+package's `serverModule`), so after installing or upgrading the plugin restart
+the daemon once — `sudo systemctl restart pi-web pi-web-sessiond` — and check
+that the server entry appears in the manifest below (`serverModule`).
 
 **Option B — pi package (via `pi install`):**
 
@@ -368,10 +371,16 @@ Expected output includes:
 {
   "id": "proof-of-work",
   "module": "/pi-web-plugins/proof-of-work/pi-web-plugin.js?v=...",
+  "serverModule": "/pi-web-plugins/proof-of-work/server-plugin.js?v=...",
+  "machineSpecific": true,
   "source": "local",
   ...
 }
 ```
+
+A missing `serverModule` means the running daemon predates the bd-303 server
+entry (or was not restarted); the panel then renders artifacts without a
+receipt block.
 
 **Uninstallation:**
 
@@ -448,17 +457,23 @@ legacy workspace-relative `proof-of-work/` directory. Artifacts are therefore
 reported logically as `proof-of-work/<task-id>/...`, while external-mode files
 are physically stored at `<proof-base>/<task-id>/...` outside the workspace.
 
-### Proof receipts (bd-181)
+### Proof receipts (bd-181, store-backed since bd-303)
 
 Proof artifacts are being phased out of repositories: they upload to the
-proof-of-work platform and the workflow keeps a **receipt** (an id and/or a URL)
-at `<workspace>/.belayd/proof-receipt.json`. The panel reads it on every scan
+proof-of-work platform and the workflow keeps a **receipt** (an id and/or a URL).
+Since bd-281/bd-303 the receipt is not a worktree file any more — it is one
+`proof_receipt` row in the harness's shared per-repository store,
+`<git-common-dir>/belayd/state.sqlite` (override `BELAYD_REPO_STATE_FILE`),
+keyed by the task id bound to the worktree through `workflow_binding`. The
+browser file API only sees the workspace, so the package ships a server module
+(`server-plugin.js`) that opens the store read-only through `store-reader.js`.
+The panel asks its scoped peer for the receipt on every scan
 (`resolveProofReceipt()` in `discovery.js`) and, when valid, renders a receipt
 block above the artifact list: task id, receipt id, and the upload URL as an
 external link.
 
-The receipt file holds one JSON object and is validated against the same shape
-as `src/proof-receipt.ts` (`ProofReceiptSchema`) — the two are a mirrored
+The payload holds one JSON object, validated against the same shape as
+`src/proof-receipt.ts` (`ProofReceiptSchema`) — the two are a mirrored
 cross-component contract:
 
 ```json
@@ -470,17 +485,36 @@ cross-component contract:
   a path (plain `http` is rejected), and `id` a UUID or at least 8 characters of
   `[A-Za-z0-9]` containing `-`/`_`. Short prose (`done`, `1`, `yes`) is rejected
   by the same mirrored shape rules the gate uses.
-- Receipt reading never fails the panel: a missing file is *no receipt*, and a
-  malformed/denied/binary file renders *"Proof receipt unreadable."* plus the
-  detail.
+- Receipt reading never fails the panel: no binding, no row, or no store file yet
+  (the harness creates it on the first write) is *no receipt*; a payload that is
+  unparseable or violates the shape, or a store that exists but cannot be read,
+  renders *"Proof receipt unreadable."* plus the detail; a host without plugin
+  peers renders the artifacts with no receipt block; and a read cancelled by a
+  newer scan renders nothing at all (it is never reported as unreadable).
 - The external proof-root listing keeps rendering whether or not a receipt
 exists (transition period); both can render at once. Nothing changes for
 workspaces that have no receipt yet.
 
-To verify: write a receipt into a workspace that already shows artifacts, click
-↻ **Refresh**, and confirm the receipt block appears above the task list while
-the artifact list still renders. Delete the file and refresh; the block is gone
-and the artifacts remain.
+To verify, a receipt can no longer be exercised by writing a JSON file — the
+file is retired, and hand-writing one would be the dual write bd-281 forbids.
+Instead:
+
+1. Run a phase tool for a bead in the workspace so the harness writes a row
+   (for example an upload response the proof phase consumes, or the receipt
+   write a test/proof run performs); the row lands in
+   `<git-common-dir>/belayd/state.sqlite`.
+2. Confirm the row exists, e.g.
+   `sqlite3 "$(git rev-parse --git-common-dir)/belayd/state.sqlite" "select task_id from proof_receipt"`.
+3. Open the workspace's **Proof of Work** tab and click ↻ **Refresh**: the
+   receipt block appears above the task list while the artifact list still
+   renders.
+4. Remove the row (`delete from proof_receipt where task_id = '<bead>'`) and
+   refresh: the block is gone and the artifacts remain.
+
+If the block never appears, check that the plugin's server entry is enabled
+(**Settings → PI WEB plugins**), that the session daemon was restarted after
+upgrading pi-web, and that the workspace is a git worktree (a non-repository
+directory has no store, so no receipt).
 
 ### Supported formats
 
@@ -739,6 +773,22 @@ The plugin uses **marked** with `gfm: true` and `breaks: true`. If your markdown
 
 The panel uses a context key (`machine.id` + `workspace.projectId` + `workspace.id`) to detect workspace changes. If pi-web reuses the same workspace object (e.g., reconnecting to the same machine), the panel skips a re-scan. Click refresh to force a scan.
 
+#### The receipt block never appears
+
+The receipt is a `proof_receipt` row in `<git-common-dir>/belayd/state.sqlite`,
+not a file in the workspace (bd-303), so a hand-written
+`.belayd/proof-receipt.json` does nothing. Check, in order:
+
+- The plugin's server entry is enabled (**Settings → PI WEB plugins**) and the
+  session daemon was restarted after the pi-web upgrade; a browser-only plugin
+  has no server entry until the package manifest declares `serverModule`.
+- The row exists and the worktree is bound to its task:
+  `sqlite3 "$(git rev-parse --git-common-dir)/belayd/state.sqlite" "select worktree_path, task_id from workflow_binding; select task_id from proof_receipt"`.
+- The workspace is a git worktree: a plain directory has no common dir and
+  therefore no store, so the panel reports no receipt.
+- An *"Proof receipt unreadable."* block means the row was found but its payload
+  failed the mirrored shape rules — fix the row, not the panel.
+
 #### The Proof of Work tab does not appear
 
 - Check that the plugin is enabled in **Settings → PI WEB plugins**.
@@ -748,63 +798,66 @@ The panel uses a context key (`machine.id` + `workspace.projectId` + `workspace.
 #### "Unsupported browser plugin API version" — panel missing after a pi-web upgrade
 
 After the host is rebuilt to a newer pi-web (this migration went
-`v1.202608.1` → `v1.202610.1`), a plugin that still declares the old browser
+`v1.202608.1` → `v1.202610.1`), a plugin that still declares an old browser
 `apiVersion` is rejected at registration and the **Proof of Work** tab is simply
 absent. The browser console (F12 → Console) logs:
 
 ```text
 Failed to register PI WEB plugin proof-of-work during validate
-Unsupported browser plugin API version for proof-of-work: 2 (expected 4)
+Unsupported browser plugin API version for proof-of-work: 2 (expected 5)
 ```
 
 The error name is `BrowserPluginIncompatibleError` and pi-web emits it with
 `console.warn` (it is not rendered inside the panel). Fix:
 
-1. Bump `apiVersion` in `pi-web-plugins/proof-of-work/pi-web-plugin.js` to the
-   value the installed host accepts (see step 1 for how to read both values).
+1. Bump `apiVersion` in `pi-web-plugins/proof-of-work/pi-web-plugin.js` (browser)
+   and `server-plugin.js` (server) to the values the installed host accepts (see
+   step 1 for how to read both).
 2. Re-run the guard to confirm it passes:
 
    ```bash
    pnpm vitest run pi-web-plugins/proof-of-work/pi-web-plugin.test.js
-   # Expected: Test Files  1 passed (1); Tests  2 passed (2)
+   # Expected: Test Files  1 passed (1); Tests  4 passed (4)
    ```
 
 3. Confirm the panel loads: select a workspace → **Proof of Work** tab, or press
    `Ctrl+K` / `Cmd+K` → type **"Open Proof of Work"** → Enter. If it still does
    not appear, check **Settings → PI WEB plugins** and hard-reload
    (`Cmd+Shift+R`). A browser-only plugin change never requires a service
-   restart.
+   restart; a `serverModule` change does (restart the session daemon).
 
 ### Internals overview
 
-The plugin is a plain JavaScript ES module with no build step. It consists of four modules:
+The plugin is a plain JavaScript ES module with no build step. It consists of five modules:
 
 | File | Responsibility |
 |---|---|
-| `pi-web-plugin.js` | Plugin metadata (browser plugin `apiVersion: 4`) and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
-| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `resolveProofReceipt()` reads `.belayd/proof-receipt.json`; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
+| `pi-web-plugin.js` | Plugin metadata (browser plugin `apiVersion: 5`) and `activate()` — registers the workspace panel and the "Open Proof of Work" action |
+| `discovery.js` | File I/O helpers — `resolveProofRoot()` reads `.belayd/proof-dir` and selects the external absolute root or legacy `proof-of-work`; `resolveProofReceipt()` asks the plugin peer for the stored receipt row and validates its payload; `listTaskDirs()`, `listTaskFiles()`, `readProofFile()`, `getFileExtension()`, `mediaPreviewUrl()` |
+| `server-plugin.js` | Server entry (v5 peer): one `receipt` operation — resolves the repository store for the requested workspace (git probe with the inherited git-context variables unset), binds the worktree to its task id, and returns the `proof_receipt` payload. Its input is `{}`: a peer request cannot name another bead's row |
+| `store-reader.js` | Read-only `node:sqlite` reader for the mirrored `workflow_binding` / `proof_receipt` tables (no write path) |
 | `panel.js` | Custom element `<pi-web-proof-work-panel>` — all UI, state management, player lifecycle |
 | `renderers.js` | Content rendering — `renderFileContent()`, markdown via **marked**, media placeholders |
 | `vendor/` | Third-party dependencies — asciinema-player (CSS + JS), `marked.esm.js` |
 
-The plugin targets browser plugin `apiVersion: 4`, which pi-web 1.202610.5 and
-later still accept but mark deprecated (upstream renamed the contract
-`LegacyPiWebPlugin` and logs a once-per-plugin deprecation diagnostic); the
-migration to v5 is bd-129. Server plugin `apiVersion: 3`
-is N/A here: this package's `piWeb.plugins` entry declares only a browser entry
-(`browserRoot`/`module`) with no `server`, so there is no server plugin to
-migrate. The `@jmfederico/pi-web` dependency used for API/type parity lives in
-the repository root `package.json`; `pi-web-plugins/proof-of-work/package.json`
-intentionally declares no devDependencies because the plugin is a plain-JS,
-no-build package served directly from source by pi-web and is not an npm
-workspace member. `pi-web-plugin.test.js` derives the accepted browser
-`apiVersion` values from
-this repository's installed `@jmfederico/pi-web` and fails if the plugin's value
-is not among them. A future host bump that drops v4 therefore fails this guard —
-rather than silently passing —
-until `apiVersion` in `pi-web-plugin.js` is updated to match.
+The plugin targets browser plugin `apiVersion: 5` and server plugin
+`apiVersion: 5`. Browser v5 is required (v4 is deprecated by the installed
+host): only v5 panel contexts carry the scoped backend/peer that reads the
+receipt out of the repository store, and this bump closed bd-129's
+v4-deprecation item for this plugin. The package manifest declares both entries
+(`module` + `serverModule`) and `machineSpecific: true`, because the store path
+belongs to the machine hosting the workspace. The `@jmfederico/pi-web` dependency
+used for API/type parity lives in the repository root `package.json`;
+`pi-web-plugins/proof-of-work/package.json` intentionally declares no
+devDependencies because the plugin is a plain-JS, no-build package served
+directly from source by pi-web and is not an npm workspace member.
+`pi-web-plugin.test.js` derives the accepted browser and server `apiVersion`
+values from this repository's installed `@jmfederico/pi-web` and fails if either
+entry's value is not among them. A future host bump that drops a version
+therefore fails that guard — rather than silently passing — until the manifests
+are updated to match.
 
-Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step); receipt rendering is covered in `panel.test.js`.
+Unit coverage for the discovery helpers lives in `discovery.test.js` (plain-JS vitest, no build step); receipt rendering is covered in `panel.test.js`; the store reader and the server operation have their own real-SQLite tests (`store-reader.test.js`, `server-plugin.test.js`). TypeScript ↔ plugin parity for the stored row and the receipt shape is `src/__tests__/proof-receipt-parity.test.ts`.
 
 Async operations are guarded by a monotonic `scanToken` counter that prevents stale responses from overwriting newer state. Cast recordings play via blob URLs; raster images and video set `src` to the streaming preview endpoint URL via `mediaPreviewUrl()`, with explicit error fallback.
 

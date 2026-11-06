@@ -154,6 +154,14 @@ function errorMessage(error: unknown): string {
  * Exported so test helpers that create temporary repositories strip the same
  * variables: an inherited `GIT_DIR` makes `git init` ignore its target and
  * reinitialize the caller's repository, rewriting `core.bare` to true (bd-58).
+ *
+ * SYNC WARNING: the pi-web proof-of-work plugin runs its own
+ * `git rev-parse --git-common-dir` probe and must ignore exactly these keys
+ * (`GIT_CONTEXT_ENV_KEYS` in
+ * `pi-web-plugins/proof-of-work/server-plugin.js`, passed to the host's
+ * `execFile` as `unsetEnv`). A daemon that inherited one of them would resolve
+ * another repository's common dir and read another repository's store. Change
+ * the list here and there together.
  */
 export const GIT_CONTEXT_ENV_KEYS = [
   "GIT_DIR",

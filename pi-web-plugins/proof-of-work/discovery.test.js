@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   PROOF_DIR_MARKER_PATH,
   PROOF_OF_WORK_ROOT,
-  PROOF_RECEIPT_PATH,
   getFileExtension,
   listTaskDirs,
   listTaskFiles,
@@ -42,63 +41,147 @@ function rejectWith(message) {
 describe("resolveProofReceipt", () => {
   const receipt = { version: 1, taskId: "bd-181", url: "https://proof.example.com/u/1" };
 
-  it("exposes the gitignored receipt path", () => {
-    expect(PROOF_RECEIPT_PATH).toBe(".belayd/proof-receipt.json");
+  /** A fake plugin peer returning `result`, or rejecting with `error`. */
+  function fakePeer(result) {
+    return {
+      request: async (operation, input, options) => {
+        expect(operation).toBe("receipt");
+        expect(input).toEqual({});
+        expect(options).toBeUndefined();
+        if (result instanceof Error) throw result;
+        return result;
+      },
+    };
+  }
+
+  it("returns none when the store has no receipt", async () => {
+    expect(await resolveProofReceipt(fakePeer({ kind: "none" }))).toEqual({ kind: "none" });
   });
 
-  it("returns none when the receipt file is missing", async () => {
-    const files = fakeFiles({ readFile: () => rejectWith("Path does not exist") });
-
-    expect(await resolveProofReceipt(files)).toEqual({ kind: "none" });
-  });
-
-  it("returns the normalized receipt when one exists", async () => {
-    const files = fakeFiles({
-      readFile: async () =>
-        readFileReturning(JSON.stringify({ ...receipt, taskId: "  bd-181  " })),
+  it("returns the normalized receipt from the stored payload", async () => {
+    const peer = fakePeer({
+      kind: "receipt",
+      payload: JSON.stringify({ ...receipt, taskId: "  bd-181  " }),
+      updatedAt: 20,
     });
 
-    expect(await resolveProofReceipt(files)).toEqual({ kind: "receipt", receipt });
+    expect(await resolveProofReceipt(peer)).toEqual({ kind: "receipt", receipt });
   });
 
   it("accepts an id-only receipt", async () => {
-    const files = fakeFiles({
-      readFile: async () => readFileReturning(JSON.stringify({ version: 1, taskId: "bd-181", id: "upload-42" })),
+    const peer = fakePeer({
+      kind: "receipt",
+      payload: JSON.stringify({ version: 1, taskId: "bd-181", id: "upload-42" }),
+      updatedAt: 20,
     });
 
-    expect(await resolveProofReceipt(files)).toEqual({
+    expect(await resolveProofReceipt(peer)).toEqual({
       kind: "receipt",
       receipt: { version: 1, taskId: "bd-181", id: "upload-42" },
     });
   });
 
-  it("reports invalid JSON", async () => {
-    const files = fakeFiles({ readFile: async () => readFileReturning("{not json") });
+  it("reports a host without plugin peers as unavailable", async () => {
+    expect(await resolveProofReceipt(undefined)).toEqual({
+      kind: "unavailable",
+      detail: "this pi-web host does not expose plugin peers",
+    });
+  });
 
-    expect(await resolveProofReceipt(files)).toEqual({
+  it("reports invalid JSON in a stored payload", async () => {
+    const peer = fakePeer({ kind: "receipt", payload: "{not json", updatedAt: 20 });
+
+    expect(await resolveProofReceipt(peer)).toEqual({
       kind: "invalid",
       detail: "proof receipt is not valid JSON",
     });
   });
 
-  it("reports a binary receipt", async () => {
-    const files = fakeFiles({
-      readFile: async () => readFileReturning("", { binary: true }),
-    });
+  it("reports a rejected peer request", async () => {
+    const peer = fakePeer(new Error("request timed out"));
 
-    expect(await resolveProofReceipt(files)).toEqual({
+    expect(await resolveProofReceipt(peer)).toEqual({
       kind: "invalid",
-      detail: "proof receipt is binary",
+      detail: "request timed out",
     });
   });
 
-  it("reports a denied read", async () => {
-    const files = fakeFiles({ readFile: () => rejectWith("Path outside allowed paths") });
+  it("reports an unavailable store", async () => {
+    const peer = fakePeer({ kind: "unavailable", detail: "store is busy" });
 
-    expect(await resolveProofReceipt(files)).toEqual({
+    expect(await resolveProofReceipt(peer)).toEqual({ kind: "invalid", detail: "store is busy" });
+  });
+
+  it("forwards the scan signal to the peer request", async () => {
+    const controller = new AbortController();
+    const seen = [];
+    const peer = {
+      request: async (operation, input, options) => {
+        seen.push({ operation, input, options });
+        return { kind: "none" };
+      },
+    };
+
+    expect(await resolveProofReceipt(peer, { signal: controller.signal })).toEqual({ kind: "none" });
+    expect(seen).toEqual([{ operation: "receipt", input: {}, options: { signal: controller.signal } }]);
+  });
+
+  it("returns none for an already-aborted scan without asking the peer", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let asked = false;
+    const peer = {
+      request: async () => {
+        asked = true;
+        return { kind: "none" };
+      },
+    };
+
+    expect(await resolveProofReceipt(peer, { signal: controller.signal })).toEqual({ kind: "none" });
+    expect(asked).toBe(false);
+  });
+
+  it("keeps an AbortError without the caller's signal as an unreadable receipt", async () => {
+    const peer = {
+      request: async () => {
+        const error = new Error("the request was aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+    };
+
+    // A transport that gives up can surface an AbortError too; without this
+    // scan's own signal aborting, it is a failed read, not a cancellation.
+    expect(await resolveProofReceipt(peer)).toEqual({
       kind: "invalid",
-      detail: "Path outside allowed paths",
+      detail: "the request was aborted",
     });
+  });
+
+  it("treats an AbortError on an aborted scan signal as no receipt", async () => {
+    const controller = new AbortController();
+    const peer = {
+      request: async () => {
+        controller.abort();
+        const error = new Error("the request was aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+    };
+
+    expect(await resolveProofReceipt(peer, { signal: controller.signal })).toEqual({ kind: "none" });
+  });
+
+  it("treats a rejection while the scan signal is aborted as no receipt", async () => {
+    const controller = new AbortController();
+    const peer = {
+      request: async () => {
+        controller.abort();
+        throw new Error("plugin peer disconnected");
+      },
+    };
+
+    expect(await resolveProofReceipt(peer, { signal: controller.signal })).toEqual({ kind: "none" });
   });
 
   it.each([
@@ -115,9 +198,9 @@ describe("resolveProofReceipt", () => {
     ["an empty task id", { version: 1, taskId: " ", url: receipt.url }],
     ["an unknown key", { version: 1, taskId: "bd-181", url: receipt.url, proof: "x" }],
   ])("rejects %s as invalid", async (_label, raw) => {
-    const files = fakeFiles({ readFile: async () => readFileReturning(JSON.stringify(raw)) });
+    const peer = fakePeer({ kind: "receipt", payload: JSON.stringify(raw), updatedAt: 20 });
 
-    expect(await resolveProofReceipt(files)).toEqual({
+    expect(await resolveProofReceipt(peer)).toEqual({
       kind: "invalid",
       detail: "proof receipt does not match the receipt contract",
     });

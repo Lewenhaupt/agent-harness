@@ -128,13 +128,11 @@ Operationally that means:
   `.belayd/handoff.json`, `.belayd/telemetry.json` and `.belayd/github-map.json`.
   These are path facts and deliverables, not execution state, and the publish gate
   reads them as paths.
-- **The proof receipt is a row too** (`proof_receipt`, schema v5), and that is
-  the one outward break this change accepted: the plugin at
-  `pi-web-plugins/proof-of-work/discovery.js` still reads
-  `.belayd/proof-receipt.json`, so its proof panel reports no receipt until
-  bd-303 makes it read the SQLite row. A receipt file present in an old worktree
-  is imported once by the worktree-half import and refused afterwards like every
-  other retired file.
+- **The proof receipt is a row too** (`proof_receipt`, schema v5). The pi-web
+  panel reads it through the plugin's own server module rather than the browser
+  file API (bd-303), so no worktree copy is needed: a receipt file present in an
+  old worktree is imported once by the worktree-half import and refused
+  afterwards like every other retired file.
 - The fleet intent/run (`fleet_intent`), merge queue (`fleet_queue`), merge lock
   (`fleet_lock`), audit (`fleet_audit`), launch markers (`fleet_launch_marker`),
   supervisor heartbeat (`fleet_supervisor`) and the note mailboxes (`fleet_note`)

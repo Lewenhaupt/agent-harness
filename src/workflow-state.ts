@@ -23,8 +23,8 @@
  *   API (see the SYNC WARNING in `src/proof-dir.ts`).
  *
  * The proof receipt is no longer one of them: bd-281 moved it into the same store,
- * which knowingly breaks the plugin's `.belayd/proof-receipt.json` reader until
- * bd-303 mirrors the row (see the SYNC WARNING in `src/proof-receipt.ts`).
+ * and the pi-web panel reads that row through the plugin's own server module
+ * (see the SYNC WARNING in `src/proof-receipt.ts`).
  *
  * `atomicWriteJson`/`WorkflowFs` stay exported because unrelated runtime files
  * (`.belayd/handoff.json`, fleet notes as still staged) still use the atomic

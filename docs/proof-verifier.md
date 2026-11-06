@@ -65,10 +65,11 @@ prompt — or an `id` that is a UUID or at least 8 characters of `[A-Za-z0-9]`
 containing `-`/`_`). The shape is a zod schema (`ProofReceiptSchema`) validated at
 the boundary in both directions; the browser plugin's reader mirrors it by hand.
 
-**Known break (bd-303).** `pi-web-plugins/proof-of-work/discovery.js` still reads
-`.belayd/proof-receipt.json` through the browser file API, so its proof panel
-reports no receipt until that plugin reads the `proof_receipt` row instead. bd-281
-accepted the break on purpose (no dual write, no file fallback); see the SYNC
+**Reading it from pi-web (bd-303).** `pi-web-plugins/proof-of-work/` reads that
+row through its own server module (`server-plugin.js` + `store-reader.js`, opened
+read-only): the workspace is mapped to its task id via `workflow_binding`, and the
+row's payload is validated in the browser by the mirrored shape rules in
+`discovery.js`. There is no file fallback and no dual write — see the SYNC
 WARNING in `src/proof-receipt.ts`.
 
 Absence and failure are different: a directory that is not a repository simply has

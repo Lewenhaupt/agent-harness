@@ -1,7 +1,17 @@
 import { defineProofPanelElement } from "./panel.js";
 
+/**
+ * Browser entry for the proof-of-work panel.
+ *
+ * Browser apiVersion 5 is required: only v5 panel contexts carry the package's
+ * scoped `backend` and the paired `peer` the panel needs to read the receipt out
+ * of the repository store through `server-plugin.js`. Bumping this also closes
+ * bd-129's v4-deprecation item for this plugin; `pi-web-plugin.test.js` derives
+ * the accepted versions from the installed host contract, so a host bump that
+ * drops v5 fails the guard.
+ */
 const plugin = {
-  apiVersion: 4,
+  apiVersion: 5,
   name: "Proof of Work",
   activate: ({ runtimePluginId, html, svg }) => {
     defineProofPanelElement();

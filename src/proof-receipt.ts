@@ -8,9 +8,8 @@
  * bd-281 moved the receipt out of the worktree: it is a row in the shared
  * per-repository store (`<git-common-dir>/belayd/state.sqlite`, table
  * `proof_receipt`, keyed by task id), like every other piece of execution state.
- * The one consequence to know before reading further is recorded in the SYNC
- * WARNING below: `pi-web-plugins/proof-of-work/discovery.js` still reads the
- * retired `.belayd/proof-receipt.json` and is knowingly broken until bd-303.
+ * The pi-web proof panel reads that row through its own server module — see the
+ * SYNC WARNING below for the contract the two sides share.
  *
  * Everything except the two documented store helpers is pure: parsing,
  * serialization, formatting and output scanning take data in and return data
@@ -32,19 +31,31 @@ export const PROOF_RECEIPT_VERSION = 1;
 
 // SYNC WARNING: The receipt JSON shape and reference rules below are a
 // cross-component contract duplicated in
-// `pi-web-plugins/proof-of-work/discovery.js` (`PROOF_RECEIPT_PATH` and
-// `resolveProofReceipt`), and bd-281 knowingly broke that plugin.
+// `pi-web-plugins/proof-of-work/discovery.js` (`normalizeProofReceipt`, sent
+// through `resolveProofReceipt`), and the row it reads is the one this module
+// writes.
 //
-// The receipt is no longer a file. It is a row in the shared per-repository
-// store, `<git-common-dir>/belayd/state.sqlite`, table `proof_receipt`, keyed by
-// task id and holding this document as JSON. `discovery.js` still reads
-// `.belayd/proof-receipt.json` through the browser file API, so its proof panel
-// now reports no receipt: that plugin is broken on purpose until bd-303 lands.
-// The fix belongs there — read the `proof_receipt` row from the same SQLite file
-// (task id -> payload JSON) instead of the retired path, and mirror the shape and
-// validation rules below. Do not restore the file to unbreak it: a second copy of
-// state is exactly the bd-165 copying bug bd-281 exists to remove. Until bd-303
-// lands the break is recorded here, not papered over with a dual write.
+// The landed contract (bd-303, closing bd-281's one outward break): the receipt
+// is a row in the shared per-repository store,
+// `<git-common-dir>/belayd/state.sqlite`, table `proof_receipt` (task_id,
+// payload, updated_at), keyed by task id and holding this document as the
+// `payload` JSON. The pi-web plugin reaches it without the browser file API:
+// `pi-web-plugins/proof-of-work/server-plugin.js` resolves
+// `${BELAYD_REPO_STATE_FILE}` or `<git-common-dir>/belayd/state.sqlite`, maps the
+// requested worktree to a task id through `workflow_binding`, and returns the
+// row's payload text; `discovery.js` then validates it in the browser. The
+// retired `.belayd/proof-receipt.json` file must not come back: a mirrored copy
+// is exactly the bd-165 copied-state bug bd-281 removed.
+//
+// The facts that stay mirrored in both directions (the parity test
+// `src/__tests__/proof-receipt-parity.test.ts` fails on drift): the store file
+// name `state.sqlite` inside the git common dir's `belayd` directory, the
+// `BELAYD_REPO_STATE_FILE` override, the git-context variables both git probes
+// ignore, the two table names and columns (`workflow_binding` =
+// worktree_path/task_id/bound_at, `proof_receipt` =
+// task_id/payload/updated_at), their failure modes (a missing store file is "no
+// receipt", an unreadable one is a failure), and the document shape and
+// validation rules below.
 //
 // The document is one JSON object:
 // `{ version: 1, taskId: string, id?: string, url?: string, uploadedAt?: string,
@@ -59,7 +70,7 @@ export const PROOF_RECEIPT_VERSION = 1;
 // The TypeScript side validates with {@link ProofReceiptSchema} (zod) on the way
 // in and on the way out, so a stored row and an agent-authored output line are
 // judged by one implementation. The browser plugin cannot import zod or this
-// module, so its hand-rolled reader is the daggered mirror: every change here —
+// module, so its hand-rolled reader is the deliberate mirror: every change here —
 // the strict key set, the `version: 1` literal, the https-only url rule, the id
 // shape, and the at-least-one-reference rule — must be mirrored there, and vice
 // versa.

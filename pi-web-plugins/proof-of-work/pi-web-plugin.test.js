@@ -21,19 +21,13 @@ vi.stubGlobal("customElements", {
 });
 
 const { default: plugin } = await import("./pi-web-plugin.js");
+const { default: serverPlugin } = await import("./server-plugin.js");
 
 // Resolve from this test file so the test is invariant to the vitest cwd.
 const testDir = dirname(fileURLToPath(import.meta.url));
-const hostPluginApiTypes = join(
-  testDir,
-  "..",
-  "..",
-  "node_modules",
-  "@jmfederico",
-  "pi-web",
-  "dist",
-  "plugin-api.d.ts",
-);
+const manifest = JSON.parse(readFileSync(join(testDir, "package.json"), "utf8"));
+const hostDist = join(testDir, "..", "..", "node_modules", "@jmfederico", "pi-web", "dist");
+const hostPluginApiTypes = join(hostDist, "plugin-api.d.ts");
 
 /**
  * Body of an `export interface <name> {` block, brace-counted so nested type
@@ -68,35 +62,62 @@ function interfaceBody(source, interfaceName) {
  * is what a plugin must satisfy. Throws (rather than skipping) when the
  * artifact is missing or its shape changes, so the test cannot silently pass.
  */
-function installedBrowserApiVersions() {
-  const source = readFileSync(hostPluginApiTypes, "utf8");
-  const union = source.match(/export type PiWebPlugin\s*=\s*([^;]+);/);
+/**
+ * apiVersions of the members of an `export type <union> = A | B;` host
+ * contract. The browser contract is a union, so membership — not equality — is
+ * what a plugin must satisfy; the same reader serves the server contract.
+ */
+function acceptedApiVersions(declarationFile, unionName) {
+  const path = join(hostDist, declarationFile);
+  const source = readFileSync(path, "utf8");
+  const union = source.match(new RegExp(`export type ${unionName}\\s*=\\s*([^;]+);`));
   if (union === null || union[1] === undefined) {
-    throw new Error(`could not find the PiWebPlugin union in ${hostPluginApiTypes}`);
+    throw new Error(`could not find the ${unionName} union in ${path}`);
   }
   const memberNames = union[1]
     .split("|")
     .map((member) => member.trim())
     .filter((member) => member !== "");
   if (memberNames.length === 0) {
-    throw new Error(`PiWebPlugin union has no members in ${hostPluginApiTypes}`);
+    throw new Error(`${unionName} union has no members in ${path}`);
   }
   return memberNames.map((memberName) => {
     const body = interfaceBody(source, memberName);
     if (body === null) {
-      throw new Error(`could not find PiWebPlugin member ${memberName} in ${hostPluginApiTypes}`);
+      throw new Error(`could not find ${unionName} member ${memberName} in ${path}`);
     }
     const version = body.match(/apiVersion:\s*(\d+)/);
     if (version === null || version[1] === undefined) {
-      throw new Error(`could not find apiVersion in ${memberName} (${hostPluginApiTypes})`);
+      throw new Error(`could not find apiVersion in ${memberName} (${path})`);
     }
     return Number(version[1]);
   });
 }
 
+function installedBrowserApiVersions() {
+  return acceptedApiVersions("plugin-api.d.ts", "PiWebPlugin");
+}
+
 describe("proof-of-work pi-web plugin manifest", () => {
   it("declares a browser plugin apiVersion the installed host accepts", () => {
     expect(installedBrowserApiVersions()).toContain(plugin.apiVersion);
+  });
+
+  it("declares a server plugin apiVersion the installed host accepts", () => {
+    expect(acceptedApiVersions("server-plugin-api.d.ts", "PiWebServerPlugin")).toContain(
+      serverPlugin.apiVersion,
+    );
+  });
+
+  it("is registered as a machine-specific plugin with a server entry", () => {
+    const entry = manifest.piWeb.plugins.find((candidate) => candidate.id === "proof-of-work");
+    expect(entry).toBeDefined();
+    expect(entry).toMatchObject({
+      browserRoot: ".",
+      module: "pi-web-plugin.js",
+      serverModule: "server-plugin.js",
+      machineSpecific: true,
+    });
   });
 
   it("registers the proof-of-work workspace panel and action", () => {

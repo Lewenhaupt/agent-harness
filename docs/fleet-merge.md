@@ -301,8 +301,8 @@ bd-12 stays in_progress + human: merging is not closing. Accept it with `wt merg
 Proof artifacts are refused in a published payload by default (bd-181): they
 upload to the reviewing platform and the workflow keeps a receipt — a
 `proof_receipt` row in `<git-common-dir>/belayd/state.sqlite` since bd-281, not
-the retired `.belayd/proof-receipt.json` file (whose pi-web reader is broken
-until bd-303). A repository whose own policy keeps *text* evidence
+the retired `.belayd/proof-receipt.json` file — the pi-web panel reads the row
+through the plugin's own server module since bd-303. A repository whose own policy keeps *text* evidence
 in git — `docs/proof/<bead>/` READMEs, casts, transcripts, capture scripts — is
 the case that default cannot express, and bd-181 deliberately left those repos
 "not migrated, only stopped". Every member then refuses to land, and the refusal is

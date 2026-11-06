@@ -43,8 +43,9 @@
  * browser file API — see the SYNC WARNING in `src/proof-dir.ts`),
  * `.belayd/review-findings.md` (the rendered artifact named in a posted comment)
  * and `.belayd/config.json` (repo-authored input). The proof receipt is *not* on
- * that list any more: bd-281 moved it into the store and knowingly broke the
- * plugin's `.belayd/proof-receipt.json` reader until bd-303 lands.
+ * that list any more: bd-281 moved it into the store, and the pi-web panel reads
+ * the row through the plugin's own server module (see the SYNC WARNING in
+ * `src/proof-receipt.ts`).
  *
  * The fleet half of the same migration lives in `src/fleet-state-import.ts`, split
  * out because this module is loaded by every workflow caller: importing the fleet

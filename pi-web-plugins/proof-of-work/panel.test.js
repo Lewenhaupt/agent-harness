@@ -22,7 +22,8 @@ vi.stubGlobal("customElements", {
   },
 });
 
-const { showTraceCommand, defineProofPanelElement } = await import("./panel.js");
+const { showTraceCommand, defineProofPanelElement, receiptPeer } = await import("./panel.js");
+const { resolveProofReceipt } = await import("./discovery.js");
 // Capture the panel constructor via the stubbed registry so prototype methods
 // (launchTraceViewer) can be exercised without constructing real shadow DOM.
 defineProofPanelElement();
@@ -374,5 +375,178 @@ describe("proof receipt rendering", () => {
     expect(html).toContain("Proof receipt unreadable.");
     expect(html).toContain("proof receipt is not valid JSON");
     expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+});
+
+/**
+ * The receipt is read through this package's server module rather than the
+ * retired workspace file (bd-303), so the block is rendered from a peer result.
+ */
+describe("proof receipt from the plugin peer", () => {
+  const loadedListing = {
+    kind: "loaded",
+    tasks: [{ name: "bd-181", path: "proof-of-work/bd-181" }],
+  };
+
+  function renderReceipt(receipt) {
+    const instance = Object.create(capturedPanelClass.prototype);
+    instance.contextValue = { workspace: { path: "/ws" } };
+    instance.taskListEl = { innerHTML: "" };
+    instance.listing = loadedListing;
+    instance.receipt = receipt;
+    instance.taskFiles = undefined;
+    instance.selectedTaskPath = "proof-of-work/bd-181";
+    instance.renderTaskList();
+    return instance.taskListEl.innerHTML;
+  }
+
+  it("renders the block from the stored row", async () => {
+    const peer = {
+      request: async () => ({
+        kind: "receipt",
+        payload: JSON.stringify({ version: 1, taskId: "bd-181", url: "https://proof.example.com/u/1" }),
+        updatedAt: 20,
+      }),
+    };
+
+    const html = renderReceipt(await resolveProofReceipt(peer));
+
+    expect(html).toContain("Proof uploaded");
+    expect(html).toContain('href="https://proof.example.com/u/1"');
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+
+  it("omits the block when the store has no receipt", async () => {
+    const peer = { request: async () => ({ kind: "none" }) };
+
+    const html = renderReceipt(await resolveProofReceipt(peer));
+
+    expect(html).not.toContain("Proof uploaded");
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+
+  it("omits the block on a host without plugin peers", async () => {
+    const html = renderReceipt(await resolveProofReceipt(undefined));
+
+    expect(html).not.toContain("Proof uploaded");
+    expect(html).not.toContain("Proof receipt unreadable.");
+    expect(html).toContain('data-toggle-task="proof-of-work/bd-181"');
+  });
+
+  it("prefers a workspace-scoped backend peer over the context peer", () => {
+    const scopes = [];
+    const context = {
+      workspace: { id: "workspace-1", projectId: "project-1", path: "/ws" },
+      backend: {
+        forScope: (scope) => {
+          scopes.push(scope);
+          return { request: async () => ({ kind: "none" }) };
+        },
+      },
+      peer: { request: async () => ({ kind: "receipt" }) },
+    };
+
+    expect(typeof receiptPeer(context).request).toBe("function");
+    expect(scopes).toEqual([
+      { kind: "workspace", projectId: "project-1", workspaceId: "workspace-1" },
+    ]);
+  });
+
+  it("falls back to the context peer when the host exposes no backend", () => {
+    const peer = { request: async () => ({ kind: "none" }) };
+
+    expect(receiptPeer({ workspace: { path: "/ws" }, peer })).toBe(peer);
+  });
+});
+
+/**
+ * The receipt request is tied to its scan (bd-303 review): a newer scan aborts
+ * the older request, and a cancelled request is no receipt — never an
+ * unreadable one. `scan()` itself needs shadow DOM, so the read lifecycle is
+ * driven through the methods it calls, in the same order.
+ */
+describe("proof receipt request cancellation", () => {
+  function panelInstance() {
+    const instance = Object.create(capturedPanelClass.prototype);
+    instance.contextValue = { machine: { id: "m1" }, workspace: { id: "w1", projectId: "p1", path: "/ws" } };
+    instance.scanToken = 1;
+    instance.receiptAbort = undefined;
+    instance.playerInstances = [];
+    instance.blobUrls = new Set();
+    instance.taskListEl = { innerHTML: "" };
+    instance.taskFiles = undefined;
+    instance.selectedTaskPath = undefined;
+    return instance;
+  }
+
+  /** A peer whose requests settle only when their scan signal aborts. */
+  function pendingPeer() {
+    const signals = [];
+    const request = (operation, input, options) => {
+      signals.push(options.signal);
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("the request was aborted");
+            error.name = "AbortError";
+            reject(error);
+          },
+          { once: true },
+        );
+      });
+    };
+    return { peer: { request }, signals };
+  }
+
+  const contextFor = (peer) => ({
+    machine: { id: "m1" },
+    workspace: { id: "w1", projectId: "p1", path: "/ws" },
+    peer,
+  });
+
+  it("aborts the previous receipt request when a newer scan starts", async () => {
+    const instance = panelInstance();
+    const { peer, signals } = pendingPeer();
+    const context = contextFor(peer);
+
+    const superseded = instance.readReceipt(context, 1);
+    instance.scanToken = 2;
+    const current = instance.readReceipt(context, 2);
+
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[1].aborted).toBe(false);
+    // The token guard in scan() is what decides the stale result may not render.
+    expect(instance.isCurrentScan(context, 1)).toBe(false);
+    await expect(superseded).resolves.toEqual({ kind: "none" });
+
+    instance.abortReceiptRead();
+    await expect(current).resolves.toEqual({ kind: "none" });
+  });
+
+  it("aborts the in-flight receipt read when the scan state resets", async () => {
+    const instance = panelInstance();
+    const { peer, signals } = pendingPeer();
+    const pending = instance.readReceipt(contextFor(peer), 1);
+
+    instance.resetScanState();
+
+    expect(signals[0].aborted).toBe(true);
+    await expect(pending).resolves.toEqual({ kind: "none" });
+    expect(instance.receiptAbort).toBeUndefined();
+  });
+
+  it("renders no error block for a cancelled read", async () => {
+    const instance = panelInstance();
+    const { peer } = pendingPeer();
+    const pending = instance.readReceipt(contextFor(peer), 1);
+    instance.abortReceiptRead();
+
+    instance.receipt = await pending;
+    instance.listing = { kind: "loaded", tasks: [] };
+    instance.renderTaskList();
+
+    expect(instance.receipt).toEqual({ kind: "none" });
+    expect(instance.taskListEl.innerHTML).not.toContain("Proof receipt unreadable.");
   });
 });

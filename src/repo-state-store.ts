@@ -47,11 +47,12 @@
  *   owns workflow and fleet *execution* state only.
  * - **The proof receipt is a row too (v5).** `.belayd/proof-receipt.json` was a
  *   file because pi-web-plugins read it through the browser file API; bd-281 moved
- *   it here anyway and accepted that the out-of-repo reader breaks until
- *   `pi-web-plugins/proof-of-work/discovery.js` reads the `proof_receipt` row
- *   (follow-up bd-303). The SYNC WARNING in `src/proof-receipt.ts` records the
- *   break; there is no dual write, because a mirrored file is the copy this bead
- *   removes.
+ *   it here, and bd-303 closed that break by giving the plugin its own server
+ *   module (`pi-web-plugins/proof-of-work/server-plugin.js`) that reads this
+ *   `proof_receipt` row read-only. There is no dual write, because a mirrored
+ *   file is the copy this bead removes. The facts both sides share are recorded
+ *   in the SYNC WARNING in `src/proof-receipt.ts` and in
+ *   `pi-web-plugins/proof-of-work/store-reader.js`.
  */
 
 import { existsSync } from "node:fs";
@@ -110,8 +111,8 @@ export const REPO_STATE_FILE_NAME = "state.sqlite";
  * v5 adds the proof receipt (`proof_receipt`, keyed by task id). It is purely
  * additive — a new table, no column rewrite — so `SCHEMA`'s `CREATE TABLE IF
  * NOT EXISTS` performs it inside the same `BEGIN IMMEDIATE` as the version bump.
- * The receipt was the last worktree state file pi-web read, and moving it is the
- * one knowingly outward-breaking step of this bead (bd-303).
+ * The receipt was the last worktree state file pi-web read; bd-303 moved that read
+ * into the plugin's own server module so the file could go.
  */
 export const REPO_STATE_SCHEMA_VERSION = 5;
 

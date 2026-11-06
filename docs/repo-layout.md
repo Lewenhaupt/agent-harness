@@ -72,7 +72,7 @@ barrel — a module whose symbols are not re-exported there is internal.
 | `src/quality-gates.ts` | Deterministic quality gates for Belayd agents |
 | `src/quality-gate-run.ts` | Quality-gate runner — the retry loop around a phase's deterministic gates |
 | `src/proof-dir.ts` | Proof-of-work relocation helpers |
-| `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt as a `proof_receipt` row in the shared store (bd-281; the pi-web plugin still reads the retired `.belayd/proof-receipt.json` until bd-303) |
+| `src/proof-receipt.ts` | Proof receipt contract (bd-181) — proof uploads leave the repository and the workflow keeps an id/URL receipt as a `proof_receipt` row in the shared store (bd-281); the pi-web plugin reads it through its own server module (bd-303) |
 | `src/proof-verification.ts` | Proof verification support — non-blocking, advisory review of produced |
 | `src/proof-verifier-env.ts` | `BELAYD_PROOF_VERIFIER` switch (bd-309): the advisory verifier's verdict stage is dark unless explicitly enabled; the tool name constant the registries share |
 | `src/publish-gate.ts` | Publish gate (bd-181) — deterministic refusal of proof artifacts and out-of-scope paths in a publish payload |
@@ -245,12 +245,23 @@ browser file API), `.belayd/review-findings.md`
 They are path facts and deliverables; the publish gate reads them as paths.
 
 The proof receipt is **not** in that set: bd-281 moved it into `proof_receipt`
-(schema v5) and accepted one outward break. The plugin at
-`pi-web-plugins/proof-of-work/discovery.js` still reads
-`.belayd/proof-receipt.json` through the browser file
-API, so its proof panel reports no receipt until bd-303 makes it read the
-SQLite row. There is no dual write: a mirrored file is the copied state bd-281
-removes.
+(schema v5). bd-303 closed the one outward break that move caused. The pi-web
+panel at `pi-web-plugins/proof-of-work/` cannot read the store through the
+browser file API (which only sees the workspace), so the package now ships a
+server module: `server-plugin.js` resolves the store path exactly as
+`resolveRepoStatePath` does (`BELAYD_REPO_STATE_FILE`, else the workspace's git
+common dir, probed with the inherited git-context variables unset like
+`gitContextFreeEnv()`), maps the worktree to a task id through
+`workflow_binding`, reads the `proof_receipt` row through the read-only mirror in
+`store-reader.js`, and hands the payload text to the browser, where
+`discovery.js` validates it against the mirrored receipt shape. A store file that
+does not exist yet (the harness creates it on the first write) is "no receipt";
+an existing store that cannot be read is a failure the panel shows as unreadable,
+which is the same split the gate makes. There is still no dual write and no mirrored file: a
+`.belayd/proof-receipt.json` copy is the copied state bd-281 removes. The facts
+mirrored on both sides are recorded in `src/proof-receipt.ts` and
+`pi-web-plugins/proof-of-work/{store-reader,server-plugin}.js`, and
+`src/__tests__/proof-receipt-parity.test.ts` fails if they drift.
 
 Writes retry a *transient* store failure (a busy or momentarily unavailable
 database) twice with a short backoff, reusing `classifyStoreFailure`; a permanent
