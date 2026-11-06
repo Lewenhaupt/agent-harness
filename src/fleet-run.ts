@@ -204,6 +204,16 @@ const FleetRunMemberSchema = z.object({
   /** Set once this run merged the member into the base branch. */
   landedAt: z.number().finite().optional(),
   /**
+   * The last member-branch tip this run observed *ahead of* the base branch (bd-278).
+   *
+   * A landing outside the fleet leaves no other git handle when `wt merge` deletes
+   * the worktree *and* the branch, and a branch tip equal to the launch point proves
+   * nothing (it is an ancestor of the base by construction), so only a tip that was
+   * ever ahead is recorded. Optional so every `fleet.json` written before bd-278
+   * still parses.
+   */
+  head: z.string().min(1).max(64).optional(),
+  /**
    * The one bounded repair round a refused landing was given (bd-277).
    *
    * Optional so every `fleet.json` written before bd-277 still parses. It lives on the
@@ -1023,7 +1033,7 @@ function firstStop(
   for (const taskId of members) {
     const observation = byTask.get(taskId);
     if (observation === undefined) continue;
-    const stop = stopDecision({ observation, ...options });
+    const stop = stopDecision({ observation, run: options.intent.run, ...options });
     if (stop !== undefined) return stop;
   }
   return undefined;
@@ -1337,9 +1347,9 @@ function formatLeaseEvidence(options: {
 /**
  * Whether one member must stop, or `undefined` while it is legitimately working.
  *
- * The start grace applies only to members *this run* launched: a member inherited
- * from an older launch has no `launchedAt`, and its lease is the only liveness
- * evidence this version can honestly read.
+ * The start grace applies only to members *this run* launched: an inherited member
+ * carries an older run's launch instant, so its lease is the only liveness evidence
+ * this version can honestly read ({@link memberLaunchedByThisRun}).
  */
 function stopAction(
   observation: FleetMemberObservation,
@@ -1349,8 +1359,31 @@ function stopAction(
   return { kind: "stop", taskId: observation.taskId, reason, detail };
 }
 
+/**
+ * Whether *this run* launched the member, as opposed to inheriting its record.
+ *
+ * The comparison is the honest signal: {@link startFleetRun} stamps every id it
+ * launches with `now`, so a relaunched member's `launchedAt` is never earlier than
+ * its run's `startedAt`, while a record carried from an earlier run always predates
+ * it (bd-278). Carrying the record deliberately keeps the real launch instant, so an
+ * "inherited" flag would be a second field that could disagree with it.
+ *
+ * The stop decision needs this because its evidence (the start grace, the member's
+ * own phase runs) only speaks about a launch *this* run performed; for an inherited
+ * member the lease is the only liveness proof a tick may read.
+ */
+export function memberLaunchedByThisRun(
+  run: FleetRun | undefined,
+  member: FleetRunMember | undefined,
+): boolean {
+  if (run === undefined || member === undefined) return false;
+  return member.launchedAt >= run.startedAt;
+}
+
 function stopDecision(options: {
   observation: FleetMemberObservation;
+  /** The run doing the deciding; `undefined` means nothing was launched by it. */
+  run: FleetRun | undefined;
   now: number;
   startGraceInMs?: number;
 }): Extract<FleetTickAction, { kind: "stop" }> | undefined {
@@ -1370,7 +1403,12 @@ function stopDecision(options: {
     case "state-corrupt":
       return stopAction(observation, progress.kind, progress.detail);
     case "running":
-      return runningMemberStop(observation, progress.detail, inGrace);
+      return runningMemberStop({
+        observation,
+        run: options.run,
+        detail: progress.detail,
+        inGrace,
+      });
     case "missing":
       // Phase files are copies that can be stale or inherited; a live lease is the
       // one thing that proves an execution still owns this worktree, so a member
@@ -1385,21 +1423,30 @@ function stopDecision(options: {
  * A member whose phases remain but whose orchestrator is gone.
  *
  * Only a member *this run* launched may be declared missing on lease evidence:
- * a member inherited from an older launch has no `launchedAt`, and its lease is
- * the one thing this version can honestly read about it.
+ * an inherited member was started by an earlier run, so its missing lease is not
+ * this execution's failure — the record it carries keeps that run's real launch
+ * instant ({@link memberLaunchedByThisRun}), and its own lease is the one thing
+ * this version can honestly read about it.
  */
-function runningMemberStop(
-  observation: FleetMemberObservation,
-  detail: string,
-  inGrace: boolean,
-): Extract<FleetTickAction, { kind: "stop" }> | undefined {
-  if (inGrace || observation.launchedAt === undefined || observation.claim === "live") {
+function runningMemberStop(options: {
+  observation: FleetMemberObservation;
+  run: FleetRun | undefined;
+  detail: string;
+  inGrace: boolean;
+}): Extract<FleetTickAction, { kind: "stop" }> | undefined {
+  const { observation } = options;
+  const member = (options.run?.members ?? []).find((entry) => entry.taskId === observation.taskId);
+  if (
+    options.inGrace ||
+    !memberLaunchedByThisRun(options.run, member) ||
+    observation.claim === "live"
+  ) {
     return undefined;
   }
   return stopAction(
     observation,
     "orchestrator-missing",
-    `${detail}, but no live orchestrator lease holds the worktree`,
+    `${options.detail}, but no live orchestrator lease holds the worktree`,
   );
 }
 
@@ -1412,18 +1459,33 @@ export function startFleetRun(options: {
   members: readonly { taskId: string; sessionId?: string }[];
   previous?: FleetRun;
 }): FleetRun {
-  const alreadyLanded = new Map(
-    (options.previous?.members ?? []).map((member) => [member.taskId, member]),
-  );
+  const prior = new Map((options.previous?.members ?? []).map((member) => [member.taskId, member]));
+  const relaunched = new Set(options.members.map((member) => member.taskId));
   const members = options.members.map((member) => {
-    const prior = alreadyLanded.get(member.taskId);
+    const previous = prior.get(member.taskId);
     return {
       taskId: member.taskId,
       launchedAt: options.now,
       ...(member.sessionId === undefined ? {} : { sessionId: member.sessionId }),
-      ...(prior?.landedAt === undefined ? {} : { landedAt: prior.landedAt }),
+      ...(previous?.landedAt === undefined ? {} : { landedAt: previous.landedAt }),
+      // A run that ended before the human merged must not lose the only git handle a
+      // deleted branch leaves behind: the carried proof belongs to the id, not the run
+      // (bd-278).
+      ...(previous?.head === undefined ? {} : { head: previous.head }),
     };
   });
+  // A carried id the new launch did not relaunch keeps the record the fleet actually
+  // wrote: `launchedAt` is the instant the fleet launched it, never `now`, so the
+  // capture rotation can still refresh its `head` (bd-278). `landRepair` is dropped
+  // because the bounded repair round belongs to the run that started it.
+  const carried = (options.previous?.members ?? [])
+    .filter((member) => !relaunched.has(member.taskId))
+    .map((member) => ({
+      taskId: member.taskId,
+      launchedAt: member.launchedAt,
+      ...(member.head === undefined ? {} : { head: member.head }),
+      ...(member.landedAt === undefined ? {} : { landedAt: member.landedAt }),
+    }));
   return {
     schemaVersion: FLEET_RUN_SCHEMA_VERSION,
     mode: "until-complete",
@@ -1432,7 +1494,7 @@ export function startFleetRun(options: {
     ticks: 0,
     idleTicks: 0,
     accept: options.accept,
-    members,
+    members: [...members, ...carried],
   };
 }
 
@@ -1537,6 +1599,126 @@ export function landRepairForMember(
   taskId: string,
 ): FleetRunMemberLandRepair | undefined {
   return (run?.members ?? []).find((member) => member.taskId === taskId)?.landRepair;
+}
+
+/**
+ * Remember the last member-branch tip this run saw ahead of the base branch (bd-278).
+ *
+ * `wt merge` removes the worktree *and* deletes the branch, so a landing outside the
+ * fleet can only be proven later by a commit id this record kept. The caller must
+ * only pass a tip git proved is *not* on the base: a freshly launched branch sits on
+ * the launch point, and storing that would make it read as already landed.
+ *
+ * Only an **existing** `run.members` entry is updated. Synthesising one would invent
+ * a `launchedAt` and with it a start-grace window and liveness evidence for work this
+ * run never launched (`recordRunMemberLandRepair` refuses for the same reason), and
+ * it would reorder the run's member list. Idempotent: an absent member or an unchanged
+ * head returns the run itself, so the write path can skip.
+ */
+export function recordRunMemberHead(options: {
+  run: FleetRun;
+  taskId: string;
+  head: string;
+  now: number;
+}): FleetRun {
+  const members = options.run.members ?? [];
+  const existing = members.find((member) => member.taskId === options.taskId);
+  if (existing === undefined || existing.head === options.head) return options.run;
+  return {
+    ...options.run,
+    updatedAt: options.now,
+    members: [
+      ...members.filter((member) => member.taskId !== options.taskId),
+      { ...existing, head: options.head },
+    ],
+  };
+}
+
+/**
+ * Fold what the outside-fleet sweep learned into the stored run, by task id.
+ *
+ * Two reconciles of the same finished run both pass the identity check above, so a
+ * wholesale write of `next` would let the second one drop the first's `landedAt`.
+ * Only the fields this sweep writes are merged; members the sweep never touched (a
+ * concurrent advance, say) stay exactly as the stored run has them.
+ */
+function mergeOutsideFleetRun(options: {
+  stored: FleetRun;
+  next: FleetRun;
+  now: number;
+}): FleetRun {
+  const updates = new Map((options.next.members ?? []).map((member) => [member.taskId, member]));
+  const storedIds = new Set<string>();
+  const members = (options.stored.members ?? []).map((member) => {
+    storedIds.add(member.taskId);
+    const update = updates.get(member.taskId);
+    if (update === undefined) return member;
+    const landedAt = update.landedAt ?? member.landedAt;
+    const head = update.head ?? member.head;
+    const merged: FleetRunMember = {
+      ...member,
+      ...(landedAt === undefined ? {} : { landedAt }),
+      ...(head === undefined ? {} : { head }),
+    };
+    // A landing ends the repair round (`recordRunMemberLanded` clears it); composing
+    // must not resurrect the stored record on a member that has now landed.
+    return landedAt === undefined ? merged : { ...merged, landRepair: undefined };
+  });
+  const added = [...updates.values()].filter((member) => !storedIds.has(member.taskId));
+  const composed = [...members, ...added];
+  const landed = new Set(
+    composed.filter((member) => member.landedAt !== undefined).map((member) => member.taskId),
+  );
+  return {
+    ...options.stored,
+    members: composed,
+    stopped: (options.stored.stopped ?? []).filter((entry) => !landed.has(entry.taskId)),
+    updatedAt: options.now,
+  };
+}
+
+/**
+ * Compose the outside-fleet landing write only while the stored run is the one read.
+ *
+ * Reconcile reads the run, sweeps git, then writes. A re-arm or relaunch can replace
+ * the record in between; overwriting it would resurrect a finished run and drop the
+ * fresh run's members. The caller retries the mutate on a CAS conflict, so this asks
+ * again on every attempt and leaves a superseded record untouched (bd-278).
+ *
+ * `allowActiveRun` is for the tick that swept its *own* live run: it must persist the
+ * landing before it acts (the advance filter reads the record, not the in-memory run),
+ * while reconcile must still leave a run another supervisor resumed alone.
+ */
+export function composeOutsideFleetRunWrite(options: {
+  intent: FleetIntent;
+  observed: FleetRun;
+  next: FleetRun;
+  now: number;
+  allowActiveRun?: boolean;
+}): { intent: FleetIntent; recorded: boolean; reason?: string } {
+  const stored = options.intent.run;
+  if (
+    stored === undefined ||
+    stored.startedAt !== options.observed.startedAt ||
+    stored.ticks !== options.observed.ticks
+  ) {
+    return { intent: options.intent, recorded: false, reason: "the stored run was replaced" };
+  }
+  if (options.allowActiveRun !== true && isFleetRunActive(stored)) {
+    return {
+      intent: options.intent,
+      recorded: false,
+      reason: "a supervisor resumed the stored run",
+    };
+  }
+  return {
+    intent: {
+      ...options.intent,
+      run: mergeOutsideFleetRun({ stored, next: options.next, now: options.now }),
+      updatedAt: options.now,
+    },
+    recorded: true,
+  };
 }
 
 /** Record that a member landed (merged) so a later tick never merges it again. */
@@ -1947,37 +2129,44 @@ export function releaseRunMembers(options: {
  *
  * `docs/fleet.md` tells humans to accept with `wt merge` / `bd close`, a path that
  * never touches `fleet.json`; the member then keeps its bead, worktree, and capacity
- * slot with nothing left to observe (bd-37). The tick asks once for every member's
- * bead and offers the closed ones here.
+ * slot with nothing left to observe (bd-37).
  *
- * Two facts are required, and neither is sufficient:
+ * **Git ancestry alone is the proof of a landing (bd-278).** Bead closure is the
+ * *acceptance* fact (bd-158) and is deliberately not an input here: the documented
+ * hand-merge path leaves the bead `in_progress` + `human`, and requiring it kept
+ * every ordering gate unresolved and the next wave deferred forever.
  *
- * - bd reports the bead `closed`/`done` — given by the caller's closed set;
- * - git proves the member's branch is an ancestor of the base branch — the injected
- *   `branchOnBase` probe. Bead status alone is not proof of merging (a human may
- *   close a bead whose branch was never merged), and a failed probe must answer
- *   `false`, because pruning on a probe that did not answer would erase a live
- *   member's only handle.
+ * Each member's handles are commit ids — the head this run recorded, then a repair
+ * round's head — and the first one git proves is on the base wins, so the returned
+ * record names the fact that fired. A branch name is never a handle: it is a movable
+ * name, so the caller may only *propose* a head from it. A failed or absent probe
+ * answers `false`, never "landed": pruning on a probe that did not answer is exactly
+ * how a live member would disappear from the fleet.
  *
  * Already-landed members are skipped so a landing is recorded once.
  */
 export async function planOutsideFleetLandings(options: {
   intent: FleetIntent;
   run: FleetRun;
-  closedBeadIds: ReadonlySet<string>;
-  branchOnBase: (taskId: string) => Promise<boolean>;
-}): Promise<readonly string[]> {
+  /** Branch names or commit ids that could prove each member's landing, in probe order. */
+  handlesFor: (taskId: string) => readonly string[];
+  /** Git ancestry probe: true only when the handle is provably on the base branch. */
+  onBase: (handle: string) => Promise<boolean>;
+}): Promise<readonly { taskId: string; handle: string }[]> {
   const landed = new Set(
     (options.run.members ?? [])
       .filter((member) => member.landedAt !== undefined)
       .map((member) => member.taskId),
   );
-  const candidates = options.intent.taskIds.filter(
-    (taskId) => !landed.has(taskId) && options.closedBeadIds.has(taskId),
-  );
-  const proven: string[] = [];
-  for (const taskId of candidates) {
-    if (await options.branchOnBase(taskId)) proven.push(taskId);
+  const proven: { taskId: string; handle: string }[] = [];
+  for (const taskId of options.intent.taskIds) {
+    if (landed.has(taskId)) continue;
+    for (const handle of options.handlesFor(taskId)) {
+      if (await options.onBase(handle)) {
+        proven.push({ taskId, handle });
+        break;
+      }
+    }
   }
   return proven;
 }

@@ -977,7 +977,14 @@ function attributeMember(
     : { taskId: member.taskId, source: member.source, belongsToIntent: true };
 }
 
-/** When the run record launched this member; absent for a member it did not launch. */
+/**
+ * When a run recorded launching this member.
+ *
+ * A carried record keeps the instant an *earlier* run launched it, which is deployment
+ * history, not evidence about this execution — that is why `observation.launchedAt` stays
+ * unset for that member (bd-278). Only a manifest cutoff for the read-only view; the stop
+ * decision asks `memberLaunchedByThisRun` instead.
+ */
 function launchedAtFor(
   intent: FleetIntent | undefined,
   taskId: string | undefined,
@@ -1929,10 +1936,12 @@ const CLOSED_BEAD_STATUSES: readonly string[] = ["closed", "done"];
  *
  * This is the bd-37 shape: the work landed and the bead was closed by hand
  * (`wt merge` / `bd close`), so no fleet path ever saw the landing and the member
- * kept holding a capacity slot. Status alone is not proof of merging — that is what
- * the tick's ancestor check is for — but it is exactly the evidence that the member
- * needs a human decision, and the worktree-gone case has its own check at build
- * time, so a task id already named by one of those is not repeated here.
+ * kept holding a capacity slot. Bead status is the acceptance fact, not proof of
+ * merging — the run's own landing path trusts a recorded **commit id** alone (the
+ * `head` observed while the branch was ahead of the base, bd-278), never a branch
+ * name — but a closed bead is exactly the evidence that the member needs a human
+ * decision, and the worktree-gone case has its own check at build time, so a task id
+ * already named by one of those is not repeated here.
  */
 function collectStaleBeadWarnings(
   status: FleetStatus,
@@ -1955,8 +1964,9 @@ function collectStaleBeadWarnings(
       taskId: bead.id,
       message:
         `fleet ${status.fleetId} still records ${bead.id}, but bd reports it ${beadStatus}; ` +
-        `the work is over — release it with belayd_fleet_release ${bead.id}, or land it if ` +
-        "its branch is on the base branch",
+        `acceptance is not a landing — release the slot with belayd_fleet_release ${bead.id}, ` +
+        `or record the landing with belayd_fleet_reconcile, since only a recorded commit id ` +
+        "on the base branch proves one",
     });
   }
   return warnings;

@@ -397,23 +397,68 @@ wave-2 member is not in `taskIds` while missing from the run record (the bd-166
 wave2 symptom: `ticks: 3`, the advance launched two members, neither was in
 `run.members`). `idleTicks`, stall accounting, and status all read the same list.
 
-**A landing can happen outside the fleet.** The tick's bead sweep treats a member
-as landed when bd reports its bead `closed`/`done` **and**
-`git merge-base --is-ancestor <branch> <base>` proves its branch is on the base
-branch — the shape `wt merge` + `bd close` leaves behind. It records `landedAt`,
-prunes the member, resolves its ordering gates, and audits `fleet-landed`.
-Bead status alone is not proof of merging, and a failed or missing git answer
-means "not landed": never prune on a probe that did not answer. If the branch was
-deleted after the merge the probe cannot answer, so such a member still needs
-`belayd_fleet_release` or reconcile.
+**A landing can happen outside the fleet.** The tick's sweep treats a member as
+landed when git proves a recorded **commit id** of it is already on the base
+branch — the shape a hand `wt merge` leaves behind. **Ancestry alone is the proof
+(bd-278).** bd's
+bead status is the *acceptance* fact (bd-158), not an ordering input: the
+repository's own accept path merges with `wt merge` and leaves the bead
+`in_progress` + `human`, so requiring a closed bead kept every ordering gate
+unresolved and every dependent deferred forever. On a proven landing the tick
+records `landedAt`, prunes the member, resolves its ordering gates, and audits
+`fleet-landed` with `landing happened outside the fleet`. A failed or missing git
+answer means "not landed": never prune on a probe that did not answer.
 
-The bead evidence uses the tick's existing budget: **one member bead per tick**,
-rotating by `run.ticks` (the same rotation the ordering-gate sweep uses), and
-exactly one `git merge-base --is-ancestor` probe per closed candidate. A member
-whose bead closes outside the fleet is therefore noticed within a fleet-sized
-cycle (minutes), not on one 15 s tick, and a 20-member fleet does not become a
-full-fleet `bd show` every tick. A failed bd or git probe skips the sweep for that
-tick and never counts as a landing.
+That landing is **written before the tick executes its own action** (bd-278). The
+advance the same tick may run filters landing edges through
+`run.members[].landedAt` read from `fleet.json`, so a landing only persisted at the
+end of the tick left the dependent deferred as "blocked by a bead outside this
+fleet" — and when the landed member was the run's last unfinished one, the run
+finished `partial` with no later tick to launch the dependent. A landing the tick
+cannot persist is reported instead of acted on, and a sweep that found nothing
+writes nothing (no churn on an unchanged fleet). A hand
+`belayd_fleet_advance` is therefore unnecessary after `wt merge`: it then refuses
+with `no deferred members`.
+
+`wt merge` cleans up the worktree **and deletes the branch**, so the branch name
+is not a durable handle. The sweep therefore also keeps one commit id per member:
+`run.members[].head` is set from the live branch tip (from the worktree, or from
+`feat/<id>` while that local branch exists) **only when that tip is not an
+ancestor of the base**. A tip already on the base is the launch point and proves
+nothing — storing it would make a freshly launched member read as landed.
+
+**A landing is only ever proven by a commit id, never by a branch name** (bd-278).
+A branch is a movable name: a member that committed (head recorded), then reset
+its branch onto an ancestor of the base would otherwise probe as landed while the
+recorded work never reached the base. The live branch therefore only *proposes* a
+`head` in the capture pass; the landing probe is handed `member.head` and a
+repair round's `head` only, and the first commit git proves is on the base is the
+proof the audit line names.
+
+This pass reads **no beads**, and its git cost is budgeted. Head capture is **one
+unlanded member per tick**, rotating by `run.ticks` (the same rotation the bd gate
+sweep uses): that one member costs the worktree/branch scan (`git worktree list`
+and `rev-parse`, which the worktree probe shells out synchronously) plus one
+`git merge-base --is-ancestor` probe of its tip. Every unlanded member that
+already carries a commit handle — its recorded `head`, or a repair round's — is
+probed once per tick with one **async** `git merge-base --is-ancestor`, with no
+worktree scan. A member's head is therefore captured within a fleet-sized rotation
+(minutes), not on one 15 s tick.
+
+Residual limitations — shapes with no ancestry proof, which still need
+`belayd_fleet_release` (capacity), `belayd_fleet_reconcile` (record) and/or a manual
+`bd gate resolve <gate-id>` (a finished run is never ticked; reconcile records the
+same ancestry-proven landing when it repairs one):
+
+- a landing that **rewrote** the member's commits (a rebase with replay, or a
+  squash merge): the recorded head is not on the base and the new commits never
+  shared its history;
+- a hand merge **before a capture rotation observed the branch ahead** of the base:
+  no head was recorded, `wt merge` deleted the branch, so nothing proves it;
+- a `head` lost because the run record was replaced by a run that did not carry it.
+  Re-arm now carries a carried member's record (including its `head`) into the new
+  run, so the capture rotation can still refresh it (bd-278); a `fleet.json` edited
+  by hand or written before this change can still lack one.
 
 ### The run record
 
@@ -428,7 +473,7 @@ tick and never counts as a landing.
   "ticks": 7,
   "accept": true,
   "members": [
-    { "taskId": "bd-36", "launchedAt": 1792947202544, "sessionId": "01a1734e-…", "landedAt": 1792947309781 }
+    { "taskId": "bd-36", "launchedAt": 1792947202544, "sessionId": "01a1734e-…", "head": "1a2b3c4", "landedAt": 1792947309781 }
   ],
   "stopped": [{ "taskId": "bd-15", "reason": "phase-failed", "detail": "…", "at": 1792947309781 }],
   "idleTicks": 0,
@@ -442,7 +487,10 @@ tick and never counts as a landing.
 
 - `members[].launchedAt` is the start-grace window's reference: a member that shows
   no state and no runs for `FLEET_RUN_START_GRACE_MS` (2 min) is declared missing
-  rather than waited on forever.
+  rather than waited on forever. Only a launch by the *current* run counts: a re-arm
+  carries an inherited member's real launch instant, which predates the run's
+  `startedAt`, so it never reopens the window or lets this run call an inherited
+  member missing (bd-278, `memberLaunchedByThisRun`).
 - `landedAt` is what makes landing idempotent across ticks and supervisor restarts,
   and what satisfies dependents' edges before the bead is closed.
 - `memberSignatures` is the previous tick's view of each member (`kind` plus the

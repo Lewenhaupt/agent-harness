@@ -2217,6 +2217,14 @@ describe("capacity arithmetic (bd-166)", () => {
     const stale = enriched.warnings.filter((warning) => warning.kind === "stale-member");
     // bd-15 is released, so its closed bead is expected and silent.
     expect(stale.map((warning) => warning.taskId)).toEqual(["bd-12"]);
+    // The operator is offered the rule the code implements: a landing is proven by a
+    // recorded commit id, never by a branch name (bd-278).
+    const message = stale[0]?.message ?? "";
+    expect(message).toContain("recorded commit id");
+    expect(message).toContain("belayd_fleet_release bd-12");
+    expect(message).toContain("belayd_fleet_reconcile");
+    expect(message).not.toContain("its branch");
+    expect(message).not.toContain("branch name");
   });
 });
 
@@ -2571,6 +2579,71 @@ describe("readFleetStatus", () => {
       released: 0,
       landed: 1,
     });
+  });
+
+  it("bd-278: reports a hand-merged member as landed, never as live work", () => {
+    // `wt merge` removed the worktree and deleted the branch while the bead stayed
+    // `in_progress`, so the run's own landing record — proved by the `head` captured
+    // while the branch was ahead of the base — is the only thing that says the work is
+    // over. Once recorded, the landing prunes the member: the status view has no
+    // member left to list, no slot to hold, and nothing left for a human to release.
+    const launchedAt = 90_000;
+    const head = "d".repeat(40);
+    const landedRun = {
+      ...startFleetRun({ now: launchedAt, accept: false, members: [{ taskId: "bd-15" }] }),
+      members: [{ taskId: "bd-15", launchedAt, head, landedAt: 95_000 }],
+      finishedAt: 95_000,
+      outcome: "complete" as const,
+    };
+    const readRun = (overrides: Partial<FleetIntent>) => {
+      const fs = createFakeFs({
+        [fleetIntentFilePath(commonDir, fleetId)]: JSON.stringify(sampleIntent(overrides)),
+      });
+      return readFleetStatus({
+        cwd,
+        fleetId,
+        fs,
+        resolveCommonDir: () => ({ ok: true, commonDir }),
+        listWorktrees: () => ({ ok: true, entries: [], warnings: [] }),
+        branchExists: () => false,
+        memberLeaseFor: () => ({ state: "absent" }),
+        scanProcesses: () => ({ ok: true, processes: [] }),
+        now: 100_000,
+      });
+    };
+
+    const landed = readRun({ taskIds: [], run: landedRun });
+    expect(landed.ok).toBe(true);
+    if (!landed.ok) return;
+    const rendered = formatFleetStatus(landed.value);
+    expect(landed.value.members).toEqual([]);
+    expect(landed.value.capacity).toMatchObject({ counted: 0, free: 3 });
+    expect(landed.value.warnings).toEqual([]);
+    expect(rendered).toContain("members: 0");
+    expect(rendered).toContain("No fleet members");
+    expect(rendered).not.toContain("bd-15");
+
+    // The negative twin: the same captured head with no recorded landing is still a
+    // member whose work the fleet cannot prove landed — the pre-fix view a hand merge
+    // used to leave behind forever.
+    const unlanded = readRun({
+      taskIds: ["bd-15"],
+      run: {
+        ...landedRun,
+        finishedAt: undefined,
+        outcome: undefined,
+        members: [{ taskId: "bd-15", launchedAt, head }],
+      },
+    });
+    expect(unlanded.ok).toBe(true);
+    if (!unlanded.ok) return;
+    expect(unlanded.value.capacity).toMatchObject({ counted: 1, free: 2 });
+    expect(
+      unlanded.value.warnings.some(
+        (warning) => warning.kind === "stale-member" && warning.taskId === "bd-15",
+      ),
+    ).toBe(true);
+    expect(formatFleetStatus(unlanded.value)).toContain("still records bd-15");
   });
 
   it("W1: treats a listed worktree whose directory is gone as absent, not unknown", () => {

@@ -94,6 +94,7 @@ import {
 import {
   createFleetOrderingGates,
   type FleetOrderingGate,
+  type FleetOrderingGateListResult,
   listFleetOrderingGatesForBead,
   reapFleetOrderingGatesByPrefix,
   resolveFleetOrderingGates,
@@ -116,6 +117,7 @@ import {
   supervisorRecordFingerprint,
 } from "../../src/fleet-reconcile.js";
 import {
+  composeOutsideFleetRunWrite,
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_RUN_ACTION_TICK_INTERVAL_MS,
@@ -128,6 +130,7 @@ import {
   type FleetMemberObservation,
   type FleetMemberReleaseReason,
   type FleetRun,
+  type FleetRunMember,
   type FleetRunMemberLandRepair,
   type FleetRunStop,
   type FleetTickAction,
@@ -138,6 +141,7 @@ import {
   isFleetRunActive,
   landRepairForMember,
   memberEvidenceCutoff,
+  memberLaunchedByThisRun,
   memberRanEvidence,
   memberWorktreeExisted,
   planFleetTick,
@@ -145,6 +149,7 @@ import {
   planOutsideFleetLandings,
   recordFleetGateNotices,
   recordFleetTickProgress,
+  recordRunMemberHead,
   recordRunMemberLanded,
   recordRunMemberLandRepair,
   recordRunMemberLaunched,
@@ -1505,9 +1510,14 @@ export function createFleet(deps: FleetDeps): FleetApi {
     run: FleetRun;
     now: number;
   }): Promise<FleetMemberObservation> {
-    const launchedAt = options.run.members?.find(
-      (member) => member.taskId === options.taskId,
-    )?.launchedAt;
+    const recorded = options.run.members?.find((member) => member.taskId === options.taskId);
+    // Only a launch by *this* run may set the start grace and the manifest cutoff: a
+    // carried record keeps the instant an earlier run launched it, which is deployment
+    // history, not evidence about this execution (bd-278, bd-277).
+    const launchedAt =
+      recorded === undefined || !memberLaunchedByThisRun(options.run, recorded)
+        ? undefined
+        : recorded.launchedAt;
     const launched = launchedAt === undefined ? {} : { launchedAt };
     const worktreePath = resolveWorktreePath(options.cwd, fleetMemberBranch(options.taskId));
     if (worktreePath === undefined) {
@@ -3204,10 +3214,25 @@ export function createFleet(deps: FleetDeps): FleetApi {
       mode: options.mode,
       now: options.now,
       resolvedGateIds,
+      droppedGateIds: unrecorded.vanishedGateIds,
       adopted,
       notices,
     });
     warnings.push(...persisted.warnings);
+    if (unrecorded.vanishedGateIds.length > 0) {
+      const vanished = new Set(unrecorded.vanishedGateIds);
+      const dropped = gates.filter((gate) => vanished.has(gate.gateId));
+      auditFleetAction({
+        ctx: options.ctx,
+        gitCommonDir: options.mode.gitCommonDir,
+        fleetId: options.mode.fleetId,
+        action: "ordering-gates-resolved",
+        taskIds: [...new Set(dropped.map((gate) => gate.blocked))],
+        detail: `${dropped.length} gate(s) bd no longer reports: ${dropped
+          .map((gate) => `${gate.blocker}->${gate.blocked} (${gate.gateId})`)
+          .join(", ")}`,
+      });
+    }
     if (persisted.accepted.length > 0) {
       auditFleetAction({
         ctx: options.ctx,
@@ -3447,10 +3472,16 @@ export function createFleet(deps: FleetDeps): FleetApi {
     mode: FleetMode;
     now: number;
     resolvedGateIds: readonly string[];
+    /** Recorded gate ids bd no longer reports; the record goes, bd is not called. */
+    droppedGateIds: readonly string[];
     adopted: readonly FleetOrderingGate[];
     notices: FleetGateNotice[];
   }): { warnings: readonly string[]; accepted: readonly FleetOrderingGate[] } {
-    if (options.resolvedGateIds.length === 0 && options.adopted.length === 0) {
+    if (
+      options.resolvedGateIds.length === 0 &&
+      options.droppedGateIds.length === 0 &&
+      options.adopted.length === 0
+    ) {
       return { warnings: [], accepted: [] };
     }
     // Filled inside the compare-and-replace, because only the record actually
@@ -3460,7 +3491,11 @@ export function createFleet(deps: FleetDeps): FleetApi {
       gitCommonDir: options.mode.gitCommonDir,
       fleetId: options.mode.fleetId,
       mutate: (intent) => {
-        const dropped = dropFleetOrderingGates(intent, options.resolvedGateIds, options.now);
+        const dropped = dropFleetOrderingGates(
+          intent,
+          [...options.resolvedGateIds, ...options.droppedGateIds],
+          options.now,
+        );
         const added = addFleetOrderingGates(dropped, options.adopted, options.now);
         const refusedIds = new Set(
           (added.ok ? [] : added.refused).map((entry) => entry.gate.gateId),
@@ -3536,6 +3571,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
     warnings: readonly string[];
     /** Per-gate findings, reported once per gate per run (`planGateNotices`). */
     notices: readonly FleetGateNotice[];
+  }
+
+  /** The unrecorded sweep's answer, plus records bd no longer reports (bd-278). */
+  interface UnrecordedReapOutcome extends ReapOutcome {
+    /**
+     * Recorded gate ids no queried bead lists any more. The record is dropped without
+     * `bd gate resolve`: there is no gate in bd left to resolve.
+     */
+    vanishedGateIds: readonly string[];
   }
 
   /** Resolve a chosen set of gates, keeping every record bd did not confirm. */
@@ -3635,6 +3679,32 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
+   * Recorded gate ids a **full** sweep proved bd no longer reports (bd-278).
+   *
+   * Fail closed: a record goes only when both of its beads were answered and neither
+   * answer lists the gate id. A rotating tick sweep queried one bead and cannot prove
+   * absence, so it keeps every record (and the caller does not drop any).
+   */
+  function vanishedRecordedGates(input: {
+    recorded: readonly FleetOrderingGate[];
+    lookupsByBead: ReadonlyMap<string, FleetOrderingGateListResult>;
+    sweep: "tick" | "all" | undefined;
+  }): readonly string[] {
+    if (input.sweep !== "all") return [];
+    const reportsGate = (
+      answer: FleetOrderingGateListResult | undefined,
+      gateId: string,
+    ): boolean => answer?.ok === true && answer.gates.some((gate) => gate.gateId === gateId);
+    return input.recorded
+      .filter((gate) => {
+        const answers = [gate.blocker, gate.blocked].map((bead) => input.lookupsByBead.get(bead));
+        if (!answers.every((answer) => answer?.ok === true)) return false;
+        return !answers.some((answer) => reportsGate(answer, gate.gateId));
+      })
+      .map((gate) => gate.gateId);
+  }
+
+  /**
    * Sweep bd for ordering gates `fleet.json` does not name, and adopt them.
    *
    * The record list cannot name a gate the fleet never wrote down, so asking bd
@@ -3663,10 +3733,17 @@ export function createFleet(deps: FleetDeps): FleetApi {
     gateReleased: (gate: { blocker: string; blocked: string }) => boolean;
     /** Records the intent already holds, so an adoption never duplicates an edge. */
     recorded: readonly FleetOrderingGate[];
-  }): Promise<ReapOutcome> {
+  }): Promise<UnrecordedReapOutcome> {
     const beads = sweepBeads(options);
     if (beads.length === 0)
-      return { remaining: [], resolvedGateIds: [], adopted: [], warnings: [], notices: [] };
+      return {
+        remaining: [],
+        resolvedGateIds: [],
+        adopted: [],
+        warnings: [],
+        notices: [],
+        vanishedGateIds: [],
+      };
     const lookups = await mapBounded(beads, ORDERING_SWEEP_CONCURRENCY, (beadId) =>
       listFleetOrderingGatesForBead({
         beadId,
@@ -3674,6 +3751,15 @@ export function createFleet(deps: FleetDeps): FleetApi {
         runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
       }).then((lookup) => ({ beadId, lookup })),
     );
+    // A full sweep queried every member bead, so it can also answer the reverse
+    // question (see `vanishedRecordedGates`). Nothing is resolved in bd: a gate bd
+    // does not have has nothing to resolve.
+    const lookupsByBead = new Map(lookups.map(({ beadId, lookup }) => [beadId, lookup]));
+    const vanishedGateIds = vanishedRecordedGates({
+      recorded: options.recorded,
+      lookupsByBead,
+      sweep: options.sweep,
+    });
 
     const recordedByEdge = new Map(options.recorded.map((gate) => [edgeKeyOf(gate), gate.gateId]));
     const resolvedGateIds: string[] = [];
@@ -3703,7 +3789,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         }
       }
     }
-    return { remaining: [], resolvedGateIds, adopted, warnings, notices };
+    return { remaining: [], resolvedGateIds, adopted, warnings, notices, vanishedGateIds };
   }
 
   /** What one discovered gate needs: a resolve, an adoption, or nothing. */
@@ -3772,23 +3858,55 @@ export function createFleet(deps: FleetDeps): FleetApi {
   }
 
   /**
-   * Whether git proves the member's branch is already on the base branch.
+   * The branch a member's live git handle currently names, if any.
+   *
+   * This is the head-capture input, never a landing proof: a branch is a movable name.
+   * `memberMergeBranch` asks the worktree, which is the only source that knows a
+   * renamed branch; when the worktree is gone but the branch survived, `feat/<id>` is
+   * still a warm handle. Both answer nothing after `wt merge` cleaned up (bd-278).
+   */
+  function liveMemberBranch(rootCwd: string, taskId: string): string | undefined {
+    const worktreeBranch = memberMergeBranch(rootCwd, taskId);
+    if (worktreeBranch.ok) return worktreeBranch.branch;
+    const candidate = fleetMemberBranch(taskId);
+    return branchExists(rootCwd, candidate) ? candidate : undefined;
+  }
+
+  /**
+   * Commit ids that could prove a member landed outside the fleet, in probe order.
+   *
+   * A landing is only ever proven by a commit id, never by a branch name: a branch is
+   * a movable name, so a member that committed (head recorded) and then reset its
+   * branch onto an ancestor of the base would otherwise probe as landed while the
+   * recorded work never reached the base. The live branch therefore only *proposes* a
+   * head in the capture pass; this list never contains one. The recorded head covers
+   * the `wt merge` cleanup that deletes worktree *and* branch, and a repair round's
+   * head covers a branch the member rebased while fixing its landing (bd-277).
+   */
+  function memberLandingHandles(member: FleetRunMember | undefined): readonly string[] {
+    const handles: string[] = [];
+    if (member?.head !== undefined) handles.push(member.head);
+    const repairHead = member?.landRepair?.head;
+    if (repairHead !== undefined) handles.push(repairHead);
+    return [...new Set(handles)];
+  }
+
+  /**
+   * Whether git proves the handle is already on the base branch.
    *
    * `merge-base --is-ancestor` exits non-zero for "not an ancestor", and a missing
    * branch or a failed git call throws; every one of those is "not proven landed",
    * never "landed", because pruning on a probe that did not answer is exactly how a
    * live member would disappear from the fleet.
    */
-  async function branchIsOnBase(options: {
+  async function handleIsOnBase(options: {
     ctx: ExtensionContext;
     mode: FleetMode;
-    taskId: string;
+    handle: string;
   }): Promise<boolean> {
-    const branch = memberMergeBranch(options.ctx.cwd, options.taskId);
-    if (!branch.ok) return false;
     try {
       await runGitCommand(
-        ["merge-base", "--is-ancestor", branch.branch, options.mode.intent.baseBranch],
+        ["merge-base", "--is-ancestor", options.handle, options.mode.intent.baseBranch],
         { cwd: options.ctx.cwd, timeoutInMs: 15_000, maxBufferInBytes: 1024 * 1024 },
       );
       return true;
@@ -3797,14 +3915,32 @@ export function createFleet(deps: FleetDeps): FleetApi {
     }
   }
 
+  /** The commit a member's live branch points at, or undefined when git cannot say. */
+  async function memberBranchTip(options: {
+    ctx: ExtensionContext;
+    branch: string;
+  }): Promise<string | undefined> {
+    try {
+      const { stdout } = await runGitCommand(["rev-parse", options.branch], {
+        cwd: options.ctx.cwd,
+        timeoutInMs: 15_000,
+        maxBufferInBytes: 1024 * 1024,
+      });
+      const tip = stdout.trim();
+      return tip === "" ? undefined : tip;
+    } catch {
+      return undefined;
+    }
+  }
+
   /**
    * Land a member whose work reached the base branch outside the fleet (bd-166).
    *
-   * No merge happens: git already proved the branch is on the base. The landing is
+   * No merge happens: git already proved the handle is on the base. The landing is
    * recorded, the member pruned, and its ordering gates resolved exactly like the
    * loop's own landing, so a later tick does not see a phantom member. Acceptance is
-   * deliberately not re-run — the human who closed the bead already decided what to
-   * do with the bead and worktree.
+   * deliberately not re-run — the human's merge already decided the work; the bead
+   * stays whatever they left it (`in_progress` + `human` by default).
    */
   async function landAlreadyMergedMember(options: {
     ctx: ExtensionContext;
@@ -3812,6 +3948,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     intent: FleetIntent;
     run: FleetRun;
     taskId: string;
+    /** The branch name or commit id git proved is on the base branch. */
+    handle: string;
     now: number;
   }): Promise<
     | { ok: true; intent: FleetIntent; run: FleetRun; lines: readonly string[] }
@@ -3836,7 +3974,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
       fleetId: options.mode.fleetId,
       action: "fleet-landed",
       taskIds: [options.taskId],
-      detail: `${options.taskId} was already on ${base} (bead closed outside the fleet); pruned and gates resolved`,
+      detail: `${options.taskId} was already on ${base} via ${options.handle} (landing happened outside the fleet); pruned and gates resolved`,
     });
     const gateLines = await resolveLandedOrderingGates({
       ctx: options.ctx,
@@ -3849,26 +3987,83 @@ export function createFleet(deps: FleetDeps): FleetApi {
       intent: pruneLandedFleetMember(options.intent, options.taskId, options.now),
       run,
       lines: [
-        `Fleet ${options.mode.fleetId}: landed ${options.taskId} — its bead is closed and its branch is already on ${base}`,
+        `Fleet ${options.mode.fleetId}: landed ${options.taskId} — ${options.handle} is already on ${base} (landing happened outside the fleet); pruned and gates resolved`,
         ...gateLines,
       ],
     };
   }
 
+  /** Record a head for every member branch git proves is ahead of the base. */
+  async function captureOutsideFleetHeads(options: {
+    ctx: ExtensionContext;
+    candidates: readonly string[];
+    run: FleetRun;
+    onBase: (handle: string) => Promise<boolean>;
+    now: number;
+  }): Promise<FleetRun> {
+    let run = options.run;
+    for (const taskId of options.candidates) {
+      const branch = liveMemberBranch(options.ctx.cwd, taskId);
+      if (branch === undefined) continue;
+      const tip = await memberBranchTip({ ctx: options.ctx, branch });
+      if (tip === undefined || (await options.onBase(tip))) continue;
+      run = recordRunMemberHead({ run, taskId, head: tip, now: options.now });
+    }
+    return run;
+  }
+
+  /** Record each proven landing, then prune the member and resolve its gates. */
+  async function recordOutsideFleetLandings(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    run: FleetRun;
+    proven: readonly { taskId: string; handle: string }[];
+    now: number;
+  }): Promise<{ intent: FleetIntent; run: FleetRun; lines: readonly string[] }> {
+    let intent = options.intent;
+    let run = options.run;
+    const lines: string[] = [];
+    for (const { taskId, handle } of options.proven) {
+      const landed = await landAlreadyMergedMember({
+        ctx: options.ctx,
+        mode: options.mode,
+        intent,
+        run,
+        taskId,
+        handle,
+        now: options.now,
+      });
+      if (!landed.ok) {
+        lines.push(
+          `Fleet ${options.mode.fleetId}: could not record the landing of ${taskId}: ${landed.error}`,
+        );
+        continue;
+      }
+      intent = landed.intent;
+      run = landed.run;
+      lines.push(...landed.lines);
+    }
+    return { intent, run, lines };
+  }
+
   /**
    * Detect members the fleet never landed but whose work is on the base branch.
    *
-   * `docs/fleet.md` tells humans to accept with `wt merge` / `bd close`, a path that
-   * never touches `fleet.json` — that is bd-37, and the member kept its slot forever
-   * with nothing left to observe. A bead bd reports `closed`/`done` is a candidate,
-   * and only a git ancestor proof makes it a landing. Bead status alone is not proof
-   * of merging.
+   * `docs/fleet.md` tells humans to accept with `wt merge`, a path that never touches
+   * `fleet.json` — that is bd-37, and the member kept its slot forever with nothing
+   * left to observe. **Git ancestry alone is the proof (bd-278)**: bead closure is
+   * the acceptance fact (bd-158), so a hand merge that leaves the bead `in_progress`
+   * still resolves its ordering gates and starts the next wave.
    *
-   * The bead evidence uses the tick's existing budget: one member bead, rotating by
-   * `run.ticks` (`sweepBeads`, the same rotation the gate sweep uses), so a large
-   * fleet does not become a full-fleet `bd show` every 15 s. Each closed candidate
-   * costs exactly one `git merge-base --is-ancestor` probe, and a bd read failure
-   * just skips the sweep for this tick.
+   * Capture is budgeted: **one unlanded member per tick**, rotating by `run.ticks`
+   * (the same rule the bd gate sweep uses), because resolving its live branch costs a
+   * synchronous worktree scan plus `rev-parse`. That one tip is recorded as the
+   * member's `head` only when git proves it is *not* on the base: a tip already on the
+   * base is the launch point, and storing it would land a member that has not done any
+   * work yet. Every unlanded member that already carries a commit handle (its `head`
+   * or a repair head) is then probed once per tick with one async ancestry call, with
+   * no worktree scan and no bd read at all.
    */
   async function landMembersMergedOutsideFleet(options: {
     ctx: ExtensionContext;
@@ -3883,51 +4078,45 @@ export function createFleet(deps: FleetDeps): FleetApi {
         .map((member) => member.taskId),
     );
     const candidates = options.intent.taskIds.filter((taskId) => !landedIds.has(taskId));
-    // One bead per tick, rotating with the run's tick counter: a hand merge becomes
-    // visible within a fleet-sized cycle rather than on one 15 s tick, and the tick
-    // keeps the read budget it already had (bd-166 review).
-    const rotating = sweepBeads({ tick: options.run.ticks, members: new Set(candidates) });
-    if (rotating.length === 0) {
+    if (candidates.length === 0) {
       return { intent: options.intent, run: options.run, lines: [] };
     }
-    const lookup = await lookupFleetBeads({
-      taskIds: rotating,
-      cwd: options.ctx.cwd,
-      runBd: (argv, runnerOptions) => runBdCommand(argv, runnerOptions),
+    // One answer per commit id per tick: the capture and the planner ask about the
+    // same tip, and a second `merge-base` adds nothing.
+    const answers = new Map<string, boolean>();
+    const onBase = async (handle: string): Promise<boolean> => {
+      const cached = answers.get(handle);
+      if (cached !== undefined) return cached;
+      const answer = await handleIsOnBase({ ctx: options.ctx, mode: options.mode, handle });
+      answers.set(handle, answer);
+      return answer;
+    };
+    const rotating = sweepBeads({
+      tick: options.run.ticks,
+      members: new Set(candidates),
     });
-    // A failed read skips the sweep, silently: this pass is opportunistic (the gate
-    // reaper already reports an unreadable bd), and a per-tick warning about it
-    // would drown the run's own lines.
-    if (!lookup.ok) return { intent: options.intent, run: options.run, lines: [] };
+    const run = await captureOutsideFleetHeads({
+      ctx: options.ctx,
+      candidates: rotating,
+      run: options.run,
+      onBase,
+      now: options.now,
+    });
     const proven = await planOutsideFleetLandings({
       intent: options.intent,
-      run: options.run,
-      closedBeadIds: closedBeadsOf(lookup.beads),
-      branchOnBase: (taskId) => branchIsOnBase({ ctx: options.ctx, mode: options.mode, taskId }),
+      run,
+      handlesFor: (taskId) =>
+        memberLandingHandles((run.members ?? []).find((member) => member.taskId === taskId)),
+      onBase,
     });
-    let intent = options.intent;
-    let run = options.run;
-    const lines: string[] = [];
-    for (const taskId of proven) {
-      const landed = await landAlreadyMergedMember({
-        ctx: options.ctx,
-        mode: options.mode,
-        intent,
-        run,
-        taskId,
-        now: options.now,
-      });
-      if (!landed.ok) {
-        lines.push(
-          `Fleet ${options.mode.fleetId}: could not record the landing of ${taskId}: ${landed.error}`,
-        );
-        continue;
-      }
-      intent = landed.intent;
-      run = landed.run;
-      lines.push(...landed.lines);
-    }
-    return { intent, run, lines };
+    return recordOutsideFleetLandings({
+      ctx: options.ctx,
+      mode: options.mode,
+      intent: options.intent,
+      run,
+      proven,
+      now: options.now,
+    });
   }
 
   /** What one tick did, and why it stopped the loop when it did. */
@@ -4151,8 +4340,37 @@ export function createFleet(deps: FleetDeps): FleetApi {
       run,
       now,
     });
-    const tickIntent = swept.intent;
-    const tickRun = swept.run;
+    // Write the sweep before acting, not only at the end of the tick: the advance's
+    // landing filter (`fleetLandedTaskIds`) reads `run.members[].landedAt` from the
+    // record, so a swept-but-unwritten landing made this very tick re-defer the
+    // dependent as "blocked by a bead outside this fleet" — and when the landed member
+    // was the run's last unfinished one, the run finished `partial` with no later tick
+    // to launch it (bd-278).
+    let tickIntent = swept.intent;
+    let tickRun = swept.run;
+    if (swept.run !== run) {
+      const written = writeOutsideFleetRun({
+        mode: current,
+        observed: run,
+        next: swept.run,
+        now,
+        allowActiveRun: true,
+      });
+      if (written.kind !== "written") {
+        // The loop notifies a tick's returned lines at one level, so this one carries
+        // its own: a failed `fleet.json` write warns like every other write failure in
+        // this loop, while a replaced run is the compare-and-replace doing its job and
+        // stays informational (bd-278 review). Neither acts: acting on an unrecorded
+        // landing is the defect itself — the dependent would be re-deferred and, on a
+        // run-ending tick, never launched — so the next tick re-sweeps instead.
+        ctx.ui.notify(written.line, written.kind === "failed" ? "warning" : "info");
+        return { lines: swept.lines, stop: false, acted: false };
+      }
+      // Continue from what was actually stored, so the end-of-tick persist builds on
+      // the landing instead of replacing it with the tick's pre-write snapshot.
+      tickIntent = written.intent;
+      tickRun = written.intent.run ?? swept.run;
+    }
     const observations = await readFleetMemberObservations({
       cwd: ctx.cwd,
       intent: tickIntent,
@@ -7403,6 +7621,21 @@ export function createFleet(deps: FleetDeps): FleetApi {
       if (!loaded.ok) {
         return textToolResult(`Could not read the fleet intent: ${loaded.error}`, 1);
       }
+      // Nothing ticks a finished run, so a recorded ordering gate bd no longer reports
+      // used to wedge the whole wave: the launch kept refusing on a gate id that read
+      // like an outside bead (bd-278 notes, 2026-11-06). Reap exactly like the tick
+      // and reconcile do before planning, so the launch sees bd's current truth.
+      if (loaded.intent !== undefined) {
+        const reaped = await reapOrderingGates({
+          ctx: extensionCtx,
+          mode,
+          intent: loaded.intent,
+          now: Date.now(),
+          tick: 0,
+          sweep: "all",
+        });
+        for (const warning of reaped.warnings) extensionCtx.ui.notify(warning, "warning");
+      }
       const planned = planFleetAdvance({ fleetId: mode.fleetId, intent: loaded.intent });
       if (!planned.ok) return textToolResult(planned.text, 1);
 
@@ -7424,6 +7657,152 @@ export function createFleet(deps: FleetDeps): FleetApi {
   });
 
   /**
+   * What one composed outside-fleet landing write did to the stored run.
+   *
+   * Three outcomes, not a boolean: a failure is a real `fleet.json` write failure and
+   * warns like every other one in this loop, while a skip is the compare-and-replace
+   * doing its job on a record another session already replaced (bd-278 review).
+   */
+  type OutsideFleetRunWrite =
+    | { kind: "written"; intent: FleetIntent }
+    | { kind: "skipped"; intent: FleetIntent; reason: string; line: string }
+    | { kind: "failed"; error: string; line: string; intent?: FleetIntent };
+
+  /**
+   * Write a swept run only while it is still the run that was read (bd-278).
+   *
+   * Nothing ticks a finished/dead fleet, so reconcile writes the landing itself, and a
+   * tick writes the landing its own sweep found *before* it acts. The mutate re-reads
+   * and `composeOutsideFleetRunWrite` re-checks: a re-arm/relaunch can replace the run
+   * while the git sweep runs, and overwriting that fresh run with the swept stale one
+   * would drop its members. A skip is reported as a line, never silent.
+   */
+  function writeOutsideFleetRun(options: {
+    mode: FleetMode;
+    observed: FleetRun;
+    next: FleetRun;
+    now: number;
+    /** The tick swept its own live run and must persist the landing before acting. */
+    allowActiveRun?: boolean;
+  }): OutsideFleetRunWrite {
+    let skipReason: string | undefined;
+    let composedIntent: FleetIntent | undefined;
+    const written = mutateFleetIntent({
+      gitCommonDir: options.mode.gitCommonDir,
+      fleetId: options.mode.fleetId,
+      mutate: (current) => {
+        const composed = composeOutsideFleetRunWrite({
+          intent: current,
+          observed: options.observed,
+          next: options.next,
+          now: options.now,
+          ...(options.allowActiveRun === undefined
+            ? {}
+            : { allowActiveRun: options.allowActiveRun }),
+        });
+        composedIntent = composed.intent;
+        skipReason = composed.recorded ? undefined : composed.reason;
+        return composed.intent;
+      },
+    });
+    const composed = composedIntent;
+    // A successful write always composed first; a refusal or an unreadable record can
+    // leave the compose unset, and nothing was recorded either way.
+    if (!written.ok || composed === undefined) {
+      const error = written.ok
+        ? "the intent write reported success without composing the run"
+        : written.error;
+      return {
+        kind: "failed",
+        error,
+        line: `Fleet ${options.mode.fleetId}: could not record the outside-fleet landing: ${error}`,
+        ...(composed === undefined ? {} : { intent: composed }),
+      };
+    }
+    if (skipReason !== undefined) {
+      return {
+        kind: "skipped",
+        intent: composed,
+        reason: skipReason,
+        line:
+          `Fleet ${options.mode.fleetId}: did not write the outside-fleet landing record (` +
+          `${skipReason}); the stored run was left alone`,
+      };
+    }
+    return { kind: "written", intent: composed };
+  }
+
+  /** Whether a reconciled run still has unlanded work that only a repair can land. */
+  function needsReconciledLanding(options: {
+    intent: FleetIntent;
+    run: FleetRun;
+    deadSupervisor: boolean;
+  }): boolean {
+    const landed = new Set(
+      (options.run.members ?? [])
+        .filter((member) => member.landedAt !== undefined)
+        .map((member) => member.taskId),
+    );
+    if (!options.intent.taskIds.some((taskId) => !landed.has(taskId))) return false;
+    return !isFleetRunActive(options.run) || options.deadSupervisor;
+  }
+
+  /**
+   * Record an outside-fleet landing for a fleet nothing is ticking (bd-278).
+   *
+   * A finished run has no tick left, and a provably dead supervisor cannot tick, so
+   * the live recovery in the bead notes needed a hand `bd close` plus a second tool
+   * call to free the slot. Reconcile already holds this fleet's repair authority, so
+   * it may record the same ancestry-proven landing a tick would and report the lines.
+   * A live supervisor's tick owns the decision, and is left to make it.
+   */
+  async function landReconciledOutsideFleet(options: {
+    ctx: ExtensionContext;
+    mode: FleetMode;
+    intent: FleetIntent;
+    now: number;
+    deadSupervisor: boolean;
+  }): Promise<{ intent: FleetIntent; lines: readonly string[] }> {
+    const run = options.intent.run;
+    if (run === undefined) return { intent: options.intent, lines: [] };
+    if (
+      !needsReconciledLanding({
+        intent: options.intent,
+        run,
+        deadSupervisor: options.deadSupervisor,
+      })
+    ) {
+      return { intent: options.intent, lines: [] };
+    }
+    const swept = await landMembersMergedOutsideFleet({
+      ctx: options.ctx,
+      mode: options.mode,
+      intent: options.intent,
+      run,
+      now: options.now,
+    });
+    const lines = [...swept.lines];
+    let intent = swept.intent;
+    if (swept.run !== run) {
+      const written = writeOutsideFleetRun({
+        mode: options.mode,
+        observed: run,
+        next: swept.run,
+        now: options.now,
+      });
+      // Reconcile reports rather than stops: it keeps the composed record for the gate
+      // reap that follows, even when the write itself was refused.
+      if (written.kind === "written") {
+        intent = written.intent;
+      } else {
+        if (written.intent !== undefined) intent = written.intent;
+        lines.push(written.line);
+      }
+    }
+    return { intent, lines };
+  }
+
+  /**
    * Reap the ordering gates a reconcile pass left behind (bd-158).
    *
    * A repair is not a tick: sweep every member *and* the members the pass just pruned
@@ -7435,6 +7814,8 @@ export function createFleet(deps: FleetDeps): FleetApi {
     ctx: ExtensionContext;
     mode: FleetMode;
     repairs: readonly string[];
+    /** The repair was granted because the fleet's supervisor is provably dead. */
+    deadSupervisor: boolean;
   }): Promise<void> {
     // Re-read the intent: the reconcile may have just pruned a member.
     const reconciled = readFleetIntent({
@@ -7442,6 +7823,18 @@ export function createFleet(deps: FleetDeps): FleetApi {
       fleetId: options.mode.fleetId,
     });
     if (!reconciled.ok || reconciled.intent === undefined) return;
+    const now = Date.now();
+    const swept = await landReconciledOutsideFleet({
+      ctx: options.ctx,
+      mode: options.mode,
+      intent: reconciled.intent,
+      now,
+      deadSupervisor: options.deadSupervisor,
+    });
+    for (const line of swept.lines) {
+      options.ctx.ui.notify(line, "info");
+      console.warn(`[belayd-harness] ${line}`);
+    }
     const pruned = options.repairs
       .filter((repair) => repair.startsWith("member-pruned:"))
       .map((repair) => repair.slice("member-pruned:".length))
@@ -7449,7 +7842,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
     const reaped = await reapOrderingGates({
       ctx: options.ctx,
       mode: options.mode,
-      intent: reconciled.intent,
+      intent: swept.intent,
       now: Date.now(),
       tick: 0,
       sweep: "all",
@@ -7626,6 +8019,7 @@ export function createFleet(deps: FleetDeps): FleetApi {
         ctx: extensionCtx,
         mode,
         repairs: result.repairs,
+        deadSupervisor: target.recovery !== undefined,
       });
       return textToolResult(result.text, result.ok ? 0 : 1);
     },

@@ -47,6 +47,15 @@ export interface FleetScheduleInput {
    * an unplannable outsider — whether the blocker is still working or has stopped.
    */
   memberIds?: readonly string[];
+  /**
+   * Gate ids this fleet recorded as ordering gates (bd-278).
+   *
+   * bd lists an ordering gate as a blocker under its own id, so a stale record whose
+   * gate bd no longer reports reached the operator as "a bead outside this fleet" —
+   * a bead dependency that does not exist. Naming those ids here lets the deferral
+   * say "ordering gate" and point at the repair instead. Defaults to empty.
+   */
+  orderingGateIds?: ReadonlySet<string>;
   /** Known blocking edges; a blocker outside `taskIds` means "wait for that bead". */
   edges: readonly FleetDependencyEdge[];
   /** Concurrency ceiling in effect (already clamped to the locked maximum). */
@@ -366,6 +375,8 @@ interface DeferralInput {
   activeCount: number;
   edges: readonly FleetDependencyEdge[];
   unplannable: ReadonlyMap<string, readonly string[]>;
+  /** Recorded ordering-gate ids; see {@link FleetScheduleInput.orderingGateIds}. */
+  orderingGateIds: ReadonlySet<string>;
   /** Every id this fleet owns: the worklist plus its existing members (launched or stopped). */
   fleet: ReadonlySet<string>;
 }
@@ -404,6 +415,34 @@ function dependencyDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
   return deferrals;
 }
 
+/**
+ * Operator wording for blockers outside the fleet, split by what they actually are.
+ *
+ * A recorded ordering gate is not a bead dependency: bd names the gate by its own id,
+ * so the old text read as "a bead outside this fleet" for something the fleet itself
+ * created and can drop. A real outside bead keeps that wording.
+ */
+function outsideBlockerDetail(gates: readonly string[], beads: readonly string[]): string {
+  const gateText =
+    gates.length === 0
+      ? undefined
+      : `blocked by ordering gate${gates.length === 1 ? "" : "s"} ${gates.join(", ")}, which ` +
+        "bd no longer reports; run belayd_fleet_reconcile to drop the stale record and " +
+        "re-plan the wave, or run " +
+        (gates.length === 1
+          ? `\`bd gate resolve ${gates[0]}\` if bd still lists it`
+          : "`bd gate resolve <gate-id>` if bd still lists them");
+  const beadText =
+    beads.length === 0
+      ? undefined
+      : `blocked by ${beads.join(", ")}, which is not part of this fleet; it cannot be ` +
+        "planned for any wave until that bead lands";
+  if (gateText !== undefined && beadText !== undefined) {
+    return `${gateText}; also ${beadText}`;
+  }
+  return gateText ?? beadText ?? "";
+}
+
 function unplannableDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
   const deferrals: FleetScheduleDeferral[] = [];
   for (const taskId of input.order) {
@@ -413,13 +452,13 @@ function unplannableDeferrals(input: DeferralInput): FleetScheduleDeferral[] {
     // A direct outside blocker and a member waiting for one that is itself
     // blocked read differently to the operator, so they get different reasons.
     if (outside.length > 0) {
+      const gates = outside.filter((blocker) => input.orderingGateIds.has(blocker));
+      const beads = outside.filter((blocker) => !input.orderingGateIds.has(blocker));
       deferrals.push({
         taskId,
         reason: "external-blocker",
         blockers: outside,
-        detail:
-          `blocked by ${outside.join(", ")}, which is not part of this fleet; it cannot be ` +
-          "planned for any wave until that bead lands",
+        detail: outsideBlockerDetail(gates, beads),
       });
       continue;
     }
@@ -461,7 +500,20 @@ function buildReasons(input: DeferralInput): string[] {
     (input.unplannable.get(taskId) ?? []).some((blocker) => !input.fleet.has(blocker)),
   );
   if (outside.length > 0) {
-    reasons.push(`${outside.join(", ")} cannot be planned: blocked by a bead outside this fleet`);
+    const blockers = input.order.flatMap((taskId) =>
+      (input.unplannable.get(taskId) ?? []).filter((blocker) => !input.fleet.has(blocker)),
+    );
+    const beads = [...new Set(blockers.filter((blocker) => !input.orderingGateIds.has(blocker)))];
+    const gates = [...new Set(blockers.filter((blocker) => input.orderingGateIds.has(blocker)))];
+    if (beads.length > 0) {
+      reasons.push(`${outside.join(", ")} cannot be planned: blocked by a bead outside this fleet`);
+    }
+    if (gates.length > 0) {
+      reasons.push(
+        `${outside.join(", ")} cannot be planned: blocked by ordering gate(s) ` +
+          `${gates.join(", ")} that bd no longer reports`,
+      );
+    }
   }
   return reasons;
 }
@@ -532,6 +584,7 @@ export function planFleetSchedule(input: FleetScheduleInput): FleetScheduleResul
     activeCount,
     edges,
     unplannable,
+    orderingGateIds: input.orderingGateIds ?? new Set<string>(),
     fleet,
   };
 

@@ -509,6 +509,12 @@ function stubRefusingPayloadGit(options: {
       },
     },
     {
+      // An outside-fleet landing probe (bd-278): while the repair round is outstanding
+      // the branch is not on the base, whatever tip its record names.
+      matches: (args) => args[0] === "merge-base" && args[1] === "--is-ancestor",
+      answer: () => ({ failWith: "fatal: not an ancestor" }),
+    },
+    {
       matches: (args) => args[0] === "status",
       answer: () => ({ stdout: options.statusOutput ?? "" }),
     },
@@ -922,6 +928,13 @@ describe("fleet supervisor mode", () => {
       .map((line) => (JSON.parse(line) as { action: string }).action);
   }
 
+  /** Rewrite the armed fleet record, the way a rival fleet or an operator would. */
+  function editIntent(mutate: (intent: Record<string, unknown>) => Record<string, unknown>): void {
+    const path = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    const intent = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify(mutate(intent)));
+  }
+
   function supervisorFor(sessionId: string): { sessionId: string; pid: number } {
     return { sessionId, pid: process.pid };
   }
@@ -1197,6 +1210,282 @@ describe("fleet supervisor mode", () => {
     }
   });
 
+  it("reaps a stale ordering-gate record on advance so it stops blocking the wave (bd-278)", async () => {
+    const sessionId = "supervisor-session";
+    let gateResolved = false;
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") {
+        if (args[1] === "resolve") {
+          gateResolved = true;
+          return `✓ Gate resolved: ${args[2] ?? ""}\n`;
+        }
+        return "null";
+      }
+      if (args[0] !== "show") return undefined;
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      if (args.includes("--brief-deps")) {
+        return JSON.stringify(
+          ids.map((id) => ({
+            id,
+            dependencies:
+              id === "bd-19" && !gateResolved
+                ? [{ id: "bd-294", dependency_type: "blocks", status: "open" }]
+                : [],
+          })),
+        );
+      }
+      return JSON.stringify(ids.map((id) => ({ id, status: id === "bd-12" ? "closed" : "open" })));
+    };
+    try {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, sessionId);
+      await arm(mock, ctx);
+      editIntent((current) => ({
+        ...current,
+        deferred: [{ taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" }],
+        // The shape from the notes: a recorded ordering gate bd no longer reports, and
+        // bd-19's only blocker is the gate id, which read like a bead outside the fleet.
+        // bd-12 is closed, so the closed-bead reap resolves bd-294 before planning.
+        orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-294" }],
+      }));
+
+      const advanced = await mock.tools
+        .get("belayd_fleet_advance")
+        ?.execute("call-1", {}, undefined, undefined, ctx);
+      expect(advanced?.details).toHaveProperty("exitCode", 0);
+      const text = textOf(advanced as ToolResult);
+      expect(gateResolved).toBe(true);
+      expect(text).not.toContain("not part of this fleet");
+      expect(text).toContain("1/1 member(s) launched");
+      const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(loaded).toHaveProperty("ok", true);
+      if (!loaded.ok) return;
+      expect(loaded.intent?.orderingGates).toBeUndefined();
+    } finally {
+      childProcess.bdStdout = undefined;
+    }
+  });
+
+  it("records an outside-fleet landing from reconcile when no tick can (bd-278)", async () => {
+    const sessionId = "supervisor-session";
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, sessionId);
+    await arm(mock, ctx);
+
+    // A finished run has no tick left, and its member's bead is still in_progress
+    // after a hand merge: only the head the run recorded can prove the landing.
+    const head = "d".repeat(40);
+    editIntent((current) => ({
+      ...current,
+      run: {
+        schemaVersion: 1,
+        mode: "until-complete",
+        startedAt: 1,
+        updatedAt: 2,
+        ticks: 3,
+        idleTicks: 0,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1, head }],
+        finishedAt: 2,
+        outcome: "partial",
+      },
+    }));
+
+    const reconciled = await mock.tools
+      .get("belayd_fleet_reconcile")
+      ?.execute("call-1", {}, undefined, undefined, ctx);
+    expect(reconciled?.details).toHaveProperty("exitCode", 0);
+
+    // The default git stub answers every `merge-base --is-ancestor` as an ancestor,
+    // which is the proof: no bead status is read for this decision.
+    const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(loaded).toHaveProperty("ok", true);
+    if (!loaded.ok) return;
+    expect(loaded.intent?.taskIds).toEqual(["bd-15"]);
+    expect(loaded.intent?.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject({
+      landedAt: expect.any(Number),
+      head,
+    });
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "landing happened outside the fleet",
+    );
+  });
+
+  it("leaves a run replaced mid-repair untouched (bd-278)", async () => {
+    const sessionId = "supervisor-session";
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, sessionId);
+    await arm(mock, ctx);
+
+    // A finished run with a recorded head, as the outside-fleet sweep reads it.
+    const head = "d".repeat(40);
+    editIntent((current) => ({
+      ...current,
+      run: {
+        schemaVersion: 1,
+        mode: "until-complete",
+        startedAt: 1,
+        updatedAt: 2,
+        ticks: 3,
+        idleTicks: 0,
+        accept: false,
+        members: [{ taskId: "bd-12", launchedAt: 1, head }],
+        finishedAt: 2,
+        outcome: "partial",
+      },
+    }));
+
+    // A re-arm starts a fresh run while the repair is between its prune and its run
+    // write. The prune update still sees bd-12 in `taskIds`; the update after it sees
+    // it gone, which is the update the landing record would overwrite.
+    const freshHead = "e".repeat(40);
+    const freshRun = {
+      schemaVersion: 1,
+      mode: "until-complete",
+      startedAt: 9_999,
+      updatedAt: 9_999,
+      ticks: 0,
+      idleTicks: 0,
+      accept: false,
+      members: [{ taskId: "bd-12", launchedAt: 9_999, head: freshHead }],
+    };
+    const fleetPath = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    const swapAfterPrune = (): void => {
+      const current = JSON.parse(readFileSync(fleetPath, "utf8")) as Record<string, unknown>;
+      const taskIds = Array.isArray(current.taskIds) ? (current.taskIds as string[]) : [];
+      if (taskIds.includes("bd-12")) {
+        intentCas.beforeUpdate = swapAfterPrune;
+        return;
+      }
+      writeFileSync(fleetPath, JSON.stringify({ ...current, run: freshRun }));
+    };
+    intentCas.beforeUpdate = swapAfterPrune;
+
+    const reconciled = await mock.tools
+      .get("belayd_fleet_reconcile")
+      ?.execute("call-1", {}, undefined, undefined, ctx);
+    intentCas.beforeUpdate = undefined;
+    expect(reconciled?.details).toHaveProperty("exitCode", 0);
+
+    const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(loaded).toHaveProperty("ok", true);
+    if (!loaded.ok) return;
+    // The fresh run survives with its own member and no landing recorded on it.
+    expect(loaded.intent?.run?.startedAt).toBe(9_999);
+    expect(loaded.intent?.run?.members).toEqual([
+      { taskId: "bd-12", launchedAt: 9_999, head: freshHead },
+    ]);
+    expect(ctxNotifications.map((entry) => entry.message).join("\n")).toContain(
+      "the stored run was left alone",
+    );
+  });
+
+  it("drops a recorded ordering gate bd no longer reports on a full sweep (bd-278)", async () => {
+    const sessionId = "supervisor-session";
+    const resolves: string[][] = [];
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") {
+        if (args[1] === "resolve") {
+          resolves.push([...args]);
+          return `✓ Gate resolved: ${args[2] ?? ""}\n`;
+        }
+        // bd no longer reports bd-294 for either bead.
+        return "null";
+      }
+      if (args[0] !== "show") return undefined;
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      if (args.includes("--brief-deps")) {
+        return JSON.stringify(ids.map((id) => ({ id, dependencies: [] })));
+      }
+      return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
+    };
+    try {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, sessionId);
+      await arm(mock, ctx);
+      editIntent((current) => ({
+        ...current,
+        deferred: [{ taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" }],
+        orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-294" }],
+      }));
+
+      const advanced = await mock.tools
+        .get("belayd_fleet_advance")
+        ?.execute("call-1", {}, undefined, undefined, ctx);
+      expect(advanced?.details).toHaveProperty("exitCode", 0);
+      // Both beads are members and still open, so only the full sweep can prove the
+      // gate is gone. Dropping the record must not call bd: there is nothing to resolve.
+      expect(resolves).toEqual([]);
+      const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(loaded).toHaveProperty("ok", true);
+      if (!loaded.ok) return;
+      expect(loaded.intent?.orderingGates).toBeUndefined();
+      expect(auditActions()).toContain("ordering-gates-resolved");
+    } finally {
+      childProcess.bdStdout = undefined;
+    }
+  });
+
+  it("keeps a recorded gate when one of its beads could not be read (bd-278)", async () => {
+    const sessionId = "supervisor-session";
+    const resolves: string[][] = [];
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") {
+        if (args[1] === "resolve") {
+          resolves.push([...args]);
+          return `✓ Gate resolved: ${args[2] ?? ""}\n`;
+        }
+        return "null";
+      }
+      if (args[0] !== "show") return undefined;
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      if (args.includes("--brief-deps")) {
+        return JSON.stringify(
+          ids.map((id) => ({
+            id,
+            dependencies:
+              id === "bd-19" ? [{ id: "bd-294", dependency_type: "blocks", status: "open" }] : [],
+          })),
+        );
+      }
+      return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
+    };
+    childProcess.bdFailure = (args) =>
+      args[0] === "gate" && args[1] === "list" && args[2] === "bd-15"
+        ? "bd: database unavailable"
+        : undefined;
+    try {
+      const mock = await loadFleetExtension();
+      const ctx = makeCtx(cwd, sessionId);
+      await arm(mock, ctx);
+      editIntent((current) => ({
+        ...current,
+        deferred: [{ taskId: "bd-19", reason: "dependency", detail: "waits for bd-12" }],
+        orderingGates: [{ blocker: "bd-12", blocked: "bd-15", gateId: "bd-294" }],
+      }));
+
+      const advanced = await mock.tools
+        .get("belayd_fleet_advance")
+        ?.execute("call-1", {}, undefined, undefined, ctx);
+      expect(advanced?.details).toHaveProperty("exitCode", 0);
+      const text = textOf(advanced as ToolResult);
+      // Fail closed: an unreadable answer is not proof the gate is gone, so the record
+      // stays and the deferral names it as an ordering gate with the manual fallback.
+      expect(resolves).toEqual([]);
+      expect(text).toContain("ordering gate bd-294");
+      expect(text).toContain("bd gate resolve");
+      const loaded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      expect(loaded).toHaveProperty("ok", true);
+      if (!loaded.ok) return;
+      expect(loaded.intent?.orderingGates).toEqual([
+        { blocker: "bd-12", blocked: "bd-15", gateId: "bd-294" },
+      ]);
+    } finally {
+      childProcess.bdStdout = undefined;
+      childProcess.bdFailure = undefined;
+    }
+  });
+
   it("leaves fleet.json readable when a sweep cannot adopt past the gate bound", async () => {
     // C1: a crash window can leave more gates in bd than `fleet.json` may record.
     // One full sweep must refuse the extra adoption (and leave that gate open, since
@@ -1205,13 +1494,20 @@ describe("fleet supervisor mode", () => {
     const sessionId = "supervisor-session";
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, sessionId);
-    await arm(mock, ctx);
+    // One record per directed member edge, so the set really is full of distinct
+    // live gates (duplicate edges would be reaped as duplicates before the adoption).
+    const memberIds = Array.from({ length: 17 }, (_, index) => `bd-${12 + index}`);
+    await arm(mock, ctx, memberIds.join(" "));
 
-    const atBound = Array.from({ length: FLEET_INTENT_ORDERING_GATES_MAX }, (_, index) => ({
-      blocker: "bd-15",
-      blocked: "bd-12",
-      gateId: `bd-${5000 + index}`,
-    }));
+    const allEdges = memberIds.flatMap((blocker) =>
+      memberIds.filter((blocked) => blocked !== blocker).map((blocked) => ({ blocker, blocked })),
+    );
+    const atBound = allEdges
+      .slice(0, FLEET_INTENT_ORDERING_GATES_MAX)
+      .map((edge, index) => ({ ...edge, gateId: `bd-${5000 + index}` }));
+    const extra = allEdges[FLEET_INTENT_ORDERING_GATES_MAX];
+    if (extra === undefined) throw new Error("fixture needs one edge past the record bound");
+
     const seeded = updateFleetIntent({
       gitCommonDir: commonDir,
       fleetId: "default",
@@ -1220,13 +1516,26 @@ describe("fleet supervisor mode", () => {
     });
     expect(seeded).toHaveProperty("ok", true);
 
-    const text = `belayd-fleet-ordering: fleet:default bd-12 -> bd-15`;
+    const stubGate = (gate: { gateId: string; blocker: string; blocked: string }) => {
+      const marker = `belayd-fleet-ordering: fleet:default ${gate.blocker} -> ${gate.blocked}`;
+      return {
+        id: gate.gateId,
+        status: "open",
+        await_type: "human",
+        title: marker,
+        description: marker,
+      };
+    };
     childProcess.bdStdout = (args) => {
       if (args[0] === "gate" && args[1] === "list") {
-        if (args[2] !== "bd-15") return "null";
-        return JSON.stringify([
-          { id: "bd-970", status: "open", await_type: "human", title: text, description: text },
-        ]);
+        // Every seeded record is still live in bd; only bd-970 is an extra gate the
+        // record set cannot take. Returning them keeps the full sweep from reading
+        // them as "bd no longer reports this gate" (bd-278).
+        return JSON.stringify([...atBound.map(stubGate), stubGate({ ...extra, gateId: "bd-970" })]);
+      }
+      if (args[0] === "show") {
+        const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+        return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
       }
       return undefined;
     };
@@ -1238,7 +1547,7 @@ describe("fleet supervisor mode", () => {
 
       const reported = ctxNotifications.map((entry) => entry.message).join("\n");
       expect(reported).toContain("bd-970");
-      expect(reported).toContain("bd-12 -> bd-15");
+      expect(reported).toContain(`${extra.blocker} -> ${extra.blocked}`);
       expect(reported).toContain("could not be recorded");
 
       // The gate stays open: nothing resolved it. On a `bd gate list` of bd-15 it
@@ -5882,24 +6191,42 @@ describe("fleet run mode", () => {
     expect(intentRun()).toBeUndefined();
   });
 
-  it("lands a member whose bead is closed and whose branch is already on the base (bd-166)", async () => {
+  it("lands a member whose bead is still in_progress after its worktree and branch are gone (bd-278)", async () => {
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "supervisor-session");
     const command = mock.commands.get("fleet");
     if (command === undefined) throw new Error("/fleet was not registered");
     await command.handler("bd-12", ctx);
 
-    // A human merged with `wt merge` and closed the bead: the member's worktree and
-    // branch still resolve, bd reports it closed, and the git probe answers that the
-    // branch is an ancestor of the base (the stubbed git runner exits 0).
-    const memberPath = join(worktree.path, "feat-bd-12");
-    mkdirSync(memberPath, { recursive: true });
-    worktree.byBranch = { "feat/bd-12": memberPath };
-    worktree.branch = "feat/bd-12";
+    // The documented hand-merge path: `wt merge` merged the branch, removed the
+    // worktree, deleted the branch, and left the bead in_progress + human. Only the
+    // head a tick recorded before the cleanup can still prove the landing.
+    const head = "d".repeat(40);
+    editIntent((current) => {
+      const run = current.run as { members?: Array<Record<string, unknown>> } | undefined;
+      return {
+        ...current,
+        orderingGates: [{ blocker: "bd-12", blocked: "bd-13", gateId: "bd-900" }],
+        run: {
+          ...(run ?? {}),
+          members: (run?.members ?? []).map((member) =>
+            member.taskId === "bd-12" ? { ...member, head } : member,
+          ),
+        },
+      };
+    });
     childProcess.bdStdout = (args) => {
-      if (args[0] === "gate") return "null";
+      if (args[0] === "gate") {
+        return args[1] === "resolve" ? `✓ Gate resolved: ${args[2] ?? ""}\n` : "null";
+      }
       if (args[0] !== "show") return undefined;
-      return JSON.stringify([{ id: "bd-12", status: "closed" }]);
+      return JSON.stringify([{ id: "bd-12", status: "in_progress" }]);
+    };
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor" && args[2] === head) {
+        return { stdout: "" };
+      }
+      return undefined;
     };
 
     await vi.advanceTimersByTimeAsync(15_000);
@@ -5907,11 +6234,23 @@ describe("fleet run mode", () => {
     const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
     expect(intent).toHaveProperty("ok", true);
     if (!intent.ok) return;
-    // Landed and pruned: no merge ran, the branch was already on the base.
+    // Landed and pruned from ancestry alone: bd still reports the bead in_progress,
+    // so bead status cannot be what decided it.
     expect(intent.intent?.taskIds).toEqual([]);
     expect(intent.intent?.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject({
       landedAt: expect.any(Number),
+      head,
     });
+    // The ordering gate the landing satisfied is resolved and its record dropped.
+    expect(intent.intent?.orderingGates).toBeUndefined();
+    expect(
+      childProcess.execFileCalls
+        .filter((call) => call.file === "bd" && call.args[0] === "gate")
+        .map((call) => [...call.args]),
+    ).toContainEqual(["gate", "resolve", "bd-900"]);
+    expect(
+      childProcess.execFileCalls.filter((call) => call.file === "bd" && call.args[0] === "close"),
+    ).toEqual([]);
     const auditPath = join(commonDir, "belayd", "fleet", "default", "audit.log");
     const entries = readFileSync(auditPath, "utf8")
       .split("\n")
@@ -5919,40 +6258,440 @@ describe("fleet run mode", () => {
       .map((line) => JSON.parse(line) as { action: string; detail?: string });
     const landed = entries.find((entry) => entry.action === "fleet-landed");
     expect(landed?.detail).toContain("already on main");
+    expect(landed?.detail).toContain("landing happened outside the fleet");
     expect(entries.some((entry) => entry.action === "merge-enqueued")).toBe(false);
   });
 
-  it("sweeps one member bead per tick, rotating with the run ticks (bd-166)", async () => {
+  it("never lands a freshly launched member whose branch sits on the launch point (bd-278)", async () => {
     const mock = await loadFleetExtension();
     const ctx = makeCtx(cwd, "supervisor-session");
     const command = mock.commands.get("fleet");
     if (command === undefined) throw new Error("/fleet was not registered");
-    await command.handler("bd-12 bd-13 bd-14", ctx);
-    const launched = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
-    expect(launched).toHaveProperty("ok", true);
-    if (!launched.ok) return;
-    expect(launched.intent?.run?.members?.map((member) => member.taskId)).toEqual([
-      "bd-12",
-      "bd-13",
-      "bd-14",
-    ]);
+    await command.handler("bd-12", ctx);
 
-    const probedBeads = (): string[] =>
-      childProcess.execFileCalls
-        .filter((call) => call.file === "bd" && call.args[0] === "show")
-        .flatMap((call) => call.args.filter((arg) => /^bd-\d+$/u.test(arg)));
+    // A brand-new member branch points at the launch commit, which is an ancestor of
+    // the base by construction. Ancestry there proves nothing, so it must never be
+    // stored as a head and must never land the member.
+    const memberPath = join(worktree.path, "feat-bd-12");
+    mkdirSync(memberPath, { recursive: true });
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    worktree.branch = "feat/bd-12";
+    const launchPoint = "a".repeat(40);
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "rev-parse" && args[1] === "feat/bd-12") {
+        return { stdout: `${launchPoint}\n` };
+      }
+      if (args[0] === "merge-base" && args[2] === launchPoint) return { stdout: "" };
+      return undefined;
+    };
 
-    childProcess.execFileCalls.length = 0;
-    await vi.advanceTimersByTimeAsync(0);
-    const firstTick = probedBeads();
-    childProcess.execFileCalls.length = 0;
     await vi.advanceTimersByTimeAsync(15_000);
-    const secondTick = probedBeads();
 
-    // A regression to one batched `bd show` would probe all three in a single tick.
-    expect(firstTick).toHaveLength(1);
-    expect(secondTick).toHaveLength(1);
-    expect(firstTick[0]).not.toBe(secondTick[0]);
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    const member = intent.intent?.run?.members?.find((entry) => entry.taskId === "bd-12");
+    expect(member?.landedAt).toBeUndefined();
+    expect(member?.head).toBeUndefined();
+    expect(intent.intent?.taskIds).toContain("bd-12");
+  });
+
+  it("never records a landing from a closed bead whose branch never merged (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // bd says the bead is closed, but git proves nothing landed. Bead status is the
+    // acceptance fact and must stay out of the landing decision.
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") return "null";
+      if (args[0] !== "show") return undefined;
+      return JSON.stringify([{ id: "bd-12", status: "closed" }]);
+    };
+    childProcess.gitAnswer = ({ args }) =>
+      args[0] === "merge-base" ? { failWith: "fatal: not an ancestor" } : undefined;
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.taskIds).toContain("bd-12");
+    expect(
+      intent.intent?.run?.members?.find((member) => member.taskId === "bd-12")?.landedAt,
+    ).toBeUndefined();
+  });
+
+  it("records the head while the branch is ahead and never overwrites it with the launch point (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    const memberPath = join(worktree.path, "feat-bd-12");
+    mkdirSync(memberPath, { recursive: true });
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    worktree.branch = "feat/bd-12";
+    const ahead = "b".repeat(40);
+    const launchPoint = "a".repeat(40);
+    let tip = ahead;
+    let landedOnBase = false;
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "rev-parse" && args[1] === "feat/bd-12") return { stdout: `${tip}\n` };
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+        if (args[2] === ahead && landedOnBase) return { stdout: "" };
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    const recorded = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(recorded).toHaveProperty("ok", true);
+    if (!recorded.ok) return;
+    const first = recorded.intent?.run?.members?.find((member) => member.taskId === "bd-12");
+    // Ahead of the base: that tip is the only handle a later merge leaves behind.
+    expect(first?.head).toBe(ahead);
+    expect(first?.landedAt).toBeUndefined();
+
+    // The branch is gone and its commits are now on the base: the recorded head
+    // proves the landing, and the launch point a stale probe reports is not stored.
+    tip = launchPoint;
+    landedOnBase = true;
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "rev-parse" && args[1] === "feat/bd-12") return { stdout: `${tip}\n` };
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+        if (args[2] === launchPoint || args[2] === ahead) return { stdout: "" };
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const after = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    const landed = after.intent?.run?.members?.find((member) => member.taskId === "bd-12");
+    expect(landed?.landedAt).toEqual(expect.any(Number));
+    expect(landed?.head).toBe(ahead);
+    expect(after.intent?.taskIds).toEqual([]);
+  });
+
+  it("never lands from a live branch whose reset tip is an ancestor of the base (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-15", ctx);
+
+    // A repairing member committed (head recorded), then reset its branch onto an
+    // ancestor of the base. Real git answers *true* for that branch name; only the
+    // recorded commit id may decide the landing, and it never reached the base.
+    const head = "b".repeat(40);
+    const resetTip = "a".repeat(40);
+    const gate = { blocker: "bd-12", blocked: "bd-15", gateId: "bd-900" };
+    editIntent((current) => {
+      const run = current.run as { members?: Array<Record<string, unknown>> } | undefined;
+      return {
+        ...current,
+        orderingGates: [gate],
+        run: {
+          ...(run ?? {}),
+          members: (run?.members ?? []).map((member) =>
+            member.taskId === "bd-12" ? { ...member, head } : member,
+          ),
+        },
+      };
+    });
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") return "null";
+      if (args[0] !== "show") return undefined;
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
+    };
+    const memberPath = join(worktree.path, "feat-bd-12");
+    mkdirSync(memberPath, { recursive: true });
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    worktree.branch = "feat/bd-12";
+    const probed: string[] = [];
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "rev-parse" && args[1] === "feat/bd-12") {
+        return { stdout: `${resetTip}\n` };
+      }
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor" && args[2] !== undefined) {
+        probed.push(args[2]);
+        // The reset tip really is on the base, and so is the branch name (which is
+        // exactly what makes a reintroduced branch handle land the member wrongly).
+        if (args[2] === resetTip || args[2] === "feat/bd-12") return { stdout: "" };
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    const member = intent.intent?.run?.members?.find((entry) => entry.taskId === "bd-12");
+    expect(member?.landedAt).toBeUndefined();
+    // The reset tip is on the base, so it is not captured either.
+    expect(member?.head).toBe(head);
+    expect(intent.intent?.taskIds).toContain("bd-12");
+    expect(intent.intent?.orderingGates).toEqual([gate]);
+    // The branch name was never offered as a landing handle; only commit ids were.
+    expect(probed).toContain(head);
+    expect(probed).not.toContain("feat/bd-12");
+  });
+
+  it("lands when the recorded head itself is on the base (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12", ctx);
+
+    // The mirrored direction of the reset case: the same branch handle, but the
+    // recorded commit id is on the base, so the landing is real.
+    const head = "b".repeat(40);
+    editIntent((current) => {
+      const run = current.run as { members?: Array<Record<string, unknown>> } | undefined;
+      return {
+        ...current,
+        run: {
+          ...(run ?? {}),
+          members: (run?.members ?? []).map((member) =>
+            member.taskId === "bd-12" ? { ...member, head } : member,
+          ),
+        },
+      };
+    });
+    const memberPath = join(worktree.path, "feat-bd-12");
+    mkdirSync(memberPath, { recursive: true });
+    worktree.byBranch = { "feat/bd-12": memberPath };
+    worktree.branch = "feat/bd-12";
+    childProcess.gitAnswer = ({ args }) => {
+      if (args[0] === "rev-parse" && args[1] === "feat/bd-12") {
+        return { stdout: `${head}\n` };
+      }
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") return { stdout: "" };
+      return undefined;
+    };
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.taskIds).toEqual([]);
+    expect(intent.intent?.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject({
+      landedAt: expect.any(Number),
+      head,
+    });
+  });
+
+  it("captures one head per tick, rotating through unlanded members (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    // Both branches survived (no worktree scan needed here) and both are ahead. The
+    // capture costs a branch scan, so only one member is captured per tick.
+    worktree.existingBranches = new Set(["feat/bd-12", "feat/bd-13"]);
+    const ahead: Record<string, string> = {
+      "feat/bd-12": "b".repeat(40),
+      "feat/bd-13": "c".repeat(40),
+    };
+    childProcess.gitAnswer = ({ args }) => {
+      const branch = args[1];
+      if (args[0] === "rev-parse" && branch !== undefined && ahead[branch] !== undefined) {
+        return { stdout: `${ahead[branch]}\n` };
+      }
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+
+    const capturedHeads = (): Array<string | undefined> => {
+      const read = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      if (!read.ok) return [];
+      return (read.intent?.run?.members ?? []).map((member) => member.head);
+    };
+
+    await vi.advanceTimersByTimeAsync(0);
+    const first = capturedHeads();
+    expect(first.filter((head) => head !== undefined)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    const second = capturedHeads();
+    expect(second.filter((head) => head !== undefined)).toHaveLength(2);
+  });
+
+  it("warns when the pre-action landing write fails, and acts on nothing (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    // Two branches ahead of the base: the rotating capture changes the run on each of
+    // the first two ticks, so the second one has a swept run to persist before it acts.
+    worktree.existingBranches = new Set(["feat/bd-12", "feat/bd-13"]);
+    const ahead: Record<string, string> = {
+      "feat/bd-12": "b".repeat(40),
+      "feat/bd-13": "c".repeat(40),
+    };
+    childProcess.gitAnswer = ({ args }) => {
+      const branch = args[1];
+      if (args[0] === "rev-parse" && branch !== undefined && ahead[branch] !== undefined) {
+        return { stdout: `${ahead[branch]}\n` };
+      }
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+    const readRun = () => {
+      const read = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+      return read.ok ? read.intent?.run : undefined;
+    };
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readRun()).toMatchObject({ ticks: 1 });
+
+    // Two lost compare-and-swaps: `mutateFleetIntent` retries once, so the pre-action
+    // write never reaches disk — a genuine write failure, not the compare-and-replace.
+    intentCas.conflictsRemaining = 2;
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+    } finally {
+      intentCas.conflictsRemaining = 0;
+    }
+
+    // The operator sees it as a warning, like every other fleet.json write failure.
+    expect(
+      ctxNotifications.filter((entry) => entry.message.includes("outside-fleet landing")),
+    ).toEqual([
+      {
+        message: expect.stringContaining("could not record the outside-fleet landing"),
+        level: "warning",
+      },
+    ]);
+    // Nothing was launched on that unrecorded landing and the tick counter did not move:
+    // the run still holds only the head the previous tick managed to write.
+    const run = readRun();
+    expect(run?.ticks).toBe(1);
+    expect((run?.members ?? []).filter((member) => member.head !== undefined)).toHaveLength(1);
+  });
+
+  it("reports a replaced run as an info line, not a write failure (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    worktree.existingBranches = new Set(["feat/bd-12", "feat/bd-13"]);
+    const ahead: Record<string, string> = {
+      "feat/bd-12": "b".repeat(40),
+      "feat/bd-13": "c".repeat(40),
+    };
+    childProcess.gitAnswer = ({ args }) => {
+      const branch = args[1];
+      if (args[0] === "rev-parse" && branch !== undefined && ahead[branch] !== undefined) {
+        return { stdout: `${ahead[branch]}\n` };
+      }
+      if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+        return { failWith: "fatal: not an ancestor" };
+      }
+      return undefined;
+    };
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A re-arm replaced the run while this tick's sweep was running. The compose refuses
+    // to write over it, which is the compare-and-replace doing its job, not a failure.
+    const fleetPath = join(commonDir, "belayd", "fleet", "default", "fleet.json");
+    intentCas.beforeUpdate = () => {
+      const current = JSON.parse(readFileSync(fleetPath, "utf8")) as Record<string, unknown>;
+      writeFileSync(
+        fleetPath,
+        JSON.stringify({
+          ...current,
+          run: {
+            schemaVersion: 1,
+            mode: "until-complete",
+            startedAt: 9_999,
+            updatedAt: 9_999,
+            ticks: 0,
+            idleTicks: 0,
+            accept: false,
+            members: [{ taskId: "bd-12", launchedAt: 9_999 }],
+          },
+        }),
+      );
+    };
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+    } finally {
+      intentCas.beforeUpdate = undefined;
+    }
+
+    expect(
+      ctxNotifications.filter((entry) => entry.message.includes("outside-fleet landing")),
+    ).toEqual([
+      {
+        message: expect.stringContaining("the stored run was left alone"),
+        level: "info",
+      },
+    ]);
+    // The fresh run survived with its own member and no landing written onto it.
+    const read = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(read).toHaveProperty("ok", true);
+    if (!read.ok) return;
+    expect(read.intent?.run?.startedAt).toBe(9_999);
+    expect(read.intent?.run?.ticks).toBe(0);
+    expect(read.intent?.run?.members).toEqual([{ taskId: "bd-12", launchedAt: 9_999 }]);
+  });
+
+  it("keeps a recorded ordering gate on a rotating tick sweep (bd-278)", async () => {
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "supervisor-session");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    // Both beads stay members and open, and bd reports no such gate. A rotating tick
+    // queried one bead only, which cannot prove a gate is gone: the record must stay.
+    editIntent((current) => ({
+      ...current,
+      orderingGates: [{ blocker: "bd-12", blocked: "bd-13", gateId: "bd-294" }],
+    }));
+    childProcess.bdStdout = (args) => {
+      if (args[0] === "gate") return "null";
+      if (args[0] !== "show") return undefined;
+      const ids = args.slice(1).filter((arg) => !arg.startsWith("-"));
+      return JSON.stringify(ids.map((id) => ({ id, status: "open" })));
+    };
+
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const intent = readFleetIntent({ gitCommonDir: commonDir, fleetId: "default" });
+    expect(intent).toHaveProperty("ok", true);
+    if (!intent.ok) return;
+    expect(intent.intent?.orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-294" },
+    ]);
+    expect(
+      childProcess.execFileCalls.filter(
+        (call) => call.file === "bd" && call.args[0] === "gate" && call.args[1] === "resolve",
+      ),
+    ).toEqual([]);
   });
   it("releases a finished run's unlanded member without pruning it (bd-166)", async () => {
     await stopEveryMemberInRun();
@@ -7901,6 +8640,226 @@ describe("fleet ordering gates", () => {
     expect(firstIndex("member-launch", "bd-13")).toBeGreaterThan(
       firstIndex("fleet-landed", "bd-12"),
     );
+  });
+
+  it("lands a hand-merged blocker and starts its dependents, closing no bead (bd-278)", async () => {
+    // AC1 end to end. `wt merge` removes the worktree and deletes the branch while
+    // the bead stays `in_progress` + `human` (this repo's documented accept path), so
+    // bd never reports the landing and the only proof is the head a tick captured
+    // while the branch was still ahead of the base.
+    stubBd(
+      [
+        { id: "bd-12", dependencies: [] },
+        {
+          id: "bd-13",
+          dependencies: [{ id: "bd-12", dependency_type: "blocks", status: "in_progress" }],
+        },
+      ],
+      { "bd-12": "in_progress", "bd-13": "in_progress" },
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "gate-hand-merged");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    const launched = intent();
+    expect(launched).toHaveProperty("ok", true);
+    if (!launched.ok) return;
+    expect(launched.intent?.taskIds).toEqual(["bd-12"]);
+    expect(launched.intent?.orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-901" },
+    ]);
+
+    // The member worked on its branch: the tick records the one durable handle a
+    // hand merge leaves behind, because the branch is still ahead of the base.
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    worktree.byBranch = { "feat/bd-12": memberDir };
+    const head = "d".repeat(40);
+    childProcess.gitAnswer = ({ args }) =>
+      args[0] === "rev-parse" && args[1] === "feat/bd-12"
+        ? { stdout: `${head}\n` }
+        : args[0] === "merge-base" && args[1] === "--is-ancestor"
+          ? { failWith: "fatal: not an ancestor" }
+          : undefined;
+    await vi.advanceTimersByTimeAsync(0);
+
+    const captured = intent();
+    expect(captured).toHaveProperty("ok", true);
+    if (!captured.ok) return;
+    const capturing = captured.intent?.run?.members?.find((member) => member.taskId === "bd-12");
+    expect(capturing).toMatchObject({ head });
+    // A tip ahead of the base is not a landing; the member keeps working.
+    expect(capturing?.landedAt).toBeUndefined();
+    expect(captured.intent?.taskIds).toEqual(["bd-12"]);
+
+    // Hand merge: the worktree and the branch are gone, the bead is untouched.
+    rmSync(memberDir, { recursive: true, force: true });
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.byBranch = {};
+    childProcess.gitAnswer = ({ args }) =>
+      args[0] === "merge-base" && args[1] === "--is-ancestor" ? { stdout: "" } : undefined;
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    const landingTick = intent();
+    expect(landingTick).toHaveProperty("ok", true);
+    if (!landingTick.ok) return;
+    const landed = landingTick.intent?.run?.members?.find((member) => member.taskId === "bd-12");
+    expect(landed).toMatchObject({ landedAt: expect.any(Number), head });
+    // The landing resolved the edge's gate and pruned the member...
+    expect(landingTick.intent?.orderingGates).toBeUndefined();
+    // ...and the same tick started the dependent, which was the missing half of AC1:
+    // the advance inside the tick reads the landing this tick wrote, not a stale record.
+    expect(landingTick.intent?.taskIds).toEqual(["bd-13"]);
+    expect(landingTick.intent?.deferred ?? []).toEqual([]);
+    expect(
+      landingTick.intent?.run?.members?.find((member) => member.taskId === "bd-13"),
+    ).toMatchObject({ launchedAt: expect.any(Number) });
+    const gateResolves = bdCalls((args) => args[0] === "gate" && args[1] === "resolve");
+    // A tick may resolve it twice (landing, then the orphan reap of the record the
+    // landing's own write left behind); `bd gate resolve` is idempotent.
+    expect(gateResolves.length).toBeGreaterThan(0);
+    expect(gateResolves.every((args) => args[2] === "bd-901")).toBe(true);
+    const landedAudit = readFileSync(
+      join(commonDir, "belayd", "fleet", "default", "audit.log"),
+      "utf8",
+    )
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as { action: string; detail?: string })
+      .find((entry) => entry.action === "fleet-landed");
+    expect(landedAudit?.detail).toContain("landing happened outside the fleet");
+
+    // AC1: the dependent starts although bd still reports the edge and both beads
+    // open — no `bd gate resolve`, no `bd close`, no re-arm, and no hand advance
+    // either, since the landing tick already did it.
+    const advanced = await mock.tools
+      .get("belayd_fleet_advance")
+      ?.execute("advance-1", {}, undefined, undefined, ctx);
+    expect(advanced?.details).toHaveProperty("exitCode", 1);
+    expect(textOf(advanced as ToolResult)).toContain("no deferred members");
+
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.taskIds).toEqual(["bd-13"]);
+    expect(after.intent?.deferred ?? []).toEqual([]);
+    expect(existsSync(join(worktree.path, "feat-bd-13"))).toBe(true);
+    // Acceptance never came from the fleet: no bead was closed or relabelled.
+    expect(bdCalls((args) => args[0] === "close" || args[0] === "label")).toEqual([]);
+
+    const audit = readFileSync(join(commonDir, "belayd", "fleet", "default", "audit.log"), "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map(
+        (line) =>
+          JSON.parse(line) as { action: string; taskIds?: readonly string[]; detail?: string },
+      );
+    const firstIndex = (action: string, taskId: string): number =>
+      audit.findIndex(
+        (entry) => entry.action === action && entry.taskIds?.includes(taskId) === true,
+      );
+    const landedEntry = audit.find((entry) => entry.action === "fleet-landed");
+    expect(landedEntry?.detail).toContain("landing happened outside the fleet");
+    expect(firstIndex("member-launch", "bd-13")).toBeGreaterThan(
+      firstIndex("fleet-landed", "bd-12"),
+    );
+  });
+
+  it("starts a dependent on the very tick that landed the wave's last member (bd-278)", async () => {
+    // The run-ending shape of the hand merge: the landed member is the run's *last*
+    // unfinished member, so the tick that records the landing is also the tick that
+    // plans the advance, and it is the last tick this run gets. The advance's landing
+    // filter reads `run.members[].landedAt` from the record, so a landing persisted only
+    // at the end of the tick re-defers bd-13 and finishes the run `partial` with nothing
+    // left to launch it.
+    stubBd(
+      [
+        { id: "bd-12", dependencies: [] },
+        {
+          id: "bd-13",
+          dependencies: [{ id: "bd-12", dependency_type: "blocks", status: "in_progress" }],
+        },
+      ],
+      { "bd-12": "in_progress", "bd-13": "in_progress" },
+    );
+    const mock = await loadFleetExtension();
+    const ctx = makeCtx(cwd, "gate-landing-tick");
+    const command = mock.commands.get("fleet");
+    if (command === undefined) throw new Error("/fleet was not registered");
+    await command.handler("bd-12 bd-13", ctx);
+
+    const launchedIntent = intent();
+    expect(launchedIntent).toHaveProperty("ok", true);
+    if (!launchedIntent.ok) return;
+    // Only bd-12 is live; bd-13 waits behind the ordering gate bd-158 created.
+    expect(launchedIntent.intent?.taskIds).toEqual(["bd-12"]);
+    expect(launchedIntent.intent?.orderingGates).toEqual([
+      { blocker: "bd-12", blocked: "bd-13", gateId: "bd-901" },
+    ]);
+
+    // The member worked on its branch: capture the one durable handle a hand merge
+    // leaves behind, because the branch is still ahead of the base.
+    const memberDir = join(worktree.path, "feat-bd-12");
+    worktree.branchPath = memberDir;
+    worktree.branch = "feat/bd-12";
+    worktree.byBranch = { "feat/bd-12": memberDir };
+    const head = "e".repeat(40);
+    childProcess.gitAnswer = ({ args }) =>
+      args[0] === "rev-parse" && args[1] === "feat/bd-12"
+        ? { stdout: `${head}\n` }
+        : args[0] === "merge-base" && args[1] === "--is-ancestor"
+          ? { failWith: "fatal: not an ancestor" }
+          : undefined;
+    await vi.advanceTimersByTimeAsync(0);
+
+    const captured = intent();
+    expect(captured).toHaveProperty("ok", true);
+    if (!captured.ok) return;
+    expect(
+      captured.intent?.run?.members?.find((member) => member.taskId === "bd-12"),
+    ).toMatchObject({ head });
+
+    // Hand merge: worktree and branch gone, bead still `in_progress` + `human`.
+    rmSync(memberDir, { recursive: true, force: true });
+    worktree.branchPath = "";
+    worktree.branch = "";
+    worktree.byBranch = {};
+    childProcess.gitAnswer = ({ args }) =>
+      args[0] === "merge-base" && args[1] === "--is-ancestor" ? { stdout: "" } : undefined;
+    // Exactly one more tick: it lands bd-12 and must launch bd-13 in that same tick.
+    await vi.advanceTimersByTimeAsync(FLEET_RUN_TICK_INTERVAL_MS);
+
+    const after = intent();
+    expect(after).toHaveProperty("ok", true);
+    if (!after.ok) return;
+    expect(after.intent?.taskIds).toEqual(["bd-13"]);
+    expect(after.intent?.deferred ?? []).toEqual([]);
+    const members = after.intent?.run?.members ?? [];
+    expect(members.find((member) => member.taskId === "bd-12")).toMatchObject({
+      landedAt: expect.any(Number),
+      head,
+    });
+    expect(members.find((member) => member.taskId === "bd-13")).toMatchObject({
+      launchedAt: expect.any(Number),
+    });
+    // The dependent is unfinished work, so the run must still be active: the tick must
+    // not have completed `partial` with bd-13 waiting and no tick left to start it.
+    expect(after.intent?.run?.finishedAt).toBeUndefined();
+    expect(after.intent?.run?.outcome).toBeUndefined();
+    expect(after.intent?.orderingGates).toBeUndefined();
+    expect(existsSync(join(worktree.path, "feat-bd-13"))).toBe(true);
+    // The fleet resolved its own ordering gate on landing: no hand `bd gate resolve`
+    // and no `bd close` was needed to get bd-13 started.
+    expect(bdCalls((args) => args[0] === "gate" && args[1] === "resolve")[0]).toEqual([
+      "gate",
+      "resolve",
+      "bd-901",
+    ]);
+    expect(bdCalls((args) => args[0] === "close" || args[0] === "label")).toEqual([]);
   });
 
   /** Seed the merge queue as the drain leaves it: one entry per landed member. */

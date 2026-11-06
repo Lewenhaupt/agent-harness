@@ -18,6 +18,7 @@ import {
 function scheduleOrFail(input: {
   taskIds: readonly string[];
   memberIds?: readonly string[];
+  orderingGateIds?: ReadonlySet<string>;
   edges?: readonly FleetDependencyEdge[];
   capacity?: number;
   activeCount?: number;
@@ -25,6 +26,7 @@ function scheduleOrFail(input: {
   const result = planFleetSchedule({
     taskIds: input.taskIds,
     ...(input.memberIds === undefined ? {} : { memberIds: input.memberIds }),
+    ...(input.orderingGateIds === undefined ? {} : { orderingGateIds: input.orderingGateIds }),
     edges: input.edges ?? [],
     capacity: input.capacity ?? 3,
     activeCount: input.activeCount ?? 0,
@@ -134,6 +136,29 @@ describe("planFleetSchedule: order, waves, capacity", () => {
       },
     ]);
     expect(schedule.reasons.join("\n")).toContain("blocked by a bead outside this fleet");
+  });
+
+  it("words a stale recorded ordering gate as a gate, not as an outside bead (bd-278)", () => {
+    const schedule = scheduleOrFail({
+      taskIds: ["bd-12"],
+      edges: [{ blocker: "bd-294", blocked: "bd-12" }],
+      orderingGateIds: new Set(["bd-294"]),
+    });
+    expect(schedule.deferred).toEqual([
+      {
+        taskId: "bd-12",
+        reason: "external-blocker",
+        blockers: ["bd-294"],
+        detail:
+          "blocked by ordering gate bd-294, which bd no longer reports; run " +
+          "belayd_fleet_reconcile to drop the stale record and re-plan the wave, or run " +
+          "`bd gate resolve bd-294` if bd still lists it",
+      },
+    ]);
+    // The old wording sent the operator looking for a bead dependency that does not
+    // exist instead of at the fleet's own stale record.
+    expect(schedule.reasons.join("\n")).not.toContain("blocked by a bead outside this fleet");
+    expect(schedule.reasons.join("\n")).toContain("ordering gate(s) bd-294");
   });
 
   it("treats a blocker the fleet already owns as an internal dependency, never an outsider", () => {

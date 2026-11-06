@@ -525,7 +525,7 @@ complete set:
 | `schedule-planned` / `member-deferred` / `capacity-blocked` | once per launch or advance: the plan, and one per deferred member with its reason |
 | `ordering-gates` | once per launch that created (or adopted) bd ordering gates, naming each `blocker->blocked (gate)` |
 | `ordering-gates-adopted` | once per tick/reconcile sweep that wrote a record for a gate bd already had (the crash window between `bd gate create` and the intent write), naming each `blocker->blocked (gate)` |
-| `ordering-gates-resolved` | once per landing / closed-bead resolve, naming the gate ids bd confirmed resolved (bd-158) |
+| `ordering-gates-resolved` | once per landing / closed-bead resolve, naming the gate ids bd confirmed resolved (bd-158); also once per full sweep that drops recorded gates **bd no longer reports** (bd-278; no `bd gate resolve` is called for those) |
 | `ordering-gate-unresolved` | once when a landing merged but bd refused the gate resolve: the record stays and the next tick retries (bd-158) |
 | `fleet-landed` | once per landing, with the member and base branch |
 | `member-merged-released` | once per successful drain, when the merged member was appended to `released[]` with reason `merged` (bd-168) |

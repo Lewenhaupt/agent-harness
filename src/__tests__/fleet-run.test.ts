@@ -17,6 +17,7 @@ import type {
   FleetWorkflowProgressSnapshot,
 } from "../fleet-run.js";
 import {
+  composeOutsideFleetRunWrite,
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_HUMAN_GATE_DETAIL,
@@ -40,6 +41,7 @@ import {
   isFleetRunActive,
   landRepairForMember,
   memberEvidenceCutoff,
+  memberLaunchedByThisRun,
   memberRanEvidence,
   memberWorktreeExisted,
   planFleetTick,
@@ -47,6 +49,7 @@ import {
   planOutsideFleetLandings,
   recordFleetGateNotices,
   recordFleetTickProgress,
+  recordRunMemberHead,
   recordRunMemberLanded,
   recordRunMemberLandRepair,
   recordRunMemberLaunched,
@@ -708,7 +711,12 @@ describe("planFleetTick", () => {
 
   it("stops a member whose orchestrator is gone once the start grace has passed", () => {
     const action = planFleetTick({
-      intent: intent({ taskIds: ["bd-12"] }),
+      intent: intent({
+        taskIds: ["bd-12"],
+        // This run launched bd-12 itself, so its lease is the only thing that could
+        // still prove an execution owns the worktree.
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      }),
       observations: [
         observation(
           "bd-12",
@@ -724,6 +732,46 @@ describe("planFleetTick", () => {
       taskId: "bd-12",
       reason: "orchestrator-missing",
     });
+  });
+
+  it("W-2: does not declare an inherited member missing on the first tick after a re-arm", () => {
+    // The re-arm carries bd-12's honest launch instant from the old run, so its start
+    // grace expired long ago. That evidence is about a launch this run did not perform:
+    // an inherited member was started by earlier work, so a missing lease is not this
+    // execution's failure (bd-278).
+    const previous = startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] });
+    const rearmed = startFleetRun({
+      now: 3_000,
+      accept: false,
+      members: [{ taskId: "bd-15" }],
+      previous,
+    });
+    expect(rearmed.members?.find((member) => member.taskId === "bd-12")?.launchedAt).toBe(1_000);
+
+    const action = planFleetTick({
+      intent: intent({ taskIds: ["bd-12"], run: rearmed }),
+      observations: [
+        observation(
+          "bd-12",
+          { kind: "running", detail: "2/5 phases complete", key: "phases:2/5" },
+          "absent",
+          1_000,
+        ),
+      ],
+      now: 3_000 + FLEET_RUN_START_GRACE_MS + 1,
+    });
+    expect(action.kind).toBe("wait");
+  });
+
+  it("W-2: memberLaunchedByThisRun compares the record with the run's own start", () => {
+    const run = startFleetRun({ now: 2_000, accept: false, members: [] });
+    // A relaunch is stamped with the run's own clock, so the boundary is `true`.
+    expect(memberLaunchedByThisRun(run, { taskId: "bd-12", launchedAt: 2_000 })).toBe(true);
+    // A carried record always predates `startedAt`.
+    expect(memberLaunchedByThisRun(run, { taskId: "bd-12", launchedAt: 1_999 })).toBe(false);
+    // Nothing was launched by a run that does not exist, or by a member it lacks.
+    expect(memberLaunchedByThisRun(undefined, { taskId: "bd-12", launchedAt: 2_000 })).toBe(false);
+    expect(memberLaunchedByThisRun(run, undefined)).toBe(false);
   });
 
   it("does not declare a just-launched member missing", () => {
@@ -1860,33 +1908,41 @@ describe("releaseRunMembers (bd-166)", () => {
   });
 });
 
-describe("planOutsideFleetLandings (bd-166)", () => {
-  it("lands a member whose bead is closed and whose branch git proves is on the base", async () => {
+describe("planOutsideFleetLandings (bd-278)", () => {
+  it("lands a member git proves is on the base, with no bead status as input", async () => {
     const landed = await planOutsideFleetLandings({
       intent: intent({ taskIds: ["bd-12", "bd-15"] }),
       run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
-      closedBeadIds: new Set(["bd-12"]),
-      branchOnBase: async () => true,
+      handlesFor: (taskId) => (taskId === "bd-12" ? ["feat/bd-12"] : []),
+      onBase: async () => true,
     });
-    expect(landed).toEqual(["bd-12"]);
+    // Bead closure is the acceptance fact, not an ordering input: nothing about bd is
+    // consulted, and the unlanded member is returned on ancestry alone.
+    expect(landed).toEqual([{ taskId: "bd-12", handle: "feat/bd-12" }]);
   });
 
-  it("requires both facts: a closed bead alone or an ancestor alone is not a landing", async () => {
-    const run = startFleetRun({ now: 1_000, accept: false, members: [] });
+  it("probes every handle and returns the one that proved the landing", async () => {
+    const probed: string[] = [];
+    const landed = await planOutsideFleetLandings({
+      intent: intent({ taskIds: ["bd-12"] }),
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      handlesFor: () => ["feat/bd-12", "abc1234"],
+      onBase: async (handle) => {
+        probed.push(handle);
+        return handle === "abc1234";
+      },
+    });
+    expect(landed).toEqual([{ taskId: "bd-12", handle: "abc1234" }]);
+    expect(probed).toEqual(["feat/bd-12", "abc1234"]);
+  });
+
+  it("yields nothing when every probe answers false", async () => {
     expect(
       await planOutsideFleetLandings({
         intent: intent({ taskIds: ["bd-12", "bd-15"] }),
-        run,
-        closedBeadIds: new Set(["bd-12"]),
-        branchOnBase: async () => false,
-      }),
-    ).toEqual([]);
-    expect(
-      await planOutsideFleetLandings({
-        intent: intent({ taskIds: ["bd-12", "bd-15"] }),
-        run,
-        closedBeadIds: new Set([]),
-        branchOnBase: async () => true,
+        run: startFleetRun({ now: 1_000, accept: false, members: [] }),
+        handlesFor: () => ["feat/bd-12"],
+        onBase: async () => false,
       }),
     ).toEqual([]);
   });
@@ -1899,10 +1955,251 @@ describe("planOutsideFleetLandings (bd-166)", () => {
       await planOutsideFleetLandings({
         intent: intent({ taskIds: ["bd-12"] }),
         run: already,
-        closedBeadIds: new Set(["bd-12"]),
-        branchOnBase: async () => true,
+        handlesFor: () => ["feat/bd-12"],
+        onBase: async () => true,
       }),
     ).toEqual([]);
+  });
+});
+
+describe("recordRunMemberHead (bd-278)", () => {
+  it("stores the observed head without touching other members", () => {
+    const started = startFleetRun({
+      now: 1_000,
+      accept: false,
+      members: [{ taskId: "bd-12" }, { taskId: "bd-15" }],
+    });
+    const head = recordRunMemberHead({
+      run: started,
+      taskId: "bd-12",
+      head: "abc1234",
+      now: 2_000,
+    });
+
+    expect(head.members?.find((member) => member.taskId === "bd-12")).toMatchObject({
+      head: "abc1234",
+    });
+    expect(head.members?.find((member) => member.taskId === "bd-15")).toEqual({
+      taskId: "bd-15",
+      launchedAt: 1_000,
+    });
+    expect(head.updatedAt).toBe(2_000);
+  });
+
+  it("is idempotent: an unchanged head returns the same run object", () => {
+    const once = recordRunMemberHead({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      head: "abc1234",
+      now: 2_000,
+    });
+    const twice = recordRunMemberHead({ run: once, taskId: "bd-12", head: "abc1234", now: 3_000 });
+
+    expect(twice).toBe(once);
+  });
+
+  it("never invents a member for an id the run did not launch (bd-278)", () => {
+    const started = startFleetRun({ now: 1_000, accept: false, members: [] });
+    const head = recordRunMemberHead({
+      run: started,
+      taskId: "bd-12",
+      head: "abc1234",
+      now: 2_000,
+    });
+    // Synthesising `launchedAt: now` would claim work the run never launched and feed
+    // the liveness evidence; an absent member is simply left out.
+    expect(head).toBe(started);
+    expect(head.members).toEqual([]);
+  });
+});
+
+describe("startFleetRun head durability (bd-278)", () => {
+  it("carries a recorded head into the next run for an id that survives", () => {
+    const previous = recordRunMemberHead({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      head: "abc1234",
+      now: 2_000,
+    });
+    const next = startFleetRun({
+      now: 3_000,
+      accept: false,
+      members: [{ taskId: "bd-12" }],
+      previous,
+    });
+    expect(next.members).toEqual([{ taskId: "bd-12", launchedAt: 3_000, head: "abc1234" }]);
+    expect(next.members?.[0]?.landedAt).toBeUndefined();
+  });
+
+  it("keeps a carried, non-relaunched member's honest record so capture can refresh it", () => {
+    const previous = recordRunMemberHead({
+      run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+      taskId: "bd-12",
+      head: "abc1234",
+      now: 1_500,
+    });
+    // Only bd-15 is launched by the re-arm; bd-12 is carried from the old run.
+    const next = startFleetRun({
+      now: 3_000,
+      accept: false,
+      members: [{ taskId: "bd-15" }],
+      previous,
+    });
+    expect(next.members).toEqual([
+      { taskId: "bd-15", launchedAt: 3_000 },
+      // The instant the fleet actually launched it, never `now`.
+      { taskId: "bd-12", launchedAt: 1_000, head: "abc1234" },
+    ]);
+    const refreshed = recordRunMemberHead({
+      run: next,
+      taskId: "bd-12",
+      head: "def5678",
+      now: 4_000,
+    });
+    expect(refreshed.members?.find((member) => member.taskId === "bd-12")?.head).toBe("def5678");
+  });
+
+  it("still gives a relaunched carried id a fresh launchedAt and inherits head and landedAt", () => {
+    const previous = recordRunMemberLanded({
+      run: recordRunMemberHead({
+        run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+        taskId: "bd-12",
+        head: "abc1234",
+        now: 1_500,
+      }),
+      taskId: "bd-12",
+      now: 2_000,
+    });
+    const next = startFleetRun({
+      now: 3_000,
+      accept: false,
+      members: [{ taskId: "bd-12" }],
+      previous,
+    });
+    expect(next.members).toEqual([
+      { taskId: "bd-12", launchedAt: 3_000, landedAt: 2_000, head: "abc1234" },
+    ]);
+  });
+
+  it("does not carry a repair round into a run that did not start it", () => {
+    const started = startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] });
+    const repaired = recordRunMemberLandRepair({
+      run: started,
+      taskId: "bd-12",
+      refusal: "proof-artifacts-in-diff",
+      head: "abc1234",
+      now: 2_000,
+    });
+    if (!repaired.ok) throw new Error("expected the repair round to be recorded");
+    const next = startFleetRun({
+      now: 3_000,
+      accept: false,
+      members: [{ taskId: "bd-15" }],
+      previous: repaired.run,
+    });
+    const carried = next.members?.find((member) => member.taskId === "bd-12");
+    expect(carried).toEqual({ taskId: "bd-12", launchedAt: 1_000 });
+    expect(carried?.landRepair).toBeUndefined();
+  });
+});
+
+describe("composeOutsideFleetRunWrite (bd-278)", () => {
+  const observed = finishFleetRun({
+    run: startFleetRun({ now: 1_000, accept: false, members: [{ taskId: "bd-12" }] }),
+    now: 2_000,
+    outcome: "partial",
+  });
+  const swept = recordRunMemberLanded({ run: observed, taskId: "bd-12", now: 3_000 });
+  const baseIntent = intent({ taskIds: ["bd-12"], run: observed });
+
+  it("writes the swept run while the stored run is the one that was read", () => {
+    const composed = composeOutsideFleetRunWrite({
+      intent: baseIntent,
+      observed,
+      next: swept,
+      now: 4_000,
+    });
+    expect(composed.recorded).toBe(true);
+    expect(composed.intent.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject(
+      { landedAt: 3_000 },
+    );
+    expect(composed.intent.updatedAt).toBe(4_000);
+  });
+
+  it("merges two concurrent landings instead of letting the second replace the first", () => {
+    const observedBoth = finishFleetRun({
+      run: startFleetRun({
+        now: 1_000,
+        accept: false,
+        members: [{ taskId: "bd-12" }, { taskId: "bd-15" }],
+      }),
+      now: 2_000,
+      outcome: "partial",
+    });
+    const bothIntent = intent({ taskIds: ["bd-12", "bd-15"], run: observedBoth });
+    const first = recordRunMemberLanded({ run: observedBoth, taskId: "bd-12", now: 3_000 });
+    const afterFirst = composeOutsideFleetRunWrite({
+      intent: bothIntent,
+      observed: observedBoth,
+      next: first,
+      now: 4_000,
+    });
+    const second = recordRunMemberLanded({ run: observedBoth, taskId: "bd-15", now: 3_500 });
+    const afterSecond = composeOutsideFleetRunWrite({
+      intent: afterFirst.intent,
+      observed: observedBoth,
+      next: second,
+      now: 5_000,
+    });
+    const members = afterSecond.intent.run?.members ?? [];
+    expect(members.find((member) => member.taskId === "bd-12")?.landedAt).toBe(3_000);
+    expect(members.find((member) => member.taskId === "bd-15")?.landedAt).toBe(3_500);
+  });
+
+  it("leaves a replaced run untouched instead of clobbering it", () => {
+    const fresh = startFleetRun({ now: 9_000, accept: false, members: [{ taskId: "bd-15" }] });
+    const composed = composeOutsideFleetRunWrite({
+      intent: { ...baseIntent, run: fresh },
+      observed,
+      next: swept,
+      now: 4_000,
+    });
+    expect(composed.recorded).toBe(false);
+    expect(composed.reason).toContain("replaced");
+    expect(composed.intent.run).toBe(fresh);
+  });
+
+  it("leaves an active run alone when a supervisor resumed it", () => {
+    const sameRun = { ...observed, finishedAt: undefined, outcome: undefined };
+    const composed = composeOutsideFleetRunWrite({
+      intent: { ...baseIntent, run: sameRun },
+      observed,
+      next: swept,
+      now: 4_000,
+    });
+    expect(composed.recorded).toBe(false);
+    expect(composed.reason).toContain("resumed");
+    expect(composed.intent.run).toBe(sameRun);
+  });
+
+  it("records the landing on the live run a tick swept when the caller allows it (bd-278)", () => {
+    // The tick's own run is active by construction, and the advance it executes reads
+    // `landedAt` from the record, so this write must not be the reconcile-only refusal.
+    const live = { ...observed, finishedAt: undefined, outcome: undefined };
+    const composed = composeOutsideFleetRunWrite({
+      intent: { ...baseIntent, run: live },
+      observed: live,
+      next: recordRunMemberLanded({ run: live, taskId: "bd-12", now: 3_000 }),
+      now: 4_000,
+      allowActiveRun: true,
+    });
+    expect(composed.recorded).toBe(true);
+    expect(composed.intent.run?.members?.find((member) => member.taskId === "bd-12")).toMatchObject(
+      { landedAt: 3_000 },
+    );
+    // Still the same run: composing a landing never finishes or restarts it.
+    expect(composed.intent.run?.finishedAt).toBeUndefined();
+    expect(composed.intent.run?.ticks).toBe(live.ticks);
   });
 });
 

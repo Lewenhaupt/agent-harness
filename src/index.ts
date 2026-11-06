@@ -736,6 +736,7 @@ export type {
   RecordRunMemberLandRepairResult,
 } from "./fleet-run.js";
 export {
+  composeOutsideFleetRunWrite,
   deriveFleetMemberProgress,
   emptyAdvanceAction,
   FLEET_MEMBER_RELEASE_REASONS,
@@ -769,6 +770,7 @@ export {
   planOutsideFleetLandings,
   recordFleetGateNotices,
   recordFleetTickProgress,
+  recordRunMemberHead,
   recordRunMemberLanded,
   recordRunMemberLandRepair,
   recordRunMemberLaunched,

@@ -1466,6 +1466,11 @@ function planLaunchSchedule(options: {
     // this worklist, but they are still the fleet's: an edge from one is a
     // dependency on a sibling's landing, never an outsider blocking the wave.
     memberIds: options.context.targetIntent?.taskIds ?? [],
+    // A stale ordering-gate record is the fleet's own object, not an outside bead; the
+    // deferral text must not read like a bead dependency that does not exist (bd-278).
+    orderingGateIds: new Set(
+      (options.context.targetIntent?.orderingGates ?? []).map((gate) => gate.gateId),
+    ),
     edges: options.dependencyGraph.edges,
     capacity: options.maxConcurrent,
     activeCount,
